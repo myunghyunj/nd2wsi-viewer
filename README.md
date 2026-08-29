@@ -1,7 +1,8 @@
 # nd2-wsi-bridge
 
 **Nikon ND2 → OME-Zarr pyramid → browser slide viewer, with native-resolution
-ROI export — in one command, without ever loading the slide into RAM.**
+ROI export back to ND2 — in one command, without ever loading the slide into
+RAM.**
 
 ```
 pip install .
@@ -66,18 +67,27 @@ End-to-end on an Apple-silicon laptop (14 cores, `--workers 8`):
 | 53,144 × 27,799 | 5.5 GB |  49.2 s | 3.8 GB (8 levels) |
 
 On the 1.48-gigapixel slide the viewer pans/zooms fluidly from
-whole-slide overview to native 1:1; a 11,957 × 7,972 px native-resolution
-ROI (364 MB raw) streamed out as a zlib TIFF in **2.4 s**, and the export
-was verified pixel-identical to reading the same region straight from the
-ND2 memory map, with the 0.66 µm/px calibration intact in the TIFF tags.
-NIS-assigned channel display colors (e.g. CY5 shown red in one staining
-batch, green in another) carry through to the viewer via the ND2 metadata.
+whole-slide overview to native 1:1 — the network log for one zoom shows
+tiles requested from level 6 down to level 0 in sequence, with only the
+handful of visible native tiles fetched at the end. A 11,957 × 7,972 px
+native-resolution ROI (364 MB raw) streamed out as a zlib TIFF in **2.4 s**,
+and as a new **ND2** via `nd2wsi crop` (no pyramid needed) in **14 s**; both
+exports verified pixel-identical to reading the same region straight from
+the source ND2 memory map, with the µm calibration intact (TIFF resolution
+tags / ND2 metadata) and, for ND2, the channel names, display colors and
+objective magnification carried over. NIS-assigned channel colors (e.g. CY5
+shown red in one staining batch, green in another) carry through to the
+viewer via the ND2 metadata.
 
 ## Install
 
 ```bash
 pip install .            # nd2, numpy, dask, zarr, numcodecs, pillow, tifffile
 pip install ".[legacy]"  # + imagecodecs, for JPEG2000-era (pre-2012) ND2 files
+
+# for ND2 export (the ND2 button / `nd2wsi crop`): limnd2 is on Laboratory
+# Imaging's own package index, not PyPI --
+pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2
 ```
 
 Python ≥ 3.10. No web framework — the server is stdlib `http.server`, and
@@ -90,6 +100,9 @@ nd2wsi info    slide.nd2      # internal layout: chunk census, embedded pyramid,
                               # stage positions, compression, calibration
 nd2wsi convert slide.nd2 [out.ome.zarr] [--tile 512] [--t N] [--z mid|max|N]
                               [--position N] [--workers 4] [--overwrite]
+nd2wsi crop    slide.nd2 roi.nd2 --x X --y Y --w W --h H [--c 0,1] [--t/--z/--position]
+                              # native-res ND2 -> ND2 crop, straight off the
+                              # memory map -- no pyramid needed (needs limnd2)
 nd2wsi serve   out.ome.zarr   [--host 127.0.0.1] [--port 8000]
 nd2wsi view    slide.nd2      # convert if needed, then serve
 ```
@@ -101,15 +114,22 @@ and `--position` for multipoint files. RGB slides are stored as C=3.
 ## The viewer
 
 * Deep-zoom pan/scroll with a minimap; channel toggles for multichannel
-  fluorescence (server-side additive compositing with per-channel windows
-  auto-set from percentiles).
+  fluorescence (server-side additive compositing).
+* **Per-channel LUTs**: each channel gets a dual-handle window slider
+  (low/high, in raw counts, sqrt-scaled so the fluorescence range has fine
+  control) and a gamma slider (0.25–4, NIS convention: γ > 1 brightens
+  midtones), with live re-rendering and a per-channel reset. Defaults come
+  from percentile auto-windows computed at convert time.
 * **Region export**: press `R` or *Select region*, drag a rectangle, choose a
   pyramid level, and download:
+  * **ND2** (default) — a real, uncompressed modern ND2 with the source's
+    µm calibration, channel names/colors and objective magnification;
+    reopens in NIS-Elements (written with Laboratory Imaging's own `limnd2`)
+    and round-trips through this tool. Streams at any size.
   * **TIFF** — raw pixel values, original dtype, tiled + zlib, with the true
-    pixel size embedded in the resolution tags. Streams from the store, so
-    any size works (whole slide included).
-  * **PNG / JPEG** — rendered exactly as displayed (capped by
-    `--max-render-mpx`, default 100 MPx).
+    pixel size embedded in the resolution tags. Streams at any size.
+  * **PNG / JPEG** — rendered exactly as displayed, current LUTs included
+    (capped by `--max-render-mpx`, default 100 MPx).
 * Status strip: live stage position in µm, pixel coordinates, zoom, the
   active pyramid level, and a real scale bar.
 
@@ -117,9 +137,12 @@ Everything the UI does is plain HTTP you can script:
 
 ```
 GET /api/info
-GET /api/tile/{level}/{x}/{y}.jpg?c=0,2
-GET /api/roi?level=0&x=6803&y=3517&w=1234&h=987&format=tiff&c=0,2
+GET /api/tile/{level}/{x}/{y}.jpg?c=0,2&win=399:1057,220:2366:2.0
+GET /api/roi?level=0&x=6803&y=3517&w=1234&h=987&format=nd2&c=0,2
 ```
+
+(`win` is one `lo:hi[:gamma]` slot per channel; empty slot = stored default.
+`format` is `nd2` | `tiff` | `png` | `jpg`.)
 
 ## Correctness
 
@@ -128,6 +151,10 @@ The test battery (run in CI-style against synthetic + real files) verifies:
 * ROI TIFF and PNG exports are **pixel-identical** to reading the same region
   straight from the ND2 memory map — including unaligned regions, RGB uint8,
   planar multichannel uint16, and single-channel subsets;
+* ND2 exports **round-trip**: `crop`/`format=nd2` output reopens in the
+  independent `nd2` reader pixel-identical to the source region, with
+  calibration, channel names/colors and magnification preserved
+  (`tests/test_nd2_export.py`, skipped when `limnd2` is absent);
 * `--z max --t N` matches a manual per-frame maximum (validating frame
   indexing on a real T×Z file);
 * the stores open in the official `ome-zarr-py` reader (and therefore in
@@ -170,6 +197,14 @@ python scripts/download_samples.py     # small real files from OME's collection
 
 * One 2D plane per store: T/Z/position are chosen at convert time, not
   browsable live. (Convert multiple stores if you need several planes.)
+* ND2 export needs `limnd2`, which is only on Laboratory Imaging's package
+  index (see Install); without it the ND2 button explains itself and
+  TIFF/PNG/JPEG still work. ND2 export covers uint8/uint16 sources (which is
+  what ND2 acquisitions are); exported files are uncompressed.
+* The ND2 exporter reads the source one 512-row band at a time, so heap is
+  bounded by `512 × ROI-width`; macOS may show a large *resident set* during
+  big crops — that is the OS keeping clean, evictable memory-mapped file
+  pages around, not process heap.
 * zlib-compressed ND2 frames can't be mmap-sliced — conversion of a
   compressed *stitched* slide would need the whole frame in RAM. Consider
   `bioformats2raw` for those, or re-save uncompressed.

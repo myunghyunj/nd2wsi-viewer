@@ -32,6 +32,37 @@ def parse_channels(param: str | None, n: int) -> list[int]:
     return out or list(range(n))
 
 
+def parse_windows(
+    param: str | None,
+    defaults: list[tuple[float, float]],
+) -> tuple[list[tuple[float, float]], list[float]]:
+    """Per-channel LUT overrides from a ``win=lo:hi[:gamma],...`` query param.
+
+    One comma-separated slot per channel index; an empty slot keeps the
+    store's default window.  Gamma defaults to 1 (linear).  Returns
+    ``(windows, gammas)`` aligned with ``defaults``.
+    """
+    windows = list(defaults)
+    gammas = [1.0] * len(defaults)
+    if not param:
+        return windows, gammas
+    for i, tok in enumerate(param.split(",")):
+        tok = tok.strip()
+        if i >= len(defaults) or not tok:
+            continue
+        parts = tok.split(":")
+        try:
+            lo, hi = float(parts[0]), float(parts[1])
+            g = float(parts[2]) if len(parts) > 2 else 1.0
+        except (IndexError, ValueError):
+            continue
+        if hi <= lo:
+            hi = lo + 1.0
+        windows[i] = (lo, hi)
+        gammas[i] = min(max(g, 0.1), 10.0)
+    return windows, gammas
+
+
 def _read_region(root: Any, level_path: str, x: int, y: int, w: int, h: int) -> np.ndarray:
     """(C, h, w) region from one pyramid level, clipped to bounds."""
     arr = root[level_path]
@@ -49,23 +80,34 @@ def composite(
     windows: list[tuple[float, float]],
     colors: list[tuple[int, int, int]],
     rgb: bool,
+    gammas: list[float] | None = None,
 ) -> np.ndarray:
-    """(C, h, w) raw values -> (h, w, 3) uint8 display image."""
+    """(C, h, w) raw values -> (h, w, 3) uint8 display image.
+
+    ``gammas`` follows the NIS convention: gamma > 1 brightens midtones
+    (``v ** (1/gamma)`` after windowing).
+    """
     c, h, w = region.shape
     if h == 0 or w == 0:
         return np.zeros((h, w, 3), dtype=np.uint8)
+    gammas = gammas or [1.0] * len(windows)
 
     if rgb and len(channels) == 3 and channels == [0, 1, 2]:
         lo, hi = windows[0]
         img = region.astype(np.float32)
         img = (img - lo) / max(hi - lo, 1e-6)
-        return (np.clip(np.moveaxis(img, 0, -1), 0, 1) * 255).astype(np.uint8)
+        np.clip(img, 0, 1, out=img)
+        if gammas[0] != 1.0:
+            img **= 1.0 / gammas[0]
+        return (np.moveaxis(img, 0, -1) * 255).astype(np.uint8)
 
     out = np.zeros((h, w, 3), dtype=np.float32)
     for ci in channels:
         lo, hi = windows[ci]
         v = (region[ci].astype(np.float32) - lo) / max(hi - lo, 1e-6)
         np.clip(v, 0, 1, out=v)
+        if gammas[ci] != 1.0:
+            v **= 1.0 / gammas[ci]
         col = np.asarray(colors[ci], dtype=np.float32) / 255.0
         out += v[..., None] * col
     return (np.clip(out, 0, 1) * 255).astype(np.uint8)
@@ -93,6 +135,7 @@ def render_tile(
     ty: int,
     channels: list[int],
     fmt: str = "jpg",
+    win: str | None = None,
 ) -> bytes:
     meta = attrs["nd2wsi"]
     tile = int(meta["tile"])
@@ -106,7 +149,8 @@ def render_tile(
     w, h = min(tile, lw - x), min(tile, lh - y)
     region = _read_region(root, levels[level]["path"], x, y, w, h)
     windows, colors = display_params(attrs)
-    img = composite(region, channels, windows, colors, meta["rgb"])
+    windows, gammas = parse_windows(win, windows)
+    img = composite(region, channels, windows, colors, meta["rgb"], gammas)
     return encode_image(img, fmt)
 
 
@@ -249,10 +293,12 @@ def export_roi_rendered(
     h: int,
     channels: list[int],
     fmt: str,
+    win: str | None = None,
 ) -> bytes:
     meta = attrs["nd2wsi"]
     levels = meta["levels"]
     region = _read_region(root, levels[level]["path"], x, y, w, h)
     windows, colors = display_params(attrs)
-    img = composite(region, channels, windows, colors, meta["rgb"])
+    windows, gammas = parse_windows(win, windows)
+    img = composite(region, channels, windows, colors, meta["rgb"], gammas)
     return encode_image(img, fmt, quality=92)

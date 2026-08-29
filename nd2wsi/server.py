@@ -28,6 +28,12 @@ from . import render
 STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
 
+
+def _limnd2_available() -> bool:
+    from importlib.util import find_spec
+
+    return find_spec("limnd2") is not None
+
 MIME = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -130,6 +136,7 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                     for ch in state.attrs["omero"]["channels"]
                 ],
                 "maxRenderMpx": state.max_render_mpx,
+                "nd2Export": _limnd2_available(),
             }
             self._json(info)
 
@@ -138,9 +145,10 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             fmt = m.group(4)
             n = len(state.attrs["omero"]["channels"])
             channels = render.parse_channels((q.get("c") or [None])[0], n)
+            win = (q.get("win") or [None])[0]
             try:
                 body = render.render_tile(
-                    state.root, state.attrs, level, tx, ty, channels, fmt
+                    state.root, state.attrs, level, tx, ty, channels, fmt, win
                 )
             except KeyError as e:
                 return self._error(404, str(e))
@@ -168,27 +176,43 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 return self._error(400, str(e))
             x, y = max(0, min(x, lw - 1)), max(0, min(y, lh - 1))
             w, h = max(1, min(w, lw - x)), max(1, min(h, lh - y))
-            fmt = (q.get("format") or ["tiff"])[0].lower()
+            fmt = (q.get("format") or ["nd2"])[0].lower()
             n = len(state.attrs["omero"]["channels"])
             channels = render.parse_channels((q.get("c") or [None])[0], n)
+            win = (q.get("win") or [None])[0]
             stem = Path(meta["source"]).stem
             fname = f"{stem}_L{level}_x{x}_y{y}_{w}x{h}"
 
-            if fmt in ("tif", "tiff"):
+            if fmt in ("nd2", "tif", "tiff"):
                 # write through an on-disk temp file so RAM stays bounded for
                 # arbitrarily large regions, then stream it to the client
-                tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+                is_nd2 = fmt == "nd2"
+                ext = ".nd2" if is_nd2 else ".tif"
+                ctype = "application/octet-stream" if is_nd2 else "image/tiff"
+                tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
                 try:
                     tmp.close()
-                    render.export_roi_tiff(
-                        state.root, state.attrs, tmp.name, level, x, y, w, h, channels
-                    )
+                    if is_nd2:
+                        from .export_nd2 import export_roi_nd2
+
+                        try:
+                            export_roi_nd2(
+                                state.root, state.attrs, tmp.name,
+                                level, x, y, w, h, channels,
+                            )
+                        except (RuntimeError, ValueError) as e:
+                            return self._error(400, str(e))
+                    else:
+                        render.export_roi_tiff(
+                            state.root, state.attrs, tmp.name,
+                            level, x, y, w, h, channels,
+                        )
                     size = Path(tmp.name).stat().st_size
                     self.send_response(200)
-                    self.send_header("Content-Type", "image/tiff")
+                    self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(size))
                     self.send_header(
-                        "Content-Disposition", f'attachment; filename="{fname}.tif"'
+                        "Content-Disposition", f'attachment; filename="{fname}{ext}"'
                     )
                     self.end_headers()
                     with open(tmp.name, "rb") as fh:
@@ -210,7 +234,7 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                         "(streams any size) or a higher level",
                     )
                 body = render.export_roi_rendered(
-                    state.root, state.attrs, level, x, y, w, h, channels, fmt
+                    state.root, state.attrs, level, x, y, w, h, channels, fmt, win
                 )
                 ext = "png" if fmt == "png" else "jpg"
                 ctype = "image/png" if fmt == "png" else "image/jpeg"

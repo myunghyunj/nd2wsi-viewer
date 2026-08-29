@@ -170,6 +170,7 @@ def build_group_attrs(
         "levels": levels,
         "selection": src.selection,
         "notes": src.notes,
+        "objective_magnification": src.magnification,
     }
     return {"multiscales": multiscales, "omero": omero, "nd2wsi": nd2wsi}
 

@@ -65,6 +65,7 @@ class PlaneSource:
     source_name: str
     selection: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    magnification: float | None = None  # objective magnification, if recorded
 
 
 def _mid(n: int) -> int:
@@ -230,7 +231,19 @@ def open_plane(
         source_name=str(getattr(f, "path", "nd2")),
         selection={"t": selection.t, "p": selection.p, "z": z_used},
         notes=notes,
+        magnification=objective_magnification(f),
     )
+
+
+def objective_magnification(f: Any) -> float | None:
+    try:
+        for ch in f.metadata.channels or []:
+            mag = getattr(ch.microscope, "objectiveMagnification", None)
+            if mag:
+                return float(mag)
+    except Exception:  # pragma: no cover - metadata parsing is best effort
+        pass
+    return None
 
 
 def level_shapes(height: int, width: int, tile: int) -> list[tuple[int, int]]:

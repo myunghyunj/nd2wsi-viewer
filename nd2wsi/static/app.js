@@ -7,6 +7,7 @@ const state = {
   info: null,
   viewer: null,
   channels: [], // enabled channel indices
+  luts: [], // per channel {lo, hi, gamma}; null while at store defaults
   roi: null, // {x, y, w, h} in level-0 pixels
   roiOverlayEl: null,
   selecting: false,
@@ -22,6 +23,7 @@ async function init() {
   state.info = await res.json();
   const info = state.info;
   state.channels = info.channels.map((_, i) => i);
+  state.luts = info.channels.map(() => null);
 
   document.title = info.name + " — nd2wsi";
   $("file-name").textContent = info.name;
@@ -55,9 +57,28 @@ function planeNote(info) {
 
 /* ---- tile source ---------------------------------------------------------- */
 
+function lutParam() {
+  // one lo:hi[:gamma] slot per channel; empty slot = store default
+  const luts = state.luts;
+  if (!luts.some((l) => l)) return "";
+  return state.info.channels
+    .map((ch, i) => {
+      const l = luts[i];
+      if (!l) return "";
+      const g = Math.abs(l.gamma - 1) > 0.005 ? ":" + l.gamma.toFixed(2) : "";
+      return Math.round(l.lo) + ":" + Math.round(l.hi) + g;
+    })
+    .join(",");
+}
+
 function tileQuery() {
-  const all = state.channels.length === state.info.channels.length;
-  return all ? "" : "?c=" + state.channels.join(",");
+  const q = new URLSearchParams();
+  if (state.channels.length !== state.info.channels.length)
+    q.set("c", state.channels.join(","));
+  const win = lutParam();
+  if (win) q.set("win", win);
+  const s = q.toString();
+  return s ? "?" + s : "";
 }
 
 function makeTileSource() {
@@ -149,7 +170,7 @@ function reopenPreservingView() {
 
 function buildChannelPanel() {
   const info = state.info;
-  if (info.rgb || info.channels.length < 2) return;
+  if (info.rgb) return; // RGB slides render as-is
   $("channels-section").hidden = false;
   const list = $("channel-list");
   info.channels.forEach((ch, i) => {
@@ -158,6 +179,7 @@ function buildChannelPanel() {
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.checked = true;
+    if (info.channels.length < 2) cb.style.display = "none";
     cb.onchange = () => {
       const on = new Set(state.channels);
       cb.checked ? on.add(i) : on.delete(i);
@@ -179,7 +201,130 @@ function buildChannelPanel() {
     win.textContent = fmtInt(ch.window.start) + "–" + fmtInt(ch.window.end);
     row.append(cb, sw, name, win);
     list.append(row);
+    list.append(buildLutRow(i, ch, win));
   });
+}
+
+/* ---- per-channel LUT (window + gamma) ------------------------------------- */
+
+const SLIDER_STEPS = 1000;
+
+function lutMax(ch) {
+  return Math.max(ch.window.max || 0, ch.window.end, 1);
+}
+
+// sqrt mapping: fine control where fluorescence signal lives (low counts)
+function sliderToValue(p, max) {
+  const t = p / SLIDER_STEPS;
+  return max * t * t;
+}
+function valueToSlider(v, max) {
+  return Math.round(SLIDER_STEPS * Math.sqrt(Math.max(0, v) / max));
+}
+
+function buildLutRow(i, ch, winLabel) {
+  const wrap = document.createElement("div");
+  wrap.className = "lut";
+  const max = lutMax(ch);
+  const def = { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
+
+  const track = document.createElement("div");
+  track.className = "lut-track";
+  const fill = document.createElement("div");
+  fill.className = "lut-fill";
+  fill.style.background = "#" + ch.color;
+  const lo = document.createElement("input");
+  const hi = document.createElement("input");
+  for (const [el, val] of [[lo, def.lo], [hi, def.hi]]) {
+    el.type = "range";
+    el.min = 0;
+    el.max = SLIDER_STEPS;
+    el.step = 1;
+    el.value = valueToSlider(val, max);
+  }
+  lo.className = "lut-lo";
+  hi.className = "lut-hi";
+  track.append(fill, lo, hi);
+
+  const gRow = document.createElement("div");
+  gRow.className = "lut-gamma";
+  const gLabel = document.createElement("span");
+  gLabel.className = "glabel";
+  gLabel.textContent = "γ";
+  const g = document.createElement("input");
+  g.type = "range";
+  g.min = -100; // gamma = 4^(v/100): 0.25 .. 4, centered on 1
+  g.max = 100;
+  g.step = 1;
+  g.value = 0;
+  const gVal = document.createElement("span");
+  gVal.className = "gval";
+  gVal.textContent = "1.00";
+  const reset = document.createElement("button");
+  reset.className = "lut-reset";
+  reset.type = "button";
+  reset.title = "Reset window and gamma";
+  reset.textContent = "↺";
+  gRow.append(gLabel, g, gVal, reset);
+  wrap.append(track, gRow);
+
+  function current() {
+    let a = sliderToValue(+lo.value, max);
+    let b = sliderToValue(+hi.value, max);
+    if (b <= a) b = a + 1;
+    return { lo: a, hi: b, gamma: Math.pow(4, +g.value / 100) };
+  }
+  function isDefault(l) {
+    return (
+      Math.abs(l.lo - def.lo) < 0.5 &&
+      Math.abs(l.hi - def.hi) < 0.5 &&
+      Math.abs(l.gamma - 1) < 0.005
+    );
+  }
+  function paint() {
+    const l = current();
+    const a = (100 * +lo.value) / SLIDER_STEPS;
+    const b = (100 * +hi.value) / SLIDER_STEPS;
+    fill.style.left = a + "%";
+    fill.style.width = Math.max(0, b - a) + "%";
+    winLabel.textContent = fmtInt(l.lo) + "–" + fmtInt(l.hi);
+    gVal.textContent = l.gamma.toFixed(2);
+  }
+  const apply = debounce(() => {
+    const l = current();
+    state.luts[i] = isDefault(l) ? null : l;
+    reopenPreservingView();
+  }, 250);
+  for (const el of [lo, hi, g]) {
+    el.addEventListener("input", () => {
+      // keep handles ordered while dragging
+      if (+lo.value > +hi.value) {
+        if (el === lo) hi.value = lo.value;
+        else lo.value = hi.value;
+      }
+      paint();
+      apply();
+    });
+    el.addEventListener("click", (ev) => ev.preventDefault());
+  }
+  reset.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    lo.value = valueToSlider(def.lo, max);
+    hi.value = valueToSlider(def.hi, max);
+    g.value = 0;
+    paint();
+    apply();
+  });
+  paint();
+  return wrap;
+}
+
+function debounce(fn, ms) {
+  let t = null;
+  return () => {
+    clearTimeout(t);
+    t = setTimeout(fn, ms);
+  };
 }
 
 /* ---- readout strip -------------------------------------------------------- */
@@ -290,10 +435,18 @@ function wireRoi() {
   }, true);
 
   $("roi-clear").onclick = clearRoi;
+  $("roi-dl-nd2").onclick = () => downloadRoi("nd2");
   $("roi-dl-tiff").onclick = () => downloadRoi("tiff");
   $("roi-dl-png").onclick = () => downloadRoi("png");
   $("roi-dl-jpg").onclick = () => downloadRoi("jpg");
   $("roi-level").onchange = updateRoiPanel;
+  if (state.info.nd2Export === false) {
+    const b = $("roi-dl-nd2");
+    b.disabled = true;
+    b.title =
+      "ND2 export needs the limnd2 package on the server — " +
+      "pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2";
+  }
 
   function positionRubber(a, b) {
     const r = rectFrom(a, b);
@@ -391,7 +544,12 @@ function updateRoiPanel() {
   const h = Math.max(1, Math.round(r.h / f));
   $("roi-px").textContent = fmtInt(w) + " × " + fmtInt(h);
   const [py, px] = info.pixelSizeUm;
-  $("roi-um").textContent = fmtUm(r.w * px) + " × " + fmtUm(r.h * py);
+  const wUm = fmtUm(r.w * px);
+  const hUm = fmtUm(r.h * py);
+  const [wNum, wUnit] = wUm.split(" ");
+  const [hNum, hUnit] = hUm.split(" ");
+  $("roi-um").textContent =
+    wUnit === hUnit ? wNum + " × " + hNum + " " + wUnit : wUm + " × " + hUm;
   const itemsize = dtypeBytes(info.dtype);
   const nCh = info.rgb ? 3 : state.channels.length;
   $("roi-bytes").textContent = "≈ " + fmtBytes(w * h * nCh * itemsize);
@@ -412,12 +570,14 @@ function downloadRoi(fmt) {
   });
   const all = state.channels.length === state.info.channels.length;
   if (!all) q.set("c", state.channels.join(","));
-  if (fmt !== "tiff") {
+  if (fmt === "png" || fmt === "jpg") {
+    const win = lutParam();
+    if (win) q.set("win", win); // rendered exports match the screen LUTs
     const mpx = (q.get("w") * q.get("h")) / 1e6;
     if (mpx > state.info.maxRenderMpx) {
       showToast(
         "rendered export capped at " + state.info.maxRenderMpx +
-        " MPx — use TIFF (streams any size) or a coarser level"
+        " MPx — use ND2/TIFF (they stream any size) or a coarser level"
       );
       return;
     }

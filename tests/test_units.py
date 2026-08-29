@@ -4,7 +4,7 @@ import pytest
 
 from nd2wsi.convert import _even_chunks, build_group_attrs
 from nd2wsi.reader import ChannelInfo, PlaneSource, level_shapes
-from nd2wsi.render import composite, parse_channels
+from nd2wsi.render import composite, parse_channels, parse_windows
 
 
 def test_level_shapes_halve_until_tile():
@@ -30,6 +30,31 @@ def test_parse_channels():
     assert parse_channels("1", 3) == [1]
     assert parse_channels("0,2,9", 3) == [0, 2]
     assert parse_channels(",", 3) == [0, 1, 2]
+
+
+def test_parse_windows():
+    defaults = [(0.0, 255.0), (10.0, 90.0)]
+    # no override
+    assert parse_windows(None, defaults) == (defaults, [1.0, 1.0])
+    # override channel 1 only, with gamma
+    wins, gammas = parse_windows(",5:50:2", defaults)
+    assert wins == [(0.0, 255.0), (5.0, 50.0)] and gammas == [1.0, 2.0]
+    # malformed slots fall back to defaults; inverted window is repaired
+    wins, gammas = parse_windows("junk,100:100", defaults)
+    assert wins[0] == (0.0, 255.0) and wins[1] == (100.0, 101.0)
+    # gamma clamped
+    _, gammas = parse_windows("0:1:99", defaults)
+    assert gammas[0] == 10.0
+
+
+def test_composite_gamma():
+    region = np.array([[[64]]], np.uint8)  # quarter-scale value in a 0-255 window
+    linear = composite(region, [0], [(0, 255)], [(255, 255, 255)], rgb=False)
+    bright = composite(
+        region, [0], [(0, 255)], [(255, 255, 255)], rgb=False, gammas=[2.0]
+    )
+    assert bright[0, 0, 0] > linear[0, 0, 0]  # gamma > 1 brightens midtones
+    assert bright[0, 0, 0] == int((64 / 255) ** 0.5 * 255)  # matches astype truncation
 
 
 def test_composite_rgb_passthrough():

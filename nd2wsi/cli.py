@@ -2,6 +2,7 @@
 
     nd2wsi info    slide.nd2                 # how is this file laid out inside?
     nd2wsi convert slide.nd2 [out.ome.zarr]  # build the OME-Zarr pyramid
+    nd2wsi crop    slide.nd2 roi.nd2 --x --y --w --h   # native-res ND2 crop
     nd2wsi serve   out.ome.zarr              # serve the browser viewer
     nd2wsi view    slide.nd2                 # convert (if needed) + serve
 """
@@ -74,6 +75,21 @@ def main(argv: list[str] | None = None) -> int:
     p_conv.add_argument("out", nargs="?", help="output store (default: <nd2>.ome.zarr)")
     _add_convert_args(p_conv)
 
+    p_crop = sub.add_parser(
+        "crop",
+        help="crop a native-resolution ROI straight out of an ND2, as a new .nd2",
+    )
+    p_crop.add_argument("nd2")
+    p_crop.add_argument("out", help="output .nd2 file")
+    p_crop.add_argument("--x", type=int, required=True, help="left edge (px)")
+    p_crop.add_argument("--y", type=int, required=True, help="top edge (px)")
+    p_crop.add_argument("--w", type=int, required=True, help="width (px)")
+    p_crop.add_argument("--h", type=int, required=True, help="height (px)")
+    p_crop.add_argument(
+        "--c", type=str, default=None, help="channel subset, e.g. 0 or 0,2 (default all)"
+    )
+    _add_selection_args(p_crop)
+
     p_serve = sub.add_parser("serve", help="serve the viewer for a converted store")
     p_serve.add_argument("store")
     _add_serve_args(p_serve)
@@ -109,6 +125,32 @@ def main(argv: list[str] | None = None) -> int:
             selection=_selection(args),
             overwrite=args.overwrite,
             workers=args.workers,
+        )
+        return 0
+
+    if args.cmd == "crop":
+        from .export_nd2 import crop_nd2_to_nd2
+
+        channels = [int(t) for t in args.c.split(",") if t.strip()] if args.c else None
+        try:
+            res = crop_nd2_to_nd2(
+                args.nd2,
+                args.out,
+                args.x,
+                args.y,
+                args.w,
+                args.h,
+                selection=_selection(args),
+                channels=channels,
+            )
+        except (RuntimeError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        wum, hum = res["um"]
+        print(
+            f"wrote {args.out}: {res['w']} x {res['h']} px "
+            f"({wum:.0f} x {hum:.0f} um) at x={res['x']} y={res['y']}, "
+            f"channels {res['channels']}, {res['pixel_size_um']:.4f} um/px"
         )
         return 0
 
