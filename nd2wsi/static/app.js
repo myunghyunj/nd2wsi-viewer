@@ -605,6 +605,7 @@ function niceLength(um) {
 
 const TOOL_BTN = {
   roi: "roi-toggle",
+  move: "roi-move",
   measure: "tool-measure",
   pin: "tool-pin",
   box: "tool-box",
@@ -613,12 +614,14 @@ const TOOL_BTN = {
 function setTool(tool) {
   state.tool = state.tool === tool ? null : tool;
   const on = state.tool;
-  if (on === "roi" && state.windows.region.isHidden()) state.windows.region.open();
+  if ((on === "roi" || on === "move") && state.windows.region.isHidden())
+    state.windows.region.open();
   for (const [t, id] of Object.entries(TOOL_BTN)) {
     $(id).classList.toggle("armed", on === t);
   }
   $("roi-toggle").textContent = on === "roi" ? "Drag to Mark…" : "Select Region";
-  $("stage").classList.toggle("selecting", !!on);
+  $("stage").classList.toggle("selecting", !!on && on !== "move");
+  $("stage").classList.toggle("moving", on === "move");
   state.viewer.setMouseNavEnabled(!on);
   if (!on) {
     $("rubber").style.display = "none";
@@ -644,14 +647,23 @@ function wireTools() {
   let startImg = null;
 
   $("roi-toggle").onclick = () => setTool("roi");
+  $("roi-move").onclick = () => {
+    if (state.roi) setTool("move");
+  };
   $("tool-measure").onclick = () => setTool("measure");
   $("tool-pin").onclick = () => setTool("pin");
   $("tool-box").onclick = () => setTool("box");
 
+  let moveFrom = null; // roi origin at drag start (move mode)
   stage.addEventListener("pointerdown", (ev) => {
     if (!state.tool || ev.button !== 0) return;
+    if (state.tool === "move" && !state.roi) return;
     start = elementPoint(ev, stage);
     startImg = imgPoint(start);
+    if (state.tool === "move") {
+      moveFrom = { x: state.roi.x, y: state.roi.y };
+      stage.classList.add("grabbing");
+    }
     if (state.tool === "roi" || state.tool === "box") {
       rubber.style.display = "block";
       positionRubber(start, start);
@@ -664,7 +676,13 @@ function wireTools() {
   stage.addEventListener("pointermove", (ev) => {
     if (!state.tool || !start) return;
     const cur = elementPoint(ev, stage);
-    if (state.tool === "roi" || state.tool === "box") {
+    if (state.tool === "move" && moveFrom) {
+      const p = imgPoint(cur);
+      const r = state.roi;
+      r.x = Math.round(clamp(moveFrom.x + (p.x - startImg.x), 0, state.info.width - r.w));
+      r.y = Math.round(clamp(moveFrom.y + (p.y - startImg.y), 0, state.info.height - r.h));
+      moveRoiOverlay();
+    } else if (state.tool === "roi" || state.tool === "box") {
       positionRubber(start, cur);
     } else if (state.tool === "measure") {
       const p = imgPoint(cur);
@@ -683,7 +701,11 @@ function wireTools() {
     const tool = state.tool;
     const moved = Math.hypot(end.x - start.x, end.y - start.y);
 
-    if (tool === "roi") {
+    if (tool === "move") {
+      moveFrom = null;
+      stage.classList.remove("grabbing");
+      updateRoiPanel(); // position changed; size and readouts stay
+    } else if (tool === "roi") {
       finishSelection(start, end);
     } else if (tool === "measure") {
       state.tempLine = null;
@@ -1071,6 +1093,7 @@ function finishSelection(a, b) {
   updateRoiPanel();
   $("roi-detail").classList.add("active");
   $("roi-hint").style.display = "none";
+  $("roi-move").disabled = false;
 }
 
 function drawRoiOverlay() {
@@ -1092,6 +1115,17 @@ function drawRoiOverlay() {
   state.roiOverlayEl = el;
 }
 
+function moveRoiOverlay() {
+  const r = state.roi;
+  if (!r || !state.roiOverlayEl) return drawRoiOverlay();
+  state.viewer.updateOverlay(
+    state.roiOverlayEl,
+    state.viewer.viewport.imageToViewportRectangle(
+      new OpenSeadragon.Rect(r.x, r.y, r.w, r.h)
+    )
+  );
+}
+
 function restoreRoiOverlay() {
   if (state.roi) drawRoiOverlay();
 }
@@ -1104,6 +1138,8 @@ function clearRoi() {
   }
   $("roi-detail").classList.remove("active");
   $("roi-hint").style.display = "";
+  $("roi-move").disabled = true;
+  if (state.tool === "move") setTool("move"); // toggles the mode off
 }
 
 function updateRoiPanel() {
@@ -1446,6 +1482,7 @@ function wireKeys() {
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
     const k = ev.key.toLowerCase();
     if (k === "r") setTool("roi");
+    else if (k === "v") { if (state.roi) setTool("move"); }
     else if (k === "m") setTool("measure");
     else if (k === "p") setTool("pin");
     else if (k === "b") setTool("box");
