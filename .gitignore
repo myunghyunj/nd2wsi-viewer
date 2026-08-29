@@ -11,3 +11,7 @@ dist/
 build/
 build/
 docs/*.tmp
+build/
+dist/
+*.ome.zarr/
+*.annotations.json

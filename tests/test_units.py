@@ -91,3 +91,13 @@ def test_group_attrs_shape():
     assert len(ms["datasets"]) == len(shapes)
     assert ms["datasets"][1]["coordinateTransformations"][0]["scale"] == [1.0, 1.0, 1.0]
     assert attrs["nd2wsi"]["levels"][0]["width"] == 2000
+
+
+def test_svs_aperio_meta_parsing():
+    from nd2wsi.svs import _aperio_meta, is_svs
+
+    desc = "Aperio Image Library v11.2.1\n46920x33014 ... |AppMag = 20|MPP = 0.4990|Filtered=5"
+    meta = _aperio_meta(desc)
+    assert meta["mpp"] == 0.4990 and meta["magnification"] == 20.0
+    assert _aperio_meta("no metadata here") == {}
+    assert is_svs("a/b/slide.SVS") and not is_svs("x.nd2")

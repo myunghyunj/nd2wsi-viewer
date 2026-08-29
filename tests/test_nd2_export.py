@@ -98,6 +98,49 @@ def test_three_channel_roundtrip(tmp_path):
         assert [c.channel.name for c in f.metadata.channels] == ["CY5", "FITC", "DAPI"]
 
 
+def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
+    """GET/POST /api/annotations persists a JSON sidecar next to the store."""
+    import json
+    import threading
+    import urllib.request
+
+    from nd2wsi.convert import convert
+    from nd2wsi.server import create_server
+
+    src_path, _ = fluor_nd2
+    store = tmp_path / "ann.ome.zarr"
+    convert(src_path, store, progress=False)
+    httpd = create_server(store, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        first = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
+        assert first["items"] == [] and first["path"].endswith("fluor.annotations.json")
+
+        items = [
+            {"id": "a1", "type": "line", "x1": 0, "y1": 0, "x2": 100, "y2": 0,
+             "text": "", "color": "#ffd60a"},
+            {"id": "a2", "type": "pin", "x": 50, "y": 60, "text": "hello"},
+        ]
+        req = urllib.request.Request(
+            base + "/api/annotations",
+            data=json.dumps({"items": items}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = json.loads(urllib.request.urlopen(req).read())
+        assert resp["ok"] and resp["count"] == 2
+
+        sidecar = tmp_path / "fluor.annotations.json"
+        assert sidecar.exists()
+        on_disk = json.loads(sidecar.read_text())
+        assert on_disk["items"] == items and on_disk["source"] == "fluor.nd2"
+
+        back = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
+        assert back["items"] == items  # auto-found on the next open
+    finally:
+        httpd.shutdown()
+
+
 def test_store_roi_export_matches_source(fluor_nd2, tmp_path):
     """convert -> export_roi_nd2 -> identical pixels + metadata carried over."""
     from nd2wsi.convert import convert, open_store

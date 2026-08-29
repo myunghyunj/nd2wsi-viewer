@@ -8,31 +8,66 @@
 </head>
 <body>
 <div id="app">
-  <header>
-    <span class="wordmark"><b>nd2</b> &middot; wsi bridge</span>
-    <span id="file-name">&nbsp;</span>
-    <span id="file-dims"></span>
-    <span class="spacer"></span>
-    <span id="plane-note"></span>
+  <header id="toolbar">
+    <div class="tb-group">
+      <span class="app-mark">ND2</span>
+      <span id="file-name">&nbsp;</span>
+      <span id="file-dims"></span>
+    </div>
+    <div class="tb-spacer"></div>
+    <div class="tb-group">
+      <button class="tb-btn" id="tb-channels" title="Show or hide Channels &amp; LUTs">
+        <span class="tb-ico">&#9680;</span>Channels
+      </button>
+      <button class="tb-btn" id="tb-region" title="Show or hide Region (R)">
+        <span class="tb-ico">&#9634;</span>Region
+      </button>
+      <button class="tb-btn" id="tb-annot" title="Show or hide Annotations">
+        <span class="tb-ico">&#9998;</span>Annotate
+      </button>
+    </div>
   </header>
 
   <div id="stage-wrap">
     <div id="stage"></div>
+    <svg id="ann-layer" xmlns="http://www.w3.org/2000/svg"></svg>
     <div id="rubber"></div>
 
-    <div id="controls">
-      <section id="channels-section" hidden>
-        <h2>Channels</h2>
+    <div id="ann-editor" hidden>
+      <textarea id="ann-text" rows="2" placeholder="Annotation&hellip;"></textarea>
+      <div class="ed-row">
+        <button class="btn danger" id="ann-delete">Delete</button>
+        <span class="ed-spacer"></span>
+        <button class="btn primary" id="ann-done">Done</button>
+      </div>
+    </div>
+
+    <section class="mac-window" id="win-channels">
+      <div class="win-titlebar">
+        <div class="traffic">
+          <button class="tl tl-close" title="Close"></button>
+          <button class="tl tl-min" title="Minimize"></button>
+          <button class="tl tl-zoom" title="Zoom"></button>
+        </div>
+        <span class="win-title">Channels &amp; LUTs</span>
+      </div>
+      <div class="win-body">
         <div id="channel-list"></div>
-      </section>
+      </div>
+    </section>
 
-      <section>
-        <h2>Region</h2>
-        <button id="roi-toggle" class="btn full" title="Drag on the slide to mark a region (R)">
-          Select region
-        </button>
+    <section class="mac-window" id="win-region">
+      <div class="win-titlebar">
+        <div class="traffic">
+          <button class="tl tl-close" title="Close"></button>
+          <button class="tl tl-min" title="Minimize"></button>
+          <button class="tl tl-zoom" title="Zoom"></button>
+        </div>
+        <span class="win-title">Region</span>
+      </div>
+      <div class="win-body">
+        <button id="roi-toggle" class="btn full">Select Region</button>
         <div class="hint" id="roi-hint">Drag on the slide to mark a region.</div>
-
         <div id="roi-detail">
           <div class="roi-line"><span class="k">Pixels</span><span class="v" id="roi-px">&ndash;</span></div>
           <div class="roi-line"><span class="k">Physical</span><span class="v" id="roi-um">&ndash;</span></div>
@@ -44,27 +79,55 @@
             <button id="roi-dl-png" class="btn" title="Rendered as displayed">PNG</button>
             <button id="roi-dl-jpg" class="btn" title="Rendered as displayed">JPEG</button>
           </div>
-          <button id="roi-clear" class="btn">Clear region</button>
+          <button id="roi-clear" class="btn full">Clear Region</button>
         </div>
-      </section>
-    </div>
+      </div>
+    </section>
+
+    <section class="mac-window" id="win-annot">
+      <div class="win-titlebar">
+        <div class="traffic">
+          <button class="tl tl-close" title="Close"></button>
+          <button class="tl tl-min" title="Minimize"></button>
+          <button class="tl tl-zoom" title="Zoom"></button>
+        </div>
+        <span class="win-title">Annotations</span>
+      </div>
+      <div class="win-body">
+        <div class="tool-row">
+          <button id="tool-measure" class="btn" title="Measure a distance (M)">&#8596; Measure</button>
+          <button id="tool-pin" class="btn" title="Drop a pin (P)">&#9679; Pin</button>
+          <button id="tool-box" class="btn" title="Draw a box (B)">&#9634; Box</button>
+        </div>
+        <div id="ann-list"></div>
+        <div class="hint" id="ann-empty">Measurements and notes live in a sidecar file next to the slide, loaded automatically on open.</div>
+        <div class="tool-row footer">
+          <button id="ann-open" class="btn" title="Load an annotation file">Open&hellip;</button>
+          <button id="ann-export" class="btn" title="Download the annotation file">Export</button>
+        </div>
+        <div class="hint" id="ann-status"></div>
+        <input type="file" id="ann-file" accept=".json,application/json" hidden />
+      </div>
+    </section>
 
     <div id="zoom-cluster">
-      <button class="btn" id="zoom-in" title="Zoom in">+</button>
-      <button class="btn" id="zoom-out" title="Zoom out">&minus;</button>
-      <button class="btn" id="zoom-fit" title="Fit slide (0)">&#8862;</button>
+      <button class="zc-btn" id="zoom-in" title="Zoom in">+</button>
+      <button class="zc-btn" id="zoom-out" title="Zoom out">&minus;</button>
+      <button class="zc-btn" id="zoom-fit" title="Fit slide (0)">&#8862;</button>
     </div>
 
     <div id="toast"></div>
-    <div id="boot">loading slide &hellip;</div>
+    <div id="boot">Loading slide&hellip;</div>
   </div>
 
-  <footer>
+  <footer id="statusbar">
     <span class="cell"><span class="label">Stage</span><span class="value" id="pos-um">&ndash;</span></span>
     <span class="cell optional"><span class="label">Pixel</span><span class="value" id="pos-px">&ndash;</span></span>
     <span class="cell"><span class="label">Zoom</span><span class="value" id="zoom-val">&ndash;</span></span>
     <span class="cell"><span class="label">Level</span><span id="level-lamps"></span></span>
+    <span class="cell optional" id="hw-cell" hidden><span class="label">Display</span><span class="value" id="hw-val"></span></span>
     <span class="spacer"></span>
+    <span id="plane-note"></span>
     <span id="scalebar-wrap"><span id="scalebar"></span><span id="scalebar-label"></span></span>
   </footer>
 </div>

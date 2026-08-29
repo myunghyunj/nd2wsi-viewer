@@ -1,10 +1,10 @@
 """nd2wsi command line interface.
 
-    nd2wsi info    slide.nd2                 # how is this file laid out inside?
+    nd2wsi info    slide.nd2|.svs            # how is this file laid out inside?
     nd2wsi convert slide.nd2 [out.ome.zarr]  # build the OME-Zarr pyramid
     nd2wsi crop    slide.nd2 roi.nd2 --x --y --w --h   # native-res ND2 crop
     nd2wsi serve   out.ome.zarr              # serve the browser viewer
-    nd2wsi view    slide.nd2                 # convert (if needed) + serve
+    nd2wsi view    slide.nd2|.svs            # convert (if needed) + serve
 """
 
 from __future__ import annotations
@@ -31,7 +31,12 @@ def _add_selection_args(p: argparse.ArgumentParser) -> None:
 
 def _add_convert_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tile", type=int, default=512, help="pyramid tile size (default 512)")
-    p.add_argument("--workers", type=int, default=4, help="dask worker threads")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="dask worker threads (default: auto from this machine's CPU count)",
+    )
     p.add_argument("--overwrite", action="store_true", help="replace existing store")
     _add_selection_args(p)
 
@@ -66,11 +71,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_info = sub.add_parser("info", help="inspect an ND2 file's internal layout")
+    p_info = sub.add_parser("info", help="inspect an ND2/SVS file's internal layout")
     p_info.add_argument("nd2")
     p_info.add_argument("--json", action="store_true", help="machine-readable output")
 
-    p_conv = sub.add_parser("convert", help="ND2 -> OME-Zarr multiscale pyramid")
+    p_conv = sub.add_parser("convert", help="ND2/SVS -> OME-Zarr multiscale pyramid")
     p_conv.add_argument("nd2")
     p_conv.add_argument("out", nargs="?", help="output store (default: <nd2>.ome.zarr)")
     _add_convert_args(p_conv)
@@ -103,7 +108,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "info":
-        from .inspect_nd2 import collect_info, format_info
+        from .svs import collect_svs_info, format_svs_info, is_svs
+
+        if is_svs(args.nd2):
+            collect_info, format_info = collect_svs_info, format_svs_info
+        else:
+            from .inspect_nd2 import collect_info, format_info
 
         info = collect_info(args.nd2)
         if args.json:

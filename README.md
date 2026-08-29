@@ -1,8 +1,12 @@
-# nd2-wsi-bridge
+# nd2wsi-viewer
 
-**Nikon ND2 → OME-Zarr pyramid → browser slide viewer, with native-resolution
-ROI export back to ND2 — in one command, without ever loading the slide into
-RAM.**
+**Nikon ND2 (and Aperio SVS) → OME-Zarr pyramid → whole-slide viewer with
+native-resolution ROI export back to ND2 — as a CLI + browser viewer or a
+double-clickable macOS app, without ever loading the slide into RAM.**
+
+SVS input reads the baseline level of the pyramidal TIFF through `tifffile`
+(JPEG tiles need `pip install ".[svs]"`), takes µm calibration from the
+Aperio `MPP` field, and flows through the identical pipeline.
 
 ```
 pip install .
@@ -13,7 +17,6 @@ nd2wsi view my_stitched_slide.nd2
 Built for large stitched acquisitions from NIS-Elements ("Scan Large Image" /
 XY-stitched scans on Ti2-class stands), but works on any 2D-viewable ND2 plane.
 
-![viewer with a region selected](docs/viewer_roi.png)
 
 ## Why this exists — what's actually inside a stitched ND2
 
@@ -105,7 +108,11 @@ nd2wsi crop    slide.nd2 roi.nd2 --x X --y Y --w W --h H [--c 0,1] [--t/--z/--po
                               # memory map -- no pyramid needed (needs limnd2)
 nd2wsi serve   out.ome.zarr   [--host 127.0.0.1] [--port 8000]
 nd2wsi view    slide.nd2      # convert if needed, then serve
+nd2wsi-viewer  [slide.nd2]    # native macOS window (needs the [app] extra)
 ```
+
+`convert` sizes its thread pool to the machine (`hardware: N cores -> M
+workers`); pass `--workers` to override.
 
 `convert` picks one 2D plane (plus channels) per store: timepoint `--t`,
 Z plane `--z` (an index, `mid`, or `max` for a maximum-intensity projection),
@@ -113,8 +120,29 @@ and `--position` for multipoint files. RGB slides are stored as C=3.
 
 ## The viewer
 
-* Deep-zoom pan/scroll with a minimap; channel toggles for multichannel
-  fluorescence (server-side additive compositing).
+Designed in the macOS design language (values measured from Apple's macOS 27
+UI kit): SF Pro / SF Mono type, translucent panels with behind-panel blur,
+capsule glass controls with specular edges, and real macOS-geometry switches.
+The control panels are small mac windows — drag them by the title bar,
+resize from any edge (the LUT histograms grow with the window), and use the
+traffic lights: close (reopen from the toolbar), minimize to the title bar,
+zoom. Geometry is remembered per slide server.
+
+* Deep-zoom pan/scroll with a minimap (white viewport box); channel on/off
+  switches for multichannel fluorescence (server-side additive compositing).
+  The viewer is Retina-aware: zoom % and the active-level readout are in
+  device pixels, and overzoom is capped at ~3 device px per image px.
+* **Measure / annotate** (Annotations window, sidecar-persisted):
+  * `M` ruler — drag a line, get its length in µm (anisotropy-correct);
+  * `P` pin and `B` box — drop a marker or draw a region, type a note;
+  * every item has a color dot in the list — click it to cycle through the
+    Apple system palette; click a row to fly to it;
+  * everything saves automatically to `<slide>.annotations.json` next to the
+    slide (never into the ND2), is found again on the next open, and can be
+    opened from / exported to a plain JSON file.
+* **Per-channel LUTs with Auto**: the NIS-style histogram panel (window
+  triangles + gamma knob) plus an `Auto` per channel — a 0.1–99.9 percentile
+  stretch computed from the histogram.
 * **Per-channel LUTs**, laid out like the NIS-Elements LUTs panel: each
   channel (however many the file has) gets its intensity histogram drawn in
   the channel color, black/white triangles to drag the display window in raw
@@ -140,15 +168,35 @@ and `--position` for multipoint files. RGB slides are stored as C=3.
 Everything the UI does is plain HTTP you can script:
 
 ```
-GET /api/info
-GET /api/histogram
-GET /api/tile/{level}/{x}/{y}.jpg?c=0,2&win=399:1057,220:2366:2.0
-GET /api/roi?level=0&x=6803&y=3517&w=1234&h=987&format=nd2&c=0,2
+GET  /api/info
+GET  /api/histogram
+GET  /api/tile/{level}/{x}/{y}.jpg?c=0,2&win=399:1057,220:2366:2.0
+GET  /api/roi?level=0&x=6803&y=3517&w=1234&h=987&format=nd2&c=0,2
+GET  /api/annotations            # sidecar contents (auto-found per slide)
+POST /api/annotations            # {"items": [...]} -> atomic sidecar write
 ```
 
 (`win` is one `lo:hi[:gamma]` slot per channel; empty slot = stored default.
 `format` is `nd2` | `tiff` | `png` | `jpg`. The UI always exports level 0;
 the `level` parameter remains for scripted downsampled reads.)
+
+## The macOS app
+
+`nd2wsi/app.py` wraps the same local server in a native WKWebView window
+(pywebview): launch to a black drop target — drag an `.nd2` or `.svs` onto
+it (or click to browse, or pass a path on the command line), first open
+builds the pyramid, then the viewer loads from an ephemeral localhost port.
+
+```bash
+pip install ".[app]" && nd2wsi-viewer          # run from a checkout
+packaging/build_mac_app.sh                     # nd2wsi-viewer.app + .dmg
+```
+
+The build script bundles Python and every dependency (including `limnd2`
+for ND2 export) with PyInstaller, ad-hoc signs the bundle, self-tests it
+headlessly (`--smoke`), and wraps it in a drag-to-Applications `.dmg`.
+Ad-hoc signing is fine for direct hand-offs; public distribution wants a
+Developer ID + notarization on top.
 
 ## Correctness
 

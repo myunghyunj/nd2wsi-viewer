@@ -45,12 +45,27 @@ MIME = {
 
 
 class ViewerState:
-    def __init__(self, root: Any, attrs: dict[str, Any], max_render_mpx: float = 100.0):
+    def __init__(
+        self,
+        root: Any,
+        attrs: dict[str, Any],
+        max_render_mpx: float = 100.0,
+        annotations_path: Path | None = None,
+    ):
         self.root = root
         self.attrs = attrs
         self.max_render_mpx = max_render_mpx
         self.histograms: list | None = None  # computed lazily, once
+        self.annotations_path = annotations_path
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
+
+
+def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
+    """Annotations live in a plain JSON sidecar next to the pyramid store,
+    named after the source ND2 -- found automatically on the next open."""
+    store_path = Path(store_path).resolve()
+    stem = Path(attrs["nd2wsi"]["source"]).stem
+    return store_path.parent / (stem + ".annotations.json")
 
 
 def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
@@ -92,6 +107,8 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                     return self._info()
                 if path == "/api/histogram":
                     return self._histogram()
+                if path == "/api/annotations":
+                    return self._annotations_get()
                 m = TILE_RE.match(path)
                 if m:
                     return self._tile(m, q)
@@ -142,6 +159,57 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 "nd2Export": _limnd2_available(),
             }
             self._json(info)
+
+        def do_POST(self):  # noqa: N802 (http.server API)
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/api/annotations":
+                    return self._annotations_post()
+                return self._error(404, f"no POST route for {parsed.path}")
+            except BrokenPipeError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive
+                try:
+                    self._error(500, f"{type(e).__name__}: {e}")
+                except Exception:
+                    pass
+
+        def _annotations_get(self):
+            p = state.annotations_path
+            if p is None:
+                return self._json({"items": [], "path": None})
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text())
+                    items = data.get("items", []) if isinstance(data, dict) else []
+                except (json.JSONDecodeError, OSError) as e:
+                    return self._error(500, f"could not read {p.name}: {e}")
+            else:
+                items = []
+            self._json({"items": items, "path": str(p)})
+
+        def _annotations_post(self):
+            p = state.annotations_path
+            if p is None:
+                return self._error(400, "no annotation sidecar path for this store")
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= 10_000_000:
+                return self._error(400, "annotation payload missing or too large")
+            try:
+                data = json.loads(self.rfile.read(n))
+            except json.JSONDecodeError as e:
+                return self._error(400, f"invalid JSON: {e}")
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                return self._error(400, "expected {\"items\": [...]}")
+            payload = {
+                "format": "nd2wsi-annotations/1",
+                "source": state.attrs["nd2wsi"]["source"],
+                "items": data["items"],
+            }
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=1))
+            tmp.replace(p)  # atomic
+            self._json({"ok": True, "path": str(p), "count": len(data["items"])})
 
         def _histogram(self):
             with state.lock:
@@ -260,24 +328,46 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def create_server(
+    store_path: str | Path,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    max_render_mpx: float = 100.0,
+) -> ThreadingHTTPServer:
+    """Build the viewer HTTP server without running it (port 0 = ephemeral).
+
+    The caller runs ``httpd.serve_forever()`` -- directly (CLI) or in a
+    thread (the macOS app shell).
+    """
+    from .convert import open_store
+
+    root, attrs = open_store(store_path)
+    state = ViewerState(
+        root,
+        attrs,
+        max_render_mpx=max_render_mpx,
+        annotations_path=annotations_sidecar(store_path, attrs),
+    )
+    httpd = ThreadingHTTPServer((host, port), make_handler(state))
+    httpd.nd2wsi_state = state  # for embedders
+    return httpd
+
+
 def serve(
     store_path: str | Path,
     host: str = "127.0.0.1",
     port: int = 8000,
     max_render_mpx: float = 100.0,
 ) -> None:
-    from .convert import open_store
-
-    root, attrs = open_store(store_path)
-    state = ViewerState(root, attrs, max_render_mpx=max_render_mpx)
-    httpd = ThreadingHTTPServer((host, port), make_handler(state))
+    httpd = create_server(store_path, host=host, port=port, max_render_mpx=max_render_mpx)
+    attrs = httpd.nd2wsi_state.attrs
     meta = attrs["nd2wsi"]
     lv0 = meta["levels"][0]
     print(
         f"serving {meta['source']}  {lv0['width']} x {lv0['height']} px, "
         f"{len(meta['levels'])} levels"
     )
-    print(f"open   http://{host}:{port}/   (Ctrl+C to stop)")
+    print(f"open   http://{host}:{httpd.server_address[1]}/   (Ctrl+C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

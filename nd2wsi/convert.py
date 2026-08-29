@@ -35,6 +35,19 @@ from .reader import PlaneSelection, PlaneSource, level_shapes, nice_bytes, open_
 NGFF_VERSION = "0.4"
 
 
+def auto_workers() -> int:
+    """Dask worker threads matched to this machine's CPU.
+
+    Leaves two cores for the OS/UI, floors at 2, caps at 12 (beyond that the
+    conversion is I/O-bound on a single NVMe and extra threads only add
+    contention).
+    """
+    import os
+
+    n = os.cpu_count() or 4
+    return max(2, min(n - 2, 12))
+
+
 def _create_level_array(
     root: Any, path: str, shape: tuple[int, ...], dtype: np.dtype, tile: int
 ) -> Any:
@@ -183,9 +196,14 @@ def convert(
     selection: PlaneSelection | None = None,
     overwrite: bool = False,
     progress: bool = True,
-    workers: int = 4,
+    workers: int | None = None,
 ) -> Path:
-    """Convert one plane of an ND2 file to an OME-Zarr pyramid on disk."""
+    """Convert one plane of an ND2 file to an OME-Zarr pyramid on disk.
+
+    ``workers=None`` sizes the thread pool to this machine's CPU.
+    """
+    import os
+
     import dask
     import nd2
     import zarr
@@ -193,6 +211,10 @@ def convert(
     nd2_path = Path(nd2_path)
     out_path = Path(out_path)
     selection = selection or PlaneSelection()
+    if workers is None:
+        workers = auto_workers()
+        if progress:
+            print(f"hardware: {os.cpu_count()} CPU cores -> {workers} worker threads")
 
     if out_path.exists():
         if not overwrite:
@@ -200,9 +222,17 @@ def convert(
         shutil.rmtree(out_path)
 
     t0 = time.time()
+    from contextlib import ExitStack
+
+    from .svs import is_svs, open_svs
+
     with dask.config.set(scheduler="threads", num_workers=workers):
-        with nd2.ND2File(str(nd2_path)) as f:
-            src = open_plane(f, selection, tile=tile)
+        with ExitStack() as stack:
+            if is_svs(nd2_path):
+                src = open_svs(stack, nd2_path, tile=tile)
+            else:
+                f = stack.enter_context(nd2.ND2File(str(nd2_path)))
+                src = open_plane(f, selection, tile=tile)
             c, h, w = src.shape
             shapes = level_shapes(h, w, tile)
             if progress:
