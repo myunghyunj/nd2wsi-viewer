@@ -19,6 +19,23 @@
 
 ---
 
+## Why this exists
+
+I scan whole slides on a Nikon Ti2 and also read H&E slides from Aperio
+scanners, and the difference between the two viewing experiences is jarring.
+Pathology WSI viewers solved this years ago: open a slide and it is simply
+*there* — fly out to the whole section, dive down to single nuclei, never
+wait, never load the file into memory. Nikon's NIS viewers don't behave
+that way with big stitched ND2 scans. And I'm an Apple user — NIS-Elements
+doesn't even run on a Mac.
+
+So this project is the viewer I wanted: ND2 scans treated the way H&E WSI
+viewers treat their slides, native on macOS, with the one thing pathology
+viewers don't give you — cropping a region back out as a **real ND2** that
+reopens in NIS-Elements with its calibration and channels intact.
+
+## How it works
+
 The pipeline is `slide → OME-Zarr pyramid (built once, memory-bounded) →
 local tile server → deep-zoom viewer`, so multi-gigabyte stitched scans pan
 and zoom fluidly without ever being loaded whole. SVS input reads the
@@ -187,8 +204,11 @@ zoom. Geometry is remembered per slide server.
   Defaults come from percentile auto-windows computed at convert time;
   histograms come from `/api/histogram` (computed once per store, from a
   small pyramid level, robust to lone hot pixels).
-* **Region export**: press `R` or *Select region*, drag a rectangle, and
-  download — always at native resolution:
+* **Region export**: press `R` or *Select region*, drag a rectangle — then,
+  if you need an exact size, type it: the Pixels and **Physical (µm)** fields
+  in the Region window are editable and stay in sync (the µm scale is the
+  file's own calibration: ND2 `voxel_size` / Aperio `MPP`). Download — always
+  at native resolution:
   * **ND2** (default) — a real, uncompressed modern ND2 with the source's
     µm calibration, channel names/colors and objective magnification;
     reopens in NIS-Elements (written with Laboratory Imaging's own `limnd2`)
