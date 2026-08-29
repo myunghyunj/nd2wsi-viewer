@@ -1,18 +1,41 @@
-# nd2wsi-viewer
+<p align="center">
+  <img src="docs/icon.png" alt="nd2wsi-viewer icon — a blue resolution pyramid in a macOS squircle" width="128">
+</p>
 
-**Nikon ND2 (and Aperio SVS) → OME-Zarr pyramid → whole-slide viewer with
-native-resolution ROI export back to ND2 — as a CLI + browser viewer or a
-double-clickable macOS app, without ever loading the slide into RAM.**
+<h1 align="center">nd2wsi-viewer</h1>
 
-SVS input reads the baseline level of the pyramidal TIFF through `tifffile`
-(JPEG tiles need `pip install ".[svs]"`), takes µm calibration from the
-Aperio `MPP` field, and flows through the identical pipeline.
+<p align="center">
+  <b>Whole-slide viewing for Nikon ND2 and Aperio SVS — native macOS app or CLI,<br>
+  with pixel-exact native-resolution ROI export back to ND2.</b>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-13%2B-1d1d1f?style=flat-square&logo=apple&logoColor=white" alt="macOS 13+">
+  <img src="https://img.shields.io/badge/python-3.10%2B-0A84FF?style=flat-square" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/formats-.nd2%20%C2%B7%20.svs-30D158?style=flat-square" alt="ND2 + SVS">
+  <img src="https://img.shields.io/badge/tests-16%20passing-8E8E93?style=flat-square" alt="tests">
+  <img src="https://img.shields.io/badge/license-MIT-8E8E93?style=flat-square" alt="MIT">
+</p>
+
+---
+
+The pipeline is `slide → OME-Zarr pyramid (built once, memory-bounded) →
+local tile server → deep-zoom viewer`, so multi-gigabyte stitched scans pan
+and zoom fluidly without ever being loaded whole. SVS input reads the
+baseline level of the pyramidal TIFF through `tifffile` (JPEG tiles need
+`pip install ".[svs]"`), takes µm calibration from the Aperio `MPP` field,
+and flows through the identical pipeline.
 
 ```
 pip install .
-nd2wsi view my_stitched_slide.nd2
-# → converts to my_stitched_slide.ome.zarr (once), opens http://127.0.0.1:8000
+nd2wsi view my_stitched_slide.nd2 another.svs
+# → builds pyramid_<name>.ome.zarr next to each slide (once),
+#   then opens the tabbed viewer at http://127.0.0.1:8000
 ```
+
+Or skip the terminal entirely: **`packaging/build_mac_app.sh`** produces a
+double-clickable `nd2wsi-viewer.app` (+ drag-to-Applications `.dmg`) with
+everything bundled.
 
 Built for large stitched acquisitions from NIS-Elements ("Scan Large Image" /
 XY-stitched scans on Ti2-class stands), but works on any 2D-viewable ND2 plane.
@@ -119,6 +142,18 @@ Z plane `--z` (an index, `mid`, or `max` for a maximum-intensity projection),
 and `--position` for multipoint files. RGB slides are stored as C=3.
 
 ## The viewer
+
+Open several slides at once: the root page is a **browser-style tab strip** —
+one tab per slide, a `+` button (native file dialog in the app, path prompt
+in the browser), drag-and-drop onto the shell, and every tab keeps its own
+viewer state while open. `nd2wsi serve a.ome.zarr b.ome.zarr` /
+`nd2wsi view one.nd2 two.svs` open one tab each; `POST /api/open` adds more
+at runtime.
+
+Files created next to a slide are self-describing:
+`pyramid_<slide>.ome.zarr` (the viewing cache) and
+`annotations_<slide>.json` (the annotation sidecar) — older unprefixed names
+are still found and migrated.
 
 Designed in the macOS design language (values measured from Apple's macOS 27
 UI kit): SF Pro / SF Mono type, translucent panels with behind-panel blur,

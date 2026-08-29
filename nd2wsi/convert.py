@@ -275,9 +275,16 @@ def convert(
 
 
 def default_store_path(nd2_path: str | Path, cache_dir: str | Path | None = None) -> Path:
+    """``pyramid_<slide>.ome.zarr`` next to the slide -- self-describing.
+
+    Stores made by older versions (``<slide>.ome.zarr``) are still honored.
+    """
     nd2_path = Path(nd2_path)
     base = Path(cache_dir) if cache_dir else nd2_path.parent
-    return base / (nd2_path.stem + ".ome.zarr")
+    legacy = base / (nd2_path.stem + ".ome.zarr")
+    if legacy.exists():
+        return legacy
+    return base / f"pyramid_{nd2_path.stem}.ome.zarr"
 
 
 def open_store(path: str | Path) -> tuple[Any, dict[str, Any]]:

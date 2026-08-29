@@ -95,12 +95,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_selection_args(p_crop)
 
-    p_serve = sub.add_parser("serve", help="serve the viewer for a converted store")
-    p_serve.add_argument("store")
+    p_serve = sub.add_parser("serve", help="serve the viewer for converted store(s)")
+    p_serve.add_argument("store", nargs="+", help="one tab per store")
     _add_serve_args(p_serve)
 
     p_view = sub.add_parser("view", help="one shot: convert if needed, then serve")
-    p_view.add_argument("nd2")
+    p_view.add_argument("nd2", nargs="+", help="one tab per slide")
     p_view.add_argument("--store", help="pyramid location (default: <nd2>.ome.zarr)")
     _add_convert_args(p_view)
     _add_serve_args(p_view)
@@ -168,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         from .server import serve
 
         serve(
-            args.store,
+            [Path(s) for s in args.store],
             host=args.host,
             port=args.port,
             max_render_mpx=args.max_render_mpx,
@@ -179,20 +179,25 @@ def main(argv: list[str] | None = None) -> int:
         from .convert import convert, default_store_path
         from .server import serve
 
-        store = Path(args.store) if args.store else default_store_path(args.nd2)
-        if args.overwrite or not store.exists():
-            convert(
-                args.nd2,
-                store,
-                tile=args.tile,
-                selection=_selection(args),
-                overwrite=args.overwrite,
-                workers=args.workers,
-            )
-        else:
-            print(f"reusing existing pyramid {store} (use --overwrite to rebuild)")
+        stores = []
+        for slide in args.nd2:
+            store = default_store_path(slide)
+            if args.store and len(args.nd2) == 1:
+                store = Path(args.store)
+            if args.overwrite or not store.exists():
+                convert(
+                    slide,
+                    store,
+                    tile=args.tile,
+                    selection=_selection(args),
+                    overwrite=args.overwrite,
+                    workers=args.workers,
+                )
+            else:
+                print(f"reusing existing pyramid {store} (use --overwrite to rebuild)")
+            stores.append(store)
         serve(
-            store,
+            stores,
             host=args.host,
             port=args.port,
             max_render_mpx=args.max_render_mpx,

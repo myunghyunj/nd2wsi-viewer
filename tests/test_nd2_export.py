@@ -115,7 +115,7 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     try:
         first = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
-        assert first["items"] == [] and first["path"].endswith("fluor.annotations.json")
+        assert first["items"] == [] and first["path"].endswith("annotations_fluor.json")
 
         items = [
             {"id": "a1", "type": "line", "x1": 0, "y1": 0, "x2": 100, "y2": 0,
@@ -130,7 +130,7 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
         resp = json.loads(urllib.request.urlopen(req).read())
         assert resp["ok"] and resp["count"] == 2
 
-        sidecar = tmp_path / "fluor.annotations.json"
+        sidecar = tmp_path / "annotations_fluor.json"
         assert sidecar.exists()
         on_disk = json.loads(sidecar.read_text())
         assert on_disk["items"] == items and on_disk["source"] == "fluor.nd2"
@@ -159,3 +159,47 @@ def test_store_roi_export_matches_source(fluor_nd2, tmp_path):
         back = np.moveaxis(np.array(f.read_frame(0)), 0, -1)
         assert np.array_equal(back, img[41 : 41 + 300, 333 : 333 + 512])
         assert f.voxel_size().x == pytest.approx(0.66)
+
+
+def test_multi_slide_registry(fluor_nd2, tmp_path):
+    """Two slides share one server: /api/slides, /s/<sid>/ routes, close."""
+    import json
+    import threading
+    import urllib.request
+
+    from nd2wsi.convert import convert
+    from nd2wsi.server import create_server
+
+    src_path, _ = fluor_nd2
+    s1 = tmp_path / "one.ome.zarr"
+    s2 = tmp_path / "two.ome.zarr"
+    convert(src_path, s1, progress=False)
+    convert(src_path, s2, progress=False)
+    httpd = create_server([s1, s2], port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        d = json.loads(urllib.request.urlopen(base + "/api/slides").read())
+        assert len(d["slides"]) == 2
+        sids = [s["sid"] for s in d["slides"]]
+        for sid in sids:
+            info = json.loads(
+                urllib.request.urlopen(f"{base}/s/{sid}/api/info").read()
+            )
+            assert info["width"] == 900
+        # bare /api/* keeps addressing the first slide
+        bare = json.loads(urllib.request.urlopen(base + "/api/info").read())
+        assert bare["width"] == 900
+        # shell page at the root
+        page = urllib.request.urlopen(base + "/").read().decode()
+        assert "tabbar" in page
+        # close one
+        req = urllib.request.Request(
+            base + "/api/close",
+            data=json.dumps({"sid": sids[1]}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = json.loads(urllib.request.urlopen(req).read())
+        assert len(resp["slides"]) == 1
+    finally:
+        httpd.shutdown()

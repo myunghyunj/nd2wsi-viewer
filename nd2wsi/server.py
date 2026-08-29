@@ -1,18 +1,28 @@
 """Local viewer server (stdlib only -- no web framework dependency).
 
-Endpoints
----------
-GET /                         viewer page
-GET /static/<path>            js / css / vendored OpenSeadragon
-GET /api/info                 store metadata as JSON
-GET /api/tile/<L>/<x>/<y>.jpg?c=0,1   rendered tile of pyramid level L
-GET /api/roi?level=&x=&y=&w=&h=&format=tiff|png|jpg&c=
-                              region export; tiff streams raw dtype
+Multiple slides are served at once, browser-tab style:
+
+GET  /                          tab shell (one tab per open slide)
+GET  /static/<path>             js / css / vendored OpenSeadragon (global)
+GET  /api/slides                open slides: [{sid, name, width, height}]
+POST /api/open                  {"path": "/…/slide.nd2|.svs|store.ome.zarr"}
+                                converts if needed, registers, -> {sid}
+POST /api/close                 {"sid": "…"} unregister a slide
+
+Per slide (also reachable bare as /api/… for the first slide, so scripts
+keep working):
+
+GET  /s/<sid>/                  viewer page
+GET  /s/<sid>/api/info          store metadata as JSON
+GET  /s/<sid>/api/histogram     per-channel LUT histograms
+GET  /s/<sid>/api/tile/<L>/<x>/<y>.jpg?c=0,1&win=…
+GET  /s/<sid>/api/roi?level=&x=&y=&w=&h=&format=nd2|tiff|png|jpg&c=&win=
+GET/POST /s/<sid>/api/annotations   sidecar annotations
 """
 
 from __future__ import annotations
 
-import io
+import hashlib
 import json
 import re
 import tempfile
@@ -27,12 +37,16 @@ from . import render
 
 STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
+SLIDE_RE = re.compile(r"^/s/([0-9a-f]{8})(/.*)?$")
+
+SLIDE_SUFFIXES = {".nd2", ".svs"}
 
 
 def _limnd2_available() -> bool:
     from importlib.util import find_spec
 
     return find_spec("limnd2") is not None
+
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -61,14 +75,90 @@ class ViewerState:
 
 
 def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
-    """Annotations live in a plain JSON sidecar next to the pyramid store,
-    named after the source ND2 -- found automatically on the next open."""
+    """Annotations live in ``annotations_<slide>.json`` next to the pyramid
+    store -- self-describing, and found automatically on the next open.
+    (Older ``<slide>.annotations.json`` sidecars are migrated silently.)"""
     store_path = Path(store_path).resolve()
     stem = Path(attrs["nd2wsi"]["source"]).stem
-    return store_path.parent / (stem + ".annotations.json")
+    new = store_path.parent / f"annotations_{stem}.json"
+    old = store_path.parent / f"{stem}.annotations.json"
+    if old.exists() and not new.exists():
+        try:
+            old.rename(new)
+        except OSError:
+            return old
+    return new
 
 
-def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
+class SlideRegistry:
+    """The set of slides this server has open, keyed by a stable short id."""
+
+    def __init__(self, max_render_mpx: float = 100.0):
+        self.slides: dict[str, ViewerState] = {}  # insertion-ordered
+        self.max_render_mpx = max_render_mpx
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def sid_for(store_path: Path) -> str:
+        return hashlib.sha1(str(store_path.resolve()).encode()).hexdigest()[:8]
+
+    def add_store(self, store_path: str | Path) -> str:
+        from .convert import open_store
+
+        store_path = Path(store_path).resolve()
+        sid = self.sid_for(store_path)
+        with self._lock:
+            if sid in self.slides:
+                return sid
+            root, attrs = open_store(store_path)
+            self.slides[sid] = ViewerState(
+                root,
+                attrs,
+                max_render_mpx=self.max_render_mpx,
+                annotations_path=annotations_sidecar(store_path, attrs),
+            )
+        return sid
+
+    def open_path(self, path: str | Path) -> str:
+        """A slide file (converted on first open) or an existing store."""
+        from .convert import convert, default_store_path
+
+        path = Path(path).expanduser().resolve()
+        if path.suffix.lower() in SLIDE_SUFFIXES:
+            store = default_store_path(path)
+            if not store.exists():
+                convert(path, store, progress=False)
+        elif path.is_dir():  # a *.ome.zarr store
+            store = path
+        else:
+            raise ValueError(f"not an ND2/SVS slide or pyramid store: {path.name}")
+        return self.add_store(store)
+
+    def remove(self, sid: str) -> bool:
+        with self._lock:
+            return self.slides.pop(sid, None) is not None
+
+    def default_sid(self) -> str | None:
+        return next(iter(self.slides), None)
+
+    def listing(self) -> list[dict[str, Any]]:
+        out = []
+        for sid, st in self.slides.items():
+            meta = st.attrs["nd2wsi"]
+            lv0 = meta["levels"][0]
+            out.append(
+                {
+                    "sid": sid,
+                    "name": meta["source"],
+                    "width": lv0["width"],
+                    "height": lv0["height"],
+                    "rgb": meta["rgb"],
+                }
+            )
+        return out
+
+
+def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nd2wsi"
@@ -90,8 +180,25 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
         def _error(self, code: int, msg: str):
             self._json({"error": msg}, code)
 
+        def _body_json(self, limit: int = 10_000_000) -> Any:
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= limit:
+                raise ValueError("payload missing or too large")
+            return json.loads(self.rfile.read(n))
+
         def log_message(self, fmt, *args):  # quieter default log
             pass
+
+        def _resolve(self, path: str) -> tuple[ViewerState | None, str]:
+            """Map a URL path to (slide state, slide-relative path)."""
+            m = SLIDE_RE.match(path)
+            if m:
+                st = registry.slides.get(m.group(1))
+                return st, (m.group(2) or "/")
+            if path.startswith("/api/"):  # bare API -> first slide (scripts)
+                sid = registry.default_sid()
+                return (registry.slides.get(sid) if sid else None), path
+            return None, path
 
         # ---- routing -----------------------------------------------------
         def do_GET(self):  # noqa: N802 (http.server API)
@@ -100,22 +207,30 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 path = parsed.path
                 q = urllib.parse.parse_qs(parsed.query)
                 if path == "/":
-                    return self._static("index.html")
+                    return self._static("shell.html")
                 if path.startswith("/static/"):
                     return self._static(path[len("/static/") :])
-                if path == "/api/info":
-                    return self._info()
-                if path == "/api/histogram":
-                    return self._histogram()
-                if path == "/api/annotations":
-                    return self._annotations_get()
-                m = TILE_RE.match(path)
-                if m:
-                    return self._tile(m, q)
-                if path == "/api/roi":
-                    return self._roi(q)
+                if path == "/api/slides":
+                    return self._json({"slides": registry.listing()})
                 if path == "/favicon.ico":
                     return self._send(HTTPStatus.NO_CONTENT, b"", "image/x-icon")
+
+                st, sub = self._resolve(path)
+                if sub == "/" and st is not None:
+                    return self._static("index.html")
+                if st is None:
+                    return self._error(404, f"no slide for {path}")
+                if sub == "/api/info":
+                    return self._info(st)
+                if sub == "/api/histogram":
+                    return self._histogram(st)
+                if sub == "/api/annotations":
+                    return self._annotations_get(st)
+                m = TILE_RE.match(sub)
+                if m:
+                    return self._tile(st, m, q)
+                if sub == "/api/roi":
+                    return self._roi(st, q)
                 return self._error(404, f"no route for {path}")
             except BrokenPipeError:
                 pass
@@ -125,7 +240,27 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 except Exception:
                     pass
 
-        # ---- endpoints ---------------------------------------------------
+        def do_POST(self):  # noqa: N802 (http.server API)
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                path = parsed.path
+                if path == "/api/open":
+                    return self._open()
+                if path == "/api/close":
+                    return self._close()
+                st, sub = self._resolve(path)
+                if st is not None and sub == "/api/annotations":
+                    return self._annotations_post(st)
+                return self._error(404, f"no POST route for {path}")
+            except BrokenPipeError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive
+                try:
+                    self._error(500, f"{type(e).__name__}: {e}")
+                except Exception:
+                    pass
+
+        # ---- global endpoints --------------------------------------------
         def _static(self, rel: str):
             file = (STATIC_DIR / rel).resolve()
             if not str(file).startswith(str(STATIC_DIR.resolve())) or not file.is_file():
@@ -133,8 +268,32 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             body = file.read_bytes()
             self._send(200, body, MIME.get(file.suffix, "application/octet-stream"))
 
-        def _info(self):
-            meta = state.attrs["nd2wsi"]
+        def _open(self):
+            try:
+                data = self._body_json()
+                path = data.get("path") if isinstance(data, dict) else None
+                if not path:
+                    return self._error(400, 'expected {"path": "..."}')
+                sid = registry.open_path(path)
+            except (ValueError, FileNotFoundError, OSError) as e:
+                return self._error(400, str(e))
+            except json.JSONDecodeError as e:
+                return self._error(400, f"invalid JSON: {e}")
+            return self._json({"sid": sid, "slides": registry.listing()})
+
+        def _close(self):
+            try:
+                data = self._body_json(limit=10_000)
+            except (ValueError, json.JSONDecodeError) as e:
+                return self._error(400, str(e))
+            sid = data.get("sid") if isinstance(data, dict) else None
+            if not sid or not registry.remove(sid):
+                return self._error(404, f"no open slide {sid}")
+            return self._json({"ok": True, "slides": registry.listing()})
+
+        # ---- per-slide endpoints -----------------------------------------
+        def _info(self, st: ViewerState):
+            meta = st.attrs["nd2wsi"]
             lv0 = meta["levels"][0]
             info = {
                 "name": meta["source"],
@@ -153,29 +312,15 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                         "color": ch["color"],
                         "window": ch["window"],
                     }
-                    for ch in state.attrs["omero"]["channels"]
+                    for ch in st.attrs["omero"]["channels"]
                 ],
-                "maxRenderMpx": state.max_render_mpx,
+                "maxRenderMpx": st.max_render_mpx,
                 "nd2Export": _limnd2_available(),
             }
             self._json(info)
 
-        def do_POST(self):  # noqa: N802 (http.server API)
-            try:
-                parsed = urllib.parse.urlparse(self.path)
-                if parsed.path == "/api/annotations":
-                    return self._annotations_post()
-                return self._error(404, f"no POST route for {parsed.path}")
-            except BrokenPipeError:
-                pass
-            except Exception as e:  # pragma: no cover - defensive
-                try:
-                    self._error(500, f"{type(e).__name__}: {e}")
-                except Exception:
-                    pass
-
-        def _annotations_get(self):
-            p = state.annotations_path
+        def _annotations_get(self, st: ViewerState):
+            p = st.annotations_path
             if p is None:
                 return self._json({"items": [], "path": None})
             if p.exists():
@@ -188,22 +333,19 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 items = []
             self._json({"items": items, "path": str(p)})
 
-        def _annotations_post(self):
-            p = state.annotations_path
+        def _annotations_post(self, st: ViewerState):
+            p = st.annotations_path
             if p is None:
                 return self._error(400, "no annotation sidecar path for this store")
-            n = int(self.headers.get("Content-Length") or 0)
-            if not 0 < n <= 10_000_000:
-                return self._error(400, "annotation payload missing or too large")
             try:
-                data = json.loads(self.rfile.read(n))
-            except json.JSONDecodeError as e:
-                return self._error(400, f"invalid JSON: {e}")
+                data = self._body_json()
+            except (ValueError, json.JSONDecodeError) as e:
+                return self._error(400, str(e))
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):
                 return self._error(400, "expected {\"items\": [...]}")
             payload = {
                 "format": "nd2wsi-annotations/1",
-                "source": state.attrs["nd2wsi"]["source"],
+                "source": st.attrs["nd2wsi"]["source"],
                 "items": data["items"],
             }
             tmp = p.with_suffix(".json.tmp")
@@ -211,30 +353,28 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             tmp.replace(p)  # atomic
             self._json({"ok": True, "path": str(p), "count": len(data["items"])})
 
-        def _histogram(self):
-            with state.lock:
-                if state.histograms is None:
-                    state.histograms = render.compute_histograms(
-                        state.root, state.attrs
-                    )
-            self._json({"channels": state.histograms})
+        def _histogram(self, st: ViewerState):
+            with st.lock:
+                if st.histograms is None:
+                    st.histograms = render.compute_histograms(st.root, st.attrs)
+            self._json({"channels": st.histograms})
 
-        def _tile(self, m: re.Match, q: dict):
+        def _tile(self, st: ViewerState, m: re.Match, q: dict):
             level, tx, ty = int(m.group(1)), int(m.group(2)), int(m.group(3))
             fmt = m.group(4)
-            n = len(state.attrs["omero"]["channels"])
+            n = len(st.attrs["omero"]["channels"])
             channels = render.parse_channels((q.get("c") or [None])[0], n)
             win = (q.get("win") or [None])[0]
             try:
                 body = render.render_tile(
-                    state.root, state.attrs, level, tx, ty, channels, fmt, win
+                    st.root, st.attrs, level, tx, ty, channels, fmt, win
                 )
             except KeyError as e:
                 return self._error(404, str(e))
             ctype = "image/jpeg" if fmt in ("jpg", "jpeg") else "image/png"
             self._send(200, body, ctype)
 
-        def _roi(self, q: dict):
+        def _roi(self, st: ViewerState, q: dict):
             def qi(name: str, default: int | None = None) -> int:
                 v = q.get(name)
                 if not v:
@@ -243,7 +383,7 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                     return default
                 return int(float(v[0]))
 
-            meta = state.attrs["nd2wsi"]
+            meta = st.attrs["nd2wsi"]
             levels = meta["levels"]
             level = qi("level", 0)
             if not 0 <= level < len(levels):
@@ -256,7 +396,7 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             x, y = max(0, min(x, lw - 1)), max(0, min(y, lh - 1))
             w, h = max(1, min(w, lw - x)), max(1, min(h, lh - y))
             fmt = (q.get("format") or ["nd2"])[0].lower()
-            n = len(state.attrs["omero"]["channels"])
+            n = len(st.attrs["omero"]["channels"])
             channels = render.parse_channels((q.get("c") or [None])[0], n)
             win = (q.get("win") or [None])[0]
             stem = Path(meta["source"]).stem
@@ -276,14 +416,14 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
 
                         try:
                             export_roi_nd2(
-                                state.root, state.attrs, tmp.name,
+                                st.root, st.attrs, tmp.name,
                                 level, x, y, w, h, channels,
                             )
                         except (RuntimeError, ValueError) as e:
                             return self._error(400, str(e))
                     else:
                         render.export_roi_tiff(
-                            state.root, state.attrs, tmp.name,
+                            st.root, st.attrs, tmp.name,
                             level, x, y, w, h, channels,
                         )
                     size = Path(tmp.name).stat().st_size
@@ -305,15 +445,15 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 return
 
             if fmt in ("png", "jpg", "jpeg"):
-                if w * h / 1e6 > state.max_render_mpx:
+                if w * h / 1e6 > st.max_render_mpx:
                     return self._error(
                         400,
-                        f"rendered export capped at {state.max_render_mpx:.0f} MPx; "
+                        f"rendered export capped at {st.max_render_mpx:.0f} MPx; "
                         f"requested {w * h / 1e6:.0f} MPx -- use format=tiff "
                         "(streams any size) or a higher level",
                     )
                 body = render.export_roi_rendered(
-                    state.root, state.attrs, level, x, y, w, h, channels, fmt, win
+                    st.root, st.attrs, level, x, y, w, h, channels, fmt, win
                 )
                 ext = "png" if fmt == "png" else "jpg"
                 ctype = "image/png" if fmt == "png" else "image/jpeg"
@@ -329,7 +469,7 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
 
 
 def create_server(
-    store_path: str | Path,
+    store_paths: str | Path | list[str | Path],
     host: str = "127.0.0.1",
     port: int = 8000,
     max_render_mpx: float = 100.0,
@@ -337,36 +477,30 @@ def create_server(
     """Build the viewer HTTP server without running it (port 0 = ephemeral).
 
     The caller runs ``httpd.serve_forever()`` -- directly (CLI) or in a
-    thread (the macOS app shell).
+    thread (the macOS app shell). More slides can be added afterwards via
+    ``httpd.registry`` or POST /api/open.
     """
-    from .convert import open_store
-
-    root, attrs = open_store(store_path)
-    state = ViewerState(
-        root,
-        attrs,
-        max_render_mpx=max_render_mpx,
-        annotations_path=annotations_sidecar(store_path, attrs),
-    )
-    httpd = ThreadingHTTPServer((host, port), make_handler(state))
-    httpd.nd2wsi_state = state  # for embedders
+    if isinstance(store_paths, (str, Path)):
+        store_paths = [store_paths]
+    registry = SlideRegistry(max_render_mpx=max_render_mpx)
+    for p in store_paths:
+        registry.add_store(p)
+    httpd = ThreadingHTTPServer((host, port), make_handler(registry))
+    httpd.registry = registry  # for embedders
     return httpd
 
 
 def serve(
-    store_path: str | Path,
+    store_paths: str | Path | list[str | Path],
     host: str = "127.0.0.1",
     port: int = 8000,
     max_render_mpx: float = 100.0,
 ) -> None:
-    httpd = create_server(store_path, host=host, port=port, max_render_mpx=max_render_mpx)
-    attrs = httpd.nd2wsi_state.attrs
-    meta = attrs["nd2wsi"]
-    lv0 = meta["levels"][0]
-    print(
-        f"serving {meta['source']}  {lv0['width']} x {lv0['height']} px, "
-        f"{len(meta['levels'])} levels"
+    httpd = create_server(
+        store_paths, host=host, port=port, max_render_mpx=max_render_mpx
     )
+    for s in httpd.registry.listing():
+        print(f"serving {s['name']}  {s['width']} x {s['height']} px")
     print(f"open   http://{host}:{httpd.server_address[1]}/   (Ctrl+C to stop)")
     try:
         httpd.serve_forever()

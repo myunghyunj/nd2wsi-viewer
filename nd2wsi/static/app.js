@@ -24,7 +24,7 @@ init().catch((e) => {
 });
 
 async function init() {
-  const res = await fetch("/api/info");
+  const res = await fetch("api/info");
   if (!res.ok) throw new Error("info endpoint returned " + res.status);
   state.info = await res.json();
   const info = state.info;
@@ -119,7 +119,7 @@ function makeTileSource() {
       );
     },
     getTileUrl: function (l, x, y) {
-      return "/api/tile/" + lv[l].path + "/" + x + "/" + y + ".jpg" + q;
+      return "api/tile/" + lv[l].path + "/" + x + "/" + y + ".jpg" + q;
     },
   };
 }
@@ -506,7 +506,7 @@ function relayoutLuts() {
 }
 
 function loadHistograms() {
-  fetch("/api/histogram")
+  fetch("api/histogram")
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
     .then((d) => {
       d.channels.forEach((hg, i) => {
@@ -773,7 +773,7 @@ function annotationsChanged() {
 const scheduleAnnSave = debounce(saveAnnotations, 800);
 
 function saveAnnotations() {
-  fetch("/api/annotations", {
+  fetch("api/annotations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ items: state.annotations }),
@@ -784,7 +784,7 @@ function saveAnnotations() {
 }
 
 function loadAnnotations() {
-  fetch("/api/annotations")
+  fetch("api/annotations")
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
     .then((d) => {
       state.annotations = Array.isArray(d.items) ? d.items : [];
@@ -1149,7 +1149,7 @@ function downloadRoi(fmt) {
     }
   }
   const a = document.createElement("a");
-  a.href = "/api/roi?" + q.toString();
+  a.href = "api/roi?" + q.toString();
   a.download = "";
   document.body.append(a);
   a.click();

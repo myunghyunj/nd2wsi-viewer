@@ -132,6 +132,15 @@ class Api:
             return None
         return self._launch(p)
 
+    def pick_path(self):
+        """Native open dialog for the tab shell's '+' button (no convert)."""
+        import webview
+
+        picked = webview.windows[0].create_file_dialog(
+            webview.OPEN_DIALOG, file_types=("Slide scans (*.nd2;*.svs)",)
+        )
+        return str(picked[0]) if picked else None
+
     def _launch(self, path: Path):
         try:
             def note(msg):
@@ -139,10 +148,12 @@ class Api:
 
             store = open_or_convert(path, on_status=note)
             self._status = "starting viewer …"
-            if self._httpd is not None:
-                self._httpd.shutdown()
-            self._httpd, url = start_server(store)
-            return url
+            if self._httpd is None:
+                self._httpd, url = start_server(store)
+            else:
+                self._httpd.registry.add_store(store)
+                url = f"http://127.0.0.1:{self._httpd.server_address[1]}/"
+            return url  # the tab shell at / lists every open slide
         except Exception as e:  # surfaced in the bootstrap page
             self._status = f"could not open {path.name}: {e}"
             return None
