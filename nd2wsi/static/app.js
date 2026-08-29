@@ -1094,6 +1094,7 @@ function finishSelection(a, b) {
   $("roi-detail").classList.add("active");
   $("roi-hint").style.display = "none";
   $("roi-move").disabled = false;
+  state.windows.region.fitContent(); // saved heights must not hide the exports
 }
 
 function drawRoiOverlay() {
@@ -1467,6 +1468,12 @@ function makeMacWindow(el, opts) {
     open,
     close,
     clampToStage,
+    fitContent() {
+      st.rect.h = null;
+      st.collapsed = false;
+      apply();
+      persist();
+    },
     isHidden: () => st.hidden,
     bodyWidth: () => Math.max(180, (body.clientWidth || st.rect.w - 2) - 24),
   };
