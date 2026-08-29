@@ -203,3 +203,35 @@ def test_multi_slide_registry(fluor_nd2, tmp_path):
         assert len(resp["slides"]) == 1
     finally:
         httpd.shutdown()
+
+
+def test_export_progress_endpoint(fluor_nd2, tmp_path):
+    """A jobbed export leaves 100 percent and a done state behind."""
+    import json
+    import threading
+    import urllib.request
+
+    from nd2wsi.convert import convert
+    from nd2wsi.server import create_server
+
+    src_path, _ = fluor_nd2
+    store = tmp_path / "prog.ome.zarr"
+    convert(src_path, store, progress=False)
+    httpd = create_server(store, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        body = urllib.request.urlopen(
+            base + "/api/roi?level=0&x=0&y=0&w=300&h=200&format=tiff&job=t-1", timeout=60
+        ).read()
+        assert len(body) > 1000
+        prog = json.loads(
+            urllib.request.urlopen(base + "/api/roi/progress?job=t-1").read()
+        )
+        assert prog["state"] == "done" and prog["pct"] == 100
+        unknown = json.loads(
+            urllib.request.urlopen(base + "/api/roi/progress?job=nope").read()
+        )
+        assert unknown["state"] == "unknown"
+    finally:
+        httpd.shutdown()

@@ -27,6 +27,7 @@ import json
 import re
 import tempfile
 import threading
+import time
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,6 +39,30 @@ from . import render
 STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
 SLIDE_RE = re.compile(r"^/s/([0-9a-f]{8})(/.*)?$")
+JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+# region-export progress, polled by the viewer's status bar
+EXPORT_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _job_update(job: str | None, **kw) -> None:
+    if not job:
+        return
+    now = time.time()
+    with _JOBS_LOCK:
+        for stale in [k for k, v in EXPORT_JOBS.items() if now - v.get("t", 0) > 600]:
+            EXPORT_JOBS.pop(stale, None)
+        d = EXPORT_JOBS.setdefault(job, {})
+        d.update(kw)
+        d["t"] = now
+
+
+def _job_get(job: str) -> dict:
+    with _JOBS_LOCK:
+        d = dict(EXPORT_JOBS.get(job) or {})
+    d.pop("t", None)
+    return d or {"state": "unknown", "pct": 0}
 
 SLIDE_SUFFIXES = {".nd2", ".svs"}
 
@@ -222,6 +247,11 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
                     return self._static(path[len("/static/") :])
                 if path == "/api/slides":
                     return self._json({"slides": registry.listing()})
+                if path == "/api/roi/progress" or path.endswith("/api/roi/progress"):
+                    job = (q.get("job") or [""])[0]
+                    if not JOB_RE.match(job):
+                        return self._error(400, "bad job id")
+                    return self._json(_job_get(job))
                 if path == "/favicon.ico":
                     return self._send(HTTPStatus.NO_CONTENT, b"", "image/x-icon")
 
@@ -409,6 +439,9 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
             n = len(st.attrs["omero"]["channels"])
             channels = render.parse_channels((q.get("c") or [None])[0], n)
             win = (q.get("win") or [None])[0]
+            job = (q.get("job") or [None])[0]
+            if job and not JOB_RE.match(job):
+                job = None
             stem = Path(meta["source"]).stem
             fname = f"{stem}_L{level}_x{x}_y{y}_{w}x{h}"
 
@@ -419,6 +452,11 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
                 ext = ".nd2" if is_nd2 else ".tif"
                 ctype = "application/octet-stream" if is_nd2 else "image/tiff"
                 tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+                _job_update(job, state="writing", pct=0)
+
+                def on_progress(frac: float) -> None:
+                    _job_update(job, state="writing", pct=int(min(1.0, frac) * 100))
+
                 try:
                     tmp.close()
                     if is_nd2:
@@ -428,14 +466,18 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
                             export_roi_nd2(
                                 st.root, st.attrs, tmp.name,
                                 level, x, y, w, h, channels,
+                                on_progress=on_progress,
                             )
                         except (RuntimeError, ValueError) as e:
+                            _job_update(job, state="error", error=str(e))
                             return self._error(400, str(e))
                     else:
                         render.export_roi_tiff(
                             st.root, st.attrs, tmp.name,
                             level, x, y, w, h, channels,
+                            on_progress=on_progress,
                         )
+                    _job_update(job, state="streaming", pct=100)
                     size = Path(tmp.name).stat().st_size
                     self.send_response(200)
                     self.send_header("Content-Type", ctype)
@@ -450,6 +492,10 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
                             if not buf:
                                 break
                             self.wfile.write(buf)
+                    _job_update(job, state="done", pct=100)
+                except BrokenPipeError:
+                    _job_update(job, state="error", error="client disconnected")
+                    raise
                 finally:
                     Path(tmp.name).unlink(missing_ok=True)
                 return

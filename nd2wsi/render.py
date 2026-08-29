@@ -256,6 +256,7 @@ def export_roi_tiff(
     w: int,
     h: int,
     channels: list[int],
+    on_progress=None,
 ) -> None:
     """Stream a raw-dtype tiled TIFF of the ROI to a file object or path."""
     import tifffile
@@ -270,11 +271,19 @@ def export_roi_tiff(
     # pixels per centimeter at this level
     res = (1e4 / (px * factor), 1e4 / (py * factor))
 
+    def counted(it: Iterator[np.ndarray], total: int) -> Iterator[np.ndarray]:
+        for n, block in enumerate(it, 1):
+            yield block
+            if on_progress and (n % 8 == 0 or n == total):
+                on_progress(n / total)
+
+    ny = -(-h // tile)
+    nx = -(-w // tile)
     rgb = meta["rgb"] and channels == [0, 1, 2]
     with tifffile.TiffWriter(out_file, bigtiff=True) as tw:
         if rgb:
             tw.write(
-                _roi_rgb_tile_iter(root, level_path, x, y, w, h, tile),
+                counted(_roi_rgb_tile_iter(root, level_path, x, y, w, h, tile), ny * nx),
                 shape=(h, w, 3),
                 dtype=dtype,
                 tile=(tile, tile),
@@ -308,7 +317,10 @@ def export_roi_tiff(
             else:
                 kwargs["shape"] = (h, w)
             tw.write(
-                _roi_tile_iter(root, level_path, x, y, w, h, channels, tile),
+                counted(
+                    _roi_tile_iter(root, level_path, x, y, w, h, channels, tile),
+                    ny * nx * len(channels),
+                ),
                 **kwargs,
             )
 

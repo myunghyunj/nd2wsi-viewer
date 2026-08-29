@@ -1232,13 +1232,60 @@ function downloadRoi(fmt) {
       return;
     }
   }
+  let job = null;
+  if (fmt === "nd2" || fmt === "tiff") {
+    job = Math.random().toString(36).slice(2, 10);
+    q.set("job", job);
+  }
   const a = document.createElement("a");
   a.href = "api/roi?" + q.toString();
   a.download = "";
   document.body.append(a);
   a.click();
   a.remove();
-  showToast("export started — check your downloads");
+  if (job) trackExport(job, fmt.toUpperCase());
+  else showToast("export started — check your downloads");
+}
+
+/* Poll the server's write progress and fill the status-bar export gauge. */
+let exportTimer = null;
+function trackExport(job, label) {
+  const cell = $("export-cell");
+  const fill = $("export-fill");
+  const pct = $("export-pct");
+  clearInterval(exportTimer);
+  cell.hidden = false;
+  cell.classList.remove("done");
+  fill.style.width = "0%";
+  pct.textContent = label + " 0 %";
+  const t0 = Date.now();
+  exportTimer = setInterval(() => {
+    fetch("api/roi/progress?job=" + job)
+      .then((r) => r.json())
+      .then((d) => {
+        const p = d.pct || 0;
+        fill.style.width = p + "%";
+        if (d.state === "writing" || d.state === "unknown") {
+          pct.textContent = label + " " + p + " %";
+        } else if (d.state === "streaming") {
+          pct.textContent = label + " saving…";
+        } else if (d.state === "done") {
+          cell.classList.add("done");
+          pct.textContent = label + " done";
+          clearInterval(exportTimer);
+          setTimeout(() => { cell.hidden = true; }, 2000);
+        } else if (d.state === "error") {
+          clearInterval(exportTimer);
+          cell.hidden = true;
+          showToast("export failed: " + (d.error || "unknown error"));
+        }
+        if (Date.now() - t0 > 15 * 60 * 1000) {
+          clearInterval(exportTimer);
+          cell.hidden = true;
+        }
+      })
+      .catch(() => {});
+  }, 350);
 }
 
 /* ---- floating mac windows --------------------------------------------------

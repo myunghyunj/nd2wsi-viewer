@@ -60,6 +60,7 @@ def write_nd2(
     pixel_size_um: float,
     planes: list[dict[str, Any]],
     magnification: float | None = None,
+    on_progress: Callable[[float], None] | None = None,
 ) -> None:
     """Stream a (Y, X, C) image into a new ND2 file, one row band at a time.
 
@@ -98,6 +99,8 @@ def write_nd2(
                 f.setImageTile(
                     0, x0, y0, np.ascontiguousarray(band[:, x0 : x0 + tw])
                 )
+            if on_progress:
+                on_progress((y0 + th) / height)
         mf = limnd2.MetadataFactory(**mf_kwargs)
         for pl in planes:
             mf.addPlane(name=pl.get("name") or None, color=pl.get("color") or None)
@@ -119,6 +122,7 @@ def export_roi_nd2(
     w: int,
     h: int,
     channels: list[int],
+    on_progress: Callable[[float], None] | None = None,
 ) -> None:
     """Export a region of one pyramid level of a converted store as ND2."""
     meta = attrs["nd2wsi"]
@@ -140,6 +144,7 @@ def export_roi_nd2(
         pixel_size_um=px * factor,
         planes=_store_planes(attrs, channels),
         magnification=meta.get("objective_magnification"),
+        on_progress=on_progress,
     )
 
 

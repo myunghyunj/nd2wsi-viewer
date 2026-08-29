@@ -383,3 +383,15 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 
 /* minimap viewport indicator: white (thickness untouched) */
 .displayregion { border-color: #fff !important; }
+
+/* ---- region-export progress (status bar) ---------------------------------- */
+#export-bar {
+  display: inline-block; width: 130px; height: 4px; border-radius: 2px;
+  background: rgba(255, 255, 255, 0.12); overflow: hidden; vertical-align: middle;
+}
+#export-fill {
+  display: block; height: 100%; width: 0%; border-radius: 2px;
+  background: #b08900; /* dark yellow */
+  transition: width 0.25s ease;
+}
+#export-cell.done #export-fill { background: #30d158; }
