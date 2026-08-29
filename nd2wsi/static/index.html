@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>nd2wsi viewer</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="wordmark"><b>nd2</b> &middot; wsi bridge</span>
+    <span id="file-name">&nbsp;</span>
+    <span id="file-dims"></span>
+    <span class="spacer"></span>
+    <span id="plane-note"></span>
+  </header>
+
+  <div id="stage-wrap">
+    <div id="stage"></div>
+    <div id="rubber"></div>
+
+    <div id="controls">
+      <section id="channels-section" hidden>
+        <h2>Channels</h2>
+        <div id="channel-list"></div>
+      </section>
+
+      <section>
+        <h2>Region</h2>
+        <button id="roi-toggle" class="btn full" title="Drag on the slide to mark a region (R)">
+          Select region
+        </button>
+        <div class="hint" id="roi-hint">Drag on the slide to mark a region.</div>
+
+        <div id="roi-detail">
+          <div class="roi-line"><span class="k">Pixels</span><span class="v" id="roi-px">&ndash;</span></div>
+          <div class="roi-line"><span class="k">Physical</span><span class="v" id="roi-um">&ndash;</span></div>
+          <div class="roi-line"><span class="k">Raw size</span><span class="v" id="roi-bytes">&ndash;</span></div>
+          <select id="roi-level" title="Export resolution"></select>
+          <div class="roi-actions">
+            <button id="roi-dl-tiff" class="btn primary" title="Raw pixel values, dtype preserved, streams any size">TIFF</button>
+            <button id="roi-dl-png" class="btn" title="Rendered as displayed">PNG</button>
+            <button id="roi-dl-jpg" class="btn" title="Rendered as displayed">JPEG</button>
+          </div>
+          <button id="roi-clear" class="btn">Clear region</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="zoom-cluster">
+      <button class="btn" id="zoom-in" title="Zoom in">+</button>
+      <button class="btn" id="zoom-out" title="Zoom out">&minus;</button>
+      <button class="btn" id="zoom-fit" title="Fit slide (0)">&#8862;</button>
+    </div>
+
+    <div id="toast"></div>
+    <div id="boot">loading slide &hellip;</div>
+  </div>
+
+  <footer>
+    <span class="cell"><span class="label">Stage</span><span class="value" id="pos-um">&ndash;</span></span>
+    <span class="cell optional"><span class="label">Pixel</span><span class="value" id="pos-px">&ndash;</span></span>
+    <span class="cell"><span class="label">Zoom</span><span class="value" id="zoom-val">&ndash;</span></span>
+    <span class="cell"><span class="label">Level</span><span id="level-lamps"></span></span>
+    <span class="spacer"></span>
+    <span id="scalebar-wrap"><span id="scalebar"></span><span id="scalebar-label"></span></span>
+  </footer>
+</div>
+
+<script src="/static/vendor/openseadragon/openseadragon.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

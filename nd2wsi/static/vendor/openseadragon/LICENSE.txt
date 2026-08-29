@@ -1,0 +1,8 @@
+OpenSeadragon 5.0.1 (openseadragon.min.js) is included unmodified.
+
+Copyright (C) 2009 CodePlex Foundation
+Copyright (C) 2010-2024 OpenSeadragon contributors
+
+Licensed under the New BSD license (BSD-3-Clause).
+Full license text: https://github.com/openseadragon/openseadragon/blob/master/LICENSE.txt
+Project: https://openseadragon.github.io

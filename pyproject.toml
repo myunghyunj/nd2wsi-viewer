@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nd2wsi"
+version = "0.1.0"
+description = "Nikon ND2 -> OME-Zarr pyramid -> browser slide viewer with native-resolution ROI export"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "nd2-wsi-bridge prototype" }]
+keywords = ["nd2", "nikon", "nis-elements", "ome-zarr", "ngff", "whole-slide", "openseadragon"]
+dependencies = [
+  "nd2>=0.10",
+  "numpy>=1.24",
+  "dask[array]>=2023.5",
+  "zarr>=3.0",
+  "numcodecs>=0.12",
+  "pillow>=10",
+  "tifffile>=2023.7",
+]
+
+[project.optional-dependencies]
+legacy = ["nd2[legacy]"]           # JPEG2000-era ND2 files (imagecodecs)
+test = ["pytest>=7"]
+# synthetic test-data generation uses Laboratory Imaging's limnd2 writer,
+# which lives on their own package index -- see README ("Synthetic fixtures").
+
+[project.scripts]
+nd2wsi = "nd2wsi.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nd2wsi*"]
+
+[tool.setuptools.package-data]
+nd2wsi = ["static/**/*"]
