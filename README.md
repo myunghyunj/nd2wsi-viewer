@@ -164,6 +164,24 @@ out at native resolution in four formats.
 
 ND2 and TIFF stream, so any size works, the whole slide included.
 
+### SVS input
+
+<p align="center">
+  <img src="docs/svs.png" alt="An H&E SVS slide with a boxed vessel and a 111 micron measurement" width="900">
+  <br><sub>An Aperio SVS slide in the same viewer. A boxed vessel, a 111 &micro;m measurement, and the sidecar annotations loaded on open.</sub>
+</p>
+
+Brightfield H&E works with every tool above, unchanged. The demo slide is
+CMU-1-Small-Region.svs, an exported region of CMU-1.svs: H&E-stained skin
+tissue, brightfield, scanned at 20x on an Aperio ScanScope CS,
+JPEG-compressed, with a single pyramid level. It is OpenSlide
+freely-distributable test data from Carnegie Mellon University, released
+under the CC0 1.0 public domain dedication.
+
+* URL: https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/CMU-1-Small-Region.svs
+* SHA-256: ed92d5a9f2e86df67640d6f92ce3e231419ce127131697fbbce42ad5e002c8a7
+* Accessed: August 29, 2026
+
 ### Scripting
 
 Everything the UI does is plain HTTP.
