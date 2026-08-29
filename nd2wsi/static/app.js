@@ -744,6 +744,7 @@ function wireTools() {
     rubber.style.height = r.h + "px";
   }
 
+  wireRoiDims();
   wireAnnotationPanel();
 }
 
@@ -1108,18 +1109,64 @@ function clearRoi() {
 function updateRoiPanel() {
   const r = state.roi;
   if (!r) return;
-  const info = state.info;
-  $("roi-px").textContent = fmtInt(r.w) + " × " + fmtInt(r.h);
-  const [py, px] = info.pixelSizeUm;
-  const wUm = fmtUm(r.w * px);
-  const hUm = fmtUm(r.h * py);
-  const [wNum, wUnit] = wUm.split(" ");
-  const [hNum, hUnit] = hUm.split(" ");
-  $("roi-um").textContent =
-    wUnit === hUnit ? wNum + " × " + hNum + " " + wUnit : wUm + " × " + hUm;
-  const itemsize = dtypeBytes(info.dtype);
-  const nCh = info.rgb ? 3 : state.channels.length;
+  const [py, px] = state.info.pixelSizeUm;
+  const put = (id, v) => {
+    const el = $(id);
+    if (document.activeElement !== el) el.value = v; // don't clobber typing
+  };
+  put("roi-px-w", Math.round(r.w));
+  put("roi-px-h", Math.round(r.h));
+  put("roi-um-w", (r.w * px).toFixed(1));
+  put("roi-um-h", (r.h * py).toFixed(1));
+  const itemsize = dtypeBytes(state.info.dtype);
+  const nCh = state.info.rgb ? 3 : state.channels.length;
   $("roi-bytes").textContent = "≈ " + fmtBytes(r.w * r.h * nCh * itemsize);
+}
+
+/* The calibration for the µm fields is the file's own: ND2 voxel_size() /
+   Aperio MPP, carried through the store as pixelSizeUm. Typing a size keeps
+   the region's top-left corner, clamps to the slide, and syncs both rows. */
+function applyRoiDims(unit) {
+  const r = state.roi;
+  if (!r) return;
+  const info = state.info;
+  const [py, px] = info.pixelSizeUm;
+  const num = (id) => parseFloat(String($(id).value).replace(/[,\s]/g, ""));
+  let w;
+  let h;
+  if (unit === "um") {
+    w = num("roi-um-w") / px;
+    h = num("roi-um-h") / py;
+  } else {
+    w = num("roi-px-w");
+    h = num("roi-px-h");
+  }
+  if (!isFinite(w) || w < 4) w = r.w;
+  if (!isFinite(h) || h < 4) h = r.h;
+  w = Math.round(Math.min(w, info.width));
+  h = Math.round(Math.min(h, info.height));
+  // keep the requested size: slide the origin back if the box would overflow
+  r.x = Math.min(r.x, info.width - w);
+  r.y = Math.min(r.y, info.height - h);
+  r.w = w;
+  r.h = h;
+  drawRoiOverlay();
+  updateRoiPanel();
+}
+
+function wireRoiDims() {
+  for (const [id, unit] of [
+    ["roi-px-w", "px"], ["roi-px-h", "px"],
+    ["roi-um-w", "um"], ["roi-um-h", "um"],
+  ]) {
+    const el = $(id);
+    el.addEventListener("change", () => applyRoiDims(unit));
+    el.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); el.blur(); }
+      ev.stopPropagation();
+    });
+    el.addEventListener("focus", () => el.select());
+  }
 }
 
 function downloadRoi(fmt) {

@@ -69,8 +69,16 @@
         <button id="roi-toggle" class="btn full">Select Region</button>
         <div class="hint" id="roi-hint">Drag on the slide to mark a region.</div>
         <div id="roi-detail">
-          <div class="roi-line"><span class="k">Pixels</span><span class="v" id="roi-px">&ndash;</span></div>
-          <div class="roi-line"><span class="k">Physical</span><span class="v" id="roi-um">&ndash;</span></div>
+          <div class="roi-line"><span class="k">Pixels</span><span class="v dims">
+            <input id="roi-px-w" class="dim" inputmode="numeric" title="Width in pixels" />
+            &times;
+            <input id="roi-px-h" class="dim" inputmode="numeric" title="Height in pixels" />
+            <span class="unit">px</span></span></div>
+          <div class="roi-line"><span class="k">Physical</span><span class="v dims">
+            <input id="roi-um-w" class="dim" inputmode="decimal" title="Width in micrometers" />
+            &times;
+            <input id="roi-um-h" class="dim" inputmode="decimal" title="Height in micrometers" />
+            <span class="unit">&micro;m</span></span></div>
           <div class="roi-line"><span class="k">Raw size</span><span class="v" id="roi-bytes">&ndash;</span></div>
           <div class="hint">Exports at native resolution.</div>
           <div class="roi-actions">
