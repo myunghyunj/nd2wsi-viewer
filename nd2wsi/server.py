@@ -42,10 +42,20 @@ SLIDE_RE = re.compile(r"^/s/([0-9a-f]{8})(/.*)?$")
 SLIDE_SUFFIXES = {".nd2", ".svs"}
 
 
-def _limnd2_available() -> bool:
-    from importlib.util import find_spec
+_LIMND2_OK: bool | None = None
 
-    return find_spec("limnd2") is not None
+
+def _limnd2_available() -> bool:
+    """True only when limnd2 actually imports (find_spec lies in bundles)."""
+    global _LIMND2_OK
+    if _LIMND2_OK is None:
+        try:
+            import limnd2  # noqa: F401
+
+            _LIMND2_OK = True
+        except Exception:
+            _LIMND2_OK = False
+    return _LIMND2_OK
 
 
 MIME = {

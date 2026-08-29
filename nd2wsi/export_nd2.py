@@ -34,7 +34,9 @@ def require_limnd2() -> Any:
     try:
         import limnd2
     except ImportError as e:
-        raise RuntimeError(LIMND2_HINT) from e
+        raise RuntimeError(
+            f"{LIMND2_HINT} (import failed with {type(e).__name__}: {e})"
+        ) from e
     return limnd2
 
 

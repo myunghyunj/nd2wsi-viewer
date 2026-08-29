@@ -168,12 +168,37 @@ def smoke(nd2_path: Path) -> int:
     httpd, url = start_server(store)
     info = json.loads(urllib.request.urlopen(url + "api/info", timeout=30).read())
     tile = urllib.request.urlopen(url + "api/tile/0/0/0.jpg", timeout=30).read()
-    httpd.shutdown()
+
+    # ND2 export must work in the shipped bundle: crop 64x64 and read it back
+    nd2_ok = "no"
+    try:
+        roi = urllib.request.urlopen(
+            url + "api/roi?level=0&x=0&y=0&w=64&h=64&format=nd2", timeout=60
+        ).read()
+        import tempfile
+
+        import nd2 as nd2lib
+
+        with tempfile.NamedTemporaryFile(suffix=".nd2", delete=False) as tf:
+            tf.write(roi)
+        with nd2lib.ND2File(tf.name) as f:
+            assert f.sizes["X"] == 64 and f.sizes["Y"] == 64
+        Path(tf.name).unlink(missing_ok=True)
+        nd2_ok = f"yes ({len(roi)} bytes)"
+    except urllib.error.HTTPError as e:
+        print(f"smoke FAIL: ND2 export -> HTTP {e.code}: {e.read().decode()[:300]}",
+              file=sys.stderr)
+    except Exception as e:
+        print(f"smoke FAIL: ND2 export -> {type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        httpd.shutdown()
+
     print(
         f"smoke ok: {info['name']} {info['width']}x{info['height']} "
-        f"{len(info['levels'])} levels, tile {len(tile)} bytes"
+        f"{len(info['levels'])} levels, tile {len(tile)} bytes, "
+        f"nd2 export {nd2_ok}"
     )
-    return 0
+    return 0 if nd2_ok.startswith("yes") else 3
 
 
 def main(argv: list[str] | None = None) -> int:
