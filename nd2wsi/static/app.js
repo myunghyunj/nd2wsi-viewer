@@ -8,6 +8,7 @@ const state = {
   viewer: null,
   channels: [], // enabled channel indices
   luts: [], // per channel {lo, hi, gamma}; null while at store defaults
+  lutWidgets: [], // canvas LUT widgets, aligned with luts
   roi: null, // {x, y, w, h} in level-0 pixels
   roiOverlayEl: null,
   selecting: false,
@@ -24,6 +25,7 @@ async function init() {
   const info = state.info;
   state.channels = info.channels.map((_, i) => i);
   state.luts = info.channels.map(() => null);
+  state.lutWidgets = [];
 
   document.title = info.name + " — nd2wsi";
   $("file-name").textContent = info.name;
@@ -34,7 +36,6 @@ async function init() {
 
   buildChannelPanel();
   buildLevelLamps();
-  buildRoiLevelSelect();
   buildViewer();
   wireRoi();
   wireKeys();
@@ -199,81 +200,156 @@ function buildChannelPanel() {
     const win = document.createElement("span");
     win.className = "win";
     win.textContent = fmtInt(ch.window.start) + "–" + fmtInt(ch.window.end);
-    row.append(cb, sw, name, win);
+    const reset = document.createElement("button");
+    reset.className = "lut-reset";
+    reset.type = "button";
+    reset.title = "Reset window and gamma";
+    reset.textContent = "↺";
+    reset.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      state.lutWidgets[i].reset();
+    });
+    row.append(cb, sw, name, win, reset);
     list.append(row);
     list.append(buildLutRow(i, ch, win));
   });
+  if (info.channels.length > 1) {
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent = "Shift-drag adjusts all channels.";
+    list.append(hint);
+  }
+  loadHistograms();
 }
 
-/* ---- per-channel LUT (window + gamma) ------------------------------------- */
+/* ---- per-channel LUT (NIS-style histogram + window/gamma curve) ------------
+   Each channel gets a small canvas: the intensity histogram filled in the
+   channel color, a black (low) and white (high) triangle to drag the display
+   window, and a knob on the mapping curve that drags vertically to set gamma
+   -- the layout NIS-Elements' LUTs panel uses.  Shift-drag applies to all
+   channels. */
 
-const SLIDER_STEPS = 1000;
+const LUT_W = 208;
+const LUT_H = 84;
+const PLOT = { x0: 4, x1: 204, y0: 14, y1: 66 }; // curve/histogram area
 
-function lutMax(ch) {
-  return Math.max(ch.window.max || 0, ch.window.end, 1);
-}
-
-// sqrt mapping: fine control where fluorescence signal lives (low counts)
-function sliderToValue(p, max) {
-  const t = p / SLIDER_STEPS;
-  return max * t * t;
-}
-function valueToSlider(v, max) {
-  return Math.round(SLIDER_STEPS * Math.sqrt(Math.max(0, v) / max));
-}
+const applyLuts = debounce(() => reopenPreservingView(), 250);
 
 function buildLutRow(i, ch, winLabel) {
   const wrap = document.createElement("div");
   wrap.className = "lut";
-  const max = lutMax(ch);
+  const canvas = document.createElement("canvas");
+  canvas.className = "lut-canvas";
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = LUT_W * dpr;
+  canvas.height = LUT_H * dpr;
+  canvas.style.width = LUT_W + "px";
+  canvas.style.height = LUT_H + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  wrap.append(canvas);
+
   const def = { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
+  const cur = { ...def };
+  let vmax = Math.max(def.hi * 2, 1); // provisional until the histogram loads
+  let bins = null;
 
-  const track = document.createElement("div");
-  track.className = "lut-track";
-  const fill = document.createElement("div");
-  fill.className = "lut-fill";
-  fill.style.background = "#" + ch.color;
-  const lo = document.createElement("input");
-  const hi = document.createElement("input");
-  for (const [el, val] of [[lo, def.lo], [hi, def.hi]]) {
-    el.type = "range";
-    el.min = 0;
-    el.max = SLIDER_STEPS;
-    el.step = 1;
-    el.value = valueToSlider(val, max);
+  const vx = (v) => PLOT.x0 + (Math.max(0, Math.min(v, vmax)) / vmax) * (PLOT.x1 - PLOT.x0);
+  const xv = (x) =>
+    (Math.max(0, Math.min(1, (x - PLOT.x0) / (PLOT.x1 - PLOT.x0)))) * vmax;
+  const curveY = (t) =>
+    PLOT.y1 - Math.pow(Math.max(0, Math.min(1, t)), 1 / cur.gamma) * (PLOT.y1 - PLOT.y0);
+  const knobPos = () => ({
+    x: vx(cur.lo + (Math.max(cur.hi, cur.lo + 1) - cur.lo) * 0.5),
+    y: curveY(Math.pow(0.5, 1 / cur.gamma)),
+  });
+
+  function draw() {
+    const w = PLOT.x1 - PLOT.x0;
+    const h = PLOT.y1 - PLOT.y0;
+    ctx.clearRect(0, 0, LUT_W, LUT_H);
+    // frame + baseline
+    ctx.strokeStyle = "#262b31";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(PLOT.x0 - 0.5, PLOT.y0 - 0.5, w + 1, h + 1);
+    // histogram (sqrt-scaled so tissue signal shows over background counts)
+    if (bins) {
+      const peak = Math.sqrt(Math.max(...bins, 1));
+      ctx.beginPath();
+      ctx.moveTo(PLOT.x0, PLOT.y1);
+      for (let b = 0; b < bins.length; b++) {
+        const x = PLOT.x0 + (w * (b + 0.5)) / bins.length;
+        ctx.lineTo(x, PLOT.y1 - (Math.sqrt(bins[b]) / peak) * (h - 2));
+      }
+      ctx.lineTo(PLOT.x1, PLOT.y1);
+      ctx.closePath();
+      ctx.fillStyle = "#" + ch.color + "55";
+      ctx.fill();
+      ctx.strokeStyle = "#" + ch.color + "cc";
+      ctx.stroke();
+    }
+    // window guides
+    ctx.strokeStyle = "#566070";
+    ctx.setLineDash([2, 3]);
+    for (const v of [cur.lo, cur.hi]) {
+      ctx.beginPath();
+      ctx.moveTo(vx(v) + 0.5, PLOT.y0);
+      ctx.lineTo(vx(v) + 0.5, PLOT.y1);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    // mapping curve: flat-left, gamma ramp, flat-right
+    ctx.strokeStyle = "#dbe1e8";
+    ctx.beginPath();
+    ctx.moveTo(PLOT.x0, PLOT.y1);
+    ctx.lineTo(vx(cur.lo), PLOT.y1);
+    const steps = 40;
+    for (let s = 0; s <= steps; s++) {
+      const t = s / steps;
+      ctx.lineTo(vx(cur.lo + (cur.hi - cur.lo) * t), curveY(t));
+    }
+    ctx.lineTo(PLOT.x1, PLOT.y0);
+    ctx.stroke();
+    // gamma knob
+    const k = knobPos();
+    ctx.beginPath();
+    ctx.arc(k.x, k.y, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = "#16191d";
+    ctx.fill();
+    ctx.strokeStyle = "#dbe1e8";
+    ctx.stroke();
+    // lo/hi triangles along the top edge
+    triangle(vx(cur.lo), "#0a0c0e", "#8b94a1");
+    triangle(vx(cur.hi), "#dbe1e8", "#0a0c0e");
+    // labels
+    ctx.font = "9px ui-monospace, Menlo, monospace";
+    ctx.fillStyle = "#8b94a1";
+    ctx.textAlign = "left";
+    ctx.fillText(fmtInt(cur.lo), PLOT.x0, 9);
+    ctx.textAlign = "right";
+    ctx.fillText(fmtInt(cur.hi), PLOT.x1, 9);
+    ctx.textAlign = "center";
+    ctx.fillText("G: " + cur.gamma.toFixed(2), (PLOT.x0 + PLOT.x1) / 2, 9);
+    ctx.fillStyle = "#566070";
+    ctx.textAlign = "left";
+    ctx.fillText("0", PLOT.x0, LUT_H - 3);
+    ctx.textAlign = "right";
+    ctx.fillText(fmtInt(vmax), PLOT.x1, LUT_H - 3);
+    winLabel.textContent = fmtInt(cur.lo) + "–" + fmtInt(cur.hi);
   }
-  lo.className = "lut-lo";
-  hi.className = "lut-hi";
-  track.append(fill, lo, hi);
 
-  const gRow = document.createElement("div");
-  gRow.className = "lut-gamma";
-  const gLabel = document.createElement("span");
-  gLabel.className = "glabel";
-  gLabel.textContent = "γ";
-  const g = document.createElement("input");
-  g.type = "range";
-  g.min = -100; // gamma = 4^(v/100): 0.25 .. 4, centered on 1
-  g.max = 100;
-  g.step = 1;
-  g.value = 0;
-  const gVal = document.createElement("span");
-  gVal.className = "gval";
-  gVal.textContent = "1.00";
-  const reset = document.createElement("button");
-  reset.className = "lut-reset";
-  reset.type = "button";
-  reset.title = "Reset window and gamma";
-  reset.textContent = "↺";
-  gRow.append(gLabel, g, gVal, reset);
-  wrap.append(track, gRow);
-
-  function current() {
-    let a = sliderToValue(+lo.value, max);
-    let b = sliderToValue(+hi.value, max);
-    if (b <= a) b = a + 1;
-    return { lo: a, hi: b, gamma: Math.pow(4, +g.value / 100) };
+  function triangle(x, fill, stroke) {
+    ctx.beginPath();
+    ctx.moveTo(x - 5, PLOT.y0 - 10);
+    ctx.lineTo(x + 5, PLOT.y0 - 10);
+    ctx.lineTo(x, PLOT.y0 - 1);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = stroke;
+    ctx.stroke();
   }
+
   function isDefault(l) {
     return (
       Math.abs(l.lo - def.lo) < 0.5 &&
@@ -281,42 +357,82 @@ function buildLutRow(i, ch, winLabel) {
       Math.abs(l.gamma - 1) < 0.005
     );
   }
-  function paint() {
-    const l = current();
-    const a = (100 * +lo.value) / SLIDER_STEPS;
-    const b = (100 * +hi.value) / SLIDER_STEPS;
-    fill.style.left = a + "%";
-    fill.style.width = Math.max(0, b - a) + "%";
-    winLabel.textContent = fmtInt(l.lo) + "–" + fmtInt(l.hi);
-    gVal.textContent = l.gamma.toFixed(2);
+  function setLut(l) {
+    cur.lo = l.lo;
+    cur.hi = Math.max(l.hi, l.lo + 1);
+    cur.gamma = Math.max(0.25, Math.min(4, l.gamma));
+    draw();
+    state.luts[i] = isDefault(cur) ? null : { ...cur };
+    applyLuts(); // shared debounce: one tile reload even for shift-drags
   }
-  const apply = debounce(() => {
-    const l = current();
-    state.luts[i] = isDefault(l) ? null : l;
-    reopenPreservingView();
-  }, 250);
-  for (const el of [lo, hi, g]) {
-    el.addEventListener("input", () => {
-      // keep handles ordered while dragging
-      if (+lo.value > +hi.value) {
-        if (el === lo) hi.value = lo.value;
-        else lo.value = hi.value;
-      }
-      paint();
-      apply();
-    });
-    el.addEventListener("click", (ev) => ev.preventDefault());
-  }
-  reset.addEventListener("click", (ev) => {
+
+  // dragging: lo/hi triangles (horizontal), gamma knob (vertical)
+  let mode = null;
+  const pt = (ev) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  };
+  canvas.addEventListener("pointerdown", (ev) => {
+    const p = pt(ev);
+    const k = knobPos();
+    if (Math.hypot(p.x - k.x, p.y - k.y) < 9) mode = "gamma";
+    else if (Math.abs(p.x - vx(cur.hi)) < Math.abs(p.x - vx(cur.lo))) mode = "hi";
+    else mode = "lo";
+    canvas.setPointerCapture(ev.pointerId);
+    drag(ev);
     ev.preventDefault();
-    lo.value = valueToSlider(def.lo, max);
-    hi.value = valueToSlider(def.hi, max);
-    g.value = 0;
-    paint();
-    apply();
   });
-  paint();
+  canvas.addEventListener("pointermove", (ev) => {
+    if (mode) drag(ev);
+  });
+  canvas.addEventListener("pointerup", () => (mode = null));
+
+  function drag(ev) {
+    const p = pt(ev);
+    const next = { ...cur };
+    if (mode === "gamma") {
+      const frac = (PLOT.y1 - Math.max(PLOT.y0, Math.min(PLOT.y1, p.y))) /
+        (PLOT.y1 - PLOT.y0);
+      // knob height = 0.5^(1/gamma)  =>  gamma = ln(0.5)/ln(frac)
+      const f = Math.max(0.02, Math.min(0.98, frac));
+      next.gamma = Math.max(0.25, Math.min(4, Math.log(0.5) / Math.log(f)));
+    } else {
+      const v = xv(p.x);
+      if (mode === "lo") next.lo = Math.min(v, cur.hi - 1);
+      else next.hi = Math.max(v, cur.lo + 1);
+    }
+    if (ev.shiftKey) {
+      state.lutWidgets.forEach((wd) => wd.setLut(next));
+    } else {
+      setLut(next);
+    }
+  }
+
+  const widget = {
+    setLut,
+    setHistogram(hg) {
+      bins = hg.bins;
+      vmax = hg.vmax;
+      draw();
+    },
+    reset() {
+      setLut({ ...def });
+    },
+  };
+  state.lutWidgets[i] = widget;
+  draw();
   return wrap;
+}
+
+function loadHistograms() {
+  fetch("/api/histogram")
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+    .then((d) => {
+      d.channels.forEach((hg, i) => {
+        if (state.lutWidgets[i]) state.lutWidgets[i].setHistogram(hg);
+      });
+    })
+    .catch(() => {}); // panel still works without histograms
 }
 
 function debounce(fn, ms) {
@@ -439,7 +555,6 @@ function wireRoi() {
   $("roi-dl-tiff").onclick = () => downloadRoi("tiff");
   $("roi-dl-png").onclick = () => downloadRoi("png");
   $("roi-dl-jpg").onclick = () => downloadRoi("jpg");
-  $("roi-level").onchange = updateRoiPanel;
   if (state.info.nd2Export === false) {
     const b = $("roi-dl-nd2");
     b.disabled = true;
@@ -521,28 +636,11 @@ function clearRoi() {
   $("roi-hint").style.display = "";
 }
 
-function buildRoiLevelSelect() {
-  const sel = $("roi-level");
-  state.info.levels.forEach((lv, k) => {
-    const opt = document.createElement("option");
-    opt.value = k;
-    opt.textContent =
-      k === 0
-        ? "Native resolution (level 0)"
-        : "Level " + k + "  ·  1/" + lv.downsample;
-    sel.append(opt);
-  });
-}
-
 function updateRoiPanel() {
   const r = state.roi;
   if (!r) return;
   const info = state.info;
-  const k = parseInt($("roi-level").value, 10) || 0;
-  const f = info.levels[k].downsample;
-  const w = Math.max(1, Math.round(r.w / f));
-  const h = Math.max(1, Math.round(r.h / f));
-  $("roi-px").textContent = fmtInt(w) + " × " + fmtInt(h);
+  $("roi-px").textContent = fmtInt(r.w) + " × " + fmtInt(r.h);
   const [py, px] = info.pixelSizeUm;
   const wUm = fmtUm(r.w * px);
   const hUm = fmtUm(r.h * py);
@@ -552,20 +650,19 @@ function updateRoiPanel() {
     wUnit === hUnit ? wNum + " × " + hNum + " " + wUnit : wUm + " × " + hUm;
   const itemsize = dtypeBytes(info.dtype);
   const nCh = info.rgb ? 3 : state.channels.length;
-  $("roi-bytes").textContent = "≈ " + fmtBytes(w * h * nCh * itemsize);
+  $("roi-bytes").textContent = "≈ " + fmtBytes(r.w * r.h * nCh * itemsize);
 }
 
 function downloadRoi(fmt) {
   const r = state.roi;
   if (!r) return;
-  const k = parseInt($("roi-level").value, 10) || 0;
-  const f = state.info.levels[k].downsample;
+  // exports are always native resolution (level 0)
   const q = new URLSearchParams({
-    level: k,
-    x: Math.floor(r.x / f),
-    y: Math.floor(r.y / f),
-    w: Math.max(1, Math.round(r.w / f)),
-    h: Math.max(1, Math.round(r.h / f)),
+    level: 0,
+    x: r.x,
+    y: r.y,
+    w: r.w,
+    h: r.h,
     format: fmt,
   });
   const all = state.channels.length === state.info.channels.length;
@@ -577,7 +674,7 @@ function downloadRoi(fmt) {
     if (mpx > state.info.maxRenderMpx) {
       showToast(
         "rendered export capped at " + state.info.maxRenderMpx +
-        " MPx — use ND2/TIFF (they stream any size) or a coarser level"
+        " MPx — use ND2/TIFF (they stream any size)"
       );
       return;
     }

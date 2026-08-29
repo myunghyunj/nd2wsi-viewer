@@ -49,6 +49,7 @@ class ViewerState:
         self.root = root
         self.attrs = attrs
         self.max_render_mpx = max_render_mpx
+        self.histograms: list | None = None  # computed lazily, once
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
 
 
@@ -89,6 +90,8 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                     return self._static(path[len("/static/") :])
                 if path == "/api/info":
                     return self._info()
+                if path == "/api/histogram":
+                    return self._histogram()
                 m = TILE_RE.match(path)
                 if m:
                     return self._tile(m, q)
@@ -139,6 +142,14 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 "nd2Export": _limnd2_available(),
             }
             self._json(info)
+
+        def _histogram(self):
+            with state.lock:
+                if state.histograms is None:
+                    state.histograms = render.compute_histograms(
+                        state.root, state.attrs
+                    )
+            self._json({"channels": state.histograms})
 
         def _tile(self, m: re.Match, q: dict):
             level, tx, ty = int(m.group(1)), int(m.group(2)), int(m.group(3))

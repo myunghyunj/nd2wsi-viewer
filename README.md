@@ -115,13 +115,17 @@ and `--position` for multipoint files. RGB slides are stored as C=3.
 
 * Deep-zoom pan/scroll with a minimap; channel toggles for multichannel
   fluorescence (server-side additive compositing).
-* **Per-channel LUTs**: each channel gets a dual-handle window slider
-  (low/high, in raw counts, sqrt-scaled so the fluorescence range has fine
-  control) and a gamma slider (0.25–4, NIS convention: γ > 1 brightens
-  midtones), with live re-rendering and a per-channel reset. Defaults come
-  from percentile auto-windows computed at convert time.
-* **Region export**: press `R` or *Select region*, drag a rectangle, choose a
-  pyramid level, and download:
+* **Per-channel LUTs**, laid out like the NIS-Elements LUTs panel: each
+  channel (however many the file has) gets its intensity histogram drawn in
+  the channel color, black/white triangles to drag the display window in raw
+  counts, and a knob on the mapping curve that drags vertically to set gamma
+  (0.25–4, NIS convention: γ > 1 brightens midtones) — live re-rendering, a
+  per-channel reset, and shift-drag to adjust all channels together.
+  Defaults come from percentile auto-windows computed at convert time;
+  histograms come from `/api/histogram` (computed once per store, from a
+  small pyramid level, robust to lone hot pixels).
+* **Region export**: press `R` or *Select region*, drag a rectangle, and
+  download — always at native resolution:
   * **ND2** (default) — a real, uncompressed modern ND2 with the source's
     µm calibration, channel names/colors and objective magnification;
     reopens in NIS-Elements (written with Laboratory Imaging's own `limnd2`)
@@ -137,12 +141,14 @@ Everything the UI does is plain HTTP you can script:
 
 ```
 GET /api/info
+GET /api/histogram
 GET /api/tile/{level}/{x}/{y}.jpg?c=0,2&win=399:1057,220:2366:2.0
 GET /api/roi?level=0&x=6803&y=3517&w=1234&h=987&format=nd2&c=0,2
 ```
 
 (`win` is one `lo:hi[:gamma]` slot per channel; empty slot = stored default.
-`format` is `nd2` | `tiff` | `png` | `jpg`.)
+`format` is `nd2` | `tiff` | `png` | `jpg`. The UI always exports level 0;
+the `level` parameter remains for scripted downsampled reads.)
 
 ## Correctness
 

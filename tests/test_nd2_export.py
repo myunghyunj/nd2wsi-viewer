@@ -59,6 +59,45 @@ def test_crop_channel_subset(fluor_nd2, tmp_path):
         assert [c.channel.name for c in f.metadata.channels] == ["DAPI"]
 
 
+def test_three_channel_roundtrip(tmp_path):
+    """Files are not always 2-channel: full 3-channel convert -> nd2 export."""
+    from nd2wsi.convert import convert, open_store
+    from nd2wsi.export_nd2 import export_roi_nd2
+    from nd2wsi.render import compute_histograms
+
+    rng = np.random.default_rng(5)
+    img = rng.integers(0, 3000, size=(600, 800, 3), dtype=np.uint16)
+    src = tmp_path / "three.nd2"
+    attrs = limnd2.ImageAttributes.create(
+        width=800, height=600, component_count=3, bits=16, sequence_count=1
+    )
+    with limnd2.Nd2Writer(str(src)) as f:
+        f.imageAttributes = attrs
+        f.setImage(0, img)
+        mf = limnd2.MetadataFactory(pixel_calibration=0.33)
+        for name, color in [("CY5", "FF0000"), ("FITC", "00FF00"), ("DAPI", "0000FF")]:
+            mf.addPlane(name=name, color=color)
+        f.pictureMetadata = mf.createMetadata()
+
+    with nd2.ND2File(str(src)) as f:
+        assert f.sizes.get("C") == 3 and not f.is_rgb  # channels, not RGB comps
+
+    store = tmp_path / "three.ome.zarr"
+    convert(src, store, progress=False)
+    root, sattrs = open_store(store)
+    assert root["0"].shape == (3, 600, 800)
+    assert [c["label"] for c in sattrs["omero"]["channels"]] == ["CY5", "FITC", "DAPI"]
+    assert len(compute_histograms(root, sattrs, min_pixels=1000)) == 3
+
+    out = tmp_path / "three_roi.nd2"
+    export_roi_nd2(root, sattrs, out, level=0, x=101, y=53, w=333, h=222,
+                   channels=[0, 1, 2])
+    with nd2.ND2File(str(out)) as f:
+        back = np.moveaxis(np.array(f.read_frame(0)), 0, -1)
+        assert np.array_equal(back, img[53 : 53 + 222, 101 : 101 + 333])
+        assert [c.channel.name for c in f.metadata.channels] == ["CY5", "FITC", "DAPI"]
+
+
 def test_store_roi_export_matches_source(fluor_nd2, tmp_path):
     """convert -> export_roi_nd2 -> identical pixels + metadata carried over."""
     from nd2wsi.convert import convert, open_store

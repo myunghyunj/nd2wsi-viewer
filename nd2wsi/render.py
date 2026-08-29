@@ -154,6 +154,36 @@ def render_tile(
     return encode_image(img, fmt)
 
 
+def compute_histograms(
+    root: Any, attrs: dict[str, Any], bins: int = 256, min_pixels: int = 300_000
+) -> list[dict[str, Any]]:
+    """Per-channel intensity histograms for the LUT panel.
+
+    Computed from the smallest pyramid level with at least ``min_pixels``
+    (a few-MPx read at most).  The axis max is robust to lone hot pixels:
+    the 99.9th percentile with 30% headroom, clamped to the data max, and
+    never below the stored display window.  Overflow lands in the last bin.
+    """
+    meta = attrs["nd2wsi"]
+    levels = meta["levels"]
+    pick = levels[0]
+    for lv in reversed(levels):
+        if lv["width"] * lv["height"] >= min_pixels:
+            pick = lv
+            break
+    data = np.asarray(root[pick["path"]][:])  # (C, h, w)
+    out = []
+    for ci in range(data.shape[0]):
+        ch = data[ci].ravel()
+        dmax = float(ch.max()) if ch.size else 1.0
+        vmax = min(float(np.percentile(ch, 99.9)) * 1.3, dmax)
+        win = attrs["omero"]["channels"][ci].get("window", {})
+        vmax = max(vmax, float(win.get("end", 0)) * 1.1, 1.0)
+        counts, _ = np.histogram(np.minimum(ch, vmax), bins=bins, range=(0, vmax))
+        out.append({"bins": [int(c) for c in counts], "vmax": vmax, "level": pick["path"]})
+    return out
+
+
 def display_params(
     attrs: dict[str, Any],
 ) -> tuple[list[tuple[float, float]], list[tuple[int, int, int]]]:
