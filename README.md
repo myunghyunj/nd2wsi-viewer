@@ -32,7 +32,7 @@ out as a real ND2 that reopens in NIS-Elements with its calibration and
 channels intact.
 
 <p align="center">
-  <img src="docs/tabs.png" alt="Two slides open in tabs, with serial measurements and a labeled box on a PDGFRb slide" width="900">
+  <img src="docs/hero.png" alt="Two slides open in tabs, with serial measurements and a labeled box on a PDGFRb slide" width="900">
   <br><sub>Two slides open as tabs. Serial thickness measurements and a labeled box on a PDGFR&beta; slide, loaded from its sidecar.</sub>
 </p>
 
