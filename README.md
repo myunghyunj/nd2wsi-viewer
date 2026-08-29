@@ -48,6 +48,31 @@ container: conversion in ~29 s with heap bounded by `tile × workers` (not
 slide size); exporting the *entire slide* as one native-resolution TIFF used
 **14 MB** of additional heap.
 
+### Validated on real Ti2 slide scans
+
+Five 20× "Scan Large Image" acquisitions from an ECLIPSE Ti2 / NIS-Elements
+AR 2022 (2-channel CY5 + DAPI uint16 immunofluorescence, 0.66 µm/px,
+1.4–5.5 GB per file) all showed the same internal layout: **exactly one
+uncompressed `ImageDataSeq|0!` blob** — one flattened raster, no surviving
+acquisition tiles, no embedded preview pyramid. That is the best case for
+this tool: the mmap streaming path applies unmodified.
+
+End-to-end on an Apple-silicon laptop (14 cores, `--workers 8`):
+
+| slide (px)      | ND2    | convert | pyramid on disk |
+|-----------------|--------|---------|-----------------|
+| 19,029 × 19,171 | 1.4 GB |   7.3 s | 1.0 GB (7 levels) |
+| 20,064 × 34,271 | 2.6 GB |  15.1 s | 1.9 GB (8 levels) |
+| 53,144 × 27,799 | 5.5 GB |  49.2 s | 3.8 GB (8 levels) |
+
+On the 1.48-gigapixel slide the viewer pans/zooms fluidly from
+whole-slide overview to native 1:1; a 11,957 × 7,972 px native-resolution
+ROI (364 MB raw) streamed out as a zlib TIFF in **2.4 s**, and the export
+was verified pixel-identical to reading the same region straight from the
+ND2 memory map, with the 0.66 µm/px calibration intact in the TIFF tags.
+NIS-assigned channel display colors (e.g. CY5 shown red in one staining
+batch, green in another) carry through to the viewer via the ND2 metadata.
+
 ## Install
 
 ```bash
