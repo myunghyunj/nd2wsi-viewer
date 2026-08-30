@@ -37,6 +37,8 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
     background:rgba(255,255,255,.12);overflow:hidden;display:none}
   #fill{display:block;height:100%;width:0%;border-radius:2px;background:#b08900;
     transition:width .25s ease}
+  #pct{margin-top:7px;font-size:12px;color:rgba(255,255,255,.5);min-height:14px;
+    font-family:ui-monospace,"SF Mono",Menlo,monospace}
   #drop.over::after{content:"";position:fixed;inset:14px;border-radius:16px;
     border:2px dashed rgba(10,132,255,.9);background:rgba(10,132,255,.06)}
 </style></head><body>
@@ -46,6 +48,7 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   <div class="sub"><b>.nd2</b> or <b>.svs</b> &nbsp;·&nbsp; or click anywhere to browse</div>
   <div id="status"></div>
   <div id="bar"><span id="fill"></span></div>
+  <div id="pct"></div>
 </div></div>
 <script>
   let busy = false, polling = null;
@@ -55,12 +58,17 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   function poll(){
     pywebview.api.status().then(s => { if (s) setStatus(s); });
     pywebview.api.progress().then(f => {
-      if (f >= 0) { bar.style.display = 'block'; fill.style.width = Math.round(f*100)+'%'; }
-      else bar.style.display = 'none';
+      const pctEl = document.getElementById('pct');
+      if (f >= 0) {
+        bar.style.display = 'block';
+        const p = Math.round(f * 100);
+        fill.style.width = p + '%';
+        pctEl.textContent = p + ' %';
+      } else { bar.style.display = 'none'; pctEl.textContent = ''; }
     });
   }
   function begin(){ busy = true; polling = setInterval(poll, 400); }
-  function end(msg){ clearInterval(polling); busy = false; setStatus(msg || ''); bar.style.display='none'; }
+  function end(msg){ clearInterval(polling); busy = false; setStatus(msg || ''); bar.style.display='none'; document.getElementById('pct').textContent=''; }
   function go(promise){
     begin();
     promise.then(url => { if (url) location.replace(url); else end(''); })

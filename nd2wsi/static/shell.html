@@ -4,6 +4,14 @@
 <meta charset="utf-8" />
 <title>nd2wsi-viewer</title>
 <style>
+  :root.light {
+    --canvas: #ececef;
+    --bar: rgba(238, 238, 240, 0.99);
+    --hairline: rgba(0, 0, 0, 0.10);
+    --label: rgba(0, 0, 0, 0.85);
+    --label-2: rgba(0, 0, 0, 0.55);
+    --label-3: rgba(0, 0, 0, 0.32);
+  }
   :root {
     --accent: #0a84ff;
     --canvas: #161618;
@@ -33,6 +41,10 @@
     color: var(--label-2); font-size: 12px; position: relative;
   }
   .tab:hover { background: rgba(255, 255, 255, 0.05); color: var(--label); }
+  :root.light .tab:hover { background: rgba(0, 0, 0, 0.05); }
+  :root.light .tab .x:hover { background: rgba(0, 0, 0, 0.10); }
+  :root.light #newtab:hover { background: rgba(0, 0, 0, 0.06); }
+  :root.light .tab .tprog { background: rgba(0, 0, 0, 0.10); }
   .tab.active {
     background: var(--canvas); color: var(--label);
     box-shadow: 0 0 0 0.5px var(--hairline);
@@ -51,6 +63,8 @@
     border-radius: 2px 2px 0 0; background: rgba(255, 255, 255, 0.10); overflow: hidden; }
   .tab .tprog span { display: block; height: 100%; width: 0%; background: #b08900;
     transition: width 0.3s ease; }
+  .tab .tprog span.indet { width: 26%; animation: slide 1.1s infinite ease-in-out; }
+  @keyframes slide { 0% { margin-left: 0; } 50% { margin-left: 74%; } 100% { margin-left: 0; } }
   @keyframes pulse { from { opacity: 0.3; } to { opacity: 1; } }
   #newtab {
     border: 0; background: none; color: var(--label-2); font-size: 17px;
@@ -100,6 +114,11 @@
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+try {
+  if (localStorage.getItem("nd2wsi.theme") === "light")
+    document.documentElement.classList.add("light");
+} catch (e) { /* ok */ }
+
 const frames = new Map(); // sid -> iframe
 let slides = [];
 let active = null;
@@ -120,11 +139,12 @@ function render() {
     name.className = "name";
     name.textContent = s.name;
     t.append(dot, name);
-    if (busy && s.pct != null) {
+    if (busy) {
       const p = document.createElement("div");
       p.className = "tprog";
       const f = document.createElement("span");
-      f.style.width = (s.pct || 0) + "%";
+      if (s.pct > 0) f.style.width = s.pct + "%";
+      else f.className = "indet";
       p.append(f);
       t.append(p);
     }
@@ -179,13 +199,15 @@ function openPath(path) {
   render();
   clearInterval(busyTimer);
   busyTimer = setInterval(() => {
-    fetch("/api/roi/progress?job=" + job)
+    fetch("/api/roi/progress?job=" + job, { cache: "no-store" })
       .then((r) => r.json())
       .then((d) => {
         if (!busyTab) return;
         if (d.state === "converting") {
           busyTab.pct = d.pct || 0;
-          busyTab.name = "Converting " + name + " " + busyTab.pct + " %";
+          busyTab.name = busyTab.pct > 0
+            ? "Converting " + name + " " + busyTab.pct + " %"
+            : "Preparing " + name + " …";
           render();
         }
       })
@@ -251,6 +273,15 @@ window.addEventListener("message", (ev) => {
   if (!ev.data) return;
   if (ev.data.nd2wsi === "slide-trashed") refresh();
   if (ev.data.nd2wsi === "file-drag") zone.hidden = false;
+  if (ev.data.nd2wsi === "theme") {
+    document.documentElement.classList.toggle("light", ev.data.theme === "light");
+    try { localStorage.setItem("nd2wsi.theme", ev.data.theme); } catch (e) { /* ok */ }
+    for (const [, f] of frames) {
+      if (f.contentWindow && f.contentWindow !== ev.source) {
+        f.contentWindow.postMessage(ev.data, "*");
+      }
+    }
+  }
 });
 
 refresh();

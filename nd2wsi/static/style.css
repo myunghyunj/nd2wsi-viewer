@@ -35,6 +35,46 @@
     0 8px 15px rgba(0, 0, 0, 0.22);
 }
 
+/* ---- light appearance (toggled by the toolbar sun/moon button) ------------- */
+:root.light {
+  --canvas: #ececef;
+  --material: rgba(246, 246, 248, 0.97);
+  --material-strong: rgba(240, 240, 242, 0.98);
+  --hairline: rgba(0, 0, 0, 0.10);
+  --label: rgba(0, 0, 0, 0.85);
+  --label-2: rgba(0, 0, 0, 0.55);
+  --label-3: rgba(0, 0, 0, 0.32);
+  --window-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.03),
+    0 0 0 0.5px rgba(0, 0, 0, 0.14),
+    0 1px 3px rgba(0, 0, 0, 0.12),
+    0 8px 15px rgba(0, 0, 0, 0.10);
+}
+:root.light .app-mark { background: rgba(0, 0, 0, 0.07); box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.7); }
+:root.light #toolbar { border-bottom-color: rgba(0, 0, 0, 0.14); }
+:root.light .tb-btn:hover { background: rgba(0, 0, 0, 0.06); }
+:root.light .tb-btn.active { background: rgba(0, 0, 0, 0.11); }
+:root.light .tb-btn:active { background: rgba(0, 0, 0, 0.15); }
+:root.light .btn {
+  color: var(--label);
+  background: linear-gradient(#ffffff, #f0f0f2);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.03),
+    0 0 0 0.5px rgba(0, 0, 0, 0.16),
+    0 1px 1px rgba(0, 0, 0, 0.10);
+}
+:root.light .btn:hover { filter: brightness(0.975); }
+:root.light .btn.primary, :root.light .btn.armed, :root.light .btn.destructive { color: #fff; }
+:root.light .switch { background: rgba(120, 120, 128, 0.24); box-shadow: inset 0 0.5px 1.5px rgba(0, 0, 0, 0.12); }
+:root.light input.dim { background: rgba(0, 0, 0, 0.05); box-shadow: inset 0 0.5px 1px rgba(0, 0, 0, 0.10); }
+:root.light .zc-btn:hover { background: rgba(0, 0, 0, 0.06); }
+:root.light #export-bar { background: rgba(0, 0, 0, 0.12); }
+:root.light .swatch { box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.20); }
+:root.light .tl { box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.18); }
+:root.light .lut-canvas { background: rgba(0, 0, 0, 0.02); }
+
 * { box-sizing: border-box; }
 html, body {
   margin: 0; height: 100%; overflow: hidden;
@@ -342,6 +382,7 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
   font-size: 11px;
 }
 #statusbar .cell { display: flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+#statusbar .cell[hidden] { display: none; }
 #statusbar .label { color: var(--label-3); font-size: 11px; }
 #statusbar .value { font-family: var(--font-mono); color: var(--label-2); }
 #statusbar .spacer { flex: 1; }
@@ -399,6 +440,9 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 
 /* ---- cache trash button + confirm popover --------------------------------- */
 .tb-btn.tb-danger:hover { color: #ff453a; background: rgba(255, 69, 58, 0.12); }
+.tb-btn.tb-theme:hover { color: #b08900; background: rgba(176, 137, 0, 0.14); }
+:root.light .tb-btn.tb-danger:hover { color: #d70015; background: rgba(215, 0, 21, 0.10); }
+:root.light .tb-btn.tb-theme:hover { color: #8a6a00; background: rgba(138, 106, 0, 0.10); }
 #trash-confirm {
   position: absolute; top: 46px; right: 12px; z-index: 80; width: 264px;
   padding: 12px; border-radius: 12px;

@@ -131,7 +131,9 @@ measured from Apple's macOS 27 UI kit. Expect SF Pro and SF Mono type,
 translucent panels over the slide, and capsule controls with specular
 edges. Each panel is a little mac window. Drag it by the title bar, resize it from any edge, and
 use the traffic lights to close, collapse, or zoom it. The viewer
-remembers where you put things.
+remembers where you put things. A sun and moon button next to the
+trashcan switches the whole viewer between dark and light, and the choice
+sticks across slides and sessions.
 
 ### Channels and LUTs
 

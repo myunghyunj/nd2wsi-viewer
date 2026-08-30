@@ -46,6 +46,7 @@ async function init() {
   }
 
   buildWindows();
+  wireTheme();
   wireTrash();
   wireDragForward();
   buildChannelPanel();
@@ -325,7 +326,7 @@ function buildLutRow(i, ch, winLabel) {
     const h = PLOT.y1 - PLOT.y0;
     ctx.clearRect(0, 0, W, H);
     // frame
-    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.strokeStyle = inkColor(0.12);
     ctx.lineWidth = 1;
     ctx.strokeRect(PLOT.x0 - 0.5, PLOT.y0 - 0.5, w + 1, h + 1);
     // histogram (sqrt-scaled so tissue signal shows over background counts)
@@ -345,7 +346,7 @@ function buildLutRow(i, ch, winLabel) {
       ctx.stroke();
     }
     // window guides
-    ctx.strokeStyle = "rgba(255,255,255,0.30)";
+    ctx.strokeStyle = inkColor(0.30);
     ctx.setLineDash([2, 3]);
     for (const v of [cur.lo, cur.hi]) {
       ctx.beginPath();
@@ -355,7 +356,7 @@ function buildLutRow(i, ch, winLabel) {
     }
     ctx.setLineDash([]);
     // mapping curve: flat-left, gamma ramp, flat-right
-    ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    ctx.strokeStyle = inkColor(0.85);
     ctx.beginPath();
     ctx.moveTo(PLOT.x0, PLOT.y1);
     ctx.lineTo(vx(cur.lo), PLOT.y1);
@@ -370,23 +371,23 @@ function buildLutRow(i, ch, winLabel) {
     const k = knobPos();
     ctx.beginPath();
     ctx.arc(k.x, k.y, 4.5, 0, Math.PI * 2);
-    ctx.fillStyle = "#1e1e20";
+    ctx.fillStyle = currentTheme() === "light" ? "#f6f6f8" : "#1e1e20";
     ctx.fill();
-    ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    ctx.strokeStyle = inkColor(0.85);
     ctx.stroke();
     // lo/hi triangles along the top edge
-    triangle(vx(cur.lo), "#111214", "rgba(255,255,255,0.55)");
-    triangle(vx(cur.hi), "rgba(255,255,255,0.92)", "rgba(0,0,0,0.6)");
+    triangle(vx(cur.lo), currentTheme() === "light" ? "#3a3a3c" : "#111214", inkColor(0.55));
+    triangle(vx(cur.hi), currentTheme() === "light" ? "#ffffff" : "rgba(255,255,255,0.92)", "rgba(0,0,0,0.6)");
     // labels — SF Mono ramp
     ctx.font = "9px ui-monospace, 'SF Mono', Menlo, monospace";
-    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillStyle = inkColor(0.55);
     ctx.textAlign = "left";
     ctx.fillText(fmtInt(cur.lo), PLOT.x0, 9);
     ctx.textAlign = "right";
     ctx.fillText(fmtInt(cur.hi), PLOT.x1, 9);
     ctx.textAlign = "center";
     ctx.fillText("G: " + cur.gamma.toFixed(2), (PLOT.x0 + PLOT.x1) / 2, 9);
-    ctx.fillStyle = "rgba(255,255,255,0.28)";
+    ctx.fillStyle = inkColor(0.28);
     ctx.textAlign = "left";
     ctx.fillText("0", PLOT.x0, H - 3);
     ctx.textAlign = "right";
@@ -1256,30 +1257,36 @@ function trackExport(job, label) {
   const fill = $("export-fill");
   const pct = $("export-pct");
   clearInterval(exportTimer);
-  cell.hidden = false;
-  cell.classList.remove("done");
-  fill.style.width = "0%";
-  pct.textContent = label + " 0 %";
+  let shown = false;
   const t0 = Date.now();
   exportTimer = setInterval(() => {
-    fetch("api/roi/progress?job=" + job)
+    fetch("api/roi/progress?job=" + job, { cache: "no-store" })
       .then((r) => r.json())
       .then((d) => {
         const p = d.pct || 0;
-        fill.style.width = p + "%";
-        if (d.state === "writing" || d.state === "unknown") {
-          pct.textContent = label + " " + p + " %";
-        } else if (d.state === "streaming") {
-          pct.textContent = label + " saving…";
+        if (d.state === "writing" || d.state === "streaming") {
+          if (!shown) {
+            shown = true;
+            cell.hidden = false;
+            cell.classList.remove("done");
+          }
+          fill.style.width = p + "%";
+          pct.textContent =
+            d.state === "writing" ? label + " " + p + " %" : label + " saving…";
         } else if (d.state === "done") {
-          cell.classList.add("done");
-          pct.textContent = label + " done";
           clearInterval(exportTimer);
-          setTimeout(() => { cell.hidden = true; }, 2000);
+          if (shown) {
+            fill.style.width = "100%";
+            cell.classList.add("done");
+            pct.textContent = label + " done";
+            setTimeout(() => { cell.hidden = true; }, 2000);
+          }
         } else if (d.state === "error") {
           clearInterval(exportTimer);
           cell.hidden = true;
           showToast("export failed: " + (d.error || "unknown error"));
+        } else if (!shown && Date.now() - t0 > 4000) {
+          clearInterval(exportTimer); // job never materialized, stay hidden
         }
         if (Date.now() - t0 > 15 * 60 * 1000) {
           clearInterval(exportTimer);
@@ -1288,6 +1295,44 @@ function trackExport(job, label) {
       })
       .catch(() => {});
   }, 350);
+}
+
+/* ---- light / dark theme ----------------------------------------------------
+   The class lives on <html>, the choice in localStorage, and the shell
+   keeps every open tab in step via postMessage. */
+
+function currentTheme() {
+  return document.documentElement.classList.contains("light") ? "light" : "dark";
+}
+
+function applyTheme(t) {
+  document.documentElement.classList.toggle("light", t === "light");
+  const ico = document.querySelector("#tb-theme .tb-ico");
+  if (ico) ico.innerHTML = t === "light" ? "&#9790;" : "&#9788;";
+  try { localStorage.setItem("nd2wsi.theme", t); } catch (e) { /* private mode */ }
+  if (state.lutWidgets && state.lutWidgets.length) relayoutLuts();
+}
+
+function wireTheme() {
+  let t = "dark";
+  try { t = localStorage.getItem("nd2wsi.theme") || "dark"; } catch (e) { /* ok */ }
+  applyTheme(t);
+  $("tb-theme").onclick = () => {
+    const next = currentTheme() === "light" ? "dark" : "light";
+    applyTheme(next);
+    if (window.parent !== window) {
+      window.parent.postMessage({ nd2wsi: "theme", theme: next }, "*");
+    }
+  };
+  window.addEventListener("message", (ev) => {
+    if (ev.data && ev.data.nd2wsi === "theme") applyTheme(ev.data.theme);
+  });
+}
+
+function inkColor(a) {
+  return currentTheme() === "light"
+    ? "rgba(0,0,0," + a + ")"
+    : "rgba(255,255,255," + a + ")";
 }
 
 /* ---- cache trashcan --------------------------------------------------------
