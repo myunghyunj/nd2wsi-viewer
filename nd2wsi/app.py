@@ -17,6 +17,20 @@ from pathlib import Path
 
 APP_NAME = "nd2wsi-viewer"
 
+
+def _dlog(msg: str) -> None:
+    """Append one line to ~/Library/Logs/nd2wsi-viewer.log (best effort)."""
+    import datetime
+
+    try:
+        log = Path.home() / "Library" / "Logs" / "nd2wsi-viewer.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        with open(log, "a") as fh:
+            fh.write(f"{stamp} {msg}\n")
+    except OSError:
+        pass
+
 BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   html,body{height:100%;margin:0;background:#000;color:rgba(255,255,255,.85);
     font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display",sans-serif;
@@ -78,7 +92,10 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   // pywebview 6 delivers dropped-file paths through a Python-side DOM
   // handler, which calls __pydrop with the real path. The JS listeners
   // below only run the visuals.
-  window.__pydrop = path => { if (!busy) go(pywebview.api.open_path(path)); };
+  window.__pydrop_multi = paths => { if (!busy) go(pywebview.api.open_paths(paths)); };
+  window.__pydrop = path => window.__pydrop_multi([path]);
+  document.addEventListener('dragover', ev => ev.preventDefault(), true);
+  document.addEventListener('drop', ev => ev.preventDefault(), true);
   window.addEventListener('dragover', ev => { ev.preventDefault(); drop.classList.add('over'); });
   window.addEventListener('dragleave', () => drop.classList.remove('over'));
   window.addEventListener('drop', ev => {
@@ -118,15 +135,20 @@ def _wire_file_drop(window):
 
     def on_drop(e):
         files = (e.get("dataTransfer") or {}).get("files") or []
-        for f in files:
-            path = f.get("pywebviewFullPath")
-            if path:
-                window.evaluate_js(
-                    f"window.__pydrop && window.__pydrop({_json.dumps(path)})"
-                )
-                return
+        paths = [f["pywebviewFullPath"] for f in files if f.get("pywebviewFullPath")]
+        _dlog(f"drop received {len(files)} file(s), {len(paths)} with paths")
+        if paths:
+            window.evaluate_js(
+                "window.__pydrop_multi ? window.__pydrop_multi(%s)"
+                " : (window.__pydrop && window.__pydrop(%s))"
+                % (_json.dumps(paths), _json.dumps(paths[0]))
+            )
 
     def attach(*_args):
+        try:
+            _dlog(f"loaded {window.get_current_url()}")
+        except Exception:
+            pass
         try:
             window.dom.document.events.drop += DOMEventHandler(
                 on_drop, prevent_default=True
@@ -172,32 +194,76 @@ class Api:
         else:
             picked = webview.windows[0].create_file_dialog(
                 webview.OPEN_DIALOG,
+                allow_multiple=True,
                 file_types=("Slide scans (*.nd2;*.svs)",),
             )
             if not picked:
                 return None
-            path = Path(picked[0])
+            return self._launch_many([Path(p) for p in picked])
         return self._launch(path)
 
     def open_path(self, path: str):
         """A file dropped onto the entry page."""
-        p = Path(path)
-        if p.suffix.lower() not in (".nd2", ".svs"):
-            self._status = f"{p.name}: not an .nd2 or .svs file"
+        return self.open_paths([path])
+
+    def open_paths(self, paths):
+        """Several slides at once, converted one by one."""
+        good = []
+        for raw in paths or []:
+            p = Path(raw)
+            if p.suffix.lower() not in (".nd2", ".svs"):
+                self._status = f"{p.name}: not an .nd2 or .svs file"
+            elif not p.is_file():
+                self._status = f"could not find {p.name}"
+            else:
+                good.append(p)
+        if not good:
             return None
-        if not p.is_file():
-            self._status = f"could not find {p.name}"
-            return None
-        return self._launch(p)
+        return self._launch_many(good)
 
     def pick_path(self):
+        """Kept for older pages. Returns one path."""
+        picked = self.pick_paths()
+        return picked[0] if picked else None
+
+    def pick_paths(self):
         """Native open dialog for the tab shell's '+' button (no convert)."""
         import webview
 
         picked = webview.windows[0].create_file_dialog(
-            webview.OPEN_DIALOG, file_types=("Slide scans (*.nd2;*.svs)",)
+            webview.OPEN_DIALOG,
+            allow_multiple=True,
+            file_types=("Slide scans (*.nd2;*.svs)",),
         )
-        return str(picked[0]) if picked else None
+        return [str(p) for p in picked] if picked else None
+
+    def _launch_many(self, paths):
+        url = None
+        n = len(paths)
+        for i, p in enumerate(paths):
+            tag = f" ({i + 1} of {n})" if n > 1 else ""
+
+            def note(msg, _tag=tag):
+                self._status = msg.replace(" … (first open only)", "") + _tag + " …"
+
+            def frac(f):
+                self._frac = f
+
+            _dlog(f"open {p}")
+            try:
+                store = open_or_convert(p, on_status=note, on_progress=frac)
+                self._frac = -1.0
+                if self._httpd is None:
+                    self._httpd, url = start_server(store)
+                else:
+                    self._httpd.registry.add_store(store)
+                    url = f"http://127.0.0.1:{self._httpd.server_address[1]}/"
+            except Exception as e:
+                self._frac = -1.0
+                self._status = f"could not open {p.name}: {e}"
+                _dlog(f"open FAILED {p.name}: {e}")
+        self._status = "starting viewer …" if url else self._status
+        return url
 
     def _launch(self, path: Path):
         try:

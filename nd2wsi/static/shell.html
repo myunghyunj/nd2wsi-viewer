@@ -192,6 +192,12 @@ function refresh(selectSid) {
   });
 }
 
+function openMany(paths) {
+  let chain = Promise.resolve();
+  for (const p of paths) chain = chain.then(() => openPath(p));
+  return chain;
+}
+
 function openPath(path) {
   const job = Math.random().toString(36).slice(2, 10);
   const name = path.split("/").pop();
@@ -213,7 +219,7 @@ function openPath(path) {
       })
       .catch(() => {});
   }, 400);
-  fetch("/api/open", {
+  return fetch("/api/open", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, job }),
@@ -237,8 +243,8 @@ function closeTab(sid) {
 }
 
 $("newtab").onclick = () => {
-  if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_path) {
-    window.pywebview.api.pick_path().then((p) => { if (p) openPath(p); });
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_paths) {
+    window.pywebview.api.pick_paths().then((ps) => { if (ps && ps.length) openMany(ps); });
   } else {
     const p = prompt("Path to a .nd2 / .svs slide (or a pyramid_*.ome.zarr store):");
     if (p) openPath(p.trim());
@@ -249,7 +255,8 @@ $("newtab").onclick = () => {
    file path and calls __pydrop. The overlay makes drops over the slide
    iframes land on this document instead of the iframe's. */
 const zone = $("dropzone");
-window.__pydrop = (p) => { zone.hidden = true; openPath(p); };
+window.__pydrop_multi = (paths) => { zone.hidden = true; openMany(paths); };
+window.__pydrop = (p) => window.__pydrop_multi([p]);
 window.addEventListener("dragenter", (ev) => {
   const types = ev.dataTransfer ? Array.from(ev.dataTransfer.types || []) : [];
   if (types.includes("Files")) zone.hidden = false;
@@ -261,13 +268,16 @@ zone.addEventListener("dragleave", (ev) => {
 zone.addEventListener("drop", (ev) => {
   ev.preventDefault();
   zone.hidden = true;
-  if (window.pywebview) return; // the Python handler delivers the path
-  const f = ev.dataTransfer.files[0];
-  const p = f && (f.pywebviewFullPath || f.path);
-  if (p) openPath(p);
+  if (window.pywebview) return; // the Python handler delivers the paths
+  const ps = Array.from(ev.dataTransfer.files)
+    .map((f) => f.pywebviewFullPath || f.path)
+    .filter(Boolean);
+  if (ps.length) openMany(ps);
   else alert("Browsers hide dropped file paths. Use + and type the path, or use the macOS app.");
 });
 window.addEventListener("drop", (ev) => ev.preventDefault());
+document.addEventListener("dragover", (ev) => ev.preventDefault(), true);
+document.addEventListener("drop", (ev) => ev.preventDefault(), true);
 
 window.addEventListener("message", (ev) => {
   if (!ev.data) return;

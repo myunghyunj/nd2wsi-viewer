@@ -1635,6 +1635,8 @@ function wireDragForward() {
   });
   window.addEventListener("dragover", (ev) => ev.preventDefault());
   window.addEventListener("drop", (ev) => ev.preventDefault());
+  document.addEventListener("dragover", (ev) => ev.preventDefault(), true);
+  document.addEventListener("drop", (ev) => ev.preventDefault(), true);
 }
 
 function wireKeys() {
