@@ -2,9 +2,10 @@
 import numpy as np
 import pytest
 
-from nd2wsi.convert import _even_chunks, build_group_attrs
+from nd2wsi.convert import build_group_attrs
 from nd2wsi.reader import ChannelInfo, PlaneSource, level_shapes
 from nd2wsi.render import composite, parse_channels, parse_windows
+from nd2wsi.svs import _grid_chunks
 
 
 def test_level_shapes_halve_until_tile():
@@ -19,10 +20,10 @@ def test_level_shapes_small_image_single_level():
     assert level_shapes(100, 200, 512) == [(100, 200)]
 
 
-def test_even_chunks():
-    assert _even_chunks(1024, 256) == (256, 256, 256, 256)
-    assert _even_chunks(1000, 256) == (256, 256, 256, 232)
-    assert sum(_even_chunks(998, 256)) == 998
+def test_grid_chunks():
+    assert _grid_chunks(1024, 256) == (256, 256, 256, 256)
+    assert _grid_chunks(1000, 256) == (256, 256, 256, 232)
+    assert sum(_grid_chunks(998, 256)) == 998
 
 
 def test_parse_channels():

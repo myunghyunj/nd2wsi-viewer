@@ -196,7 +196,23 @@ ND2 and TIFF stream, so any size works, the whole slide included.
   <br><sub>An Aperio SVS slide in the same viewer. A boxed vessel, a 111 &micro;m measurement, and the sidecar annotations loaded on open.</sub>
 </p>
 
-Brightfield H&E works with every tool above, unchanged. The demo slide
+Brightfield H&E works with every tool above, unchanged.
+
+An SVS carries JPEG or JPEG 2000 tiles, so a 1.4 GB file holds 18 GB of
+pixels and its pyramid lands near 13 GB. That is worth knowing before you
+spend it. nd2wsi samples a few dozen tiles of the slide, measures how they
+compress, and reports the size it expects, within about 5 percent on the
+slides here. The app asks in a dialog that also shows the free space on the
+volume. The command line prints the same line and waits for an answer, and
+`--yes` skips the question.
+
+Tiles are read straight off the file with `os.pread` and decoded in
+parallel, and every pyramid level is written to its chunk files directly,
+so the work scales across the cores rather than queueing behind one
+writer. An 82,799 x 79,731 px slide builds in 50 seconds on a 14-core
+laptop, down from 148 seconds in 0.3.1.
+
+The demo slide
 is CMU-1-Small-Region.svs, an exported region of CMU-1.svs. It shows
 H&E-stained skin tissue in brightfield, scanned at 20x on an Aperio
 ScanScope CS, JPEG-compressed, with a single pyramid level. It is
@@ -278,6 +294,15 @@ cores.
 | 20,064 x 34,271 | 2.6 GB |  15.1 s | 1.9 GB (8 levels) |
 | 53,144 x 27,799 | 5.5 GB |  49.2 s | 3.8 GB (8 levels) |
 
+Two Aperio slides on the same laptop, both JPEG 2000 tiles at 240 px,
+scanned on a Leica Aperio. An SVS costs far more disk than an ND2 because
+its file is compressed and its pyramid is not.
+
+| slide (px)      | SVS    | convert | pyramid on disk |
+|-----------------|--------|---------|-----------------|
+| 82,799 x 79,731 | 1.4 GB |  49.7 s | 13.6 GB (9 levels) |
+| 80,999 x 76,259 | 1.3 GB |  46.4 s | 13.1 GB (9 levels) |
+
 On the 1.48-gigapixel slide, one zoom gesture fetched tiles from level 6
 down to level 0 in order and ended with only the visible native tiles. An
 11,957 x 7,972 px region (364 MB raw) exported as TIFF in 2.4 s and as a
@@ -287,7 +312,7 @@ colors, and objective magnification carried over.
 
 ## Tests
 
-pytest runs 19 tests. They verify that ND2 exports round-trip pixel-exact
+pytest runs 26 tests. They verify that ND2 exports round-trip pixel-exact
 through the independent nd2 reader with calibration and channel metadata
 preserved, that three-channel files convert, render histograms, and
 export, that the annotation sidecar survives a GET and POST round-trip on

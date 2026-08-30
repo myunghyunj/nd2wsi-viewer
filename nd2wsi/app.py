@@ -108,16 +108,50 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
 </script></body></html>"""
 
 
-def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
+def confirm_pyramid(path: Path, est: dict) -> bool:
+    """Native yes/no dialog quoting what the pyramid will cost on disk."""
+    import webview
+
+    from .reader import nice_bytes
+
+    win = webview.windows[0] if webview.windows else None
+    if win is None:
+        return True
+    times = est["bytes"] / max(1, est["source_bytes"])
+    message = (
+        f"{path.name} is {nice_bytes(est['source_bytes'])} of compressed tiles.\n"
+        f"Its pyramid needs about {est['human']}, roughly {times:.0f} times that, "
+        f"stored next to the slide.\n\n"
+        f"{est['width']} x {est['height']} px, {est['levels']} levels, "
+        f"{nice_bytes(est['free_bytes'])} free on this volume.\n\n"
+        "Build it now?"
+    )
+    return bool(win.create_confirmation_dialog("Build pyramid", message))
+
+
+def open_or_convert(
+    nd2_path: Path, on_status=None, on_progress=None, confirm=None
+) -> Path:
     """Return the pyramid store for an ND2, building it on first open."""
-    from .convert import convert, default_store_path
+    from .convert import convert, default_store_path, estimate_store_bytes
+    from .svs import is_svs
 
     store = default_store_path(nd2_path)
     if not store.exists():
+        # An SVS decodes to many times its own size, so ask before spending it.
+        if confirm is not None and is_svs(nd2_path):
+            if on_status:
+                on_status(f"sizing the pyramid for {nd2_path.name} …")
+            if not confirm(nd2_path, estimate_store_bytes(nd2_path)):
+                raise PyramidDeclined(nd2_path.name)
         if on_status:
             on_status(f"building pyramid for {nd2_path.name} … (first open only)")
         convert(nd2_path, store, progress=False, on_progress=on_progress)
     return store
+
+
+class PyramidDeclined(Exception):
+    """Raised when the user answered no to building a pyramid."""
 
 
 _PENDING_OPENS: list = []
@@ -274,6 +308,7 @@ def start_server(store: Path):
     from .server import create_server
 
     httpd = create_server(store, host="127.0.0.1", port=0)
+    httpd.registry.confirm_convert = confirm_pyramid
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/"
 
@@ -361,13 +396,19 @@ class Api:
 
             _dlog(f"open {p}")
             try:
-                store = open_or_convert(p, on_status=note, on_progress=frac)
+                store = open_or_convert(
+                    p, on_status=note, on_progress=frac, confirm=confirm_pyramid
+                )
                 self._frac = -1.0
                 if self._httpd is None:
                     self._httpd, url = start_server(store)
                 else:
                     self._httpd.registry.add_store(store)
                     url = f"http://127.0.0.1:{self._httpd.server_address[1]}/"
+            except PyramidDeclined:
+                self._frac = -1.0
+                self._status = f"skipped {p.name}"
+                _dlog(f"open declined {p.name}")
             except Exception as e:
                 self._frac = -1.0
                 self._status = f"could not open {p.name}: {e}"
@@ -383,7 +424,9 @@ class Api:
             def frac(f):
                 self._frac = f
 
-            store = open_or_convert(path, on_status=note, on_progress=frac)
+            store = open_or_convert(
+                path, on_status=note, on_progress=frac, confirm=confirm_pyramid
+            )
             self._frac = -1.0
             self._status = "starting viewer …"
             if self._httpd is None:

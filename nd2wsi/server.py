@@ -109,6 +109,10 @@ class ViewerState:
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
 
 
+class ConversionDeclined(Exception):
+    """Raised when the caller answered no to building a pyramid."""
+
+
 def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
     """Annotations live in ``annotations_<slide>.json`` next to the pyramid
     store -- self-describing, and found automatically on the next open.
@@ -127,6 +131,10 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
 
 class SlideRegistry:
     """The set of slides this server has open, keyed by a stable short id."""
+
+    #: optional ``callable(path, estimate) -> bool`` asked before building a
+    #: pyramid that will be large; ``None`` means build without asking
+    confirm_convert = None
 
     def __init__(self, max_render_mpx: float = 100.0):
         self.slides: dict[str, ViewerState] = {}  # insertion-ordered
@@ -158,12 +166,19 @@ class SlideRegistry:
 
     def open_path(self, path: str | Path, on_progress=None) -> str:
         """A slide file (converted on first open) or an existing store."""
-        from .convert import convert, default_store_path
+        from .convert import convert, default_store_path, estimate_store_bytes
+        from .svs import is_svs
 
         path = Path(path).expanduser().resolve()
         if path.suffix.lower() in SLIDE_SUFFIXES:
             store = default_store_path(path)
             if not store.exists():
+                # An SVS decodes to many times its own size, so the caller
+                # gets to see the bill before the pyramid is built.
+                if self.confirm_convert is not None and is_svs(path):
+                    est = estimate_store_bytes(path)
+                    if not self.confirm_convert(path, est):
+                        raise ConversionDeclined(path.name)
                 convert(path, store, progress=False, on_progress=on_progress)
         elif path.is_dir():  # a *.ome.zarr store
             store = path
@@ -355,6 +370,9 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
                 sid = registry.open_path(path, on_progress=on_progress)
                 if job:
                     _job_update(job, state="done", pct=100)
+            except ConversionDeclined as e:
+                _job_update(job, state="declined", pct=0)
+                return self._json({"declined": True, "name": str(e)})
             except (ValueError, FileNotFoundError, OSError) as e:
                 _job_update(job, state="error", error=str(e))
                 return self._error(400, str(e))

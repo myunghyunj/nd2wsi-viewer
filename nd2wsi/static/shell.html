@@ -228,6 +228,7 @@ function openPath(path) {
     .then((d) => {
       clearInterval(busyTimer);
       busyTab = null;
+      if (d.declined) { render(); return; }  /* user said no to the pyramid */
       if (d.error) { alert(d.error); render(); return; }
       refresh(d.sid);
     })

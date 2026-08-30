@@ -29,6 +29,31 @@ def _add_selection_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def confirm_pyramid(slide: str | Path, assume_yes: bool = False) -> bool:
+    """Report what an SVS pyramid will cost and ask whether to build it.
+
+    ND2 pyramids land near the size of the file itself, so only SVS gets the
+    question. Non-interactive runs go ahead, which keeps scripts working.
+    """
+    from .convert import estimate_store_bytes
+    from .reader import nice_bytes
+    from .svs import is_svs
+
+    if assume_yes or not is_svs(slide):
+        return True
+    est = estimate_store_bytes(slide)
+    times = est["bytes"] / max(1, est["source_bytes"])
+    print(
+        f"{Path(slide).name} is {nice_bytes(est['source_bytes'])} of compressed "
+        f"tiles. Its pyramid needs about {est['human']}, roughly {times:.0f} "
+        f"times that, next to the slide."
+    )
+    print(f"  {nice_bytes(est['free_bytes'])} free on this volume.")
+    if not sys.stdin.isatty():
+        return True
+    return input("build it? [Y/n] ").strip().lower() in ("", "y", "yes")
+
+
 def _add_convert_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tile", type=int, default=512, help="pyramid tile size (default 512)")
     p.add_argument(
@@ -38,6 +63,12 @@ def _add_convert_args(p: argparse.ArgumentParser) -> None:
         help="dask worker threads (default: auto from this machine's CPU count)",
     )
     p.add_argument("--overwrite", action="store_true", help="replace existing store")
+    p.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="skip the disk-space question asked before converting an SVS",
+    )
     _add_selection_args(p)
 
 
@@ -128,6 +159,9 @@ def main(argv: list[str] | None = None) -> int:
         from .convert import convert, default_store_path
 
         out = Path(args.out) if args.out else default_store_path(args.nd2)
+        if not out.exists() and not confirm_pyramid(args.nd2, args.yes):
+            print("nothing built")
+            return 0
         convert(
             args.nd2,
             out,
@@ -185,6 +219,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.store and len(args.nd2) == 1:
                 store = Path(args.store)
             if args.overwrite or not store.exists():
+                if not confirm_pyramid(slide, args.yes):
+                    print(f"skipped {Path(slide).name}")
+                    continue
                 convert(
                     slide,
                     store,
@@ -196,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"reusing existing pyramid {store} (use --overwrite to rebuild)")
             stores.append(store)
+        if not stores:
+            return 0
         serve(
             stores,
             host=args.host,
