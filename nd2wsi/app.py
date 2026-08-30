@@ -33,6 +33,10 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   .sub b{color:rgba(255,255,255,.55);font-weight:600}
   #status{margin-top:26px;font-size:12px;color:rgba(255,255,255,.4);min-height:16px;
     font-family:ui-monospace,"SF Mono",Menlo,monospace}
+  #bar{width:180px;height:4px;border-radius:2px;margin:10px auto 0;
+    background:rgba(255,255,255,.12);overflow:hidden;display:none}
+  #fill{display:block;height:100%;width:0%;border-radius:2px;background:#b08900;
+    transition:width .25s ease}
   #drop.over::after{content:"";position:fixed;inset:14px;border-radius:16px;
     border:2px dashed rgba(10,132,255,.9);background:rgba(10,132,255,.06)}
 </style></head><body>
@@ -41,14 +45,22 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   <h1>Drop a slide to open</h1>
   <div class="sub"><b>.nd2</b> or <b>.svs</b> &nbsp;·&nbsp; or click anywhere to browse</div>
   <div id="status"></div>
+  <div id="bar"><span id="fill"></span></div>
 </div></div>
 <script>
   let busy = false, polling = null;
   const drop = document.getElementById('drop');
   function setStatus(t){ document.getElementById('status').textContent = t || ''; }
-  function poll(){ pywebview.api.status().then(s => { if (s) setStatus(s); }); }
+  const bar = document.getElementById('bar'), fill = document.getElementById('fill');
+  function poll(){
+    pywebview.api.status().then(s => { if (s) setStatus(s); });
+    pywebview.api.progress().then(f => {
+      if (f >= 0) { bar.style.display = 'block'; fill.style.width = Math.round(f*100)+'%'; }
+      else bar.style.display = 'none';
+    });
+  }
   function begin(){ busy = true; polling = setInterval(poll, 400); }
-  function end(msg){ clearInterval(polling); busy = false; setStatus(msg || ''); }
+  function end(msg){ clearInterval(polling); busy = false; setStatus(msg || ''); bar.style.display='none'; }
   function go(promise){
     begin();
     promise.then(url => { if (url) location.replace(url); else end(''); })
@@ -71,7 +83,7 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
 </script></body></html>"""
 
 
-def open_or_convert(nd2_path: Path, on_status=None) -> Path:
+def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     """Return the pyramid store for an ND2, building it on first open."""
     from .convert import convert, default_store_path
 
@@ -79,7 +91,7 @@ def open_or_convert(nd2_path: Path, on_status=None) -> Path:
     if not store.exists():
         if on_status:
             on_status(f"building pyramid for {nd2_path.name} … (first open only)")
-        convert(nd2_path, store, progress=False)
+        convert(nd2_path, store, progress=False, on_progress=on_progress)
     return store
 
 
@@ -98,6 +110,7 @@ class Api:
     def __init__(self, initial: Path | None):
         self._initial = initial
         self._status = ""
+        self._frac = -1.0  # conversion progress, -1 = not converting
         self._httpd = None
 
     def pending(self) -> bool:
@@ -105,6 +118,9 @@ class Api:
 
     def status(self) -> str:
         return self._status
+
+    def progress(self) -> float:
+        return self._frac
 
     def open_slide(self):
         import webview
@@ -146,7 +162,11 @@ class Api:
             def note(msg):
                 self._status = msg
 
-            store = open_or_convert(path, on_status=note)
+            def frac(f):
+                self._frac = f
+
+            store = open_or_convert(path, on_status=note, on_progress=frac)
+            self._frac = -1.0
             self._status = "starting viewer …"
             if self._httpd is None:
                 self._httpd, url = start_server(store)
@@ -155,6 +175,7 @@ class Api:
                 url = f"http://127.0.0.1:{self._httpd.server_address[1]}/"
             return url  # the tab shell at / lists every open slide
         except Exception as e:  # surfaced in the bootstrap page
+            self._frac = -1.0
             self._status = f"could not open {path.name}: {e}"
             return None
 

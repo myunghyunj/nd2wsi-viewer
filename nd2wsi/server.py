@@ -146,15 +146,17 @@ class SlideRegistry:
             if sid in self.slides:
                 return sid
             root, attrs = open_store(store_path)
-            self.slides[sid] = ViewerState(
+            st = ViewerState(
                 root,
                 attrs,
                 max_render_mpx=self.max_render_mpx,
                 annotations_path=annotations_sidecar(store_path, attrs),
             )
+            st.store_path = store_path
+            self.slides[sid] = st
         return sid
 
-    def open_path(self, path: str | Path) -> str:
+    def open_path(self, path: str | Path, on_progress=None) -> str:
         """A slide file (converted on first open) or an existing store."""
         from .convert import convert, default_store_path
 
@@ -162,7 +164,7 @@ class SlideRegistry:
         if path.suffix.lower() in SLIDE_SUFFIXES:
             store = default_store_path(path)
             if not store.exists():
-                convert(path, store, progress=False)
+                convert(path, store, progress=False, on_progress=on_progress)
         elif path.is_dir():  # a *.ome.zarr store
             store = path
         else:
@@ -172,6 +174,27 @@ class SlideRegistry:
     def remove(self, sid: str) -> bool:
         with self._lock:
             return self.slides.pop(sid, None) is not None
+
+    def trash_cache(self, sid: str) -> int:
+        """Close the slide and delete its pyramid store. Returns bytes freed.
+
+        Deletes only the registered store directory, never the source slide.
+        """
+        import shutil
+
+        with self._lock:
+            st = self.slides.get(sid)
+            if st is None:
+                raise KeyError(sid)
+            store = Path(getattr(st, "store_path", ""))
+            if not (store.is_dir() and store.name.endswith(".ome.zarr")):
+                raise ValueError(f"refusing to delete {store}: not a pyramid store")
+            freed = sum(
+                f.stat().st_size for f in store.rglob("*") if f.is_file()
+            )
+            self.slides.pop(sid, None)
+        shutil.rmtree(store)
+        return freed
 
     def default_sid(self) -> str | None:
         return next(iter(self.slides), None)
@@ -288,6 +311,8 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
                     return self._open()
                 if path == "/api/close":
                     return self._close()
+                if path == "/api/trash":
+                    return self._trash()
                 st, sub = self._resolve(path)
                 if st is not None and sub == "/api/annotations":
                     return self._annotations_post(st)
@@ -309,17 +334,49 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
             self._send(200, body, MIME.get(file.suffix, "application/octet-stream"))
 
         def _open(self):
+            job = None
             try:
                 data = self._body_json()
                 path = data.get("path") if isinstance(data, dict) else None
                 if not path:
                     return self._error(400, 'expected {"path": "..."}')
-                sid = registry.open_path(path)
+                job = data.get("job") if isinstance(data, dict) else None
+                if job and not JOB_RE.match(str(job)):
+                    job = None
+                on_progress = None
+                if job:
+                    _job_update(job, state="converting", pct=0)
+
+                    def on_progress(frac: float) -> None:
+                        _job_update(
+                            job, state="converting", pct=int(min(1.0, frac) * 100)
+                        )
+
+                sid = registry.open_path(path, on_progress=on_progress)
+                if job:
+                    _job_update(job, state="done", pct=100)
             except (ValueError, FileNotFoundError, OSError) as e:
+                _job_update(job, state="error", error=str(e))
                 return self._error(400, str(e))
             except json.JSONDecodeError as e:
                 return self._error(400, f"invalid JSON: {e}")
             return self._json({"sid": sid, "slides": registry.listing()})
+
+        def _trash(self):
+            try:
+                data = self._body_json(limit=10_000)
+            except (ValueError, json.JSONDecodeError) as e:
+                return self._error(400, str(e))
+            sid = data.get("sid") if isinstance(data, dict) else None
+            try:
+                freed = registry.trash_cache(sid or "")
+            except KeyError:
+                return self._error(404, f"no open slide {sid}")
+            except (ValueError, OSError) as e:
+                return self._error(400, str(e))
+            return self._json(
+                {"ok": True, "freed": freed, "slides": registry.listing()}
+            )
 
         def _close(self):
             try:

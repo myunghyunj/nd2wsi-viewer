@@ -46,6 +46,7 @@ async function init() {
   }
 
   buildWindows();
+  wireTrash();
   buildChannelPanel();
   buildLevelLamps();
   buildViewer();
@@ -1286,6 +1287,51 @@ function trackExport(job, label) {
       })
       .catch(() => {});
   }, 350);
+}
+
+/* ---- cache trashcan --------------------------------------------------------
+   Deletes this slide's pyramid store on disk (annotations stay). The tab
+   closes because the tiles are gone; the slide re-converts on next open. */
+
+function wireTrash() {
+  const btn = $("tb-trash");
+  const pop = $("trash-confirm");
+  const hide = () => { pop.hidden = true; };
+  btn.onclick = () => { pop.hidden = !pop.hidden; };
+  $("trash-cancel").onclick = hide;
+  document.addEventListener("pointerdown", (ev) => {
+    if (!pop.hidden && !pop.contains(ev.target) && ev.target !== btn && !btn.contains(ev.target)) hide();
+  });
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") hide();
+  });
+  $("trash-go").onclick = () => {
+    const m = location.pathname.match(/\/s\/([0-9a-f]{8})\//);
+    if (!m) { hide(); showToast("cannot resolve slide id"); return; }
+    $("trash-go").disabled = true;
+    fetch("/api/trash", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid: m[1] }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.error) throw new Error(d.error);
+        showToast("cache deleted — freed " + fmtBytes(d.freed || 0));
+        setTimeout(() => {
+          if (window.parent !== window) {
+            window.parent.postMessage({ nd2wsi: "slide-trashed" }, "*");
+          } else {
+            location.href = "/";
+          }
+        }, 900);
+      })
+      .catch((e) => {
+        $("trash-go").disabled = false;
+        hide();
+        showToast("could not delete cache: " + e.message);
+      });
+  };
 }
 
 /* ---- floating mac windows --------------------------------------------------

@@ -30,9 +30,29 @@ from typing import Any
 
 import numpy as np
 
+from typing import Callable
+
 from .reader import PlaneSelection, PlaneSource, level_shapes, nice_bytes, open_plane
 
 NGFF_VERSION = "0.4"
+
+
+class _StoreProgress:
+    """Dask callback that reports one store() call's completion fraction."""
+
+    def __new__(cls, cb):
+        from dask.callbacks import Callback
+
+        class _CB(Callback):
+            def _start_state(self, dsk, state):
+                self._done = 0
+                self._total = max(1, len(state["ready"]) + len(state["waiting"]))
+
+            def _posttask(self, key, result, dsk, state, worker_id):
+                self._done += 1
+                cb(min(1.0, self._done / self._total))
+
+        return _CB()
 
 
 def auto_workers() -> int:
@@ -197,6 +217,7 @@ def convert(
     overwrite: bool = False,
     progress: bool = True,
     workers: int | None = None,
+    on_progress: Callable[[float], None] | None = None,
 ) -> Path:
     """Convert one plane of an ND2 file to an OME-Zarr pyramid on disk.
 
@@ -253,18 +274,39 @@ def convert(
                     _create_level_array(root, str(k), (c, lh, lw), src.dtype, tile)
                 )
 
+            weights = [lh * lw for (lh, lw) in shapes]
+            total_px = float(sum(weights))
+            done_px = 0.0
+
+            def level_ctx(k: int):
+                if on_progress is None:
+                    import contextlib
+
+                    return contextlib.nullcontext()
+                base = done_px
+
+                return _StoreProgress(
+                    lambda f: on_progress((base + f * weights[k]) / total_px)
+                )
+
             if progress:
                 print(f"  level 0  {w} x {h}  writing from ND2 ...", flush=True)
-            _write_level0(src, arrays[0])
+            with level_ctx(0):
+                _write_level0(src, arrays[0])
+            done_px += weights[0]
 
             for k in range(1, len(shapes)):
                 lh, lw = shapes[k]
                 if progress:
                     print(f"  level {k}  {lw} x {lh}  downsampling ...", flush=True)
-                _downsample_into(arrays[k - 1], arrays[k], tile, src.dtype)
+                with level_ctx(k):
+                    _downsample_into(arrays[k - 1], arrays[k], tile, src.dtype)
+                done_px += weights[k]
 
             windows = _percentile_windows(root, [str(k) for k in range(len(shapes))], src)
             root.attrs.update(build_group_attrs(src, shapes, tile, windows))
+            if on_progress is not None:
+                on_progress(1.0)
 
     if progress:
         size = sum(p.stat().st_size for p in out_path.rglob("*") if p.is_file())

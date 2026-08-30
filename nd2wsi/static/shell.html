@@ -47,6 +47,10 @@
   .tab:hover .x, .tab.active .x { visibility: visible; }
   .tab .x:hover { background: rgba(255, 255, 255, 0.12); color: var(--label); }
   .tab.busy .dot { background: var(--label-3); animation: pulse 1s infinite alternate; }
+  .tab .tprog { position: absolute; left: 6px; right: 6px; bottom: 0; height: 3px;
+    border-radius: 2px 2px 0 0; background: rgba(255, 255, 255, 0.10); overflow: hidden; }
+  .tab .tprog span { display: block; height: 100%; width: 0%; background: #b08900;
+    transition: width 0.3s ease; }
   @keyframes pulse { from { opacity: 0.3; } to { opacity: 1; } }
   #newtab {
     border: 0; background: none; color: var(--label-2); font-size: 17px;
@@ -97,7 +101,8 @@ const $ = (id) => document.getElementById(id);
 const frames = new Map(); // sid -> iframe
 let slides = [];
 let active = null;
-let busyTab = null; // {name} while /api/open runs
+let busyTab = null; // {name, job, pct} while /api/open runs
+let busyTimer = null;
 
 function render() {
   const bar = $("tabbar");
@@ -113,6 +118,14 @@ function render() {
     name.className = "name";
     name.textContent = s.name;
     t.append(dot, name);
+    if (busy && s.pct != null) {
+      const p = document.createElement("div");
+      p.className = "tprog";
+      const f = document.createElement("span");
+      f.style.width = (s.pct || 0) + "%";
+      p.append(f);
+      t.append(p);
+    }
     if (!busy) {
       const x = document.createElement("button");
       x.className = "x";
@@ -158,20 +171,37 @@ function refresh(selectSid) {
 }
 
 function openPath(path) {
-  busyTab = { name: "Opening " + path.split("/").pop() + "…" };
+  const job = Math.random().toString(36).slice(2, 10);
+  const name = path.split("/").pop();
+  busyTab = { name: "Opening " + name + "…", job, pct: null };
   render();
+  clearInterval(busyTimer);
+  busyTimer = setInterval(() => {
+    fetch("/api/roi/progress?job=" + job)
+      .then((r) => r.json())
+      .then((d) => {
+        if (!busyTab) return;
+        if (d.state === "converting") {
+          busyTab.pct = d.pct || 0;
+          busyTab.name = "Converting " + name + " " + busyTab.pct + " %";
+          render();
+        }
+      })
+      .catch(() => {});
+  }, 400);
   fetch("/api/open", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, job }),
   })
     .then((r) => r.json())
     .then((d) => {
+      clearInterval(busyTimer);
       busyTab = null;
       if (d.error) { alert(d.error); render(); return; }
       refresh(d.sid);
     })
-    .catch((e) => { busyTab = null; render(); alert("open failed: " + e); });
+    .catch((e) => { clearInterval(busyTimer); busyTab = null; render(); alert("open failed: " + e); });
 }
 
 function closeTab(sid) {
@@ -199,6 +229,10 @@ window.addEventListener("drop", (ev) => {
   if (!ev.dataTransfer.files.length) return;
   const f = ev.dataTransfer.files[0];
   openPath(f.pywebviewFullPath || f.path || f.name);
+});
+
+window.addEventListener("message", (ev) => {
+  if (ev.data && ev.data.nd2wsi === "slide-trashed") refresh();
 });
 
 refresh();

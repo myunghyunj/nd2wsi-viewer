@@ -25,8 +25,24 @@
       <button class="tb-btn" id="tb-annot" title="Show or hide Annotations">
         <span class="tb-ico">&#9998;</span>Annotate
       </button>
+      <button class="tb-btn tb-danger" id="tb-trash"
+        title="Delete this slide's viewing cache (pyramid_*.ome.zarr)">
+        <span class="tb-ico">&#128465;</span>
+      </button>
     </div>
   </header>
+
+  <div id="trash-confirm" hidden>
+    <div class="tc-text">
+      Delete this slide's viewing cache?<br>
+      <span class="tc-sub">The tab closes and the slide re-converts on next
+      open. Your annotations are kept.</span>
+    </div>
+    <div class="tc-actions">
+      <button class="btn" id="trash-cancel">Cancel</button>
+      <button class="btn destructive" id="trash-go">Delete Cache</button>
+    </div>
+  </div>
 
   <div id="stage-wrap">
     <div id="stage"></div>

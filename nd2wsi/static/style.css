@@ -395,3 +395,28 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
   transition: width 0.25s ease;
 }
 #export-cell.done #export-fill { background: #30d158; }
+
+
+/* ---- cache trash button + confirm popover --------------------------------- */
+.tb-btn.tb-danger:hover { color: #ff453a; background: rgba(255, 69, 58, 0.12); }
+#trash-confirm {
+  position: absolute; top: 46px; right: 12px; z-index: 80; width: 264px;
+  padding: 12px; border-radius: 12px;
+  background: var(--material-strong);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  box-shadow: var(--window-shadow);
+}
+#trash-confirm .tc-text { font-size: 13px; color: var(--label); }
+#trash-confirm .tc-sub { font-size: 11px; color: var(--label-2); }
+#trash-confirm .tc-actions { display: flex; gap: 8px; margin-top: 11px; }
+#trash-confirm .tc-actions .btn { flex: 1; }
+.btn.destructive {
+  color: #fff; font-weight: 600;
+  background: linear-gradient(#ff6259, #e0352b);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.30),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.10),
+    0 0 0 0.5px rgba(0, 0, 0, 0.30),
+    0 1px 2px rgba(255, 69, 58, 0.35);
+}

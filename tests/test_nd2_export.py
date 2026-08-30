@@ -235,3 +235,89 @@ def test_export_progress_endpoint(fluor_nd2, tmp_path):
         assert unknown["state"] == "unknown"
     finally:
         httpd.shutdown()
+
+
+def test_convert_progress_and_trash(fluor_nd2, tmp_path):
+    """on_progress climbs to 1.0; /api/trash deletes the store, keeps the source."""
+    import json
+    import threading
+    import urllib.request
+
+    from nd2wsi.convert import convert
+    from nd2wsi.server import create_server
+
+    src_path, _ = fluor_nd2
+    store = tmp_path / "prog.ome.zarr"
+    seen = []
+    convert(src_path, store, progress=False, on_progress=seen.append)
+    assert seen and seen[-1] == 1.0
+    assert all(0.0 <= f <= 1.0 for f in seen)
+    assert seen == sorted(seen)  # monotonic
+
+    httpd = create_server(store, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        sid = json.loads(
+            urllib.request.urlopen(base + "/api/slides").read()
+        )["slides"][0]["sid"]
+        req = urllib.request.Request(
+            base + "/api/trash",
+            data=json.dumps({"sid": sid}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = json.loads(urllib.request.urlopen(req).read())
+        assert resp["ok"] and resp["freed"] > 0
+        assert resp["slides"] == []
+        assert not store.exists()  # pyramid gone
+        assert src_path.exists()  # source slide untouched
+        # trashing an unknown sid is a clean 404
+        req2 = urllib.request.Request(
+            base + "/api/trash",
+            data=json.dumps({"sid": "deadbeef"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(req2)
+            raise AssertionError("expected 404")
+        except urllib.error.HTTPError as e:
+            assert e.code == 404
+    finally:
+        httpd.shutdown()
+
+
+def test_open_reports_convert_progress(fluor_nd2, tmp_path):
+    """POST /api/open with a job id exposes converting->done via the progress route."""
+    import json
+    import shutil
+    import threading
+    import urllib.request
+
+    from nd2wsi.convert import convert
+    from nd2wsi.server import create_server
+
+    src_path, _ = fluor_nd2
+    # server needs at least one slide; give it a throwaway store
+    seed = tmp_path / "seed.ome.zarr"
+    convert(src_path, seed, progress=False)
+    fresh = tmp_path / "fresh.nd2"
+    shutil.copy(src_path, fresh)
+
+    httpd = create_server(seed, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        req = urllib.request.Request(
+            base + "/api/open",
+            data=json.dumps({"path": str(fresh), "job": "testjob1"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = json.loads(urllib.request.urlopen(req).read())
+        assert resp["sid"] and len(resp["slides"]) == 2
+        prog = json.loads(
+            urllib.request.urlopen(base + "/api/roi/progress?job=testjob1").read()
+        )
+        assert prog["state"] == "done" and prog["pct"] == 100
+        assert (tmp_path / "pyramid_fresh.ome.zarr").exists()
+    finally:
+        httpd.shutdown()
