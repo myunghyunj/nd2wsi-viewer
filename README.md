@@ -21,11 +21,11 @@
 
 ## Motivation
 
-I routinely look up two kinds of slides every week: MT and H&E scans from
-a Leica Aperio scanner, and immunofluorescence scans from a Nikon Ti2,
-saved as ND2 by NIS-Elements. The pathology slides open instantly in any
-WSI viewer. But I found my Mac struggling to open the ND2 files, and for a
-while I was just angry at the computer.
+I routinely look up two kinds of slides every week. MT and H&E scans come
+from a Leica Aperio scanner. Immunofluorescence scans come from a Nikon
+Ti2 and are saved as ND2 by NIS-Elements. The pathology slides open
+instantly in any WSI viewer. But I found my Mac struggling to open the
+ND2 files, and for a while I was just angry at the computer.
 
 Then I looked inside the files, and it turned out the computer was never
 the problem. An Aperio SVS is a pyramid of small tiles at several zoom
@@ -33,18 +33,18 @@ levels, so a viewer only reads the handful of tiles on screen. A stitched
 ND2 is one flat 5 GB image. Software that opens it has little choice but
 to drag the whole thing through memory, and no laptop enjoys that.
 
-That reframing points straight at the fix, because of which resource is
-actually scarce. RAM is fixed the day you buy the machine. Storage is the
-one thing you can always add, and an external SSD is cheap. So this viewer
-makes the trade on purpose: it converts the ND2 once into a tiled pyramid
-on disk and never loads the slide whole again. You pay roughly 70% of the
+Once you see it that way, the fix is obvious. RAM is fixed the day you
+buy the machine. Storage is the one thing you can always add, and an
+external SSD is cheap. So this viewer makes the trade on purpose. It
+converts the ND2 once into a tiled pyramid on disk and never loads the
+slide whole again. You pay roughly 70% of the
 file size in storage, and in return a 5 GB scan pans and zooms like a map
 on any Mac with room on its SSD. The cache lives next to the slide, so
 keep your slides on an external drive and the speed travels with it.
 
-One more thing, because pathology viewers all skip it: any region crops
-back out as a real ND2 that reopens in NIS-Elements with its calibration
-and channels intact.
+It also does the one thing pathology viewers skip. Any region crops back
+out as a real ND2 that reopens in NIS-Elements with its calibration and
+channels intact.
 
 <p align="center">
   <img src="docs/hero.png" alt="Two slides open in tabs, with serial measurements and a labeled box on a PDGFRb slide" width="900">
@@ -60,9 +60,9 @@ every zoom level, which is exactly the shape a deep-zoom viewer wants to
 read. It's an open standard, so the same `pyramid_*.ome.zarr` also opens
 in napari, vizarr, and QuPath.
 
-The pipeline is short: slide to OME-Zarr pyramid, pyramid to a local tile
-server, tile server to a deep-zoom viewer in a browser tab or the app
-window. Conversion happens once, next to the slide, with bounded memory
+The pipeline is short. A slide becomes an OME-Zarr pyramid, the pyramid
+feeds a local tile server, and the server feeds a deep-zoom viewer in a
+browser tab or the app window. Conversion happens once, next to the slide, with bounded memory
 and a progress bar. SVS files take the same path. The reader pulls the
 baseline level of the pyramidal TIFF through tifffile and takes the micron
 calibration from the Aperio MPP field.
@@ -74,9 +74,9 @@ nd2wsi view slide.nd2 another.svs
 # then opens the tabbed viewer at http://127.0.0.1:8000
 ```
 
-Don't want a terminal? `packaging/build_mac_app.sh` builds a
-double-clickable `nd2wsi-viewer.app` and a drag-to-Applications `.dmg`
-with everything bundled.
+If you would rather skip the terminal, `packaging/build_mac_app.sh`
+builds a double-clickable `nd2wsi-viewer.app` and a drag-to-Applications
+`.dmg` with everything bundled.
 
 ## Install
 
@@ -86,7 +86,7 @@ pip install ".[svs]"     # adds imagecodecs, for Aperio SVS
 pip install ".[app]"     # adds pywebview, for the native macOS window
 pip install ".[legacy]"  # adds imagecodecs, for pre-2012 JPEG2000 ND2
 
-# ND2 export uses limnd2, published on Laboratory Imaging's own index:
+# ND2 export uses limnd2, published on Laboratory Imaging's own index
 pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2
 ```
 
@@ -96,7 +96,7 @@ vendored, and viewing works offline.
 ## Commands
 
 ```text
-nd2wsi info    slide.nd2|.svs    # internal layout: chunk census, pyramid,
+nd2wsi info    slide.nd2|.svs    # chunk census, embedded pyramid,
                                  # compression, calibration, stage positions
 nd2wsi convert slide.nd2 [out.ome.zarr] [--tile 512] [--t N] [--z mid|max|N]
                                  [--position N] [--workers N] [--overwrite]
@@ -126,10 +126,10 @@ annotations. When you want the disk space back, the trashcan button in the
 toolbar deletes that slide's cache after a confirm. Your annotations and
 the source slide stay, and the slide simply re-converts on its next open.
 
-The look follows the macOS design language, with control geometry measured
-from Apple's macOS 27 UI kit: SF Pro and SF Mono type, translucent panels
-over the slide, capsule controls with specular edges. Each panel is a
-little mac window. Drag it by the title bar, resize it from any edge, and
+The look follows the macOS design language, with control geometry
+measured from Apple's macOS 27 UI kit. Expect SF Pro and SF Mono type,
+translucent panels over the slide, and capsule controls with specular
+edges. Each panel is a little mac window. Drag it by the title bar, resize it from any edge, and
 use the traffic lights to close, collapse, or zoom it. The viewer
 remembers where you put things.
 
@@ -171,9 +171,9 @@ and `Export` move the same plain JSON in and out.
   <br><sub>A selected region. The pixel and micron fields edit the box directly, and ND2 is the default export.</sub>
 </p>
 
-Press `R` and drag a rectangle. Need an exact size? Type it: the Pixels
-and Physical fields edit the region directly and stay in sync through the
-slide's calibration. The Move button (or `V`) turns the cursor into a hand
+Press `R` and drag a rectangle. To hit an exact size, type it into the
+Pixels or Physical fields. They edit the region directly and stay in sync
+through the slide's calibration. The Move button (or `V`) turns the cursor into a hand
 that slides the region around with its size locked. Exports always come
 out at native resolution, with a progress gauge in the status bar.
 
@@ -194,16 +194,18 @@ ND2 and TIFF stream, so any size works, the whole slide included.
   <br><sub>An Aperio SVS slide in the same viewer. A boxed vessel, a 111 &micro;m measurement, and the sidecar annotations loaded on open.</sub>
 </p>
 
-Brightfield H&E works with every tool above, unchanged. The demo slide is
-CMU-1-Small-Region.svs, an exported region of CMU-1.svs: H&E-stained skin
-tissue, brightfield, scanned at 20x on an Aperio ScanScope CS,
-JPEG-compressed, with a single pyramid level. It is OpenSlide
-freely-distributable test data from Carnegie Mellon University, released
-under the CC0 1.0 public domain dedication.
+Brightfield H&E works with every tool above, unchanged. The demo slide
+is CMU-1-Small-Region.svs, an exported region of CMU-1.svs. It shows
+H&E-stained skin tissue in brightfield, scanned at 20x on an Aperio
+ScanScope CS, JPEG-compressed, with a single pyramid level. It is
+OpenSlide freely-distributable test data from Carnegie Mellon University,
+released under the CC0 1.0 public domain dedication.
 
-* URL: https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/CMU-1-Small-Region.svs
-* SHA-256: ed92d5a9f2e86df67640d6f92ce3e231419ce127131697fbbce42ad5e002c8a7
-* Accessed: August 29, 2026
+| | |
+|---|---|
+| Source | https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/CMU-1-Small-Region.svs |
+| SHA-256 | ed92d5a9f2e86df67640d6f92ce3e231419ce127131697fbbce42ad5e002c8a7 |
+| Accessed | August 29, 2026 |
 
 ### Scripting
 
@@ -240,7 +242,7 @@ notarization.
 
 ## Inside a stitched ND2
 
-The question that started this project: does a stitched ND2 keep its
+This project started with a question. Does a stitched ND2 keep its
 acquisition tiles, or is it one flattened raster? Run `nd2wsi info` on
 your own files for the answer. On mine it was unambiguous.
 
@@ -263,9 +265,10 @@ the bridge between them.
 
 Five 20x "Scan Large Image" acquisitions from an ECLIPSE Ti2 with
 NIS-Elements AR 2022 (two-channel CY5 and DAPI uint16, 0.66 um/px, 1.4 to
-5.5 GB per file) all showed the same layout: exactly one uncompressed
-ImageDataSeq blob, no surviving tiles, no embedded pyramid. Conversion on
-an Apple-silicon laptop with 14 cores:
+5.5 GB per file) all showed the same layout. Each file holds exactly one
+uncompressed ImageDataSeq blob, with no surviving tiles and no embedded
+pyramid. The table shows conversion on an Apple-silicon laptop with 14
+cores.
 
 | slide (px)      | ND2    | convert | pyramid on disk |
 |-----------------|--------|---------|-----------------|
@@ -335,9 +338,9 @@ writer. The export tests skip when limnd2 is absent.
 
 ## Related work
 
-* **limnd2**, Laboratory Imaging's own Python ND2 SDK: reader, writer, and
-  OME-Zarr exporter. Its exporter loads whole frames, which breaks on
-  giant stitched scans. That gap is what this tool fills.
+* **limnd2** is Laboratory Imaging's own Python ND2 SDK, with a reader,
+  a writer, and an OME-Zarr exporter. Its exporter loads whole frames,
+  which breaks on giant stitched scans. That gap is what this tool fills.
 * **nis2pyr** converts ND2 to pyramidal OME-TIFF for viewing in QuPath.
 * **QuPath with Bio-Formats** opens ND2 directly, as a full analysis
   suite.
