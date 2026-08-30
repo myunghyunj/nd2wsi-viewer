@@ -290,9 +290,12 @@ cores.
 
 | slide (px)      | ND2    | convert | pyramid on disk |
 |-----------------|--------|---------|-----------------|
-| 19,029 x 19,171 | 1.4 GB |   7.3 s | 1.0 GB (7 levels) |
+| 19,029 x 19,171 | 1.4 GB |   1.9 s | 1.0 GB (7 levels) |
 | 20,064 x 34,271 | 2.6 GB |  15.1 s | 1.9 GB (8 levels) |
 | 53,144 x 27,799 | 5.5 GB |  49.2 s | 3.8 GB (8 levels) |
+
+The first row is 0.4.0, where it took 7.3 s before. The other two were
+timed on 0.3.1 and now run faster than shown.
 
 Two Aperio slides on the same laptop, both JPEG 2000 tiles at 240 px,
 scanned on a Leica Aperio. An SVS costs far more disk than an ND2 because
