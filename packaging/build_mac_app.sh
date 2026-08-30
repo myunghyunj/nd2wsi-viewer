@@ -37,7 +37,7 @@ echo "==> build venv ($BASEPY)"
 "$BASEPY" -m venv "$BUILD/venv"
 PY="$BUILD/venv/bin/python"
 "$PY" -m pip -q install --upgrade pip
-"$PY" -m pip -q install "$REPO" pyinstaller "pywebview>=5.0" "imagecodecs>=2023.9"
+"$PY" -m pip -q install "$REPO" pyinstaller "pywebview>=6.0" "imagecodecs>=2023.9"
 "$PY" -m pip -q install --index-url https://pypi.laboratory-imaging.com/simple limnd2 \
   || echo "warn: limnd2 unavailable — app will ship without ND2 export"
 "$PY" -c "import limnd2; print('   limnd2', limnd2.__version__, 'in build venv')" \

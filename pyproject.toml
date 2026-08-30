@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nd2wsi-viewer"
-version = "0.2.4"
+version = "0.2.5"
 description = "Nikon ND2 -> OME-Zarr pyramid -> browser slide viewer with native-resolution ROI export"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,7 +27,7 @@ test = ["pytest>=7"]
 # ND2 (re-)export -- limnd2 is on Laboratory Imaging's own index, so install
 # with: pip install ".[nd2export]" --extra-index-url https://pypi.laboratory-imaging.com/simple
 nd2export = ["limnd2>=0.4"]
-app = ["pywebview>=5.0"]           # native macOS shell (nd2wsi-viewer command)
+app = ["pywebview>=6.0"]           # native macOS shell (nd2wsi-viewer command)
 svs = ["imagecodecs>=2023.9"]      # JPEG tile decode for Aperio SVS input
 # synthetic test-data generation uses Laboratory Imaging's limnd2 writer,
 # which lives on their own package index -- see README ("Synthetic fixtures").

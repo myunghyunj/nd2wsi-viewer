@@ -21,10 +21,11 @@
 
 ## Motivation
 
-I look at two kinds of slides every week. H&E scans from a Leica Aperio
-scanner open instantly in any pathology viewer. My own ND2 scans from a
-Nikon Ti2 brought the same Mac to a crawl. For a while I was just angry at
-the computer.
+I routinely look up two kinds of slides every week: MT and H&E scans from
+a Leica Aperio scanner, and immunofluorescence scans from a Nikon Ti2,
+saved as ND2 by NIS-Elements. The pathology slides open instantly in any
+WSI viewer. But I found my Mac struggling to open the ND2 files, and for a
+while I was just angry at the computer.
 
 Then I looked inside the files, and it turned out the computer was never
 the problem. An Aperio SVS is a pyramid of small tiles at several zoom

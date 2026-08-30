@@ -47,6 +47,7 @@ async function init() {
 
   buildWindows();
   wireTrash();
+  wireDragForward();
   buildChannelPanel();
   buildLevelLamps();
   buildViewer();
@@ -1576,6 +1577,20 @@ function makeMacWindow(el, opts) {
 }
 
 /* ---- keys / misc ---------------------------------------------------------- */
+
+function wireDragForward() {
+  // a Finder drag that starts over the slide lands in this iframe's
+  // document; hand it to the shell, whose overlay (and the app's Python
+  // drop handler) can actually open the file
+  window.addEventListener("dragenter", (ev) => {
+    const types = ev.dataTransfer ? Array.from(ev.dataTransfer.types || []) : [];
+    if (types.includes("Files") && window.parent !== window) {
+      window.parent.postMessage({ nd2wsi: "file-drag" }, "*");
+    }
+  });
+  window.addEventListener("dragover", (ev) => ev.preventDefault());
+  window.addEventListener("drop", (ev) => ev.preventDefault());
+}
 
 function wireKeys() {
   window.addEventListener("keydown", (ev) => {

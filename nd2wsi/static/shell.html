@@ -76,12 +76,14 @@
   #empty .sub { color: var(--label-3); font-size: 13px; margin-top: 7px; }
   #empty .sub b { color: var(--label-2); font-weight: 600; }
 
-  body.over::after { content: ""; position: fixed; inset: 46px 8px 8px; z-index: 50;
+  #dropzone { position: fixed; inset: 0; z-index: 200; }
+  #dropzone::after { content: ""; position: fixed; inset: 46px 8px 8px;
     border-radius: 16px; border: 2px dashed rgba(10, 132, 255, 0.9);
     background: rgba(10, 132, 255, 0.06); pointer-events: none; }
 </style>
 </head>
 <body>
+<div id="dropzone" hidden></div>
 <div id="tabbar">
   <button id="newtab" title="Open another slide (.nd2 / .svs)">+</button>
 </div>
@@ -221,18 +223,34 @@ $("newtab").onclick = () => {
   }
 };
 
-window.addEventListener("dragover", (ev) => { ev.preventDefault(); document.body.classList.add("over"); });
-window.addEventListener("dragleave", () => document.body.classList.remove("over"));
-window.addEventListener("drop", (ev) => {
-  ev.preventDefault();
-  document.body.classList.remove("over");
-  if (!ev.dataTransfer.files.length) return;
-  const f = ev.dataTransfer.files[0];
-  openPath(f.pywebviewFullPath || f.path || f.name);
+/* Drag and drop. In the app, pywebview's Python side receives the real
+   file path and calls __pydrop. The overlay makes drops over the slide
+   iframes land on this document instead of the iframe's. */
+const zone = $("dropzone");
+window.__pydrop = (p) => { zone.hidden = true; openPath(p); };
+window.addEventListener("dragenter", (ev) => {
+  const types = ev.dataTransfer ? Array.from(ev.dataTransfer.types || []) : [];
+  if (types.includes("Files")) zone.hidden = false;
 });
+window.addEventListener("dragover", (ev) => ev.preventDefault());
+zone.addEventListener("dragleave", (ev) => {
+  if (ev.target === zone) zone.hidden = true;
+});
+zone.addEventListener("drop", (ev) => {
+  ev.preventDefault();
+  zone.hidden = true;
+  if (window.pywebview) return; // the Python handler delivers the path
+  const f = ev.dataTransfer.files[0];
+  const p = f && (f.pywebviewFullPath || f.path);
+  if (p) openPath(p);
+  else alert("Browsers hide dropped file paths. Use + and type the path, or use the macOS app.");
+});
+window.addEventListener("drop", (ev) => ev.preventDefault());
 
 window.addEventListener("message", (ev) => {
-  if (ev.data && ev.data.nd2wsi === "slide-trashed") refresh();
+  if (!ev.data) return;
+  if (ev.data.nd2wsi === "slide-trashed") refresh();
+  if (ev.data.nd2wsi === "file-drag") zone.hidden = false;
 });
 
 refresh();

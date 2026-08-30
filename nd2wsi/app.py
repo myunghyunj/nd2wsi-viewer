@@ -67,15 +67,15 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
       .catch(e => end('failed: ' + e));
   }
   drop.addEventListener('click', () => { if (!busy) go(pywebview.api.open_slide()); });
+  // pywebview 6 delivers dropped-file paths through a Python-side DOM
+  // handler, which calls __pydrop with the real path. The JS listeners
+  // below only run the visuals.
+  window.__pydrop = path => { if (!busy) go(pywebview.api.open_path(path)); };
   window.addEventListener('dragover', ev => { ev.preventDefault(); drop.classList.add('over'); });
   window.addEventListener('dragleave', () => drop.classList.remove('over'));
   window.addEventListener('drop', ev => {
     ev.preventDefault();
     drop.classList.remove('over');
-    if (busy || !ev.dataTransfer.files.length) return;
-    const f = ev.dataTransfer.files[0];
-    const path = f.pywebviewFullPath || f.path || f.name; // pywebview exposes the real path
-    go(pywebview.api.open_path(path));
   });
   window.addEventListener('pywebviewready', () => {
     pywebview.api.pending().then(p => { if (p) go(pywebview.api.open_slide()); });
@@ -93,6 +93,40 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
             on_status(f"building pyramid for {nd2_path.name} … (first open only)")
         convert(nd2_path, store, progress=False, on_progress=on_progress)
     return store
+
+
+def _wire_file_drop(window):
+    """Deliver Finder drops to the page.
+
+    pywebview 6 exposes a dropped file's real path only inside Python-side
+    DOM drop handlers (the native layer records paths only while such a
+    handler is registered). Page JS never sees pywebviewFullPath, so we
+    register here on every page load and hand the path to the page's
+    __pydrop function.
+    """
+    import json as _json
+
+    from webview.dom import DOMEventHandler
+
+    def on_drop(e):
+        files = (e.get("dataTransfer") or {}).get("files") or []
+        for f in files:
+            path = f.get("pywebviewFullPath")
+            if path:
+                window.evaluate_js(
+                    f"window.__pydrop && window.__pydrop({_json.dumps(path)})"
+                )
+                return
+
+    def attach(*_args):
+        try:
+            window.dom.document.events.drop += DOMEventHandler(
+                on_drop, prevent_default=True
+            )
+        except Exception:
+            pass  # not a document we control; the next load re-attaches
+
+    window.events.loaded += attach
 
 
 def start_server(store: Path):
@@ -249,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
     except (AttributeError, TypeError, KeyError):
         pass
     api = Api(initial)
-    webview.create_window(
+    window = webview.create_window(
         APP_NAME,
         html=BOOT_HTML,
         js_api=api,
@@ -258,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         min_size=(760, 520),
         background_color="#161618",
     )
+    _wire_file_drop(window)
     webview.start()
     return 0
 
