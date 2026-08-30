@@ -120,22 +120,63 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     return store
 
 
+_PENDING_OPENS: list = []
+_OPENS_LOCK = threading.Lock()
+_FLUSHER_ALIVE = False
+
+
 def _dispatch_open(paths):
-    """Route Finder-opened files into the current page, like a drop."""
+    """Queue Finder-opened files and deliver once the page can take them.
+
+    The open event can arrive on the AppKit main thread before the window
+    or its page exists. A synchronous evaluate_js there deadlocks startup,
+    so the event only queues the paths and a background thread hands them
+    to the page when __pydrop_multi is ready.
+    """
+    global _FLUSHER_ALIVE
+    if not paths:
+        return
+    with _OPENS_LOCK:
+        _PENDING_OPENS.extend(paths)
+        if _FLUSHER_ALIVE:
+            return
+        _FLUSHER_ALIVE = True
+    threading.Thread(target=_flush_opens, daemon=True).start()
+
+
+def _flush_opens():
     import json as _json
+    import time
 
     import webview
 
-    if not paths or not webview.windows:
-        return
+    global _FLUSHER_ALIVE
     try:
-        webview.windows[0].evaluate_js(
-            "window.__pydrop_multi ? window.__pydrop_multi(%s)"
-            " : (window.__pydrop && window.__pydrop(%s))"
-            % (_json.dumps(list(paths)), _json.dumps(paths[0]))
-        )
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if webview.windows:
+                try:
+                    ready = webview.windows[0].evaluate_js(
+                        "typeof window.__pydrop_multi"
+                    )
+                except Exception:
+                    ready = None
+                if ready == "function":
+                    with _OPENS_LOCK:
+                        batch, _PENDING_OPENS[:] = list(_PENDING_OPENS), []
+                    if batch:
+                        _dlog(f"flushing {len(batch)} queued open(s)")
+                        webview.windows[0].evaluate_js(
+                            f"window.__pydrop_multi({_json.dumps(batch)})"
+                        )
+                    return
+            time.sleep(0.3)
+        _dlog("flush_opens timed out")
     except Exception as e:
-        _dlog(f"dispatch_open failed: {e}")
+        _dlog(f"flush_opens failed: {e}")
+    finally:
+        with _OPENS_LOCK:
+            _FLUSHER_ALIVE = False
 
 
 def _install_open_files_handler():
@@ -154,13 +195,36 @@ def _install_open_files_handler():
             good = [p for p in paths if p.lower().endswith((".nd2", ".svs"))]
             if good:
                 _dispatch_open(good)
+            try:
+                # tell LaunchServices the open succeeded, or Finder shows a
+                # "could not be opened" alert even though the slide opened
+                app.replyToOpenOrPrint_(0)  # NSApplicationDelegateReplySuccess
+            except Exception as e:
+                _dlog(f"replyToOpenOrPrint failed: {e}")
 
-        method = objc.selector(
-            application_openFiles_,
-            selector=b"application:openFiles:",
-            signature=b"v@:@@",
+        def application_openFile_(self, app, filename):
+            _dlog(f"openFile event {filename}")
+            p = str(filename)
+            if p.lower().endswith((".nd2", ".svs")):
+                _dispatch_open([p])
+                return True
+            return False
+
+        objc.classAddMethods(
+            BrowserView.AppDelegate,
+            [
+                objc.selector(
+                    application_openFiles_,
+                    selector=b"application:openFiles:",
+                    signature=b"v@:@@",
+                ),
+                objc.selector(
+                    application_openFile_,
+                    selector=b"application:openFile:",
+                    signature=b"B@:@@",
+                ),
+            ],
         )
-        objc.classAddMethods(BrowserView.AppDelegate, [method])
         _dlog("openFiles handler installed")
     except Exception as e:
         _dlog(f"openFiles handler install failed: {e}")

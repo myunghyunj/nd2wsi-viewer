@@ -46,7 +46,6 @@ PY="$BUILD/venv/bin/python"
 echo "==> pyinstaller"
 "$BUILD/venv/bin/pyinstaller" \
   --noconfirm --windowed --name "$APPNAME" \
-  --argv-emulation \
   --icon "$HERE/AppIcon.icns" \
   --osx-bundle-identifier "com.nd2wsi.viewer" \
   --collect-all nd2wsi \
