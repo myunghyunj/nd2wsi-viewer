@@ -13,23 +13,37 @@
   <img src="https://img.shields.io/badge/macOS-13%2B-1d1d1f?style=flat-square&logo=apple&logoColor=white" alt="macOS 13+">
   <img src="https://img.shields.io/badge/python-3.10%2B-0A84FF?style=flat-square" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/formats-.nd2%20%C2%B7%20.svs-30D158?style=flat-square" alt="ND2 + SVS">
-  <img src="https://img.shields.io/badge/tests-16%20passing-8E8E93?style=flat-square" alt="tests">
+  <img src="https://img.shields.io/badge/tests-19%20passing-8E8E93?style=flat-square" alt="tests">
   <img src="https://img.shields.io/badge/license-MIT-8E8E93?style=flat-square" alt="MIT">
 </p>
 
 ---
 
-## Why this exists
+## Motivation
 
-A pathology viewer opens a two-gigabyte H&E slide in a second. You fly out
-to the whole section, dive to a single nucleus, and never wait. Nikon's NIS
-viewers give stitched ND2 scans no such treatment, and NIS-Elements does
-not run on a Mac. I scan slides on a Ti2, read H&E slides from Aperio
-scanners, and work on a Mac, so I built the viewer I wanted.
+I look at two kinds of slides every week. H&E scans from a Leica Aperio
+scanner open instantly in any pathology viewer. My own ND2 scans from a
+Nikon Ti2 brought the same Mac to a crawl. For a while I was just angry at
+the computer.
 
-It also does the one thing pathology viewers skip. It crops any region back
-out as a real ND2 that reopens in NIS-Elements with its calibration and
-channels intact.
+Then I looked inside the files, and it turned out the computer was never
+the problem. An Aperio SVS is a pyramid of small tiles at several zoom
+levels, so a viewer only reads the handful of tiles on screen. A stitched
+ND2 is one flat 5 GB image. Software that opens it has little choice but
+to drag the whole thing through memory, and no laptop enjoys that.
+
+That reframing points straight at the fix, because of which resource is
+actually scarce. RAM is fixed the day you buy the machine. Storage is the
+one thing you can always add, and an external SSD is cheap. So this viewer
+makes the trade on purpose: it converts the ND2 once into a tiled pyramid
+on disk and never loads the slide whole again. You pay roughly 70% of the
+file size in storage, and in return a 5 GB scan pans and zooms like a map
+on any Mac with room on its SSD. The cache lives next to the slide, so
+keep your slides on an external drive and the speed travels with it.
+
+One more thing, because pathology viewers all skip it: any region crops
+back out as a real ND2 that reopens in NIS-Elements with its calibration
+and channels intact.
 
 <p align="center">
   <img src="docs/hero.png" alt="Two slides open in tabs, with serial measurements and a labeled box on a PDGFRb slide" width="900">
@@ -38,13 +52,19 @@ channels intact.
 
 ## How it works
 
-The pipeline is short: slide to OME-Zarr pyramid, pyramid to local tile
-server, tile server to deep-zoom viewer. The pyramid is built once, next to
-the slide, with bounded memory. After that a five-gigabyte scan pans and
-zooms fluidly, because the viewer touches only the tiles on screen. An SVS
-file takes the same path. The reader pulls the baseline level of the
-pyramidal TIFF through tifffile and takes the micron calibration from the
-Aperio MPP field.
+The pyramid format is [OME-Zarr](https://ngff.openmicroscopy.org/), the
+bioimaging community's next-generation pyramidal format. Instead of one
+giant blob, the image lives as thousands of small compressed chunks at
+every zoom level, which is exactly the shape a deep-zoom viewer wants to
+read. It's an open standard, so the same `pyramid_*.ome.zarr` also opens
+in napari, vizarr, and QuPath.
+
+The pipeline is short: slide to OME-Zarr pyramid, pyramid to a local tile
+server, tile server to a deep-zoom viewer in a browser tab or the app
+window. Conversion happens once, next to the slide, with bounded memory
+and a progress bar. SVS files take the same path. The reader pulls the
+baseline level of the pyramidal TIFF through tifffile and takes the micron
+calibration from the Aperio MPP field.
 
 ```
 pip install .
@@ -53,9 +73,9 @@ nd2wsi view slide.nd2 another.svs
 # then opens the tabbed viewer at http://127.0.0.1:8000
 ```
 
-To skip the terminal, run `packaging/build_mac_app.sh`. It produces a
-double-clickable `nd2wsi-viewer.app` and a drag-to-Applications `.dmg` with
-everything bundled.
+Don't want a terminal? `packaging/build_mac_app.sh` builds a
+double-clickable `nd2wsi-viewer.app` and a drag-to-Applications `.dmg`
+with everything bundled.
 
 ## Install
 
@@ -69,7 +89,7 @@ pip install ".[legacy]"  # adds imagecodecs, for pre-2012 JPEG2000 ND2
 pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2
 ```
 
-Python 3.10 or newer. The server is stdlib http.server, OpenSeadragon is
+Python 3.10 or newer. The server is stdlib `http.server`, OpenSeadragon is
 vendored, and viewing works offline.
 
 ## Commands
@@ -95,19 +115,22 @@ and the stage position with `--position`. RGB slides are stored as C=3.
 ## The viewer
 
 The root page is a browser-style tab strip. Each slide gets a tab, the `+`
-button opens another, and dropping a file onto the window works too. Each
-tab keeps its own viewer state while open.
+button opens another, and you can just drop a file onto the window. Every
+tab keeps its own viewer state while open. A first-time open shows the
+conversion progress right in the tab.
 
-The files created next to a slide name themselves. `pyramid_<slide>.ome.zarr`
-holds the viewing cache and `annotations_<slide>.json` holds the
-annotations. Older unprefixed names still load and migrate.
+Files created next to a slide name themselves. `pyramid_<slide>.ome.zarr`
+holds the viewing cache and `annotations_<slide>.json` holds your
+annotations. When you want the disk space back, the trashcan button in the
+toolbar deletes that slide's cache after a confirm. Your annotations and
+the source slide stay, and the slide simply re-converts on its next open.
 
-The design follows the macOS design language, with control values measured
+The look follows the macOS design language, with control geometry measured
 from Apple's macOS 27 UI kit: SF Pro and SF Mono type, translucent panels
-over the slide, capsule controls with specular edges, and kit-geometry
-switches. Each panel is a small mac window. Drag it by the title bar,
-resize it from any edge, and use the traffic lights to close, collapse, or
-zoom it. The viewer remembers the geometry.
+over the slide, capsule controls with specular edges. Each panel is a
+little mac window. Drag it by the title bar, resize it from any edge, and
+use the traffic lights to close, collapse, or zoom it. The viewer
+remembers where you put things.
 
 ### Channels and LUTs
 
@@ -116,13 +139,12 @@ zoom it. The viewer remembers the geometry.
   <br><sub>Two-channel immunofluorescence (CY5 and DAPI). The histograms grow when you widen the window.</sub>
 </p>
 
-Every channel shows its intensity histogram in the channel color, in the
-layout of the NIS-Elements LUTs panel. The black and white triangles set
-the display window in raw counts. The knob on the mapping curve sets gamma,
-from 0.25 to 4, and gamma above 1 brightens midtones. `Auto` stretches the
-window to the 0.1 to 99.9 percentile of the histogram. Shift-drag moves all
-channels together. Each channel has a reset and an on-off switch, and the
-viewer handles any channel count.
+Every channel gets its intensity histogram in the channel color, laid out
+like the NIS-Elements LUTs panel. The black and white triangles set the
+display window in raw counts. The knob on the curve sets gamma, from 0.25
+to 4, and gamma above 1 brightens midtones. `Auto` stretches the window to
+the 0.1 to 99.9 percentile. Shift-drag moves all channels together. Each
+channel has a reset and an on-off switch, and any channel count works.
 
 ### Measure and annotate
 
@@ -131,15 +153,15 @@ viewer handles any channel count.
   <br><sub>A CD31 slide with pins on ring-shaped vessel profiles, a 354 &micro;m distance, and a boxed field. The sidecar loaded all of it on open.</sub>
 </p>
 
-Press `M` and drag to measure a distance in microns. The math uses the
-file's own pixel calibration and respects anisotropic pixels. Press `P` to
-drop a pin or `B` to draw a box, and type a note on either. The colored dot
-beside each list item cycles it through the Apple system palette. Clicking
-an item flies to it.
+Press `M` and drag to measure a distance in microns, using the file's own
+pixel calibration (anisotropic pixels included). Press `P` to drop a pin
+or `B` to draw a box, and type a note on either. The colored dot beside
+each list item cycles through the Apple system palette. Click an item and
+the view flies to it.
 
-Annotations save themselves to `annotations_<slide>.json` beside the slide,
-never into the ND2. The next open finds the file again, and `Open` and
-`Export` move the same plain JSON in and out.
+Annotations save themselves to `annotations_<slide>.json` beside the
+slide, never into the ND2. The next open finds the file again, and `Open`
+and `Export` move the same plain JSON in and out.
 
 ### Region export
 
@@ -148,13 +170,13 @@ never into the ND2. The next open finds the file again, and `Open` and
   <br><sub>A selected region. The pixel and micron fields edit the box directly, and ND2 is the default export.</sub>
 </p>
 
-Press `R` and drag a rectangle. To hit an exact size, type it: the Pixels
+Press `R` and drag a rectangle. Need an exact size? Type it: the Pixels
 and Physical fields edit the region directly and stay in sync through the
 slide's calibration. The Move button (or `V`) turns the cursor into a hand
-that drags the region across the slide with its size locked. Exports come
-out at native resolution in four formats.
+that slides the region around with its size locked. Exports always come
+out at native resolution, with a progress gauge in the status bar.
 
-* **ND2**, the default. A real, uncompressed ND2 that carries the source
+* **ND2**, the default. A real, uncompressed ND2 carrying the source
   calibration, channel names, colors, and objective magnification. It
   reopens in NIS-Elements and round-trips through this tool.
 * **TIFF**. Raw pixel values in the original dtype, tiled, with the pixel
@@ -184,11 +206,12 @@ under the CC0 1.0 public domain dedication.
 
 ### Scripting
 
-Everything the UI does is plain HTTP.
+Everything the UI does is plain HTTP, so you can script it.
 
 ```
 GET  /api/slides                 open slides and their ids
 POST /api/open                   {"path": ...} converts if needed, adds a tab
+POST /api/trash                  {"sid": ...} deletes a slide's pyramid cache
 GET  /s/<sid>/api/info
 GET  /s/<sid>/api/histogram
 GET  /s/<sid>/api/tile/{level}/{x}/{y}.jpg?c=0,2&win=399:1057,220:2366:2.0
@@ -197,31 +220,33 @@ GET  /s/<sid>/api/annotations    sidecar contents
 POST /s/<sid>/api/annotations    {"items": [...]} writes the sidecar atomically
 ```
 
-Bare `/api/...` addresses the first slide, which keeps single-slide scripts
-simple. `win` takes one `lo:hi[:gamma]` slot per channel, and an empty slot
-keeps the stored default.
+Bare `/api/...` addresses the first slide, which keeps single-slide
+scripts simple. `win` takes one `lo:hi[:gamma]` slot per channel, and an
+empty slot keeps the stored default.
 
 ## The macOS app
 
 `nd2wsi-viewer` wraps the same server in a native WKWebView window. It
-opens to a black drop target. Drop an `.nd2` or `.svs`, or click to browse.
-The first open builds the pyramid, and the viewer loads from an ephemeral
-localhost port.
+opens to a black drop target. Drop an `.nd2` or `.svs`, or click to
+browse. The first open builds the pyramid with a progress bar, then the
+viewer loads from an ephemeral localhost port.
 
 `packaging/build_mac_app.sh` bundles Python and every dependency with
-PyInstaller, signs the bundle ad hoc, self-tests it headlessly, and wraps
-it in a `.dmg`. Ad-hoc signing suits direct hand-offs. Public distribution
-also needs a Developer ID and notarization.
+PyInstaller, signs the bundle ad hoc, self-tests it headlessly (including
+a real ND2 export), and wraps it in a `.dmg`. Ad-hoc signing is fine for
+handing to colleagues. Public distribution also needs a Developer ID and
+notarization.
 
 ## Inside a stitched ND2
 
 The question that started this project: does a stitched ND2 keep its
-acquisition tiles, or is it one flattened raster? Run `nd2wsi info` on your
-own files for the answer. On ours it was unambiguous.
+acquisition tiles, or is it one flattened raster? Run `nd2wsi info` on
+your own files for the answer. On mine it was unambiguous.
 
 * A modern ND2 stores pixel data as one ImageDataSeq blob per frame and
   never splits a frame spatially. A stitched scan is a single frame, so it
-  is one contiguous raster. The acquisition tiles do not survive stitching.
+  is one contiguous raster. The acquisition tiles do not survive
+  stitching.
 * An uncompressed ND2 is efficiently seekable. The reader hands out
   zero-copy views onto a memory map, so cropping a small ROI from a
   multi-gigabyte slide touches only the pages it needs. Files saved with
@@ -229,9 +254,9 @@ own files for the answer. On ours it was unambiguous.
 * Multipoint files saved unstitched keep per-tile frames and micron stage
   positions. The tiles are addressable, and stitching becomes your job.
 
-The slide is flat but seekable. Interactive viewing needs a pyramid and a
-tile protocol, which OME-Zarr and OpenSeadragon supply. This tool is the
-bridge between them.
+So the slide is flat but seekable. Interactive viewing needs a pyramid
+and a tile protocol, which OME-Zarr and OpenSeadragon supply. This tool is
+the bridge between them.
 
 ## Measured on real Ti2 scans
 
@@ -256,17 +281,19 @@ colors, and objective magnification carried over.
 
 ## Tests
 
-pytest runs 16 tests. They verify that ND2 exports round-trip pixel-exact
+pytest runs 19 tests. They verify that ND2 exports round-trip pixel-exact
 through the independent nd2 reader with calibration and channel metadata
-preserved, that three-channel files convert, render histograms, and export,
-that the annotation sidecar survives a GET and POST round-trip on disk,
-that multi-slide routing serves each slide and closes cleanly, and that the
-LUT parsing and compositing math behave. The stores also open in the
-official ome-zarr-py reader, so napari and vizarr read them directly.
+preserved, that three-channel files convert, render histograms, and
+export, that the annotation sidecar survives a GET and POST round-trip on
+disk, that multi-slide routing serves each slide and closes cleanly, that
+conversion progress climbs monotonically to done, that the cache trashcan
+deletes only the pyramid and never the source, and that the LUT parsing
+and compositing math behave. The stores also open in the official
+ome-zarr-py reader, so napari and vizarr read them directly.
 
 `scripts/make_synthetic_nd2.py` generates fixtures with the same internal
-shape as real stitched scans, using Laboratory Imaging's own limnd2 writer.
-The export tests skip when limnd2 is absent.
+shape as real stitched scans, using Laboratory Imaging's own limnd2
+writer. The export tests skip when limnd2 is absent.
 
 ## Architecture
 
@@ -286,8 +313,8 @@ The export tests skip when limnd2 is absent.
   computes each further level as a 2x2 mean of the one before it, so
   memory never depends on slide size.
 * `render.py` composites tiles and streams ROI exports.
-* `export_nd2.py` writes ROIs back to ND2 through limnd2, one 512-row band
-  at a time.
+* `export_nd2.py` writes ROIs back to ND2 through limnd2, one 512-row
+  band at a time.
 * `server.py` and `static/` serve the tabs, the tiles, and the viewer.
 
 ## Limitations
@@ -308,10 +335,11 @@ The export tests skip when limnd2 is absent.
 ## Related work
 
 * **limnd2**, Laboratory Imaging's own Python ND2 SDK: reader, writer, and
-  OME-Zarr exporter. Its exporter loads whole frames, which breaks on giant
-  stitched scans. That gap is what this tool fills.
+  OME-Zarr exporter. Its exporter loads whole frames, which breaks on
+  giant stitched scans. That gap is what this tool fills.
 * **nis2pyr** converts ND2 to pyramidal OME-TIFF for viewing in QuPath.
-* **QuPath with Bio-Formats** opens ND2 directly, as a full analysis suite.
+* **QuPath with Bio-Formats** opens ND2 directly, as a full analysis
+  suite.
 * **bioformats2raw** converts ND2 to OME-Zarr on the JVM.
 * **large-image-source-nd2** is Kitware's ND2 tile source for Girder.
 
