@@ -46,6 +46,7 @@ PY="$BUILD/venv/bin/python"
 echo "==> pyinstaller"
 "$BUILD/venv/bin/pyinstaller" \
   --noconfirm --windowed --name "$APPNAME" \
+  --argv-emulation \
   --icon "$HERE/AppIcon.icns" \
   --osx-bundle-identifier "com.nd2wsi.viewer" \
   --collect-all nd2wsi \
@@ -62,6 +63,49 @@ echo "==> pyinstaller"
   --collect-all webview \
   --distpath "$OUT" --workpath "$BUILD/pyi" --specpath "$BUILD" \
   "$HERE/launch.py"
+
+echo "==> document types (Finder Open With)"
+"$PY" - "$OUT/$APPNAME.app/Contents/Info.plist" << 'PLISTEOF'
+import plistlib
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as fh:
+    info = plistlib.load(fh)
+
+info["UTImportedTypeDeclarations"] = [
+    {
+        "UTTypeIdentifier": "com.nikon.nis-elements.nd2",
+        "UTTypeDescription": "Nikon NIS-Elements ND2 image",
+        "UTTypeConformsTo": ["public.data"],
+        "UTTypeTagSpecification": {"public.filename-extension": ["nd2"]},
+    },
+    {
+        "UTTypeIdentifier": "com.aperio.svs",
+        "UTTypeDescription": "Aperio SVS whole-slide image",
+        "UTTypeConformsTo": ["public.data"],
+        "UTTypeTagSpecification": {"public.filename-extension": ["svs"]},
+    },
+]
+info["CFBundleDocumentTypes"] = [
+    {
+        "CFBundleTypeName": "Nikon ND2 slide scan",
+        "LSItemContentTypes": ["com.nikon.nis-elements.nd2"],
+        "CFBundleTypeRole": "Viewer",
+        "LSHandlerRank": "Default",
+    },
+    {
+        "CFBundleTypeName": "Aperio SVS slide",
+        "LSItemContentTypes": ["com.aperio.svs"],
+        "CFBundleTypeRole": "Viewer",
+        "LSHandlerRank": "Default",
+    },
+]
+
+with open(path, "wb") as fh:
+    plistlib.dump(info, fh)
+print("   document types declared")
+PLISTEOF
 
 echo "==> codesign (ad-hoc)"
 codesign --force --deep -s - "$OUT/$APPNAME.app"

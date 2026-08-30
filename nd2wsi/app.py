@@ -120,6 +120,52 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     return store
 
 
+def _dispatch_open(paths):
+    """Route Finder-opened files into the current page, like a drop."""
+    import json as _json
+
+    import webview
+
+    if not paths or not webview.windows:
+        return
+    try:
+        webview.windows[0].evaluate_js(
+            "window.__pydrop_multi ? window.__pydrop_multi(%s)"
+            " : (window.__pydrop && window.__pydrop(%s))"
+            % (_json.dumps(list(paths)), _json.dumps(paths[0]))
+        )
+    except Exception as e:
+        _dlog(f"dispatch_open failed: {e}")
+
+
+def _install_open_files_handler():
+    """Accept Finder's open events (double-click, Open With) while running.
+
+    pywebview's cocoa delegate does not implement application:openFiles:,
+    so we add the method to its class before the app starts.
+    """
+    try:
+        import objc
+        from webview.platforms.cocoa import BrowserView
+
+        def application_openFiles_(self, app, filenames):
+            paths = [str(f) for f in filenames]
+            _dlog(f"openFiles event {paths}")
+            good = [p for p in paths if p.lower().endswith((".nd2", ".svs"))]
+            if good:
+                _dispatch_open(good)
+
+        method = objc.selector(
+            application_openFiles_,
+            selector=b"application:openFiles:",
+            signature=b"v@:@@",
+        )
+        objc.classAddMethods(BrowserView.AppDelegate, [method])
+        _dlog("openFiles handler installed")
+    except Exception as e:
+        _dlog(f"openFiles handler install failed: {e}")
+
+
 def _wire_file_drop(window):
     """Deliver Finder drops to the page.
 
@@ -367,6 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         background_color="#161618",
     )
     _wire_file_drop(window)
+    _install_open_files_handler()
     webview.start()
     return 0
 
