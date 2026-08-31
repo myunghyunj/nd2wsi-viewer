@@ -64,13 +64,20 @@ echo "==> pyinstaller"
   "$HERE/launch.py"
 
 echo "==> document types (Finder Open With)"
-"$PY" - "$OUT/$APPNAME.app/Contents/Info.plist" << 'PLISTEOF'
+"$PY" - "$OUT/$APPNAME.app/Contents/Info.plist" "$REPO/pyproject.toml" << 'PLISTEOF'
 import plistlib
+import re
 import sys
 
 path = sys.argv[1]
 with open(path, "rb") as fh:
     info = plistlib.load(fh)
+
+# Finder's Get Info reads these; PyInstaller leaves them at 0.0.0
+pyproject = open(sys.argv[2]).read()
+version = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+info["CFBundleShortVersionString"] = version
+info["CFBundleVersion"] = version
 
 info["UTImportedTypeDeclarations"] = [
     {
