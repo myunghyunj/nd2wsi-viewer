@@ -87,9 +87,9 @@
       <div class="win-body">
         <div class="tool-row">
           <button id="roi-toggle" class="btn grow2" title="Drag on the slide to mark a region (R)">Select Region</button>
-          <button id="roi-move" class="btn" disabled title="Drag to move the region (V)">&#128400; Move</button>
+          <button id="roi-full" class="btn" title="Mark the whole slide, for a downscaled JPEG or PNG of everything">Whole Slide</button>
         </div>
-        <div class="hint" id="roi-hint">Drag on the slide to mark a region.</div>
+        <div class="hint" id="roi-hint">Drag on the slide, or take the whole slide.</div>
         <div id="roi-detail">
           <div class="roi-line"><span class="k">Pixels</span><span class="v dims">
             <input id="roi-px-w" class="dim" inputmode="numeric" title="Width in pixels" />
@@ -112,7 +112,7 @@
             <button id="roi-dl-jpg" class="btn" title="Rendered as displayed">JPEG</button>
           </div>
           <div class="tool-row">
-            <button id="roi-full" class="btn" title="Mark the whole slide, for a downscaled JPEG or PNG of everything">Whole Slide</button>
+            <button id="roi-move" class="btn" disabled title="Drag to move the region (V)">&#128400; Move</button>
             <button id="roi-clear" class="btn">Clear Region</button>
           </div>
         </div>
