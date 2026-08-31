@@ -718,7 +718,7 @@ function wireTools() {
           x1: startImg.x, y1: startImg.y, x2: endImg.x, y2: endImg.y,
           text: "",
         });
-        // stay armed: rulers are usually taken in series
+        setTool(null); // hand the mouse back for panning and zooming
       }
       renderAnnotations();
     } else if (tool === "box") {
@@ -1316,6 +1316,14 @@ function applyTheme(t) {
 function wireTheme() {
   let t = "dark";
   try { t = localStorage.getItem("nd2wsi.theme") || "dark"; } catch (e) { /* ok */ }
+  // H&E and MT are read on white, so a brightfield slide brings the light
+  // theme with it when it opens. The toggle still has the last word.
+  if (state.info && state.info.rgb && t !== "light") {
+    t = "light";
+    if (window.parent !== window) {
+      window.parent.postMessage({ nd2wsi: "theme", theme: t }, "*");
+    }
+  }
   applyTheme(t);
   $("tb-theme").onclick = () => {
     const next = currentTheme() === "light" ? "dark" : "light";
@@ -1354,14 +1362,29 @@ function wireTrash() {
   $("trash-go").onclick = () => {
     const m = location.pathname.match(/\/s\/([0-9a-f]{8})\//);
     if (!m) { hide(); showToast("cannot resolve slide id"); return; }
-    $("trash-go").disabled = true;
+    const go = $("trash-go");
+    const label = go.textContent;
+    go.disabled = true;
+    // a store is hundreds of thousands of small files, and on a USB disk
+    // that takes minutes, so the button carries the count while it runs
+    const job = Math.random().toString(36).slice(2, 10);
+    const timer = setInterval(() => {
+      fetch("/api/roi/progress?job=" + job, { cache: "no-store" })
+        .then((r) => r.json())
+        .then((d) => {
+          if (d.state === "deleting") go.textContent = "Deleting… " + (d.pct || 0) + " %";
+        })
+        .catch(() => {});
+    }, 400);
+    const stop = () => { clearInterval(timer); go.textContent = label; };
     fetch("/api/trash", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sid: m[1] }),
+      body: JSON.stringify({ sid: m[1], job }),
     })
       .then((r) => r.json())
       .then((d) => {
+        stop();
         if (d.error) throw new Error(d.error);
         showToast("cache deleted — freed " + fmtBytes(d.freed || 0));
         setTimeout(() => {
@@ -1373,7 +1396,8 @@ function wireTrash() {
         }, 900);
       })
       .catch((e) => {
-        $("trash-go").disabled = false;
+        stop();
+        go.disabled = false;
         hide();
         showToast("could not delete cache: " + e.message);
       });
@@ -1413,6 +1437,7 @@ function buildWindows() {
       maxW: 420,
       zoomW: 340,
       toolbarBtn: $("tb-region"),
+      startClosed: true, // a slide opens with the channels alone
     }),
     annot: makeMacWindow($("win-annot"), {
       key: "annot",
@@ -1427,6 +1452,7 @@ function buildWindows() {
       maxW: 420,
       zoomW: 340,
       toolbarBtn: $("tb-annot"),
+      startClosed: true,
     }),
   };
   window.addEventListener("resize", () => {
@@ -1440,10 +1466,15 @@ function makeMacWindow(el, opts) {
   const titlebar = el.querySelector(".win-titlebar");
   const store = "nd2wsi.win." + opts.key;
 
-  let st = { rect: opts.def(), collapsed: false, hidden: false, zoomRestore: null };
+  let st = {
+    rect: opts.def(),
+    collapsed: false,
+    hidden: !!opts.startClosed,
+    zoomRestore: null,
+  };
   try {
     // geometry and collapse persist; "closed" is session-only, so panels
-    // always come back on the next launch (macOS palette behavior)
+    // come back in their opening state on the next launch
     const saved = JSON.parse(localStorage.getItem(store) || "null");
     if (saved && saved.rect) {
       st.rect = saved.rect;

@@ -109,23 +109,58 @@ class ViewerState:
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
 
 
+def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
+    """Lift annotation sidecars out of ``folder`` before it is deleted.
+
+    Annotations belong beside the slide, but a store built by an older
+    version may hold them, and they are work rather than cache. Returns the
+    files moved to safety.
+    """
+    import shutil
+
+    folder, home = Path(folder), Path(home)
+    saved = []
+    for path in folder.rglob("annotations_*.json"):
+        target = home / path.name
+        if target.exists():
+            continue
+        try:
+            shutil.move(str(path), str(target))
+        except OSError:
+            continue
+        saved.append(target)
+    return saved
+
+
 class ConversionDeclined(Exception):
     """Raised when the caller answered no to building a pyramid."""
 
 
 def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
-    """Annotations live in ``annotations_<slide>.json`` next to the pyramid
-    store -- self-describing, and found automatically on the next open.
-    (Older ``<slide>.annotations.json`` sidecars are migrated silently.)"""
+    """Annotations live in ``annotations_<slide>.json`` beside the slide.
+
+    They are your work, not cache, so they stay out of the ``pyramids``
+    folder and survive emptying it. Sidecars written by older versions, or
+    left inside the cache folder, are moved here on open.
+    """
+    from .convert import CACHE_DIR_NAME
+
     store_path = Path(store_path).resolve()
     stem = Path(attrs["nd2wsi"]["source"]).stem
-    new = store_path.parent / f"annotations_{stem}.json"
-    old = store_path.parent / f"{stem}.annotations.json"
-    if old.exists() and not new.exists():
-        try:
-            old.rename(new)
-        except OSError:
-            return old
+    home = store_path.parent
+    if home.name == CACHE_DIR_NAME:
+        home = home.parent
+    new = home / f"annotations_{stem}.json"
+    for old in (
+        store_path.parent / f"annotations_{stem}.json",
+        home / f"{stem}.annotations.json",
+        store_path.parent / f"{stem}.annotations.json",
+    ):
+        if old != new and old.exists() and not new.exists():
+            try:
+                old.rename(new)
+            except OSError:
+                return old
     return new
 
 
@@ -190,12 +225,15 @@ class SlideRegistry:
         with self._lock:
             return self.slides.pop(sid, None) is not None
 
-    def trash_cache(self, sid: str) -> int:
+    def trash_cache(self, sid: str, on_progress=None) -> int:
         """Close the slide and delete its pyramid store. Returns bytes freed.
 
-        Deletes only the registered store directory, never the source slide.
+        Deletes only the registered store directory, never the source slide,
+        and never an annotation sidecar that ended up inside it. A store is
+        hundreds of thousands of small files, so the caller gets a fraction
+        as the files go.
         """
-        import shutil
+        import os
 
         with self._lock:
             st = self.slides.get(sid)
@@ -204,11 +242,45 @@ class SlideRegistry:
             store = Path(getattr(st, "store_path", ""))
             if not (store.is_dir() and store.name.endswith(".ome.zarr")):
                 raise ValueError(f"refusing to delete {store}: not a pyramid store")
-            freed = sum(
-                f.stat().st_size for f in store.rglob("*") if f.is_file()
-            )
             self.slides.pop(sid, None)
-        shutil.rmtree(store)
+
+        from .convert import CACHE_DIR_NAME
+
+        home = store.parent
+        if home.name == CACHE_DIR_NAME:
+            home = home.parent  # annotations belong beside the slide
+        rescue_annotations(store, home)
+        victims = []
+        freed = 0
+        for root, _, files in os.walk(store):
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    freed += os.stat(path).st_size
+                except OSError:
+                    pass
+                victims.append(path)
+        total = max(1, len(victims))
+        step = max(1, total // 100)  # a hundred ticks, whatever the store size
+        for i, path in enumerate(victims):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            if on_progress and i % step == 0:
+                on_progress(i / total)
+        for root, dirs, _ in os.walk(store, topdown=False):
+            for d in dirs:
+                try:
+                    os.rmdir(os.path.join(root, d))
+                except OSError:
+                    pass
+        try:
+            store.rmdir()
+        except OSError:
+            pass
+        if on_progress:
+            on_progress(1.0)
         return freed
 
     def default_sid(self) -> str | None:
@@ -386,8 +458,20 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
             except (ValueError, json.JSONDecodeError) as e:
                 return self._error(400, str(e))
             sid = data.get("sid") if isinstance(data, dict) else None
+            job = data.get("job") if isinstance(data, dict) else None
+            if job and not JOB_RE.match(str(job)):
+                job = None
+            on_progress = None
+            if job:
+                _job_update(job, state="deleting", pct=0)
+
+                def on_progress(frac: float) -> None:
+                    _job_update(job, state="deleting", pct=int(min(1.0, frac) * 100))
+
             try:
-                freed = registry.trash_cache(sid or "")
+                freed = registry.trash_cache(sid or "", on_progress=on_progress)
+                if job:
+                    _job_update(job, state="done", pct=100)
             except KeyError:
                 return self._error(404, f"no open slide {sid}")
             except (ValueError, OSError) as e:

@@ -102,3 +102,88 @@ def test_svs_aperio_meta_parsing():
     assert meta["mpp"] == 0.4990 and meta["magnification"] == 20.0
     assert _aperio_meta("no metadata here") == {}
     assert is_svs("a/b/slide.SVS") and not is_svs("x.nd2")
+
+
+def test_default_store_path_collects_caches_in_one_folder(tmp_path):
+    from nd2wsi.convert import default_store_path
+
+    slide = tmp_path / "23-12089.nd2"
+    slide.write_bytes(b"")
+    assert default_store_path(slide) == tmp_path / "pyramids" / "23-12089.ome.zarr"
+
+    legacy = tmp_path / "pyramid_23-12089.ome.zarr"
+    legacy.mkdir()
+    assert default_store_path(slide) == legacy  # nothing has to be rebuilt
+
+
+def test_tidy_caches_moves_only_our_stores(tmp_path):
+    from nd2wsi.convert import tidy_caches
+
+    ours = tmp_path / "pyramid_a.ome.zarr"
+    ours.mkdir()
+    (ours / ".zattrs").write_text('{"nd2wsi": {}, "multiscales": []}')
+    older = tmp_path / "b.ome.zarr"
+    older.mkdir()
+    (older / ".zattrs").write_text('{"nd2wsi": {}, "multiscales": []}')
+    foreign = tmp_path / "someone_else.ome.zarr"
+    foreign.mkdir()
+    (foreign / ".zattrs").write_text('{"multiscales": []}')
+
+    planned = tidy_caches(tmp_path, dry_run=True)["moved"]
+    assert {p[0].name for p in planned} == {"pyramid_a.ome.zarr", "b.ome.zarr"}
+    assert ours.exists()  # dry run touched nothing
+
+    tidy_caches(tmp_path)
+    assert (tmp_path / "pyramids" / "a.ome.zarr").is_dir()
+    assert (tmp_path / "pyramids" / "b.ome.zarr").is_dir()
+    assert foreign.is_dir() and not ours.exists()
+
+
+def test_annotations_stay_beside_the_slide(tmp_path):
+    from nd2wsi.server import annotations_sidecar
+
+    store = tmp_path / "pyramids" / "24-962.ome.zarr"
+    store.mkdir(parents=True)
+    attrs = {"nd2wsi": {"source": "24-962.nd2"}}
+    assert annotations_sidecar(store, attrs) == tmp_path / "annotations_24-962.json"
+
+    # one left inside the cache folder is pulled back out
+    inside = store.parent / "annotations_24-962.json"
+    inside.write_text("[]")
+    assert annotations_sidecar(store, attrs).read_text() == "[]"
+    assert not inside.exists()
+
+
+def test_sweep_appledouble_removes_only_the_twins(tmp_path):
+    from nd2wsi.convert import sweep_appledouble
+
+    store = tmp_path / "a.ome.zarr"
+    (store / "0").mkdir(parents=True)
+    (store / ".zattrs").write_text("{}")
+    (store / "0" / "0.0.0").write_bytes(b"chunk")
+    (store / "0" / "._0.0.0").write_bytes(b"junk")
+    (store / "._.zattrs").write_bytes(b"junk")
+
+    n, freed = sweep_appledouble(store)
+    assert n == 2 and freed > 0
+    assert (store / "0" / "0.0.0").read_bytes() == b"chunk"
+    assert (store / ".zattrs").exists()
+    assert not (store / "0" / "._0.0.0").exists()
+    assert sweep_appledouble(store) == (0, 0)
+
+
+def test_rescue_annotations_lifts_work_out_of_a_doomed_folder(tmp_path):
+    from nd2wsi.server import rescue_annotations
+
+    store = tmp_path / "pyramids" / "a.ome.zarr"
+    store.mkdir(parents=True)
+    (store / "annotations_a.json").write_text('{"items": []}')
+    (store / "0.0.0").write_bytes(b"chunk")
+    (tmp_path / "annotations_b.json").write_text("keep me")
+    (store.parent / "annotations_b.json").write_text("newer duplicate")
+
+    saved = rescue_annotations(store.parent, tmp_path)
+    assert (tmp_path / "annotations_a.json").exists()
+    assert [p.name for p in saved] == ["annotations_a.json"]
+    # an existing file beside the slide is never overwritten
+    assert (tmp_path / "annotations_b.json").read_text() == "keep me"

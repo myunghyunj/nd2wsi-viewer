@@ -153,3 +153,24 @@ def test_declining_the_size_question_builds_nothing(slide, tmp_path, monkeypatch
     registry.confirm_convert = lambda p, est: True
     sid = registry.open_path(path)
     assert sid and store.exists()
+
+
+def test_trash_reports_progress_and_saves_annotations(slide, tmp_path):
+    from nd2wsi.convert import convert, default_store_path
+    from nd2wsi.server import SlideRegistry
+
+    path, _ = slide
+    store = default_store_path(path)
+    convert(path, store, tile=128, progress=False)  # many small chunks
+    (store / "annotations_slide.json").write_text('{"items": [1]}')
+
+    registry = SlideRegistry()
+    sid = registry.add_store(store)
+    seen = []
+    freed = registry.trash_cache(sid, on_progress=seen.append)
+
+    assert freed > 0
+    assert not store.exists()
+    assert seen == sorted(seen) and seen[-1] == 1.0
+    assert len(seen) > 10  # the bar actually moves
+    assert (path.parent / "annotations_slide.json").read_text() == '{"items": [1]}'

@@ -196,7 +196,8 @@ ND2 and TIFF stream, so any size works, the whole slide included.
   <br><sub>An Aperio SVS slide in the same viewer. A boxed vessel, a 111 &micro;m measurement, and the sidecar annotations loaded on open.</sub>
 </p>
 
-Brightfield H&E works with every tool above, unchanged.
+Brightfield H&E works with every tool above, unchanged. An SVS opens in the
+light theme, since that is how these stains are read.
 
 An SVS carries JPEG or JPEG 2000 tiles, so a 1.4 GB file holds 18 GB of
 pixels and its pyramid lands near 13 GB. That is worth knowing before you
@@ -224,6 +225,32 @@ released under the CC0 1.0 public domain dedication.
 | Source | https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/CMU-1-Small-Region.svs |
 | SHA-256 | ed92d5a9f2e86df67640d6f92ce3e231419ce127131697fbbce42ad5e002c8a7 |
 | Accessed | August 29, 2026 |
+
+### Where the caches live
+
+Each folder of slides keeps its pyramids together.
+
+```
+CD31/
+  23-12089.nd2
+  annotations_23-12089.json
+  pyramids/
+    23-12089.ome.zarr
+```
+
+Annotations sit beside the slide rather than inside `pyramids`, so emptying
+the cache never costs you work. Stores built by older versions are still read
+where they lie, and `nd2wsi tidy <folder>` collects them into `pyramids`
+without rebuilding anything.
+
+Size is worth watching on an external disk. A file never occupies less than
+one allocation block, and a large exFAT volume uses blocks of 1 MB, which
+turns a 130 KB chunk into a megabyte. macOS makes it worse by attaching an
+extended attribute to every file it writes there, stored in a `._` twin that
+takes another block. On one 3.6 TB exFAT SSD that combination cost 776 GiB
+for 78 GiB of pyramid. nd2wsi now sweeps the twins after every build and
+`tidy` sweeps the ones already on disk, and the size it quotes before
+converting counts the blocks the volume will really spend.
 
 ### Scripting
 
@@ -315,7 +342,7 @@ colors, and objective magnification carried over.
 
 ## Tests
 
-pytest runs 26 tests. They verify that ND2 exports round-trip pixel-exact
+pytest runs 33 tests. They verify that ND2 exports round-trip pixel-exact
 through the independent nd2 reader with calibration and channel metadata
 preserved, that three-channel files convert, render histograms, and
 export, that the annotation sidecar survives a GET and POST round-trip on

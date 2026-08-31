@@ -350,6 +350,7 @@ def convert(
         if not overwrite:
             raise FileExistsError(f"{out_path} exists (use --overwrite)")
         shutil.rmtree(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
     from contextlib import ExitStack
@@ -417,12 +418,56 @@ def convert(
             if on_progress is not None:
                 on_progress(1.0)
 
+    swept, freed = sweep_appledouble(out_path)
     if progress:
         size = sum(p.stat().st_size for p in out_path.rglob("*") if p.is_file())
         print(
             f"  done in {time.time() - t0:.1f}s -> {out_path} ({nice_bytes(size)} on disk)"
         )
+        if swept:
+            print(f"  swept {swept} AppleDouble files, {nice_bytes(freed)} recovered")
     return out_path
+
+
+def sweep_appledouble(folder: str | Path) -> tuple[int, int]:
+    """Delete the ``._`` twins macOS leaves beside files on exFAT and NTFS.
+
+    Every file written on such a volume gets a ``com.apple.provenance``
+    extended attribute, and the attribute is stored in a sibling AppleDouble
+    file. A pyramid is tens of thousands of chunks, so the twins double the
+    file count, and on a volume with a 1 MB allocation block they double the
+    size of the store while holding nothing anyone reads. Returns the number
+    of files removed and the blocks they held.
+    """
+    import os
+
+    folder = Path(folder)
+    block = _block_bytes(folder)
+    n = freed = 0
+    for root, dirs, files in os.walk(folder):
+        for name in files:
+            if not name.startswith("._"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                size = os.stat(path).st_blocks * 512 or block
+                os.unlink(path)
+            except OSError:
+                continue
+            n += 1
+            freed += size
+    return n, freed
+
+
+def _block_bytes(folder: str | Path) -> int:
+    """Smallest number of bytes a file can occupy on this volume."""
+    import os
+
+    try:
+        st = os.statvfs(str(folder))
+        return max(512, int(st.f_frsize))
+    except (OSError, ValueError):
+        return 4096
 
 
 def estimate_store_bytes(
@@ -477,9 +522,24 @@ def estimate_store_bytes(
     )
     ratio = (packed / sampled) if sampled else 1.0
     total = int(raw * ratio)
+
+    # A pyramid is tens of thousands of small files, and a file never takes
+    # less than one allocation block. On a big exFAT volume that block is
+    # 1 MB, which turns a 130 KB chunk into a megabyte and the whole store
+    # into several times its own size, so report what the volume will
+    # actually spend rather than the size of the data.
+    block = _block_bytes(path.parent)
+    chunk_bytes = tile * tile * dtype.itemsize * ratio
+    per_chunk = max(block, -(-int(chunk_bytes) // block) * block)
+    files = sum(c * -(-lh // tile) * -(-lw // tile) for lh, lw in shapes)
+    on_disk = files * per_chunk + block * (len(shapes) + 2)  # plus metadata
     return {
-        "bytes": total,
-        "human": nice_bytes(total),
+        "bytes": max(total, on_disk),
+        "human": nice_bytes(max(total, on_disk)),
+        "data_bytes": total,
+        "disk_bytes": on_disk,
+        "block_bytes": block,
+        "files": files,
         "ratio": ratio,
         "width": w,
         "height": h,
@@ -491,17 +551,78 @@ def estimate_store_bytes(
     }
 
 
-def default_store_path(nd2_path: str | Path, cache_dir: str | Path | None = None) -> Path:
-    """``pyramid_<slide>.ome.zarr`` next to the slide -- self-describing.
+CACHE_DIR_NAME = "pyramids"
 
-    Stores made by older versions (``<slide>.ome.zarr``) are still honored.
+
+def default_store_path(nd2_path: str | Path, cache_dir: str | Path | None = None) -> Path:
+    """``pyramids/<slide>.ome.zarr`` beside the slide.
+
+    One folder per directory of slides keeps the caches together instead of
+    scattering a store between every file. Stores made by older versions
+    (``pyramid_<slide>.ome.zarr`` or ``<slide>.ome.zarr`` next to the slide)
+    are still used where they lie, so nothing has to be rebuilt.
     """
     nd2_path = Path(nd2_path)
     base = Path(cache_dir) if cache_dir else nd2_path.parent
-    legacy = base / (nd2_path.stem + ".ome.zarr")
-    if legacy.exists():
-        return legacy
-    return base / f"pyramid_{nd2_path.stem}.ome.zarr"
+    for legacy in (
+        base / f"pyramid_{nd2_path.stem}.ome.zarr",
+        base / f"{nd2_path.stem}.ome.zarr",
+    ):
+        if legacy.exists():
+            return legacy
+    return base / CACHE_DIR_NAME / f"{nd2_path.stem}.ome.zarr"
+
+
+def is_nd2wsi_store(path: str | Path) -> bool:
+    """True for a directory this tool wrote, cheaply and without opening it."""
+    attrs = Path(path) / ".zattrs"
+    try:
+        return '"nd2wsi"' in attrs.read_text()
+    except OSError:
+        return False
+
+
+def tidy_caches(folder: str | Path, *, dry_run: bool = False) -> dict[str, Any]:
+    """Move scattered pyramid stores in ``folder`` into ``pyramids/``.
+
+    Only directories this tool wrote are touched, and only when the target
+    name is free. AppleDouble twins inside the collected stores go too.
+    Returns ``{"moved": [(from, to)], "swept": count, "freed": bytes}``.
+    """
+    folder = Path(folder)
+    dest = folder / CACHE_DIR_NAME
+    moved = []
+    swept = freed = 0
+    if not dry_run and dest.is_dir():
+        n, b = sweep_appledouble(dest)
+        swept += n
+        freed += b
+    for item in sorted(folder.iterdir()):
+        if not item.is_dir() or not item.name.endswith(".ome.zarr"):
+            continue
+        if item.name.startswith("._") or not is_nd2wsi_store(item):
+            continue
+        stem = item.name[: -len(".ome.zarr")]
+        if stem.startswith("pyramid_"):
+            stem = stem[len("pyramid_") :]
+        target = dest / f"{stem}.ome.zarr"
+        if target.exists():
+            continue
+        moved.append((item, target))
+        if not dry_run:
+            dest.mkdir(exist_ok=True)
+            item.rename(target)
+            n, b = sweep_appledouble(target)
+            swept += n
+            freed += b
+            # exFAT and NTFS carry Finder metadata in a sibling AppleDouble
+            # file, which is dead weight once its item has moved away.
+            sidecar = item.parent / f"._{item.name}"
+            if sidecar.exists():
+                sidecar.unlink()
+                swept += 1
+                freed += _block_bytes(folder)
+    return {"moved": moved, "swept": swept, "freed": freed}
 
 
 def open_store(path: str | Path) -> tuple[Any, dict[str, Any]]:

@@ -318,6 +318,6 @@ def test_open_reports_convert_progress(fluor_nd2, tmp_path):
             urllib.request.urlopen(base + "/api/roi/progress?job=testjob1").read()
         )
         assert prog["state"] == "done" and prog["pct"] == 100
-        assert (tmp_path / "pyramid_fresh.ome.zarr").exists()
+        assert (tmp_path / "pyramids" / "fresh.ome.zarr").exists()
     finally:
         httpd.shutdown()

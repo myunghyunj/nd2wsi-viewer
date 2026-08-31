@@ -66,7 +66,17 @@
     0 1px 1px rgba(0, 0, 0, 0.10);
 }
 :root.light .btn:hover { filter: brightness(0.975); }
-:root.light .btn.primary, :root.light .btn.armed, :root.light .btn.destructive { color: #fff; }
+:root.light .btn.primary, :root.light .btn.destructive { color: #fff; }
+/* the light .btn gradient outranks .btn.armed, so an armed button needs its
+   own rule here or it renders white text on white */
+:root.light .btn.armed {
+  color: var(--label);
+  background: linear-gradient(#cfcfd4, #bfbfc6);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.14),
+    0 0 0 0.5px rgba(0, 0, 0, 0.24);
+}
+:root.light .btn.armed:hover { filter: brightness(0.97); }
 :root.light .switch { background: rgba(120, 120, 128, 0.24); box-shadow: inset 0 0.5px 1.5px rgba(0, 0, 0, 0.12); }
 :root.light input.dim { background: rgba(0, 0, 0, 0.05); box-shadow: inset 0 0.5px 1px rgba(0, 0, 0, 0.10); }
 :root.light .zc-btn:hover { background: rgba(0, 0, 0, 0.06); }

@@ -126,6 +126,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_selection_args(p_crop)
 
+    p_tidy = sub.add_parser(
+        "tidy", help="collect scattered pyramid stores into one pyramids/ folder"
+    )
+    p_tidy.add_argument("folder", nargs="+", help="folder(s) holding slides")
+    p_tidy.add_argument(
+        "--dry-run", action="store_true", help="list the moves without making them"
+    )
+
     p_serve = sub.add_parser("serve", help="serve the viewer for converted store(s)")
     p_serve.add_argument("store", nargs="+", help="one tab per store")
     _add_serve_args(p_serve)
@@ -170,6 +178,24 @@ def main(argv: list[str] | None = None) -> int:
             overwrite=args.overwrite,
             workers=args.workers,
         )
+        return 0
+
+    if args.cmd == "tidy":
+        from .convert import CACHE_DIR_NAME, tidy_caches
+        from .reader import nice_bytes
+
+        total = swept = freed = 0
+        for folder in args.folder:
+            res = tidy_caches(folder, dry_run=args.dry_run)
+            total += len(res["moved"])
+            swept += res["swept"]
+            freed += res["freed"]
+            for src, dst in res["moved"]:
+                verb = "would move" if args.dry_run else "moved"
+                print(f"{verb} {src.name} -> {CACHE_DIR_NAME}/{dst.name}")
+        print(f"{total} store(s) {'to move' if args.dry_run else 'collected'}")
+        if swept:
+            print(f"swept {swept} AppleDouble files, {nice_bytes(freed)} recovered")
         return 0
 
     if args.cmd == "crop":
