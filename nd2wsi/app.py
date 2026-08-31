@@ -51,6 +51,9 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
     background:rgba(255,255,255,.12);overflow:hidden;display:none}
   #fill{display:block;height:100%;width:0%;border-radius:2px;background:#b08900;
     transition:width .25s ease}
+  #fill.indet{width:40%;transition:none;
+    animation:indet 1.1s ease-in-out infinite alternate}
+  @keyframes indet{from{margin-left:0}to{margin-left:60%}}
   #pct{margin-top:7px;font-size:12px;color:rgba(255,255,255,.5);min-height:14px;
     font-family:ui-monospace,"SF Mono",Menlo,monospace}
   #drop.over::after{content:"";position:fixed;inset:14px;border-radius:16px;
@@ -73,12 +76,18 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
     pywebview.api.status().then(s => { if (s) setStatus(s); });
     pywebview.api.progress().then(f => {
       const pctEl = document.getElementById('pct');
-      if (f >= 0) {
+      if (f === 0) {            /* alive, before the first real tick */
         bar.style.display = 'block';
+        fill.style.width = '';
+        fill.classList.add('indet');
+        pctEl.textContent = '';
+      } else if (f > 0) {
+        bar.style.display = 'block';
+        fill.classList.remove('indet');
         const p = Math.round(f * 100);
         fill.style.width = p + '%';
         pctEl.textContent = p + ' %';
-      } else { bar.style.display = 'none'; pctEl.textContent = ''; }
+      } else { bar.style.display = 'none'; fill.classList.remove('indet'); pctEl.textContent = ''; }
     });
   }
   function begin(){ busy = true; polling = setInterval(poll, 400); }
@@ -370,6 +379,7 @@ class Api:
 
             _dlog(f"open {p}")
             try:
+                self._frac = 0.0  # bar up while the file opens, before ticks
                 store = open_or_convert(p, on_status=note, on_progress=frac)
                 self._frac = -1.0
                 if self._httpd is None:
@@ -392,6 +402,7 @@ class Api:
             def frac(f):
                 self._frac = f
 
+            self._frac = 0.0  # bar up while the file opens, before ticks
             store = open_or_convert(path, on_status=note, on_progress=frac)
             self._frac = -1.0
             self._status = "starting viewer …"
