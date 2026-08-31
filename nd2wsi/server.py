@@ -98,7 +98,7 @@ class ViewerState:
         self,
         root: Any,
         attrs: dict[str, Any],
-        max_render_mpx: float = 100.0,
+        max_render_mpx: float = 400.0,
         annotations_path: Path | None = None,
     ):
         self.root = root
@@ -163,7 +163,7 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
 class SlideRegistry:
     """The set of slides this server has open, keyed by a stable short id."""
 
-    def __init__(self, max_render_mpx: float = 100.0):
+    def __init__(self, max_render_mpx: float = 400.0):
         self.slides: dict[str, ViewerState] = {}  # insertion-ordered
         self.max_render_mpx = max_render_mpx
         self._lock = threading.Lock()
@@ -723,7 +723,7 @@ def create_server(
     store_paths: str | Path | list[str | Path],
     host: str = "127.0.0.1",
     port: int = 8000,
-    max_render_mpx: float = 100.0,
+    max_render_mpx: float = 400.0,
 ) -> ThreadingHTTPServer:
     """Build the viewer HTTP server without running it (port 0 = ephemeral).
 
@@ -745,7 +745,7 @@ def serve(
     store_paths: str | Path | list[str | Path],
     host: str = "127.0.0.1",
     port: int = 8000,
-    max_render_mpx: float = 100.0,
+    max_render_mpx: float = 400.0,
 ) -> None:
     httpd = create_server(
         store_paths, host=host, port=port, max_render_mpx=max_render_mpx

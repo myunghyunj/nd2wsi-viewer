@@ -12,6 +12,7 @@ const state = {
   roi: null, // {x, y, w, h} in level-0 pixels
   roiOverlayEl: null,
   tool: null, // null | "roi" | "measure" | "pin" | "box"
+  renderScale: null, // chosen PNG/JPEG downsample; null = finest that fits
   annotations: [], // {id, type: "line"|"pin"|"box", ...image coords, text}
   annPath: null, // sidecar file, reported by the server
   editingId: null,
@@ -1097,6 +1098,7 @@ function finishSelection(a, b) {
 
 function applyRoi(x, y, w, h) {
   state.roi = { x, y, w, h };
+  state.renderScale = null; // a new region starts at the finest fitting scale
   drawRoiOverlay();
   updateRoiPanel();
   $("roi-detail").classList.add("active");
@@ -1166,6 +1168,119 @@ function updateRoiPanel() {
   const itemsize = dtypeBytes(state.info.dtype);
   const nCh = state.info.rgb ? 3 : state.channels.length;
   $("roi-bytes").textContent = "≈ " + fmtBytes(r.w * r.h * nCh * itemsize);
+  updateScaleStrip();
+}
+
+/* ---- render scale: how PNG and JPEG leave -------------------------------
+   Each option is one pyramid level. The strip shows the same field at every
+   scale so the pixel cost is visible, the dims line shows what the file
+   will hold, and the size is measured from one real 512 px sample at that
+   level rather than guessed. ND2 and TIFF ignore all of this and stream at
+   native resolution. */
+function scaleOptions() {
+  const r = state.roi;
+  if (!r) return [];
+  const out = [];
+  for (const lv of state.info.levels) {
+    const d = lv.downsample;
+    const w = Math.max(1, Math.floor(r.w / d));
+    const h = Math.max(1, Math.floor(r.h / d));
+    if ((w * h) / 1e6 <= state.info.maxRenderMpx) out.push({ d, w, h });
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+function roiScale() {
+  const opts = scaleOptions();
+  if (!opts.length) return null;
+  const pick = opts.find((o) => o.d === state.renderScale);
+  return pick || opts[0]; // finest that fits, unless the user chose coarser
+}
+
+let scaleSeq = 0;
+function updateScaleStrip() {
+  const strip = $("roi-scales");
+  const dims = $("roi-scale-dims");
+  const r = state.roi;
+  const opts = scaleOptions();
+  const seq = ++scaleSeq;
+  strip.innerHTML = "";
+  if (!r || !opts.length) {
+    dims.textContent = "–";
+    return;
+  }
+  const sel = roiScale();
+  const win = lutParam();
+  let winQ = win ? "&win=" + encodeURIComponent(win) : "";
+  if (state.channels.length !== state.info.channels.length) {
+    winQ += "&c=" + state.channels.join(",");
+  }
+  // one shared field, sized to the coarsest scale so every patch is honest
+  const dMax = opts[opts.length - 1].d;
+  const field = Math.min(64 * dMax, r.w, r.h); // native px on a side
+  const fx = Math.round(r.x + r.w / 2 - field / 2);
+  const fy = Math.round(r.y + r.h / 2 - field / 2);
+
+  for (const o of opts) {
+    const btn = document.createElement("button");
+    btn.className = "scale-opt" + (o.d === sel.d ? " sel" : "");
+    const img = document.createElement("img");
+    const pw = Math.max(1, Math.round(field / o.d));
+    img.src = "api/roi?" + new URLSearchParams({
+      level: levelPathFor(o.d), x: Math.max(0, Math.floor(fx / o.d)),
+      y: Math.max(0, Math.floor(fy / o.d)), w: pw, h: pw, format: "jpg",
+    }) + winQ;
+    img.alt = "";
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = o.d === 1 ? "1×" : "1/" + o.d;
+    btn.append(img, tag);
+    btn.onclick = () => {
+      state.renderScale = o.d;
+      updateScaleStrip();
+    };
+    strip.append(btn);
+  }
+
+  dims.textContent = fmtInt(sel.w) + " × " + fmtInt(sel.h) + " px";
+  const note = $("roi-scale-note");
+  note.textContent = "ND2 and TIFF stay native.";
+  estimateRenderBytes(sel, winQ).then((t) => {
+    if (seq === scaleSeq && t) {
+      note.textContent = t + " · ND2 and TIFF stay native.";
+    }
+  });
+}
+
+function levelPathFor(d) {
+  const lv = state.info.levels.find((l) => l.downsample === d);
+  return lv ? lv.path : 0;
+}
+
+const sizeSamples = new Map(); // sid-stable cache: level+fmt+win -> bytes/px
+async function estimateRenderBytes(o, winQ) {
+  const r = state.roi;
+  const side = Math.min(512, o.w, o.h);
+  const sx = Math.max(0, Math.floor((r.x + r.w / 2) / o.d) - side / 2);
+  const sy = Math.max(0, Math.floor((r.y + r.h / 2) / o.d) - side / 2);
+  const parts = [];
+  for (const fmt of ["jpg", "png"]) {
+    const key = o.d + ":" + fmt + ":" + winQ + ":" + Math.round(sx / 512);
+    let bpp = sizeSamples.get(key);
+    if (bpp === undefined) {
+      try {
+        const res = await fetch("api/roi?" + new URLSearchParams({
+          level: levelPathFor(o.d), x: sx, y: sy, w: side, h: side, format: fmt,
+        }) + winQ, { cache: "no-store" });
+        const blob = await res.blob();
+        bpp = blob.size / (side * side);
+        sizeSamples.set(key, bpp);
+      } catch (e) { bpp = null; }
+    }
+    if (bpp) parts.push("≈ " + fmtBytes(bpp * o.w * o.h) + " " + (fmt === "jpg" ? "JPEG" : "PNG"));
+  }
+  return parts.join(" · ") || "";
 }
 
 /* The calibration for the µm fields is the file's own: ND2 voxel_size() /
@@ -1223,21 +1338,16 @@ function downloadRoi(fmt) {
   let level = 0;
   let d = 1;
   if (fmt === "png" || fmt === "jpg") {
-    const lv = state.info.levels;
-    while (
-      level < lv.length - 1 &&
-      (r.w / d) * (r.h / d) / 1e6 > state.info.maxRenderMpx
-    ) {
-      level += 1;
-      d = lv[level].downsample;
-    }
-    if ((r.w / d) * (r.h / d) / 1e6 > state.info.maxRenderMpx) {
+    const sel = roiScale();
+    if (!sel) {
       showToast(
         "rendered export capped at " + state.info.maxRenderMpx +
         " MPx — use ND2/TIFF (they stream any size)"
       );
       return;
     }
+    d = sel.d;
+    level = state.info.levels.findIndex((l) => l.downsample === d);
   }
   const q = new URLSearchParams({
     level,

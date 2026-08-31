@@ -84,7 +84,7 @@ def _add_serve_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--max-render-mpx",
         type=float,
-        default=100.0,
+        default=400.0,
         help="cap for rendered (png/jpg) ROI exports in megapixels; "
         "tiff export streams and has no cap",
     )

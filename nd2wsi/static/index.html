@@ -102,7 +102,9 @@
             <input id="roi-um-h" class="dim" inputmode="decimal" title="Height in micrometers" />
             <span class="unit">&micro;m</span></span></div>
           <div class="roi-line"><span class="k">Raw size</span><span class="v" id="roi-bytes">&ndash;</span></div>
-          <div class="hint">Exports at native resolution.</div>
+          <div class="roi-line"><span class="k">Scale</span><span class="v" id="roi-scale-dims">&ndash;</span></div>
+          <div id="roi-scales" class="scale-strip" title="How PNG and JPEG leave. Each patch shows the same field at that scale."></div>
+          <div class="hint" id="roi-scale-note">ND2 and TIFF always export at native resolution.</div>
           <div class="roi-actions">
             <button id="roi-dl-nd2" class="btn primary" title="A real ND2 file — raw pixels, calibration and channel metadata; reopens in NIS-Elements">ND2</button>
             <button id="roi-dl-tiff" class="btn" title="Raw pixel values, dtype preserved, streams any size">TIFF</button>

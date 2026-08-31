@@ -474,3 +474,26 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
     0 0 0 0.5px rgba(0, 0, 0, 0.30),
     0 1px 2px rgba(255, 69, 58, 0.35);
 }
+
+/* ---- render scale strip (Region window) ----------------------------------- */
+.scale-strip { display: flex; gap: 6px; margin: 6px 0 2px; }
+.scale-opt {
+  flex: 1; min-width: 0; padding: 0; border: 0; cursor: default;
+  border-radius: 6px; overflow: hidden; position: relative;
+  background: rgba(0, 0, 0, 0.25);
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.14);
+}
+.scale-opt img {
+  display: block; width: 100%; aspect-ratio: 1; object-fit: cover;
+  image-rendering: pixelated;
+}
+.scale-opt .tag {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  font-size: 11px; line-height: 16px; text-align: center;
+  color: rgba(255, 255, 255, 0.92); background: rgba(0, 0, 0, 0.55);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.scale-opt.sel { box-shadow: 0 0 0 2px var(--accent); }
+:root.light .scale-opt { background: rgba(0, 0, 0, 0.06); box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.22); }
+:root.light .scale-opt .tag { background: rgba(255, 255, 255, 0.72); color: rgba(0, 0, 0, 0.85); }
+:root.light .scale-opt.sel { box-shadow: 0 0 0 2px var(--accent); }
