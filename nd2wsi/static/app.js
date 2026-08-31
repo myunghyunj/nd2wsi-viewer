@@ -747,6 +747,7 @@ function wireTools() {
   }, true);
 
   $("roi-clear").onclick = clearRoi;
+  $("roi-full").onclick = () => applyRoi(0, 0, state.info.width, state.info.height);
   $("roi-dl-nd2").onclick = () => downloadRoi("nd2");
   $("roi-dl-tiff").onclick = () => downloadRoi("tiff");
   $("roi-dl-png").onclick = () => downloadRoi("png");
@@ -1091,7 +1092,11 @@ function finishSelection(a, b) {
   const h = Math.round(y1 - y0);
   setTool(null);
   if (w < 4 || h < 4) return; // treat as an aborted drag
-  state.roi = { x: Math.round(x0), y: Math.round(y0), w, h };
+  applyRoi(Math.round(x0), Math.round(y0), w, h);
+}
+
+function applyRoi(x, y, w, h) {
+  state.roi = { x, y, w, h };
   drawRoiOverlay();
   updateRoiPanel();
   $("roi-detail").classList.add("active");
@@ -1212,13 +1217,34 @@ function wireRoiDims() {
 function downloadRoi(fmt) {
   const r = state.roi;
   if (!r) return;
-  // exports are always native resolution (level 0)
+  // ND2 and TIFF stream raw pixels at native resolution; a rendered PNG or
+  // JPEG too big for one image drops to the pyramid level that fits, which
+  // is how the whole slide leaves as one picture
+  let level = 0;
+  let d = 1;
+  if (fmt === "png" || fmt === "jpg") {
+    const lv = state.info.levels;
+    while (
+      level < lv.length - 1 &&
+      (r.w / d) * (r.h / d) / 1e6 > state.info.maxRenderMpx
+    ) {
+      level += 1;
+      d = lv[level].downsample;
+    }
+    if ((r.w / d) * (r.h / d) / 1e6 > state.info.maxRenderMpx) {
+      showToast(
+        "rendered export capped at " + state.info.maxRenderMpx +
+        " MPx — use ND2/TIFF (they stream any size)"
+      );
+      return;
+    }
+  }
   const q = new URLSearchParams({
-    level: 0,
-    x: r.x,
-    y: r.y,
-    w: r.w,
-    h: r.h,
+    level,
+    x: Math.floor(r.x / d),
+    y: Math.floor(r.y / d),
+    w: Math.max(1, Math.floor(r.w / d)),
+    h: Math.max(1, Math.floor(r.h / d)),
     format: fmt,
   });
   const all = state.channels.length === state.info.channels.length;
@@ -1226,14 +1252,6 @@ function downloadRoi(fmt) {
   if (fmt === "png" || fmt === "jpg") {
     const win = lutParam();
     if (win) q.set("win", win); // rendered exports match the screen LUTs
-    const mpx = (q.get("w") * q.get("h")) / 1e6;
-    if (mpx > state.info.maxRenderMpx) {
-      showToast(
-        "rendered export capped at " + state.info.maxRenderMpx +
-        " MPx — use ND2/TIFF (they stream any size)"
-      );
-      return;
-    }
   }
   let job = null;
   if (fmt === "nd2" || fmt === "tiff") {
@@ -1247,7 +1265,10 @@ function downloadRoi(fmt) {
   a.click();
   a.remove();
   if (job) trackExport(job, fmt.toUpperCase());
-  else showToast("export started — check your downloads");
+  else if (level > 0) {
+    showToast("export started at 1/" + d + " scale (" +
+      Math.round((r.w / d) * (r.h / d) / 1e6) + " MPx) — check your downloads");
+  } else showToast("export started — check your downloads");
 }
 
 /* Poll the server's write progress and fill the status-bar export gauge. */
