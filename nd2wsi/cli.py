@@ -250,6 +250,12 @@ def main(argv: list[str] | None = None) -> int:
             store = default_store_path(slide)
             if args.store and len(args.nd2) == 1:
                 store = Path(args.store)
+            from .svs import is_svs
+
+            if is_svs(slide) and not store.exists() and not args.overwrite:
+                print(f"{Path(slide).name}: serving straight from the file")
+                stores.append(Path(slide))
+                continue
             if args.overwrite or not store.exists():
                 if not confirm_pyramid(slide, args.yes):
                     print(f"skipped {Path(slide).name}")

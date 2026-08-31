@@ -132,10 +132,6 @@ def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
     return saved
 
 
-class ConversionDeclined(Exception):
-    """Raised when the caller answered no to building a pyramid."""
-
-
 def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
     """Annotations live in ``annotations_<slide>.json`` beside the slide.
 
@@ -167,10 +163,6 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
 class SlideRegistry:
     """The set of slides this server has open, keyed by a stable short id."""
 
-    #: optional ``callable(path, estimate) -> bool`` asked before building a
-    #: pyramid that will be large; ``None`` means build without asking
-    confirm_convert = None
-
     def __init__(self, max_render_mpx: float = 100.0):
         self.slides: dict[str, ViewerState] = {}  # insertion-ordered
         self.max_render_mpx = max_render_mpx
@@ -182,8 +174,20 @@ class SlideRegistry:
 
     def add_store(self, store_path: str | Path) -> str:
         from .convert import open_store
+        from .svs import is_svs
 
         store_path = Path(store_path).resolve()
+        if is_svs(store_path):  # an SVS itself serves with no store
+            try:
+                return self.add_direct(store_path)
+            except NotImplementedError:
+                from .convert import convert as _convert
+                from .convert import default_store_path as _dsp
+
+                built = _dsp(store_path)
+                if not built.exists():
+                    _convert(store_path, built, progress=False)
+                store_path = built
         sid = self.sid_for(store_path)
         with self._lock:
             if sid in self.slides:
@@ -199,21 +203,41 @@ class SlideRegistry:
             self.slides[sid] = st
         return sid
 
+    def add_direct(self, slide_path: str | Path) -> str:
+        """Serve an SVS straight from the file, writing nothing to disk."""
+        from .direct import open_direct
+
+        slide_path = Path(slide_path).resolve()
+        sid = self.sid_for(slide_path)
+        with self._lock:
+            if sid in self.slides:
+                return sid
+            root, attrs = open_direct(slide_path)
+            st = ViewerState(
+                root,
+                attrs,
+                max_render_mpx=self.max_render_mpx,
+                annotations_path=annotations_sidecar(slide_path, attrs),
+            )
+            st.store_path = None  # nothing on disk to trash
+            self.slides[sid] = st
+        return sid
+
     def open_path(self, path: str | Path, on_progress=None) -> str:
         """A slide file (converted on first open) or an existing store."""
-        from .convert import convert, default_store_path, estimate_store_bytes
+        from .convert import convert, default_store_path
         from .svs import is_svs
 
         path = Path(path).expanduser().resolve()
         if path.suffix.lower() in SLIDE_SUFFIXES:
             store = default_store_path(path)
+            if is_svs(path) and not store.exists():
+                try:
+                    # the file already holds a pyramid, so serve it as it lies
+                    return self.add_direct(path)
+                except NotImplementedError:
+                    pass  # untiled or off-ladder file: build a store instead
             if not store.exists():
-                # An SVS decodes to many times its own size, so the caller
-                # gets to see the bill before the pyramid is built.
-                if self.confirm_convert is not None and is_svs(path):
-                    est = estimate_store_bytes(path)
-                    if not self.confirm_convert(path, est):
-                        raise ConversionDeclined(path.name)
                 convert(path, store, progress=False, on_progress=on_progress)
         elif path.is_dir():  # a *.ome.zarr store
             store = path
@@ -223,7 +247,11 @@ class SlideRegistry:
 
     def remove(self, sid: str) -> bool:
         with self._lock:
-            return self.slides.pop(sid, None) is not None
+            st = self.slides.pop(sid, None)
+        close = getattr(getattr(st, "root", None), "close", None)
+        if close:
+            close()
+        return st is not None
 
     def trash_cache(self, sid: str, on_progress=None) -> int:
         """Close the slide and delete its pyramid store. Returns bytes freed.
@@ -239,7 +267,11 @@ class SlideRegistry:
             st = self.slides.get(sid)
             if st is None:
                 raise KeyError(sid)
-            store = Path(getattr(st, "store_path", ""))
+            if getattr(st, "store_path", None) is None:
+                raise ValueError(
+                    "this slide runs straight from the file, there is no cache"
+                )
+            store = Path(st.store_path)
             if not (store.is_dir() and store.name.endswith(".ome.zarr")):
                 raise ValueError(f"refusing to delete {store}: not a pyramid store")
             self.slides.pop(sid, None)
@@ -442,10 +474,13 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
                 sid = registry.open_path(path, on_progress=on_progress)
                 if job:
                     _job_update(job, state="done", pct=100)
-            except ConversionDeclined as e:
-                _job_update(job, state="declined", pct=0)
-                return self._json({"declined": True, "name": str(e)})
-            except (ValueError, FileNotFoundError, OSError) as e:
+            except (
+                ValueError,
+                FileNotFoundError,
+                OSError,
+                NotImplementedError,
+                RuntimeError,
+            ) as e:
                 _job_update(job, state="error", error=str(e))
                 return self._error(400, str(e))
             except json.JSONDecodeError as e:
@@ -515,6 +550,7 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
                 ],
                 "maxRenderMpx": st.max_render_mpx,
                 "nd2Export": _limnd2_available(),
+                "direct": bool(meta.get("direct")),
             }
             self._json(info)
 

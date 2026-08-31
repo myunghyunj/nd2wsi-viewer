@@ -43,12 +43,14 @@ def _require_imagecodecs() -> None:
 
 def _aperio_meta(description: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    m = re.search(r"\bMPP\s*=\s*([0-9.]+)", description)
-    if m:
-        out["mpp"] = float(m.group(1))
-    m = re.search(r"\bAppMag\s*=\s*([0-9.]+)", description)
-    if m:
-        out["magnification"] = float(m.group(1))
+    for key, pattern in (("mpp", r"\bMPP\s*=\s*([0-9.]+)"),
+                         ("magnification", r"\bAppMag\s*=\s*([0-9.]+)")):
+        m = re.search(pattern, description)
+        if m:
+            try:
+                out[key] = float(m.group(1))
+            except ValueError:  # malformed metadata such as "1.2.3"
+                pass
     return out
 
 

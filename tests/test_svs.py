@@ -134,25 +134,20 @@ def test_pyramid_of_a_thin_strip_keeps_its_values(tmp_path):
         assert arr.min() == 200 and arr.max() == 200, f"level {level} decayed"
 
 
-def test_declining_the_size_question_builds_nothing(slide, tmp_path, monkeypatch):
+def test_a_single_level_svs_falls_back_to_a_real_store(slide):
+    """Direct serving needs the file's own pyramid. A baseline-only SVS
+    cannot offer one, so it converts the way every SVS did before 0.7.0."""
     from nd2wsi import convert as convert_mod
-    from nd2wsi.server import ConversionDeclined, SlideRegistry
+    from nd2wsi.server import SlideRegistry
 
     path, _ = slide
     store = convert_mod.default_store_path(path)
-    asked = {}
 
     registry = SlideRegistry()
-    registry.confirm_convert = lambda p, est: asked.setdefault("est", est) and False
-
-    with pytest.raises(ConversionDeclined):
-        registry.open_path(path)
-    assert not store.exists()
-    assert asked["est"]["bytes"] > 0
-
-    registry.confirm_convert = lambda p, est: True
     sid = registry.open_path(path)
-    assert sid and store.exists()
+    assert sid
+    assert store.exists()
+    assert not registry.slides[sid].attrs["nd2wsi"].get("direct")
 
 
 def test_trash_reports_progress_and_saves_annotations(slide, tmp_path):

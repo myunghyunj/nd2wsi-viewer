@@ -199,19 +199,19 @@ ND2 and TIFF stream, so any size works, the whole slide included.
 Brightfield H&E works with every tool above, unchanged. An SVS opens in the
 light theme, since that is how these stains are read.
 
-An SVS carries JPEG or JPEG 2000 tiles, so a 1.4 GB file holds 18 GB of
-pixels and its pyramid lands near 13 GB. That is worth knowing before you
-spend it. nd2wsi samples a few dozen tiles of the slide, measures how they
-compress, and reports the size it expects, within about 5 percent on the
-slides here. The app asks in a dialog that also shows the free space on the
-volume. The command line prints the same line and waits for an answer, and
-`--yes` skips the question.
+An SVS opens with no conversion at all. The file already carries a
+pyramid, typically 1x, 4x, 16x and 32x, and nd2wsi serves tiles straight
+from it with `os.pread` and parallel decode. The zoom steps the file skips
+are computed per request from the next finer level, and a memory cache
+keeps revisited fields instant. On an 81,000 x 76,000 px JPEG 2000 slide
+the tab appears in under a second, a screenful arrives in 50 to 200 ms
+cold and half that warm, and nothing is written to disk. Region export at
+native resolution reads the same file and stays pixel exact.
 
-Tiles are read straight off the file with `os.pread` and decoded in
-parallel, and every pyramid level is written to its chunk files directly,
-so the work scales across the cores rather than queueing behind one
-writer. An 82,799 x 79,731 px slide builds in 50 seconds on a 14-core
-laptop, down from 148 seconds in 0.3.1.
+`nd2wsi convert slide.svs` still builds a full pyramid store when you want
+one, for archives or network shares. It quotes what the store will cost
+first, since an SVS decodes to about ten times its size, and `--yes` skips
+the question. A store that exists is preferred over direct serving.
 
 The demo slide
 is CMU-1-Small-Region.svs, an exported region of CMU-1.svs. It shows

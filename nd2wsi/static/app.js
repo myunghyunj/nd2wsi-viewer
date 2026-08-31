@@ -1350,6 +1350,10 @@ function inkColor(a) {
 function wireTrash() {
   const btn = $("tb-trash");
   const pop = $("trash-confirm");
+  if (state.info && state.info.direct) {
+    btn.hidden = true; // served straight from the file, nothing to trash
+    return;
+  }
   const hide = () => { pop.hidden = true; };
   btn.onclick = () => { pop.hidden = !pop.hidden; };
   $("trash-cancel").onclick = hide;
