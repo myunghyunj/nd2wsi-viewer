@@ -412,10 +412,3 @@ writer. The export tests skip when limnd2 is absent.
 
 MIT licensed. OpenSeadragon (BSD-3) is bundled under
 `nd2wsi/static/vendor/openseadragon/`.
-
----
-
-<sub>Slides keep the plain document icon in Finder. Showing the scan itself
-there takes a Quick Look thumbnail extension, and macOS will not load one
-from an ad-hoc signed app, so it would need an Apple Developer ID and
-notarization.</sub>
