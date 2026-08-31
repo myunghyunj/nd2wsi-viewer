@@ -55,7 +55,13 @@ def confirm_pyramid(slide: str | Path, assume_yes: bool = False) -> bool:
 
 
 def _add_convert_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--tile", type=int, default=512, help="pyramid tile size (default 512)")
+    p.add_argument(
+        "--tile",
+        type=int,
+        default=None,
+        help="pyramid tile size (default picks for the volume, 1024 on "
+        "big-block disks such as exFAT, else 512)",
+    )
     p.add_argument(
         "--workers",
         type=int,

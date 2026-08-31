@@ -321,7 +321,7 @@ def convert(
     nd2_path: str | Path,
     out_path: str | Path,
     *,
-    tile: int = 512,
+    tile: int | None = None,
     selection: PlaneSelection | None = None,
     overwrite: bool = False,
     progress: bool = True,
@@ -340,6 +340,10 @@ def convert(
 
     nd2_path = Path(nd2_path)
     out_path = Path(out_path)
+    if tile is None:
+        tile = auto_tile(out_path)
+        if progress and tile != 512:
+            print(f"tile {tile} for this volume's allocation blocks")
     selection = selection or PlaneSelection()
     if workers is None:
         workers = auto_workers()
@@ -470,8 +474,24 @@ def _block_bytes(folder: str | Path) -> int:
         return 4096
 
 
+def auto_tile(out_path: str | Path) -> int:
+    """Chunk edge matched to where the pyramid will live.
+
+    A chunk file never occupies less than one allocation block, and big
+    exFAT volumes use blocks of 128 KB to 1 MB, so 512 px chunks there cost
+    four times their content. Measured on such an SSD, 1024 px chunks cut
+    the store to 1.6 GB where 512 took 3.8, built five times faster, and
+    filled a screen a shade quicker, with a pan step at 17 ms. Volumes with
+    ordinary 4 KB blocks keep 512, which pans fastest.
+    """
+    path = Path(out_path).resolve()
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return 1024 if _block_bytes(path) >= 65536 else 512
+
+
 def estimate_store_bytes(
-    path: str | Path, *, tile: int = 512, points: int = 16
+    path: str | Path, *, tile: int | None = None, points: int = 16
 ) -> dict[str, Any]:
     """Predict what a slide's pyramid will take on disk, before building it.
 
@@ -485,6 +505,8 @@ def estimate_store_bytes(
     from .svs import is_svs, sample_planes
 
     path = Path(path)
+    if tile is None:
+        tile = auto_tile(default_store_path(path))
     blocks: list[np.ndarray] = []
     if is_svs(path):
         import tifffile

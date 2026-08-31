@@ -252,6 +252,12 @@ for 78 GiB of pyramid. nd2wsi now sweeps the twins after every build and
 `tidy` sweeps the ones already on disk, and the size it quotes before
 converting counts the blocks the volume will really spend.
 
+The chunk size follows the volume too. On big-block disks the pyramid is
+built with 1024 px chunks, which on the SSD above cut one slide's store
+from 3.8 GB to 1.6 GB, built it five times faster, and filled a screen a
+shade quicker, with a pan step at 17 ms against 5. Ordinary 4 KB volumes
+keep 512 px chunks, and `--tile` overrides either way.
+
 ### Scripting
 
 Everything the UI does is plain HTTP, so you can script it.

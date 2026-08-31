@@ -187,3 +187,37 @@ def test_rescue_annotations_lifts_work_out_of_a_doomed_folder(tmp_path):
     assert [p.name for p in saved] == ["annotations_a.json"]
     # an existing file beside the slide is never overwritten
     assert (tmp_path / "annotations_b.json").read_text() == "keep me"
+
+
+def test_auto_tile_follows_the_volume(monkeypatch, tmp_path):
+    from nd2wsi import convert as c
+
+    monkeypatch.setattr(c, "_block_bytes", lambda p: 4096)
+    assert c.auto_tile(tmp_path / "x.ome.zarr") == 512
+    monkeypatch.setattr(c, "_block_bytes", lambda p: 1048576)
+    assert c.auto_tile(tmp_path / "x.ome.zarr") == 1024
+    # the store's directories may not exist yet, only the volume does
+    monkeypatch.setattr(c, "_block_bytes", lambda p: 131072)
+    assert c.auto_tile(tmp_path / "not" / "yet" / "x.ome.zarr") == 1024
+
+
+def test_explicit_tile_still_wins(monkeypatch, tmp_path):
+    import zarr
+
+    from nd2wsi import convert as c
+
+    pytest.importorskip("tifffile")
+    pytest.importorskip("imagecodecs")
+    import numpy as np
+    import tifffile
+
+    img = np.random.default_rng(0).integers(0, 255, (700, 900, 3), np.uint8)
+    slide = tmp_path / "s.svs"
+    tifffile.imwrite(slide, img, tile=(240, 240), photometric="rgb",
+                     compression="jpeg2000", compressionargs={"reversible": True})
+    monkeypatch.setattr(c, "_block_bytes", lambda p: 1048576)  # would pick 1024
+    out = tmp_path / "s.ome.zarr"
+    c.convert(slide, out, tile=256, progress=False)
+    root = zarr.open_group(str(out), mode="r")
+    assert root.attrs["nd2wsi"]["tile"] == 256
+    assert root["0"].chunks == (1, 256, 256)
