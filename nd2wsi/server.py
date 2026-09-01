@@ -299,6 +299,25 @@ class SlideRegistry:
         if home.name == CACHE_DIR_NAME:
             home = home.parent  # annotations belong beside the slide
         rescue_annotations(store, home)
+        from .cache import CacheLock
+
+        # under the build lock, the doomed directory is renamed aside
+        # before deletion: a concurrent opener either sees the intact
+        # container or none at all, never a half-deleted one
+        try:
+            lock = CacheLock(store)
+            lock.acquire(timeout=10)
+        except TimeoutError:
+            raise ValueError(
+                "this slide's cache is being rebuilt right now — try again "
+                "when the build finishes"
+            ) from None
+        try:
+            doomed = store.with_name(f".{store.name}.trashing-{os.getpid()}")
+            store.rename(doomed)
+        finally:
+            lock.release()
+        store = doomed
         # two passes, neither holding a path list: a store is hundreds of
         # thousands of files and their names alone would be real memory
         total = 0
@@ -365,6 +384,21 @@ class SlideRegistry:
         return out
 
 
+def content_disposition(filename: str) -> str:
+    """An attachment header safe for any filename.
+
+    HTTP headers travel as latin-1; a Korean or accented slide name used
+    to raise UnicodeEncodeError after the export was already written. The
+    ASCII fallback keeps old clients working and the RFC 5987 filename*
+    carries the real name.
+    """
+    import urllib.parse as _up
+
+    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace('"', "_")
+    utf8_name = _up.quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
+
+
 def make_handler(
     registry: SlideRegistry, token: str = ""
 ) -> type[BaseHTTPRequestHandler]:
@@ -422,8 +456,12 @@ def make_handler(
             """
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
-            host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
-            if host not in ("127.0.0.1", "localhost", "[::1]", "::1", ""):
+            raw_host = self.headers.get("Host") or ""
+            if raw_host.startswith("["):  # bracketed IPv6, maybe with a port
+                host = raw_host[: raw_host.find("]") + 1]
+            else:
+                host = raw_host.rsplit(":", 1)[0]
+            if host.lower() not in ("127.0.0.1", "localhost", "[::1]", ""):
                 self._error(404, "not found")
                 return None
             origin = self.headers.get("Origin")
@@ -774,7 +812,7 @@ def make_handler(
                     self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(size))
                     self.send_header(
-                        "Content-Disposition", f'attachment; filename="{fname}{ext}"'
+                        "Content-Disposition", content_disposition(f"{fname}{ext}")
                     )
                     self.end_headers()
                     with open(tmp.name, "rb") as fh:
@@ -808,7 +846,7 @@ def make_handler(
                     200,
                     body,
                     ctype,
-                    {"Content-Disposition": f'attachment; filename="{fname}.{ext}"'},
+                    {"Content-Disposition": content_disposition(f"{fname}.{ext}")},
                 )
             return self._error(400, f"unknown format {fmt}")
 
@@ -847,7 +885,14 @@ def create_server(
     for p in store_paths:
         registry.add_store(p)
     token = secrets.token_urlsafe(16)
-    httpd = ThreadingHTTPServer((host, port), make_handler(registry, token))
+
+    class _Server(ThreadingHTTPServer):
+        # OpenSeadragon opens many tile connections in one burst; the
+        # stdlib default backlog of 5 resets the overflow at the kernel
+        request_queue_size = 64
+        daemon_threads = True
+
+    httpd = _Server((host, port), make_handler(registry, token))
     httpd.registry = registry  # for embedders
     httpd.token = token
     return httpd

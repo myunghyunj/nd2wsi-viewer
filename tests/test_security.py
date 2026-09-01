@@ -113,3 +113,13 @@ def test_eight_threads_hammering_tiles_and_listing(served):
     with concurrent.futures.ThreadPoolExecutor(8) as ex:
         sizes = list(ex.map(hit, range(80)))
     assert all(s > 0 for s in sizes)
+
+
+def test_download_filenames_survive_any_alphabet():
+    from nd2wsi.server import content_disposition
+
+    header = content_disposition("세포_L0.nd2")
+    header.encode("latin-1")  # must be header-safe
+    assert "filename*=UTF-8''%EC%84%B8%ED%8F%AC" in header
+    plain = content_disposition("plain.nd2")
+    assert 'filename="plain.nd2"' in plain

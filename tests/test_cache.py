@@ -142,3 +142,62 @@ def test_build_lock_serializes_concurrent_builders(slide):
     stale = CacheLock(container)
     stale.path.write_text(json.dumps({"pid": 99999999, "time": 0}))
     CacheLock(container).acquire(timeout=2)
+
+
+def test_explicit_convert_is_never_quarantined_mid_build(slide, tmp_path):
+    """`nd2wsi convert` stages atomically now, so a concurrent default
+    open finds nothing at the final path while the build runs."""
+    from nd2wsi.convert import _legacy_store
+
+    staging = tmp_path / "pyramids" / ".s.ome.zarr.building-12345"
+    (staging / "0").mkdir(parents=True)  # someone else's build in flight
+    assert _legacy_store(slide.resolve()) is None
+    assert staging.exists()  # untouched
+
+
+def test_legacy_store_for_another_timepoint_is_not_the_default_view(slide, tmp_path):
+    from nd2wsi.convert import convert, ensure_cache, open_store
+
+    legacy = tmp_path / "pyramids" / "s.ome.zarr"
+    convert(slide, legacy, progress=False)
+    # forge a recorded non-default selection, as `nd2wsi convert --t 3` writes
+    import zarr
+
+    g = zarr.open_group(str(legacy), mode="r+")
+    meta = dict(g.attrs["nd2wsi"])
+    meta["selection"] = {"t": 3, "p": 0, "z": 0}
+    g.attrs["nd2wsi"] = meta
+
+    store = ensure_cache(slide)
+    assert store != legacy  # a fresh default cache, not the t=3 pyramid
+    assert legacy.exists()  # and the explicit store is untouched
+    _, attrs = open_store(store)
+    assert not attrs["nd2wsi"]["selection"].get("t")
+
+
+def test_lock_release_never_removes_a_reclaimed_lock(slide):
+    container = cache_container(slide)
+    a = CacheLock(container)
+    a.acquire()
+    # someone reclaims a's lock (judged stale) and takes their own
+    b = CacheLock(container)
+    a.path.unlink()
+    b.acquire(timeout=2)
+    a.release()  # must not unlink b's live lock
+    assert b.path.exists()
+    with pytest.raises(TimeoutError):
+        CacheLock(container).acquire(timeout=0.3, poll=0.1)
+    b.release()
+
+
+def test_sweep_clears_stranded_backups_and_stagings(tmp_path):
+    from nd2wsi.cache import sweep_stale_builds
+
+    caches = tmp_path / "caches"
+    dead1 = caches / "a--t0-p0-zmid.nd2wsi-cache.building-99999999"
+    dead2 = caches / "a--t0-p0-zmid.nd2wsi-cache.replaced-deadbeef"
+    weird = caches / "b[1]--t0-p0-zmid.nd2wsi-cache.building-99999999"
+    for d in (dead1, dead2, weird):
+        d.mkdir(parents=True)
+    assert sweep_stale_builds(caches) == 3
+    assert not dead1.exists() and not dead2.exists() and not weird.exists()

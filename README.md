@@ -228,20 +228,33 @@ released under the CC0 1.0 public domain dedication.
 
 ### Where the caches live
 
-Each folder of slides keeps its pyramids together.
+Each folder of slides keeps one managed folder, split by what the data is.
 
 ```
 CD31/
   23-12089.nd2
-  annotations_23-12089.json
-  pyramids/
-    23-12089.ome.zarr
+  nd2wsi/
+    annotations/
+      annotations_23-12089.json
+    caches/
+      23-12089--t0-p0-zmid.nd2wsi-cache/
+        manifest.json
+        store.ome.zarr/
 ```
 
-Annotations sit beside the slide rather than inside `pyramids`, so emptying
-the cache never costs you work. Stores built by older versions are still read
-where they lie, and `nd2wsi tidy <folder>` collects them into `pyramids`
-without rebuilding anything.
+Caches are disposable and annotations are work, so they never share a
+folder. A cache is named for its slide and its T, P and Z selection, and
+its manifest records the source's size, modification time and a sampled
+fingerprint. Opening checks all of it. A changed slide rebuilds instead
+of serving stale pixels, a different selection gets its own cache, and a
+damaged cache is set aside with a timestamped name rather than deleted.
+Builds stage in a sibling directory under a lock and appear only when
+complete, so a crash can never leave a half-cache that blocks the slide.
+
+Stores built by older versions are still read where they lie, and
+`nd2wsi tidy <folder>` migrates strays. Its two destructive options,
+`--remove-stale-builds` and `--remove-corrupt-caches`, run only when
+asked by name.
 
 Size is worth watching on an external disk. A file never occupies less than
 one allocation block, and a large exFAT volume uses blocks of 1 MB, which

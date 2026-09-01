@@ -375,11 +375,15 @@ def convert(
         if progress:
             print(f"hardware: {os.cpu_count()} CPU cores -> {workers} worker threads")
 
-    if out_path.exists():
-        if not overwrite:
-            raise FileExistsError(f"{out_path} exists (use --overwrite)")
-        shutil.rmtree(out_path)
+    if out_path.exists() and not overwrite:
+        raise FileExistsError(f"{out_path} exists (use --overwrite)")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # every conversion stages beside its destination and renames in only
+    # when complete: a crash leaves no half-store at the final path, and a
+    # concurrent open never sees (let alone quarantines) work in progress
+    final_path = out_path
+    out_path = out_path.parent / f".{out_path.name}.building-{os.getpid()}"
+    shutil.rmtree(out_path, ignore_errors=True)
 
     t0 = time.time()
     from contextlib import ExitStack
@@ -448,14 +452,20 @@ def convert(
                 on_progress(1.0)
 
     swept, freed = sweep_appledouble(out_path)
+    if final_path.exists():
+        if not overwrite:
+            shutil.rmtree(out_path, ignore_errors=True)
+            raise FileExistsError(f"{final_path} exists (use --overwrite)")
+        shutil.rmtree(final_path)
+    os.rename(out_path, final_path)
     if progress:
-        size = sum(p.stat().st_size for p in out_path.rglob("*") if p.is_file())
+        size = sum(p.stat().st_size for p in final_path.rglob("*") if p.is_file())
         print(
-            f"  done in {time.time() - t0:.1f}s -> {out_path} ({nice_bytes(size)} on disk)"
+            f"  done in {time.time() - t0:.1f}s -> {final_path} ({nice_bytes(size)} on disk)"
         )
         if swept:
             print(f"  swept {swept} AppleDouble files, {nice_bytes(freed)} recovered")
-    return out_path
+    return final_path
 
 
 def sweep_appledouble(folder: str | Path) -> tuple[int, int]:
@@ -631,26 +641,35 @@ def ensure_cache(
     slide = Path(slide).resolve()
     selection = selection or PlaneSelection()
 
+    container = cache_container(slide, selection)
+    store = container_store(container)
+    # the common case takes no lock: a valid container serves immediately,
+    # and it outranks legacy stores so an old pyramids dir cannot shadow a
+    # correct managed cache
+    if cache_matches(container, slide, selection) and store.is_dir():
+        try:
+            open_store(store)
+            return store
+        except ValueError:
+            pass  # damaged despite its manifest: handled under the lock
+
     if selection == PlaneSelection():
         legacy = _legacy_store(slide)
         if legacy is not None:
             return legacy
 
-    container = cache_container(slide, selection)
-    store = container_store(container)
-    if container.exists():
+    with CacheLock(container):
+        # someone else may have finished it while this process waited, and
+        # quarantining under the lock means two openers cannot both grab
+        # the same stale container
         if cache_matches(container, slide, selection) and store.is_dir():
             try:
                 open_store(store)
                 return store
             except ValueError:
-                pass  # damaged despite its manifest: set aside below
-        quarantine(container)
-
-    with CacheLock(container):
-        # someone else may have finished it while this process waited
-        if cache_matches(container, slide, selection) and store.is_dir():
-            return store
+                pass
+        if container.exists():
+            quarantine(container)
         sweep_stale_builds(container.parent)
         before = quick_fingerprint(slide)
         staging = container.with_name(f"{container.name}.building-{os.getpid()}")
@@ -730,10 +749,20 @@ def _legacy_store(slide: Path) -> Path | None:
         if not cand.exists():
             continue
         try:
-            open_store(cand)
-            return cand
-        except ValueError:
-            quarantine(cand)
+            _, attrs = open_store(cand)
+        except (ValueError, FileNotFoundError):
+            # 0.8 converts atomically, so a store that exists but does not
+            # open is a wedge from an older version, never work in progress
+            try:
+                quarantine(cand)
+            except FileNotFoundError:
+                pass  # another opener quarantined it first
+            continue
+        sel = attrs["nd2wsi"].get("selection") or {}
+        if sel.get("t", 0) or sel.get("p", 0):
+            # built for another timepoint or position: not the default view
+            continue
+        return cand
     return None
 
 

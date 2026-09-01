@@ -82,7 +82,11 @@ def quick_fingerprint(path: str | Path) -> dict[str, Any]:
     st = path.stat()
     h = hashlib.sha256()
     with open(path, "rb") as fh:
-        for offset in (0, max(0, st.st_size // 2 - 1 << 19), max(0, st.st_size - (1 << 20))):
+        for offset in (
+            0,
+            max(0, st.st_size // 2 - (1 << 19)),
+            max(0, st.st_size - (1 << 20)),
+        ):
             fh.seek(offset)
             h.update(fh.read(1 << 20))
     h.update(str(st.st_size).encode())
@@ -170,25 +174,33 @@ def quarantine(path: Path) -> Path:
 class CacheLock:
     """One build per source and selection, across processes.
 
-    An O_EXCL lockfile beside the container carries pid and start time.
-    A second opener waits for the holder rather than double-building; a
-    lock whose process is gone, or which is very old, is reclaimed.
+    An O_EXCL lockfile beside the container carries pid, start time and a
+    random generation. The payload lands on the raw fd before anything
+    else can matter, release removes only a lock this instance created,
+    and a stale lock is reclaimed by atomically renaming it aside — so
+    two waiters can never both count one reclaim, and nobody ever unlinks
+    a live lock they do not own.
     """
 
     def __init__(self, container: Path):
         self.path = container.with_name(container.name + ".lock")
-        self._held = False
+        self._gen: str | None = None
 
-    def _read(self) -> dict[str, Any] | None:
+    def _read(self, path: Path | None = None) -> dict[str, Any] | None:
         try:
-            return json.loads(self.path.read_text())
+            return json.loads((path or self.path).read_text())
         except (OSError, json.JSONDecodeError):
             return None
 
     def _stale(self) -> bool:
         info = self._read()
         if info is None:
-            return True
+            # unreadable or momentarily empty: only old age makes it stale
+            try:
+                age = time.time() - self.path.stat().st_mtime
+            except OSError:
+                return False  # vanished: not ours to reclaim
+            return age > 30
         if time.time() - info.get("time", 0) > _LOCK_STALE_S:
             return True
         pid = info.get("pid")
@@ -200,19 +212,32 @@ class CacheLock:
         except PermissionError:
             return False
 
+    def _reclaim(self) -> None:
+        """Take a stale lock out of play; only one contender can win."""
+        aside = self.path.with_name(f"{self.path.name}.reclaim-{uuid.uuid4().hex[:8]}")
+        try:
+            self.path.rename(aside)
+        except OSError:
+            return  # someone else reclaimed it first
+        aside.unlink(missing_ok=True)
+
     def acquire(self, timeout: float = 3600.0, poll: float = 0.5) -> None:
         deadline = time.time() + timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        gen = uuid.uuid4().hex
+        payload = json.dumps({"pid": os.getpid(), "time": time.time(), "gen": gen})
         while True:
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w") as fh:
-                    json.dump({"pid": os.getpid(), "time": time.time()}, fh)
-                self._held = True
+                try:
+                    os.write(fd, payload.encode())
+                finally:
+                    os.close(fd)
+                self._gen = gen
                 return
             except FileExistsError:
                 if self._stale():
-                    self.path.unlink(missing_ok=True)
+                    self._reclaim()
                     continue
                 if time.time() > deadline:
                     raise TimeoutError(
@@ -221,9 +246,14 @@ class CacheLock:
                 time.sleep(poll)
 
     def release(self) -> None:
-        if self._held:
-            self.path.unlink(missing_ok=True)
-            self._held = False
+        if self._gen is None:
+            return
+        info = self._read()
+        if info is not None and info.get("gen") != self._gen:
+            self._gen = None
+            return  # reclaimed out from under us: that lock is not ours
+        self.path.unlink(missing_ok=True)
+        self._gen = None
 
     def __enter__(self) -> CacheLock:
         self.acquire()
@@ -255,31 +285,35 @@ def commit_container(staging: Path, final: Path) -> None:
 
 
 def sweep_stale_builds(caches_dir: Path) -> int:
-    """Remove leftover staging dirs whose builder is gone. Returns count."""
+    """Remove leftover staging and backup dirs whose builder is gone.
+
+    Covers ``*.building-<pid>`` staging and ``*.replaced-*`` backups that
+    a crash inside commit_container can strand. Liveness is judged from
+    the family's exact lockfile — names are never fed to glob, so a
+    bracketed NIS-Elements filename cannot inject wildcards.
+    """
     n = 0
     if not caches_dir.is_dir():
         return 0
     for item in caches_dir.iterdir():
-        if ".building-" not in item.name:
+        name = item.name
+        if ".building-" in name:
+            family = name.split(".building-")[0].lstrip(".")
+        elif ".replaced-" in name:
+            family = name.split(".replaced-")[0]
+        else:
             continue
-        # a staging dir is fair game once no lockfile in the directory
-        # claims a live pid for its container family
-        family = item.name.split(".building-")[0]
+        lock = CacheLock(caches_dir / family)
+        info = lock._read()
         live = False
-        for lk in caches_dir.glob(f"{family}*.lock"):
-            info = None
+        if info:
             try:
-                info = json.loads(lk.read_text())
-            except (OSError, json.JSONDecodeError):
+                os.kill(int(info.get("pid", -1)), 0)
+                live = True
+            except (ProcessLookupError, ValueError, TypeError):
                 pass
-            if info:
-                try:
-                    os.kill(int(info.get("pid", -1)), 0)
-                    live = True
-                except (ProcessLookupError, ValueError, TypeError):
-                    pass
-                except PermissionError:
-                    live = True
+            except PermissionError:
+                live = True
         if not live:
             shutil.rmtree(item, ignore_errors=True)
             n += 1
