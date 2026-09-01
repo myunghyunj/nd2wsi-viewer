@@ -258,20 +258,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "view":
-        from .convert import convert, default_store_path
+        from .convert import convert, default_store_path, ensure_cache, existing_cache_store
         from .server import serve
+        from .svs import is_svs
 
+        explicit = bool(
+            args.store or args.overwrite or args.t or args.position
+            or args.z != "mid" or args.tile
+        )
         stores = []
         for slide in args.nd2:
+            if not explicit:
+                # the default view goes through the managed cache: identity
+                # checked, atomically built, straight from the file for SVS
+                if is_svs(slide) and existing_cache_store(slide) is None:
+                    print(f"{Path(slide).name}: serving straight from the file")
+                    stores.append(Path(slide))
+                else:
+                    stores.append(ensure_cache(slide, selection=_selection(args)))
+                continue
+            # explicit knobs mean a deliberate, portable store
             store = default_store_path(slide)
             if args.store and len(args.nd2) == 1:
                 store = Path(args.store)
-            from .svs import is_svs
-
-            if is_svs(slide) and not store.exists() and not args.overwrite:
-                print(f"{Path(slide).name}: serving straight from the file")
-                stores.append(Path(slide))
-                continue
             if args.overwrite or not store.exists():
                 if not confirm_pyramid(slide, args.yes):
                     print(f"skipped {Path(slide).name}")

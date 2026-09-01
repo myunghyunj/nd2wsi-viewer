@@ -2,6 +2,8 @@
 import numpy as np
 import pytest
 
+from nd2wsi.server import server_url
+
 limnd2 = pytest.importorskip("limnd2")
 nd2 = pytest.importorskip("nd2")
 
@@ -112,7 +114,7 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
     convert(src_path, store, progress=False)
     httpd = create_server(store, port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    base = server_url(httpd).rstrip("/")
     try:
         first = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
         assert first["items"] == [] and first["path"].endswith(
@@ -179,7 +181,7 @@ def test_multi_slide_registry(fluor_nd2, tmp_path):
     convert(src_path, s2, progress=False)
     httpd = create_server([s1, s2], port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    base = server_url(httpd).rstrip("/")
     try:
         d = json.loads(urllib.request.urlopen(base + "/api/slides").read())
         assert len(d["slides"]) == 2
@@ -221,7 +223,7 @@ def test_export_progress_endpoint(fluor_nd2, tmp_path):
     convert(src_path, store, progress=False)
     httpd = create_server(store, port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    base = server_url(httpd).rstrip("/")
     try:
         body = urllib.request.urlopen(
             base + "/api/roi?level=0&x=0&y=0&w=300&h=200&format=tiff&job=t-1", timeout=60
@@ -258,7 +260,7 @@ def test_convert_progress_and_trash(fluor_nd2, tmp_path):
 
     httpd = create_server(store, port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    base = server_url(httpd).rstrip("/")
     try:
         sid = json.loads(
             urllib.request.urlopen(base + "/api/slides").read()
@@ -307,7 +309,7 @@ def test_open_reports_convert_progress(fluor_nd2, tmp_path):
 
     httpd = create_server(seed, port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    base = server_url(httpd).rstrip("/")
     try:
         req = urllib.request.Request(
             base + "/api/open",

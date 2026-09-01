@@ -1480,7 +1480,7 @@ function wireTheme() {
   if (state.info && state.info.rgb && t !== "light") {
     t = "light";
     if (window.parent !== window) {
-      window.parent.postMessage({ nd2wsi: "theme", theme: t }, "*");
+      window.parent.postMessage({ nd2wsi: "theme", theme: t }, location.origin);
     }
   }
   applyTheme(t);
@@ -1488,10 +1488,11 @@ function wireTheme() {
     const next = currentTheme() === "light" ? "dark" : "light";
     applyTheme(next);
     if (window.parent !== window) {
-      window.parent.postMessage({ nd2wsi: "theme", theme: next }, "*");
+      window.parent.postMessage({ nd2wsi: "theme", theme: next }, location.origin);
     }
   };
   window.addEventListener("message", (ev) => {
+  if (ev.origin !== location.origin) return;
     if (ev.data && ev.data.nd2wsi === "theme") applyTheme(ev.data.theme);
   });
 }
@@ -1532,7 +1533,7 @@ function wireTrash() {
     // that takes minutes, so the button carries the count while it runs
     const job = Math.random().toString(36).slice(2, 10);
     const timer = setInterval(() => {
-      fetch("/api/roi/progress?job=" + job, { cache: "no-store" })
+      fetch("api/roi/progress?job=" + job, { cache: "no-store" })
         .then((r) => r.json())
         .then((d) => {
           if (d.state === "deleting") go.textContent = "Deleting… " + (d.pct || 0) + " %";
@@ -1540,7 +1541,7 @@ function wireTrash() {
         .catch(() => {});
     }, 400);
     const stop = () => { clearInterval(timer); go.textContent = label; };
-    fetch("/api/trash", {
+    fetch("../../api/trash", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sid: m[1], job }),
@@ -1552,9 +1553,9 @@ function wireTrash() {
         showToast("cache deleted — freed " + fmtBytes(d.freed || 0));
         setTimeout(() => {
           if (window.parent !== window) {
-            window.parent.postMessage({ nd2wsi: "slide-trashed" }, "*");
+            window.parent.postMessage({ nd2wsi: "slide-trashed" }, location.origin);
           } else {
-            location.href = "/";
+            location.href = "../../";
           }
         }, 900);
       })
@@ -1824,7 +1825,7 @@ function wireDragForward() {
   window.addEventListener("dragenter", (ev) => {
     const types = ev.dataTransfer ? Array.from(ev.dataTransfer.types || []) : [];
     if (types.includes("Files") && window.parent !== window) {
-      window.parent.postMessage({ nd2wsi: "file-drag" }, "*");
+      window.parent.postMessage({ nd2wsi: "file-drag" }, location.origin);
     }
   });
   window.addEventListener("dragover", (ev) => ev.preventDefault());

@@ -171,7 +171,7 @@ function activate(sid) {
   active = sid;
   if (sid && !frames.has(sid)) {
     const f = document.createElement("iframe");
-    f.src = "/s/" + sid + "/";
+    f.src = "s/" + sid + "/";
     frames.set(sid, f);
     $("frames").append(f);
   }
@@ -180,7 +180,7 @@ function activate(sid) {
 }
 
 function refresh(selectSid) {
-  return fetch("/api/slides").then((r) => r.json()).then((d) => {
+  return fetch("api/slides").then((r) => r.json()).then((d) => {
     slides = d.slides || [];
     for (const [k, f] of [...frames]) {
       if (!slides.some((s) => s.sid === k)) { f.remove(); frames.delete(k); }
@@ -205,7 +205,7 @@ function openPath(path) {
   render();
   clearInterval(busyTimer);
   busyTimer = setInterval(() => {
-    fetch("/api/roi/progress?job=" + job, { cache: "no-store" })
+    fetch("api/roi/progress?job=" + job, { cache: "no-store" })
       .then((r) => r.json())
       .then((d) => {
         if (!busyTab) return;
@@ -219,7 +219,7 @@ function openPath(path) {
       })
       .catch(() => {});
   }, 400);
-  return fetch("/api/open", {
+  return fetch("api/open", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, job }),
@@ -235,7 +235,7 @@ function openPath(path) {
 }
 
 function closeTab(sid) {
-  fetch("/api/close", {
+  fetch("api/close", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sid }),
@@ -280,7 +280,7 @@ document.addEventListener("dragover", (ev) => ev.preventDefault(), true);
 document.addEventListener("drop", (ev) => ev.preventDefault(), true);
 
 window.addEventListener("message", (ev) => {
-  if (!ev.data) return;
+  if (ev.origin !== location.origin || !ev.data) return;
   if (ev.data.nd2wsi === "slide-trashed") refresh();
   if (ev.data.nd2wsi === "file-drag") zone.hidden = false;
   if (ev.data.nd2wsi === "theme") {
@@ -288,7 +288,7 @@ window.addEventListener("message", (ev) => {
     try { localStorage.setItem("nd2wsi.theme", ev.data.theme); } catch (e) { /* ok */ }
     for (const [, f] of frames) {
       if (f.contentWindow && f.contentWindow !== ev.source) {
-        f.contentWindow.postMessage(ev.data, "*");
+        f.contentWindow.postMessage(ev.data, location.origin);
       }
     }
   }

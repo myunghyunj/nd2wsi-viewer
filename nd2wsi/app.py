@@ -282,13 +282,19 @@ def _wire_file_drop(window):
     window.events.loaded += attach
 
 
+def _server_url(httpd) -> str:
+    from .server import server_url
+
+    return server_url(httpd)
+
+
 def start_server(store: Path):
     """Serve the store on an ephemeral localhost port; returns (httpd, url)."""
-    from .server import create_server
+    from .server import create_server, server_url
 
     httpd = create_server(store, host="127.0.0.1", port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/"
+    return httpd, server_url(httpd)
 
 
 class Api:
@@ -381,7 +387,7 @@ class Api:
                     self._httpd, url = start_server(store)
                 else:
                     self._httpd.registry.add_store(store)
-                    url = f"http://127.0.0.1:{self._httpd.server_address[1]}/"
+                    url = _server_url(self._httpd)
             except Exception as e:
                 self._frac = -1.0
                 self._status = f"could not open {p.name}: {e}"
@@ -405,7 +411,7 @@ class Api:
                 self._httpd, url = start_server(store)
             else:
                 self._httpd.registry.add_store(store)
-                url = f"http://127.0.0.1:{self._httpd.server_address[1]}/"
+                url = _server_url(self._httpd)
             return url  # the tab shell at / lists every open slide
         except Exception as e:  # surfaced in the bootstrap page
             self._frac = -1.0

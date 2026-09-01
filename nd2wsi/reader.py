@@ -69,6 +69,30 @@ class PlaneSource:
     calibration_source: str = "unknown"  # nd2-voxel-size | aperio-mpp | unknown
 
 
+class _OpaqueView:
+    """An ndarray face whose dask token never touches the pixels.
+
+    dask 2026 tokenizes captured arrays by content even under
+    ``name=False``, which for a memory-mapped stitched slide means hashing
+    the whole multi-gigabyte file through the page cache before a single
+    task runs — minutes on a USB disk, observed at 376 s for one 14 GB
+    scan. Handing dask this wrapper instead makes the token a constant and
+    leaves the pixels untouched until a chunk is actually computed.
+    """
+
+    def __init__(self, a: Any):
+        self._a = a
+        self.shape = a.shape
+        self.dtype = a.dtype
+        self.ndim = a.ndim
+
+    def __getitem__(self, idx: Any) -> Any:
+        return self._a[idx]
+
+    def __dask_tokenize__(self) -> Any:
+        return ("nd2wsi-opaque", id(self._a), self.shape, str(self.dtype))
+
+
 def _mid(n: int) -> int:
     return n // 2
 
@@ -224,7 +248,9 @@ def open_plane(
         planes = []
         for zi in range(n_z):
             cyx, rgb = _frame_to_cyx(frame_view(zi), sizes)
-            planes.append(da.from_array(cyx, chunks=(1, tile, tile), name=False))
+            planes.append(
+                da.from_array(_OpaqueView(cyx), chunks=(1, tile, tile), name=False)
+            )
         data = da.stack(planes, axis=0).max(axis=0)
         z_used: str | int = "max"
         notes.append(f"Z: maximum-intensity projection over {n_z} planes")
@@ -238,7 +264,7 @@ def open_plane(
         if not 0 <= z_index < n_z:
             raise ValueError(f"--z {z_index} out of range (Z={n_z})")
         cyx, rgb = _frame_to_cyx(frame_view(z_index), sizes)
-        data = da.from_array(cyx, chunks=(1, tile, tile), name=False)
+        data = da.from_array(_OpaqueView(cyx), chunks=(1, tile, tile), name=False)
         z_used = z_index
         if n_z > 1:
             notes.append(f"file has {n_z} Z planes; converting z={z_index}")

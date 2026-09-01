@@ -356,7 +356,9 @@ class SlideRegistry:
         return out
 
 
-def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    registry: SlideRegistry, token: str = ""
+) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nd2wsi"
@@ -367,6 +369,8 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
             self.end_headers()
@@ -399,10 +403,45 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
             return None, path
 
         # ---- routing -----------------------------------------------------
+        def _gate(self) -> str | None:
+            """Strip and verify the capability prefix; None means rejected.
+
+            Every route lives under /<token>/. A request without the right
+            token gets a bare 404 — tiles, downloads and API alike — so a
+            local process or a web page cannot even probe the server. The
+            Host header must name loopback, and any Origin present must be
+            this server itself.
+            """
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+            if host not in ("127.0.0.1", "localhost", "[::1]", "::1", ""):
+                self._error(404, "not found")
+                return None
+            origin = self.headers.get("Origin")
+            if origin and urllib.parse.urlparse(origin).hostname not in (
+                "127.0.0.1",
+                "localhost",
+                "::1",
+            ):
+                self._error(404, "not found")
+                return None
+            if not token:
+                return path
+            prefix = f"/{token}"
+            if path == prefix:
+                path = prefix + "/"
+            if not path.startswith(prefix + "/"):
+                self._error(404, "not found")
+                return None
+            return path[len(prefix) :]
+
         def do_GET(self):  # noqa: N802 (http.server API)
             try:
                 parsed = urllib.parse.urlparse(self.path)
-                path = parsed.path
+                path = self._gate()
+                if path is None:
+                    return
                 q = urllib.parse.parse_qs(parsed.query)
                 if path == "/":
                     return self._static("shell.html")
@@ -445,8 +484,12 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self):  # noqa: N802 (http.server API)
             try:
-                parsed = urllib.parse.urlparse(self.path)
-                path = parsed.path
+                path = self._gate()
+                if path is None:
+                    return
+                ctype = (self.headers.get("Content-Type") or "").split(";")[0]
+                if ctype.strip().lower() != "application/json":
+                    return self._error(415, "expected application/json")
                 if path == "/api/open":
                     return self._open()
                 if path == "/api/close":
@@ -468,7 +511,7 @@ def make_handler(registry: SlideRegistry) -> type[BaseHTTPRequestHandler]:
         # ---- global endpoints --------------------------------------------
         def _static(self, rel: str):
             file = (STATIC_DIR / rel).resolve()
-            if not str(file).startswith(str(STATIC_DIR.resolve())) or not file.is_file():
+            if not file.is_relative_to(STATIC_DIR.resolve()) or not file.is_file():
                 return self._error(404, "not found")
             body = file.read_bytes()
             self._send(200, body, MIME.get(file.suffix, "application/octet-stream"))
@@ -753,14 +796,35 @@ def create_server(
     thread (the macOS app shell). More slides can be added afterwards via
     ``httpd.registry`` or POST /api/open.
     """
+    import ipaddress
+    import secrets
+
+    try:
+        is_loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise ValueError(
+            f"refusing to bind {host}: this server has no authentication "
+            "beyond its capability URL and serves local files -- it binds "
+            "loopback only"
+        )
+
     if isinstance(store_paths, (str, Path)):
         store_paths = [store_paths]
     registry = SlideRegistry(max_render_mpx=max_render_mpx)
     for p in store_paths:
         registry.add_store(p)
-    httpd = ThreadingHTTPServer((host, port), make_handler(registry))
+    token = secrets.token_urlsafe(16)
+    httpd = ThreadingHTTPServer((host, port), make_handler(registry, token))
     httpd.registry = registry  # for embedders
+    httpd.token = token
     return httpd
+
+
+def server_url(httpd: ThreadingHTTPServer, host: str = "127.0.0.1") -> str:
+    """The capability URL — the only address that reaches this server."""
+    return f"http://{host}:{httpd.server_address[1]}/{httpd.token}/"
 
 
 def serve(
@@ -774,7 +838,7 @@ def serve(
     )
     for s in httpd.registry.listing():
         print(f"serving {s['name']}  {s['width']} x {s['height']} px")
-    print(f"open   http://{host}:{httpd.server_address[1]}/   (Ctrl+C to stop)")
+    print(f"open   {server_url(httpd, host)}   (Ctrl+C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

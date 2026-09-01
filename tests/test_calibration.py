@@ -16,7 +16,7 @@ tifffile = pytest.importorskip("tifffile")
 pytest.importorskip("imagecodecs")
 
 from nd2wsi.convert import convert, default_store_path, open_store  # noqa: E402
-from nd2wsi.server import SlideRegistry  # noqa: E402
+from nd2wsi.server import SlideRegistry, server_url  # noqa: E402
 
 
 @pytest.fixture()
@@ -137,7 +137,7 @@ def test_info_payload_flags_calibration(uncalibrated_svs):
     httpd = create_server(path, host="127.0.0.1", port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
-        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        base = server_url(httpd).rstrip("/")
         info = json.loads(urllib.request.urlopen(base + "/api/info", timeout=30).read())
         assert info["calibrated"] is False
         assert info["pixelSizeUm"] is None
