@@ -26,7 +26,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install with every extra, limnd2 index included
         run: |
-          uv venv .venv
+          uv venv .venv --clear
           uv pip install -p .venv -e ".[svs,nd2export,app,test]" \
             --extra-index-url https://pypi.laboratory-imaging.com/simple
       - name: Unit and integration tests (synthetic fixtures)

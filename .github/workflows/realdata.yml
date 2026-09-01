@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: |
-          uv venv .venv
+          uv venv .venv --clear
           uv pip install -p .venv -e ".[svs,nd2export,app,test]" \
             --extra-index-url https://pypi.laboratory-imaging.com/simple
       - name: Fetch the example acquisitions
