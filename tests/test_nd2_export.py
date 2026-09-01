@@ -137,7 +137,13 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
         sidecar = tmp_path / "nd2wsi" / "annotations" / "annotations_fluor.json"
         assert sidecar.exists()
         on_disk = json.loads(sidecar.read_text())
-        assert on_disk["items"] == items and on_disk["source"] == "fluor.nd2"
+        assert on_disk["items"] == items
+        assert on_disk["format"] == "nd2wsi-annotations/2"
+        assert on_disk["coordinate_space"] == "level-0-pixels"
+        assert on_disk["source"]["name"] == "fluor.nd2"
+        assert on_disk["source"]["width"] == 900
+        assert on_disk["calibration"]["status"] == "calibrated"
+        assert abs(on_disk["calibration"]["x_um_per_px"] - 0.66) < 1e-6
 
         back = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
         assert back["items"] == items  # auto-found on the next open

@@ -91,3 +91,25 @@ def test_static_stays_inside_its_directory(served):
     base = server_url(served).rstrip("/")
     for probe in ("/static/../server.py", "/static/%2e%2e/server.py"):
         assert _status(base + probe) == 404, probe
+
+
+def test_eight_threads_hammering_tiles_and_listing(served):
+    """The registry used to iterate its dict unlocked while other threads
+    mutated it; polling plus opening raced into RuntimeError."""
+    import concurrent.futures
+
+    base = server_url(served).rstrip("/")
+
+    def hit(i):
+        if i % 3 == 0:
+            return len(urllib.request.urlopen(base + "/api/slides", timeout=30).read())
+        tx, ty = i % 2, (i // 2) % 2
+        return len(
+            urllib.request.urlopen(
+                f"{base}/api/tile/0/{tx}/{ty}.jpg", timeout=30
+            ).read()
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        sizes = list(ex.map(hit, range(80)))
+    assert all(s > 0 for s in sizes)

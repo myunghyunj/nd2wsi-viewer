@@ -136,11 +136,26 @@ def main(argv: list[str] | None = None) -> int:
     _add_selection_args(p_crop)
 
     p_tidy = sub.add_parser(
-        "tidy", help="collect scattered pyramid stores into one pyramids/ folder"
+        "tidy", help="collect caches and annotations into the managed nd2wsi folder"
     )
     p_tidy.add_argument("folder", nargs="+", help="folder(s) holding slides")
     p_tidy.add_argument(
         "--dry-run", action="store_true", help="list the moves without making them"
+    )
+    p_tidy.add_argument(
+        "--move-annotations",
+        action="store_true",
+        help="move stray annotation sidecars into nd2wsi/annotations/",
+    )
+    p_tidy.add_argument(
+        "--remove-stale-builds",
+        action="store_true",
+        help="delete leftover .building-* staging dirs with no live builder",
+    )
+    p_tidy.add_argument(
+        "--remove-corrupt-caches",
+        action="store_true",
+        help="delete quarantined *.corrupt-* caches",
     )
 
     p_serve = sub.add_parser("serve", help="serve the viewer for converted store(s)")
@@ -190,11 +205,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "tidy":
+        import shutil
+
+        from .cache import ANNOTATIONS_DIR, MANAGED_DIR, sweep_stale_builds
         from .convert import CACHE_DIR_NAME, tidy_caches
         from .reader import nice_bytes
 
         total = swept = freed = 0
         for folder in args.folder:
+            folder = Path(folder)
             res = tidy_caches(folder, dry_run=args.dry_run)
             total += len(res["moved"])
             swept += res["swept"]
@@ -202,6 +221,37 @@ def main(argv: list[str] | None = None) -> int:
             for src, dst in res["moved"]:
                 verb = "would move" if args.dry_run else "moved"
                 print(f"{verb} {src.name} -> {CACHE_DIR_NAME}/{dst.name}")
+
+            if args.move_annotations:
+                target = folder / MANAGED_DIR / ANNOTATIONS_DIR
+                for stray in sorted(folder.glob("annotations_*.json")) + sorted(
+                    (folder / CACHE_DIR_NAME).glob("annotations_*.json")
+                ):
+                    dest = target / stray.name
+                    if dest.exists():
+                        print(f"kept {stray} (a copy already lives in the managed folder)")
+                        continue
+                    if args.dry_run:
+                        print(f"would move {stray.name} -> {MANAGED_DIR}/{ANNOTATIONS_DIR}/")
+                        continue
+                    target.mkdir(parents=True, exist_ok=True)
+                    stray.rename(dest)
+                    print(f"moved {stray.name} -> {MANAGED_DIR}/{ANNOTATIONS_DIR}/")
+
+            caches = folder / MANAGED_DIR / "caches"
+            if args.remove_stale_builds and not args.dry_run:
+                n = sweep_stale_builds(caches)
+                if n:
+                    print(f"removed {n} stale build dir(s)")
+            if args.remove_corrupt_caches:
+                for corpse in sorted(caches.glob("*.corrupt-*")) + sorted(
+                    (folder / CACHE_DIR_NAME).glob("*.corrupt-*")
+                ):
+                    if args.dry_run:
+                        print(f"would remove {corpse.name}")
+                    else:
+                        shutil.rmtree(corpse, ignore_errors=True)
+                        print(f"removed {corpse.name}")
         print(f"{total} store(s) {'to move' if args.dry_run else 'collected'}")
         if swept:
             print(f"swept {swept} AppleDouble files, {nice_bytes(freed)} recovered")

@@ -337,11 +337,20 @@ class SlideRegistry:
         return freed
 
     def default_sid(self) -> str | None:
-        return next(iter(self.slides), None)
+        with self._lock:
+            return next(iter(self.slides), None)
+
+    def get(self, sid: str | None) -> ViewerState | None:
+        with self._lock:
+            if sid is None:
+                sid = next(iter(self.slides), None)
+            return self.slides.get(sid) if sid else None
 
     def listing(self) -> list[dict[str, Any]]:
+        with self._lock:
+            items = list(self.slides.items())
         out = []
-        for sid, st in self.slides.items():
+        for sid, st in items:
             meta = st.attrs["nd2wsi"]
             lv0 = meta["levels"][0]
             out.append(
@@ -395,11 +404,10 @@ def make_handler(
             """Map a URL path to (slide state, slide-relative path)."""
             m = SLIDE_RE.match(path)
             if m:
-                st = registry.slides.get(m.group(1))
+                st = registry.get(m.group(1))
                 return st, (m.group(2) or "/")
             if path.startswith("/api/"):  # bare API -> first slide (scripts)
-                sid = registry.default_sid()
-                return (registry.slides.get(sid) if sid else None), path
+                return registry.get(None), path
             return None, path
 
         # ---- routing -----------------------------------------------------
@@ -634,6 +642,8 @@ def make_handler(
             self._json({"items": items, "path": str(p)})
 
         def _annotations_post(self, st: ViewerState):
+            import uuid as _uuid
+
             p = st.annotations_path
             if p is None:
                 return self._error(400, "no annotation sidecar path for this store")
@@ -643,14 +653,35 @@ def make_handler(
                 return self._error(400, str(e))
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):
                 return self._error(400, "expected {\"items\": [...]}")
+            meta = st.attrs["nd2wsi"]
+            lv0 = meta["levels"][0]
+            cal = meta.get("calibration", {})
+            ps = meta.get("pixel_size_um")
             payload = {
-                "format": "nd2wsi-annotations/1",
-                "source": st.attrs["nd2wsi"]["source"],
+                "format": "nd2wsi-annotations/2",
+                "coordinate_space": "level-0-pixels",
+                "source": {
+                    "name": meta["source"],
+                    "width": lv0["width"],
+                    "height": lv0["height"],
+                },
+                "calibration": {
+                    "status": cal.get("status", "unknown"),
+                    "source": cal.get("source", "unknown"),
+                    **(
+                        {"y_um_per_px": ps[0], "x_um_per_px": ps[1]}
+                        if ps
+                        else {}
+                    ),
+                },
                 "items": data["items"],
             }
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, indent=1))
-            tmp.replace(p)  # atomic
+            # unique temp + per-slide lock: two tabs saving at once cannot
+            # interleave through one shared temp name
+            with st.lock:
+                tmp = p.with_name(f".{p.name}.{_uuid.uuid4().hex[:8]}.tmp")
+                tmp.write_text(json.dumps(payload, indent=1))
+                tmp.replace(p)  # atomic
             self._json({"ok": True, "path": str(p), "count": len(data["items"])})
 
         def _histogram(self, st: ViewerState):
