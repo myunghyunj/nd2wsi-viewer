@@ -16,8 +16,9 @@ regardless of ROI height.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -189,7 +190,7 @@ def crop_nd2_to_nd2(
         planes = [
             {
                 "name": src.channels[ci].name,
-                "color": "%02X%02X%02X" % src.channels[ci].color,
+                "color": "{:02X}{:02X}{:02X}".format(*src.channels[ci].color),
             }
             for ci in chans
         ]

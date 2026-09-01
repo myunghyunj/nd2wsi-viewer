@@ -267,9 +267,8 @@ def _wire_file_drop(window):
         _dlog(f"drop received {len(files)} file(s), {len(paths)} with paths")
         if paths:
             window.evaluate_js(
-                "window.__pydrop_multi ? window.__pydrop_multi(%s)"
-                " : (window.__pydrop && window.__pydrop(%s))"
-                % (_json.dumps(paths), _json.dumps(paths[0]))
+                f"window.__pydrop_multi ? window.__pydrop_multi({_json.dumps(paths)})"
+                f" : (window.__pydrop && window.__pydrop({_json.dumps(paths[0])}))"
             )
 
     def attach(*_args):

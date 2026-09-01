@@ -117,10 +117,18 @@ echo "==> codesign (ad-hoc)"
 codesign --force --deep -s - "$OUT/$APPNAME.app"
 
 echo "==> smoke test"
+# A release artifact must prove itself: convert, serve, tile, ND2 round-trip.
+# Only an explicit --skip-smoke (development convenience) may skip it.
 if [ -n "${ND2WSI_SMOKE_FILE:-}" ]; then
   "$OUT/$APPNAME.app/Contents/MacOS/$APPNAME" --smoke "$ND2WSI_SMOKE_FILE"
+elif [ "${ND2WSI_SKIP_SMOKE:-}" = "1" ]; then
+  echo "   SKIPPED by explicit request — do not ship this build"
 else
-  echo "   (set ND2WSI_SMOKE_FILE=/path/to/small.nd2 to smoke-test the bundle)"
+  echo "   ERROR: no ND2WSI_SMOKE_FILE set." >&2
+  echo "   Fetch the examples (scripts/fetch_testdata.py) and set" >&2
+  echo "   ND2WSI_SMOKE_FILE=docs/example_cell.nd2, or set" >&2
+  echo "   ND2WSI_SKIP_SMOKE=1 for a development build that must not ship." >&2
+  exit 4
 fi
 
 echo "==> dmg"

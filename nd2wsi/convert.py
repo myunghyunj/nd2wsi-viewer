@@ -25,12 +25,11 @@ import json
 import math
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-from typing import Callable
 
 from .reader import PlaneSelection, PlaneSource, level_shapes, nice_bytes, open_plane
 
@@ -252,7 +251,7 @@ def _percentile_windows(
 
 
 def _hex_color(rgb: tuple[int, int, int]) -> str:
-    return "%02X%02X%02X" % rgb
+    return "{:02X}{:02X}{:02X}".format(*rgb)
 
 
 def build_group_attrs(
@@ -501,7 +500,7 @@ def estimate_store_bytes(
     the sample grid covers background as well as tissue, so the ratio is the
     slide's own rather than one hardcoded number.
     """
-    from .reader import level_shapes, nice_bytes, open_plane, PlaneSelection
+    from .reader import PlaneSelection, level_shapes, nice_bytes, open_plane
     from .svs import is_svs, sample_planes
 
     path = Path(path)
