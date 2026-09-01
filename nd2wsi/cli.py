@@ -123,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_crop.add_argument("nd2")
     p_crop.add_argument("out", help="output .nd2 file")
+    p_crop.add_argument(
+        "--overwrite", action="store_true", help="replace an existing output file"
+    )
     p_crop.add_argument("--x", type=int, required=True, help="left edge (px)")
     p_crop.add_argument("--y", type=int, required=True, help="top edge (px)")
     p_crop.add_argument("--w", type=int, required=True, help="width (px)")
@@ -206,6 +209,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "crop":
         from .export_nd2 import crop_nd2_to_nd2
+
+        if Path(args.out).exists() and not args.overwrite:
+            print(
+                f"error: {args.out} exists (use --overwrite to replace it)",
+                file=sys.stderr,
+            )
+            return 1
 
         channels = [int(t) for t in args.c.split(",") if t.strip()] if args.c else None
         try:

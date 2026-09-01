@@ -328,3 +328,21 @@ def test_open_reports_convert_progress(fluor_nd2, tmp_path):
         assert manifest and manifest["complete"] and manifest["kind"] == "full"
     finally:
         httpd.shutdown()
+
+
+def test_failed_write_preserves_the_existing_output(fluor_nd2, tmp_path):
+    """The old writer deleted the destination before writing; a failure
+    then left neither the old file nor a valid new one."""
+    from nd2wsi.export_nd2 import write_nd2
+
+    out = tmp_path / "keep.nd2"
+    out.write_bytes(b"precious previous export")
+
+    def bomb(x, y, w, h):
+        raise RuntimeError("disk on fire")
+
+    with pytest.raises(RuntimeError, match="disk on fire"):
+        write_nd2(out, bomb, height=100, width=100, dtype=np.dtype(np.uint16),
+                  pixel_size_um=0.5, planes=[{"name": "A", "color": "FF0000"}])
+    assert out.read_bytes() == b"precious previous export"
+    assert not list(tmp_path.glob("*.partial-*"))

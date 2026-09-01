@@ -166,13 +166,29 @@ def _write_level0(src: PlaneSource, arr: Any) -> None:
     _store_direct(src.data, arr)
 
 
-def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -> None:
-    """2x2-mean one pyramid level into the next, one task per target chunk.
+DOWNSAMPLE_TASK_BUDGET = 96 << 20  # peak bytes one downsample task may hold
 
-    Each task decodes the four source chunk files under its footprint,
-    means them (float32 is exact for 2x2 means of uint8/uint16), and writes
-    the encoded target chunk -- direct chunk I/O end to end, nothing moves
-    through the dask graph.
+
+def _batch_cols(nt: int, itemsize: int) -> int:
+    """Output columns one task may span, from the task memory budget.
+
+    Per output column a task holds two source rows of chunks, a float32
+    mean and the output row: ``2*nt*2*itemsize + nt*4 + nt*itemsize``
+    bytes. The batch is a whole number of chunks and at least one.
+    """
+    per_col = 2 * nt * 2 * itemsize + nt * 4 + nt * itemsize
+    cols = max(nt, int(DOWNSAMPLE_TASK_BUDGET / per_col) // nt * nt)
+    return cols
+
+
+def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -> None:
+    """2x2-mean one pyramid level into the next, in bounded batches.
+
+    Each task decodes the source chunk files under its footprint, means
+    them (float32 is exact for 2x2 means of uint8/uint16), and writes the
+    encoded target chunks -- direct chunk I/O end to end. A task spans one
+    target chunk row by a column batch sized from a fixed memory budget,
+    so peak bytes per task depend on the tile size, never the slide width.
     """
     import dask
 
@@ -181,50 +197,52 @@ def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -
     pdtype = np.dtype(prev_arr.dtype)
     c, ph, pw = prev_arr.shape
     _, nh, nw = next_arr.shape
-    ew = nw * 2  # even source extent consumed per row
     _, pt, _ = pcs
     _, nt, _ = ncs
     integer = np.issubdtype(dtype, np.integer)
+    bw = _batch_cols(nt, pdtype.itemsize)
 
-    def one_row(ci: int, ty: int) -> None:
+    def one_batch(ci: int, ty: int, x0: int, x1: int) -> None:
         y0, y1 = ty * nt, min((ty + 1) * nt, nh)
         sy0, sy1 = 2 * y0, 2 * y1
-        src = np.zeros((sy1 - sy0, ew), pdtype)
+        sx0, sx1 = 2 * x0, 2 * x1
+        src = np.zeros((sy1 - sy0, sx1 - sx0), pdtype)
         # An axis that has already collapsed to one pixel has no second row
         # or column to average with. Read only what the source holds, then
         # repeat its edge, so the level carries the real value forward
         # instead of averaging it with the padding zarr keeps in edge chunks.
-        ry, rx = min(sy1, ph), min(ew, pw)
+        ry, rx = min(sy1, ph), min(sx1, pw)
         for cy in range(sy0 // pt, -(-ry // pt)):
-            for cx in range(-(-rx // pt)):
+            for cx in range(sx0 // pt, -(-rx // pt)):
                 key = psep.join((str(ci), str(cy), str(cx)))
                 full = np.frombuffer(
                     pcodec.decode((ppath / key).read_bytes()), pdtype
                 ).reshape(pcs)[0]
                 oy0, oy1 = max(sy0, cy * pt), min(ry, cy * pt + pt)
-                ox0, ox1 = cx * pt, min(cx * pt + pt, rx)
-                src[oy0 - sy0 : oy1 - sy0, ox0:ox1] = full[
-                    oy0 - cy * pt : oy1 - cy * pt, : ox1 - ox0
+                ox0, ox1 = max(sx0, cx * pt), min(rx, cx * pt + pt)
+                src[oy0 - sy0 : oy1 - sy0, ox0 - sx0 : ox1 - sx0] = full[
+                    oy0 - cy * pt : oy1 - cy * pt, ox0 - cx * pt : ox1 - cx * pt
                 ]
         if ry < sy1:
             src[ry - sy0 :] = src[ry - sy0 - 1 : ry - sy0]
-        if rx < ew:
-            src[:, rx:] = src[:, rx - 1 : rx]
-        h2 = y1 - y0
-        mean = src.reshape(h2, 2, nw, 2).mean(axis=(1, 3), dtype=np.float32)
+        if rx < sx1:
+            src[:, rx - sx0 :] = src[:, rx - sx0 - 1 : rx - sx0]
+        h2, w2 = y1 - y0, x1 - x0
+        mean = src.reshape(h2, 2, w2, 2).mean(axis=(1, 3), dtype=np.float32)
         row = np.rint(mean).astype(dtype) if integer else mean.astype(dtype)
-        for tx in range(-(-nw // nt)):
-            x0, x1 = tx * nt, min((tx + 1) * nt, nw)
+        for tx in range(x0 // nt, -(-x1 // nt)):
+            cx0, cx1 = tx * nt - x0, min((tx + 1) * nt, nw) - x0
             out = np.zeros(ncs, dtype)  # v2 pads edge chunks to full size
-            out[0, :h2, : x1 - x0] = row[:, x0:x1]
+            out[0, :h2, : cx1 - cx0] = row[:, cx0:cx1]
             (npath / nsep.join((str(ci), str(ty), str(tx)))).write_bytes(
                 ncodec.encode(out)
             )
 
     tasks = [
-        dask.delayed(one_row)(ci, ty)
+        dask.delayed(one_batch)(ci, ty, x0, min(x0 + bw, nw))
         for ci in range(c)
         for ty in range(-(-nh // nt))
+        for x0 in range(0, nw, bw)
     ]
     dask.compute(*tasks)
 

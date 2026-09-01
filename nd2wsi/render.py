@@ -331,6 +331,9 @@ def export_roi_tiff(
             )
 
 
+RENDER_STRIP_ROWS = 1024
+
+
 def export_roi_rendered(
     root: Any,
     attrs: dict[str, Any],
@@ -343,10 +346,48 @@ def export_roi_rendered(
     fmt: str,
     win: str | None = None,
 ) -> bytes:
+    """Render a region to PNG or JPEG, strip by strip.
+
+    Compositing goes through float32, which at hundreds of megapixels used
+    to mean several times the output size in transients. Each strip is
+    composited alone into one preallocated uint8 canvas, so the peak is
+    the canvas plus one strip — the canvas itself is checked against free
+    memory before anything is read. Encoding still needs the whole image;
+    this is bounded, not streaming.
+    """
     meta = attrs["nd2wsi"]
     levels = meta["levels"]
-    region = _read_region(root, levels[level]["path"], x, y, w, h)
     windows, colors = display_params(attrs)
     windows, gammas = parse_windows(win, windows)
-    img = composite(region, channels, windows, colors, meta["rgb"], gammas)
-    return encode_image(img, fmt, quality=92)
+
+    canvas_bytes = h * w * 3
+    budget = _available_memory() // 2
+    if canvas_bytes > budget:
+        raise ValueError(
+            f"a {w} x {h} render needs {canvas_bytes / 1e9:.1f} GB for its "
+            f"canvas but only {budget / 1e9:.1f} GB is safely available — "
+            "export a coarser level, or use TIFF, which streams"
+        )
+
+    canvas = np.empty((h, w, 3), np.uint8)
+    for y0 in range(0, h, RENDER_STRIP_ROWS):
+        th = min(RENDER_STRIP_ROWS, h - y0)
+        region = _read_region(root, levels[level]["path"], x, y + y0, w, th)
+        canvas[y0 : y0 + th] = composite(
+            region, channels, windows, colors, meta["rgb"], gammas
+        )
+    return encode_image(canvas, fmt, quality=92)
+
+
+def _available_memory() -> int:
+    """Bytes this process can reasonably claim right now."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5
+        )
+        total = int(out.stdout.strip())
+    except Exception:
+        total = 8 << 30
+    return total // 2

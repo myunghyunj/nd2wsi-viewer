@@ -109,7 +109,7 @@ def test_nd2_export_omits_fabricated_calibration(tmp_path):
     out = tmp_path / "uncal.nd2"
     write_nd2(
         out,
-        lambda y, h: img[y : y + h],
+        lambda x, y, w, h: img[y : y + h, x : x + w],
         height=300,
         width=400,
         dtype=np.dtype(np.uint16),

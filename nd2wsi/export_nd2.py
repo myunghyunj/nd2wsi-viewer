@@ -6,8 +6,8 @@ source, so it reopens in NIS-Elements -- and in this tool -- like any other
 acquisition.
 
 Writes are streamed with ``Nd2Writer.setImageTile``, reading the source one
-TILE-row band at a time, so heap stays bounded by ``TILE x ROI-width``
-regardless of ROI height.
+TILE x TILE tile at a time, so heap stays bounded by one tile regardless
+of the ROI's width or height.
 
 ``limnd2`` is not on PyPI; it lives on Laboratory Imaging's own index:
 
@@ -16,6 +16,7 @@ regardless of ROI height.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -53,7 +54,7 @@ def _check_dtype(dtype: np.dtype) -> int:
 
 def write_nd2(
     out_path: str | Path,
-    get_band: Callable[[int, int], np.ndarray],
+    get_tile: Callable[[int, int, int, int], np.ndarray],
     *,
     height: int,
     width: int,
@@ -63,19 +64,24 @@ def write_nd2(
     magnification: float | None = None,
     on_progress: Callable[[float], None] | None = None,
 ) -> None:
-    """Stream a (Y, X, C) image into a new ND2 file, one row band at a time.
+    """Stream a (Y, X, C) image into a new ND2 file, one tile at a time.
 
-    ``get_band(y, h)`` must return a component-interleaved ``(h, width, C)``
-    (or ``(h, width)`` for C=1) band of raw pixel values; it is called with
-    ``h <= TILE``, so memory stays bounded by ``TILE x width``.  ``planes`` is
-    one dict per component: ``{"name": str, "color": "RRGGBB"}``.
+    ``get_tile(x, y, w, h)`` must return a component-interleaved
+    ``(h, w, C)`` (or ``(h, w)`` for C=1) block of raw pixel values; it is
+    called with ``w, h <= TILE``, so memory stays bounded by one tile
+    whatever the ROI's dimensions. ``planes`` is one dict per component:
+    ``{"name": str, "color": "RRGGBB"}``.
     """
+    import uuid
+
     limnd2 = require_limnd2()
     bits = _check_dtype(np.dtype(dtype))
     n_comp = len(planes)
 
+    # write to a sibling and rename in only when complete, so a failure
+    # mid-write can never have destroyed an existing file first
     out_path = Path(out_path)
-    out_path.unlink(missing_ok=True)  # Nd2Writer appends to existing files
+    partial = out_path.with_name(f"{out_path.name}.partial-{uuid.uuid4().hex[:8]}")
 
     attrs = limnd2.ImageAttributes.create(
         width=width,
@@ -92,18 +98,38 @@ def write_nd2(
     if magnification:
         mf_kwargs["objective_magnification"] = float(magnification)
 
-    with limnd2.Nd2Writer(str(out_path)) as f:
+    try:
+        _write_partial(limnd2, partial, get_tile, height, width, n_comp,
+                       attrs, mf_kwargs, planes, on_progress)
+        _validate_nd2(partial, width, height, n_comp)
+        os.replace(partial, out_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def _write_partial(
+    limnd2: Any,
+    partial: Path,
+    get_tile: Callable[[int, int, int, int], np.ndarray],
+    height: int,
+    width: int,
+    n_comp: int,
+    attrs: Any,
+    mf_kwargs: dict[str, Any],
+    planes: list[dict[str, Any]],
+    on_progress: Callable[[float], None] | None = None,
+) -> None:
+    with limnd2.Nd2Writer(str(partial)) as f:
         f.imageAttributes = attrs
         for y0 in range(0, height, TILE):
             th = min(TILE, height - y0)
-            band = np.asarray(get_band(y0, th))
-            if n_comp == 1 and band.ndim == 3:
-                band = band[..., 0]
             for x0 in range(0, width, TILE):
                 tw = min(TILE, width - x0)
-                f.setImageTile(
-                    0, x0, y0, np.ascontiguousarray(band[:, x0 : x0 + tw])
-                )
+                block = np.asarray(get_tile(x0, y0, tw, th))
+                if n_comp == 1 and block.ndim == 3:
+                    block = block[..., 0]
+                f.setImageTile(0, x0, y0, np.ascontiguousarray(block))
             if on_progress:
                 on_progress((y0 + th) / height)
         mf = limnd2.MetadataFactory(**mf_kwargs)
@@ -134,6 +160,19 @@ def _scalar_calibration(pair: Any) -> float | None:
     return px
 
 
+def _validate_nd2(path: Path, width: int, height: int, n_comp: int) -> None:
+    """The finished file must reopen with the dimensions it was asked for."""
+    import nd2 as nd2lib
+
+    with nd2lib.ND2File(str(path)) as f:
+        sizes = dict(f.sizes)
+        got = (sizes.get("X"), sizes.get("Y"))
+        if got != (width, height):
+            raise RuntimeError(
+                f"written ND2 reads back as {got}, expected {(width, height)}"
+            )
+
+
 def _store_planes(attrs: dict[str, Any], channels: list[int]) -> list[dict[str, Any]]:
     chs = attrs["omero"]["channels"]
     return [{"name": chs[ci]["label"], "color": chs[ci]["color"]} for ci in channels]
@@ -158,13 +197,15 @@ def export_roi_nd2(
     factor = levels[level]["downsample"]
     px = _scalar_calibration(meta.get("pixel_size_um"))
 
-    def get_band(ty: int, th: int) -> np.ndarray:
-        block = np.asarray(arr[channels, y + ty : y + ty + th, x : x + w])
+    def get_tile(tx: int, ty: int, tw: int, th: int) -> np.ndarray:
+        block = np.asarray(
+            arr[channels, y + ty : y + ty + th, x + tx : x + tx + tw]
+        )
         return np.moveaxis(block, 0, -1)  # (C, h, w) -> (h, w, C)
 
     write_nd2(
         out_path,
-        get_band,
+        get_tile,
         height=h,
         width=w,
         dtype=np.dtype(meta["dtype"]),
@@ -208,8 +249,10 @@ def crop_nd2_to_nd2(
 
         data = src.data  # (C, Y, X) dask array over the mmap
 
-        def get_band(ty: int, th: int) -> np.ndarray:
-            block = data[chans, y + ty : y + ty + th, x : x + w].compute()
+        def get_tile(tx: int, ty: int, tw: int, th: int) -> np.ndarray:
+            block = data[
+                chans, y + ty : y + ty + th, x + tx : x + tx + tw
+            ].compute()
             return np.moveaxis(np.asarray(block), 0, -1)
 
         px_um = _scalar_calibration(src.pixel_size_um)
@@ -223,7 +266,7 @@ def crop_nd2_to_nd2(
         ]
         write_nd2(
             out_path,
-            get_band,
+            get_tile,
             height=h,
             width=w,
             dtype=src.dtype,

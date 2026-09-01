@@ -299,25 +299,29 @@ class SlideRegistry:
         if home.name == CACHE_DIR_NAME:
             home = home.parent  # annotations belong beside the slide
         rescue_annotations(store, home)
-        victims = []
+        # two passes, neither holding a path list: a store is hundreds of
+        # thousands of files and their names alone would be real memory
+        total = 0
         freed = 0
-        for root, _, files in os.walk(store):
+        for walk_root, _, files in os.walk(store):
+            total += len(files)
             for name in files:
-                path = os.path.join(root, name)
                 try:
-                    freed += os.stat(path).st_size
+                    freed += os.stat(os.path.join(walk_root, name)).st_size
                 except OSError:
                     pass
-                victims.append(path)
-        total = max(1, len(victims))
-        step = max(1, total // 100)  # a hundred ticks, whatever the store size
-        for i, path in enumerate(victims):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            if on_progress and i % step == 0:
-                on_progress(i / total)
+        total = max(1, total)
+        step = max(1, total // 100)  # a hundred ticks, whatever the size
+        done = 0
+        for walk_root, _, files in os.walk(store):
+            for name in files:
+                try:
+                    os.unlink(os.path.join(walk_root, name))
+                except OSError:
+                    pass
+                done += 1
+                if on_progress and done % step == 0:
+                    on_progress(done / total)
         for root, dirs, _ in os.walk(store, topdown=False):
             for d in dirs:
                 try:

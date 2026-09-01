@@ -229,3 +229,15 @@ def test_explicit_tile_still_wins(monkeypatch, tmp_path):
     root = zarr.open_group(str(out), mode="r")
     assert root.attrs["nd2wsi"]["tile"] == 256
     assert root["0"].chunks == (1, 256, 256)
+
+
+def test_downsample_batches_are_width_independent():
+    """A task's memory comes from the tile and a fixed budget, never the
+    slide width — the old full-width stripes reached gigabytes."""
+    from nd2wsi.convert import DOWNSAMPLE_TASK_BUDGET, _batch_cols
+
+    for nt, itemsize in [(512, 1), (512, 2), (1024, 2), (1024, 4)]:
+        bw = _batch_cols(nt, itemsize)
+        per_col = 2 * nt * 2 * itemsize + nt * 4 + nt * itemsize
+        assert bw % nt == 0 and bw >= nt
+        assert bw * per_col <= DOWNSAMPLE_TASK_BUDGET * 1.05
