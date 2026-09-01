@@ -93,6 +93,22 @@ pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2
 Python 3.11 or newer. The server is stdlib `http.server`, OpenSeadragon is
 vendored, and viewing works offline.
 
+## Example slides
+
+No microscope needed. Two real Nikon Ti2 fluorescence acquisitions live on
+the [testdata-v1 release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/testdata-v1),
+published under CC0. They stay out of the git history because clones should
+not carry 75 MB of pixels forever, so one script fetches them into `docs/`
+and verifies their checksums.
+
+```bash
+python scripts/fetch_testdata.py
+nd2wsi view docs/example_cell.nd2 docs/example_tissue.nd2
+```
+
+The same files back the real data test suite (`pytest -m realdata`) and the
+release build's smoke gate.
+
 ## Commands
 
 ```text
