@@ -1600,30 +1600,15 @@ function trackExport(job, label) {
    mode. An explicit light or dark choice is never overwritten by the slide. */
 
 const THEME_MODES = ["auto", "light", "dark"];
-const THEME_MODE_KEY = "nd2wsi.theme.mode";
-const LEGACY_THEME_KEY = "nd2wsi.theme";
-
 function currentTheme() {
   return document.documentElement.classList.contains("light") ? "light" : "dark";
 }
 
-function savedThemeMode() {
-  // the pre-1.1 key recorded every automatic theme flip, not a choice the
-  // user made, so upgraders start in Auto rather than pinned to whatever
-  // the old build last wrote
-  try {
-    const mode = localStorage.getItem(THEME_MODE_KEY);
-    if (THEME_MODES.includes(mode)) return mode;
-  } catch (e) { /* private mode */ }
-  return "auto";
-}
-
 function resolveTheme(mode) {
   if (mode === "light" || mode === "dark") return mode;
-  if (state.info && state.info.rgb) return "light";
-  return window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
-    ? "light"
-    : "dark";
+  // Auto follows the slide, not the OS: brightfield color slides (SVS,
+  // RGB ND2) read best on light chrome, fluorescence on dark
+  return state.info && state.info.rgb ? "light" : "dark";
 }
 
 function themeGlyph(mode) {
@@ -1642,7 +1627,7 @@ function themeGlyph(mode) {
     '<path d="M8 2.75v10.5a5.25 5.25 0 0 0 0-10.5Z" class="icon-fill"></path></svg>';
 }
 
-function applyThemeMode(mode, resolved = null, persist = true) {
+function applyThemeMode(mode, resolved = null) {
   if (!THEME_MODES.includes(mode)) mode = "auto";
   const theme = resolved || resolveTheme(mode);
   document.documentElement.classList.toggle("light", theme === "light");
@@ -1660,12 +1645,6 @@ function applyThemeMode(mode, resolved = null, persist = true) {
     button.dataset.mode = mode;
   }
 
-  if (persist) {
-    try {
-      localStorage.setItem(THEME_MODE_KEY, mode);
-      localStorage.setItem(LEGACY_THEME_KEY, theme);
-    } catch (e) { /* private mode */ }
-  }
   if (state.lutWidgets && state.lutWidgets.length) relayoutLuts();
   return theme;
 }
@@ -1677,7 +1656,8 @@ function announceTheme(mode, theme) {
 }
 
 function wireTheme() {
-  let mode = savedThemeMode();
+  // each tab derives its look from its slide type; nothing persists
+  let mode = "auto";
   let theme = applyThemeMode(mode);
   announceTheme(mode, theme);
 
@@ -1687,24 +1667,15 @@ function wireTheme() {
     announceTheme(mode, theme);
   };
 
-  const media = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
-  if (media && media.addEventListener) {
-    media.addEventListener("change", () => {
-      if (mode !== "auto") return;
-      theme = applyThemeMode(mode, null, false);
-      announceTheme(mode, theme);
-    });
-  }
-
   window.addEventListener("message", (ev) => {
     if (ev.origin !== location.origin || !ev.data) return;
     if (ev.data.nd2wsi === "theme-request") {
+      // coming to the front re-asserts the slide-type default; a manual
+      // choice lasts only while the tab stays front
+      mode = "auto";
+      theme = applyThemeMode(mode);
       announceTheme(mode, theme);
-      return;
     }
-    if (ev.data.nd2wsi !== "theme") return;
-    mode = THEME_MODES.includes(ev.data.mode) ? ev.data.mode : mode;
-    theme = applyThemeMode(mode, ev.data.theme || null);
   });
 }
 
@@ -2048,6 +2019,13 @@ function wireDragForward() {
 function wireKeys() {
   window.addEventListener("keydown", (ev) => {
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    if ((ev.metaKey || ev.ctrlKey) && ["1", "2", "3"].includes(ev.key)) {
+      const btn = { 1: "tb-channels", 2: "tb-region", 3: "tb-annot" }[ev.key];
+      ev.preventDefault();
+      $(btn).click();  // same toggle the toolbar button performs
+      return;
+    }
+    if (ev.metaKey || ev.ctrlKey) return;  // leave other shortcuts alone
     const k = ev.key.toLowerCase();
     if (k === "r") setTool("roi");
     else if (k === "v") { if (state.roi) setTool("move"); }

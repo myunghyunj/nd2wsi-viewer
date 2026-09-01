@@ -244,6 +244,90 @@ def _install_open_files_handler():
         _dlog(f"openFiles handler install failed: {e}")
 
 
+def _inline_traffic_lights(window):
+    """Hide the macOS title bar so the tab strip hosts the traffic lights.
+
+    Safari-style chrome: the window keeps its close/minimize/zoom buttons,
+    which float over the web content, and the shell pads its tab strip to
+    make room (the ``native-chrome`` class). pywebview installs the
+    WKWebView as the content view only after the first navigation, which
+    can rebuild the frame, so the tweak re-runs on every ``loaded`` event
+    as well as on ``shown``. Purely cosmetic — on any failure the stock
+    title bar simply stays.
+    """
+
+    def apply(trigger):
+        try:
+            import AppKit
+            from Foundation import NSOperationQueue
+        except Exception:
+            return
+
+        def tweak():
+            try:
+                native = getattr(window, "native", None)
+                candidate = getattr(native, "window", None) or native
+                ns = candidate if isinstance(candidate, AppKit.NSWindow) else None
+                if ns is None:
+                    for win in AppKit.NSApplication.sharedApplication().windows():
+                        if win.isVisible():
+                            ns = win
+                            break
+                if ns is None:
+                    return
+                # the style-mask change rebuilds the title bar, wiping any
+                # appearance set before it — so the mask goes first
+                ns.setStyleMask_(
+                    ns.styleMask() | AppKit.NSWindowStyleMaskFullSizeContentView
+                )
+                ns.setTitlebarAppearsTransparent_(True)
+                ns.setTitleVisibility_(AppKit.NSWindowTitleHidden)
+                if hasattr(ns, "setTitlebarSeparatorStyle_"):
+                    ns.setTitlebarSeparatorStyle_(
+                        getattr(AppKit, "NSTitlebarSeparatorStyleNone", 1)
+                    )
+
+                frame_view = ns.contentView().superview()
+                # the content view must truly span the frame: when the web
+                # view was installed before the mask changed, its frame
+                # still excludes the old title bar
+                content = ns.contentView()
+                content.setFrame_(frame_view.bounds())
+                content.setAutoresizingMask_(
+                    AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable
+                )
+
+                # pywebview's frameless mode hides the standard buttons;
+                # this app wants them, floating over the tab strip
+                for which in (
+                    AppKit.NSWindowCloseButton,
+                    AppKit.NSWindowMiniaturizeButton,
+                    AppKit.NSWindowZoomButton,
+                ):
+                    button = ns.standardWindowButton_(which)
+                    if button is not None:
+                        button.setHidden_(False)
+
+                # macOS 26+ draws a glass decoration layer over the title
+                # bar that ignores titlebarAppearsTransparent; hide it (it
+                # returns after frame rebuilds, hence the re-run)
+                for sub in frame_view.subviews():
+                    if "TitlebarContainer" not in str(sub.className()):
+                        continue
+                    for inner in sub.subviews():
+                        name = str(inner.className())
+                        if "Decoration" in name or "Background" in name:
+                            inner.setHidden_(True)
+
+            except Exception as e:
+                _dlog(f"titlebar tweak failed ({trigger}): {e!r}")
+
+        NSOperationQueue.mainQueue().addOperationWithBlock_(tweak)
+
+    window.events.shown += lambda: apply("shown")
+    window.events.loaded += lambda: apply("loaded")
+
+
 def _wire_file_drop(window):
     """Deliver Finder drops to the page.
 
@@ -493,7 +577,14 @@ def main(argv: list[str] | None = None) -> int:
         height=860,
         min_size=(760, 520),
         background_color="#161618",
+        # frameless makes pywebview create the NSWindow with
+        # FullSizeContentView from birth — the only point where WebKit
+        # decides whether the page composites under the title bar. The
+        # traffic lights it hides come back in _inline_traffic_lights.
+        frameless=True,
+        easy_drag=False,
     )
+    _inline_traffic_lights(window)
     _wire_file_drop(window)
     _install_open_files_handler()
     webview.start()

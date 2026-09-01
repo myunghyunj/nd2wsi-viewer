@@ -178,6 +178,8 @@ Display changes affect viewer tiles and rendered PNG or JPEG files. They do not 
 
 RGB slides use their native color channels and hide the fluorescence panel.
 
+The chrome follows the slide. A brightfield color slide such as an SVS opens in light appearance and a fluorescence ND2 opens in dark. The appearance button overrides either, and the override lasts while that tab stays in front.
+
 ### Measure and annotate
 
 ![Measurements, pins, and boxes](docs/annotations.png)
@@ -191,6 +193,9 @@ RGB slides use their native color channels and hide the fluorescence panel.
 | `V` | move the selected region |
 | `0` | fit the slide |
 | `Esc` | cancel the active tool |
+| `⌘1` | show or hide Channels and LUTs |
+| `⌘2` | show or hide Region |
+| `⌘3` | show or hide Annotate |
 
 Measurements use the calibration stored in the source. Without calibration, the viewer reports pixels.
 

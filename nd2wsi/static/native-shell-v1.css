@@ -61,3 +61,10 @@ button { color:inherit; font:inherit; }
 @keyframes slide { 0%,100%{margin-left:0} 50%{margin-left:74%} }
 @keyframes pulse { from{opacity:.3} to{opacity:1} }
 @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration:.01ms!important; transition-duration:.01ms!important; } }
+
+/* packaged app: the hidden title bar leaves the traffic lights floating
+   over the tab strip, so the strip starts past them and its empty areas
+   drag the window */
+#chrome-pad { display: none; }
+.native-chrome #chrome-pad { display: block; flex: none; width: 74px; height: 100%; }
+#tabbar-space { flex: 1 1 auto; height: 100%; min-width: 24px; }

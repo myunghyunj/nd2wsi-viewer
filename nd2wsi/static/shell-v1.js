@@ -16,23 +16,20 @@ function showError(message) {
   toastTimer = setTimeout(() => toast.classList.remove("show"), 4200);
 }
 
-function applyShellTheme(theme, mode) {
+function applyShellTheme(theme) {
   document.documentElement.classList.toggle("light", theme === "light");
-  try {
-    localStorage.setItem("nd2wsi.theme", theme);
-    if (mode) localStorage.setItem("nd2wsi.theme.mode", mode);
-  } catch (_) { /* private mode */ }
 }
 
-try {
-  const mode = localStorage.getItem("nd2wsi.theme.mode");
-  const theme = mode === "light" || mode === "dark"
-    ? mode
-    : matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-  // apply without writing: recording the system preference here would
-  // later read back as if the user had chosen it explicitly
-  document.documentElement.classList.toggle("light", theme === "light");
-} catch (_) { /* private mode */ }
+// the shell chrome always mirrors the front tab; with no tab open it
+// stays on the app's own dark ground
+
+function markNativeChrome() {
+  // inside the packaged app the title bar is hidden and the traffic
+  // lights float over the tab strip, which needs room and a drag handle
+  document.documentElement.classList.add("native-chrome");
+}
+if (window.pywebview !== undefined) markNativeChrome();
+window.addEventListener("pywebviewready", markNativeChrome);
 
 function render() {
   const bar = $("tabbar");
@@ -223,14 +220,10 @@ window.addEventListener("message", (event) => {
   if (event.data.nd2wsi === "slide-trashed") refresh();
   if (event.data.nd2wsi === "file-drag") zone.hidden = false;
   if (event.data.nd2wsi === "theme") {
-    applyShellTheme(event.data.theme, event.data.mode);
-    for (const [, frame] of frames) {
-      if (frame.contentWindow && frame.contentWindow !== event.source) {
-        frame.contentWindow.postMessage(
-          { nd2wsi: "theme", mode: event.data.mode },
-          location.origin,
-        );
-      }
+    // only the front tab colors the chrome; each tab keeps its own look
+    const front = frames.get(active);
+    if (front && event.source === front.contentWindow) {
+      applyShellTheme(event.data.theme);
     }
   }
 });
