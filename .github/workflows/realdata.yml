@@ -1,0 +1,26 @@
+name: realdata
+
+# The example acquisitions live as assets on the immutable testdata-v1
+# release, checksum-verified by the fetch script. This gate runs the tests
+# that need them, on demand and before a release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  realdata:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - run: |
+          uv venv .venv
+          uv pip install -p .venv -e ".[svs,nd2export,app,test]" \
+            --extra-index-url https://pypi.laboratory-imaging.com/simple
+      - name: Fetch the example acquisitions
+        run: .venv/bin/python scripts/fetch_testdata.py
+      - name: Real-data suite
+        run: .venv/bin/python -m pytest tests -q -m realdata

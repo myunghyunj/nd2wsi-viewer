@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check nd2wsi tests
+
+  test:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install with every extra, limnd2 index included
+        run: |
+          uv venv .venv
+          uv pip install -p .venv -e ".[svs,nd2export,app,test]" \
+            --extra-index-url https://pypi.laboratory-imaging.com/simple
+      - name: Unit and integration tests (synthetic fixtures)
+        run: .venv/bin/python -m pytest tests -q -m "not realdata"
+
+  package:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build wheel and sdist, then install the wheel cold
+        run: |
+          uv build
+          uv venv /tmp/wheeltest
+          uv pip install -p /tmp/wheeltest dist/*.whl
+          /tmp/wheeltest/bin/python -c "import nd2wsi.convert, nd2wsi.server, nd2wsi.direct"
+          /tmp/wheeltest/bin/nd2wsi --help >/dev/null
