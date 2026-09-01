@@ -64,6 +64,19 @@ def parse_windows(
     return windows, gammas
 
 
+def level_entry(levels: list, level: int) -> dict:
+    """The level whose stored path names ``level``.
+
+    Levels are addressed by their path, not their list position: a
+    degraded overview starts at path "1", so positional indexing would
+    serve the wrong level and 404 the deepest one.
+    """
+    for lv in levels:
+        if lv["path"] == str(level):
+            return lv
+    raise KeyError(f"level {level} out of range")
+
+
 def _read_region(root: Any, level_path: str, x: int, y: int, w: int, h: int) -> np.ndarray:
     """(C, h, w) region from one pyramid level, clipped to bounds."""
     arr = root[level_path]
@@ -140,15 +153,13 @@ def render_tile(
 ) -> bytes:
     meta = attrs["nd2wsi"]
     tile = int(meta["tile"])
-    levels = meta["levels"]
-    if not 0 <= level < len(levels):
-        raise KeyError(f"level {level} out of range")
-    lw, lh = levels[level]["width"], levels[level]["height"]
+    lv = level_entry(meta["levels"], level)
+    lw, lh = lv["width"], lv["height"]
     x, y = tx * tile, ty * tile
     if x >= lw or y >= lh or tx < 0 or ty < 0:
         raise KeyError("tile out of range")
     w, h = min(tile, lw - x), min(tile, lh - y)
-    region = _read_region(root, levels[level]["path"], x, y, w, h)
+    region = _read_region(root, lv["path"], x, y, w, h)
     windows, colors = display_params(attrs)
     windows, gammas = parse_windows(win, windows)
     img = composite(region, channels, windows, colors, meta["rgb"], gammas)
@@ -263,11 +274,11 @@ def export_roi_tiff(
     import tifffile
 
     meta = attrs["nd2wsi"]
-    levels = meta["levels"]
-    level_path = levels[level]["path"]
+    lv = level_entry(meta["levels"], level)
+    level_path = lv["path"]
     tile = min(int(meta["tile"]), 512)
     dtype = np.dtype(meta["dtype"])
-    factor = levels[level]["downsample"]
+    factor = lv["downsample"]
     # pixels per centimeter at this level; an uncalibrated store gets no
     # resolution tags at all rather than tags built from an invented value
     if meta.get("pixel_size_um"):
@@ -356,7 +367,7 @@ def export_roi_rendered(
     this is bounded, not streaming.
     """
     meta = attrs["nd2wsi"]
-    levels = meta["levels"]
+    lv = level_entry(meta["levels"], level)
     windows, colors = display_params(attrs)
     windows, gammas = parse_windows(win, windows)
 
@@ -372,7 +383,7 @@ def export_roi_rendered(
     canvas = np.empty((h, w, 3), np.uint8)
     for y0 in range(0, h, RENDER_STRIP_ROWS):
         th = min(RENDER_STRIP_ROWS, h - y0)
-        region = _read_region(root, levels[level]["path"], x, y + y0, w, th)
+        region = _read_region(root, lv["path"], x, y + y0, w, th)
         canvas[y0 : y0 + th] = composite(
             region, channels, windows, colors, meta["rgb"], gammas
         )

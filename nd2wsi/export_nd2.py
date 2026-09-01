@@ -192,9 +192,11 @@ def export_roi_nd2(
 ) -> None:
     """Export a region of one pyramid level of a converted store as ND2."""
     meta = attrs["nd2wsi"]
-    levels = meta["levels"]
-    arr = root[levels[level]["path"]]
-    factor = levels[level]["downsample"]
+    from .render import level_entry
+
+    lv = level_entry(meta["levels"], level)
+    arr = root[lv["path"]]
+    factor = lv["downsample"]
     px = _scalar_calibration(meta.get("pixel_size_um"))
 
     def get_tile(tx: int, ty: int, tw: int, th: int) -> np.ndarray:

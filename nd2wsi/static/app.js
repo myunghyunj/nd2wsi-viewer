@@ -56,6 +56,16 @@ async function init() {
   wireTools();
   wireKeys();
   loadAnnotations();
+  if (annLocked()) {
+    for (const id of ["tool-measure", "tool-pin", "tool-box", "ann-open"]) {
+      const el = $(id);
+      if (el) {
+        el.disabled = true;
+        el.title = "The source file is missing; annotation is locked";
+      }
+    }
+    setAnnStatus("Annotation locked: source file missing");
+  }
 }
 
 function planeNote(info) {
@@ -623,7 +633,17 @@ const TOOL_BTN = {
   box: "tool-box",
 };
 
+function annLocked() {
+  // a degraded overview's base level is level 1: drawing here would save
+  // half-scale coordinates into the slide's level-0 sidecar
+  return state.info && state.info.storage === "overview-degraded";
+}
+
 function setTool(tool) {
+  if (annLocked() && (tool === "measure" || tool === "pin" || tool === "box")) {
+    setAnnStatus("Annotation is locked while the source file is missing");
+    return;
+  }
   state.tool = state.tool === tool ? null : tool;
   const on = state.tool;
   if ((on === "roi" || on === "move") && state.windows.region.isHidden())
@@ -809,6 +829,10 @@ function annotationsChanged() {
 const scheduleAnnSave = debounce(saveAnnotations, 800);
 
 function saveAnnotations() {
+  if (annLocked()) {
+    setAnnStatus("Not saved: annotation is locked in this degraded view");
+    return;
+  }
   fetch("api/annotations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

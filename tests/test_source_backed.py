@@ -129,6 +129,7 @@ def test_registry_serves_the_source_as_level_zero(big_nd2):
 
 
 def test_missing_source_degrades_to_the_stored_overview(big_nd2):
+    from nd2wsi import render
     from nd2wsi.server import SlideRegistry
 
     path, _ = big_nd2
@@ -141,10 +142,118 @@ def test_missing_source_degrades_to_the_stored_overview(big_nd2):
         meta = st.attrs["nd2wsi"]
         assert meta["kind"] == "overview-degraded"
         assert [lv["downsample"] for lv in meta["levels"]] == [1, 2]
+        # a pixel of the new base level is twice the size, and the scalebar
+        # and every measurement must say so
+        assert meta["pixel_size_um"] == [1.0, 1.0]
+        assert st.generation.endswith("-degraded")
         assert st.annotations_path is None  # level-0 work must not be halved
         assert any("missing" in n for n in meta["notes"])
+        # levels are addressed by their stored path, not list position:
+        # the base level here is "1" and there is no "0" to serve
+        assert render.render_tile(st.root, st.attrs, 1, 0, 0, [0, 1])
+        with pytest.raises(KeyError):
+            render.render_tile(st.root, st.attrs, 0, 0, 0, [0, 1])
     finally:
         hidden.rename(path)
+
+
+def test_source_return_upgrades_the_degraded_slide(big_nd2):
+    from nd2wsi.server import SlideRegistry
+
+    path, _ = big_nd2
+    store = ensure_cache(path, tile=512)
+    hidden = path.with_name("elsewhere.nd2")
+    path.rename(hidden)
+    reg = SlideRegistry()
+    sid = reg.add_store(store)
+    assert reg.get(sid).attrs["nd2wsi"]["kind"] == "overview-degraded"
+    hidden.rename(path)
+    # the same sid re-registers against the restored source
+    assert reg.add_store(store) == sid
+    st = reg.get(sid)
+    assert st.attrs["nd2wsi"]["kind"] == "source-backed"
+    assert not st.generation.endswith("-degraded")
+    reg.remove(sid)
+
+
+def test_rebuild_evicts_the_registered_state(big_nd2):
+    import os
+
+    from nd2wsi.server import SlideRegistry
+
+    path, _ = big_nd2
+    store = ensure_cache(path, tile=512)
+    reg = SlideRegistry()
+    sid = reg.add_store(store)
+    gen0 = reg.get(sid).generation
+    # the slide's mtime changes, so the cache rebuilds with a new generation
+    os.utime(path, ns=(0, 0))
+    assert ensure_cache(path, tile=512) == store
+    assert reg.add_store(store) == sid
+    st = reg.get(sid)
+    assert st.generation != gen0  # the stale root was evicted, not reused
+    assert st.attrs["nd2wsi"]["kind"] == "source-backed"
+    reg.remove(sid)
+
+
+def test_level0_reads_hand_out_real_copies(big_nd2):
+    from nd2wsi.server import SlideRegistry
+
+    path, _ = big_nd2
+    store = ensure_cache(path, tile=512)
+    reg = SlideRegistry()
+    sid = reg.add_store(store)
+    st = reg.get(sid)
+    # a full-width slice of a C-contiguous single plane is itself
+    # contiguous, where ascontiguousarray would hand back the mapped view
+    got = st.root["0"][0, 100:110, 0:1600]
+    assert got.flags.owndata and got.base is None
+    reg.remove(sid)
+
+
+def test_source_changed_while_open_raises_instead_of_serving_garbage(big_nd2):
+    import os
+
+    from nd2wsi.server import SlideRegistry
+
+    path, _ = big_nd2
+    store = ensure_cache(path, tile=512)
+    reg = SlideRegistry()
+    sid = reg.add_store(store)
+    st = reg.get(sid)
+    assert st.root["0"][:, :4, :4].shape == (2, 4, 4)
+    os.utime(path)  # the file changed underneath the open map
+    with pytest.raises(ValueError, match="changed"):
+        st.root["0"][:, :4, :4]
+    reg.remove(sid)
+
+
+def test_overview_manifest_uses_the_new_format(big_nd2):
+    from nd2wsi.cache import OVERVIEW_FORMAT, read_manifest
+
+    path, _ = big_nd2
+    store = ensure_cache(path, tile=512)
+    m = read_manifest(store.parent)
+    # a pre-0.9 reader must reject this container instead of serving the
+    # overview as a full store at half resolution
+    assert m["format"] == OVERVIEW_FORMAT
+    full = ensure_cache(path, tile=512, kind="full")
+    assert read_manifest(full.parent)["format"] == "nd2wsi-cache/2"
+
+
+def test_trash_refuses_while_an_export_runs(big_nd2):
+    from nd2wsi.server import SlideRegistry
+
+    path, _ = big_nd2
+    store = ensure_cache(path, tile=512)
+    reg = SlideRegistry()
+    sid = reg.add_store(store)
+    st = reg.get(sid)
+    with st.busy:  # an export is in flight
+        with pytest.raises(ValueError, match="still running"):
+            reg.trash_cache(sid)
+    assert reg.trash_cache(sid) > 0  # drained: deletion proceeds
+    assert path.exists()
 
 
 def test_trash_removes_the_container_and_spares_the_source(big_nd2):

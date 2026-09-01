@@ -11,9 +11,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-13%2B-1d1d1f?style=flat-square&logo=apple&logoColor=white" alt="macOS 13+">
-  <img src="https://img.shields.io/badge/python-3.10%2B-0A84FF?style=flat-square" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11%2B-0A84FF?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/formats-.nd2%20%C2%B7%20.svs-30D158?style=flat-square" alt="ND2 + SVS">
-  <img src="https://img.shields.io/badge/tests-19%20passing-8E8E93?style=flat-square" alt="tests">
+  <img src="https://github.com/myunghyunj/nd2wsi-viewer/actions/workflows/ci.yml/badge.svg" alt="CI">
   <img src="https://img.shields.io/badge/license-MIT-8E8E93?style=flat-square" alt="MIT">
 </p>
 
@@ -57,8 +57,8 @@ The pyramid format is [OME-Zarr](https://ngff.openmicroscopy.org/), the
 bioimaging community's next-generation pyramidal format. Instead of one
 giant blob, the image lives as thousands of small compressed chunks at
 every zoom level, which is exactly the shape a deep-zoom viewer wants to
-read. It's an open standard, so the same `pyramid_*.ome.zarr` also opens
-in napari, vizarr, and QuPath.
+read. It's an open standard, so a store made with `nd2wsi convert` also
+opens in napari, vizarr, and QuPath.
 
 The pipeline is short. A slide becomes an OME-Zarr pyramid, the pyramid
 feeds a local tile server, and the server feeds a deep-zoom viewer in a
@@ -70,7 +70,7 @@ calibration from the Aperio MPP field.
 ```
 pip install .
 nd2wsi view slide.nd2 another.svs
-# builds pyramid_<name>.ome.zarr next to each slide (once),
+# builds a cache under nd2wsi/ next to each slide (once),
 # then opens the tabbed viewer at http://127.0.0.1:8000
 ```
 
@@ -90,7 +90,7 @@ pip install ".[legacy]"  # adds imagecodecs, for pre-2012 JPEG2000 ND2
 pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2
 ```
 
-Python 3.10 or newer. The server is stdlib `http.server`, OpenSeadragon is
+Python 3.11 or newer. The server is stdlib `http.server`, OpenSeadragon is
 vendored, and viewing works offline.
 
 ## Commands
@@ -120,11 +120,11 @@ button opens another, and you can just drop a file onto the window. Every
 tab keeps its own viewer state while open. A first-time open shows the
 conversion progress right in the tab.
 
-Files created next to a slide name themselves. `pyramid_<slide>.ome.zarr`
-holds the viewing cache and `annotations_<slide>.json` holds your
-annotations. When you want the disk space back, the trashcan button in the
-toolbar deletes that slide's cache after a confirm. Your annotations and
-the source slide stay, and the slide simply re-converts on its next open.
+Everything the app writes next to a slide lives in one `nd2wsi` folder,
+described under "Where the caches live" below. When you want the disk
+space back, the trashcan button in the toolbar deletes that slide's cache
+after a confirm. Your annotations and the source slide stay, and the
+slide simply rebuilds its cache on its next open.
 
 The look follows the macOS design language, with control geometry
 measured from Apple's macOS 27 UI kit. Expect SF Pro and SF Mono type,
@@ -250,6 +250,19 @@ of serving stale pixels, a different selection gets its own cache, and a
 damaged cache is set aside with a timestamped name rather than deleted.
 Builds stage in a sibling directory under a lock and appear only when
 complete, so a crash can never leave a half-cache that blocks the slide.
+
+Since 0.9 an uncompressed modern ND2 gets a compact cache. The store
+holds the reduced levels only, and the viewer reads full resolution
+straight off the slide's own memory map, which cuts the cache to about a
+quarter of a full pyramid and makes level 0 exports read the original
+bytes. The manifest calls this kind `overview`, and the store's metadata
+lists just the levels it holds rather than pretending to a level 0. The
+slide file must stay where it is. If it moves or changes, the viewer
+still shows the stored overview at half resolution and says why, and
+never guesses at pixels it cannot verify. A compressed or legacy file,
+or a maximum projection, keeps getting the full self contained store.
+So does `nd2wsi convert`, whose output remains a portable OME-Zarr that
+opens anywhere without the source.
 
 Stores built by older versions are still read where they lie, and
 `nd2wsi tidy <folder>` migrates strays. Its two destructive options,

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from . import render
+from .direct import _Lifecycle
 
 STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
@@ -108,7 +109,16 @@ class ViewerState:
         self.histograms: list | None = None  # computed lazily, once
         self.annotations_path = annotations_path
         self.generation = generation  # changes when the pixels could
+        self.busy = _Lifecycle()  # in-flight exports, so trash can refuse
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
+
+
+def _close_state(st: ViewerState | None) -> None:
+    if st is None:
+        return
+    close = getattr(st.root, "close", None)
+    if close:
+        close()
 
 
 def store_generation(store_path: str | Path) -> str:
@@ -233,19 +243,25 @@ class SlideRegistry:
             if manifest.get("kind") == "overview":
                 return self._add_overview(store_path, manifest)
         sid = self.sid_for(store_path)
+        gen = store_generation(store_path)
+        stale = None
         with self._lock:
-            if sid in self.slides:
+            st = self.slides.get(sid)
+            if st is not None and st.generation == gen:
                 return sid
+            if st is not None:  # rebuilt underneath: the old root is stale
+                stale = self.slides.pop(sid)
             root, attrs = open_store(store_path)
             st = ViewerState(
                 root,
                 attrs,
                 max_render_mpx=self.max_render_mpx,
                 annotations_path=annotations_sidecar(store_path, attrs),
-                generation=store_generation(store_path),
+                generation=gen,
             )
             st.store_path = store_path
             self.slides[sid] = st
+        _close_state(stale)
         return sid
 
     def _add_overview(self, store_path: Path, manifest: dict) -> str:
@@ -260,22 +276,33 @@ class SlideRegistry:
         from .direct import open_nd2_backed
 
         sid = self.sid_for(store_path)
+        gen = store_generation(store_path)
+        stale = None
         with self._lock:
-            if sid in self.slides:
-                return sid
             src_info = manifest.get("source", {})
             source = (store_path.parent / src_info.get("relative_path", "")).resolve()
+            source_ok = False
+            try:
+                source_ok = source.is_file() and fingerprints_match(
+                    src_info, quick_fingerprint(source)
+                )
+            except OSError:
+                source_ok = False
+            st = self.slides.get(sid)
+            expected = gen + ("" if source_ok else "-degraded")
+            if st is not None and st.generation == expected:
+                return sid
+            if st is not None:  # rebuilt or mode change: the state is stale
+                stale = self.slides.pop(sid)
             root = attrs = None
             reason = f"{src_info.get('name', 'source')} is missing"
-            try:
-                if source.is_file() and fingerprints_match(
-                    src_info, quick_fingerprint(source)
-                ):
+            if source.is_file() and not source_ok:
+                reason = f"{source.name} has changed since this cache was built"
+            if source_ok:
+                try:
                     root, attrs = open_nd2_backed(source, store_path)
-                elif source.is_file():
-                    reason = f"{source.name} has changed since this cache was built"
-            except NotImplementedError as e:
-                reason = str(e)
+                except NotImplementedError as e:
+                    reason = str(e)
             degraded = root is None
             if degraded:
                 root, attrs = open_store(store_path)
@@ -283,6 +310,11 @@ class SlideRegistry:
                 meta["kind"] = "overview-degraded"
                 for lv in meta["levels"]:
                     lv["downsample"] //= 2
+                # the base level is now the half-resolution overview, so a
+                # pixel is twice as large — otherwise every scalebar and
+                # measurement would read half its true length
+                if meta.get("pixel_size_um"):
+                    meta["pixel_size_um"] = [v * 2 for v in meta["pixel_size_um"]]
                 meta["notes"] = meta.get("notes", []) + [
                     f"{reason}; showing the stored overview at half resolution"
                 ]
@@ -295,10 +327,13 @@ class SlideRegistry:
                 annotations_path=None
                 if degraded
                 else annotations_sidecar(store_path, attrs),
-                generation=store_generation(store_path),
+                # the two modes map levels differently, so tiles cached as
+                # immutable in one must never be revived in the other
+                generation=gen + ("-degraded" if degraded else ""),
             )
             st.store_path = store_path
             self.slides[sid] = st
+        _close_state(stale)
         return sid
 
     def add_direct(self, slide_path: str | Path) -> str:
@@ -307,19 +342,25 @@ class SlideRegistry:
 
         slide_path = Path(slide_path).resolve()
         sid = self.sid_for(slide_path)
+        gen = store_generation(slide_path)
+        stale = None
         with self._lock:
-            if sid in self.slides:
+            st = self.slides.get(sid)
+            if st is not None and st.generation == gen:
                 return sid
+            if st is not None:  # file replaced underneath
+                stale = self.slides.pop(sid)
             root, attrs = open_direct(slide_path)
             st = ViewerState(
                 root,
                 attrs,
                 max_render_mpx=self.max_render_mpx,
                 annotations_path=annotations_sidecar(slide_path, attrs),
-                generation=store_generation(slide_path),
+                generation=gen,
             )
             st.store_path = None  # nothing on disk to trash
             self.slides[sid] = st
+        _close_state(stale)
         return sid
 
     def open_path(self, path: str | Path, on_progress=None) -> str:
@@ -375,7 +416,15 @@ class SlideRegistry:
 
             if store.parent.name.endswith(CACHE_SUFFIX):
                 store = store.parent  # the container owns manifest and store
+            if st.busy.active:
+                raise ValueError(
+                    "an export from this slide is still running — try again "
+                    "when it finishes"
+                )
             self.slides.pop(sid, None)
+        # bar any export that raced the check above and wait it out, so the
+        # deletion below can never zero-fill a file someone is still writing
+        st.busy.close(timeout=30)
         close = getattr(st.root, "close", None)
         if close:  # a source-backed slide holds the ND2 memory map open
             close()
@@ -866,6 +915,15 @@ def make_handler(
             self._send(200, body, ctype, cache=cache)
 
         def _roi(self, st: ViewerState, q: dict):
+            try:
+                with st.busy:
+                    return self._roi_impl(st, q)
+            except ValueError as e:
+                if "closed" in str(e):
+                    return self._error(409, "slide was closed")
+                raise
+
+        def _roi_impl(self, st: ViewerState, q: dict):
             def qi(name: str, default: int | None = None) -> int:
                 v = q.get(name)
                 if not v:
@@ -875,11 +933,12 @@ def make_handler(
                 return int(float(v[0]))
 
             meta = st.attrs["nd2wsi"]
-            levels = meta["levels"]
             level = qi("level", 0)
-            if not 0 <= level < len(levels):
+            try:
+                lv = render.level_entry(meta["levels"], level)
+            except KeyError:
                 return self._error(400, f"level {level} out of range")
-            lw, lh = levels[level]["width"], levels[level]["height"]
+            lw, lh = lv["width"], lv["height"]
             try:
                 x, y, w, h = qi("x"), qi("y"), qi("w"), qi("h")
             except ValueError as e:
@@ -946,6 +1005,9 @@ def make_handler(
                     _job_update(job, state="done", pct=100)
                 except BrokenPipeError:
                     _job_update(job, state="error", error="client disconnected")
+                    raise
+                except Exception as e:
+                    _job_update(job, state="error", error=f"{type(e).__name__}: {e}")
                     raise
                 finally:
                     Path(tmp.name).unlink(missing_ok=True)

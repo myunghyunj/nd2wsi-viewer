@@ -84,6 +84,11 @@ class _Lifecycle:
             self._n -= 1
             self._cv.notify_all()
 
+    @property
+    def active(self) -> int:
+        with self._cv:
+            return self._n
+
     def close(self, timeout: float = 300.0) -> bool:
         """Bar new reads, wait for running ones. True when fully drained."""
         with self._cv:
@@ -192,11 +197,12 @@ class _SvsLevel:
     walk off the native tile grid or touch zero-filled padding.
     """
 
-    def __init__(self, read, h: int, w: int, extra: int):
+    def __init__(self, read, h: int, w: int, extra: int, life: _Lifecycle | None = None):
         self._read = read
         self.shape = (3, h, w)
         self.dtype = np.dtype(np.uint8)
         self._extra = extra
+        self._life = life
 
     def _window(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         e = self._extra
@@ -213,8 +219,10 @@ class _SvsLevel:
 
     def __getitem__(self, idx: Any) -> np.ndarray:
         cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
-        block = self._window(y0, y1, x0, x1)  # (3, h, w)
-        return block[cs]
+        if self._life is None:
+            return self._window(y0, y1, x0, x1)[cs]
+        with self._life:  # the fd must not close under an in-flight pread
+            return self._window(y0, y1, x0, x1)[cs]
 
 
 class _Nd2Level0:
@@ -222,19 +230,39 @@ class _Nd2Level0:
 
     Wraps the zero-copy strided view :func:`nd2wsi.reader.plane_view`
     returns. Every read copies its window out of the memory map inside
-    the lifecycle guard, so nothing mapped survives past ``close``.
+    the lifecycle guard — ``.copy()``, never ``ascontiguousarray``, which
+    hands the mapped view itself back for contiguous slices — so nothing
+    mapped survives past ``close``. Each read also re-stats the source:
+    a file changed or unreachable raises a clean error instead of
+    serving garbage, and a vanished volume fails before the map is
+    touched in almost every case.
     """
 
-    def __init__(self, view: np.ndarray, life: _Lifecycle):
+    def __init__(self, view: np.ndarray, life: _Lifecycle, path: str | Path):
         self._view = view
         self._life = life
+        self._path = str(path)
+        st = os.stat(path)
+        self._ident = (st.st_size, st.st_mtime_ns)
         self.shape = tuple(view.shape)
         self.dtype = view.dtype
 
     def __getitem__(self, idx: Any) -> np.ndarray:
         cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
         with self._life:
-            return np.ascontiguousarray(self._view[cs, y0:y1, x0:x1])
+            try:
+                st = os.stat(self._path)
+            except OSError as e:
+                raise ValueError(
+                    f"the source file is unreachable ({e.strerror}); "
+                    "close and reopen the slide"
+                ) from e
+            if (st.st_size, st.st_mtime_ns) != self._ident:
+                raise ValueError(
+                    "the source file changed while it was open; "
+                    "close and reopen the slide"
+                )
+            return self._view[cs, y0:y1, x0:x1].copy()
 
 
 MAX_EXTRA = 8  # deepest on-the-fly downsample of one embedded level
@@ -267,6 +295,12 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         shapes = level_shapes(H, W, 512)
         cache = _TILE_CACHE
         owner = str(path)
+        # a replaced file must never alias tiles a previous open decoded:
+        # sweep anything the deferred close has not purged yet, and fold
+        # the file's identity into every new key
+        cache.purge(owner)
+        ident = path.stat().st_mtime_ns
+        life = _Lifecycle()
 
         # every embedded level that is tiled and sits on the halving ladder
         embedded: dict[int, Any] = {}
@@ -291,7 +325,7 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
             raise NotImplementedError("SVS carries no usable embedded pyramid")
 
         readers = {
-            k: _cached_reader(page, fd, cache, (owner, k))
+            k: _cached_reader(page, fd, cache, (owner, ident, k))
             for k, (page, _, _) in embedded.items()
         }
         root: dict[str, _SvsLevel] = {}
@@ -308,7 +342,7 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
             # serve exactly what the source holds, so a read scaled by
             # ``e`` can never cross the source edge or its tile grid
             h, w = sh // e, sw // e
-            root[str(k)] = _SvsLevel(readers[src], h, w, e)
+            root[str(k)] = _SvsLevel(readers[src], h, w, e, life)
             served.append((h, w))
         shapes = served
 
@@ -342,6 +376,8 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
     attrs["nd2wsi"]["direct"] = True
 
     def _teardown() -> None:
+        if not life.close():
+            return  # a read still holds the fd; leaking beats EBADF under it
         tf.close()
         os.close(fd)
         _TILE_CACHE.purge(owner)
@@ -397,7 +433,7 @@ def open_nd2_backed(
             )
 
         life = _Lifecycle()
-        levels: dict[str, Any] = {"0": _Nd2Level0(view, life)}
+        levels: dict[str, Any] = {"0": _Nd2Level0(view, life, slide)}
         for lv in meta["levels"]:
             levels[lv["path"]] = zroot[lv["path"]]
 
@@ -422,12 +458,15 @@ def open_nd2_backed(
         raise
 
     def _teardown() -> None:
-        life.close()
+        if not life.close():
+            # a reader still holds the map after the drain timeout.
+            # nd2's frames are ndarray(buffer=mmap) views, which raise no
+            # BufferError on close — unmapping here would be a segfault in
+            # that reader, so the handle leaks until process exit instead
+            return
         try:
             f.close()
-        except BufferError:
-            # a straggling view still exports the map; leaking the handle
-            # until process exit beats freeing memory something may read
+        except BufferError:  # pragma: no cover - defensive
             pass
 
     return _Root(levels, _teardown), attrs

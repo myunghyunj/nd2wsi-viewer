@@ -37,6 +37,11 @@ CACHE_SUFFIX = ".nd2wsi-cache"
 STORE_NAME = "store.ome.zarr"
 MANIFEST_NAME = "manifest.json"
 MANIFEST_FORMAT = "nd2wsi-cache/2"
+# overview containers hold no level 0, which a pre-0.9 reader would serve
+# as a full store at half resolution with level-0 calibration — so they
+# carry a format that old readers reject (and quarantine) instead
+OVERVIEW_FORMAT = "nd2wsi-cache/3"
+KNOWN_FORMATS = (MANIFEST_FORMAT, OVERVIEW_FORMAT)
 ALGORITHM = "box-mean-floor-v1"
 
 _LOCK_STALE_S = 4 * 3600
@@ -116,7 +121,7 @@ def write_manifest(
     from . import __version__
 
     manifest = {
-        "format": MANIFEST_FORMAT,
+        "format": MANIFEST_FORMAT if kind == "full" else OVERVIEW_FORMAT,
         "kind": kind,
         "complete": True,
         "generation": uuid.uuid4().hex,
@@ -150,7 +155,7 @@ def cache_matches(
     ``kind`` narrows the match ("full" or "overview"); None takes either.
     """
     m = read_manifest(container)
-    if m is None or m.get("format") != MANIFEST_FORMAT:
+    if m is None or m.get("format") not in KNOWN_FORMATS:
         return False
     if m.get("pyramid", {}).get("algorithm") != ALGORITHM:
         return False
