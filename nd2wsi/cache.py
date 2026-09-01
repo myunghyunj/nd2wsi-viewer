@@ -8,7 +8,7 @@ served stale, and two selections fought over one directory.
 
 Now every cache lives in a container named for its source and selection,
 
-    <slide dir>/nd2wsi/caches/<stem>--t0-p0-zmid.nd2wsi-cache/
+    <slide dir>/nd2wsi/caches/<source-name>--t0-p0-zmid.nd2wsi-cache/
         manifest.json     identity, fingerprint, completion — written last
         store.ome.zarr/   the pyramid
 
@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -61,15 +62,37 @@ def annotations_dir(slide: str | Path) -> Path:
     return managed_dir(slide) / ANNOTATIONS_DIR
 
 
-def cache_container(
+def source_tag(slide: str | Path) -> str:
+    """Filesystem-safe source name, including its extension.
+
+    Keeping ``.nd2`` or ``.svs`` in the key prevents two files with the same
+    stem from sharing a cache container.
+    """
+    return re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", Path(slide).name)
+
+
+def legacy_cache_container(
     slide: str | Path, selection: Any = None, cache_dir: str | Path | None = None
 ) -> Path:
+    """The stem-only managed path written by versions 0.8 and 0.9."""
     from .reader import PlaneSelection
 
     slide = Path(slide)
     base = Path(cache_dir) if cache_dir else managed_dir(slide) / CACHES_DIR
     tag = selection_tag(selection or PlaneSelection())
     return base / f"{slide.stem}--{tag}{CACHE_SUFFIX}"
+
+
+def cache_container(
+    slide: str | Path, selection: Any = None, cache_dir: str | Path | None = None
+) -> Path:
+    """The v1 cache path, keyed by source filename and selected plane."""
+    from .reader import PlaneSelection
+
+    slide = Path(slide)
+    base = Path(cache_dir) if cache_dir else managed_dir(slide) / CACHES_DIR
+    tag = selection_tag(selection or PlaneSelection())
+    return base / f"{source_tag(slide)}--{tag}{CACHE_SUFFIX}"
 
 
 def container_store(container: str | Path) -> Path:
@@ -117,6 +140,7 @@ def write_manifest(
     shape_cyx: tuple[int, int, int],
     dtype: str,
     kind: str = "full",
+    storage: dict[str, Any] | None = None,
 ) -> None:
     from . import __version__
 
@@ -132,6 +156,13 @@ def write_manifest(
         "selection": {**selection, "z_resolved": resolved_z},
         "image": {"shape_cyx": list(shape_cyx), "dtype": dtype},
         "pyramid": {"algorithm": ALGORITHM, "tile": tile},
+        "storage": storage
+        or {
+            "format": "zarr",
+            "zarr_version": 2,
+            "ngff_version": "0.4",
+            "backend": "zarr-v2-direct",
+        },
         "created_by": {"nd2wsi_version": __version__},
     }
     tmp = container / f".{MANIFEST_NAME}.tmp"
@@ -160,6 +191,8 @@ def cache_matches(
     if m.get("pyramid", {}).get("algorithm") != ALGORITHM:
         return False
     if kind is not None and m.get("kind", "full") != kind:
+        return False
+    if m.get("source", {}).get("name") not in (None, slide.name):
         return False
     sel = selection.describe() if hasattr(selection, "describe") else dict(selection)
     stored = m.get("selection", {})
@@ -214,6 +247,9 @@ class CacheLock:
                 return False  # vanished: not ours to reclaim
             return age > 30
         if time.time() - info.get("time", 0) > _LOCK_STALE_S:
+            # the pid probe alone cannot see a recycled pid: after a crash
+            # an unrelated process may wear the builder's number forever,
+            # so very old locks age out no matter what the probe says
             return True
         pid = info.get("pid")
         try:

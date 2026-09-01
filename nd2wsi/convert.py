@@ -1,22 +1,14 @@
-"""ND2 -> OME-Zarr pyramid conversion.
+"""Build full or source-backed OME-Zarr pyramids.
 
-Writes an OME-NGFF 0.4 multiscales group (zarr v2 layout for maximum viewer
-compatibility: napari, vizarr, ome-zarr-py, QuPath all read it today):
+A portable conversion stores level 0 and every reduced level. A compact
+viewing cache stores levels 1 and smaller; the source ND2 supplies level 0 at
+runtime. Both use the same bounded 2x2 box-mean pipeline.
 
-    out.zarr/
-      .zattrs          multiscales + omero + nd2wsi metadata
-      .zgroup
-      0/               level 0, shape (C, Y, X), chunks (1, tile, tile)
-      1/               level 1 = level 0 downsampled 2x (2x2 mean)
-      ...
-
-Every step is memory-bounded:
-
-* level 0 streams straight out of the ND2 memory map in (1, tile, tile)
-  chunks (see :mod:`nd2wsi.reader`);
-* level k+1 is computed from the *zarr* level k with a chunk-aligned
-  2x2 mean (dask ``coarsen``), so nothing larger than a few tiles is ever
-  resident.
+Pyramid math is independent of physical storage. The current backend writes
+OME-NGFF 0.4 metadata on local Zarr v2 for broad reader compatibility. Zarr
+v2 chunk naming, padding, fill semantics, and codec I/O live in
+:mod:`nd2wsi.storage.zarr_v2`, leaving a narrow seam for a future Zarr v3
+backend.
 """
 
 from __future__ import annotations
@@ -33,6 +25,7 @@ from typing import Any
 import numpy as np
 
 from .reader import PlaneSelection, PlaneSource, level_shapes, nice_bytes, open_plane
+from .storage import DEFAULT_STORAGE, StorageBackend
 
 NGFF_VERSION = "0.4"
 
@@ -55,123 +48,79 @@ class _StoreProgress:
         return _CB()
 
 
-def auto_workers() -> int:
-    """Dask worker threads matched to this machine's CPU.
+MAX_AUTO_WORKERS = 32  # guards pathological container CPU counts only
 
-    Uses 80% of the logical cores (rounded up, floor 2), leaving headroom
-    for the OS and the UI. Tile decode and zstd compression both release
-    the GIL, so throughput scales with cores on Apple silicon.
+
+def available_memory_bytes() -> int | None:
+    """Memory a burst of workers may reasonably claim, or None if unknown.
+
+    Linux publishes MemAvailable, which counts reclaimable page cache too.
+    The bare free-page count would throttle a healthy machine whose RAM is
+    rightly full of cache, so it is never used. macOS has no cheap
+    equivalent; the memory ceiling simply does not apply there.
     """
-    import os
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
-    n = os.cpu_count() or 4
-    return max(2, math.ceil(n * 0.8))
+
+def auto_workers(task_bytes: int | None = None) -> int:
+    """Choose useful Dask parallelism without spending the machine's RAM.
+
+    80% of the logical cores, as always. A container or workstation can
+    expose far more cores than its memory can feed, so where available
+    memory is known, half of it divided by the per-task budget sets a
+    second ceiling, and an absolute cap covers the rest.
+    """
+    task_bytes = task_bytes or DOWNSAMPLE_TASK_BUDGET
+    cpu_target = max(2, math.ceil((os.cpu_count() or 4) * 0.8))
+    memory = available_memory_bytes()
+    if memory is None:
+        return min(cpu_target, MAX_AUTO_WORKERS)
+    memory_target = max(2, int((memory * 0.5) // max(1, task_bytes)))
+    return min(cpu_target, memory_target, MAX_AUTO_WORKERS)
 
 
 def store_compressor() -> Any:
-    """The codec every pyramid level is written with."""
-    from numcodecs import Blosc
-
-    return Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+    """Codec used by the default persistent storage backend."""
+    return DEFAULT_STORAGE.compressor()
 
 
 def _create_level_array(
-    root: Any, path: str, shape: tuple[int, ...], dtype: np.dtype, tile: int
+    root: Any,
+    path: str,
+    shape: tuple[int, ...],
+    dtype: np.dtype,
+    tile: int,
+    storage: StorageBackend = DEFAULT_STORAGE,
 ) -> Any:
-    return root.create_array(
-        name=path,
-        shape=shape,
-        chunks=(1, tile, tile),
-        dtype=dtype,
-        compressors=store_compressor(),
-        dimension_names=None,
-        overwrite=True,
-        # explicit, because chunks that are entirely zero are never
-        # written: any reader must fill their absence with this value
-        fill_value=0,
-    )
+    return storage.create_array(root, path, shape, dtype, tile)
 
 
-def _chunk_io(arr: Any) -> tuple[Path, Any, tuple[int, ...], str]:
-    """(dir, codec, chunk shape, key separator) for a local zarr v2 array.
-
-    zarr-python 3's synchronous API funnels every chunk read and write from
-    dask's worker threads through one async bridge, capping bulk pixel I/O
-    near 0.7 GB/s where direct file + blosc access reaches ~4.7 GB/s on the
-    same cores -- so the conversion hot loops do their own chunk file I/O
-    against the v2 layout and keep zarr for metadata and casual reads.
-    """
-    import numcodecs
-
-    path = Path(arr.store.root) / arr.path
-    meta = json.loads((path / ".zarray").read_text())
-    if meta.get("order", "C") != "C":
-        raise ValueError("expected C-order chunks")
-    codec = numcodecs.get_codec(meta["compressor"])
-    sep = meta.get("dimension_separator", ".")
-    return path, codec, tuple(meta["chunks"]), sep
+def _store_direct(
+    data: Any,
+    array: Any,
+    storage: StorageBackend = DEFAULT_STORAGE,
+    *,
+    allow_rechunk: bool = True,
+) -> None:
+    storage.store_dask(data, array, allow_rechunk=allow_rechunk)
 
 
-def _is_aligned(chunks: tuple[tuple[int, ...], ...], cshape: tuple[int, ...]) -> bool:
-    """True when every dask block boundary sits on the store's chunk grid."""
-    for dim, step in zip(chunks, cshape):
-        edge = 0
-        for size in dim[:-1]:
-            edge += size
-            if edge % step:
-                return False
-    return True
+def _write_level0(
+    src: PlaneSource, arr: Any, storage: StorageBackend = DEFAULT_STORAGE
+) -> None:
+    _store_direct(src.data, arr, storage)
 
 
-def _store_direct(data: Any, zarr_arr: Any) -> None:
-    """da.store equivalent writing encoded chunk files straight to disk.
-
-    Each dask block may span many store chunks (block boundaries must sit on
-    the chunk grid); the whole block is sliced, encoded and written inside
-    one task, so nothing is reshuffled through the dask graph.
-    """
-    import dask.array as da
-
-    path, codec, cshape, sep = _chunk_io(zarr_arr)
-    if not _is_aligned(data.chunks, cshape):
-        data = data.rechunk(cshape)
-
-    def put(block: np.ndarray, block_info: Any = None) -> np.ndarray:
-        starts = [a for a, _ in block_info[0]["array-location"]]
-        ranges = [range(0, s, c) for s, c in zip(block.shape, cshape)]
-        for c0 in ranges[0]:
-            for y0 in ranges[1]:
-                for x0 in ranges[2]:
-                    sub = block[
-                        c0 : c0 + cshape[0],
-                        y0 : y0 + cshape[1],
-                        x0 : x0 + cshape[2],
-                    ]
-                    if not sub.any():  # all-zero chunk: its absence says it
-                        continue
-                    if sub.shape != cshape:  # v2 pads edge chunks to full size
-                        full = np.zeros(cshape, sub.dtype)
-                        full[tuple(slice(0, s) for s in sub.shape)] = sub
-                        sub = full
-                    key = sep.join(
-                        str((a + o) // s)
-                        for a, o, s in zip(starts, (c0, y0, x0), cshape)
-                    )
-                    (path / key).write_bytes(
-                        codec.encode(np.ascontiguousarray(sub))
-                    )
-        return np.zeros((1,) * block.ndim, np.uint8)
-
-    da.map_blocks(
-        put, data, chunks=tuple((1,) * len(c) for c in data.chunks), dtype=np.uint8
-    ).compute()
-
-
-def _write_level0(src: PlaneSource, arr: Any) -> None:
-    _store_direct(src.data, arr)
-
-
-def _write_level1_from_source(src: PlaneSource, arr: Any) -> None:
+def _write_level1_from_source(
+    src: PlaneSource, arr: Any, storage: StorageBackend = DEFAULT_STORAGE
+) -> None:
     """Level 1 straight from the source, skipping a stored level 0.
 
     Byte-identical to downsampling a stored level 0 (``box-mean-floor-v1``):
@@ -181,12 +130,22 @@ def _write_level1_from_source(src: PlaneSource, arr: Any) -> None:
     """
     import dask.array as da
 
-    c, h, w = src.shape
+    _, h, w = src.shape
+    _, out_tile, _ = storage.chunk_array(arr).chunk_shape
     data = src.data[:, : h // 2 * 2, : w // 2 * 2]
+    # Merge four aligned source tiles before reducing them. The 2x2 mean then
+    # emits blocks on the target grid, so the writer never has to reshuffle
+    # half-tile output blocks into full store chunks.
+    data = data.rechunk((1, out_tile * 2, out_tile * 2))
     mean = da.coarsen(np.mean, data.astype(np.float32), {0: 1, 1: 2, 2: 2})
     if np.issubdtype(src.dtype, np.integer):
         mean = da.rint(mean)
-    _store_direct(mean.astype(src.dtype), arr)
+    _store_direct(
+        mean.astype(src.dtype),
+        arr,
+        storage,
+        allow_rechunk=False,
+    )
 
 
 DOWNSAMPLE_TASK_BUDGET = 96 << 20  # peak bytes one downsample task may hold
@@ -204,7 +163,13 @@ def _batch_cols(nt: int, itemsize: int) -> int:
     return cols
 
 
-def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -> None:
+def _downsample_into(
+    prev_arr: Any,
+    next_arr: Any,
+    tile: int,
+    dtype: np.dtype,
+    storage: StorageBackend = DEFAULT_STORAGE,
+) -> None:
     """2x2-mean one pyramid level into the next, in bounded batches.
 
     Each task decodes the source chunk files under its footprint, means
@@ -215,8 +180,10 @@ def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -
     """
     import dask
 
-    ppath, pcodec, pcs, psep = _chunk_io(prev_arr)
-    npath, ncodec, ncs, nsep = _chunk_io(next_arr)
+    previous = storage.chunk_array(prev_arr)
+    target = storage.chunk_array(next_arr)
+    pcs = previous.chunk_shape
+    ncs = target.chunk_shape
     pdtype = np.dtype(prev_arr.dtype)
     c, ph, pw = prev_arr.shape
     _, nh, nw = next_arr.shape
@@ -237,12 +204,10 @@ def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -
         ry, rx = min(sy1, ph), min(sx1, pw)
         for cy in range(sy0 // pt, -(-ry // pt)):
             for cx in range(sx0 // pt, -(-rx // pt)):
-                key = psep.join((str(ci), str(cy), str(cx)))
-                try:
-                    raw = (ppath / key).read_bytes()
-                except FileNotFoundError:
+                chunk = previous.read_or_none((ci, cy, cx))
+                if chunk is None:
                     continue  # an omitted chunk is all zeros, as src already is
-                full = np.frombuffer(pcodec.decode(raw), pdtype).reshape(pcs)[0]
+                full = chunk[0]
                 oy0, oy1 = max(sy0, cy * pt), min(ry, cy * pt + pt)
                 ox0, ox1 = max(sx0, cx * pt), min(rx, cx * pt + pt)
                 src[oy0 - sy0 : oy1 - sy0, ox0 - sx0 : ox1 - sx0] = full[
@@ -261,9 +226,7 @@ def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -
                 continue
             out = np.zeros(ncs, dtype)  # v2 pads edge chunks to full size
             out[0, :h2, : cx1 - cx0] = row[:, cx0:cx1]
-            (npath / nsep.join((str(ci), str(ty), str(tx)))).write_bytes(
-                ncodec.encode(out)
-            )
+            target.write((ci, ty, tx), out)
 
     tasks = [
         dask.delayed(one_batch)(ci, ty, x0, min(x0 + bw, nw))
@@ -306,6 +269,7 @@ def build_group_attrs(
     tile: int,
     windows: list[dict[str, float]],
     start_level: int = 0,
+    ngff_version: str = NGFF_VERSION,
 ) -> dict[str, Any]:
     """``start_level`` names the first stored level: an overview store keeps
     levels 1..n and must say so rather than pretend to hold a level 0."""
@@ -326,7 +290,7 @@ def build_group_attrs(
         )
     multiscales = [
         {
-            "version": NGFF_VERSION,
+            "version": ngff_version,
             "name": Path(src.source_name).name,
             "axes": [
                 {"name": "c", "type": "channel"},
@@ -383,26 +347,29 @@ def convert(
     workers: int | None = None,
     on_progress: Callable[[float], None] | None = None,
     overview: bool = False,
+    storage: StorageBackend | None = None,
+    ngff_version: str = NGFF_VERSION,
 ) -> Path:
-    """Convert one plane of an ND2 file to an OME-Zarr pyramid on disk.
+    """Write a portable pyramid or a source-linked overview store.
 
-    ``workers=None`` sizes the thread pool to this machine's CPU.
-    ``overview=True`` writes levels 1..n only — level 1 comes straight
-    from the source and the store's metadata lists just what it holds.
-    Such a store is a cache half of a source-backed slide, not a portable
-    export; the caller is responsible for having checked eligibility with
-    :func:`nd2wsi.reader.is_source_backable`.
+    ``overview=False`` writes levels 0..n and produces a self-contained
+    OME-Zarr store. ``overview=True`` writes levels 1..n only; an eligible
+    uncompressed ND2 supplies level 0 at runtime.
     """
-    import os
+    import uuid
+    from contextlib import ExitStack
 
     import dask
     import nd2
-    import zarr
 
-    nd2_path = Path(nd2_path)
-    out_path = Path(out_path)
+    from .cache import commit_container
+    from .svs import is_svs, open_svs
+
+    source_path = Path(nd2_path)
+    final_path = Path(out_path)
+    storage = storage or DEFAULT_STORAGE
     if tile is None:
-        tile = auto_tile(out_path)
+        tile = auto_tile(final_path, storage)
         if progress and tile != 512:
             print(f"tile {tile} for this volume's allocation blocks")
     selection = selection or PlaneSelection()
@@ -411,121 +378,166 @@ def convert(
         if progress:
             print(f"hardware: {os.cpu_count()} CPU cores -> {workers} worker threads")
 
-    if out_path.exists() and not overwrite:
-        raise FileExistsError(f"{out_path} exists (use --overwrite)")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    # every conversion stages beside its destination and renames in only
-    # when complete: a crash leaves no half-store at the final path, and a
-    # concurrent open never sees (let alone quarantines) work in progress
-    final_path = out_path
-    out_path = out_path.parent / f".{out_path.name}.building-{os.getpid()}"
-    shutil.rmtree(out_path, ignore_errors=True)
+    if final_path.exists() and not overwrite:
+        raise FileExistsError(f"{final_path} exists (use --overwrite)")
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path = final_path.parent / (
+        f".{final_path.name}.building-{uuid.uuid4().hex[:12]}"
+    )
+    shutil.rmtree(staging_path, ignore_errors=True)
 
-    t0 = time.time()
-    from contextlib import ExitStack
-
-    from .svs import is_svs, open_svs
-
-    with dask.config.set(scheduler="threads", num_workers=workers):
-        with ExitStack() as stack:
-            if is_svs(nd2_path):
-                if overview:
-                    raise ValueError("overview stores are for ND2 sources only")
-                src = open_svs(stack, nd2_path, tile=tile)
-            else:
-                f = stack.enter_context(nd2.ND2File(str(nd2_path)))
-                src = open_plane(f, selection, tile=tile)
-            c, h, w = src.shape
-            shapes = level_shapes(h, w, tile)
-            first = 1 if overview else 0
-            if overview and len(shapes) < 2:
-                raise ValueError(
-                    f"{nd2_path.name} fits one tile; an overview would be empty"
-                )
-            if progress:
-                raw = c * h * w * src.dtype.itemsize
-                print(
-                    f"{nd2_path.name}: {w} x {h} px, {c} channel(s), "
-                    f"{src.dtype}, {'RGB' if src.rgb else 'grayscale'}, "
-                    f"~{nice_bytes(raw)} of level-0 pixels"
-                )
-                for note in src.notes:
-                    print(f"  note: {note}")
-                kinds = "overview levels 1.." if overview else "levels 0.."
-                print(f"  pyramid: {kinds}{len(shapes) - 1}, tile {tile}")
-
-            root = zarr.open_group(str(out_path), mode="w", zarr_format=2)
-            arrays = {}
-            for k in range(first, len(shapes)):
-                lh, lw = shapes[k]
-                arrays[k] = _create_level_array(
-                    root, str(k), (c, lh, lw), src.dtype, tile
-                )
-
-            weights = {k: shapes[k][0] * shapes[k][1] for k in arrays}
-            total_px = float(sum(weights.values()))
-            done_px = 0.0
-
-            def level_ctx(k: int):
-                if on_progress is None:
-                    import contextlib
-
-                    return contextlib.nullcontext()
-                base = done_px
-
-                return _StoreProgress(
-                    lambda f: on_progress((base + f * weights[k]) / total_px)
-                )
-
-            lh, lw = shapes[first]
-            if progress:
-                what = "downsampling from the source" if overview else "writing from ND2"
-                print(f"  level {first}  {lw} x {lh}  {what} ...", flush=True)
-            with level_ctx(first):
-                if overview:
-                    _write_level1_from_source(src, arrays[1])
+    started = time.time()
+    swept = freed = 0
+    try:
+        with dask.config.set(scheduler="threads", num_workers=workers):
+            with ExitStack() as stack:
+                if is_svs(source_path):
+                    if overview:
+                        raise ValueError("overview stores are for ND2 sources only")
+                    src = open_svs(stack, source_path, tile=tile)
                 else:
-                    _write_level0(src, arrays[0])
-            done_px += weights[first]
+                    handle = stack.enter_context(nd2.ND2File(str(source_path)))
+                    # Coarsening a 2*tile source block yields one tile-sized
+                    # level-1 block. This alignment prevents the hidden Dask
+                    # rechunk that made early compact-cache prototypes slower
+                    # than full conversion.
+                    source_tile = tile * 2 if overview else tile
+                    src = open_plane(handle, selection, tile=source_tile)
 
-            for k in range(first + 1, len(shapes)):
-                lh, lw = shapes[k]
+                channels, height, width = src.shape
+                shapes = level_shapes(height, width, tile)
+                first_level = 1 if overview else 0
+                if overview and len(shapes) < 2:
+                    raise ValueError(
+                        f"{source_path.name} fits one tile; an overview would be empty"
+                    )
+
                 if progress:
-                    print(f"  level {k}  {lw} x {lh}  downsampling ...", flush=True)
-                with level_ctx(k):
-                    _downsample_into(arrays[k - 1], arrays[k], tile, src.dtype)
-                done_px += weights[k]
+                    raw = channels * height * width * src.dtype.itemsize
+                    print(
+                        f"{source_path.name}: {width} x {height} px, "
+                        f"{channels} channel(s), {src.dtype}, "
+                        f"{'RGB' if src.rgb else 'grayscale'}, "
+                        f"~{nice_bytes(raw)} of level-0 pixels"
+                    )
+                    for note in src.notes:
+                        print(f"  note: {note}")
+                    label = "overview levels 1.." if overview else "levels 0.."
+                    print(f"  pyramid: {label}{len(shapes) - 1}, tile {tile}")
 
-            level_paths = [str(k) for k in range(first, len(shapes))]
-            windows = _percentile_windows(root, level_paths, src)
-            attrs = build_group_attrs(
-                src, shapes[first:], tile, windows, start_level=first
-            )
-            if overview:
-                attrs["nd2wsi"]["kind"] = "overview"
-                attrs["nd2wsi"]["overview_of"] = {
-                    "channels": c,
-                    "height": h,
-                    "width": w,
+                root = storage.create_group(staging_path)
+                arrays: dict[int, Any] = {}
+                for level in range(first_level, len(shapes)):
+                    level_height, level_width = shapes[level]
+                    arrays[level] = _create_level_array(
+                        root,
+                        str(level),
+                        (channels, level_height, level_width),
+                        src.dtype,
+                        tile,
+                        storage,
+                    )
+
+                weights = {
+                    level: shapes[level][0] * shapes[level][1]
+                    for level in arrays
                 }
-                attrs["nd2wsi"]["notes"] = attrs["nd2wsi"].get("notes", []) + [
-                    "overview store: full resolution is read from the source file"
-                ]
-            root.attrs.update(attrs)
-            if on_progress is not None:
-                on_progress(1.0)
+                total_pixels = float(sum(weights.values()))
+                completed_pixels = 0.0
 
-    swept, freed = sweep_appledouble(out_path)
-    if final_path.exists():
-        if not overwrite:
-            shutil.rmtree(out_path, ignore_errors=True)
+                def level_context(level: int):
+                    if on_progress is None:
+                        import contextlib
+
+                        return contextlib.nullcontext()
+                    base = completed_pixels
+                    return _StoreProgress(
+                        lambda fraction: on_progress(
+                            (base + fraction * weights[level]) / total_pixels
+                        )
+                    )
+
+                level_height, level_width = shapes[first_level]
+                if progress:
+                    action = (
+                        "downsampling from the source"
+                        if overview
+                        else "writing from the source"
+                    )
+                    print(
+                        f"  level {first_level}  {level_width} x {level_height}  "
+                        f"{action} ...",
+                        flush=True,
+                    )
+                with level_context(first_level):
+                    if overview:
+                        _write_level1_from_source(src, arrays[1], storage)
+                    else:
+                        _write_level0(src, arrays[0], storage)
+                completed_pixels += weights[first_level]
+
+                for level in range(first_level + 1, len(shapes)):
+                    level_height, level_width = shapes[level]
+                    if progress:
+                        print(
+                            f"  level {level}  {level_width} x {level_height}  "
+                            "downsampling ...",
+                            flush=True,
+                        )
+                    with level_context(level):
+                        _downsample_into(
+                            arrays[level - 1],
+                            arrays[level],
+                            tile,
+                            src.dtype,
+                            storage,
+                        )
+                    completed_pixels += weights[level]
+
+                level_paths = [
+                    str(level) for level in range(first_level, len(shapes))
+                ]
+                windows = _percentile_windows(root, level_paths, src)
+                attrs = build_group_attrs(
+                    src,
+                    shapes[first_level:],
+                    tile,
+                    windows,
+                    start_level=first_level,
+                    ngff_version=ngff_version,
+                )
+                attrs["nd2wsi"]["storage"] = storage.descriptor(
+                    ngff_version=ngff_version
+                )
+                if overview:
+                    attrs["nd2wsi"]["kind"] = "overview"
+                    attrs["nd2wsi"]["overview_of"] = {
+                        "channels": channels,
+                        "height": height,
+                        "width": width,
+                    }
+                    attrs["nd2wsi"]["notes"] = attrs["nd2wsi"].get(
+                        "notes", []
+                    ) + [
+                        "overview store: full resolution is read from the source file"
+                    ]
+                root.attrs.update(attrs)
+                if on_progress is not None:
+                    on_progress(1.0)
+
+        swept, freed = sweep_appledouble(staging_path)
+        if final_path.exists() and not overwrite:
             raise FileExistsError(f"{final_path} exists (use --overwrite)")
-        shutil.rmtree(final_path)
-    os.rename(out_path, final_path)
+        commit_container(staging_path, final_path)
+    except BaseException:
+        shutil.rmtree(staging_path, ignore_errors=True)
+        raise
+
     if progress:
-        size = sum(p.stat().st_size for p in final_path.rglob("*") if p.is_file())
+        size = sum(path.stat().st_size for path in final_path.rglob("*") if path.is_file())
         print(
-            f"  done in {time.time() - t0:.1f}s -> {final_path} ({nice_bytes(size)} on disk)"
+            f"  done in {time.time() - started:.1f}s -> {final_path} "
+            f"({nice_bytes(size)} on disk)"
         )
         if swept:
             print(f"  swept {swept} AppleDouble files, {nice_bytes(freed)} recovered")
@@ -573,24 +585,27 @@ def _block_bytes(folder: str | Path) -> int:
         return 4096
 
 
-def auto_tile(out_path: str | Path) -> int:
-    """Chunk edge matched to where the pyramid will live.
+def auto_tile(
+    out_path: str | Path, storage: StorageBackend = DEFAULT_STORAGE
+) -> int:
+    """Ask the storage backend for a chunk edge suited to this volume.
 
-    A chunk file never occupies less than one allocation block, and big
-    exFAT volumes use blocks of 128 KB to 1 MB, so 512 px chunks there cost
-    four times their content. Measured on such an SSD, 1024 px chunks cut
-    the store to 1.6 GB where 512 took 3.8, built five times faster, and
-    filled a screen a shade quicker, with a pan step at 17 ms. Volumes with
-    ordinary 4 KB blocks keep 512, which pans fastest.
+    The current one-file-per-chunk Zarr v2 backend uses 1024 px chunks on
+    large-allocation-block volumes and 512 px chunks elsewhere. A future
+    sharded backend may make a different choice without changing callers.
     """
     path = Path(out_path).resolve()
     while not path.exists() and path != path.parent:
         path = path.parent
-    return 1024 if _block_bytes(path) >= 65536 else 512
+    return storage.recommended_tile(allocation_block=_block_bytes(path))
 
 
 def estimate_store_bytes(
-    path: str | Path, *, tile: int | None = None, points: int = 16
+    path: str | Path,
+    *,
+    tile: int | None = None,
+    points: int = 16,
+    storage: StorageBackend = DEFAULT_STORAGE,
 ) -> dict[str, Any]:
     """Predict what a slide's pyramid will take on disk, before building it.
 
@@ -605,7 +620,7 @@ def estimate_store_bytes(
 
     path = Path(path)
     if tile is None:
-        tile = auto_tile(default_store_path(path))
+        tile = auto_tile(default_store_path(path), storage)
     blocks: list[np.ndarray] = []
     if is_svs(path):
         import tifffile
@@ -632,47 +647,44 @@ def estimate_store_bytes(
                     blocks.append(np.asarray(block.compute()))
 
     shapes = level_shapes(h, w, tile)
-    raw = sum(c * lh * lw for lh, lw in shapes) * dtype.itemsize
-
-    codec = store_compressor()
-    sampled = sum(b.nbytes for b in blocks)
+    codec = storage.compressor()
+    sampled = sum(block.nbytes for block in blocks)
     packed = sum(
         len(codec.encode(np.ascontiguousarray(plane)))
-        for b in blocks
-        for plane in b
+        for block in blocks
+        for plane in block
     )
     ratio = (packed / sampled) if sampled else 1.0
-    total = int(raw * ratio)
-
-    # A pyramid is tens of thousands of small files, and a file never takes
-    # less than one allocation block. On a big exFAT volume that block is
-    # 1 MB, which turns a 130 KB chunk into a megabyte and the whole store
-    # into several times its own size, so report what the volume will
-    # actually spend rather than the size of the data.
-    block = _block_bytes(path.parent)
-    chunk_bytes = tile * tile * dtype.itemsize * ratio
-    per_chunk = max(block, -(-int(chunk_bytes) // block) * block)
-    files = sum(c * -(-lh // tile) * -(-lw // tile) for lh, lw in shapes)
-    # chunks that are entirely zero are never written at all
-    if blocks:
-        zero_frac = sum(1 for b in blocks if not b.any()) / len(blocks)
-        files = int(files * (1 - zero_frac))
-    on_disk = files * per_chunk + block * (len(shapes) + 2)  # plus metadata
+    zero_fraction = (
+        sum(1 for block in blocks if not block.any()) / len(blocks)
+        if blocks
+        else 0.0
+    )
+    allocation_block = _block_bytes(path.parent)
+    layout = storage.estimate_layout(
+        shapes=shapes,
+        channels=c,
+        itemsize=dtype.itemsize,
+        tile=tile,
+        compression_ratio=ratio,
+        allocation_block=allocation_block,
+        zero_fraction=zero_fraction,
+    )
+    expected = max(layout["data_bytes"], layout["disk_bytes"])
     return {
-        "bytes": max(total, on_disk),
-        "human": nice_bytes(max(total, on_disk)),
-        "data_bytes": total,
-        "disk_bytes": on_disk,
-        "block_bytes": block,
-        "files": files,
+        "bytes": expected,
+        "human": nice_bytes(expected),
+        **layout,
+        "block_bytes": allocation_block,
         "ratio": ratio,
+        "zero_fraction": zero_fraction,
         "width": w,
         "height": h,
         "channels": c,
         "levels": len(shapes),
-        "raw_bytes": raw,
         "source_bytes": path.stat().st_size,
         "free_bytes": shutil.disk_usage(path.parent).free,
+        "storage": storage.descriptor(ngff_version=NGFF_VERSION),
     }
 
 
@@ -752,6 +764,22 @@ def ensure_cache(
         except ValueError:
             pass  # damaged despite its manifest: handled under the lock
 
+    # Versions 0.8 and 0.9 used the stem alone. Reuse a valid old container,
+    # but never let it become the identity of a new cache: ``slide.nd2`` and
+    # ``slide.svs`` may live together.
+    from .cache import legacy_cache_container
+
+    old_container = legacy_cache_container(slide, selection)
+    old_store = container_store(old_container)
+    if old_container != container and cache_matches(
+        old_container, slide, selection, kind=want
+    ) and old_store.is_dir():
+        try:
+            open_store(old_store)
+            return old_store
+        except ValueError:
+            pass  # leave it for explicit cleanup; build the new identity
+
     if selection == PlaneSelection():
         legacy = _legacy_store(slide)
         if legacy is not None:
@@ -812,6 +840,7 @@ def ensure_cache(
                 shape,
                 meta["dtype"],
                 kind="overview" if ov else "full",
+                storage=meta.get("storage"),
             )
             commit_container(staging, container)
         except BaseException:
@@ -836,21 +865,60 @@ def existing_cache_store(
     store = container_store(container)
     if cache_matches(container, slide, selection) and store.is_dir():
         return store
+    from .cache import legacy_cache_container
+
+    old_container = legacy_cache_container(slide, selection)
+    old_store = container_store(old_container)
+    if old_container != container and cache_matches(
+        old_container, slide, selection
+    ) and old_store.is_dir():
+        return old_store
     return None
 
 
-def _legacy_store(slide: Path) -> Path | None:
-    """A pre-container store, honored where it lies if it truly opens.
+def _legacy_store_matches_source(
+    store: Path, slide: Path, attrs: dict[str, Any] | None = None
+) -> bool:
+    """Whether a stem-only store can be assigned to this source safely."""
+    try:
+        if attrs is None:
+            _, attrs = open_store(store)
+    except (ValueError, FileNotFoundError, OSError):
+        # an unopenable legacy dir still claims its name: fall through to
+        # the sibling check so a unique source reuses (and can repair) it
+        # in place instead of stranding it beside a fresh rebuild
+        attrs = None
+    recorded = ""
+    if attrs is not None:
+        recorded = Path(str(attrs.get("nd2wsi", {}).get("source") or "")).name
+    if recorded:
+        return recorded == slide.name
+    try:
+        siblings = [
+            item
+            for item in slide.parent.iterdir()
+            if item.is_file()
+            and item.stem == slide.stem
+            and item.suffix.lower() in (".nd2", ".svs")
+        ]
+    except OSError:
+        return False
+    return len(siblings) == 1
 
-    A directory that exists but does not open as a store is the wedge the
-    old layout could leave behind after a crash; those are quarantined so
-    the slide can be opened at all. Stores the user opens directly never
-    pass through here and are never touched.
+
+def _legacy_store(slide: Path) -> Path | None:
+    """A complete portable store found beside this source.
+
+    The current suffix-aware name is checked first, followed by historical
+    stem-only names. A directory that exists but does not open as a store is
+    quarantined so it cannot wedge automatic opening. Stores the user opens
+    directly never pass through here and are never touched.
     """
     from .cache import quarantine
 
     base = slide.parent
     for cand in (
+        base / CACHE_DIR_NAME / f"{slide.name}.ome.zarr",
         base / CACHE_DIR_NAME / f"{slide.stem}.ome.zarr",
         base / f"pyramid_{slide.stem}.ome.zarr",
         base / f"{slide.stem}.ome.zarr",
@@ -867,6 +935,8 @@ def _legacy_store(slide: Path) -> Path | None:
             except FileNotFoundError:
                 pass  # another opener quarantined it first
             continue
+        if not _legacy_store_matches_source(cand, slide, attrs):
+            continue
         sel = attrs["nd2wsi"].get("selection") or {}
         if sel.get("t", 0) or sel.get("p", 0):
             # built for another timepoint or position: not the default view
@@ -876,22 +946,22 @@ def _legacy_store(slide: Path) -> Path | None:
 
 
 def default_store_path(nd2_path: str | Path, cache_dir: str | Path | None = None) -> Path:
-    """``pyramids/<slide>.ome.zarr`` beside the slide.
+    """Default path for a complete, portable pyramid.
 
-    One folder per directory of slides keeps the caches together instead of
-    scattering a store between every file. Stores made by older versions
-    (``pyramid_<slide>.ome.zarr`` or ``<slide>.ome.zarr`` next to the slide)
-    are still used where they lie, so nothing has to be rebuilt.
+    New stores retain the source suffix (``slide.nd2.ome.zarr``), so an ND2
+    and SVS with the same stem cannot collide. Existing stem-only stores remain
+    valid and are reused where they lie.
     """
     nd2_path = Path(nd2_path)
     base = Path(cache_dir) if cache_dir else nd2_path.parent
     for legacy in (
+        base / CACHE_DIR_NAME / f"{nd2_path.stem}.ome.zarr",
         base / f"pyramid_{nd2_path.stem}.ome.zarr",
         base / f"{nd2_path.stem}.ome.zarr",
     ):
-        if legacy.exists():
+        if legacy.exists() and _legacy_store_matches_source(legacy, nd2_path):
             return legacy
-    return base / CACHE_DIR_NAME / f"{nd2_path.stem}.ome.zarr"
+    return base / CACHE_DIR_NAME / f"{nd2_path.name}.ome.zarr"
 
 
 def is_nd2wsi_store(path: str | Path) -> bool:
@@ -958,11 +1028,3 @@ def open_store(path: str | Path) -> tuple[Any, dict[str, Any]]:
             "(missing multiscales/nd2wsi metadata)"
         )
     return root, attrs
-
-
-def mpx(w: int, h: int) -> float:
-    return w * h / 1e6
-
-
-def ceil_log2(n: int) -> int:
-    return int(math.ceil(math.log2(max(1, n))))

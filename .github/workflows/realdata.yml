@@ -16,11 +16,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
-      - run: |
-          uv venv .venv --clear
-          uv pip install -p .venv -e ".[svs,nd2export,app,test]" \
-            --extra-index-url https://pypi.laboratory-imaging.com/simple
+      - name: Install the locked environment
+        run: uv sync --frozen --all-extras --python 3.13
       - name: Fetch the example acquisitions
-        run: .venv/bin/python scripts/fetch_testdata.py
+        run: uv run --frozen python scripts/fetch_testdata.py
       - name: Real-data suite
-        run: .venv/bin/python -m pytest tests -q -m realdata
+        run: uv run --frozen python -m pytest tests -q -m realdata

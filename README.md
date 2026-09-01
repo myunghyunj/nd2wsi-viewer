@@ -1,456 +1,349 @@
 <p align="center">
-  <img src="docs/icon.png" alt="nd2wsi-viewer icon, a blue resolution pyramid in a macOS squircle" width="128">
+  <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
 </p>
 
 <h1 align="center">nd2wsi-viewer</h1>
 
 <p align="center">
-  <b>Whole-slide viewing for Nikon ND2 and Aperio SVS, as a native macOS app and a CLI,<br>
-  with pixel-exact ROI export back to ND2.</b>
+  <strong>Whole-slide viewing for stitched Nikon ND2 and Aperio SVS.</strong><br>
+  Pan from an overview to native pixels. Mark a region. Export its raw values.
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-13%2B-1d1d1f?style=flat-square&logo=apple&logoColor=white" alt="macOS 13+">
-  <img src="https://img.shields.io/badge/python-3.11%2B-0A84FF?style=flat-square" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/formats-.nd2%20%C2%B7%20.svs-30D158?style=flat-square" alt="ND2 + SVS">
-  <img src="https://github.com/myunghyunj/nd2wsi-viewer/actions/workflows/ci.yml/badge.svg" alt="CI">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-0A84FF?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/license-MIT-8E8E93?style=flat-square" alt="MIT">
 </p>
 
----
+![Two slides open in nd2wsi-viewer](docs/hero.png)
 
-## Motivation
+## The problem
 
-I routinely look up two kinds of slides every week. MT and H&E scans come
-from a Leica Aperio scanner. Immunofluorescence scans come from a Nikon
-Ti2 and are saved as ND2 by NIS-Elements. The pathology slides open
-instantly in any WSI viewer. But I found my Mac struggling to open the
-ND2 files, and for a while I was just angry at the computer.
+An SVS is made for whole-slide viewing. It stores tiled images at several resolutions. A viewer reads only the tiles on screen.
 
-Then I looked inside the files, and it turned out the computer was never
-the problem. An Aperio SVS is a pyramid of small tiles at several zoom
-levels, so a viewer only reads the handful of tiles on screen. A stitched
-ND2 is one flat 5 GB image. Software that opens it has little choice but
-to drag the whole thing through memory, and no laptop enjoys that.
+A stitched ND2 is often different. In the NIS-Elements files tested here, one selected frame is one large raster. It contains the native pixels but no useful whole-slide pyramid. General ND2 viewers can open it, yet a large scan remains slow to survey and awkward to crop.
 
-Once you see it that way, the fix is obvious. RAM is fixed the day you
-buy the machine. Storage is the one thing you can always add, and an
-external SSD is cheap. So this viewer makes the trade on purpose. It
-converts the ND2 once into a tiled pyramid on disk and never loads the
-slide whole again. You pay roughly 70% of the
-file size in storage, and in return a 5 GB scan pans and zooms like a map
-on any Mac with room on its SSD. The cache lives next to the slide, so
-keep your slides on an external drive and the speed travels with it.
+`nd2wsi-viewer` adds the missing whole-slide layer. It keeps the ND2 as the source of truth, stores a compact set of reduced levels, and serves both through one local tile interface.
 
-It also does the one thing pathology viewers skip. Any region crops back
-out as a real ND2 that reopens in NIS-Elements with its calibration and
-channels intact.
+Nothing is uploaded.
 
-<p align="center">
-  <img src="docs/hero.png" alt="Two slides open in tabs, with serial measurements and a labeled box on a PDGFRb slide" width="900">
-  <br><sub>Two slides open as tabs. Serial thickness measurements and a labeled box on a PDGFR&beta; slide, loaded from its sidecar.</sub>
-</p>
+## What it does
 
-## How it works
+- Opens stitched Nikon `.nd2` and Aperio `.svs` slides.
+- Pans and zooms from a full-slide overview to native pixels.
+- Controls fluorescence channels, colors, windows, gamma, and histograms.
+- Measures calibrated distances.
+- Stores rulers, pins, boxes, and notes in a JSON sidecar.
+- Exports a selected region as ND2, TIFF, PNG, or JPEG.
+- Preserves raw values in ND2 and TIFF exports.
+- Opens several slides in tabs.
+- Runs as a macOS app, a browser UI, or a CLI.
 
-The pyramid format is [OME-Zarr](https://ngff.openmicroscopy.org/), the
-bioimaging community's next-generation pyramidal format. Instead of one
-giant blob, the image lives as thousands of small compressed chunks at
-every zoom level, which is exactly the shape a deep-zoom viewer wants to
-read. It's an open standard, so a store made with `nd2wsi convert` also
-opens in napari, vizarr, and QuPath.
+Unknown calibration stays unknown. If a file has no valid pixel size, the viewer reports pixels, hides the scale bar, and omits physical calibration from exports.
 
-The pipeline is short. A slide becomes an OME-Zarr pyramid, the pyramid
-feeds a local tile server, and the server feeds a deep-zoom viewer in a
-browser tab or the app window. Conversion happens once, next to the slide, with bounded memory
-and a progress bar. SVS files take the same path. The reader pulls the
-baseline level of the pyramidal TIFF through tifffile and takes the micron
-calibration from the Aperio MPP field.
+## Quick start
 
-```
-pip install .
-nd2wsi view slide.nd2 another.svs
-# builds a cache under nd2wsi/ next to each slide (once),
-# then opens the tabbed viewer at http://127.0.0.1:8000
-```
+### macOS app
 
-If you would rather skip the terminal, `packaging/build_mac_app.sh`
-builds a double-clickable `nd2wsi-viewer.app` and a drag-to-Applications
-`.dmg` with everything bundled.
+Download the DMG from the latest release. Drag the app to Applications. Drop an `.nd2` or `.svs` file onto the window.
 
-## Install
+The current binary is ad-hoc signed, not notarized. macOS may ask you to confirm its first launch.
+
+### Python
+
+Python 3.11 or newer is required.
 
 ```bash
-pip install .            # nd2, numpy, dask, zarr, numcodecs, pillow, tifffile
-pip install ".[svs]"     # adds imagecodecs, for Aperio SVS
-pip install ".[app]"     # adds pywebview, for the native macOS window
-pip install ".[legacy]"  # adds imagecodecs, for pre-2012 JPEG2000 ND2
-
-# ND2 export uses limnd2, published on Laboratory Imaging's own index
-pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2
+python -m pip install .
 ```
 
-Python 3.11 or newer. The server is stdlib `http.server`, OpenSeadragon is
-vendored, and viewing works offline.
+Optional extras add the rest.
 
-## Example slides
+```bash
+python -m pip install ".[app]"       # native macOS window
+python -m pip install ".[svs]"       # JPEG and JPEG 2000 SVS decoding
+python -m pip install ".[legacy]"    # older JPEG 2000 ND2 files
+```
 
-No microscope needed. Two real Nikon Ti2 fluorescence acquisitions live on
-the [testdata-v1 release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/testdata-v1),
-published under CC0. They stay out of the git history because clones should
-not carry 75 MB of pixels forever, so one script fetches them into `docs/`
-and verifies their checksums.
+ND2 export uses Laboratory Imaging's package index.
+
+```bash
+python -m pip install ".[nd2export]" \
+  --extra-index-url https://pypi.laboratory-imaging.com/simple
+```
+
+Open one or more slides.
+
+```bash
+nd2wsi view slide.nd2 another.svs
+```
+
+Inspect a file first.
+
+```bash
+nd2wsi info slide.nd2
+nd2wsi info slide.nd2 --json
+```
+
+## How storage works
+
+### Compact ND2 cache
+
+An eligible modern uncompressed ND2 stores this way.
+
+```text
+level 0      original ND2, read through its memory map
+levels 1..n  compact overview cache
+```
+
+The cache does not copy native resolution. It stores only the reduced levels.
+
+If the native image contains `N` pixels, a full pyramid contains about `4N/3` pixels.
+
+```text
+N + N/4 + N/16 + ... = 4N/3
+```
+
+The compact cache contains about `N/3` pixels.
+
+```text
+N/4 + N/16 + ... = N/3
+```
+
+Thus its pixel volume is about one quarter of a full pyramid. Actual disk use also depends on compression, blank regions, chunk size, and filesystem allocation blocks.
+
+Compact mode requires four things.
+
+- a modern ND2 container
+- uncompressed frame data
+- one stored T/P/Z plane
+- a memory-mapped frame view
+
+Compressed or legacy ND2 files, maximum-intensity projections, and unsupported layouts use a full cache instead.
+
+### Portable OME-Zarr
+
+Use `convert` when the result must stand alone.
+
+```bash
+nd2wsi convert slide.nd2 slide.ome.zarr
+```
+
+This writes native resolution and every reduced level. The result uses OME-NGFF 0.4 metadata on Zarr v2 for broad reader compatibility.
+
+A compact cache is not a portable OME-Zarr dataset. It depends on its source ND2.
+
+### SVS
+
+A tiled SVS already contains a pyramid. The viewer reads its embedded tiles directly and fills small gaps in the level ladder on demand. It writes no cache unless you run `convert` yourself.
+
+## Files on disk
+
+Managed files live beside the slide.
+
+```text
+experiment/
+├── slide.nd2
+└── nd2wsi/
+    ├── annotations/
+    │   └── annotations_slide.nd2--t0-p0-z0.json
+    └── caches/
+        └── slide.nd2--t0-p0-zmid.nd2wsi-cache/
+            ├── manifest.json
+            └── store.ome.zarr/
+```
+
+The manifest records the source fingerprint, selected plane, image shape, pyramid algorithm, cache generation, and storage format. A build occurs in a temporary sibling. The final path appears only after validation.
+
+A stale or damaged cache is quarantined, not deleted. A store opened explicitly is never treated as disposable cache.
+
+The trash button removes one viewing cache. It leaves the source slide and annotations intact.
+
+Migrate older layouts with `tidy`.
+
+```bash
+nd2wsi tidy /path/to/slides --dry-run
+nd2wsi tidy /path/to/slides --move-annotations
+```
+
+## Viewer
+
+### Display
+
+![Channel histogram and LUT controls](docs/channels-luts.png)
+
+Each fluorescence channel has its own color, display window, gamma, histogram, and visibility switch. `Auto` sets a robust display range. Shift-drag moves all windows together.
+
+Display changes affect viewer tiles and rendered PNG or JPEG files. They do not alter raw ND2 or TIFF values.
+
+RGB slides use their native color channels and hide the fluorescence panel.
+
+### Measure and annotate
+
+![Measurements, pins, and boxes](docs/annotations.png)
+
+| Key | Action |
+|---|---|
+| `M` | measure |
+| `P` | place a pin |
+| `B` | draw a box |
+| `R` | select a region |
+| `V` | move the selected region |
+| `0` | fit the slide |
+| `Esc` | cancel the active tool |
+
+Measurements use the calibration stored in the source. Without calibration, the viewer reports pixels.
+
+Annotations use level-0 pixel coordinates. Their sidecar records the source name, dimensions, selected plane, and calibration state. A mismatched sidecar is not applied silently.
+
+### Export a region
+
+![A selected export region](docs/region-export.png)
+
+Draw a box or enter its size in pixels or micrometers.
+
+| Format | Output |
+|---|---|
+| ND2 | raw selected channels, `uint8` or `uint16`, tiled write |
+| TIFF | raw values and source dtype; tiled BigTIFF |
+| PNG | current rendered display |
+| JPEG | current rendered display |
+
+ND2 keeps channel names, colors, objective magnification when known, and isotropic calibration when the writer can represent it safely. TIFF stores X and Y resolution separately.
+
+PNG and JPEG are limited by the render-memory cap. Large requests use a coarser pyramid level rather than claiming an unsafe native-size render.
+
+A native ND2 crop does not need a pyramid.
+
+```bash
+nd2wsi crop slide.nd2 roi.nd2 \
+  --x 12000 --y 8000 --w 4096 --h 4096 --c 0,2
+```
+
+## Support matrix
+
+| Input or operation | Behavior |
+|---|---|
+| modern uncompressed stitched ND2 | source-backed native level plus compact overview cache |
+| modern compressed ND2 | full conversion; whole-frame decode may use substantial RAM |
+| legacy JPEG 2000 ND2 | full conversion with the `legacy` extra |
+| one selected T/P/Z plane | supported |
+| Z maximum projection | supported through full conversion |
+| interactive T/Z navigation | not implemented |
+| tiled pyramidal SVS | direct viewing |
+| untiled or sparse SVS | full-conversion fallback |
+| ND2 export | `uint8` and `uint16` |
+| anisotropic ND2 calibration | exported uncalibrated unless the writer can represent it safely |
+
+## Measured trade-off
+
+Rebuilding this project's own working set measured the compact design at
+scale. Thirty nine stitched ND2 scans totalling 190 GB, the largest a
+15.3 GB four channel 68,938 × 27,744 px acquisition, were cached twice on
+a USB exFAT SSD, once as full pyramids and once as compact caches.
+
+| Cache mode | Total on disk |
+|---|---:|
+| full pyramids | 152.1 GB |
+| compact source-backed caches | 36.1 GB |
+
+The reduction was 76 percent, close to the 75 percent the pixel
+arithmetic predicts. A cold 512 px native window from the largest slide
+read through its memory map in 170 ms, and cached overview tiles render
+at interactive speed. These numbers describe one machine and one working
+set rather than a hardware independent guarantee.
+
+## Architecture
+
+```text
+ND2 ── native level 0 ───────────────┐
+  └── compact cached levels 1..n ───┤
+                                     ├── local tile server ── OpenSeadragon
+SVS ── embedded pyramid ─────────────┤
+                                     │
+portable OME-Zarr ── full pyramid ───┘
+
+selected region ── raw tiles ── TIFF or ND2
+```
+
+The main modules have narrow jobs.
+
+- `reader.py` opens one ND2 plane and checks compact-cache eligibility.
+- `convert.py` builds full or compact pyramids.
+- `storage/` owns the physical Zarr layout.
+- `direct.py` adapts ND2 and SVS sources to the same level interface.
+- `server.py` serves tiles, metadata, annotations, and exports on localhost.
+- `render.py` applies display windows and writes TIFF or rendered images.
+- `export_nd2.py` writes tiled ND2 regions through `limnd2`.
+
+The server binds to loopback and places every route behind a random capability URL.
+
+## Commands
+
+```text
+nd2wsi info FILE
+nd2wsi view FILE [FILE ...]
+nd2wsi convert FILE [OUTPUT.ome.zarr]
+nd2wsi crop INPUT.nd2 OUTPUT.nd2 --x X --y Y --w W --h H [--c 0,2]
+nd2wsi serve STORE [STORE ...]
+nd2wsi tidy FOLDER [FOLDER ...]
+```
+
+Run `nd2wsi COMMAND --help` for T/P/Z selection, tile size, worker count, host, port, and render limits.
+
+## Example data
+
+Two small Nikon Ti2 acquisitions are published in the immutable `testdata-v1` release.
+
+- `example_cell.nd2` with CY3/FITC/DAPI, 2,185 × 2,247, `uint16`
+- `example_tissue.nd2` with CY5/DAPI, 3,650 × 3,406, `uint16`
+
+Download and verify them.
 
 ```bash
 python scripts/fetch_testdata.py
 nd2wsi view docs/example_cell.nd2 docs/example_tissue.nd2
 ```
 
-The same files back the real data test suite (`pytest -m realdata`) and the
-release build's smoke gate.
+See `TESTDATA_LICENSE.md` for provenance and terms.
 
-## Commands
+## Development
 
-```text
-nd2wsi info    slide.nd2|.svs    # chunk census, embedded pyramid,
-                                 # compression, calibration, stage positions
-nd2wsi convert slide.nd2 [out.ome.zarr] [--tile 512] [--t N] [--z mid|max|N]
-                                 [--position N] [--workers N] [--overwrite]
-nd2wsi crop    slide.nd2 roi.nd2 --x X --y Y --w W --h H [--c 0,1]
-                                 # native-resolution ND2 to ND2 crop, straight
-                                 # off the memory map, no pyramid needed
-nd2wsi serve   a.ome.zarr [b.ome.zarr ...]   # one tab per store
-nd2wsi view    one.nd2 [two.svs ...]         # convert if needed, then serve
-nd2wsi-viewer  [slide.nd2|.svs]              # native macOS window
+```bash
+uv sync --all-extras
+uv run ruff check nd2wsi tests
+uv run pytest -q -m "not realdata"
+
+python scripts/fetch_testdata.py
+uv run pytest -q -m realdata
 ```
 
-`convert` sizes its thread pool to your CPU, and `--workers` overrides it.
-Each store holds one 2D plane. Pick the timepoint with `--t`, the Z plane
-with `--z` (an index, `mid`, or `max` for a maximum-intensity projection),
-and the stage position with `--position`. RGB slides are stored as C=3.
+CI tests Python 3.11 through 3.13, runs Ruff, and builds and installs the wheel.
 
-## The viewer
+Build the macOS app this way.
 
-The root page is a browser-style tab strip. Each slide gets a tab, the `+`
-button opens another, and you can just drop a file onto the window. Every
-tab keeps its own viewer state while open. A first-time open shows the
-conversion progress right in the tab.
-
-Everything the app writes next to a slide lives in one `nd2wsi` folder,
-described under "Where the caches live" below. When you want the disk
-space back, the trashcan button in the toolbar deletes that slide's cache
-after a confirm. Your annotations and the source slide stay, and the
-slide simply rebuilds its cache on its next open.
-
-The look follows the macOS design language, with control geometry
-measured from Apple's macOS 27 UI kit. Expect SF Pro and SF Mono type,
-translucent panels over the slide, and capsule controls with specular
-edges. Each panel is a little mac window. Drag it by the title bar, resize it from any edge, and
-use the traffic lights to close, collapse, or zoom it. The viewer
-remembers where you put things. A sun and moon button next to the
-trashcan switches the whole viewer between dark and light, and the choice
-sticks across slides and sessions.
-
-### Channels and LUTs
-
-<p align="center">
-  <img src="docs/channels-luts.png" alt="The Channels and LUTs panel with histograms" width="420">
-  <br><sub>Two-channel immunofluorescence (CY5 and DAPI). The histograms grow when you widen the window.</sub>
-</p>
-
-Every channel gets its intensity histogram in the channel color, laid out
-like the NIS-Elements LUTs panel. The black and white triangles set the
-display window in raw counts. The knob on the curve sets gamma, from 0.25
-to 4, and gamma above 1 brightens midtones. `Auto` stretches the window to
-the 0.1 to 99.9 percentile. Shift-drag moves all channels together. Each
-channel has a reset and an on-off switch, and any channel count works.
-
-### Measure and annotate
-
-<p align="center">
-  <img src="docs/annotations.png" alt="Vessel pins, a distance measurement, and a box on a CD31 slide" width="900">
-  <br><sub>A CD31 slide with pins on ring-shaped vessel profiles, a 354 &micro;m distance, and a boxed field. The sidecar loaded all of it on open.</sub>
-</p>
-
-Press `M` and drag to measure a distance in microns, using the file's own
-pixel calibration (anisotropic pixels included). Press `P` to drop a pin
-or `B` to draw a box, and type a note on either. The colored dot beside
-each list item cycles through the Apple system palette. Click an item and
-the view flies to it.
-
-Annotations save themselves to `annotations_<slide>.json` beside the
-slide, never into the ND2. The next open finds the file again, and `Open`
-and `Export` move the same plain JSON in and out.
-
-### Region export
-
-<p align="center">
-  <img src="docs/region-export.png" alt="A selected region with editable pixel and micron fields" width="900">
-  <br><sub>A selected region. The pixel and micron fields edit the box directly, and ND2 is the default export.</sub>
-</p>
-
-Press `R` and drag a rectangle. To hit an exact size, type it into the
-Pixels or Physical fields. They edit the region directly and stay in sync
-through the slide's calibration. The Move button (or `V`) turns the cursor into a hand
-that slides the region around with its size locked. Exports always come
-out at native resolution, with a progress gauge in the status bar.
-
-* **ND2**, the default. A real, uncompressed ND2 carrying the source
-  calibration, channel names, colors, and objective magnification. It
-  reopens in NIS-Elements and round-trips through this tool.
-* **TIFF**. Raw pixel values in the original dtype, tiled, with the pixel
-  size in the resolution tags.
-* **PNG and JPEG**. Rendered exactly as displayed, current LUTs included,
-  capped by `--max-render-mpx` (default 100 MPx).
-
-ND2 and TIFF stream, so any size works, the whole slide included.
-
-### SVS input
-
-<p align="center">
-  <img src="docs/svs.png" alt="An H&E SVS slide with a boxed vessel and a 111 micron measurement" width="900">
-  <br><sub>An Aperio SVS slide in the same viewer. A boxed vessel, a 111 &micro;m measurement, and the sidecar annotations loaded on open.</sub>
-</p>
-
-Brightfield H&E works with every tool above, unchanged. An SVS opens in the
-light theme, since that is how these stains are read.
-
-An SVS opens with no conversion at all. The file already carries a
-pyramid, typically 1x, 4x, 16x and 32x, and nd2wsi serves tiles straight
-from it with `os.pread` and parallel decode. The zoom steps the file skips
-are computed per request from the next finer level, and a memory cache
-keeps revisited fields instant. On an 81,000 x 76,000 px JPEG 2000 slide
-the tab appears in under a second, a screenful arrives in 50 to 200 ms
-cold and half that warm, and nothing is written to disk. Region export at
-native resolution reads the same file and stays pixel exact.
-
-`nd2wsi convert slide.svs` still builds a full pyramid store when you want
-one, for archives or network shares. It quotes what the store will cost
-first, since an SVS decodes to about ten times its size, and `--yes` skips
-the question. A store that exists is preferred over direct serving.
-
-The demo slide
-is CMU-1-Small-Region.svs, an exported region of CMU-1.svs. It shows
-H&E-stained skin tissue in brightfield, scanned at 20x on an Aperio
-ScanScope CS, JPEG-compressed, with a single pyramid level. It is
-OpenSlide freely-distributable test data from Carnegie Mellon University,
-released under the CC0 1.0 public domain dedication.
-
-| | |
-|---|---|
-| Source | https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/CMU-1-Small-Region.svs |
-| SHA-256 | ed92d5a9f2e86df67640d6f92ce3e231419ce127131697fbbce42ad5e002c8a7 |
-| Accessed | August 29, 2026 |
-
-### Where the caches live
-
-Each folder of slides keeps one managed folder, split by what the data is.
-
-```
-CD31/
-  23-12089.nd2
-  nd2wsi/
-    annotations/
-      annotations_23-12089.json
-    caches/
-      23-12089--t0-p0-zmid.nd2wsi-cache/
-        manifest.json
-        store.ome.zarr/
+```bash
+ND2WSI_SMOKE_FILE=docs/example_cell.nd2 \
+  packaging/build_mac_app.sh dist
 ```
 
-Caches are disposable and annotations are work, so they never share a
-folder. A cache is named for its slide and its T, P and Z selection, and
-its manifest records the source's size, modification time and a sampled
-fingerprint. Opening checks all of it. A changed slide rebuilds instead
-of serving stale pixels, a different selection gets its own cache, and a
-damaged cache is set aside with a timestamped name rather than deleted.
-Builds stage in a sibling directory under a lock and appear only when
-complete, so a crash can never leave a half-cache that blocks the slide.
+The script creates an app and a DMG, then opens the example, fetches a tile, exports an ND2 region, and reopens that export.
 
-Since 0.9 an uncompressed modern ND2 gets a compact cache. The store
-holds the reduced levels only, and the viewer reads full resolution
-straight off the slide's own memory map, which cuts the cache to about a
-quarter of a full pyramid and makes level 0 exports read the original
-bytes. The manifest calls this kind `overview`, and the store's metadata
-lists just the levels it holds rather than pretending to a level 0. The
-slide file must stay where it is. If it moves or changes, the viewer
-still shows the stored overview at half resolution and says why, and
-never guesses at pixels it cannot verify. A compressed or legacy file,
-or a maximum projection, keeps getting the full self contained store.
-So does `nd2wsi convert`, whose output remains a portable OME-Zarr that
-opens anywhere without the source.
+A frictionless public binary also needs Developer ID signing, hardened runtime, notarization, and stapling.
 
-Stores built by older versions are still read where they lie, and
-`nd2wsi tidy <folder>` migrates strays. Its two destructive options,
-`--remove-stale-builds` and `--remove-corrupt-caches`, run only when
-asked by name.
+## Prior work
 
-Size is worth watching on an external disk. A file never occupies less than
-one allocation block, and a large exFAT volume uses blocks of 1 MB, which
-turns a 130 KB chunk into a megabyte. macOS makes it worse by attaching an
-extended attribute to every file it writes there, stored in a `._` twin that
-takes another block. On one 3.6 TB exFAT SSD that combination cost 776 GiB
-for 78 GiB of pyramid. nd2wsi now sweeps the twins after every build and
-`tidy` sweeps the ones already on disk, and the size it quotes before
-converting counts the blocks the volume will really spend.
+This project builds on the following.
 
-The chunk size follows the volume too. On big-block disks the pyramid is
-built with 1024 px chunks, which on the SSD above cut one slide's store
-from 3.8 GB to 1.6 GB, built it five times faster, and filled a screen a
-shade quicker, with a pan step at 17 ms against 5. Ordinary 4 KB volumes
-keep 512 px chunks, and `--tile` overrides either way.
+- [`tlambert03/nd2`](https://github.com/tlambert03/nd2) for ND2 reading and metadata
+- [`Laboratory-Imaging/limnd2`](https://github.com/Laboratory-Imaging/limnd2) for ND2 writing
+- [`girder/large_image`](https://github.com/girder/large_image) as the direct ND2 tile-source reference
+- [OME-NGFF](https://ngff.openmicroscopy.org/) for multiscale metadata
+- [OpenSeadragon](https://openseadragon.github.io/) for deep zoom
+- [tifffile](https://github.com/cgohlke/tifffile) for TIFF and SVS access
 
-### Scripting
+`large-image-source-nd2` shows that ND2 can act as an on-demand tile source. `nd2wsi-viewer` makes a different trade. It reads native pixels from the ND2 but persists reduced box-mean levels for stable whole-slide navigation.
 
-Everything the UI does is plain HTTP, so you can script it.
+## License
 
-```
-GET  /api/slides                 open slides and their ids
-POST /api/open                   {"path": ...} converts if needed, adds a tab
-POST /api/trash                  {"sid": ...} deletes a slide's pyramid cache
-GET  /s/<sid>/api/info
-GET  /s/<sid>/api/histogram
-GET  /s/<sid>/api/tile/{level}/{x}/{y}.jpg?c=0,2&win=399:1057,220:2366:2.0
-GET  /s/<sid>/api/roi?level=0&x=...&y=...&w=...&h=...&format=nd2|tiff|png|jpg
-GET  /s/<sid>/api/annotations    sidecar contents
-POST /s/<sid>/api/annotations    {"items": [...]} writes the sidecar atomically
-```
-
-Bare `/api/...` addresses the first slide, which keeps single-slide
-scripts simple. `win` takes one `lo:hi[:gamma]` slot per channel, and an
-empty slot keeps the stored default.
-
-## The macOS app
-
-`nd2wsi-viewer` wraps the same server in a native WKWebView window. It
-opens to a black drop target. Drop an `.nd2` or `.svs`, or click to
-browse. The first open builds the pyramid with a progress bar, then the
-viewer loads from an ephemeral localhost port.
-
-`packaging/build_mac_app.sh` bundles Python and every dependency with
-PyInstaller, signs the bundle ad hoc, self-tests it headlessly (including
-a real ND2 export), and wraps it in a `.dmg`. Ad-hoc signing is fine for
-handing to colleagues. Public distribution also needs a Developer ID and
-notarization.
-
-## Inside a stitched ND2
-
-This project started with a question. Does a stitched ND2 keep its
-acquisition tiles, or is it one flattened raster? Run `nd2wsi info` on
-your own files for the answer. On mine it was unambiguous.
-
-* A modern ND2 stores pixel data as one ImageDataSeq blob per frame and
-  never splits a frame spatially. A stitched scan is a single frame, so it
-  is one contiguous raster. The acquisition tiles do not survive
-  stitching.
-* An uncompressed ND2 is efficiently seekable. The reader hands out
-  zero-copy views onto a memory map, so cropping a small ROI from a
-  multi-gigabyte slide touches only the pages it needs. Files saved with
-  zlib compression lose this property.
-* Multipoint files saved unstitched keep per-tile frames and micron stage
-  positions. The tiles are addressable, and stitching becomes your job.
-
-So the slide is flat but seekable. Interactive viewing needs a pyramid
-and a tile protocol, which OME-Zarr and OpenSeadragon supply. This tool is
-the bridge between them.
-
-## Measured on real Ti2 scans
-
-Five 20x "Scan Large Image" acquisitions from an ECLIPSE Ti2 with
-NIS-Elements AR 2022 (two-channel CY5 and DAPI uint16, 0.66 um/px, 1.4 to
-5.5 GB per file) all showed the same layout. Each file holds exactly one
-uncompressed ImageDataSeq blob, with no surviving tiles and no embedded
-pyramid. The table shows conversion on an Apple-silicon laptop with 14
-cores.
-
-| slide (px)      | ND2    | convert | pyramid on disk |
-|-----------------|--------|---------|-----------------|
-| 19,029 x 19,171 | 1.4 GB |   1.9 s | 1.0 GB (7 levels) |
-| 20,064 x 34,271 | 2.6 GB |  15.1 s | 1.9 GB (8 levels) |
-| 53,144 x 27,799 | 5.5 GB |  49.2 s | 3.8 GB (8 levels) |
-
-The first row is 0.4.0, where it took 7.3 s before. The other two were
-timed on 0.3.1 and now run faster than shown.
-
-Two Aperio slides on the same laptop, both JPEG 2000 tiles at 240 px,
-scanned on a Leica Aperio. An SVS costs far more disk than an ND2 because
-its file is compressed and its pyramid is not.
-
-| slide (px)      | SVS    | convert | pyramid on disk |
-|-----------------|--------|---------|-----------------|
-| 82,799 x 79,731 | 1.4 GB |  49.7 s | 13.6 GB (9 levels) |
-| 80,999 x 76,259 | 1.3 GB |  46.4 s | 13.1 GB (9 levels) |
-
-On the 1.48-gigapixel slide, one zoom gesture fetched tiles from level 6
-down to level 0 in order and ended with only the visible native tiles. An
-11,957 x 7,972 px region (364 MB raw) exported as TIFF in 2.4 s and as a
-new ND2 through `nd2wsi crop` in 14 s. Both exports matched the source
-memory map pixel for pixel, and the calibration, channel names, display
-colors, and objective magnification carried over.
-
-## Tests
-
-pytest runs 33 tests. They verify that ND2 exports round-trip pixel-exact
-through the independent nd2 reader with calibration and channel metadata
-preserved, that three-channel files convert, render histograms, and
-export, that the annotation sidecar survives a GET and POST round-trip on
-disk, that multi-slide routing serves each slide and closes cleanly, that
-conversion progress climbs monotonically to done, that the cache trashcan
-deletes only the pyramid and never the source, and that the LUT parsing
-and compositing math behave. The stores also open in the official
-ome-zarr-py reader, so napari and vizarr read them directly.
-
-`scripts/make_synthetic_nd2.py` generates fixtures with the same internal
-shape as real stitched scans, using Laboratory Imaging's own limnd2
-writer. The export tests skip when limnd2 is absent.
-
-## Architecture
-
-```
- slide.nd2 --(nd2 mmap, zero-copy frame view)--+
-                                               |  dask: (1, tile, tile) chunks
-                                               v
-                     pyramid_<name>.ome.zarr   0/ 1/ 2/ ... (NGFF 0.4, zstd)
-                                               |
-                 stdlib ThreadingHTTPServer ---+
-                   /api/tile -> JPEG/PNG       |   /api/roi -> ND2, tiled TIFF
-                   (windowed composite)        v   (streamed, raw dtype)
-                          OpenSeadragon custom tile source (vendored)
-```
-
-* `convert.py` writes level 0 straight from memory-map slices, then
-  computes each further level as a 2x2 mean of the one before it, so
-  memory never depends on slide size.
-* `render.py` composites tiles and streams ROI exports.
-* `export_nd2.py` writes ROIs back to ND2 through limnd2, one 512-row
-  band at a time.
-* `server.py` and `static/` serve the tabs, the tiles, and the viewer.
-
-## Limitations
-
-* Each store holds one 2D plane. Choose T, Z, and position at convert
-  time, and convert again for another plane.
-* ND2 export needs limnd2 (see Install) and covers uint8 and uint16
-  sources. Without it the ND2 button explains itself, and TIFF, PNG, and
-  JPEG still work.
-* zlib-compressed ND2 frames resist memory-map slicing, so converting a
-  compressed stitched slide loads the whole frame. Re-save uncompressed,
-  or use bioformats2raw.
-* Files that combine multiple channels with RGB components are rejected.
-* For pre-2012 JPEG2000 ND2 files, `info` works, and `convert` needs the
-  `[legacy]` extra and loads whole frames.
-* The server is a single-user local viewer, not a hardened web service.
-
-## Related work
-
-* **limnd2** is Laboratory Imaging's own Python ND2 SDK, with a reader,
-  a writer, and an OME-Zarr exporter. Its exporter loads whole frames,
-  which breaks on giant stitched scans. That gap is what this tool fills.
-* **nis2pyr** converts ND2 to pyramidal OME-TIFF for viewing in QuPath.
-* **QuPath with Bio-Formats** opens ND2 directly, as a full analysis
-  suite.
-* **bioformats2raw** converts ND2 to OME-Zarr on the JVM.
-* **large-image-source-nd2** is Kitware's ND2 tile source for Girder.
-
-MIT licensed. OpenSeadragon (BSD-3) is bundled under
-`nd2wsi/static/vendor/openseadragon/`.
+MIT. The example acquisitions are CC0, described in `TESTDATA_LICENSE.md`. OpenSeadragon is included under its BSD-3-Clause license.

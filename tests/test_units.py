@@ -109,11 +109,16 @@ def test_default_store_path_collects_caches_in_one_folder(tmp_path):
 
     slide = tmp_path / "23-12089.nd2"
     slide.write_bytes(b"")
-    assert default_store_path(slide) == tmp_path / "pyramids" / "23-12089.ome.zarr"
+    assert default_store_path(slide) == tmp_path / "pyramids" / "23-12089.nd2.ome.zarr"
 
     legacy = tmp_path / "pyramid_23-12089.ome.zarr"
     legacy.mkdir()
     assert default_store_path(slide) == legacy  # nothing has to be rebuilt
+
+    legacy.rmdir()
+    peer = tmp_path / "23-12089.svs"
+    peer.write_bytes(b"svs")
+    assert default_store_path(slide) != default_store_path(peer)
 
 
 def test_tidy_caches_moves_only_our_stores(tmp_path):
@@ -145,7 +150,7 @@ def test_annotations_live_in_the_managed_folder(tmp_path):
     from nd2wsi.server import annotations_sidecar
 
     attrs = {"nd2wsi": {"source": "24-962.nd2"}}
-    home = tmp_path / "nd2wsi" / "annotations" / "annotations_24-962.json"
+    home = tmp_path / "nd2wsi" / "annotations" / "annotations_24-962.nd2.json"
 
     # container-era store
     store = tmp_path / "nd2wsi" / "caches" / "24-962--t0-p0-zmid.nd2wsi-cache" / "store.ome.zarr"
@@ -160,6 +165,40 @@ def test_annotations_live_in_the_managed_folder(tmp_path):
     got = annotations_sidecar(legacy, attrs)
     assert got == home and got.read_text() == "[]"
     assert not stray.exists()
+
+
+def test_ambiguous_stem_only_annotations_are_not_moved(tmp_path):
+    from nd2wsi.server import annotations_sidecar
+
+    (tmp_path / "sample.nd2").write_bytes(b"nd2")
+    (tmp_path / "sample.svs").write_bytes(b"svs")
+    old = tmp_path / "annotations_sample.json"
+    old.write_text('{"items": []}')
+
+    nd2_attrs = {"nd2wsi": {"source": "sample.nd2", "notes": []}}
+    svs_attrs = {"nd2wsi": {"source": "sample.svs", "notes": []}}
+    nd2_path = annotations_sidecar(tmp_path / "sample.nd2", nd2_attrs)
+    svs_path = annotations_sidecar(tmp_path / "sample.svs", svs_attrs)
+
+    assert nd2_path != svs_path
+    assert old.exists()
+    assert not nd2_path.exists() and not svs_path.exists()
+    assert any("ambiguous" in note for note in nd2_attrs["nd2wsi"]["notes"])
+
+
+def test_provenanced_legacy_annotation_moves_to_the_right_source(tmp_path):
+    from nd2wsi.server import annotations_sidecar
+
+    (tmp_path / "sample.nd2").write_bytes(b"nd2")
+    (tmp_path / "sample.svs").write_bytes(b"svs")
+    old = tmp_path / "annotations_sample.json"
+    old.write_text('{"source": {"name": "sample.nd2"}, "items": []}')
+    attrs = {"nd2wsi": {"source": "sample.nd2"}}
+
+    target = annotations_sidecar(tmp_path / "sample.nd2", attrs)
+
+    assert target.name == "annotations_sample.nd2.json"
+    assert target.exists() and not old.exists()
 
 
 def test_sweep_appledouble_removes_only_the_twins(tmp_path):
@@ -241,3 +280,46 @@ def test_downsample_batches_are_width_independent():
         per_col = 2 * nt * 2 * itemsize + nt * 4 + nt * itemsize
         assert bw % nt == 0 and bw >= nt
         assert bw * per_col <= DOWNSAMPLE_TASK_BUDGET * 1.05
+
+
+def test_annotation_sidecars_follow_source_and_plane(tmp_path):
+    from nd2wsi.server import annotations_sidecar
+
+    store = tmp_path / "store.ome.zarr"
+    store.mkdir()
+
+    def attrs(source, z):
+        return {
+            "nd2wsi": {
+                "source": source,
+                "selection": {"t": 0, "p": 0, "z": z},
+            }
+        }
+
+    z0 = annotations_sidecar(store, attrs("slide.nd2", 0))
+    z1 = annotations_sidecar(store, attrs("slide.nd2", 1))
+    svs = annotations_sidecar(store, attrs("slide.svs", 0))
+    assert len({z0, z1, svs}) == 3
+    assert "slide.nd2" in z0.name and "z0" in z0.name
+    assert "z1" in z1.name
+    assert "slide.svs" in svs.name
+
+
+def test_auto_workers_respects_cpu_memory_and_absolute_caps(monkeypatch):
+    from nd2wsi import convert as c
+
+    monkeypatch.setattr(c.os, "cpu_count", lambda: 192)
+    monkeypatch.setattr(c, "available_memory_bytes", lambda: 64 * 1024**3)
+    assert c.auto_workers() == c.MAX_AUTO_WORKERS
+
+    monkeypatch.setattr(c, "available_memory_bytes", lambda: 192 * 1024**2)
+    assert c.auto_workers() == 2  # floor: two workers, never one
+
+    monkeypatch.setattr(c.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(c, "available_memory_bytes", lambda: 64 * 1024**3)
+    assert c.auto_workers() == 7
+
+    # where the platform cannot say (macOS), only the CPU rule applies
+    monkeypatch.setattr(c, "available_memory_bytes", lambda: None)
+    monkeypatch.setattr(c.os, "cpu_count", lambda: 12)
+    assert c.auto_workers() == 10

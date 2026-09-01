@@ -1,0 +1,313 @@
+/* v1 surface pass. The base sheet keeps layout and behavior; this file narrows
+   the visual language to macOS materials, restrained shadows, and clear state. */
+
+:root {
+  color-scheme: dark;
+  --material: rgba(30, 30, 32, 0.76);
+  --material-strong: rgba(27, 27, 29, 0.84);
+  --window-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.11),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.035),
+    0 0 0 0.5px rgba(255, 255, 255, 0.11),
+    0 1px 3px rgba(0, 0, 0, 0.24),
+    0 8px 15px rgba(0, 0, 0, 0.075);
+}
+
+:root.light {
+  color-scheme: light;
+  --material: rgba(248, 248, 250, 0.91);
+  --material-strong: rgba(244, 244, 246, 0.94);
+  --window-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.92),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.025),
+    0 0 0 0.5px rgba(0, 0, 0, 0.12),
+    0 1px 3px rgba(0, 0, 0, 0.10),
+    0 8px 15px rgba(0, 0, 0, 0.055);
+}
+
+#toolbar {
+  height: 42px;
+  padding: 0 13px;
+  gap: 8px;
+  border-bottom: 0;
+  background: var(--material-strong);
+  -webkit-backdrop-filter: blur(24px) saturate(165%);
+  backdrop-filter: blur(24px) saturate(165%);
+  box-shadow: inset 0 -0.5px 0 var(--hairline);
+}
+
+.tb-group { gap: 8px; }
+
+.app-mark,
+.meta-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 650;
+  color: var(--label-2);
+  background: rgba(255, 255, 255, 0.075);
+  box-shadow:
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.14),
+    0 0 0 0.5px rgba(0, 0, 0, 0.22);
+}
+
+:root.light .app-mark,
+:root.light .meta-badge {
+  background: rgba(0, 0, 0, 0.055);
+  box-shadow:
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.75),
+    0 0 0 0.5px rgba(0, 0, 0, 0.10);
+}
+
+.meta-badge { font-weight: 500; letter-spacing: 0; text-transform: none; }
+.meta-badge[data-state="warning"] { color: #ffd60a; }
+.meta-badge[data-state="ok"] { color: #30d158; }
+
+#file-name { font-weight: 600; }
+#file-dims { opacity: 0.9; }
+
+.tb-btn {
+  min-height: 27px;
+  border-radius: 7px;
+  padding: 0 9px;
+  gap: 6px;
+}
+
+.tb-btn:hover { background: rgba(255, 255, 255, 0.075); }
+.tb-btn.active { background: rgba(255, 255, 255, 0.105); }
+:root.light .tb-btn:hover { background: rgba(0, 0, 0, 0.05); }
+:root.light .tb-btn.active { background: rgba(0, 0, 0, 0.085); }
+
+.tb-ico {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  font-size: 12px;
+}
+
+.icon-sliders,
+.icon-region,
+.icon-note,
+.icon-trash {
+  position: relative;
+  color: currentColor;
+}
+
+.icon-sliders::before {
+  content: "";
+  width: 12px;
+  height: 10px;
+  background:
+    linear-gradient(currentColor, currentColor) 1px 1px / 10px 1px no-repeat,
+    linear-gradient(currentColor, currentColor) 1px 5px / 10px 1px no-repeat,
+    linear-gradient(currentColor, currentColor) 1px 9px / 10px 1px no-repeat;
+  opacity: 0.85;
+}
+.icon-sliders::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 4px 2px, currentColor 0 1.4px, transparent 1.6px),
+    radial-gradient(circle at 9px 6px, currentColor 0 1.4px, transparent 1.6px),
+    radial-gradient(circle at 6px 10px, currentColor 0 1.4px, transparent 1.6px);
+}
+
+.icon-region::before {
+  content: "";
+  width: 11px;
+  height: 9px;
+  border: 1.25px solid currentColor;
+  border-radius: 2px;
+  opacity: 0.9;
+}
+
+.icon-note::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border: 1.2px solid currentColor;
+  border-radius: 3px;
+  opacity: 0.9;
+}
+.icon-note::after {
+  content: "";
+  position: absolute;
+  width: 6px;
+  height: 1.2px;
+  background: currentColor;
+  transform: rotate(-43deg);
+}
+
+.icon-trash::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 4px;
+  width: 7px;
+  height: 8px;
+  border: 1.2px solid currentColor;
+  border-top: 0;
+  border-radius: 0 0 2px 2px;
+}
+.icon-trash::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 9px;
+  height: 1.2px;
+  background: currentColor;
+  box-shadow: 2.5px -1.8px 0 -0.1px currentColor;
+}
+
+.mac-window {
+  border-radius: 13px;
+  background: var(--material);
+  -webkit-backdrop-filter: blur(24px) saturate(165%);
+  backdrop-filter: blur(24px) saturate(165%);
+}
+
+.win-titlebar { height: 31px; padding: 0 11px; }
+.win-title { color: var(--label-2); }
+.win-body { padding: 11px 12px 12px; }
+
+.mac-window:not(.focused) { filter: saturate(0.92); }
+.mac-window:not(.focused) .tl { opacity: 0.72; }
+
+.btn {
+  min-height: 25px;
+  padding: 3px 12px;
+  background:
+    linear-gradient(rgba(248, 248, 248, 0.065), rgba(248, 248, 248, 0.018)),
+    rgba(74, 74, 78, 0.48);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.15),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.035),
+    0 0 0 0.5px rgba(0, 0, 0, 0.30),
+    0 1px 2px rgba(0, 0, 0, 0.16);
+}
+.btn:hover { filter: brightness(1.08); }
+.btn:active { transform: translateY(0.5px); filter: brightness(0.94); }
+.btn:disabled { opacity: 0.34; }
+
+:root.light .btn {
+  background: linear-gradient(rgba(255,255,255,.94), rgba(239,239,242,.94));
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.95),
+    inset 0 -1px 0 rgba(0,0,0,.025),
+    0 0 0 .5px rgba(0,0,0,.14),
+    0 1px 2px rgba(0,0,0,.08);
+}
+
+#zoom-cluster {
+  right: 13px;
+  bottom: 13px;
+  border-radius: 10px;
+  background: var(--material);
+  -webkit-backdrop-filter: blur(24px) saturate(165%);
+  backdrop-filter: blur(24px) saturate(165%);
+}
+.zc-btn { width: 32px; height: 30px; }
+
+#statusbar {
+  height: 27px;
+  gap: 14px;
+  padding: 0 12px;
+  background: var(--material-strong);
+  -webkit-backdrop-filter: blur(24px) saturate(165%);
+  backdrop-filter: blur(24px) saturate(165%);
+}
+
+#trash-confirm,
+#ann-editor {
+  border-radius: 13px;
+  background: var(--material-strong);
+  -webkit-backdrop-filter: blur(24px) saturate(165%);
+  backdrop-filter: blur(24px) saturate(165%);
+}
+
+#toast { box-shadow: var(--window-shadow); }
+
+@media (max-width: 1040px) {
+  #storage-badge, #calibration-badge { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Exact control geometry taken from the referenced Apple design toolkit. */
+.switch {
+  width: 54px;
+  height: 24px;
+}
+.switch .knob {
+  top: 2px;
+  left: 2px;
+  width: 32px;
+  height: 20px;
+  box-shadow: 0 3px 5px rgba(0, 0, 0, 0.28), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
+}
+.switch.on .knob { left: 20px; }
+
+.theme-glyph svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.theme-glyph .icon-fill {
+  fill: currentColor;
+  stroke: none;
+  opacity: 0.30;
+}
+
+.tb-btn:focus-visible,
+.btn:focus-visible,
+.zc-btn:focus-visible,
+.tl:focus-visible,
+.switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#tb-theme,
+#tb-trash {
+  width: 28px;
+  padding: 0;
+  justify-content: center;
+}
+
+@media (max-width: 860px) {
+  #file-dims { display: none; }
+  .tb-btn > span:last-child:not(:first-child) { display: none; }
+  .tb-btn { width: 28px; padding: 0; justify-content: center; }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --hairline: rgba(255, 255, 255, 0.24);
+    --label-2: rgba(255, 255, 255, 0.74);
+  }
+  :root.light {
+    --hairline: rgba(0, 0, 0, 0.24);
+    --label-2: rgba(0, 0, 0, 0.72);
+  }
+  .mac-window,
+  #zoom-cluster { outline: 1px solid var(--hairline); }
+}

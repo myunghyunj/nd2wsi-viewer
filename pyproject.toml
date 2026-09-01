@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nd2wsi-viewer"
-version = "0.9.0"
-description = "Nikon ND2 -> OME-Zarr pyramid -> browser slide viewer with native-resolution ROI export"
+version = "1.1.0"
+description = "Local whole-slide viewing for stitched Nikon ND2 and Aperio SVS, with native-value ROI export"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "nd2wsi-viewer" }]
-keywords = ["nd2", "nikon", "nis-elements", "ome-zarr", "ngff", "whole-slide", "openseadragon"]
+authors = [{ name = "Myunghyun Jeong" }]
+keywords = ["nd2", "nikon", "nis-elements", "svs", "ome-zarr", "ngff", "whole-slide", "microscopy", "openseadragon"]
 dependencies = [
   "nd2>=0.10",
   "numpy>=1.24",
@@ -21,16 +21,18 @@ dependencies = [
   "tifffile>=2023.7",
 ]
 
+[project.urls]
+Homepage = "https://github.com/myunghyunj/nd2wsi-viewer"
+Repository = "https://github.com/myunghyunj/nd2wsi-viewer"
+Issues = "https://github.com/myunghyunj/nd2wsi-viewer/issues"
+Changelog = "https://github.com/myunghyunj/nd2wsi-viewer/releases"
+
 [project.optional-dependencies]
-legacy = ["nd2[legacy]"]           # JPEG2000-era ND2 files (imagecodecs)
+legacy = ["nd2[legacy]"]
 test = ["pytest>=7"]
-# ND2 (re-)export -- limnd2 is on Laboratory Imaging's own index, so install
-# with: pip install ".[nd2export]" --extra-index-url https://pypi.laboratory-imaging.com/simple
 nd2export = ["limnd2>=0.4"]
-app = ["pywebview>=6.0"]           # native macOS shell (nd2wsi-viewer command)
-svs = ["imagecodecs>=2023.9"]      # JPEG tile decode for Aperio SVS input
-# synthetic test-data generation uses Laboratory Imaging's limnd2 writer,
-# which lives on their own package index -- see README ("Synthetic fixtures").
+app = ["pywebview>=6.0"]
+svs = ["imagecodecs>=2023.9"]
 
 [project.scripts]
 nd2wsi = "nd2wsi.cli:main"
@@ -43,7 +45,6 @@ include = ["nd2wsi*"]
 nd2wsi = ["static/**/*"]
 
 [tool.uv]
-# limnd2 (ND2 export) is published only on Laboratory Imaging's own index
 extra-index-url = ["https://pypi.laboratory-imaging.com/simple"]
 
 [tool.ruff]
@@ -51,8 +52,6 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-# defensive blanket excepts are deliberate in the UI and cleanup paths, so the
-# bug-hunting sets stay off; these four keep imports, syntax and style honest
 select = ["E4", "E7", "E9", "F", "I", "UP"]
 ignore = ["E501"]
 

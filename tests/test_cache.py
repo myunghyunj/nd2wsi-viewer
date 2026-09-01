@@ -39,6 +39,14 @@ def slide(tmp_path):
     return p
 
 
+def test_cache_identity_includes_source_suffix(tmp_path):
+    nd2 = cache_container(tmp_path / "sample.nd2")
+    svs = cache_container(tmp_path / "sample.svs")
+    assert nd2 != svs
+    assert "sample.nd2" in nd2.name
+    assert "sample.svs" in svs.name
+
+
 def test_cache_lands_in_a_manifested_container(slide):
     store = ensure_cache(slide)
     container = cache_container(slide)
@@ -201,3 +209,39 @@ def test_sweep_clears_stranded_backups_and_stagings(tmp_path):
         d.mkdir(parents=True)
     assert sweep_stale_builds(caches) == 3
     assert not dead1.exists() and not dead2.exists() and not weird.exists()
+
+
+def test_same_stem_sources_get_distinct_new_cache_names(tmp_path):
+    from nd2wsi.cache import legacy_cache_container
+
+    nd2_path = tmp_path / "slide.nd2"
+    svs_path = tmp_path / "slide.svs"
+    assert cache_container(nd2_path) != cache_container(svs_path)
+    assert cache_container(nd2_path).name.startswith("slide.nd2--")
+    assert cache_container(svs_path).name.startswith("slide.svs--")
+    # The old stem-only layout did collide; it remains a read-only migration path.
+    assert legacy_cache_container(nd2_path) == legacy_cache_container(svs_path)
+
+
+def test_legacy_portable_store_is_not_reused_for_same_stem_other_format(tmp_path):
+    import zarr
+
+    from nd2wsi.convert import default_store_path, existing_cache_store
+
+    nd2_path = tmp_path / "slide.nd2"
+    svs_path = tmp_path / "slide.svs"
+    nd2_path.write_bytes(b"nd2")
+    svs_path.write_bytes(b"svs")
+
+    legacy = tmp_path / "pyramids" / "slide.ome.zarr"
+    root = zarr.open_group(str(legacy), mode="w", zarr_format=2)
+    root.attrs.update(
+        {
+            "multiscales": [],
+            "nd2wsi": {"source": "slide.nd2", "selection": {}},
+        }
+    )
+
+    assert default_store_path(nd2_path) == legacy
+    assert default_store_path(svs_path) == tmp_path / "pyramids" / "slide.svs.ome.zarr"
+    assert existing_cache_store(svs_path) is None

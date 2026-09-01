@@ -34,6 +34,7 @@ if ! "$BASEPY" -c "import _tkinter" >/dev/null 2>&1; then
   echo "      (install python-tk, or set ND2WSI_BUILD_PYTHON to a tkinter-capable python)"
 fi
 echo "==> build venv ($BASEPY)"
+rm -rf "$BUILD/venv"
 "$BASEPY" -m venv "$BUILD/venv"
 PY="$BUILD/venv/bin/python"
 "$PY" -m pip -q install --upgrade pip
@@ -76,8 +77,14 @@ with open(path, "rb") as fh:
 # Finder's Get Info reads these; PyInstaller leaves them at 0.0.0
 pyproject = open(sys.argv[2]).read()
 version = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
-info["CFBundleShortVersionString"] = version
-info["CFBundleVersion"] = version
+match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:rc(\d+))?", version)
+if not match:
+    raise ValueError(f"unsupported package version for Info.plist: {version}")
+base = ".".join(match.group(1, 2, 3))
+bundle = base + (f"fc{match.group(4)}" if match.group(4) else "")
+info["CFBundleShortVersionString"] = base
+info["CFBundleVersion"] = bundle
+info["ND2WSIPackageVersion"] = version
 
 info["UTImportedTypeDeclarations"] = [
     {
