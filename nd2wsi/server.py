@@ -102,6 +102,7 @@ class ViewerState:
         max_render_mpx: float = 400.0,
         annotations_path: Path | None = None,
         generation: str = "",
+        trash_path: Path | None = None,
     ):
         self.root = root
         self.attrs = attrs
@@ -109,6 +110,7 @@ class ViewerState:
         self.histograms: list | None = None  # computed lazily, once
         self.annotations_path = annotations_path
         self.generation = generation  # changes when the pixels could
+        self.trash_path = trash_path
         self.busy = _Lifecycle()  # in-flight exports, so trash can refuse
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
 
@@ -153,6 +155,7 @@ def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
     import shutil
 
     folder, home = Path(folder), Path(home)
+    home.mkdir(parents=True, exist_ok=True)
     saved = []
     for path in folder.rglob("annotations_*.json"):
         target = home / path.name
@@ -166,46 +169,132 @@ def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
     return saved
 
 
-def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
-    """Annotations are work, not cache: ``nd2wsi/annotations/`` holds them.
+def _annotation_source_name(path: Path) -> str | None:
+    """Return a legacy sidecar's declared source name, when present."""
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get("source")
+    if isinstance(source, dict):
+        name = source.get("name")
+        return Path(str(name)).name if name else None
+    if isinstance(source, str):
+        return Path(source).name
+    return None
 
-    Whatever cache gets rebuilt or trashed, this folder is never touched
-    by those operations. Sidecars written by older versions — beside the
-    slide, or inside a pyramids folder — are migrated here on open.
+
+def _legacy_sidecar_matches(path: Path, source_name: str, home: Path) -> bool:
+    """Whether an unscoped sidecar can be migrated without guessing."""
+    declared = _annotation_source_name(path)
+    if declared is not None:
+        return declared == source_name
+    stem = Path(source_name).stem
+    try:
+        siblings = [
+            item
+            for item in home.iterdir()
+            if item.is_file()
+            and item.stem == stem
+            and item.suffix.lower() in SLIDE_SUFFIXES
+        ]
+    except OSError:
+        siblings = []
+    return len(siblings) <= 1
+
+
+def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
+    """Return a sidecar path scoped to the source file and selected plane.
+
+    An annotation belongs to one level-0 coordinate space. T, P, and Z are
+    therefore part of its identity, just as they are part of cache identity.
+    An older unscoped sidecar is claimed by the default plane and copied
+    for any other, so every selection keeps seeing its 0.9 work.
     """
-    from .cache import ANNOTATIONS_DIR, CACHE_SUFFIX, MANAGED_DIR
+    from .cache import (
+        ANNOTATIONS_DIR,
+        CACHE_SUFFIX,
+        MANAGED_DIR,
+        read_manifest,
+        selection_tag,
+    )
     from .convert import CACHE_DIR_NAME
 
     store_path = Path(store_path).resolve()
-    stem = Path(attrs["nd2wsi"]["source"]).stem
+    meta = attrs["nd2wsi"]
+    source_name = Path(meta["source"]).name
+    stem = Path(source_name).stem
 
-    # the slide's folder: caches sit either beside it, under pyramids/, or
-    # two levels down inside nd2wsi/caches/<container>/
     home = store_path.parent
-    if home.name.endswith(CACHE_SUFFIX):
+    container = home if home.name.endswith(CACHE_SUFFIX) else None
+    if container is not None:
         home = home.parent
     if home.name in (CACHE_DIR_NAME, "caches"):
         home = home.parent
     if home.name == MANAGED_DIR:
         home = home.parent
 
+    manifest = read_manifest(container) if container is not None else None
+    raw_selection = (manifest or {}).get("selection") or meta.get("selection") or {}
+    selection = {
+        key: raw_selection[key]
+        for key in ("t", "p")
+        if key in raw_selection
+    }
+    if "z_resolved" in raw_selection:
+        selection["z"] = raw_selection["z_resolved"]
+    elif "z" in raw_selection:
+        selection["z"] = raw_selection["z"]
+
+    safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", source_name)
+    filename = f"annotations_{safe_source}"
+    if selection:
+        filename += f"--{selection_tag(selection)}"
+    filename += ".json"
+
     target_dir = home / MANAGED_DIR / ANNOTATIONS_DIR
-    new = target_dir / f"annotations_{stem}.json"
-    for old in (
-        home / f"annotations_{stem}.json",
-        home / CACHE_DIR_NAME / f"annotations_{stem}.json",
-        home / f"{stem}.annotations.json",
-        store_path.parent / f"annotations_{stem}.json",
-    ):
-        if old != new and old.exists() and not new.exists():
+    target_dir.mkdir(parents=True, exist_ok=True)
+    new = target_dir / filename
+
+    if not new.exists():
+        import shutil
+
+        old_paths = (
+            target_dir / f"annotations_{stem}.json",
+            home / f"annotations_{stem}.json",
+            home / CACHE_DIR_NAME / f"annotations_{stem}.json",
+            home / f"{stem}.annotations.json",
+            store_path.parent / f"annotations_{stem}.json",
+        )
+        for old in old_paths:
+            if old == new or not old.exists():
+                continue
+            if not _legacy_sidecar_matches(old, source_name, home):
+                note = (
+                    f"legacy annotation sidecar {old.name} was not imported "
+                    "because its source is ambiguous"
+                )
+                if note not in meta.setdefault("notes", []):
+                    meta["notes"].append(note)
+                continue
+            # the default plane inherits the unscoped file outright; any
+            # other selection takes a copy, because one unscoped sidecar
+            # used to serve every plane and the rest must keep finding it
+            claim = not selection or (
+                int(raw_selection.get("t", 0) or 0) == 0
+                and int(raw_selection.get("p", 0) or 0) == 0
+                and str(raw_selection.get("z", "mid")) in ("mid", "0")
+            )
             try:
-                target_dir.mkdir(parents=True, exist_ok=True)
-                old.rename(new)
+                if claim:
+                    old.rename(new)
+                else:
+                    shutil.copy2(old, new)
                 break
             except OSError:
-                return old
-    if not new.exists():
-        target_dir.mkdir(parents=True, exist_ok=True)
+                continue
     return new
 
 
@@ -221,12 +310,25 @@ class SlideRegistry:
     def sid_for(store_path: Path) -> str:
         return hashlib.sha1(str(store_path.resolve()).encode()).hexdigest()[:8]
 
-    def add_store(self, store_path: str | Path) -> str:
+    def add_store(
+        self, store_path: str | Path, *, trash_path: str | Path | None = None
+    ) -> str:
         from .cache import CACHE_SUFFIX, read_manifest
-        from .convert import open_store
+        from .convert import CACHE_DIR_NAME, is_nd2wsi_store, open_store
         from .svs import is_svs
 
         store_path = Path(store_path).resolve()
+        if trash_path is not None:
+            trash_path = Path(trash_path).resolve()
+        elif store_path.parent.name.endswith(CACHE_SUFFIX):
+            trash_path = store_path.parent
+        elif store_path.parent.name == CACHE_DIR_NAME and is_nd2wsi_store(
+            store_path
+        ):
+            # a store inside a pyramids/ folder is a cache this app built
+            # (0.5 through 0.7 layouts) and stays trashable; a store the
+            # user opened at any other explicit path never is
+            trash_path = store_path
         if is_svs(store_path):  # an SVS itself serves with no store
             try:
                 return self.add_direct(store_path)
@@ -238,6 +340,7 @@ class SlideRegistry:
                 if not built.exists():
                     _convert(store_path, built, progress=False)
                 store_path = built
+                trash_path = built
         if store_path.parent.name.endswith(CACHE_SUFFIX):
             manifest = read_manifest(store_path.parent) or {}
             if manifest.get("kind") == "overview":
@@ -258,6 +361,7 @@ class SlideRegistry:
                 max_render_mpx=self.max_render_mpx,
                 annotations_path=annotations_sidecar(store_path, attrs),
                 generation=gen,
+                trash_path=Path(trash_path) if trash_path is not None else None,
             )
             st.store_path = store_path
             self.slides[sid] = st
@@ -330,6 +434,7 @@ class SlideRegistry:
                 # the two modes map levels differently, so tiles cached as
                 # immutable in one must never be revived in the other
                 generation=gen + ("-degraded" if degraded else ""),
+                trash_path=store_path.parent,
             )
             st.store_path = store_path
             self.slides[sid] = st
@@ -377,19 +482,42 @@ class SlideRegistry:
                 except NotImplementedError:
                     pass  # untiled or off-ladder file: build a store instead
             store = ensure_cache(path, on_progress=on_progress)
-        elif path.is_dir():  # a *.ome.zarr store
-            store = path
+        elif path.is_dir():  # a user-supplied *.ome.zarr store
+            return self.add_store(path)
         else:
             raise ValueError(f"not an ND2/SVS slide or pyramid store: {path.name}")
+        # no explicit trash_path: add_store promotes a container store to its
+        # container, so trashing removes manifest and pixels together
         return self.add_store(store)
 
     def remove(self, sid: str) -> bool:
         with self._lock:
             st = self.slides.pop(sid, None)
-        close = getattr(getattr(st, "root", None), "close", None)
-        if close:
-            close()
+        _close_state(st)
         return st is not None
+
+    def close_all(self, *, immediate: bool = False) -> None:
+        """Close every registered backend after the server stops.
+
+        Normal tab closure defers native-handle teardown briefly so in-flight
+        requests can finish. A stopped smoke-test server has no such requests,
+        so it may close source-backed roots synchronously.
+        """
+        with self._lock:
+            states = list(self.slides.values())
+            self.slides.clear()
+        for st in states:
+            st.busy.close(timeout=30)
+            close = getattr(st.root, "close", None)
+            if close is None:
+                continue
+            if immediate:
+                try:
+                    close(delay=0)
+                    continue
+                except TypeError:
+                    pass
+            close()
 
     def trash_cache(self, sid: str, on_progress=None) -> int:
         """Close the slide and delete its pyramid store. Returns bytes freed.
@@ -405,17 +533,19 @@ class SlideRegistry:
             st = self.slides.get(sid)
             if st is None:
                 raise KeyError(sid)
-            if getattr(st, "store_path", None) is None:
-                raise ValueError(
-                    "this slide runs straight from the file, there is no cache"
-                )
-            store = Path(st.store_path)
-            if not (store.is_dir() and store.name.endswith(".ome.zarr")):
-                raise ValueError(f"refusing to delete {store}: not a pyramid store")
+            if st.trash_path is None:
+                raise ValueError("this slide has no cache managed by this app")
+            store = Path(st.trash_path)
             from .cache import CACHE_SUFFIX
 
-            if store.parent.name.endswith(CACHE_SUFFIX):
+            if store.name.endswith(".ome.zarr") and store.parent.name.endswith(
+                CACHE_SUFFIX
+            ):
                 store = store.parent  # the container owns manifest and store
+            valid_container = store.is_dir() and store.name.endswith(CACHE_SUFFIX)
+            valid_store = store.is_dir() and store.name.endswith(".ome.zarr")
+            if not (valid_container or valid_store):
+                raise ValueError(f"refusing to delete {store}: not a managed cache")
             if st.busy.active:
                 raise ValueError(
                     "an export from this slide is still running — try again "
@@ -429,13 +559,19 @@ class SlideRegistry:
         if close:  # a source-backed slide holds the ND2 memory map open
             close()
 
+        from .cache import ANNOTATIONS_DIR, CACHES_DIR, MANAGED_DIR, CacheLock
         from .convert import CACHE_DIR_NAME
 
-        home = store.parent
-        if home.name == CACHE_DIR_NAME:
-            home = home.parent  # annotations belong beside the slide
-        rescue_annotations(store, home)
-        from .cache import CacheLock
+        if st.annotations_path is not None:
+            annotation_home = st.annotations_path.parent
+        elif store.name.endswith(CACHE_SUFFIX) and store.parent.name == CACHES_DIR:
+            annotation_home = store.parent.parent / ANNOTATIONS_DIR
+        elif store.parent.name == CACHE_DIR_NAME:
+            annotation_home = store.parent.parent / MANAGED_DIR / ANNOTATIONS_DIR
+        else:
+            annotation_home = store.parent / MANAGED_DIR / ANNOTATIONS_DIR
+        annotation_home.mkdir(parents=True, exist_ok=True)
+        rescue_annotations(store, annotation_home)
 
         # under the build lock, the doomed directory is renamed aside
         # before deletion: a concurrent opener either sees the intact
@@ -619,7 +755,16 @@ def make_handler(
                 return path
             prefix = f"/{token}"
             if path == prefix:
-                path = prefix + "/"
+                # redirect rather than rewrite: relative asset and API URLs
+                # only resolve when the document URL ends with the slash
+                target = prefix + "/"
+                if parsed.query:
+                    target += "?" + parsed.query
+                self._send(
+                    HTTPStatus.PERMANENT_REDIRECT, b"", "text/plain",
+                    {"Location": target},
+                )
+                return None
             if not path.startswith(prefix + "/"):
                 self._error(404, "not found")
                 return None
@@ -815,6 +960,7 @@ def make_handler(
                 "maxRenderMpx": st.max_render_mpx,
                 "nd2Export": _limnd2_available(),
                 "direct": bool(meta.get("direct")),
+                "trashable": st.trash_path is not None,
                 "generation": st.generation,
                 "storage": (
                     "direct"
@@ -874,6 +1020,7 @@ def make_handler(
                         else {}
                     ),
                 },
+                "selection": meta.get("selection", {}),
                 "items": data["items"],
             }
             # unique temp + per-slide lock: two tabs saving at once cannot
@@ -1072,9 +1219,23 @@ def create_server(
 
     class _Server(ThreadingHTTPServer):
         # OpenSeadragon opens many tile connections in one burst; the
-        # stdlib default backlog of 5 resets the overflow at the kernel
+        # stdlib default backlog of 5 resets the overflow at the kernel.
         request_queue_size = 64
         daemon_threads = True
+
+        def _close_registry(self) -> None:
+            if getattr(self, "_registry_closed", False):
+                return
+            self._registry_closed = True
+            registry.close_all(immediate=True)
+
+        def shutdown(self) -> None:
+            super().shutdown()
+            self._close_registry()
+
+        def server_close(self) -> None:
+            self._close_registry()
+            super().server_close()
 
     httpd = _Server((host, port), make_handler(registry, token))
     httpd.registry = registry  # for embedders

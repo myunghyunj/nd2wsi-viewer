@@ -3,34 +3,36 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>nd2wsi viewer</title>
+<title>nd2wsi-viewer</title>
 <link rel="stylesheet" href="../../static/style.css" />
+<link rel="stylesheet" href="../../static/native-v1.css" />
 </head>
 <body>
 <div id="app">
   <header id="toolbar">
     <div class="tb-group">
-      <span class="app-mark">ND2</span>
+      <span class="app-mark" id="source-badge">SLIDE</span>
       <span id="file-name">&nbsp;</span>
       <span id="file-dims"></span>
+      <span class="meta-badge" id="storage-badge" hidden></span>
+      <span class="meta-badge" id="calibration-badge"></span>
     </div>
     <div class="tb-spacer"></div>
     <div class="tb-group">
       <button class="tb-btn" id="tb-channels" title="Show or hide Channels &amp; LUTs">
-        <span class="tb-ico">&#9680;</span>Channels
+        <span class="tb-ico icon-sliders" aria-hidden="true"></span><span>Channels</span>
       </button>
       <button class="tb-btn" id="tb-region" title="Show or hide Region (R)">
-        <span class="tb-ico">&#9634;</span>Region
+        <span class="tb-ico icon-region" aria-hidden="true"></span><span>Region</span>
       </button>
       <button class="tb-btn" id="tb-annot" title="Show or hide Annotations">
-        <span class="tb-ico">&#9998;</span>Annotate
+        <span class="tb-ico icon-note" aria-hidden="true"></span><span>Annotate</span>
       </button>
-      <button class="tb-btn tb-theme" id="tb-theme" title="Switch light and dark appearance">
-        <span class="tb-ico">&#9788;</span>
+      <button class="tb-btn tb-theme" id="tb-theme" title="Appearance" aria-label="Appearance">
+        <span class="tb-ico theme-glyph" aria-hidden="true"></span>
       </button>
-      <button class="tb-btn tb-danger" id="tb-trash"
-        title="Delete this slide's viewing cache (pyramid_*.ome.zarr)">
-        <span class="tb-ico">&#128465;</span>
+      <button class="tb-btn tb-danger" id="tb-trash" title="Delete this slide's viewing cache" aria-label="Delete viewing cache">
+        <span class="tb-ico icon-trash" aria-hidden="true"></span>
       </button>
     </div>
   </header>
@@ -38,8 +40,7 @@
   <div id="trash-confirm" hidden>
     <div class="tc-text">
       Delete this slide's viewing cache?<br>
-      <span class="tc-sub">The tab closes and the slide re-converts on next
-      open. Your annotations are kept.</span>
+      <span class="tc-sub">The tab will close. The source and annotations will remain.</span>
     </div>
     <div class="tc-actions">
       <button class="btn" id="trash-cancel">Cancel</button>
@@ -53,7 +54,7 @@
     <div id="rubber"></div>
 
     <div id="ann-editor" hidden>
-      <textarea id="ann-text" rows="2" placeholder="Annotation&hellip;"></textarea>
+      <textarea id="ann-text" rows="2" placeholder="Annotation…"></textarea>
       <div class="ed-row">
         <button class="btn danger" id="ann-delete">Delete</button>
         <span class="ed-spacer"></span>
@@ -65,21 +66,19 @@
       <div class="win-titlebar">
         <div class="traffic">
           <button class="tl tl-close" title="Close"></button>
-          <button class="tl tl-min" title="Minimize"></button>
+          <button class="tl tl-min" title="Collapse"></button>
           <button class="tl tl-zoom" title="Zoom"></button>
         </div>
         <span class="win-title">Channels &amp; LUTs</span>
       </div>
-      <div class="win-body">
-        <div id="channel-list"></div>
-      </div>
+      <div class="win-body"><div id="channel-list"></div></div>
     </section>
 
     <section class="mac-window" id="win-region">
       <div class="win-titlebar">
         <div class="traffic">
           <button class="tl tl-close" title="Close"></button>
-          <button class="tl tl-min" title="Minimize"></button>
+          <button class="tl tl-min" title="Collapse"></button>
           <button class="tl tl-zoom" title="Zoom"></button>
         </div>
         <span class="win-title">Region</span>
@@ -87,32 +86,30 @@
       <div class="win-body">
         <div class="tool-row">
           <button id="roi-toggle" class="btn" title="Drag on the slide to mark a region (R)">Select Region</button>
-          <button id="roi-full" class="btn" title="Mark the whole slide, for a downscaled JPEG or PNG of everything">Whole Slide</button>
+          <button id="roi-full" class="btn" title="Mark the whole slide">Whole Slide</button>
         </div>
-        <div class="hint" id="roi-hint">Drag on the slide, or take the whole slide.</div>
+        <div class="hint" id="roi-hint">Drag on the slide, or select the whole slide.</div>
         <div id="roi-detail">
           <div class="roi-line"><span class="k">Pixels</span><span class="v dims">
-            <input id="roi-px-w" class="dim" inputmode="numeric" title="Width in pixels" />
-            &times;
+            <input id="roi-px-w" class="dim" inputmode="numeric" title="Width in pixels" /> ×
             <input id="roi-px-h" class="dim" inputmode="numeric" title="Height in pixels" />
             <span class="unit">px</span></span></div>
           <div class="roi-line"><span class="k">Physical</span><span class="v dims">
-            <input id="roi-um-w" class="dim" inputmode="decimal" title="Width in micrometers" />
-            &times;
+            <input id="roi-um-w" class="dim" inputmode="decimal" title="Width in micrometers" /> ×
             <input id="roi-um-h" class="dim" inputmode="decimal" title="Height in micrometers" />
-            <span class="unit">&micro;m</span></span></div>
-          <div class="roi-line"><span class="k">Raw size</span><span class="v" id="roi-bytes">&ndash;</span></div>
-          <div class="roi-line"><span class="k">Scale</span><span class="v" id="roi-scale-dims">&ndash;</span></div>
-          <div id="roi-scales" class="scale-strip" title="How PNG and JPEG leave. Each patch shows the same field at that scale."></div>
-          <div class="hint" id="roi-scale-note">ND2 and TIFF always export at native resolution.</div>
+            <span class="unit">µm</span></span></div>
+          <div class="roi-line"><span class="k">Raw size</span><span class="v" id="roi-bytes">–</span></div>
+          <div class="roi-line"><span class="k">Scale</span><span class="v" id="roi-scale-dims">–</span></div>
+          <div id="roi-scales" class="scale-strip" title="Rendered export scale"></div>
+          <div class="hint" id="roi-scale-note">ND2 and TIFF use native values.</div>
           <div class="roi-actions">
-            <button id="roi-dl-nd2" class="btn primary" title="A real ND2 file — raw pixels, calibration and channel metadata; reopens in NIS-Elements">ND2</button>
-            <button id="roi-dl-tiff" class="btn" title="Raw pixel values, dtype preserved, streams any size">TIFF</button>
+            <button id="roi-dl-nd2" class="btn primary" title="Raw ND2 with supported source metadata">ND2</button>
+            <button id="roi-dl-tiff" class="btn" title="Tiled raw values">TIFF</button>
             <button id="roi-dl-png" class="btn" title="Rendered as displayed">PNG</button>
             <button id="roi-dl-jpg" class="btn" title="Rendered as displayed">JPEG</button>
           </div>
           <div class="tool-row">
-            <button id="roi-move" class="btn" disabled title="Drag to move the region (V)">&#128400; Move</button>
+            <button id="roi-move" class="btn" disabled title="Drag to move the region (V)">Move</button>
             <button id="roi-clear" class="btn">Clear Region</button>
           </div>
         </div>
@@ -123,21 +120,21 @@
       <div class="win-titlebar">
         <div class="traffic">
           <button class="tl tl-close" title="Close"></button>
-          <button class="tl tl-min" title="Minimize"></button>
+          <button class="tl tl-min" title="Collapse"></button>
           <button class="tl tl-zoom" title="Zoom"></button>
         </div>
         <span class="win-title">Annotations</span>
       </div>
       <div class="win-body">
         <div class="tool-row">
-          <button id="tool-measure" class="btn" title="Measure a distance (M)">&#8596; Measure</button>
-          <button id="tool-pin" class="btn" title="Drop a pin (P)">&#9679; Pin</button>
-          <button id="tool-box" class="btn" title="Draw a box (B)">&#9634; Box</button>
+          <button id="tool-measure" class="btn" title="Measure a distance (M)">↔ Measure</button>
+          <button id="tool-pin" class="btn" title="Place a pin (P)">● Pin</button>
+          <button id="tool-box" class="btn" title="Draw a box (B)">□ Box</button>
         </div>
         <div id="ann-list"></div>
-        <div class="hint" id="ann-empty">Measurements and notes live in a sidecar file next to the slide, loaded automatically on open.</div>
+        <div class="hint" id="ann-empty">Measurements and notes are stored outside the viewing cache.</div>
         <div class="tool-row footer">
-          <button id="ann-open" class="btn" title="Load an annotation file">Open&hellip;</button>
+          <button id="ann-open" class="btn" title="Load an annotation file">Open…</button>
           <button id="ann-export" class="btn" title="Download the annotation file">Export</button>
         </div>
         <div class="hint" id="ann-status"></div>
@@ -145,20 +142,20 @@
       </div>
     </section>
 
-    <div id="zoom-cluster">
-      <button class="zc-btn" id="zoom-in" title="Zoom in">+</button>
-      <button class="zc-btn" id="zoom-out" title="Zoom out">&minus;</button>
-      <button class="zc-btn" id="zoom-fit" title="Fit slide (0)">&#8862;</button>
+    <div id="zoom-cluster" aria-label="Zoom controls">
+      <button class="zc-btn" id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+      <button class="zc-btn" id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+      <button class="zc-btn" id="zoom-fit" title="Fit slide (0)" aria-label="Fit slide">⌾</button>
     </div>
 
-    <div id="toast"></div>
-    <div id="boot">Loading slide&hellip;</div>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <div id="boot">Loading slide…</div>
   </div>
 
   <footer id="statusbar">
-    <span class="cell"><span class="label">Stage</span><span class="value" id="pos-um">&ndash;</span></span>
-    <span class="cell optional"><span class="label">Pixel</span><span class="value" id="pos-px">&ndash;</span></span>
-    <span class="cell"><span class="label">Zoom</span><span class="value" id="zoom-val">&ndash;</span></span>
+    <span class="cell"><span class="label">Stage</span><span class="value" id="pos-um">–</span></span>
+    <span class="cell optional"><span class="label">Pixel</span><span class="value" id="pos-px">–</span></span>
+    <span class="cell"><span class="label">Zoom</span><span class="value" id="zoom-val">–</span></span>
     <span class="cell"><span class="label">Level</span><span id="level-lamps"></span></span>
     <span class="cell optional" id="hw-cell" hidden><span class="label">Display</span><span class="value" id="hw-val"></span></span>
     <span class="cell" id="export-cell" hidden><span class="label">Export</span><span id="export-bar"><span id="export-fill"></span></span><span class="value" id="export-pct">0 %</span></span>

@@ -350,11 +350,6 @@ class Api:
             return None
         return self._launch_many(good)
 
-    def pick_path(self):
-        """Kept for older pages. Returns one path."""
-        picked = self.pick_paths()
-        return picked[0] if picked else None
-
     def pick_paths(self):
         """Native open dialog for the tab shell's '+' button (no convert)."""
         import webview
@@ -452,6 +447,8 @@ def smoke(nd2_path: Path) -> int:
         print(f"smoke FAIL: ND2 export -> {type(e).__name__}: {e}", file=sys.stderr)
     finally:
         httpd.shutdown()
+        httpd.server_close()
+        httpd.registry.close_all(immediate=True)
 
     print(
         f"smoke ok: {info['name']} {info['width']}x{info['height']} "

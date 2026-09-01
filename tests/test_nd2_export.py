@@ -118,7 +118,7 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
     try:
         first = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
         assert first["items"] == [] and first["path"].endswith(
-            "nd2wsi/annotations/annotations_fluor.json"
+            "nd2wsi/annotations/annotations_fluor.nd2--t0-p0-z0.json"
         )
 
         items = [
@@ -134,7 +134,12 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
         resp = json.loads(urllib.request.urlopen(req).read())
         assert resp["ok"] and resp["count"] == 2
 
-        sidecar = tmp_path / "nd2wsi" / "annotations" / "annotations_fluor.json"
+        sidecar = (
+            tmp_path
+            / "nd2wsi"
+            / "annotations"
+            / "annotations_fluor.nd2--t0-p0-z0.json"
+        )
         assert sidecar.exists()
         on_disk = json.loads(sidecar.read_text())
         assert on_disk["items"] == items
@@ -142,6 +147,7 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
         assert on_disk["coordinate_space"] == "level-0-pixels"
         assert on_disk["source"]["name"] == "fluor.nd2"
         assert on_disk["source"]["width"] == 900
+        assert on_disk["selection"] == {"t": 0, "p": 0, "z": 0}
         assert on_disk["calibration"]["status"] == "calibrated"
         assert abs(on_disk["calibration"]["x_um_per_px"] - 0.66) < 1e-6
 
@@ -247,8 +253,8 @@ def test_export_progress_endpoint(fluor_nd2, tmp_path):
         httpd.shutdown()
 
 
-def test_convert_progress_and_trash(fluor_nd2, tmp_path):
-    """on_progress climbs to 1.0; /api/trash deletes the store, keeps the source."""
+def test_convert_progress_and_explicit_store_is_not_trashable(fluor_nd2, tmp_path):
+    """Progress works, but a user-supplied OME-Zarr is never treated as cache."""
     import json
     import threading
     import urllib.request
@@ -271,16 +277,21 @@ def test_convert_progress_and_trash(fluor_nd2, tmp_path):
         sid = json.loads(
             urllib.request.urlopen(base + "/api/slides").read()
         )["slides"][0]["sid"]
+        info = json.loads(urllib.request.urlopen(base + "/api/info").read())
+        assert info["trashable"] is False
         req = urllib.request.Request(
             base + "/api/trash",
             data=json.dumps({"sid": sid}).encode(),
             headers={"Content-Type": "application/json"},
         )
-        resp = json.loads(urllib.request.urlopen(req).read())
-        assert resp["ok"] and resp["freed"] > 0
-        assert resp["slides"] == []
-        assert not store.exists()  # pyramid gone
-        assert src_path.exists()  # source slide untouched
+        try:
+            urllib.request.urlopen(req)
+            raise AssertionError("expected explicit store deletion to be refused")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+            assert "no cache managed" in e.read().decode()
+        assert store.exists()  # user-owned portable store remains intact
+        assert src_path.exists()
         # trashing an unknown sid is a clean 404
         req2 = urllib.request.Request(
             base + "/api/trash",

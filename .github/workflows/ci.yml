@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uvx ruff check nd2wsi tests
+      - run: uvx ruff check nd2wsi tests scripts
 
   test:
     runs-on: macos-15
@@ -24,13 +24,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Install with every extra, limnd2 index included
-        run: |
-          uv venv .venv --clear
-          uv pip install -p .venv -e ".[svs,nd2export,app,test]" \
-            --extra-index-url https://pypi.laboratory-imaging.com/simple
+      - name: Install the locked environment
+        run: uv sync --frozen --all-extras --python ${{ matrix.python }}
       - name: Unit and integration tests (synthetic fixtures)
-        run: .venv/bin/python -m pytest tests -q -m "not realdata"
+        run: uv run --frozen python -m pytest tests -q -m "not realdata"
 
   package:
     runs-on: macos-15

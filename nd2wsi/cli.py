@@ -1,10 +1,7 @@
-"""nd2wsi command line interface.
+"""Command-line tools for local whole-slide viewing and ROI export.
 
-    nd2wsi info    slide.nd2|.svs            # how is this file laid out inside?
-    nd2wsi convert slide.nd2 [out.ome.zarr]  # build the OME-Zarr pyramid
-    nd2wsi crop    slide.nd2 roi.nd2 --x --y --w --h   # native-res ND2 crop
-    nd2wsi serve   out.ome.zarr              # serve the browser viewer
-    nd2wsi view    slide.nd2|.svs            # convert (if needed) + serve
+``view`` builds or reuses a managed viewing cache. ``convert`` writes a
+self-contained OME-Zarr pyramid. ``crop`` reads native ND2 pixels directly.
 """
 
 from __future__ import annotations
@@ -103,8 +100,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
     parser = argparse.ArgumentParser(
         prog="nd2wsi",
-        description="Nikon ND2 -> OME-Zarr pyramid -> browser slide viewer with "
-        "native-resolution ROI export.",
+        description="Local whole-slide viewing for stitched Nikon ND2 and Aperio SVS, "
+        "with native-value ROI export.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -114,7 +111,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p_conv = sub.add_parser("convert", help="ND2/SVS -> OME-Zarr multiscale pyramid")
     p_conv.add_argument("nd2")
-    p_conv.add_argument("out", nargs="?", help="output store (default: <nd2>.ome.zarr)")
+    p_conv.add_argument(
+        "out",
+        nargs="?",
+        help="output store (default: pyramids/<source>.ome.zarr)",
+    )
     _add_convert_args(p_conv)
 
     p_crop = sub.add_parser(
@@ -164,7 +165,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p_view = sub.add_parser("view", help="one shot: convert if needed, then serve")
     p_view.add_argument("nd2", nargs="+", help="one tab per slide")
-    p_view.add_argument("--store", help="pyramid location (default: <nd2>.ome.zarr)")
+    p_view.add_argument(
+        "--store", help="portable pyramid location for an explicit conversion"
+    )
     _add_convert_args(p_view)
     _add_serve_args(p_view)
 

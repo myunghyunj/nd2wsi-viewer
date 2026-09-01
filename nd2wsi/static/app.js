@@ -38,6 +38,7 @@ async function init() {
   $("file-dims").textContent =
     fmtInt(info.width) + " × " + fmtInt(info.height) + " px · " + info.dtype +
     (info.rgb ? " · RGB" : " · " + info.channels.length + " ch");
+  fillContextBadges(info);
   $("plane-note").textContent = planeNote(info);
 
   const dpr = window.devicePixelRatio || 1;
@@ -66,6 +67,40 @@ async function init() {
     }
     setAnnStatus("Annotation locked: source file missing");
   }
+}
+
+function fillContextBadges(info) {
+  const name = String(info.name || "").toLowerCase();
+  $("source-badge").textContent = name.endsWith(".svs")
+    ? "SVS"
+    : name.endsWith(".nd2")
+      ? "ND2"
+      : "OME-ZARR";
+
+  const storage = $("storage-badge");
+  const storageLabels = {
+    compact: "Compact cache",
+    full: "Portable pyramid",
+    direct: "Direct source",
+    "overview-degraded": "Overview only",
+  };
+  storage.textContent = storageLabels[info.storage] || "";
+  storage.hidden = !storage.textContent;
+  storage.dataset.state = info.storage === "overview-degraded" ? "warning" : "";
+  storage.title = info.storage === "compact"
+    ? "Native pixels come from the ND2; reduced levels live in the cache"
+    : info.storage === "direct"
+      ? "The source already contains a usable pyramid"
+      : info.storage === "overview-degraded"
+        ? "The source is unavailable; only cached reduced levels can be shown"
+        : "A self-contained pyramid is stored on disk";
+
+  const calibration = $("calibration-badge");
+  calibration.textContent = info.calibrated ? "Calibrated" : "Pixels only";
+  calibration.dataset.state = info.calibrated ? "ok" : "warning";
+  calibration.title = info.calibrated
+    ? "Physical measurements use calibration stored in the source"
+    : "No physical calibration was found";
 }
 
 function planeNote(info) {
@@ -849,8 +884,15 @@ function loadAnnotations() {
     .then((d) => {
       state.annotations = Array.isArray(d.items) ? d.items : [];
       state.annPath = d.path;
+      // a skipped legacy-sidecar import must not be silent: the server
+      // leaves a note explaining why old annotations are not shown here
+      const skipped = ((state.info && state.info.notes) || []).find((n) =>
+        n.includes("annotation sidecar")
+      );
       setAnnStatus(
-        state.annotations.length
+        skipped
+          ? skipped
+          : state.annotations.length
           ? "Loaded " + state.annotations.length + " from " + basename(d.path)
           : "Sidecar: " + basename(d.path)
       );
@@ -1043,12 +1085,12 @@ function wireAnnotationPanel() {
 
   $("ann-export").onclick = () => {
     const blob = new Blob(
-      [JSON.stringify({ format: "nd2wsi-annotations/1", source: state.info.name, items: state.annotations }, null, 1)],
+      [JSON.stringify(annotationDocument(), null, 1)],
       { type: "application/json" }
     );
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = state.info.name.replace(/\.nd2$/i, "") + ".annotations.json";
+    a.download = state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json";
     a.click();
     URL.revokeObjectURL(a.href);
   };
@@ -1059,17 +1101,87 @@ function wireAnnotationPanel() {
     f.text().then((txt) => {
       try {
         const data = JSON.parse(txt);
-        const items = Array.isArray(data) ? data : data.items;
-        if (!Array.isArray(items)) throw new Error("no items array");
+        const { items, verified } = annotationItemsForThisSlide(data);
         state.annotations = items;
         annotationsChanged();
-        setAnnStatus("Opened " + f.name + " (" + items.length + ")");
+        setAnnStatus(
+          "Opened " + f.name + " (" + items.length + ")" +
+          (verified ? "" : " · legacy file, source not verified")
+        );
       } catch (e) {
-        showToast("could not read annotations: " + e.message);
+        showToast("could not open annotations: " + e.message);
       }
       $("ann-file").value = "";
     });
   });
+}
+
+function annotationDocument() {
+  const ps = pixelSize();
+  return {
+    format: "nd2wsi-annotations/2",
+    coordinate_space: "level-0-pixels",
+    source: {
+      name: state.info.name,
+      width: state.info.width,
+      height: state.info.height,
+    },
+    calibration: ps
+      ? {
+          status: "calibrated",
+          source: "viewer-metadata",
+          y_um_per_px: ps[0],
+          x_um_per_px: ps[1],
+        }
+      : { status: "unknown", source: "unknown" },
+    selection: state.info.selection || {},
+    items: state.annotations,
+  };
+}
+
+function normalizedSelection(selection) {
+  const source = selection || {};
+  return {
+    t: Number(source.t || 0),
+    p: Number(source.p || 0),
+    z: String(source.z === undefined ? "mid" : source.z),
+  };
+}
+
+function annotationItemsForThisSlide(data) {
+  if (Array.isArray(data)) return { items: data, verified: false };
+  if (!data || !Array.isArray(data.items)) throw new Error("no items array");
+
+  const source = data.source;
+  if (typeof source === "string") {
+    if (source !== state.info.name) {
+      throw new Error("this file belongs to " + source);
+    }
+    return { items: data.items, verified: true };
+  }
+  if (!source || typeof source !== "object") {
+    return { items: data.items, verified: false };
+  }
+  if (source.name && source.name !== state.info.name) {
+    throw new Error("this file belongs to " + source.name);
+  }
+  if (
+    Number(source.width) !== Number(state.info.width) ||
+    Number(source.height) !== Number(state.info.height)
+  ) {
+    throw new Error("source dimensions do not match this slide");
+  }
+  if (data.coordinate_space && data.coordinate_space !== "level-0-pixels") {
+    throw new Error("unsupported annotation coordinate space");
+  }
+  if (data.selection) {
+    const expected = normalizedSelection(state.info.selection);
+    const actual = normalizedSelection(data.selection);
+    if (expected.t !== actual.t || expected.p !== actual.p || expected.z !== actual.z) {
+      throw new Error("annotations belong to a different T/P/Z plane");
+    }
+  }
+  return { items: data.items, verified: true };
 }
 
 function rebuildAnnList() {
@@ -1483,44 +1595,116 @@ function trackExport(job, label) {
   }, 350);
 }
 
-/* ---- light / dark theme ----------------------------------------------------
-   The class lives on <html>, the choice in localStorage, and the shell
-   keeps every open tab in step via postMessage. */
+/* ---- appearance ------------------------------------------------------------
+   Auto follows the system for fluorescence and opens RGB brightfield in light
+   mode. An explicit light or dark choice is never overwritten by the slide. */
+
+const THEME_MODES = ["auto", "light", "dark"];
+const THEME_MODE_KEY = "nd2wsi.theme.mode";
+const LEGACY_THEME_KEY = "nd2wsi.theme";
 
 function currentTheme() {
   return document.documentElement.classList.contains("light") ? "light" : "dark";
 }
 
-function applyTheme(t) {
-  document.documentElement.classList.toggle("light", t === "light");
-  const ico = document.querySelector("#tb-theme .tb-ico");
-  if (ico) ico.innerHTML = t === "light" ? "&#9790;" : "&#9788;";
-  try { localStorage.setItem("nd2wsi.theme", t); } catch (e) { /* private mode */ }
+function savedThemeMode() {
+  // the pre-1.1 key recorded every automatic theme flip, not a choice the
+  // user made, so upgraders start in Auto rather than pinned to whatever
+  // the old build last wrote
+  try {
+    const mode = localStorage.getItem(THEME_MODE_KEY);
+    if (THEME_MODES.includes(mode)) return mode;
+  } catch (e) { /* private mode */ }
+  return "auto";
+}
+
+function resolveTheme(mode) {
+  if (mode === "light" || mode === "dark") return mode;
+  if (state.info && state.info.rgb) return "light";
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
+    ? "light"
+    : "dark";
+}
+
+function themeGlyph(mode) {
+  if (mode === "light") {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true">' +
+      '<circle cx="8" cy="8" r="2.7"></circle>' +
+      '<path d="M8 1.5v1.4M8 13.1v1.4M1.5 8h1.4M13.1 8h1.4' +
+      'M3.4 3.4l1 1M11.6 11.6l1 1M12.6 3.4l-1 1M4.4 11.6l-1 1"></path></svg>';
+  }
+  if (mode === "dark") {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true">' +
+      '<path d="M12.9 10.1A5.6 5.6 0 0 1 5.9 3.1 5.6 5.6 0 1 0 12.9 10.1Z"></path></svg>';
+  }
+  return '<svg viewBox="0 0 16 16" aria-hidden="true">' +
+    '<circle cx="8" cy="8" r="5.25"></circle>' +
+    '<path d="M8 2.75v10.5a5.25 5.25 0 0 0 0-10.5Z" class="icon-fill"></path></svg>';
+}
+
+function applyThemeMode(mode, resolved = null, persist = true) {
+  if (!THEME_MODES.includes(mode)) mode = "auto";
+  const theme = resolved || resolveTheme(mode);
+  document.documentElement.classList.toggle("light", theme === "light");
+  document.documentElement.dataset.themeMode = mode;
+
+  const button = $("tb-theme");
+  const icon = button && button.querySelector(".tb-ico");
+  if (icon) icon.innerHTML = themeGlyph(mode);
+  if (button) {
+    const next = THEME_MODES[(THEME_MODES.indexOf(mode) + 1) % THEME_MODES.length];
+    const title = "Appearance: " + mode[0].toUpperCase() + mode.slice(1) +
+      " · click for " + next[0].toUpperCase() + next.slice(1);
+    button.title = title;
+    button.setAttribute("aria-label", title);
+    button.dataset.mode = mode;
+  }
+
+  if (persist) {
+    try {
+      localStorage.setItem(THEME_MODE_KEY, mode);
+      localStorage.setItem(LEGACY_THEME_KEY, theme);
+    } catch (e) { /* private mode */ }
+  }
   if (state.lutWidgets && state.lutWidgets.length) relayoutLuts();
+  return theme;
+}
+
+function announceTheme(mode, theme) {
+  if (window.parent !== window) {
+    window.parent.postMessage({ nd2wsi: "theme", mode, theme }, location.origin);
+  }
 }
 
 function wireTheme() {
-  let t = "dark";
-  try { t = localStorage.getItem("nd2wsi.theme") || "dark"; } catch (e) { /* ok */ }
-  // H&E and MT are read on white, so a brightfield slide brings the light
-  // theme with it when it opens. The toggle still has the last word.
-  if (state.info && state.info.rgb && t !== "light") {
-    t = "light";
-    if (window.parent !== window) {
-      window.parent.postMessage({ nd2wsi: "theme", theme: t }, location.origin);
-    }
-  }
-  applyTheme(t);
+  let mode = savedThemeMode();
+  let theme = applyThemeMode(mode);
+  announceTheme(mode, theme);
+
   $("tb-theme").onclick = () => {
-    const next = currentTheme() === "light" ? "dark" : "light";
-    applyTheme(next);
-    if (window.parent !== window) {
-      window.parent.postMessage({ nd2wsi: "theme", theme: next }, location.origin);
-    }
+    mode = THEME_MODES[(THEME_MODES.indexOf(mode) + 1) % THEME_MODES.length];
+    theme = applyThemeMode(mode);
+    announceTheme(mode, theme);
   };
+
+  const media = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
+  if (media && media.addEventListener) {
+    media.addEventListener("change", () => {
+      if (mode !== "auto") return;
+      theme = applyThemeMode(mode, null, false);
+      announceTheme(mode, theme);
+    });
+  }
+
   window.addEventListener("message", (ev) => {
-  if (ev.origin !== location.origin) return;
-    if (ev.data && ev.data.nd2wsi === "theme") applyTheme(ev.data.theme);
+    if (ev.origin !== location.origin || !ev.data) return;
+    if (ev.data.nd2wsi === "theme-request") {
+      announceTheme(mode, theme);
+      return;
+    }
+    if (ev.data.nd2wsi !== "theme") return;
+    mode = THEME_MODES.includes(ev.data.mode) ? ev.data.mode : mode;
+    theme = applyThemeMode(mode, ev.data.theme || null);
   });
 }
 
@@ -1537,8 +1721,8 @@ function inkColor(a) {
 function wireTrash() {
   const btn = $("tb-trash");
   const pop = $("trash-confirm");
-  if (state.info && state.info.direct) {
-    btn.hidden = true; // served straight from the file, nothing to trash
+  if (state.info && !state.info.trashable) {
+    btn.hidden = true; // direct source or user-owned portable store
     return;
   }
   const hide = () => { pop.hidden = true; };

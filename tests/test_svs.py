@@ -158,7 +158,7 @@ def test_trash_reports_progress_and_saves_annotations(slide, tmp_path):
     (store / "annotations_slide.json").write_text('{"items": [1]}')
 
     registry = SlideRegistry()
-    sid = registry.add_store(store)
+    sid = registry.add_store(store, trash_path=store)
     seen = []
     freed = registry.trash_cache(sid, on_progress=seen.append)
 
@@ -166,4 +166,4 @@ def test_trash_reports_progress_and_saves_annotations(slide, tmp_path):
     assert not store.exists()
     assert seen == sorted(seen) and seen[-1] == 1.0
     assert len(seen) > 10  # the bar actually moves
-    assert (path.parent / "annotations_slide.json").read_text() == '{"items": [1]}'
+    assert (path.parent / "nd2wsi" / "annotations" / "annotations_slide.json").read_text() == '{"items": [1]}'

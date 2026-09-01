@@ -1,4 +1,4 @@
-"""nd2wsi: Nikon ND2 -> OME-Zarr pyramid -> browser WSI-style viewer."""
+"""Local whole-slide viewing for stitched Nikon ND2 and Aperio SVS."""
 
 import importlib.metadata as _md
 

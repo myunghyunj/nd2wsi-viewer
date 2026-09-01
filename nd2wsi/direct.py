@@ -114,6 +114,9 @@ class _Root(dict):
         if self._closed or self._closer is None:
             return
         self._closed = True
+        if delay <= 0:
+            self._closer()
+            return
         t = threading.Timer(delay, self._closer)
         t.daemon = True
         t.start()

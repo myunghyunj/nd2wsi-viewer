@@ -382,23 +382,12 @@ def level_shapes(height: int, width: int, tile: int) -> list[tuple[int, int]]:
     return shapes
 
 
-def num_levels(height: int, width: int, tile: int) -> int:
-    return len(level_shapes(height, width, tile))
-
-
 def nice_bytes(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
-
-
-def estimate_pyramid_bytes(c: int, height: int, width: int, itemsize: int) -> int:
-    total = 0
-    for h, w in level_shapes(height, width, 512):
-        total += c * h * w * itemsize
-    return int(total)
 
 
 def parse_z(value: str) -> str | int:
@@ -408,7 +397,3 @@ def parse_z(value: str) -> str | int:
         return int(value)
     except ValueError as e:
         raise ValueError("--z must be 'mid', 'max' or an integer") from e
-
-
-def ceil_div(a: int, b: int) -> int:
-    return int(math.ceil(a / b))
