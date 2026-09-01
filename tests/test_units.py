@@ -139,19 +139,27 @@ def test_tidy_caches_moves_only_our_stores(tmp_path):
     assert foreign.is_dir() and not ours.exists()
 
 
-def test_annotations_stay_beside_the_slide(tmp_path):
+def test_annotations_live_in_the_managed_folder(tmp_path):
+    """Work goes to nd2wsi/annotations/, whatever holds the cache, and old
+    sidecars migrate there on open."""
     from nd2wsi.server import annotations_sidecar
 
-    store = tmp_path / "pyramids" / "24-962.ome.zarr"
-    store.mkdir(parents=True)
     attrs = {"nd2wsi": {"source": "24-962.nd2"}}
-    assert annotations_sidecar(store, attrs) == tmp_path / "annotations_24-962.json"
+    home = tmp_path / "nd2wsi" / "annotations" / "annotations_24-962.json"
 
-    # one left inside the cache folder is pulled back out
-    inside = store.parent / "annotations_24-962.json"
-    inside.write_text("[]")
-    assert annotations_sidecar(store, attrs).read_text() == "[]"
-    assert not inside.exists()
+    # container-era store
+    store = tmp_path / "nd2wsi" / "caches" / "24-962--t0-p0-zmid.nd2wsi-cache" / "store.ome.zarr"
+    store.mkdir(parents=True)
+    assert annotations_sidecar(store, attrs) == home
+
+    # legacy pyramids store, with a stray sidecar beside the slide
+    legacy = tmp_path / "pyramids" / "24-962.ome.zarr"
+    legacy.mkdir(parents=True)
+    stray = tmp_path / "annotations_24-962.json"
+    stray.write_text("[]")
+    got = annotations_sidecar(legacy, attrs)
+    assert got == home and got.read_text() == "[]"
+    assert not stray.exists()
 
 
 def test_sweep_appledouble_removes_only_the_twins(tmp_path):

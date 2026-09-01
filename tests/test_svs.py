@@ -137,16 +137,14 @@ def test_pyramid_of_a_thin_strip_keeps_its_values(tmp_path):
 def test_a_single_level_svs_falls_back_to_a_real_store(slide):
     """Direct serving needs the file's own pyramid. A baseline-only SVS
     cannot offer one, so it converts the way every SVS did before 0.7.0."""
-    from nd2wsi import convert as convert_mod
+    from nd2wsi.cache import cache_container, container_store
     from nd2wsi.server import SlideRegistry
 
     path, _ = slide
-    store = convert_mod.default_store_path(path)
-
     registry = SlideRegistry()
     sid = registry.open_path(path)
     assert sid
-    assert store.exists()
+    assert container_store(cache_container(path)).exists()
     assert not registry.slides[sid].attrs["nd2wsi"].get("direct")
 
 

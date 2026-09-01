@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import time
 from collections.abc import Callable
@@ -580,6 +581,142 @@ def estimate_store_bytes(
 
 
 CACHE_DIR_NAME = "pyramids"
+
+
+def ensure_cache(
+    slide: str | Path,
+    selection: PlaneSelection | None = None,
+    on_progress: Callable[[float], None] | None = None,
+    tile: int | None = None,
+) -> Path:
+    """The store to open for this slide and selection, building if needed.
+
+    Every automatic open goes through here. Legacy full stores from before
+    the container era are honored where they lie for the default selection.
+    Otherwise the container's manifest decides: a match serves, a mismatch
+    or damage is quarantined and rebuilt, and building itself is staged,
+    locked against concurrent builders, fingerprint-checked against a
+    source that might still be copying, and renamed into place complete.
+    """
+    from .cache import (
+        CacheLock,
+        cache_container,
+        cache_matches,
+        commit_container,
+        container_store,
+        quarantine,
+        quick_fingerprint,
+        sweep_stale_builds,
+        write_manifest,
+    )
+
+    slide = Path(slide).resolve()
+    selection = selection or PlaneSelection()
+
+    if selection == PlaneSelection():
+        legacy = _legacy_store(slide)
+        if legacy is not None:
+            return legacy
+
+    container = cache_container(slide, selection)
+    store = container_store(container)
+    if container.exists():
+        if cache_matches(container, slide, selection) and store.is_dir():
+            try:
+                open_store(store)
+                return store
+            except ValueError:
+                pass  # damaged despite its manifest: set aside below
+        quarantine(container)
+
+    with CacheLock(container):
+        # someone else may have finished it while this process waited
+        if cache_matches(container, slide, selection) and store.is_dir():
+            return store
+        sweep_stale_builds(container.parent)
+        before = quick_fingerprint(slide)
+        staging = container.with_name(f"{container.name}.building-{os.getpid()}")
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+        try:
+            convert(
+                slide,
+                staging / store.name,
+                tile=tile,
+                selection=selection,
+                progress=False,
+                on_progress=on_progress,
+            )
+            after = quick_fingerprint(slide)
+            if before != after:
+                raise RuntimeError(
+                    f"{slide.name} changed while its cache was building "
+                    "(still copying, or being written by the scanner?) — "
+                    "try again once the file is settled"
+                )
+            _, attrs = open_store(staging / store.name)
+            meta = attrs["nd2wsi"]
+            lv0 = meta["levels"][0]
+            write_manifest(
+                staging,
+                slide,
+                after,
+                selection.describe(),
+                meta.get("selection", {}).get("z"),
+                meta["tile"],
+                (len(attrs["omero"]["channels"]), lv0["height"], lv0["width"]),
+                meta["dtype"],
+            )
+            commit_container(staging, container)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    return store
+
+
+def existing_cache_store(
+    slide: str | Path, selection: PlaneSelection | None = None
+) -> Path | None:
+    """A valid, already-built store for this slide, or None. Never builds."""
+    from .cache import cache_container, cache_matches, container_store
+
+    slide = Path(slide).resolve()
+    selection = selection or PlaneSelection()
+    if selection == PlaneSelection():
+        legacy = _legacy_store(slide)
+        if legacy is not None:
+            return legacy
+    container = cache_container(slide, selection)
+    store = container_store(container)
+    if cache_matches(container, slide, selection) and store.is_dir():
+        return store
+    return None
+
+
+def _legacy_store(slide: Path) -> Path | None:
+    """A pre-container store, honored where it lies if it truly opens.
+
+    A directory that exists but does not open as a store is the wedge the
+    old layout could leave behind after a crash; those are quarantined so
+    the slide can be opened at all. Stores the user opens directly never
+    pass through here and are never touched.
+    """
+    from .cache import quarantine
+
+    base = slide.parent
+    for cand in (
+        base / CACHE_DIR_NAME / f"{slide.stem}.ome.zarr",
+        base / f"pyramid_{slide.stem}.ome.zarr",
+        base / f"{slide.stem}.ome.zarr",
+    ):
+        if not cand.exists():
+            continue
+        try:
+            open_store(cand)
+            return cand
+        except ValueError:
+            quarantine(cand)
+    return None
 
 
 def default_store_path(nd2_path: str | Path, cache_dir: str | Path | None = None) -> Path:

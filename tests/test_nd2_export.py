@@ -115,7 +115,9 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     try:
         first = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
-        assert first["items"] == [] and first["path"].endswith("annotations_fluor.json")
+        assert first["items"] == [] and first["path"].endswith(
+            "nd2wsi/annotations/annotations_fluor.json"
+        )
 
         items = [
             {"id": "a1", "type": "line", "x1": 0, "y1": 0, "x2": 100, "y2": 0,
@@ -130,7 +132,7 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
         resp = json.loads(urllib.request.urlopen(req).read())
         assert resp["ok"] and resp["count"] == 2
 
-        sidecar = tmp_path / "annotations_fluor.json"
+        sidecar = tmp_path / "nd2wsi" / "annotations" / "annotations_fluor.json"
         assert sidecar.exists()
         on_disk = json.loads(sidecar.read_text())
         assert on_disk["items"] == items and on_disk["source"] == "fluor.nd2"
@@ -318,6 +320,11 @@ def test_open_reports_convert_progress(fluor_nd2, tmp_path):
             urllib.request.urlopen(base + "/api/roi/progress?job=testjob1").read()
         )
         assert prog["state"] == "done" and prog["pct"] == 100
-        assert (tmp_path / "pyramids" / "fresh.ome.zarr").exists()
+        from nd2wsi.cache import cache_container, container_store, read_manifest
+
+        container = cache_container(tmp_path / "fresh.nd2")
+        assert container_store(container).exists()
+        manifest = read_manifest(container)
+        assert manifest and manifest["complete"] and manifest["kind"] == "full"
     finally:
         httpd.shutdown()

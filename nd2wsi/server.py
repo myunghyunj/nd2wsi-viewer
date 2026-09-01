@@ -133,30 +133,45 @@ def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
 
 
 def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
-    """Annotations live in ``annotations_<slide>.json`` beside the slide.
+    """Annotations are work, not cache: ``nd2wsi/annotations/`` holds them.
 
-    They are your work, not cache, so they stay out of the ``pyramids``
-    folder and survive emptying it. Sidecars written by older versions, or
-    left inside the cache folder, are moved here on open.
+    Whatever cache gets rebuilt or trashed, this folder is never touched
+    by those operations. Sidecars written by older versions — beside the
+    slide, or inside a pyramids folder — are migrated here on open.
     """
+    from .cache import ANNOTATIONS_DIR, CACHE_SUFFIX, MANAGED_DIR
     from .convert import CACHE_DIR_NAME
 
     store_path = Path(store_path).resolve()
     stem = Path(attrs["nd2wsi"]["source"]).stem
+
+    # the slide's folder: caches sit either beside it, under pyramids/, or
+    # two levels down inside nd2wsi/caches/<container>/
     home = store_path.parent
-    if home.name == CACHE_DIR_NAME:
+    if home.name.endswith(CACHE_SUFFIX):
         home = home.parent
-    new = home / f"annotations_{stem}.json"
+    if home.name in (CACHE_DIR_NAME, "caches"):
+        home = home.parent
+    if home.name == MANAGED_DIR:
+        home = home.parent
+
+    target_dir = home / MANAGED_DIR / ANNOTATIONS_DIR
+    new = target_dir / f"annotations_{stem}.json"
     for old in (
-        store_path.parent / f"annotations_{stem}.json",
+        home / f"annotations_{stem}.json",
+        home / CACHE_DIR_NAME / f"annotations_{stem}.json",
         home / f"{stem}.annotations.json",
-        store_path.parent / f"{stem}.annotations.json",
+        store_path.parent / f"annotations_{stem}.json",
     ):
         if old != new and old.exists() and not new.exists():
             try:
+                target_dir.mkdir(parents=True, exist_ok=True)
                 old.rename(new)
+                break
             except OSError:
                 return old
+    if not new.exists():
+        target_dir.mkdir(parents=True, exist_ok=True)
     return new
 
 
@@ -225,20 +240,18 @@ class SlideRegistry:
 
     def open_path(self, path: str | Path, on_progress=None) -> str:
         """A slide file (converted on first open) or an existing store."""
-        from .convert import convert, default_store_path
+        from .convert import ensure_cache, existing_cache_store
         from .svs import is_svs
 
         path = Path(path).expanduser().resolve()
         if path.suffix.lower() in SLIDE_SUFFIXES:
-            store = default_store_path(path)
-            if is_svs(path) and not store.exists():
+            if is_svs(path) and existing_cache_store(path) is None:
                 try:
                     # the file already holds a pyramid, so serve it as it lies
                     return self.add_direct(path)
                 except NotImplementedError:
                     pass  # untiled or off-ladder file: build a store instead
-            if not store.exists():
-                convert(path, store, progress=False, on_progress=on_progress)
+            store = ensure_cache(path, on_progress=on_progress)
         elif path.is_dir():  # a *.ome.zarr store
             store = path
         else:
@@ -274,6 +287,10 @@ class SlideRegistry:
             store = Path(st.store_path)
             if not (store.is_dir() and store.name.endswith(".ome.zarr")):
                 raise ValueError(f"refusing to delete {store}: not a pyramid store")
+            from .cache import CACHE_SUFFIX
+
+            if store.parent.name.endswith(CACHE_SUFFIX):
+                store = store.parent  # the container owns manifest and store
             self.slides.pop(sid, None)
 
         from .convert import CACHE_DIR_NAME

@@ -124,18 +124,14 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     and nothing is built or asked. An ND2 has no pyramid inside, so its
     store is built on first open, next to the slide.
     """
-    from .convert import convert, default_store_path
+    from .convert import ensure_cache, existing_cache_store
     from .svs import is_svs
 
-    store = default_store_path(nd2_path)
-    if store.exists():
-        return store
-    if is_svs(nd2_path):
-        return nd2_path
+    if is_svs(nd2_path) and existing_cache_store(nd2_path) is None:
+        return nd2_path  # the registry serves it straight from the file
     if on_status:
-        on_status(f"building pyramid for {nd2_path.name} … (first open only)")
-    convert(nd2_path, store, progress=False, on_progress=on_progress)
-    return store
+        on_status(f"opening {nd2_path.name} …")
+    return ensure_cache(nd2_path, on_progress=on_progress)
 
 
 _PENDING_OPENS: list = []
