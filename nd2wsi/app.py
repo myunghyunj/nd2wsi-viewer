@@ -297,6 +297,20 @@ def _inline_traffic_lights(window):
                     AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable
                 )
 
+                # an empty toolbar is how Chrome and Notion get their
+                # traffic lights vertically centered: it makes the title
+                # bar toolbar-height and the system re-seats the buttons
+                if ns.toolbar() is None:
+                    bar = AppKit.NSToolbar.alloc().initWithIdentifier_(
+                        "nd2wsi.titlebar.spacer"
+                    )
+                    bar.setShowsBaselineSeparator_(False)
+                    ns.setToolbar_(bar)
+                if hasattr(ns, "setToolbarStyle_"):
+                    ns.setToolbarStyle_(
+                        getattr(AppKit, "NSWindowToolbarStyleUnifiedCompact", 4)
+                    )
+
                 # pywebview's frameless mode hides the standard buttons;
                 # this app wants them, floating over the tab strip
                 for which in (
@@ -307,6 +321,17 @@ def _inline_traffic_lights(window):
                     button = ns.standardWindowButton_(which)
                     if button is not None:
                         button.setHidden_(False)
+
+                close_button = ns.standardWindowButton_(AppKit.NSWindowCloseButton)
+                zoom_button = ns.standardWindowButton_(AppKit.NSWindowZoomButton)
+                if close_button is not None and zoom_button is not None:
+                    bar_h = close_button.superview().frame().size.height
+                    cf, zf = close_button.frame(), zoom_button.frame()
+                    _dlog(
+                        f"lights: bar h={bar_h:.0f} close={cf.origin.x:.0f},"
+                        f"{cf.origin.y:.0f} {cf.size.width:.0f}x{cf.size.height:.0f} "
+                        f"zoom-right={zf.origin.x + zf.size.width:.0f}"
+                    )
 
                 # macOS 26+ draws a glass decoration layer over the title
                 # bar that ignores titlebarAppearsTransparent; hide it (it
