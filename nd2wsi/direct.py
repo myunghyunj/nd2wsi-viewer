@@ -29,8 +29,93 @@ from .svs import _aperio_meta, _require_imagecodecs, _window_reader
 TILE_CACHE_BYTES = 512 * 1024 * 1024  # decoded native tiles kept in memory
 
 
+def _parse_cyx_index(idx: Any, shape: tuple[int, int, int]):
+    """Normalize a ``(C, Y, X)`` getitem index to ``(cs, y0, y1, x0, x1)``.
+
+    Accepts what the render and export paths actually use: a channel
+    index or slice plus contiguous spatial slices. The channel part is
+    returned as given so the caller can apply it after windowing.
+    """
+    _, H, W = shape
+    if not isinstance(idx, tuple):
+        idx = (idx,)
+    idx = idx + (slice(None),) * (3 - len(idx))
+    cs, ys, xs = idx
+    if isinstance(ys, slice):
+        y0, y1, ystep = ys.indices(H)
+    else:
+        y0 = ys + H if ys < 0 else ys
+        y1, ystep = y0 + 1, 1
+    if isinstance(xs, slice):
+        x0, x1, xstep = xs.indices(W)
+    else:
+        x0 = xs + W if xs < 0 else xs
+        x1, xstep = x0 + 1, 1
+    if ystep != 1 or xstep != 1:
+        raise IndexError("strided reads are not supported")
+    if not (0 <= y0 <= y1 <= H and 0 <= x0 <= x1 <= W):
+        raise IndexError(f"index out of range for shape {shape}")
+    return cs, y0, y1, x0, x1
+
+
+class _Lifecycle:
+    """Counts in-flight reads so close can wait for them, then bar the door.
+
+    A memory-mapped view read after its file closes is not an error, it is
+    a segfault. Every level-0 read enters here; close waits until the
+    count drains before the file handle goes away, and any read arriving
+    after that gets a clean exception instead of dead memory.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0
+        self._cv = threading.Condition()
+        self.closed = False
+
+    def __enter__(self) -> _Lifecycle:
+        with self._cv:
+            if self.closed:
+                raise ValueError("slide is closed")
+            self._n += 1
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        with self._cv:
+            self._n -= 1
+            self._cv.notify_all()
+
+    def close(self, timeout: float = 300.0) -> bool:
+        """Bar new reads, wait for running ones. True when fully drained."""
+        with self._cv:
+            self.closed = True
+            return self._cv.wait_for(lambda: self._n == 0, timeout)
+
+
+class _Root(dict):
+    """A virtual store root: level adapters by name, plus deferred close.
+
+    The registry pops the slide before calling ``close``, so no new
+    request can start; ones already running still hold the underlying
+    file for a moment, so the actual teardown runs after a short delay
+    (and, for memory-mapped sources, after the lifecycle drains).
+    """
+
+    def __init__(self, levels: dict[str, Any], closer: Any = None):
+        super().__init__(levels)
+        self._closer = closer
+        self._closed = False
+
+    def close(self, delay: float = 5.0) -> None:
+        if self._closed or self._closer is None:
+            return
+        self._closed = True
+        t = threading.Timer(delay, self._closer)
+        t.daemon = True
+        t.start()
+
+
 class _TileCache:
-    """Bytes-bounded LRU shared by every level of one open slide."""
+    """Bytes-bounded LRU of decoded tiles, one budget per process."""
 
     def __init__(self, budget: int = TILE_CACHE_BYTES):
         self.budget = budget
@@ -55,8 +140,18 @@ class _TileCache:
                 _, old = self._d.popitem(last=False)
                 self.used -= old.nbytes
 
+    def purge(self, owner: str) -> None:
+        """Drop every tile whose tag names this owner (a closed slide)."""
+        with self._lock:
+            for key in [k for k in self._d if k[0][0] == owner]:
+                self.used -= self._d.pop(key).nbytes
 
-def _cached_reader(page: Any, fd: int, cache: _TileCache, tag: int):
+
+# one decode budget for the whole process, not one per open slide
+_TILE_CACHE = _TileCache()
+
+
+def _cached_reader(page: Any, fd: int, cache: _TileCache, tag: Any):
     """A :func:`_window_reader` whose native-tile decodes go through
     ``cache``. Same window semantics, shared across server threads."""
     raw = _window_reader(page, fd)
@@ -117,27 +212,29 @@ class _SvsLevel:
         return np.ascontiguousarray(np.moveaxis(block, -1, 0))
 
     def __getitem__(self, idx: Any) -> np.ndarray:
-        _, H, W = self.shape
-        if not isinstance(idx, tuple):
-            idx = (idx,)
-        idx = idx + (slice(None),) * (3 - len(idx))
-        cs, ys, xs = idx
-        if isinstance(ys, slice):
-            y0, y1, ystep = ys.indices(H)
-        else:
-            y0 = ys + H if ys < 0 else ys
-            y1, ystep = y0 + 1, 1
-        if isinstance(xs, slice):
-            x0, x1, xstep = xs.indices(W)
-        else:
-            x0 = xs + W if xs < 0 else xs
-            x1, xstep = x0 + 1, 1
-        if ystep != 1 or xstep != 1:
-            raise IndexError("strided reads are not supported")
-        if not (0 <= y0 <= y1 <= H and 0 <= x0 <= x1 <= W):
-            raise IndexError(f"index out of range for shape {self.shape}")
+        cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
         block = self._window(y0, y1, x0, x1)  # (3, h, w)
         return block[cs]
+
+
+class _Nd2Level0:
+    """The slide's own pixels as level 0, sliced like a (C, Y, X) array.
+
+    Wraps the zero-copy strided view :func:`nd2wsi.reader.plane_view`
+    returns. Every read copies its window out of the memory map inside
+    the lifecycle guard, so nothing mapped survives past ``close``.
+    """
+
+    def __init__(self, view: np.ndarray, life: _Lifecycle):
+        self._view = view
+        self._life = life
+        self.shape = tuple(view.shape)
+        self.dtype = view.dtype
+
+    def __getitem__(self, idx: Any) -> np.ndarray:
+        cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
+        with self._life:
+            return np.ascontiguousarray(self._view[cs, y0:y1, x0:x1])
 
 
 MAX_EXTRA = 8  # deepest on-the-fly downsample of one embedded level
@@ -168,7 +265,8 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
 
         H, W = int(series.shape[0]), int(series.shape[1])
         shapes = level_shapes(H, W, 512)
-        cache = _TileCache()
+        cache = _TILE_CACHE
+        owner = str(path)
 
         # every embedded level that is tiled and sits on the halving ladder
         embedded: dict[int, Any] = {}
@@ -193,7 +291,7 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
             raise NotImplementedError("SVS carries no usable embedded pyramid")
 
         readers = {
-            k: _cached_reader(page, fd, cache, k)
+            k: _cached_reader(page, fd, cache, (owner, k))
             for k, (page, _, _) in embedded.items()
         }
         root: dict[str, _SvsLevel] = {}
@@ -243,28 +341,93 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
     attrs = build_group_attrs(src_info, shapes, 512, windows)
     attrs["nd2wsi"]["direct"] = True
 
-    class _Root(dict):
-        _closed = False
+    def _teardown() -> None:
+        tf.close()
+        os.close(fd)
+        _TILE_CACHE.purge(owner)
 
-        def close(self, delay: float = 5.0) -> None:
-            """Release the file handles once in-flight requests are done.
+    return _Root(root, _teardown), attrs
 
-            The registry pops the slide before calling this, so no new
-            request can start. Ones already running still hold the fd for
-            a moment; closing it under them could hand their reads a
-            recycled descriptor, so the close waits a beat.
-            """
-            if self._closed:
-                return
-            self._closed = True
 
-            def _do() -> None:
-                tf.close()
-                os.close(fd)
+def open_nd2_backed(
+    slide: str | Path, store: str | Path
+) -> tuple[Any, dict[str, Any]]:
+    """(virtual root, attrs) serving level 0 from the ND2 file itself.
 
-            t = threading.Timer(delay, _do)
-            t.daemon = True
-            t.start()
+    ``store`` is an overview pyramid holding levels 1..n; the file's own
+    memory map plays level 0. Raises ``NotImplementedError`` when the
+    file cannot back a level at runtime — the caller falls back to a full
+    store or a degraded overview-only view.
+    """
+    import copy
 
-    out = _Root(root)
-    return out, attrs
+    import nd2
+    import zarr
+
+    from .cache import read_manifest
+    from .reader import PlaneSelection, is_source_backable, plane_view
+
+    slide, store = Path(slide), Path(store)
+    manifest = read_manifest(store.parent) or {}
+    sel = manifest.get("selection", {})
+    selection = PlaneSelection(
+        t=int(sel.get("t", 0)),
+        p=int(sel.get("p", 0)),
+        z=sel.get("z_resolved", sel.get("z", "mid")),
+    )
+
+    f = nd2.ND2File(str(slide))
+    try:
+        ok, why = is_source_backable(f, selection)
+        if not ok:
+            raise NotImplementedError(f"{slide.name}: {why}")
+        view, _ = plane_view(f, selection)
+
+        zroot = zarr.open_group(str(store), mode="r")
+        attrs = copy.deepcopy(dict(zroot.attrs))
+        meta = attrs.get("nd2wsi") or {}
+        ov = meta.get("overview_of")
+        if meta.get("kind") != "overview" or not ov:
+            raise NotImplementedError(f"{store} is not an overview store")
+        c, h, w = view.shape
+        if [c, h, w] != [ov["channels"], ov["height"], ov["width"]]:
+            raise NotImplementedError(
+                f"{slide.name} no longer matches its overview "
+                f"({w} x {h} vs {ov['width']} x {ov['height']})"
+            )
+
+        life = _Lifecycle()
+        levels: dict[str, Any] = {"0": _Nd2Level0(view, life)}
+        for lv in meta["levels"]:
+            levels[lv["path"]] = zroot[lv["path"]]
+
+        meta["levels"] = [
+            {"path": "0", "width": w, "height": h, "downsample": 1}
+        ] + meta["levels"]
+        meta["kind"] = "source-backed"
+        for ms in attrs.get("multiscales", []):
+            first = ms["datasets"][0]["coordinateTransformations"][0]["scale"]
+            ms["datasets"].insert(
+                0,
+                {
+                    "path": "0",
+                    "coordinateTransformations": [
+                        {"type": "scale", "scale": [1.0, first[1] / 2, first[2] / 2]}
+                    ],
+                },
+            )
+        attrs["nd2wsi"] = meta
+    except BaseException:
+        f.close()
+        raise
+
+    def _teardown() -> None:
+        life.close()
+        try:
+            f.close()
+        except BufferError:
+            # a straggling view still exports the map; leaking the handle
+            # until process exit beats freeing memory something may read
+            pass
+
+    return _Root(levels, _teardown), attrs

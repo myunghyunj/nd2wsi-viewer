@@ -333,7 +333,8 @@ def test_open_reports_convert_progress(fluor_nd2, tmp_path):
         container = cache_container(tmp_path / "fresh.nd2")
         assert container_store(container).exists()
         manifest = read_manifest(container)
-        assert manifest and manifest["complete"] and manifest["kind"] == "full"
+        # an eligible uncompressed ND2 now gets a compact overview cache
+        assert manifest and manifest["complete"] and manifest["kind"] == "overview"
     finally:
         httpd.shutdown()
 

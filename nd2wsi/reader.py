@@ -293,6 +293,74 @@ def open_plane(
     )
 
 
+def resolve_z(selection: PlaneSelection, n_z: int) -> int:
+    """The single Z index a selection names (``"max"`` has no single index)."""
+    if selection.z == "mid":
+        return _mid(n_z)
+    if selection.z == "max":
+        if n_z > 1:
+            raise ValueError("a maximum projection is computed, not stored")
+        return 0
+    z = int(selection.z)
+    if not 0 <= z < n_z:
+        raise ValueError(f"--z {z} out of range (Z={n_z})")
+    return z
+
+
+def plane_view(f: Any, selection: PlaneSelection) -> tuple[np.ndarray, bool]:
+    """One plane of an open ND2File as a raw ``(C, Y, X)`` numpy view.
+
+    For an uncompressed modern file this is a zero-copy strided view onto
+    the file's memory map: slicing it touches only the pages under the
+    slice, so it can serve as a pyramid's level 0 with nothing on disk.
+    The view is only valid while ``f`` is open. Returns ``(view, rgb)``.
+    """
+    sizes = dict(f.sizes)
+    coord_axes = [a for a in sizes if a not in FRAME_AXES]
+    z_index = resolve_z(selection, sizes.get("Z", 1))
+    seq = _seq_index(
+        sizes, coord_axes, {"T": selection.t, "P": selection.p, "Z": z_index}
+    )
+    return _frame_to_cyx(f.read_frame(seq), sizes)
+
+
+def _mmap_backed(a: np.ndarray) -> bool:
+    """True when the array is a non-owning view whose buffer is a memory map."""
+    import mmap as _mmap
+
+    if a.flags.owndata:
+        return False
+    base = a
+    while getattr(base, "base", None) is not None:
+        base = base.base
+    return isinstance(base, _mmap.mmap)
+
+
+def is_source_backable(f: Any, selection: PlaneSelection) -> tuple[bool, str]:
+    """Can this plane be served straight from the file at runtime?
+
+    Every condition is checked against the open file itself, not inferred
+    from metadata alone: the deciding test is that ``read_frame`` really
+    hands back a non-owning view onto the memory map.
+    """
+    if getattr(f, "is_legacy", False):
+        return False, "legacy ND2 format is read through a decoder, not a map"
+    if (getattr(f.attributes, "compressionType", None) or "none") != "none":
+        return False, "compressed frames must be inflated; no random access"
+    sizes = dict(f.sizes)
+    if selection.z == "max" and sizes.get("Z", 1) > 1:
+        return False, "a maximum projection is computed, not stored in the file"
+    try:
+        view, _ = plane_view(f, selection)
+    except (ValueError, NotImplementedError) as e:
+        return False, str(e)
+    if min(view.shape[-2:]) < 2:
+        return False, "degenerate plane (an axis of size 1)"
+    if not _mmap_backed(view):
+        return False, "frames come back as copies, not memory-mapped views"
+    return True, ""
+
+
 def objective_magnification(f: Any) -> float | None:
     try:
         for ch in f.metadata.channels or []:

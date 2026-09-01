@@ -95,6 +95,9 @@ function tileQuery() {
     q.set("c", state.channels.join(","));
   const win = lutParam();
   if (win) q.set("win", win);
+  // the cache generation makes tile URLs immutable: the browser may keep
+  // them, and a rebuilt cache changes the URLs instead of serving stale
+  if (state.info.generation) q.set("g", state.info.generation);
   const s = q.toString();
   return s ? "?" + s : "";
 }

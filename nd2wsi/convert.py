@@ -86,6 +86,9 @@ def _create_level_array(
         compressors=store_compressor(),
         dimension_names=None,
         overwrite=True,
+        # explicit, because chunks that are entirely zero are never
+        # written: any reader must fill their absence with this value
+        fill_value=0,
     )
 
 
@@ -144,6 +147,8 @@ def _store_direct(data: Any, zarr_arr: Any) -> None:
                         y0 : y0 + cshape[1],
                         x0 : x0 + cshape[2],
                     ]
+                    if not sub.any():  # all-zero chunk: its absence says it
+                        continue
                     if sub.shape != cshape:  # v2 pads edge chunks to full size
                         full = np.zeros(cshape, sub.dtype)
                         full[tuple(slice(0, s) for s in sub.shape)] = sub
@@ -164,6 +169,24 @@ def _store_direct(data: Any, zarr_arr: Any) -> None:
 
 def _write_level0(src: PlaneSource, arr: Any) -> None:
     _store_direct(src.data, arr)
+
+
+def _write_level1_from_source(src: PlaneSource, arr: Any) -> None:
+    """Level 1 straight from the source, skipping a stored level 0.
+
+    Byte-identical to downsampling a stored level 0 (``box-mean-floor-v1``):
+    a 2x2 mean of four uint8/uint16 values is exact in float32, and the
+    same rint lands on the same integer. Floor semantics drop an odd last
+    row or column, exactly as :func:`level_shapes` floors.
+    """
+    import dask.array as da
+
+    c, h, w = src.shape
+    data = src.data[:, : h // 2 * 2, : w // 2 * 2]
+    mean = da.coarsen(np.mean, data.astype(np.float32), {0: 1, 1: 2, 2: 2})
+    if np.issubdtype(src.dtype, np.integer):
+        mean = da.rint(mean)
+    _store_direct(mean.astype(src.dtype), arr)
 
 
 DOWNSAMPLE_TASK_BUDGET = 96 << 20  # peak bytes one downsample task may hold
@@ -215,9 +238,11 @@ def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -
         for cy in range(sy0 // pt, -(-ry // pt)):
             for cx in range(sx0 // pt, -(-rx // pt)):
                 key = psep.join((str(ci), str(cy), str(cx)))
-                full = np.frombuffer(
-                    pcodec.decode((ppath / key).read_bytes()), pdtype
-                ).reshape(pcs)[0]
+                try:
+                    raw = (ppath / key).read_bytes()
+                except FileNotFoundError:
+                    continue  # an omitted chunk is all zeros, as src already is
+                full = np.frombuffer(pcodec.decode(raw), pdtype).reshape(pcs)[0]
                 oy0, oy1 = max(sy0, cy * pt), min(ry, cy * pt + pt)
                 ox0, ox1 = max(sx0, cx * pt), min(rx, cx * pt + pt)
                 src[oy0 - sy0 : oy1 - sy0, ox0 - sx0 : ox1 - sx0] = full[
@@ -232,6 +257,8 @@ def _downsample_into(prev_arr: Any, next_arr: Any, tile: int, dtype: np.dtype) -
         row = np.rint(mean).astype(dtype) if integer else mean.astype(dtype)
         for tx in range(x0 // nt, -(-x1 // nt)):
             cx0, cx1 = tx * nt - x0, min((tx + 1) * nt, nw) - x0
+            if not row[:, cx0:cx1].any():  # all-zero chunk stays unwritten
+                continue
             out = np.zeros(ncs, dtype)  # v2 pads edge chunks to full size
             out[0, :h2, : cx1 - cx0] = row[:, cx0:cx1]
             (npath / nsep.join((str(ci), str(ty), str(tx)))).write_bytes(
@@ -278,11 +305,14 @@ def build_group_attrs(
     shapes: list[tuple[int, int]],
     tile: int,
     windows: list[dict[str, float]],
+    start_level: int = 0,
 ) -> dict[str, Any]:
+    """``start_level`` names the first stored level: an overview store keeps
+    levels 1..n and must say so rather than pretend to hold a level 0."""
     calibrated = src.pixel_size_um is not None
     py, px = src.pixel_size_um if calibrated else (1.0, 1.0)
     datasets = []
-    for k, (h, w) in enumerate(shapes):
+    for k, (h, w) in enumerate(shapes, start=start_level):
         factor = 2**k
         # uncalibrated files carry relative scales with no physical unit,
         # never an invented micrometer value
@@ -322,7 +352,7 @@ def build_group_attrs(
     }
     levels = [
         {"path": str(k), "width": w, "height": h, "downsample": 2**k}
-        for k, (h, w) in enumerate(shapes)
+        for k, (h, w) in enumerate(shapes, start=start_level)
     ]
     nd2wsi = {
         "rgb": src.rgb,
@@ -352,10 +382,16 @@ def convert(
     progress: bool = True,
     workers: int | None = None,
     on_progress: Callable[[float], None] | None = None,
+    overview: bool = False,
 ) -> Path:
     """Convert one plane of an ND2 file to an OME-Zarr pyramid on disk.
 
     ``workers=None`` sizes the thread pool to this machine's CPU.
+    ``overview=True`` writes levels 1..n only — level 1 comes straight
+    from the source and the store's metadata lists just what it holds.
+    Such a store is a cache half of a source-backed slide, not a portable
+    export; the caller is responsible for having checked eligibility with
+    :func:`nd2wsi.reader.is_source_backable`.
     """
     import os
 
@@ -393,12 +429,19 @@ def convert(
     with dask.config.set(scheduler="threads", num_workers=workers):
         with ExitStack() as stack:
             if is_svs(nd2_path):
+                if overview:
+                    raise ValueError("overview stores are for ND2 sources only")
                 src = open_svs(stack, nd2_path, tile=tile)
             else:
                 f = stack.enter_context(nd2.ND2File(str(nd2_path)))
                 src = open_plane(f, selection, tile=tile)
             c, h, w = src.shape
             shapes = level_shapes(h, w, tile)
+            first = 1 if overview else 0
+            if overview and len(shapes) < 2:
+                raise ValueError(
+                    f"{nd2_path.name} fits one tile; an overview would be empty"
+                )
             if progress:
                 raw = c * h * w * src.dtype.itemsize
                 print(
@@ -408,17 +451,19 @@ def convert(
                 )
                 for note in src.notes:
                     print(f"  note: {note}")
-                print(f"  pyramid: {len(shapes)} levels, tile {tile}")
+                kinds = "overview levels 1.." if overview else "levels 0.."
+                print(f"  pyramid: {kinds}{len(shapes) - 1}, tile {tile}")
 
             root = zarr.open_group(str(out_path), mode="w", zarr_format=2)
-            arrays = []
-            for k, (lh, lw) in enumerate(shapes):
-                arrays.append(
-                    _create_level_array(root, str(k), (c, lh, lw), src.dtype, tile)
+            arrays = {}
+            for k in range(first, len(shapes)):
+                lh, lw = shapes[k]
+                arrays[k] = _create_level_array(
+                    root, str(k), (c, lh, lw), src.dtype, tile
                 )
 
-            weights = [lh * lw for (lh, lw) in shapes]
-            total_px = float(sum(weights))
+            weights = {k: shapes[k][0] * shapes[k][1] for k in arrays}
+            total_px = float(sum(weights.values()))
             done_px = 0.0
 
             def level_ctx(k: int):
@@ -432,13 +477,18 @@ def convert(
                     lambda f: on_progress((base + f * weights[k]) / total_px)
                 )
 
+            lh, lw = shapes[first]
             if progress:
-                print(f"  level 0  {w} x {h}  writing from ND2 ...", flush=True)
-            with level_ctx(0):
-                _write_level0(src, arrays[0])
-            done_px += weights[0]
+                what = "downsampling from the source" if overview else "writing from ND2"
+                print(f"  level {first}  {lw} x {lh}  {what} ...", flush=True)
+            with level_ctx(first):
+                if overview:
+                    _write_level1_from_source(src, arrays[1])
+                else:
+                    _write_level0(src, arrays[0])
+            done_px += weights[first]
 
-            for k in range(1, len(shapes)):
+            for k in range(first + 1, len(shapes)):
                 lh, lw = shapes[k]
                 if progress:
                     print(f"  level {k}  {lw} x {lh}  downsampling ...", flush=True)
@@ -446,8 +496,22 @@ def convert(
                     _downsample_into(arrays[k - 1], arrays[k], tile, src.dtype)
                 done_px += weights[k]
 
-            windows = _percentile_windows(root, [str(k) for k in range(len(shapes))], src)
-            root.attrs.update(build_group_attrs(src, shapes, tile, windows))
+            level_paths = [str(k) for k in range(first, len(shapes))]
+            windows = _percentile_windows(root, level_paths, src)
+            attrs = build_group_attrs(
+                src, shapes[first:], tile, windows, start_level=first
+            )
+            if overview:
+                attrs["nd2wsi"]["kind"] = "overview"
+                attrs["nd2wsi"]["overview_of"] = {
+                    "channels": c,
+                    "height": h,
+                    "width": w,
+                }
+                attrs["nd2wsi"]["notes"] = attrs["nd2wsi"].get("notes", []) + [
+                    "overview store: full resolution is read from the source file"
+                ]
+            root.attrs.update(attrs)
             if on_progress is not None:
                 on_progress(1.0)
 
@@ -589,6 +653,10 @@ def estimate_store_bytes(
     chunk_bytes = tile * tile * dtype.itemsize * ratio
     per_chunk = max(block, -(-int(chunk_bytes) // block) * block)
     files = sum(c * -(-lh // tile) * -(-lw // tile) for lh, lw in shapes)
+    # chunks that are entirely zero are never written at all
+    if blocks:
+        zero_frac = sum(1 for b in blocks if not b.any()) / len(blocks)
+        files = int(files * (1 - zero_frac))
     on_disk = files * per_chunk + block * (len(shapes) + 2)  # plus metadata
     return {
         "bytes": max(total, on_disk),
@@ -611,11 +679,37 @@ def estimate_store_bytes(
 CACHE_DIR_NAME = "pyramids"
 
 
+def _overview_eligible(slide: Path, selection: PlaneSelection, tile: int) -> bool:
+    """Should this slide's cache be an overview backed by the source?
+
+    Only when the file can truly serve as its own level 0 — checked on the
+    open file, not assumed — and the image is big enough to have stored
+    levels at all. Anything else gets the full store it always did.
+    """
+    if slide.suffix.lower() != ".nd2":
+        return False
+    try:
+        import nd2
+
+        from .reader import is_source_backable
+
+        with nd2.ND2File(str(slide)) as f:
+            ok, _ = is_source_backable(f, selection)
+            if not ok:
+                return False
+            h = int(f.sizes.get("Y", 0))
+            w = int(f.sizes.get("X", 0))
+        return max(h, w) > tile
+    except Exception:
+        return False  # anything odd falls back to the proven full path
+
+
 def ensure_cache(
     slide: str | Path,
     selection: PlaneSelection | None = None,
     on_progress: Callable[[float], None] | None = None,
     tile: int | None = None,
+    kind: str = "auto",
 ) -> Path:
     """The store to open for this slide and selection, building if needed.
 
@@ -625,6 +719,10 @@ def ensure_cache(
     or damage is quarantined and rebuilt, and building itself is staged,
     locked against concurrent builders, fingerprint-checked against a
     source that might still be copying, and renamed into place complete.
+
+    ``kind="auto"`` builds a compact overview store when the source can
+    back its own level 0 and a full store otherwise; an existing cache of
+    either kind is honored. ``kind="full"`` insists on a full store.
     """
     from .cache import (
         CacheLock,
@@ -640,13 +738,14 @@ def ensure_cache(
 
     slide = Path(slide).resolve()
     selection = selection or PlaneSelection()
+    want = None if kind == "auto" else kind
 
     container = cache_container(slide, selection)
     store = container_store(container)
     # the common case takes no lock: a valid container serves immediately,
     # and it outranks legacy stores so an old pyramids dir cannot shadow a
     # correct managed cache
-    if cache_matches(container, slide, selection) and store.is_dir():
+    if cache_matches(container, slide, selection, kind=want) and store.is_dir():
         try:
             open_store(store)
             return store
@@ -662,7 +761,7 @@ def ensure_cache(
         # someone else may have finished it while this process waited, and
         # quarantining under the lock means two openers cannot both grab
         # the same stale container
-        if cache_matches(container, slide, selection) and store.is_dir():
+        if cache_matches(container, slide, selection, kind=want) and store.is_dir():
             try:
                 open_store(store)
                 return store
@@ -671,6 +770,9 @@ def ensure_cache(
         if container.exists():
             quarantine(container)
         sweep_stale_builds(container.parent)
+        overview = kind == "auto" and _overview_eligible(
+            slide, selection, tile or auto_tile(container)
+        )
         before = quick_fingerprint(slide)
         staging = container.with_name(f"{container.name}.building-{os.getpid()}")
         shutil.rmtree(staging, ignore_errors=True)
@@ -683,6 +785,7 @@ def ensure_cache(
                 selection=selection,
                 progress=False,
                 on_progress=on_progress,
+                overview=overview,
             )
             after = quick_fingerprint(slide)
             if before != after:
@@ -693,7 +796,12 @@ def ensure_cache(
                 )
             _, attrs = open_store(staging / store.name)
             meta = attrs["nd2wsi"]
-            lv0 = meta["levels"][0]
+            ov = meta.get("overview_of")
+            if ov:
+                shape = (ov["channels"], ov["height"], ov["width"])
+            else:
+                lv0 = meta["levels"][0]
+                shape = (len(attrs["omero"]["channels"]), lv0["height"], lv0["width"])
             write_manifest(
                 staging,
                 slide,
@@ -701,8 +809,9 @@ def ensure_cache(
                 selection.describe(),
                 meta.get("selection", {}).get("z"),
                 meta["tile"],
-                (len(attrs["omero"]["channels"]), lv0["height"], lv0["width"]),
+                shape,
                 meta["dtype"],
+                kind="overview" if ov else "full",
             )
             commit_container(staging, container)
         except BaseException:

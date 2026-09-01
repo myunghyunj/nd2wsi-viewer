@@ -142,12 +142,19 @@ def read_manifest(container: str | Path) -> dict[str, Any] | None:
     return m if isinstance(m, dict) and m.get("complete") else None
 
 
-def cache_matches(container: Path, slide: Path, selection: Any) -> bool:
-    """A cache is valid for this slide and selection, or it is stale."""
+def cache_matches(
+    container: Path, slide: Path, selection: Any, kind: str | None = None
+) -> bool:
+    """A cache is valid for this slide and selection, or it is stale.
+
+    ``kind`` narrows the match ("full" or "overview"); None takes either.
+    """
     m = read_manifest(container)
     if m is None or m.get("format") != MANIFEST_FORMAT:
         return False
     if m.get("pyramid", {}).get("algorithm") != ALGORITHM:
+        return False
+    if kind is not None and m.get("kind", "full") != kind:
         return False
     sel = selection.describe() if hasattr(selection, "describe") else dict(selection)
     stored = m.get("selection", {})

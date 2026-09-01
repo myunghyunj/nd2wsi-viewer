@@ -100,13 +100,37 @@ class ViewerState:
         attrs: dict[str, Any],
         max_render_mpx: float = 400.0,
         annotations_path: Path | None = None,
+        generation: str = "",
     ):
         self.root = root
         self.attrs = attrs
         self.max_render_mpx = max_render_mpx
         self.histograms: list | None = None  # computed lazily, once
         self.annotations_path = annotations_path
+        self.generation = generation  # changes when the pixels could
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
+
+
+def store_generation(store_path: str | Path) -> str:
+    """A token that changes whenever this store's pixels could have.
+
+    A managed cache carries its manifest's generation uuid; anything else
+    falls back to the metadata file's mtime. Tile URLs carry it, which is
+    what lets the browser cache tiles at all: a rebuilt cache mints new
+    URLs instead of reviving stale renders.
+    """
+    from .cache import CACHE_SUFFIX, read_manifest
+
+    store_path = Path(store_path)
+    if store_path.parent.name.endswith(CACHE_SUFFIX):
+        m = read_manifest(store_path.parent)
+        if m and m.get("generation"):
+            return str(m["generation"])
+    probe = store_path / ".zattrs" if store_path.is_dir() else store_path
+    try:
+        return format(probe.stat().st_mtime_ns, "x")
+    except OSError:
+        return ""
 
 
 def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
@@ -188,6 +212,7 @@ class SlideRegistry:
         return hashlib.sha1(str(store_path.resolve()).encode()).hexdigest()[:8]
 
     def add_store(self, store_path: str | Path) -> str:
+        from .cache import CACHE_SUFFIX, read_manifest
         from .convert import open_store
         from .svs import is_svs
 
@@ -203,6 +228,10 @@ class SlideRegistry:
                 if not built.exists():
                     _convert(store_path, built, progress=False)
                 store_path = built
+        if store_path.parent.name.endswith(CACHE_SUFFIX):
+            manifest = read_manifest(store_path.parent) or {}
+            if manifest.get("kind") == "overview":
+                return self._add_overview(store_path, manifest)
         sid = self.sid_for(store_path)
         with self._lock:
             if sid in self.slides:
@@ -213,6 +242,60 @@ class SlideRegistry:
                 attrs,
                 max_render_mpx=self.max_render_mpx,
                 annotations_path=annotations_sidecar(store_path, attrs),
+                generation=store_generation(store_path),
+            )
+            st.store_path = store_path
+            self.slides[sid] = st
+        return sid
+
+    def _add_overview(self, store_path: Path, manifest: dict) -> str:
+        """An overview store: the source file plays level 0 when it can.
+
+        When the source is missing, changed, or cannot back a level at
+        runtime, the stored overview still shows — at half resolution,
+        with a note saying why — rather than failing to open at all.
+        """
+        from .cache import fingerprints_match, quick_fingerprint
+        from .convert import open_store
+        from .direct import open_nd2_backed
+
+        sid = self.sid_for(store_path)
+        with self._lock:
+            if sid in self.slides:
+                return sid
+            src_info = manifest.get("source", {})
+            source = (store_path.parent / src_info.get("relative_path", "")).resolve()
+            root = attrs = None
+            reason = f"{src_info.get('name', 'source')} is missing"
+            try:
+                if source.is_file() and fingerprints_match(
+                    src_info, quick_fingerprint(source)
+                ):
+                    root, attrs = open_nd2_backed(source, store_path)
+                elif source.is_file():
+                    reason = f"{source.name} has changed since this cache was built"
+            except NotImplementedError as e:
+                reason = str(e)
+            degraded = root is None
+            if degraded:
+                root, attrs = open_store(store_path)
+                meta = attrs["nd2wsi"]
+                meta["kind"] = "overview-degraded"
+                for lv in meta["levels"]:
+                    lv["downsample"] //= 2
+                meta["notes"] = meta.get("notes", []) + [
+                    f"{reason}; showing the stored overview at half resolution"
+                ]
+            st = ViewerState(
+                root,
+                attrs,
+                max_render_mpx=self.max_render_mpx,
+                # annotations live in level-0 pixels; a degraded view's base
+                # is level 1, so editing here would silently corrupt them
+                annotations_path=None
+                if degraded
+                else annotations_sidecar(store_path, attrs),
+                generation=store_generation(store_path),
             )
             st.store_path = store_path
             self.slides[sid] = st
@@ -233,6 +316,7 @@ class SlideRegistry:
                 attrs,
                 max_render_mpx=self.max_render_mpx,
                 annotations_path=annotations_sidecar(slide_path, attrs),
+                generation=store_generation(slide_path),
             )
             st.store_path = None  # nothing on disk to trash
             self.slides[sid] = st
@@ -292,6 +376,9 @@ class SlideRegistry:
             if store.parent.name.endswith(CACHE_SUFFIX):
                 store = store.parent  # the container owns manifest and store
             self.slides.pop(sid, None)
+        close = getattr(st.root, "close", None)
+        if close:  # a source-backed slide holds the ND2 memory map open
+            close()
 
         from .convert import CACHE_DIR_NAME
 
@@ -407,11 +494,18 @@ def make_handler(
         server_version = "nd2wsi"
 
         # ---- helpers -----------------------------------------------------
-        def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
+        def _send(
+            self,
+            code: int,
+            body: bytes,
+            ctype: str,
+            extra: dict | None = None,
+            cache: str = "no-store",
+        ):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             for k, v in (extra or {}).items():
@@ -559,8 +653,18 @@ def make_handler(
             file = (STATIC_DIR / rel).resolve()
             if not file.is_relative_to(STATIC_DIR.resolve()) or not file.is_file():
                 return self._error(404, "not found")
+            st = file.stat()
+            etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+            if self.headers.get("If-None-Match") == etag:
+                return self._send(
+                    HTTPStatus.NOT_MODIFIED, b"", "text/plain",
+                    {"ETag": etag}, cache="private, no-cache",
+                )
             body = file.read_bytes()
-            self._send(200, body, MIME.get(file.suffix, "application/octet-stream"))
+            self._send(
+                200, body, MIME.get(file.suffix, "application/octet-stream"),
+                {"ETag": etag}, cache="private, no-cache",
+            )
 
         def _open(self):
             job = None
@@ -662,6 +766,15 @@ def make_handler(
                 "maxRenderMpx": st.max_render_mpx,
                 "nd2Export": _limnd2_available(),
                 "direct": bool(meta.get("direct")),
+                "generation": st.generation,
+                "storage": (
+                    "direct"
+                    if meta.get("direct")
+                    else {
+                        "source-backed": "compact",
+                        "overview-degraded": "overview-degraded",
+                    }.get(meta.get("kind"), "full")
+                ),
             }
             self._json(info)
 
@@ -741,7 +854,16 @@ def make_handler(
             except KeyError as e:
                 return self._error(404, str(e))
             ctype = "image/jpeg" if fmt in ("jpg", "jpeg") else "image/png"
-            self._send(200, body, ctype)
+            # a URL that names the cache generation can be cached hard: a
+            # rebuild mints a new generation, hence new URLs, so a stale
+            # render can never be revived from the browser cache
+            gen = (q.get("g") or [None])[0]
+            cache = (
+                "private, max-age=31536000, immutable"
+                if gen and gen == st.generation
+                else "no-store"
+            )
+            self._send(200, body, ctype, cache=cache)
 
         def _roi(self, st: ViewerState, q: dict):
             def qi(name: str, default: int | None = None) -> int:

@@ -79,3 +79,35 @@ def test_real_slide_roi_roundtrip_is_pixel_exact(slide):
     assert (got == ref).all()
     registry.remove(sid)
     assert default_store_path(slide).exists()
+
+
+def test_compact_cache_serves_the_source_and_saves_space(tmp_path):
+    from nd2wsi.cache import read_manifest
+    from nd2wsi.convert import convert, ensure_cache
+    from nd2wsi.server import SlideRegistry
+
+    copy = tmp_path / CELL.name
+    copy.write_bytes(CELL.read_bytes())
+    store = ensure_cache(copy)
+    assert read_manifest(store.parent)["kind"] == "overview"
+
+    full = tmp_path / "full.ome.zarr"
+    convert(copy, full, progress=False)
+
+    def du(p):
+        return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+    # levels 1..n hold a third of a full pyramid's pixels
+    assert du(store) < 0.45 * du(full)
+
+    reg = SlideRegistry()
+    sid = reg.add_store(store)
+    st = reg.get(sid)
+    assert st.attrs["nd2wsi"]["kind"] == "source-backed"
+    with nd2.ND2File(str(copy)) as f:
+        frame = f.read_frame(0)
+        if frame.ndim == 3 and frame.shape[-1] == st.root["0"].shape[0]:
+            frame = np.moveaxis(frame, -1, 0)
+        ref = np.array(frame[:, 100:400, 200:600])
+    assert np.array_equal(st.root["0"][:, 100:400, 200:600], ref)
+    reg.remove(sid)
