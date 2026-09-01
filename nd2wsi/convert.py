@@ -260,10 +260,13 @@ def build_group_attrs(
     tile: int,
     windows: list[dict[str, float]],
 ) -> dict[str, Any]:
-    py, px = src.pixel_size_um
+    calibrated = src.pixel_size_um is not None
+    py, px = src.pixel_size_um if calibrated else (1.0, 1.0)
     datasets = []
     for k, (h, w) in enumerate(shapes):
         factor = 2**k
+        # uncalibrated files carry relative scales with no physical unit,
+        # never an invented micrometer value
         datasets.append(
             {
                 "path": str(k),
@@ -278,8 +281,8 @@ def build_group_attrs(
             "name": Path(src.source_name).name,
             "axes": [
                 {"name": "c", "type": "channel"},
-                {"name": "y", "type": "space", "unit": "micrometer"},
-                {"name": "x", "type": "space", "unit": "micrometer"},
+                {"name": "y", "type": "space", **({"unit": "micrometer"} if calibrated else {})},
+                {"name": "x", "type": "space", **({"unit": "micrometer"} if calibrated else {})},
             ],
             "datasets": datasets,
             "type": "2x2 local mean",
@@ -305,7 +308,11 @@ def build_group_attrs(
     nd2wsi = {
         "rgb": src.rgb,
         "source": Path(src.source_name).name,
-        "pixel_size_um": [py, px],
+        "pixel_size_um": [py, px] if calibrated else None,
+        "calibration": {
+            "status": "calibrated" if calibrated else "unknown",
+            "source": src.calibration_source,
+        },
         "dtype": str(src.dtype),
         "tile": tile,
         "levels": levels,

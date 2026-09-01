@@ -190,8 +190,12 @@ def open_svs(stack: ExitStack, path: str | Path, tile: int = 512) -> PlaneSource
         data = da.moveaxis(arr, -1, 0)  # (Y, X, S) -> (S, Y, X)
 
     meta = _aperio_meta(tf.pages[0].description or "")
-    mpp = float(meta.get("mpp", 1.0))
+    mpp = meta.get("mpp")
+    calibrated = mpp is not None and mpp > 0
     h, w = int(series.shape[0]), int(series.shape[1])
+    notes = [f"Aperio SVS baseline level ({w} x {h})"]
+    if not calibrated:
+        notes.append("no MPP in the Aperio metadata; measurements are in pixels")
     return PlaneSource(
         data=data,
         dtype=np.dtype(series.dtype),
@@ -202,11 +206,12 @@ def open_svs(stack: ExitStack, path: str | Path, tile: int = 512) -> PlaneSource
             ChannelInfo("Green", (0, 255, 0)),
             ChannelInfo("Blue", (0, 0, 255)),
         ],
-        pixel_size_um=(mpp, mpp),
+        pixel_size_um=(float(mpp), float(mpp)) if calibrated else None,
         source_name=str(path),
         selection={},
-        notes=[f"Aperio SVS baseline level ({w} x {h})"],
+        notes=notes,
         magnification=meta.get("magnification"),
+        calibration_source="aperio-mpp" if calibrated else "unknown",
     )
 
 

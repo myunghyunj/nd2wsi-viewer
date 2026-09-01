@@ -61,15 +61,45 @@ class PlaneSource:
     shape: tuple[int, int, int]  # (C, Y, X)
     rgb: bool
     channels: list[ChannelInfo]
-    pixel_size_um: tuple[float, float]  # (y, x)
+    pixel_size_um: tuple[float, float] | None  # (y, x); None = uncalibrated
     source_name: str
     selection: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     magnification: float | None = None  # objective magnification, if recorded
+    calibration_source: str = "unknown"  # nd2-voxel-size | aperio-mpp | unknown
 
 
 def _mid(n: int) -> int:
     return n // 2
+
+
+def _nd2_pixel_size(f: Any) -> tuple[tuple[float, float] | None, str]:
+    """The file's own (y, x) pixel size in um, or None when it has none.
+
+    ``voxel_size()`` alone cannot say: the nd2 reader substitutes 1.0 for a
+    missing calibration, exactly the fabrication this tool refuses to pass
+    on. The per-axis ``axesCalibrated`` flags carry the truth, so when they
+    are present they decide; when the metadata lacks them, the voxel size
+    is taken at its word.
+    """
+    try:
+        vol = f.metadata.channels[0].volume
+        flags = vol.axesCalibrated
+        if not (bool(flags[0]) and bool(flags[1])):
+            return None, "unknown"
+    except (AttributeError, IndexError, TypeError):
+        pass  # metadata variant without the flags: fall through
+    vs = f.voxel_size()
+    if vs is not None and _finite_positive(vs.x) and _finite_positive(vs.y):
+        return (float(vs.y), float(vs.x)), "nd2-voxel-size"
+    return None, "unknown"
+
+
+def _finite_positive(v: Any) -> bool:
+    try:
+        return v is not None and math.isfinite(float(v)) and float(v) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _channel_infos(f: Any, n_channels: int, rgb: bool) -> list[ChannelInfo]:
@@ -215,8 +245,9 @@ def open_plane(
 
     _, rgb = _frame_to_cyx(frame_view(0 if z_used == "max" else int(z_used)), sizes)
 
-    vs = f.voxel_size()
-    pixel_size = (float(vs.y or 1.0), float(vs.x or 1.0))
+    pixel_size, cal_source = _nd2_pixel_size(f)
+    if pixel_size is None:
+        notes.append("no pixel calibration in the file; measurements are in pixels")
 
     n_channels = int(data.shape[0])
     channels = _channel_infos(f, n_channels, rgb)
@@ -232,6 +263,7 @@ def open_plane(
         selection={"t": selection.t, "p": selection.p, "z": z_used},
         notes=notes,
         magnification=objective_magnification(f),
+        calibration_source=cal_source,
     )
 
 

@@ -222,11 +222,17 @@ def main(argv: list[str] | None = None) -> int:
         except (RuntimeError, ValueError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
-        wum, hum = res["um"]
+        if res["um"] is not None:
+            wum, hum = res["um"]
+            physical = f"({wum:.0f} x {hum:.0f} um) "
+            cal = f", {res['pixel_size_um']:.4f} um/px"
+        else:
+            physical = ""
+            cal = ", uncalibrated"
         print(
             f"wrote {args.out}: {res['w']} x {res['h']} px "
-            f"({wum:.0f} x {hum:.0f} um) at x={res['x']} y={res['y']}, "
-            f"channels {res['channels']}, {res['pixel_size_um']:.4f} um/px"
+            f"{physical}at x={res['x']} y={res['y']}, "
+            f"channels {res['channels']}{cal}"
         )
         return 0
 

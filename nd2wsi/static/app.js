@@ -579,13 +579,18 @@ function updateCursor(img) {
     $("pos-px").textContent = "–";
     return;
   }
-  const [py, px] = state.info.pixelSizeUm;
-  $("pos-um").textContent = fmtUm(img.x * px) + " , " + fmtUm(img.y * py);
+  const ps = pixelSize();
+  $("pos-um").textContent = ps ? fmtUm(img.x * ps[1]) + " , " + fmtUm(img.y * ps[0]) : "uncalibrated";
   $("pos-px").textContent = fmtInt(img.x) + " , " + fmtInt(img.y) + " px";
 }
 
 function updateScalebar(iz) {
-  const px = state.info.pixelSizeUm[1];
+  if (!pixelSize()) {
+    $("scalebar").style.display = "none";
+    $("scalebar-label").textContent = "";
+    return;
+  }
+  const px = pixelSize()[1];
   const umPerScreenPx = px / iz;
   const target = 110 * umPerScreenPx; // aim for a ~110 px bar
   const nice = niceLength(target);
@@ -832,13 +837,26 @@ function setAnnStatus(msg) {
   $("ann-status").textContent = msg || "";
 }
 
+function pixelSize() {
+  // (py, px) in um, or null for an uncalibrated slide — every physical
+  // readout must go through here and cope with null
+  return state.info && state.info.pixelSizeUm ? state.info.pixelSizeUm : null;
+}
+
 function basename(p) {
   return p ? String(p).split("/").pop() : "";
 }
 
 function lineLengthUm(a) {
-  const [py, px] = state.info.pixelSizeUm;
-  return Math.hypot((a.x2 - a.x1) * px, (a.y2 - a.y1) * py);
+  const ps = pixelSize();
+  const dpx = Math.hypot(a.x2 - a.x1, a.y2 - a.y1);
+  return ps ? Math.hypot((a.x2 - a.x1) * ps[1], (a.y2 - a.y1) * ps[0]) : null;
+}
+
+function lineLengthLabel(a) {
+  const um = lineLengthUm(a);
+  if (um !== null) return fmtUm(um);
+  return fmtInt(Math.hypot(a.x2 - a.x1, a.y2 - a.y1)) + " px";
 }
 
 function toEl(x, y) {
@@ -921,7 +939,7 @@ function renderAnnotations() {
         stroke: col, "stroke-width": 1.5,
       }, g);
     }
-    const label = fmtUm(lineLengthUm(a)) + (a.text ? " · " + a.text : "");
+    const label = lineLengthLabel(a) + (a.text ? " · " + a.text : "");
     const mx = (p1.x + p2.x) / 2 + (-dy / len) * 14 - 20;
     const my = (p1.y + p2.y) / 2 + (dx / len) * 14 - 9;
     chip(layer, mx, my, label, isTemp ? null : a.id);
@@ -1047,7 +1065,7 @@ function rebuildAnnList() {
       a.type === "line" ? (a.text || "Measurement") : (a.text || (a.type === "pin" ? "Pin" : "Box"));
     const meta = document.createElement("span");
     meta.className = "meta";
-    meta.textContent = a.type === "line" ? fmtUm(lineLengthUm(a)) : "";
+    meta.textContent = a.type === "line" ? lineLengthLabel(a) : "";
     const del = document.createElement("button");
     del.className = "del";
     del.title = "Delete";
@@ -1156,15 +1174,23 @@ function clearRoi() {
 function updateRoiPanel() {
   const r = state.roi;
   if (!r) return;
-  const [py, px] = state.info.pixelSizeUm;
+  const ps = pixelSize();
   const put = (id, v) => {
     const el = $(id);
     if (document.activeElement !== el) el.value = v; // don't clobber typing
   };
   put("roi-px-w", Math.round(r.w));
   put("roi-px-h", Math.round(r.h));
-  put("roi-um-w", (r.w * px).toFixed(1));
-  put("roi-um-h", (r.h * py).toFixed(1));
+  if (ps) {
+    put("roi-um-w", (r.w * ps[1]).toFixed(1));
+    put("roi-um-h", (r.h * ps[0]).toFixed(1));
+  } else {
+    for (const id of ["roi-um-w", "roi-um-h"]) {
+      $(id).value = "";
+      $(id).disabled = true;
+      $(id).title = "Calibration unavailable — the file carries no pixel size";
+    }
+  }
   const itemsize = dtypeBytes(state.info.dtype);
   const nCh = state.info.rgb ? 3 : state.channels.length;
   $("roi-bytes").textContent = "≈ " + fmtBytes(r.w * r.h * nCh * itemsize);
@@ -1290,7 +1316,9 @@ function applyRoiDims(unit) {
   const r = state.roi;
   if (!r) return;
   const info = state.info;
-  const [py, px] = info.pixelSizeUm;
+  const ps = pixelSize();
+  if (unit === "um" && !ps) return; // no physical entry without calibration
+  const [py, px] = ps || [1, 1];
   const num = (id) => parseFloat(String($(id).value).replace(/[,\s]/g, ""));
   let w;
   let h;

@@ -58,7 +58,7 @@ def write_nd2(
     height: int,
     width: int,
     dtype: np.dtype,
-    pixel_size_um: float,
+    pixel_size_um: float | None,
     planes: list[dict[str, Any]],
     magnification: float | None = None,
     on_progress: Callable[[float], None] | None = None,
@@ -84,7 +84,11 @@ def write_nd2(
         bits=bits,
         sequence_count=1,
     )
-    mf_kwargs: dict[str, Any] = {"pixel_calibration": float(pixel_size_um)}
+    # an uncalibrated export leaves the writer at its own uncalibrated
+    # default rather than stamping a fabricated micrometer value
+    mf_kwargs: dict[str, Any] = {}
+    if pixel_size_um is not None:
+        mf_kwargs["pixel_calibration"] = float(pixel_size_um)
     if magnification:
         mf_kwargs["objective_magnification"] = float(magnification)
 
@@ -106,6 +110,28 @@ def write_nd2(
         for pl in planes:
             mf.addPlane(name=pl.get("name") or None, color=pl.get("color") or None)
         f.pictureMetadata = mf.createMetadata()
+
+
+def _scalar_calibration(pair: Any) -> float | None:
+    """One scalar for the ND2 writer, or None when that would lie.
+
+    The writer takes a single calibration value. Anisotropic pixels cannot
+    be represented by one number, so past a 0.1% imbalance the export goes
+    out uncalibrated with a warning instead of silently isotropizing.
+    """
+    if not pair:
+        return None
+    py, px = float(pair[0]), float(pair[1])
+    if abs(px - py) > 0.001 * max(abs(px), abs(py), 1e-12):
+        import warnings
+
+        warnings.warn(
+            f"anisotropic pixels ({px:.4f} x {py:.4f} um): the ND2 format "
+            "takes one calibration scalar, so this export is uncalibrated",
+            stacklevel=3,
+        )
+        return None
+    return px
 
 
 def _store_planes(attrs: dict[str, Any], channels: list[int]) -> list[dict[str, Any]]:
@@ -130,7 +156,7 @@ def export_roi_nd2(
     levels = meta["levels"]
     arr = root[levels[level]["path"]]
     factor = levels[level]["downsample"]
-    py, px = meta["pixel_size_um"]
+    px = _scalar_calibration(meta.get("pixel_size_um"))
 
     def get_band(ty: int, th: int) -> np.ndarray:
         block = np.asarray(arr[channels, y + ty : y + ty + th, x : x + w])
@@ -142,7 +168,7 @@ def export_roi_nd2(
         height=h,
         width=w,
         dtype=np.dtype(meta["dtype"]),
-        pixel_size_um=px * factor,
+        pixel_size_um=None if px is None else px * factor,
         planes=_store_planes(attrs, channels),
         magnification=meta.get("objective_magnification"),
         on_progress=on_progress,
@@ -186,7 +212,8 @@ def crop_nd2_to_nd2(
             block = data[chans, y + ty : y + ty + th, x : x + w].compute()
             return np.moveaxis(np.asarray(block), 0, -1)
 
-        py_um, px_um = src.pixel_size_um
+        px_um = _scalar_calibration(src.pixel_size_um)
+        py_um = px_um
         planes = [
             {
                 "name": src.channels[ci].name,
@@ -210,6 +237,6 @@ def crop_nd2_to_nd2(
         "w": w,
         "h": h,
         "channels": chans,
-        "um": (w * px_um, h * py_um),
+        "um": None if px_um is None else (w * px_um, h * py_um),
         "pixel_size_um": px_um,
     }

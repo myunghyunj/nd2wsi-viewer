@@ -267,10 +267,17 @@ def export_roi_tiff(
     level_path = levels[level]["path"]
     tile = min(int(meta["tile"]), 512)
     dtype = np.dtype(meta["dtype"])
-    py, px = meta["pixel_size_um"]
     factor = levels[level]["downsample"]
-    # pixels per centimeter at this level
-    res = (1e4 / (px * factor), 1e4 / (py * factor))
+    # pixels per centimeter at this level; an uncalibrated store gets no
+    # resolution tags at all rather than tags built from an invented value
+    if meta.get("pixel_size_um"):
+        py, px = meta["pixel_size_um"]
+        res_kw = {
+            "resolution": (1e4 / (px * factor), 1e4 / (py * factor)),
+            "resolutionunit": "CENTIMETER",
+        }
+    else:
+        res_kw = {}
 
     def counted(it: Iterator[np.ndarray], total: int) -> Iterator[np.ndarray]:
         for n, block in enumerate(it, 1):
@@ -289,8 +296,7 @@ def export_roi_tiff(
                 dtype=dtype,
                 tile=(tile, tile),
                 photometric="rgb",
-                resolution=res,
-                resolutionunit="CENTIMETER",
+                **res_kw,
                 compression="zlib",
                 description=(
                     f"nd2wsi ROI from {meta['source']} level {level} "
@@ -303,8 +309,7 @@ def export_roi_tiff(
                 dtype=dtype,
                 tile=(tile, tile),
                 photometric="minisblack",
-                resolution=res,
-                resolutionunit="CENTIMETER",
+                **res_kw,
                 compression="zlib",
                 description=(
                     f"nd2wsi ROI from {meta['source']} level {level} "

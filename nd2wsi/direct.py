@@ -220,7 +220,8 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         if fd >= 0:
             os.close(fd)
         raise
-    mpp = float(meta.get("mpp", 1.0))
+    mpp = meta.get("mpp")
+    calibrated = mpp is not None and mpp > 0
     src_info = PlaneSource(
         data=None,
         dtype=np.dtype(np.uint8),
@@ -231,11 +232,12 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
             ChannelInfo("Green", (0, 255, 0)),
             ChannelInfo("Blue", (0, 0, 255)),
         ],
-        pixel_size_um=(mpp, mpp),
+        pixel_size_um=(float(mpp), float(mpp)) if calibrated else None,
         source_name=str(path),
         selection={},
         notes=[f"served straight from the SVS ({len(embedded)} embedded levels)"],
         magnification=meta.get("magnification"),
+        calibration_source="aperio-mpp" if calibrated else "unknown",
     )
     windows = [{"start": 0.0, "end": 255.0, "min": 0.0, "max": 255.0}] * 3
     attrs = build_group_attrs(src_info, shapes, 512, windows)
