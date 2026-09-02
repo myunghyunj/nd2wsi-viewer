@@ -12,6 +12,32 @@
   <div id="chrome-pad" class="pywebview-drag-region"></div>
   <button id="newtab" type="button" title="Open another slide" aria-label="Open another slide">+</button>
   <div id="tabbar-space" class="pywebview-drag-region"></div>
+  <button id="compare-toggle" class="shell-icon-button" type="button"
+          title="Compare slides (⌘\)" aria-label="Compare slides"
+          aria-haspopup="menu" aria-expanded="false"
+          aria-controls="compare-picker-list" disabled>
+    <svg class="hotspot-icon" viewBox="0 0 28 18" aria-hidden="true">
+      <path d="M11.2 4.2H8.5a4.8 4.8 0 0 0 0 9.6h2.7" />
+      <path d="M16.8 4.2h2.7a4.8 4.8 0 0 1 0 9.6h-2.7" />
+      <path d="M9.7 9h8.6" />
+    </svg>
+  </button>
+  <section id="compare-picker" aria-labelledby="compare-picker-title" hidden>
+    <div class="compare-picker-head">
+      <div class="compare-picker-heading">
+        <div class="compare-picker-eyebrow">Compare from</div>
+        <div id="compare-picker-title">Choose a slide to link</div>
+      </div>
+      <button id="compare-picker-close" type="button"
+              aria-label="Cancel slide selection">×</button>
+    </div>
+    <div class="compare-picker-current">
+      <span>Current slide</span>
+      <strong id="compare-picker-current-name"></strong>
+    </div>
+    <div id="compare-picker-list" role="menu"
+         aria-label="Choose another open slide"></div>
+  </section>
 </div>
 <div id="frames">
   <div id="empty" hidden>
@@ -19,6 +45,33 @@
       <div class="pyr" aria-hidden="true"><div class="l1"></div><div class="l2"></div><div class="l3"></div></div>
       <h1>Drop a slide to open</h1>
       <div class="sub"><b>.nd2</b>, <b>.svs</b>, or press + to browse</div>
+    </div>
+  </div>
+  <div id="compare-divider" hidden aria-hidden="true">
+    <div id="compare-controls" role="toolbar" aria-label="Approximate slide alignment">
+      <span id="compare-status">Approximate alignment</span>
+      <button id="compare-link" class="compare-control linked" type="button"
+              aria-label="Unlink views" aria-pressed="true">
+        <svg class="hotspot-icon" viewBox="0 0 28 18" aria-hidden="true">
+          <path d="M11.2 4.2H8.5a4.8 4.8 0 0 0 0 9.6h2.7" />
+          <path d="M16.8 4.2h2.7a4.8 4.8 0 0 1 0 9.6h-2.7" />
+          <path d="M9.7 9h8.6" />
+        </svg>
+      </button>
+      <button id="compare-swap" class="compare-control" type="button"
+              title="Swap sides" aria-label="Swap compared slides">⇄</button>
+      <button id="compare-rotate" class="compare-control text-control" type="button"
+              title="Toggle the 180° SVS–ND2 scan orientation"
+              aria-label="Rotate compared orientation 180 degrees"
+              aria-pressed="false">180°</button>
+      <button id="compare-mirror" class="compare-control text-control" type="button"
+              title="Mirror the moving slide left-to-right"
+              aria-label="Mirror compared orientation left to right"
+              aria-pressed="false">Mirror</button>
+      <button id="compare-reset" class="compare-control text-control" type="button"
+              title="Reset alignment" aria-label="Reset approximate alignment">Reset</button>
+      <button id="compare-close" class="compare-control" type="button"
+              title="Close compare" aria-label="Close compare">×</button>
     </div>
   </div>
 </div>

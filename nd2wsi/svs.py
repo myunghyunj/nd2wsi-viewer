@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from contextlib import ExitStack
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,9 @@ import numpy as np
 from .reader import ChannelInfo, PlaneSource
 
 SVS_SUFFIXES = {".svs"}
+ASSOCIATED_IMAGE_NAMES = ("thumbnail", "label", "macro")
+ASSOCIATED_MAX_PIXELS = 50_000_000
+ASSOCIATED_MAX_DECODE_BYTES = 64 * 1024 * 1024
 IMAGECODECS_HINT = (
     "reading SVS needs the 'imagecodecs' package for its JPEG tiles: "
     "pip install \"nd2wsi-viewer[svs]\"  (or: pip install imagecodecs)"
@@ -32,6 +36,170 @@ IMAGECODECS_HINT = (
 
 def is_svs(path: str | Path) -> bool:
     return Path(path).suffix.lower() in SVS_SUFFIXES
+
+
+def _associated_series_name(series: Any) -> str | None:
+    """Map a tifffile auxiliary series to the public whitelist.
+
+    Aperio normally supplies ``series.name``. Looking at the description
+    first also handles mixed-case metadata and files where tifffile groups a
+    macro after a label under a repeated generic series name.
+    """
+    page = series.pages[0]
+    description = (page.description or "").strip().lower()
+    for name in ASSOCIATED_IMAGE_NAMES:
+        if re.match(rf"^{name}\b", description):
+            return name
+    series_name = str(getattr(series, "name", "") or "").strip().lower()
+    return series_name if series_name in ASSOCIATED_IMAGE_NAMES else None
+
+
+def associated_image_names(path: str | Path) -> list[str]:
+    """Available whitelisted Aperio auxiliary images, in stable UI order."""
+    import tifffile
+
+    found = set()
+    with tifffile.TiffFile(str(path)) as tf:
+        for series in tf.series[1:]:
+            name = _associated_series_name(series)
+            if name is not None:
+                found.add(name)
+    return [name for name in ASSOCIATED_IMAGE_NAMES if name in found]
+
+
+def _uint8_associated(array: np.ndarray) -> np.ndarray:
+    if array.dtype == np.uint8:
+        return array
+    if array.dtype == np.bool_:
+        return array.astype(np.uint8) * 255
+    if np.issubdtype(array.dtype, np.integer):
+        info = np.iinfo(array.dtype)
+        scale = 255.0 / max(1, info.max - info.min)
+        return np.clip((array.astype(np.float32) - info.min) * scale, 0, 255).astype(
+            np.uint8
+        )
+    data = np.asarray(array, dtype=np.float32)
+    finite = data[np.isfinite(data)]
+    if not finite.size:
+        return np.zeros(data.shape, dtype=np.uint8)
+    lo, hi = float(finite.min()), float(finite.max())
+    if 0 <= lo and hi <= 1:
+        lo, hi = 0.0, 1.0
+    data = np.nan_to_num(data, nan=lo, posinf=hi, neginf=lo)
+    return np.clip((data - lo) * (255.0 / max(hi - lo, 1e-12)), 0, 255).astype(
+        np.uint8
+    )
+
+
+def _validate_associated_shape(series: Any, name: str) -> None:
+    """Reject unsupported or memory-heavy auxiliary series before decoding."""
+    shape = tuple(int(value) for value in series.shape)
+    if not shape or any(value <= 0 for value in shape):
+        raise ValueError(f"unsupported associated image layout {shape}")
+    axes = str(getattr(series, "axes", "") or "")
+    channel_axis = None
+    if len(axes) == len(shape):
+        channel_axis = next(
+            (
+                index
+                for index, axis_name in enumerate(axes)
+                if axis_name.upper() in ("S", "C") and shape[index] in (1, 3, 4)
+            ),
+            None,
+        )
+    if channel_axis is None and len(shape) >= 3 and shape[-1] in (1, 3, 4):
+        channel_axis = len(shape) - 1
+    spatial = [
+        value
+        for index, value in enumerate(shape)
+        if index != channel_axis and value != 1
+    ]
+    if len(spatial) != 2:
+        raise ValueError(f"unsupported associated image layout {shape}")
+
+    pixels = spatial[0] * spatial[1]
+    samples = 1
+    for value in shape:
+        samples *= value
+    decoded_bytes = samples * np.dtype(series.dtype).itemsize
+    if (
+        pixels > ASSOCIATED_MAX_PIXELS
+        or decoded_bytes > ASSOCIATED_MAX_DECODE_BYTES
+    ):
+        raise ValueError(f"associated {name} image is unexpectedly large")
+
+
+def associated_image_jpeg(
+    path: str | Path, name: str, *, max_side: int = 512
+) -> bytes:
+    """Decode one whitelisted SVS auxiliary series as a bounded JPEG."""
+    import tifffile
+    from PIL import Image
+
+    name = name.lower()
+    if name not in ASSOCIATED_IMAGE_NAMES:
+        raise KeyError(name)
+    with tifffile.TiffFile(str(path)) as tf:
+        series = next(
+            (s for s in tf.series[1:] if _associated_series_name(s) == name),
+            None,
+        )
+        if series is None:
+            raise KeyError(name)
+        _validate_associated_shape(series, name)
+        array = np.asarray(series.asarray())
+        axes = str(getattr(series, "axes", "") or "")
+        orientation_tag = series.pages[0].tags.get("Orientation")
+        orientation = int(orientation_tag.value) if orientation_tag is not None else 1
+
+    if axes and len(axes) == array.ndim:
+        for axis in range(array.ndim - 1, -1, -1):
+            if array.shape[axis] == 1:
+                array = np.squeeze(array, axis=axis)
+                axes = axes[:axis] + axes[axis + 1 :]
+    else:
+        array = np.squeeze(array)
+        axes = ""
+
+    if array.ndim == 3:
+        channel_axis = next(
+            (
+                i
+                for i, axis_name in enumerate(axes)
+                if axis_name.upper() in ("S", "C") and array.shape[i] in (1, 3, 4)
+            ),
+            None,
+        )
+        if channel_axis is None and array.shape[-1] in (1, 3, 4):
+            channel_axis = array.ndim - 1
+        if channel_axis is None:
+            raise ValueError(f"unsupported associated image layout {array.shape}")
+        array = np.moveaxis(array, channel_axis, -1)
+        if array.shape[-1] == 1:
+            array = array[..., 0]
+    if array.ndim not in (2, 3) or (array.ndim == 3 and array.shape[-1] not in (3, 4)):
+        raise ValueError(f"unsupported associated image layout {array.shape}")
+
+    array = _uint8_associated(np.ascontiguousarray(array))
+    image = Image.fromarray(array)
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+    transforms = {
+        2: Image.Transpose.FLIP_LEFT_RIGHT,
+        3: Image.Transpose.ROTATE_180,
+        4: Image.Transpose.FLIP_TOP_BOTTOM,
+        5: Image.Transpose.TRANSPOSE,
+        6: Image.Transpose.ROTATE_270,
+        7: Image.Transpose.TRANSVERSE,
+        8: Image.Transpose.ROTATE_90,
+    }
+    if orientation in transforms:
+        image = image.transpose(transforms[orientation])
+    image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    image = image.convert("RGB")
+    out = BytesIO()
+    image.save(out, format="JPEG", quality=88)
+    return out.getvalue()
 
 
 def _require_imagecodecs() -> None:

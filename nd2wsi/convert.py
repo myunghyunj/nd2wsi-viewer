@@ -237,24 +237,76 @@ def _downsample_into(
     dask.compute(*tasks)
 
 
+def _background_mode_start(
+    channel: np.ndarray,
+    end: float,
+    fallback: float,
+    *,
+    bins: int = 256,
+    right_peak_fraction: float = 0.70,
+) -> float:
+    """A fluorescence background peak, with a bright-background escape hatch.
+
+    The modal bin is a useful black point when background occupies the low
+    side of a fluorescence histogram. It is the wrong black point for a
+    transmitted-light/BF channel, whose background peak normally sits near
+    the white end. In that case keep the percentile fallback instead of
+    collapsing the display window around the bright peak.
+
+    Using edges[argmax] is intentional: datasets whose minimum is not zero
+    must not lose the histogram origin by treating a bin index as a value.
+    """
+    data = np.asarray(channel).ravel()
+    if np.issubdtype(data.dtype, np.floating):
+        data = data[np.isfinite(data)]
+    if not data.size or not np.isfinite(end) or not np.isfinite(fallback):
+        return float(fallback)
+    low = float(np.min(data))
+    if end <= low or end <= fallback:
+        return float(fallback)
+    counts, edges = np.histogram(np.minimum(data, end), bins=bins, range=(low, end))
+    mode = float(edges[int(np.argmax(counts))])
+    if mode >= fallback + right_peak_fraction * (end - fallback):
+        return float(fallback)
+    return mode
+
+
 def _percentile_windows(
     root: Any, level_paths: list[str], src: PlaneSource
 ) -> list[dict[str, float]]:
     """Per-channel display windows from the smallest pyramid level."""
     small = np.asarray(root[level_paths[-1]][:])
     info = np.iinfo(src.dtype) if np.issubdtype(src.dtype, np.integer) else None
-    lo_all = float(info.min) if info else float(np.nanmin(small))
-    hi_all = float(info.max) if info else float(np.nanmax(small))
+    finite_small = (
+        small[np.isfinite(small)]
+        if np.issubdtype(small.dtype, np.floating)
+        else small.ravel()
+    )
+    if info:
+        lo_all, hi_all = float(info.min), float(info.max)
+    elif finite_small.size:
+        lo_all, hi_all = float(np.min(finite_small)), float(np.max(finite_small))
+    else:
+        lo_all, hi_all = 0.0, 1.0
     windows = []
     for ci in range(small.shape[0]):
         ch = small[ci]
         if src.rgb:
             start, end = 0.0, 255.0
         else:
-            start = float(np.percentile(ch, 1.0))
-            end = float(np.percentile(ch, 99.8))
-            if end <= start:
-                end = start + 1.0
+            values = (
+                ch[np.isfinite(ch)]
+                if np.issubdtype(ch.dtype, np.floating)
+                else ch.ravel()
+            )
+            if values.size:
+                fallback = float(np.percentile(values, 1.0))
+                end = float(np.percentile(values, 99.8))
+                start = _background_mode_start(values, end, fallback)
+                if end <= start:
+                    end = start + 1.0
+            else:
+                start, end = 0.0, 1.0
         windows.append({"start": start, "end": end, "min": lo_all, "max": hi_all})
     return windows
 

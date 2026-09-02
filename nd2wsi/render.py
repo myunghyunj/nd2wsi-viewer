@@ -187,12 +187,25 @@ def compute_histograms(
     out = []
     for ci in range(data.shape[0]):
         ch = data[ci].ravel()
+        if np.issubdtype(ch.dtype, np.floating):
+            ch = ch[np.isfinite(ch)]
+        dmin = float(ch.min()) if ch.size else 0.0
         dmax = float(ch.max()) if ch.size else 1.0
-        vmax = min(float(np.percentile(ch, 99.9)) * 1.3, dmax)
         win = attrs["omero"]["channels"][ci].get("window", {})
-        vmax = max(vmax, float(win.get("end", 0)) * 1.1, 1.0)
-        counts, _ = np.histogram(np.minimum(ch, vmax), bins=bins, range=(0, vmax))
-        out.append({"bins": [int(c) for c in counts], "vmax": vmax, "level": pick["path"]})
+        vmin = min(dmin, float(win.get("start", dmin)))
+        robust_high = float(np.percentile(ch, 99.9)) if ch.size else dmax
+        vmax = min(vmin + (robust_high - vmin) * 1.3, dmax)
+        window_high = float(win.get("end", vmax))
+        vmax = max(vmax, vmin + (window_high - vmin) * 1.1, vmin + 1.0)
+        counts, _ = np.histogram(np.clip(ch, vmin, vmax), bins=bins, range=(vmin, vmax))
+        out.append(
+            {
+                "bins": [int(c) for c in counts],
+                "vmin": vmin,
+                "vmax": vmax,
+                "level": pick["path"],
+            }
+        )
     return out
 
 

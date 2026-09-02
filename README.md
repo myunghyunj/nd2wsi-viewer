@@ -32,8 +32,11 @@ Nothing is uploaded.
 - Opens stitched Nikon `.nd2` and Aperio `.svs` slides.
 - Pans and zooms from a full-slide overview to native pixels.
 - Controls fluorescence channels, colors, windows, gamma, and histograms.
+- Reads native pixel values under the cursor and inspects slide/cache metadata.
+- Compares two slides with linked calibrated navigation and a manual alignment offset.
 - Measures calibrated distances.
 - Stores rulers, pins, boxes, and notes in a JSON sidecar.
+- Exports annotations as QuPath-compatible GeoJSON.
 - Exports a selected region as ND2, TIFF, PNG, or JPEG.
 - Preserves raw values in ND2 and TIFF exports.
 - Opens several slides in tabs.
@@ -172,7 +175,9 @@ nd2wsi tidy /path/to/slides --move-annotations
 
 ![Channel histogram and LUT controls](docs/channels-luts.png)
 
-Each fluorescence channel has its own color, display window, gamma, histogram, and visibility switch. `Auto` sets a robust display range. Shift-drag moves all windows together.
+Each fluorescence channel has its own color, display window, gamma, histogram, and visibility switch. `Auto` places the low threshold at the dominant background peak and the high threshold at the 99.9th percentile. A bright-background guard keeps BF-like channels on the percentile fallback instead of collapsing the range around white. Shift-drag moves all windows together.
+
+Display defaults already stored in an existing cache stay unchanged until you press `Auto` or rebuild that cache.
 
 Display changes affect viewer tiles and rendered PNG or JPEG files. They do not alter raw ND2 or TIFF values.
 
@@ -193,13 +198,40 @@ The chrome follows the slide. A brightfield color slide such as an SVS opens in 
 | `V` | move the selected region |
 | `0` | fit the slide |
 | `Esc` | cancel the active tool |
+| `I` | show or hide the Pixel Inspector HUD |
 | `⌘1` | show or hide Channels and LUTs |
 | `⌘2` | show or hide Region |
 | `⌘3` | show or hide Annotate |
+| `⌘I` | show or hide Slide Info |
+| `⌘⇧E` | export annotations as GeoJSON |
+| `⌘\` | start or stop side-by-side Compare |
+| `L` | link or unlink compared views |
 
 Measurements use the calibration stored in the source. Without calibration, the viewer reports pixels.
 
 Annotations use level-0 pixel coordinates. Their sidecar records the source name, dimensions, selected plane, and calibration state. A mismatched sidecar is not applied silently.
+
+Pins, rulers, and boxes can also be exported as a GeoJSON FeatureCollection for import into QuPath. The coordinates remain level-0 image pixels.
+
+### Inspect a slide
+
+Move over the image to see raw channel values in the Pixel status cell. Press `I` for a cursor-following HUD. The probe reports native values for a complete slide; if only a reduced cached overview survives, it says that the value is an overview mean.
+
+Open Slide Info with `⌘I` or the info button. It shows provenance, calibration source, objective, selected plane, pyramid levels, and both logical and allocated cache size. For Aperio SVS files it also shows whichever thumbnail, label, and macro images actually exist. Copy and Finder reveal actions operate only on the currently registered slide paths.
+
+### Compare serial sections
+
+Open at least two slides, then press `⌘\` or click the Personal Hotspot-style link button. The active slide stays as the reference. With two slides, Compare links the only available partner immediately; with three or more, it asks which other open slide to link. Neither slide is reloaded.
+
+When both slides are calibrated, linked navigation maps the center and field of view in micrometers. Otherwise it falls back to relative image coordinates. Press `L` or click the link control to unlink, align either view manually, then relink; the viewer captures that translation as the approximate alignment. Reset removes the manual offset.
+
+In this acquisition workflow, SVS and ND2 coordinates run in opposite horizontal and vertical directions. A mixed SVS–ND2 pair therefore starts with a 180° orientation automatically: the ND2 pane is visually rotated while linked navigation maps both reversed axes.
+
+The **180°** and **Mirror** controls are independent and preserve the current center. Mirror reverses the moving slide left-to-right; using it together with 180° gives the corresponding top-to-bottom reflection. Reset restores the format-based orientation, removes Mirror, and clears the manual offset.
+
+The rotation and reflection are display-only. Pixel readouts, regions, annotations, GeoJSON, and all exported pixels remain in the source slide's native coordinate system.
+
+This is intentionally a coarse navigation aid for serial sections. It does not claim cell-level registration, infer orientation from tissue appearance, compensate arbitrary rotation or deformation, or imply that cells in sections separated in depth are the same cells.
 
 ### Export a region
 
