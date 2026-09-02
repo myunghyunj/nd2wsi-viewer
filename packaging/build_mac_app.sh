@@ -121,6 +121,11 @@ print("   document types declared")
 PLISTEOF
 
 echo "==> codesign (ad-hoc)"
+# A checkout inside an iCloud-synced folder gets Finder and file-provider
+# attributes stamped onto the fresh bundle, and codesign refuses those as
+# "detritus". Clear every extended attribute first; none of them belongs
+# in a shipped app.
+xattr -cr "$OUT/$APPNAME.app"
 codesign --force --deep -s - "$OUT/$APPNAME.app"
 
 echo "==> smoke test"

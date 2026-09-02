@@ -13,3 +13,6 @@ docs/*.nd2
 docs/*.tmp
 testdata/
 venv/
+
+# viewer caches beside the example slides; the manifest is useless without its pixels
+docs/nd2wsi/
