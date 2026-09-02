@@ -39,6 +39,8 @@ const state = {
     displayRotation: 0,
     displayFlipped: false,
     transformWaitingForOpen: false,
+    altHeld: false, // Option held: a drag adjusts the alignment instead of both views
+    compare: null, // what the shell says about this pane's part in Compare
   },
 };
 
@@ -276,11 +278,22 @@ function buildViewer() {
 
   const stage = $("stage");
   stage.addEventListener("mousemove", (ev) => {
+    state.viewportRelay.altHeld = ev.altKey;
     const pt = elementPoint(ev, stage);
     const img = viewerElementToImagePoint(pt);
     updateCursor(img, pt);
   });
   stage.addEventListener("mouseleave", () => updateCursor(null, null));
+  stage.addEventListener("pointerdown", (ev) => {
+    state.viewportRelay.altHeld = ev.altKey;
+  }, true);
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Alt") state.viewportRelay.altHeld = true;
+  });
+  window.addEventListener("keyup", (ev) => {
+    if (ev.key === "Alt") state.viewportRelay.altHeld = false;
+  });
+  window.addEventListener("blur", () => { state.viewportRelay.altHeld = false; });
 
   $("zoom-in").onclick = () => viewer.viewport.zoomBy(1.6).applyConstraints();
   $("zoom-out").onclick = () => viewer.viewport.zoomBy(1 / 1.6).applyConstraints();
@@ -2305,6 +2318,10 @@ function viewportSnapshot() {
       y: Math.max(1e-6, Math.abs(bottomRight.y - topLeft.y)),
     },
     imagePx: { x: state.info.width, y: state.info.height },
+    containerPx: (() => {
+      const size = viewer.viewport.getContainerSize();
+      return { x: Math.max(1, size.x), y: Math.max(1, size.y) };
+    })(),
     pixelSizeUm: calibrated
       ? { x: Number(pixelSize[1]), y: Number(pixelSize[0]) }
       : null,
@@ -2331,8 +2348,32 @@ function scheduleViewportState() {
   if (state.viewportRelay.timer) return;
   state.viewportRelay.timer = setTimeout(() => {
     state.viewportRelay.timer = null;
-    if (Date.now() >= state.viewportRelay.suppressUntil) postViewportState("user");
+    if (Date.now() < state.viewportRelay.suppressUntil) return;
+    // An Option-drag moves only this pane. The shell reads the resulting
+    // relative position as the new alignment instead of steering the partner.
+    postViewportState("user", state.viewportRelay.altHeld ? { nudge: true } : {});
   }, VIEWPORT_EMIT_MS);
+}
+
+function nudgeView(dxPx, dyPx) {
+  // Move this pane's picture by a screen-pixel delta, whatever its display
+  // rotation or mirror, then report the move as an alignment nudge.
+  const viewer = state.viewer;
+  if (!viewer?.viewport || !viewer.world || !viewer.world.getItemCount()) return;
+  const dx = Number(dxPx), dy = Number(dyPx);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || (!dx && !dy)) return;
+  const viewport = viewer.viewport;
+  const size = viewport.getContainerSize();
+  const origin = { x: size.x / 2, y: size.y / 2 };
+  const a = viewerElementToImagePoint(origin);
+  const b = viewerElementToImagePoint({ x: origin.x + dx, y: origin.y + dy });
+  const center = viewport.viewportToImageCoordinates(viewport.getCenter(true));
+  const target = new OpenSeadragon.Point(center.x - (b.x - a.x), center.y - (b.y - a.y));
+  clearTimeout(state.viewportRelay.timer);
+  state.viewportRelay.timer = null;
+  state.viewportRelay.suppressUntil = Date.now() + 180;
+  viewport.panTo(viewport.imageToViewportCoordinates(target), true);
+  postViewportState("user", { nudge: true });
 }
 
 function finiteViewportPoint(value, positive = false) {
@@ -2387,10 +2428,40 @@ function wireCompareRelay() {
       else state.viewer.addOnceHandler("open", reply);
     } else if (event.data.nd2wsi === "viewport-apply") {
       applyLinkedViewport(event.data);
+    } else if (event.data.nd2wsi === "viewport-nudge") {
+      nudgeView(event.data.dxPx, event.data.dyPx);
     } else if (event.data.nd2wsi === "display-transform") {
       applyDisplayTransform(event.data);
+    } else if (event.data.nd2wsi === "compare-state") {
+      state.viewportRelay.compare = {
+        enabled: Boolean(event.data.enabled),
+        linked: Boolean(event.data.linked),
+        moving: Boolean(event.data.moving),
+      };
     }
   });
+  // Arrow keys nudge the alignment while linked. This runs in the capture
+  // phase so OpenSeadragon's own arrow-key panning never sees the event.
+  window.addEventListener("keydown", (ev) => {
+    const compare = state.viewportRelay.compare;
+    if (window.parent === window || !compare?.enabled || !compare.linked) return;
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const step = ev.shiftKey ? 10 : 1;
+    const delta = {
+      ArrowLeft: [-step, 0], ArrowRight: [step, 0],
+      ArrowUp: [0, -step], ArrowDown: [0, step],
+    }[ev.key];
+    if (!delta) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    window.parent.postMessage({
+      nd2wsi: "compare-nudge",
+      version: VIEWPORT_PROTOCOL_VERSION,
+      dxPx: delta[0],
+      dyPx: delta[1],
+    }, location.origin);
+  }, true);
   if (window.parent !== window) {
     window.parent.postMessage({
       nd2wsi: "viewport-ready",

@@ -26,7 +26,7 @@
     <div class="compare-picker-head">
       <div class="compare-picker-heading">
         <div class="compare-picker-eyebrow">Compare from</div>
-        <div id="compare-picker-title">Choose a slide to link</div>
+        <div id="compare-picker-title">Choose the slide to link</div>
       </div>
       <button id="compare-picker-close" type="button"
               aria-label="Cancel slide selection">×</button>
@@ -50,6 +50,12 @@
   <div id="compare-divider" hidden aria-hidden="true">
     <div id="compare-controls" role="toolbar" aria-label="Approximate slide alignment">
       <span id="compare-status">Approximate alignment</span>
+      <button id="compare-partner" class="compare-control compare-partner" type="button"
+              title="Choose another open slide to link" aria-label="Choose the linked slide"
+              aria-haspopup="menu" aria-expanded="false" aria-controls="compare-picker-list">
+        <span class="name">Slide</span><span class="chevron" aria-hidden="true">▾</span>
+      </button>
+      <span id="compare-delta" hidden></span>
       <button id="compare-link" class="compare-control linked" type="button"
               aria-label="Unlink views" aria-pressed="true">
         <svg class="hotspot-icon" viewBox="0 0 28 18" aria-hidden="true">

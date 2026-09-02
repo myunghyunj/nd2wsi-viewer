@@ -206,6 +206,8 @@ The chrome follows the slide. A brightfield color slide such as an SVS opens in 
 | `⌘⇧E` | export annotations as GeoJSON |
 | `⌘\` | start or stop side-by-side Compare |
 | `L` | link or unlink compared views |
+| `←` `→` `↑` `↓` | nudge the compared alignment by one screen pixel, ten with Shift |
+| `⌥` drag | move one compared pane alone and keep the difference as the alignment |
 
 Measurements use the calibration stored in the source. Without calibration, the viewer reports pixels.
 
@@ -221,9 +223,11 @@ Open Slide Info with `⌘I` or the info button. It shows provenance, calibration
 
 ### Compare serial sections
 
-Open at least two slides, then press `⌘\` or click the Personal Hotspot-style link button. The active slide stays as the reference. With two slides, Compare links the only available partner immediately; with three or more, it asks which other open slide to link. Neither slide is reloaded.
+Open at least two slides, then press `⌘\` or click the Personal Hotspot-style link button. The active slide stays as the reference, and a list asks which other open slide to link with it. The choice is always yours, even when only one other slide is open. Neither slide is reloaded. While comparing, the slide name in the alignment capsule opens the same list again to switch the linked slide, so one reference section can be checked against CD31, CD68, a trichrome, and an H&E in turn. Each pair keeps its own alignment for the rest of the session.
 
-When both slides are calibrated, linked navigation maps the center and field of view in micrometers. Otherwise it falls back to relative image coordinates. Press `L` or click the link control to unlink, align either view manually, then relink; the viewer captures that translation as the approximate alignment. Reset removes the manual offset.
+When both slides are calibrated, linked navigation maps the center and field of view in micrometers. Otherwise it falls back to relative image coordinates.
+
+Serial sections never match exactly. The overview may line up while a zoomed field is displaced by a few cells, so the alignment can be nudged at any zoom without leaving linked mode. The arrow keys move the moving slide by one screen pixel, Shift with an arrow moves it by ten, and an Option-drag on either pane moves that pane alone while the other stays put. Each nudge becomes part of the alignment, and the capsule shows the hand-tuned part as a Δ in micrometers. For a larger correction, press `L` or click the link control to unlink, align either view freely, then relink; the viewer captures that translation. Reset removes the manual offset.
 
 In this acquisition workflow, SVS and ND2 coordinates run in opposite horizontal and vertical directions. A mixed SVS–ND2 pair therefore starts with a 180° orientation automatically: the ND2 pane is visually rotated while linked navigation maps both reversed axes.
 

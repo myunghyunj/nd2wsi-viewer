@@ -7,7 +7,7 @@ let active = null;
 let busyTab = null;
 let busyTimer = null;
 let toastTimer = null;
-const pairPicker = { open: false, leftSid: null };
+const pairPicker = { open: false, leftSid: null, mode: "start" };
 
 const VIEWPORT_PROTOCOL_VERSION = 1;
 const VIEWPORT_THROTTLE_MS = 48;
@@ -27,6 +27,9 @@ const compare = {
   layoutRequestTimer: null,
   routeTimers: new Map(),
   routeLatest: new Map(),
+  // alignment per ordered pair for this session, so switching between
+  // several sections of one case keeps each hand-tuned offset
+  memory: new Map(),
 };
 
 function showError(message) {
@@ -134,6 +137,7 @@ function ensureFrame(sid) {
   frame.addEventListener("load", () => {
     if (compare.enabled && [compare.leftSid, compare.rightSid].includes(sid)) {
       applyDisplayTransform(sid);
+      broadcastCompareState();
       if (compare.linked || compare.pendingRequest) {
         requestPairSoon(
           compare.pendingRequest?.kind || (compare.offset.mode ? "sync" : "initial")
@@ -463,6 +467,108 @@ function defaultAlignmentOffset(left, right, mode) {
   };
 }
 
+function recaptureOffset() {
+  // The two panes as they stand right now define the alignment.
+  const left = compare.states.get(compare.leftSid);
+  const right = compare.states.get(compare.rightSid);
+  if (!left || !right) return false;
+  const mode = mappingMode(left, right);
+  const a = centerInSpace(left, mode);
+  const b = centerInSpace(right, mode);
+  compare.offset = {
+    mode,
+    x: b.x - compare.orientation.x * a.x,
+    y: b.y - compare.orientation.y * a.y,
+  };
+  return true;
+}
+
+function pairKey(leftSid, rightSid) {
+  return `${leftSid}|${rightSid}`;
+}
+
+function rememberAlignment() {
+  if (!compare.enabled || !compare.offset.mode) return;
+  compare.memory.set(pairKey(compare.leftSid, compare.rightSid), {
+    offset: { ...compare.offset },
+    orientation: { ...compare.orientation },
+  });
+}
+
+function restoreAlignment(leftSid, rightSid) {
+  const direct = compare.memory.get(pairKey(leftSid, rightSid));
+  if (direct) {
+    compare.offset = { ...direct.offset };
+    compare.orientation = { ...direct.orientation };
+    return true;
+  }
+  const reversed = compare.memory.get(pairKey(rightSid, leftSid));
+  if (reversed) {
+    compare.orientation = { ...reversed.orientation };
+    compare.offset = {
+      mode: reversed.offset.mode,
+      x: -compare.orientation.x * reversed.offset.x,
+      y: -compare.orientation.y * reversed.offset.y,
+    };
+    return true;
+  }
+  return false;
+}
+
+function formatDeltaUm(value) {
+  const sign = value < 0 ? "−" : "+";
+  const abs = Math.abs(value);
+  if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(2)} mm`;
+  return `${sign}${abs.toFixed(abs >= 100 ? 0 : 1)} µm`;
+}
+
+function alignmentDeltaLabel() {
+  // the hand-tuned part of the alignment, relative to centers matched
+  const left = compare.states.get(compare.leftSid);
+  const right = compare.states.get(compare.rightSid);
+  if (!left || !right || !compare.offset.mode) return "";
+  const mode = compare.offset.mode;
+  const base = defaultAlignmentOffset(left, right, mode);
+  const dx = compare.offset.x - base.x;
+  const dy = compare.offset.y - base.y;
+  if (mode === "physical") {
+    if (Math.abs(dx) < 0.05 && Math.abs(dy) < 0.05) return "";
+    return `Δ ${formatDeltaUm(dx)}, ${formatDeltaUm(dy)}`;
+  }
+  if (Math.abs(dx) < 0.0005 && Math.abs(dy) < 0.0005) return "";
+  const pct = (value) => `${value < 0 ? "−" : "+"}${(Math.abs(value) * 100).toFixed(1)}%`;
+  return `Δ ${pct(dx)}, ${pct(dy)}`;
+}
+
+function broadcastCompareState() {
+  // each pane learns whether it takes part, whether arrows may nudge, and
+  // whether it is the pane that moves
+  const pending = Boolean(compare.pendingRequest);
+  for (const sid of frames.keys()) {
+    const member = compare.enabled && [compare.leftSid, compare.rightSid].includes(sid);
+    postToSlide(sid, {
+      nd2wsi: "compare-state",
+      version: VIEWPORT_PROTOCOL_VERSION,
+      enabled: member,
+      linked: member && compare.linked && !pending,
+      moving: member && sid === movingDisplaySid(),
+    });
+  }
+}
+
+function nudgeAlignment(dxPx, dyPx) {
+  if (!compare.enabled || !compare.linked || compare.pendingRequest) return;
+  const dx = Number(dxPx), dy = Number(dyPx);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+  clearViewportRoutes();
+  postToSlide(movingDisplaySid(), {
+    nd2wsi: "viewport-nudge",
+    version: VIEWPORT_PROTOCOL_VERSION,
+    dxPx: Math.max(-200, Math.min(200, dx)),
+    dyPx: Math.max(-200, Math.min(200, dy)),
+  });
+}
+
 function mappedCenter(sourceSid, point) {
   const sign = compare.orientation;
   if (sourceSid === compare.leftSid) {
@@ -555,8 +661,17 @@ function updateCompareControls() {
   link.setAttribute("aria-pressed", String(compare.linked && !pending));
   link.setAttribute("aria-label", compare.linked ? "Unlink views" : "Relink and capture alignment");
   link.title = compare.linked
-    ? "Unlink, align either slide, then relink (L)"
+    ? "Unlink, align either slide, then relink (L). While linked, arrow keys and Option-drag nudge the alignment."
     : "Relink and keep the current manual offset (L)";
+  const partner = $("compare-partner");
+  const partnerSlide = slides.find((slide) => slide.sid === compare.rightSid);
+  const movingSlide = slides.find((slide) => slide.sid === movingDisplaySid());
+  partner.disabled = pending || slides.length < 3;
+  partner.querySelector(".name").textContent = partnerSlide?.name || "Slide";
+  partner.title = slides.length < 3
+    ? "Open another slide to switch the linked slide"
+    : `Linked with ${partnerSlide?.name || "a slide"}. Choose another open slide to link instead.`;
+  partner.setAttribute("aria-expanded", String(pairPicker.open && pairPicker.mode === "switch"));
   const halfTurn = halfTurnActive();
   const mirrored = mirrorActive();
   rotate.classList.toggle("rotated", halfTurn);
@@ -579,6 +694,15 @@ function updateCompareControls() {
         : "Approximate alignment · relative";
     $("compare-status").textContent = status + orientationNote;
   }
+  const delta = compare.enabled && compare.linked && !pending ? alignmentDeltaLabel() : "";
+  const deltaEl = $("compare-delta");
+  deltaEl.textContent = delta;
+  deltaEl.hidden = !delta;
+  deltaEl.title = delta
+    ? `Hand-tuned offset of ${movingSlide?.name || "the moving slide"} beyond matched centers. Arrow keys move it one screen pixel, Shift ten, Option-drag moves it freely.`
+    : "";
+  rememberAlignment();
+  broadcastCompareState();
 }
 
 function mostRecentOther(sid) {
@@ -598,11 +722,14 @@ function pairPickerIsOpen() {
 
 function closePairPicker(restoreFocus = true) {
   const wasOpen = pairPicker.open;
+  const wasSwitching = pairPicker.mode === "switch";
   pairPicker.open = false;
   pairPicker.leftSid = null;
+  pairPicker.mode = "start";
   $("compare-picker").hidden = true;
   $("compare-toggle").setAttribute("aria-expanded", "false");
-  if (restoreFocus && wasOpen) $("compare-toggle").focus();
+  $("compare-partner").setAttribute("aria-expanded", "false");
+  if (restoreFocus && wasOpen) $(wasSwitching ? "compare-partner" : "compare-toggle").focus();
 }
 
 function slideTypeLabel(slide) {
@@ -618,13 +745,17 @@ function slideSizeLabel(slide) {
 }
 
 function renderPairPicker() {
+  const switching = pairPicker.mode === "switch";
   const left = slides.find((slide) => slide.sid === pairPicker.leftSid);
   const choices = slides.filter((slide) => slide.sid !== pairPicker.leftSid);
-  if (!pairPicker.open || !left || !choices.length) {
+  if (!pairPicker.open || !left || !choices.length || (switching && !compare.enabled)) {
     closePairPicker(false);
     return;
   }
 
+  $("compare-picker-title").textContent = switching
+    ? "Switch the linked slide"
+    : "Choose the slide to link";
   $("compare-picker-current-name").textContent = left.name;
   const list = $("compare-picker-list");
   const previousOptions = [...list.querySelectorAll(".compare-picker-option")];
@@ -637,7 +768,12 @@ function renderPairPicker() {
     option.className = "compare-picker-option";
     option.setAttribute("role", "menuitem");
     option.dataset.sid = slide.sid;
-    option.title = `Link ${left.name} with ${slide.name}`;
+    const current = switching && slide.sid === compare.rightSid;
+    option.classList.toggle("current", current);
+    option.title = current
+      ? `${slide.name} is the linked slide now`
+      : `Link ${left.name} with ${slide.name}`;
+    if (current) option.setAttribute("aria-current", "true");
 
     const dot = document.createElement("span");
     dot.className = "dot";
@@ -647,9 +783,12 @@ function renderPairPicker() {
     name.textContent = slide.name;
     const meta = document.createElement("span");
     meta.className = "meta";
-    meta.textContent = slideSizeLabel(slide);
+    meta.textContent = current ? "Linked now" : slideSizeLabel(slide);
     option.append(dot, name, meta);
-    option.onclick = () => startComparePair(pairPicker.leftSid, slide.sid);
+    option.onclick = () => {
+      if (switching) switchComparePartner(slide.sid);
+      else startComparePair(pairPicker.leftSid, slide.sid);
+    };
     list.append(option);
   }
   if (focusedIndex >= 0) {
@@ -657,6 +796,24 @@ function renderPairPicker() {
     const sameSlide = options.find((option) => option.dataset.sid === focusedSid);
     (sameSlide || options[Math.min(focusedIndex, options.length - 1)])?.focus();
   }
+}
+
+function openPairPicker(mode, leftSid) {
+  // The user always names the slide to link. With two slides open the list
+  // has one entry, and it is still a choice rather than an assignment.
+  pairPicker.open = true;
+  pairPicker.mode = mode;
+  pairPicker.leftSid = leftSid;
+  $("compare-picker").hidden = false;
+  $(mode === "switch" ? "compare-partner" : "compare-toggle").setAttribute("aria-expanded", "true");
+  renderPairPicker();
+  const suggestedSid = mode === "switch" ? compare.rightSid : mostRecentOther(leftSid);
+  requestAnimationFrame(() => {
+    if (!pairPickerIsOpen()) return;
+    const options = [...$("compare-picker-list").querySelectorAll(".compare-picker-option")];
+    const suggested = options.find((option) => option.dataset.sid === suggestedSid);
+    (suggested || options[0])?.focus();
+  });
 }
 
 function startCompare() {
@@ -667,23 +824,20 @@ function startCompare() {
     showError("Open two slides before starting Compare");
     return;
   }
-  if (choices.length === 1) {
-    startComparePair(leftSid, choices[0].sid);
+  openPairPicker("start", leftSid);
+}
+
+function openPartnerPicker() {
+  if (!compare.enabled || compare.pendingRequest) return;
+  if (pairPickerIsOpen()) {
+    closePairPicker();
     return;
   }
-
-  pairPicker.open = true;
-  pairPicker.leftSid = leftSid;
-  $("compare-picker").hidden = false;
-  $("compare-toggle").setAttribute("aria-expanded", "true");
-  renderPairPicker();
-  const suggestedSid = mostRecentOther(leftSid);
-  requestAnimationFrame(() => {
-    if (!pairPickerIsOpen()) return;
-    const options = [...$("compare-picker-list").querySelectorAll(".compare-picker-option")];
-    const suggested = options.find((option) => option.dataset.sid === suggestedSid);
-    (suggested || options[0])?.focus();
-  });
+  if (slides.length < 3) {
+    showError("Open another slide to switch the linked slide");
+    return;
+  }
+  openPairPicker("switch", compare.leftSid);
 }
 
 function requestPair(kind) {
@@ -750,13 +904,7 @@ function finishPairRequest(pending) {
     } else if (pending.kind === "mirror") {
       compare.orientation.x *= -1;
     }
-    const a = centerInSpace(left, mode);
-    const b = centerInSpace(right, mode);
-    compare.offset = {
-      mode,
-      x: b.x - compare.orientation.x * a.x,
-      y: b.y - compare.orientation.y * a.y,
-    };
+    recaptureOffset();
     if (pending.kind === "capture") compare.linked = true;
     if (pending.kind === "rotate-180" || pending.kind === "mirror") {
       applyDisplayTransforms();
@@ -770,13 +918,7 @@ function finishPairRequest(pending) {
       }
       compare.offset = defaultAlignmentOffset(left, right, mode);
     } else if (compare.offset.mode !== mode) {
-      const a = centerInSpace(left, mode);
-      const b = centerInSpace(right, mode);
-      compare.offset = {
-        mode,
-        x: b.x - compare.orientation.x * a.x,
-        y: b.y - compare.orientation.y * a.y,
-      };
+      recaptureOffset();
     }
     if (compare.linked) forwardViewport(compare.leftSid, left);
   }
@@ -799,7 +941,47 @@ function receiveViewportState(data, sid) {
   if (!compare.enabled || !compare.linked || compare.pendingRequest ||
       state.reason !== "user" || state.echoOf) return;
   if (![compare.leftSid, compare.rightSid].includes(sid)) return;
+  if (data.nudge === true) {
+    // one pane moved on its own; the partner stays and the alignment absorbs
+    // the difference, which is how serial sections get matched at high zoom
+    clearViewportRoutes();
+    if (recaptureOffset()) updateCompareControls();
+    return;
+  }
   scheduleViewportRoute(sid, state);
+}
+
+function switchComparePartner(sid) {
+  if (!compare.enabled) {
+    closePairPicker();
+    return;
+  }
+  const openSids = new Set(slides.map((slide) => slide.sid));
+  if (!sid || sid === compare.leftSid || !openSids.has(sid)) {
+    closePairPicker();
+    showError("That slide is no longer open. Choose another slide to link.");
+    return;
+  }
+  closePairPicker();
+  if (sid === compare.rightSid) return;
+  rememberAlignment();
+  clearPendingRequest();
+  clearViewportRoutes();
+  const previous = compare.rightSid;
+  compare.rightSid = sid;
+  compare.linked = true;
+  if (!restoreAlignment(compare.leftSid, sid)) {
+    compare.offset = { mode: null, x: 0, y: 0 };
+    compare.orientation = automaticOrientation(compare.leftSid, sid);
+  }
+  clearDisplayTransforms([previous]);
+  rememberSlide(sid);
+  ensureFrame(sid);
+  applyFrameLayout();
+  applyDisplayTransforms();
+  updateCompareControls();
+  render();
+  requestPairSoon(compare.offset.mode ? "sync" : "initial");
 }
 
 function startComparePair(leftSid, rightSid) {
@@ -819,8 +1001,10 @@ function startComparePair(leftSid, rightSid) {
   compare.leftSid = leftSid;
   compare.rightSid = rightSid;
   compare.linked = true;
-  compare.offset = { mode: null, x: 0, y: 0 };
-  compare.orientation = automaticOrientation(leftSid, rightSid);
+  if (!restoreAlignment(leftSid, rightSid)) {
+    compare.offset = { mode: null, x: 0, y: 0 };
+    compare.orientation = automaticOrientation(leftSid, rightSid);
+  }
   active = leftSid;
   rememberSlide(rightSid);
   rememberSlide(leftSid);
@@ -830,13 +1014,14 @@ function startComparePair(leftSid, rightSid) {
   applyDisplayTransforms();
   updateCompareControls();
   render();
-  requestPairSoon("initial");
+  requestPairSoon(compare.offset.mode ? "sync" : "initial");
 }
 
 function stopCompare() {
   closePairPicker(false);
   if (!compare.enabled) return;
   const comparedSids = [compare.leftSid, compare.rightSid];
+  rememberAlignment();
   clearPendingRequest();
   clearTimeout(compare.layoutRequestTimer);
   compare.layoutRequestTimer = null;
@@ -887,6 +1072,8 @@ function toggleMirror() {
 
 function swapComparedSlides() {
   if (!compare.enabled) return;
+  rememberAlignment();
+  closePairPicker(false);
   clearPendingRequest();
   clearViewportRoutes();
   [compare.leftSid, compare.rightSid] = [compare.rightSid, compare.leftSid];
@@ -905,6 +1092,7 @@ function swapComparedSlides() {
 
 $("compare-toggle").onclick = toggleCompare;
 $("compare-picker-close").onclick = () => closePairPicker();
+$("compare-partner").onclick = openPartnerPicker;
 $("compare-link").onclick = toggleViewLink;
 $("compare-swap").onclick = swapComparedSlides;
 $("compare-rotate").onclick = toggleHalfTurn;
@@ -958,7 +1146,8 @@ $("compare-picker").addEventListener("keydown", (event) => {
 
 document.addEventListener("pointerdown", (event) => {
   if (!pairPickerIsOpen()) return;
-  if ($("compare-picker").contains(event.target) || $("compare-toggle").contains(event.target)) return;
+  if ($("compare-picker").contains(event.target) || $("compare-toggle").contains(event.target) ||
+      $("compare-partner").contains(event.target)) return;
   closePairPicker(false);
 }, true);
 
@@ -1049,6 +1238,10 @@ window.addEventListener("message", (event) => {
   } else if (event.data.nd2wsi === "compare-link-toggle") {
     if (!senderSid || event.data.version !== VIEWPORT_PROTOCOL_VERSION) return;
     toggleViewLink();
+  } else if (event.data.nd2wsi === "compare-nudge") {
+    if (!senderSid || event.data.version !== VIEWPORT_PROTOCOL_VERSION) return;
+    if (![compare.leftSid, compare.rightSid].includes(senderSid)) return;
+    nudgeAlignment(event.data.dxPx, event.data.dyPx);
   } else if (event.data.nd2wsi === "slide-trashed") {
     if (senderSid) refresh();
   } else if (event.data.nd2wsi === "file-drag") {

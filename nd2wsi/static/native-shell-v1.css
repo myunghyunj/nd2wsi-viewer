@@ -98,6 +98,15 @@ button { color:inherit; font:inherit; }
 .compare-control.rotated, .compare-control.mirrored { color:#fff; background:var(--accent); }
 .compare-control.pending { color:var(--accent); animation:pulse 1s infinite alternate; }
 .compare-control.text-control { padding:0 8px; font-size:11px; font-weight:600; }
+.compare-control.compare-partner { gap:4px; max-width:170px; padding:0 6px 0 8px; font-size:11px; font-weight:600; }
+.compare-partner .name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.compare-partner .chevron { flex:none; font-size:9px; opacity:.7; }
+.compare-partner[aria-expanded="true"] { color:var(--label); background:rgba(255,255,255,.12); }
+:root.light .compare-partner[aria-expanded="true"] { background:rgba(0,0,0,.09); }
+#compare-delta { max-width:190px; overflow:hidden; padding:0 6px; color:var(--accent); font:600 11px "SF Mono", ui-monospace, Menlo, monospace; text-overflow:ellipsis; white-space:nowrap; }
+#compare-delta[hidden] { display:none; }
+.compare-picker-option.current .dot { box-shadow:0 0 0 2px rgba(10,132,255,.28); }
+.compare-picker-option.current .meta { color:var(--accent); }
 #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; }
 #empty .pyr { width:64px; margin:0 auto 24px; opacity:.92; }
 #empty .pyr div { height:10px; margin:4px auto; border-radius:999px; box-shadow:inset 0 1px 0 rgba(255,255,255,.28); }
@@ -115,6 +124,7 @@ button { color:inherit; font:inherit; }
 @keyframes pulse { from{opacity:.3} to{opacity:1} }
 @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration:.01ms!important; transition-duration:.01ms!important; } }
 @media (max-width: 720px) { #compare-status { display:none; } }
+@media (max-width: 960px) { .compare-control.compare-partner { max-width:110px; } }
 
 /* packaged app: the hidden title bar leaves the traffic lights floating
    over the tab strip, so the strip starts past them and its empty areas
