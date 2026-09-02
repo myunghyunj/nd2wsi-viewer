@@ -104,6 +104,10 @@ The `Full` button selects the entire slide. A very large picture export is made 
 
 ## Comparing serial sections
 
+![The same case linked three ways, H&E, Masson's trichrome, and CD31 immunofluorescence](docs/compare-serial-sections.jpg)
+
+From left: H&E, Masson's trichrome, and CD31 immunofluorescence of the same case, linked. Moving any one pane moves the other two.
+
 Open two or more slides of the same case, press `⌘\`, and choose which slide to link with the one in front. Press `+` in the capsule to link more, up to four in all, so a reference section can sit beside CD31, CD68, and an H&E at the same time. Two slides share the screen, three take a column each, and four fill a grid. When you move one, the others follow in micrometers.
 
 Two glass slides of serial sections are never mounted the same way. Press **Align** and click the same four structures on every slide, in the same order. The viewer works out the rotation, the scale, the shift, and a mirror if a section was flipped, and it shows how well the points agree in micrometers. A linked pane turns on screen to match, but its pixels, marks, and exports stay in that slide's own coordinates.
