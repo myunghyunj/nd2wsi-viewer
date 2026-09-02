@@ -18,6 +18,28 @@ const state = {
   editingId: null,
   tempLine: null, // live ruler while dragging
   windows: null, // floating mac-window controllers
+  inspect: null, // extended slide metadata, loaded when Slide Info first opens
+  inspectLoading: false,
+  pixel: {
+    hudVisible: false,
+    cursor: null, // latest displayed-base coordinate and element position
+    result: null,
+    queued: null,
+    inFlight: false,
+    timer: null,
+    lastStarted: 0,
+    retryAfter: 0,
+    failed: false,
+  },
+  viewportRelay: {
+    seq: 0,
+    timer: null,
+    suppressUntil: 0,
+    reopening: false,
+    displayRotation: 0,
+    displayFlipped: false,
+    transformWaitingForOpen: false,
+  },
 };
 
 init().catch((e) => {
@@ -48,12 +70,14 @@ async function init() {
   }
 
   buildWindows();
+  wireSlideInspector();
   wireTheme();
   wireTrash();
   wireDragForward();
   buildChannelPanel();
   buildLevelLamps();
   buildViewer();
+  wireCompareRelay();
   wireTools();
   wireKeys();
   loadAnnotations();
@@ -176,6 +200,32 @@ function makeTileSource() {
   };
 }
 
+function flipAwareViewerElementPoint(point) {
+  const p = new OpenSeadragon.Point(Number(point.x), Number(point.y));
+  const viewport = state.viewer?.viewport;
+  if (viewport?.getFlip()) {
+    p.x = viewport.getContainerSize().x - p.x;
+  }
+  return p;
+}
+
+function viewerElementToImagePoint(point) {
+  return state.viewer.viewport.viewerElementToImageCoordinates(
+    flipAwareViewerElementPoint(point)
+  );
+}
+
+function imageToViewerElementPoint(point) {
+  const viewport = state.viewer.viewport;
+  const p = viewport.imageToViewerElementCoordinates(
+    new OpenSeadragon.Point(Number(point.x), Number(point.y))
+  );
+  if (viewport.getFlip()) {
+    p.x = viewport.getContainerSize().x - p.x;
+  }
+  return p;
+}
+
 function buildViewer() {
   const viewer = OpenSeadragon({
     id: "stage",
@@ -186,6 +236,7 @@ function buildViewer() {
     navigatorPosition: "TOP_RIGHT",
     navigatorSizeRatio: 0.16,
     navigatorAutoFade: false,
+    navigatorRotate: true,
     navigatorDisplayRegionColor: "#ffffff",
     animationTime: 0.6,
     springStiffness: 8,
@@ -201,13 +252,24 @@ function buildViewer() {
   state.viewer = viewer;
 
   viewer.addHandler("open", () => {
+    applyDesiredDisplayTransform(false);
     $("boot").style.display = "none";
     updateReadout();
     restoreRoiOverlay();
+    if (!state.viewportRelay.reopening) postViewportState("user");
   });
-  viewer.addHandler("animation", updateReadout);
-  viewer.addHandler("animation-finish", updateReadout);
-  viewer.addHandler("update-viewport", renderAnnotations);
+  viewer.addHandler("animation", () => {
+    updateReadout();
+    scheduleViewportState();
+  });
+  viewer.addHandler("animation-finish", () => {
+    updateReadout();
+    scheduleViewportState();
+  });
+  viewer.addHandler("update-viewport", () => {
+    renderAnnotations();
+    scheduleViewportState();
+  });
   viewer.addHandler("open", renderAnnotations);
   viewer.addHandler("open-failed", () => showToast("could not open tile source"));
   viewer.addHandler("tile-load-failed", debounceToast("some tiles failed to load"));
@@ -215,12 +277,10 @@ function buildViewer() {
   const stage = $("stage");
   stage.addEventListener("mousemove", (ev) => {
     const pt = elementPoint(ev, stage);
-    const img = viewer.viewport.viewerElementToImageCoordinates(
-      new OpenSeadragon.Point(pt.x, pt.y)
-    );
-    updateCursor(img);
+    const img = viewerElementToImagePoint(pt);
+    updateCursor(img, pt);
   });
-  stage.addEventListener("mouseleave", () => updateCursor(null));
+  stage.addEventListener("mouseleave", () => updateCursor(null, null));
 
   $("zoom-in").onclick = () => viewer.viewport.zoomBy(1.6).applyConstraints();
   $("zoom-out").onclick = () => viewer.viewport.zoomBy(1 / 1.6).applyConstraints();
@@ -230,10 +290,30 @@ function buildViewer() {
 function reopenPreservingView() {
   const viewer = state.viewer;
   const bounds = viewer.viewport.getBounds();
-  viewer.addOnceHandler("open", () => {
+  clearTimeout(state.viewportRelay.timer);
+  state.viewportRelay.timer = null;
+  state.viewportRelay.reopening = true;
+  state.viewportRelay.suppressUntil = Number.POSITIVE_INFINITY;
+  const cleanup = () => {
+    viewer.removeHandler("open", restored);
+    viewer.removeHandler("open-failed", failed);
+  };
+  const restored = () => {
+    cleanup();
+    applyDesiredDisplayTransform(false);
     viewer.viewport.fitBounds(bounds, true);
     restoreRoiOverlay();
-  });
+    state.viewportRelay.reopening = false;
+    state.viewportRelay.suppressUntil = Date.now() + 180;
+    postViewportState("restore");
+  };
+  const failed = () => {
+    cleanup();
+    state.viewportRelay.reopening = false;
+    state.viewportRelay.suppressUntil = 0;
+  };
+  viewer.addHandler("open", restored);
+  viewer.addHandler("open-failed", failed);
   viewer.open(makeTileSource());
 }
 
@@ -284,7 +364,7 @@ function buildChannelPanel() {
     const auto = document.createElement("button");
     auto.className = "lut-auto";
     auto.type = "button";
-    auto.title = "Auto-adjust window (0.1–99.9 percentile)";
+    auto.title = "Auto-adjust window (background peak–99.9 percentile; bright-background fallback)";
     auto.textContent = "Auto";
     auto.addEventListener("click", (ev) => {
       ev.preventDefault();
@@ -357,17 +437,22 @@ function buildLutRow(i, ch, winLabel) {
 
   const def = { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
   const cur = { ...def };
-  let vmax = Math.max(def.hi * 2, 1); // provisional until the histogram loads
+  let vmin = Math.min(Number(ch.window.min) || 0, def.lo);
+  let vmax = Math.max(
+    def.hi,
+    vmin + 2 * Math.max(def.hi - vmin, 1)
+  ); // provisional until the histogram loads
   let bins = null;
 
-  const vx = (v) => PLOT.x0 + (Math.max(0, Math.min(v, vmax)) / vmax) * (PLOT.x1 - PLOT.x0);
+  const vx = (v) => PLOT.x0 +
+    clamp((v - vmin) / Math.max(vmax - vmin, 1e-9), 0, 1) * (PLOT.x1 - PLOT.x0);
   const xv = (x) =>
-    (Math.max(0, Math.min(1, (x - PLOT.x0) / (PLOT.x1 - PLOT.x0)))) * vmax;
+    vmin + clamp((x - PLOT.x0) / (PLOT.x1 - PLOT.x0), 0, 1) * (vmax - vmin);
   const curveY = (t) =>
     PLOT.y1 - Math.pow(Math.max(0, Math.min(1, t)), 1 / cur.gamma) * (PLOT.y1 - PLOT.y0);
   const knobPos = () => ({
     x: vx(cur.lo + (Math.max(cur.hi, cur.lo + 1) - cur.lo) * 0.5),
-    y: curveY(Math.pow(0.5, 1 / cur.gamma)),
+    y: curveY(0.5),
   });
 
   function draw() {
@@ -438,7 +523,7 @@ function buildLutRow(i, ch, winLabel) {
     ctx.fillText("G: " + cur.gamma.toFixed(2), (PLOT.x0 + PLOT.x1) / 2, 9);
     ctx.fillStyle = inkColor(0.28);
     ctx.textAlign = "left";
-    ctx.fillText("0", PLOT.x0, H - 3);
+    ctx.fillText(fmtInt(vmin), PLOT.x0, H - 3);
     ctx.textAlign = "right";
     ctx.fillText(fmtInt(vmax), PLOT.x1, H - 3);
     winLabel.textContent = fmtInt(cur.lo) + "–" + fmtInt(cur.hi);
@@ -519,37 +604,50 @@ function buildLutRow(i, ch, winLabel) {
     relayout,
     setHistogram(hg) {
       bins = hg.bins;
-      vmax = hg.vmax;
+      vmin = Number.isFinite(Number(hg.vmin)) ? Number(hg.vmin) : 0;
+      const reportedMax = Number(hg.vmax);
+      vmax = Math.max(Number.isFinite(reportedMax) ? reportedMax : vmin + 1, vmin + 1);
       draw();
     },
     reset() {
       setLut({ ...def });
     },
     auto() {
-      // NIS-style auto scale: stretch the window to the 0.1–99.9 percentile
-      // of the histogram; gamma is left as set
-      if (!bins) return;
-      const total = bins.reduce((a, b) => a + b, 0);
-      if (!total) return;
-      const bw = vmax / bins.length;
-      let acc = 0;
-      let loB = 0;
-      for (let b = 0; b < bins.length; b++) {
-        acc += bins[b];
-        if (acc >= total * 0.001) { loB = b; break; }
-      }
-      acc = 0;
-      let hiB = bins.length - 1;
-      for (let b = 0; b < bins.length; b++) {
-        acc += bins[b];
-        if (acc >= total * 0.999) { hiB = b; break; }
-      }
-      setLut({ lo: loB * bw, hi: Math.max((hiB + 1) * bw, loB * bw + 1), gamma: cur.gamma });
+      const window = autoWindowFromHistogram(bins, vmin, vmax);
+      if (window) setLut({ ...window, gamma: cur.gamma });
     },
   };
   state.lutWidgets[i] = widget;
   relayout(state.windows.channels.bodyWidth());
   return wrap;
+}
+
+function autoWindowFromHistogram(bins, vmin, vmax, rightPeakFraction = 0.70) {
+  if (!Array.isArray(bins) || !bins.length || !(vmax > vmin)) return null;
+  const total = bins.reduce((sum, count) => sum + Number(count || 0), 0);
+  if (!(total > 0)) return null;
+  const bw = (vmax - vmin) / bins.length;
+  let acc = 0;
+  let fallbackBin = -1;
+  let highBin = bins.length - 1;
+  let modeBin = 0;
+  for (let b = 0; b < bins.length; b++) {
+    if (Number(bins[b] || 0) > Number(bins[modeBin] || 0)) modeBin = b;
+    acc += Number(bins[b] || 0);
+    if (acc >= total * 0.001 && fallbackBin < 0) fallbackBin = b;
+  }
+  acc = 0;
+  for (let b = 0; b < bins.length; b++) {
+    acc += Number(bins[b] || 0);
+    if (acc >= total * 0.999) { highBin = b; break; }
+  }
+  const fallback = vmin + Math.max(0, fallbackBin) * bw;
+  const high = Math.max(vmin + (highBin + 1) * bw, fallback + 1);
+  const mode = vmin + modeBin * bw;
+  const low = mode >= fallback + rightPeakFraction * (high - fallback)
+    ? fallback
+    : mode;
+  return { lo: low, hi: Math.max(high, low + 1) };
 }
 
 function relayoutLuts() {
@@ -621,15 +719,185 @@ function updateReadout() {
   updateScalebar(currentImageZoom());
 }
 
-function updateCursor(img) {
-  if (!img || img.x < 0 || img.y < 0 || img.x > state.info.width || img.y > state.info.height) {
+function updateCursor(img, elementPt) {
+  if (
+    !img || img.x < 0 || img.y < 0 ||
+    img.x >= state.info.width || img.y >= state.info.height
+  ) {
     $("pos-um").textContent = "–";
     $("pos-px").textContent = "–";
+    $("pos-px").title = "";
+    state.pixel.cursor = null;
+    state.pixel.queued = null;
+    if (state.pixel.timer && !state.pixel.inFlight) {
+      clearTimeout(state.pixel.timer);
+      state.pixel.timer = null;
+    }
+    renderPixelInspector();
     return;
   }
+
+  const x = Math.round(clamp(img.x, 0, Math.max(0, state.info.width - 1)));
+  const y = Math.round(clamp(img.y, 0, Math.max(0, state.info.height - 1)));
+  state.pixel.cursor = { x, y, point: elementPt };
   const ps = pixelSize();
-  $("pos-um").textContent = ps ? fmtUm(img.x * ps[1]) + " , " + fmtUm(img.y * ps[0]) : "uncalibrated";
-  $("pos-px").textContent = fmtInt(img.x) + " , " + fmtInt(img.y) + " px";
+  $("pos-um").textContent = ps
+    ? fmtUm(x * ps[1]) + " , " + fmtUm(y * ps[0])
+    : "uncalibrated";
+  renderPixelInspector();
+  queuePixelProbe(x, y);
+}
+
+function pixelResultMatchesCursor(result) {
+  const c = state.pixel.cursor;
+  return !!(
+    c && result &&
+    Number(result.x) === c.x && Number(result.y) === c.y
+  );
+}
+
+function rawValueLabel(value) {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return "–";
+    if (Number.isInteger(value)) return value.toLocaleString("en-US");
+    const abs = Math.abs(value);
+    return value.toFixed(abs >= 100 ? 1 : abs >= 1 ? 3 : 5).replace(/\.?0+$/, "");
+  }
+  return value === null || value === undefined ? "–" : String(value);
+}
+
+function pixelValueParts(result) {
+  if (!result || !Array.isArray(result.values)) return [];
+  return result.values.map((item, i) => ({
+    name: String((item && item.name) || "C" + i),
+    value: rawValueLabel(item && item.value),
+  }));
+}
+
+function renderPixelInspector() {
+  const cursor = state.pixel.cursor;
+  const result = pixelResultMatchesCursor(state.pixel.result) ? state.pixel.result : null;
+  const hud = $("pixel-hud");
+  if (!cursor) {
+    hud.hidden = true;
+    return;
+  }
+
+  const coords = fmtInt(cursor.x) + " , " + fmtInt(cursor.y) + " px";
+  const parts = pixelValueParts(result);
+  let summary = coords;
+  if (parts.length) {
+    summary += " · " + parts.map((p) => p.name + " " + p.value).join(" · ");
+  } else {
+    summary += state.pixel.failed ? " · values –" : " · …";
+  }
+  $("pos-px").textContent = summary;
+  $("pos-px").title = summary;
+
+  hud.hidden = !state.pixel.hudVisible;
+  if (!state.pixel.hudVisible) return;
+
+  $("pixel-hud-coord").textContent = coords;
+  const um = result && Array.isArray(result.um) ? result.um : null;
+  const ps = pixelSize();
+  $("pixel-hud-stage").textContent = um
+    ? fmtUm(Number(um[0])) + " , " + fmtUm(Number(um[1]))
+    : ps
+      ? fmtUm(cursor.x * ps[1]) + " , " + fmtUm(cursor.y * ps[0])
+      : "Physical position unavailable";
+
+  const values = $("pixel-hud-values");
+  values.replaceChildren();
+  if (parts.length) {
+    for (const part of parts) {
+      const row = document.createElement("div");
+      const name = document.createElement("span");
+      const value = document.createElement("span");
+      name.textContent = part.name;
+      value.textContent = part.value;
+      row.append(name, value);
+      values.append(row);
+    }
+  } else {
+    values.textContent = state.pixel.failed ? "Raw values unavailable" : "Reading raw values…";
+  }
+
+  const note = $("pixel-hud-note");
+  if (result) {
+    const level = result.probed_level === undefined ? "" : " · L" + result.probed_level;
+    note.textContent = result.sample_kind === "overview-mean"
+      ? "Overview mean" + level
+      : "Native pixel" + level;
+  } else {
+    note.textContent = state.pixel.failed ? "Probe endpoint unavailable; cursor coordinates still work" : "";
+  }
+  positionPixelHud(cursor.point);
+}
+
+function positionPixelHud(point) {
+  if (!point || $("pixel-hud").hidden) return;
+  const hud = $("pixel-hud");
+  const wrap = $("stage-wrap");
+  const gap = 16;
+  const w = hud.offsetWidth || 220;
+  const h = hud.offsetHeight || 96;
+  const x = point.x + gap + w <= wrap.clientWidth - 8
+    ? point.x + gap
+    : point.x - w - gap;
+  const y = point.y + gap + h <= wrap.clientHeight - 8
+    ? point.y + gap
+    : point.y - h - gap;
+  hud.style.left = clamp(x, 8, Math.max(8, wrap.clientWidth - w - 8)) + "px";
+  hud.style.top = clamp(y, 8, Math.max(8, wrap.clientHeight - h - 8)) + "px";
+}
+
+function queuePixelProbe(x, y) {
+  state.pixel.queued = { x, y };
+  pumpPixelProbe();
+}
+
+function pumpPixelProbe() {
+  if (state.pixel.inFlight || state.pixel.timer || !state.pixel.queued) return;
+  const now = Date.now();
+  const wait = Math.max(
+    0,
+    100 - (now - state.pixel.lastStarted),
+    state.pixel.retryAfter - now
+  );
+  state.pixel.timer = setTimeout(() => {
+    state.pixel.timer = null;
+    if (!state.pixel.queued) return;
+    const requested = state.pixel.queued;
+    state.pixel.queued = null;
+    state.pixel.inFlight = true;
+    state.pixel.lastStarted = Date.now();
+    const query = new URLSearchParams({ x: requested.x, y: requested.y });
+    fetch("api/pixel?" + query.toString(), { cache: "no-store" })
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
+      .then((data) => {
+        state.pixel.result = data;
+        state.pixel.failed = false;
+        state.pixel.retryAfter = 0;
+        renderPixelInspector();
+      })
+      .catch(() => {
+        state.pixel.failed = true;
+        state.pixel.retryAfter = Date.now() + 2500;
+        renderPixelInspector();
+      })
+      .finally(() => {
+        state.pixel.inFlight = false;
+        if (state.pixel.queued) pumpPixelProbe();
+      });
+  }, wait);
+}
+
+function togglePixelInspector() {
+  state.pixel.hudVisible = !state.pixel.hudVisible;
+  renderPixelInspector();
+  if (state.pixel.hudVisible && !state.pixel.cursor) {
+    showToast("Pixel Inspector on — move over the slide");
+  }
 }
 
 function updateScalebar(iz) {
@@ -698,9 +966,7 @@ function setTool(tool) {
 }
 
 function imgPoint(pt) {
-  const p = state.viewer.viewport.viewerElementToImageCoordinates(
-    new OpenSeadragon.Point(pt.x, pt.y)
-  );
+  const p = viewerElementToImagePoint(pt);
   return {
     x: clamp(p.x, 0, state.info.width),
     y: clamp(p.y, 0, state.info.height),
@@ -929,9 +1195,7 @@ function lineLengthLabel(a) {
 }
 
 function toEl(x, y) {
-  return state.viewer.viewport.imageToViewerElementCoordinates(
-    new OpenSeadragon.Point(x, y)
-  );
+  return imageToViewerElementPoint({ x, y });
 }
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -1019,13 +1283,17 @@ function renderAnnotations() {
     else if (a.type === "box") {
       const p1 = toEl(a.x, a.y);
       const p2 = toEl(a.x + a.w, a.y + a.h);
+      const left = Math.min(p1.x, p2.x);
+      const top = Math.min(p1.y, p2.y);
       const g = svgEl("g", { class: "hit" }, layer);
       svgEl("rect", {
-        x: p1.x, y: p1.y, width: Math.max(1, p2.x - p1.x), height: Math.max(1, p2.y - p1.y),
+        x: left, y: top,
+        width: Math.max(1, Math.abs(p2.x - p1.x)),
+        height: Math.max(1, Math.abs(p2.y - p1.y)),
         fill: hexAlpha(annColor(a), 0.08), stroke: annColor(a), "stroke-width": 1.5, rx: 2,
       }, g);
       g.addEventListener("pointerdown", (ev) => { ev.stopPropagation(); openEditor(a.id); });
-      chip(layer, p1.x, p1.y - 22, a.text || "Box", a.id);
+      chip(layer, left, top - 22, a.text || "Box", a.id);
     } else if (a.type === "pin") {
       const p = toEl(a.x, a.y);
       const g = svgEl("g", { class: "hit" }, layer);
@@ -1084,16 +1352,13 @@ function wireAnnotationPanel() {
   });
 
   $("ann-export").onclick = () => {
-    const blob = new Blob(
-      [JSON.stringify(annotationDocument(), null, 1)],
-      { type: "application/json" }
+    downloadJsonFile(
+      annotationDocument(),
+      state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
+      "application/json"
     );
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json";
-    a.click();
-    URL.revokeObjectURL(a.href);
   };
+  $("ann-geojson").onclick = exportAnnotationsGeoJSON;
   $("ann-open").onclick = () => $("ann-file").click();
   $("ann-file").addEventListener("change", () => {
     const f = $("ann-file").files[0];
@@ -1114,6 +1379,102 @@ function wireAnnotationPanel() {
       $("ann-file").value = "";
     });
   });
+}
+
+function downloadJsonFile(data, filename, mime) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: mime });
+  const a = document.createElement("a");
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function annotationFeature(item) {
+  if (!item || typeof item !== "object") return null;
+  const finite = (...values) => values.every((value) =>
+    value !== null && value !== "" && value !== undefined && Number.isFinite(Number(value))
+  );
+  let geometry = null;
+  if (item.type === "pin" && finite(item.x, item.y)) {
+    geometry = { type: "Point", coordinates: [Number(item.x), Number(item.y)] };
+  } else if (item.type === "line" && finite(item.x1, item.y1, item.x2, item.y2)) {
+    geometry = {
+      type: "LineString",
+      coordinates: [
+        [Number(item.x1), Number(item.y1)],
+        [Number(item.x2), Number(item.y2)],
+      ],
+    };
+  } else if (item.type === "box" && finite(item.x, item.y, item.w, item.h)) {
+    const x1 = Number(item.x);
+    const y1 = Number(item.y);
+    const x2 = x1 + Number(item.w);
+    const y2 = y1 + Number(item.h);
+    geometry = {
+      type: "Polygon",
+      coordinates: [[
+        [x1, y1], [x2, y1], [x2, y2], [x1, y2], [x1, y1],
+      ]],
+    };
+  }
+  if (!geometry) return null;
+  return {
+    type: "Feature",
+    geometry,
+    properties: {
+      objectType: "annotation",
+      name: item.text === null || item.text === undefined ? "" : String(item.text),
+    },
+  };
+}
+
+// Pure serializer: level-0 viewer coordinates are already QuPath image pixels.
+function annotationsToGeoJSON(items) {
+  return {
+    type: "FeatureCollection",
+    features: (Array.isArray(items) ? items : [])
+      .map(annotationFeature)
+      .filter((feature) => feature !== null),
+  };
+}
+
+function safeFilenamePart(value, fallback) {
+  const safe = String(value || "")
+    .replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_")
+    .replace(/[. ]+$/g, "")
+    .trim();
+  return safe || fallback;
+}
+
+function selectionFilenameTag(selection) {
+  const source = selection || {};
+  const z = source.z_resolved !== undefined
+    ? source.z_resolved
+    : source.z === undefined ? "mid" : source.z;
+  return [
+    "t" + safeFilenamePart(source.t === undefined ? 0 : source.t, "0"),
+    "p" + safeFilenamePart(source.p === undefined ? 0 : source.p, "0"),
+    "z" + safeFilenamePart(z, "mid"),
+  ].join("-");
+}
+
+function geojsonFilename(info) {
+  const name = basename(info && info.name);
+  const stem = name
+    .replace(/\.ome\.zarr$/i, "")
+    .replace(/\.(nd2|svs)$/i, "");
+  return safeFilenamePart(stem, "slide") + "--" +
+    selectionFilenameTag(info && info.selection) + ".geojson";
+}
+
+function exportAnnotationsGeoJSON() {
+  const doc = annotationsToGeoJSON(state.annotations);
+  downloadJsonFile(doc, geojsonFilename(state.info), "application/geo+json");
+  showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON");
 }
 
 function annotationDocument() {
@@ -1238,9 +1599,8 @@ function flyToAnnotation(a) {
 }
 
 function finishSelection(a, b) {
-  const vp = state.viewer.viewport;
-  const p1 = vp.viewerElementToImageCoordinates(new OpenSeadragon.Point(a.x, a.y));
-  const p2 = vp.viewerElementToImageCoordinates(new OpenSeadragon.Point(b.x, b.y));
+  const p1 = viewerElementToImagePoint(a);
+  const p2 = viewerElementToImagePoint(b);
   const info = state.info;
   const x0 = clamp(Math.min(p1.x, p2.x), 0, info.width);
   const y0 = clamp(Math.min(p1.y, p2.y), 0, info.height);
@@ -1595,6 +1955,451 @@ function trackExport(job, label) {
   }, 350);
 }
 
+/* ---- slide inspector ------------------------------------------------------- */
+
+function wireSlideInspector() {
+  $("info-retry").onclick = () => loadSlideInspector(true);
+  $("info-copy").onclick = () => {
+    const data = state.inspect || state.info;
+    const text = slideInspectionRows(data)
+      .map(([label, value]) => label + ": " + value)
+      .join("\n");
+    copyPlainText(text)
+      .then(() => {
+        $("info-status").textContent = "Metadata copied to the clipboard";
+      })
+      .catch(() => {
+        $("info-status").textContent = "Could not copy metadata";
+      });
+  };
+  $("info-reveal-source").onclick = () => revealSlidePath("source");
+  $("info-reveal-cache").onclick = () => revealSlidePath("cache");
+  $("info-copy").disabled = true;
+  $("info-reveal-source").disabled = true;
+  $("info-reveal-cache").disabled = true;
+}
+
+async function loadSlideInspector(force = false) {
+  if (state.inspectLoading || (state.inspect && !force)) return;
+  state.inspectLoading = true;
+  $("info-loading").hidden = false;
+  $("info-loading").textContent = state.inspect ? "Refreshing slide metadata…" : "Loading slide metadata…";
+  $("info-error").hidden = true;
+  if (!state.inspect) $("info-content").hidden = true;
+  try {
+    const res = await fetch("api/inspect", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (!data || typeof data !== "object") throw new Error("invalid response");
+    state.inspect = { ...state.info, ...data };
+    renderSlideInspector(state.inspect);
+    $("info-status").textContent = "";
+  } catch (error) {
+    state.inspect = null;
+    renderSlideInspector(state.info, true);
+    $("info-error").hidden = false;
+    $("info-error").querySelector("span").textContent =
+      "Detailed metadata is unavailable (" + error.message + ").";
+    $("info-status").textContent = "Basic viewer metadata is shown below";
+  } finally {
+    state.inspectLoading = false;
+    $("info-loading").hidden = true;
+  }
+}
+
+function formatMetadataValue(value) {
+  if (value === null || value === undefined || value === "") return "Not reported";
+  if (typeof value !== "object") return String(value);
+  if (Array.isArray(value)) return value.map(formatMetadataValue).join(" · ");
+  const parts = Object.entries(value)
+    .filter(([, item]) => item !== null && item !== undefined && item !== "")
+    .map(([key, item]) => key.replace(/_/g, " ") + " " + formatMetadataValue(item));
+  return parts.length ? parts.join(" · ") : "Not reported";
+}
+
+function calibratedPixelSize(data) {
+  const calibration = data && typeof data.calibration === "object" ? data.calibration : {};
+  const value = calibration.pixel_size_um || calibration.pixelSizeUm ||
+    (data && (data.pixelSizeUm || data.pixel_size_um));
+  return Array.isArray(value) && value.length >= 2 ? value.map(Number) : null;
+}
+
+function calibrationLabel(data) {
+  const ps = calibratedPixelSize(data);
+  if (!ps || !ps.every(Number.isFinite)) return "Unknown";
+  const calibration = data && typeof data.calibration === "object" ? data.calibration : {};
+  const source = calibration.source || data.calibration_source;
+  const value = rawValueLabel(ps[1]) + " × " + rawValueLabel(ps[0]) + " µm/px";
+  return source ? value + " · " + source : value;
+}
+
+function selectionLabel(selection) {
+  const source = selection || {};
+  const z = source.z_resolved !== undefined
+    ? source.z_resolved
+    : source.z === undefined ? "mid" : source.z;
+  return "T" + (source.t === undefined ? 0 : source.t) +
+    " · P" + (source.p === undefined ? 0 : source.p) +
+    " · Z" + z;
+}
+
+function byteSizeLabel(logical, allocated) {
+  if (logical === null || logical === undefined || !Number.isFinite(Number(logical))) {
+    return "Unavailable";
+  }
+  let value = "Data " + fmtBytes(Number(logical));
+  if (allocated !== null && allocated !== undefined && Number.isFinite(Number(allocated))) {
+    value += " · Disk " + fmtBytes(Number(allocated));
+  }
+  return value;
+}
+
+function storageLabel(storage) {
+  const labels = {
+    compact: "Compact cache (source-backed)",
+    full: "Portable pyramid",
+    direct: "Direct source",
+    "overview-degraded": "Overview only (source missing)",
+  };
+  return labels[storage] || formatMetadataValue(storage);
+}
+
+function slideInspectionRows(data) {
+  data = data || {};
+  const channels = Array.isArray(data.channels)
+    ? data.channels.map((channel, i) => channel.label || channel.name || "C" + i).join(", ")
+    : "Not reported";
+  const levels = Array.isArray(data.levels)
+    ? data.levels.map((level) =>
+        "L" + level.path + " " + fmtInt(level.width) + " × " + fmtInt(level.height) +
+        " (1/" + rawValueLabel(level.downsample) + ")"
+      ).join(" · ")
+    : "Not reported";
+  const sourcePath = data.source_path || "Unavailable";
+  const cachePath = data.cache_path || (
+    data.storage !== "direct" && data.container_path ? data.container_path : null
+  );
+  const rows = [
+    ["File", data.name || "Unnamed slide"],
+    ["Dimensions", fmtInt(data.width || 0) + " × " + fmtInt(data.height || 0) + " px"],
+    ["Pixel type", (data.dtype || "Unknown") + (data.rgb ? " · RGB" : "")],
+    ["Channels", data.rgb ? "RGB" : channels],
+    ["Calibration", calibrationLabel(data)],
+    ["Objective", formatMetadataValue(data.objective)],
+    ["Plane", selectionLabel(data.selection)],
+    ["Pyramid", levels],
+    ["Storage", storageLabel(data.storage)],
+    ["Source", sourcePath],
+    ["Source size", byteSizeLabel(data.source_bytes, data.source_allocated_bytes)],
+    ["Cache", cachePath || (data.storage === "direct" ? "None (served from the file)" : "Unavailable")],
+    ["Cache size", cachePath
+      ? byteSizeLabel(data.cache_bytes, data.cache_allocated_bytes)
+      : data.storage === "direct" ? "None" : "Unavailable"],
+  ];
+  if (data.storage_details && typeof data.storage_details === "object") {
+    rows.splice(9, 0, ["Storage details", formatMetadataValue(data.storage_details)]);
+  }
+  if (Array.isArray(data.associated) && data.associated.length) {
+    rows.push(["Associated", data.associated.join(", ")]);
+  }
+  if (Array.isArray(data.notes) && data.notes.length) {
+    rows.push(["Notes", data.notes.join(" · ")]);
+  }
+  return rows;
+}
+
+function renderSlideInspector(data, partial = false) {
+  const grid = $("info-grid");
+  grid.replaceChildren();
+  for (const [label, value] of slideInspectionRows(data)) {
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = label;
+    detail.textContent = value;
+    if (label === "Source" || label === "Cache") {
+      detail.classList.add("info-path");
+      detail.title = value;
+    }
+    grid.append(term, detail);
+  }
+  $("info-content").hidden = false;
+  $("info-copy").disabled = false;
+  $("info-reveal-source").disabled = partial || !data.source_path || data.source_bytes === null;
+  $("info-reveal-cache").disabled = partial || !(
+    data.cache_path || (data.storage !== "direct" && data.container_path)
+  );
+  renderAssociatedImages(partial ? [] : data.associated);
+  if (state.windows && state.windows.info) state.windows.info.fitContent();
+}
+
+function renderAssociatedImages(names) {
+  const section = $("info-associated-section");
+  const container = $("info-associated");
+  container.replaceChildren();
+  const available = new Set((Array.isArray(names) ? names : []).map((name) => String(name).toLowerCase()));
+  for (const name of ["thumbnail", "label", "macro"]) {
+    if (!available.has(name)) continue;
+    const figure = document.createElement("figure");
+    const image = document.createElement("img");
+    const caption = document.createElement("figcaption");
+    image.alt = name[0].toUpperCase() + name.slice(1) + " associated image";
+    image.loading = "lazy";
+    image.src = "api/associated/" + name + ".jpg" +
+      (state.info.generation ? "?g=" + encodeURIComponent(state.info.generation) : "");
+    caption.textContent = name[0].toUpperCase() + name.slice(1);
+    image.addEventListener("error", () => {
+      figure.remove();
+      if (!container.children.length) section.hidden = true;
+    });
+    figure.append(image, caption);
+    container.append(figure);
+  }
+  section.hidden = !container.children.length;
+}
+
+async function copyPlainText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (_) { /* fall through to the WebKit-compatible copy path */ }
+  }
+  const field = document.createElement("textarea");
+  field.value = text;
+  field.style.position = "fixed";
+  field.style.opacity = "0";
+  document.body.append(field);
+  field.select();
+  const copied = document.execCommand("copy");
+  field.remove();
+  if (!copied) throw new Error("clipboard unavailable");
+}
+
+async function revealSlidePath(which) {
+  const button = $(which === "source" ? "info-reveal-source" : "info-reveal-cache");
+  const previous = button.textContent;
+  button.disabled = true;
+  button.textContent = "Revealing…";
+  try {
+    const res = await fetch("api/reveal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ which }),
+    });
+    let data = null;
+    try { data = await res.json(); } catch (_) { /* response may be empty */ }
+    if (!res.ok || (data && data.error)) {
+      throw new Error((data && data.error) || "HTTP " + res.status);
+    }
+    const label = which === "source" ? "Source" : "Cache";
+    $("info-status").textContent = label + " revealed in Finder";
+  } catch (error) {
+    $("info-status").textContent = "Could not reveal " + which + ": " + error.message;
+  } finally {
+    button.textContent = previous;
+    const data = state.inspect || {};
+    button.disabled = which === "source"
+      ? !data.source_path || data.source_bytes === null
+      : !(data.cache_path || (data.storage !== "direct" && data.container_path));
+  }
+}
+
+/* ---- linked compare viewport relay ---------------------------------------
+   The tab shell owns pairing and alignment. Each persistent slide iframe
+   reports its current image-space field of view and accepts an immediate
+   image-space fit. Physical mapping is possible when both slides report
+   calibration; otherwise the shell uses normalized slide coordinates. */
+
+const VIEWPORT_PROTOCOL_VERSION = 1;
+const VIEWPORT_EMIT_MS = 50;
+
+function normalizedRotation(value) {
+  return ((Number(value) % 360) + 360) % 360;
+}
+
+function applyDesiredDisplayTransform(announce = true) {
+  const viewer = state.viewer;
+  if (!viewer?.viewport || !viewer.world || !viewer.world.getItemCount()) return false;
+  const degrees = state.viewportRelay.displayRotation;
+  const flipped = state.viewportRelay.displayFlipped;
+  const rotationChanged = normalizedRotation(viewer.viewport.getRotation()) !== degrees;
+  const flipChanged = viewer.viewport.getFlip() !== flipped;
+  const changed = rotationChanged || flipChanged;
+  clearTimeout(state.viewportRelay.timer);
+  state.viewportRelay.timer = null;
+  state.viewportRelay.suppressUntil = state.viewportRelay.reopening
+    ? Number.POSITIVE_INFINITY
+    : Date.now() + 180;
+  if (changed) {
+    if (!$("ann-editor").hidden) closeEditor(true);
+    if (rotationChanged) viewer.viewport.setRotation(degrees, true);
+    if (flipChanged) viewer.viewport.setFlip(flipped);
+    const cursor = state.pixel.cursor;
+    if (cursor?.point) {
+      state.pixel.result = null;
+      state.pixel.failed = false;
+      const imagePoint = viewerElementToImagePoint(cursor.point);
+      updateCursor(imagePoint, cursor.point);
+    }
+  }
+  renderAnnotations();
+  if (state.roiOverlayEl) moveRoiOverlay();
+  if (announce) {
+    postViewportState("transform", {
+      displayRotation: degrees,
+      displayFlipped: flipped,
+    });
+  }
+  return true;
+}
+
+function applyDisplayTransform(message) {
+  const degrees = Number(message.degrees);
+  if (
+    (degrees !== 0 && degrees !== 180) ||
+    typeof message.flipped !== "boolean"
+  ) return;
+  state.viewportRelay.displayRotation = degrees;
+  state.viewportRelay.displayFlipped = message.flipped;
+  if (applyDesiredDisplayTransform()) return;
+  if (state.viewportRelay.transformWaitingForOpen) return;
+  state.viewportRelay.transformWaitingForOpen = true;
+  state.viewer.addOnceHandler("open", () => {
+    state.viewportRelay.transformWaitingForOpen = false;
+    applyDesiredDisplayTransform();
+  });
+}
+
+function currentSlideSid() {
+  const match = location.pathname.match(/\/s\/([0-9a-f]{8})\//);
+  return match ? match[1] : null;
+}
+
+function viewportSnapshot() {
+  const viewer = state.viewer;
+  if (!viewer || !viewer.viewport || !viewer.world || !viewer.world.getItemCount()) return null;
+  const bounds = viewer.viewport.getBounds(true);
+  // A rotated OSD Rect stores its angle separately. Constructing x+width here
+  // would ignore that angle and shift the reported center by a full viewport
+  // after a 180° turn.
+  const viewportTopLeft = bounds.getTopLeft();
+  const viewportBottomRight = bounds.getBottomRight();
+  const topLeft = viewer.viewport.viewportToImageCoordinates(
+    viewportTopLeft
+  );
+  const bottomRight = viewer.viewport.viewportToImageCoordinates(
+    viewportBottomRight
+  );
+  const numbers = [topLeft.x, topLeft.y, bottomRight.x, bottomRight.y];
+  if (!numbers.every(Number.isFinite)) return null;
+  const pixelSize = state.info.pixelSizeUm;
+  const calibrated = Array.isArray(pixelSize) && pixelSize.length >= 2 &&
+    Number(pixelSize[0]) > 0 && Number(pixelSize[1]) > 0;
+  return {
+    centerPx: {
+      x: (topLeft.x + bottomRight.x) / 2,
+      y: (topLeft.y + bottomRight.y) / 2,
+    },
+    spanPx: {
+      x: Math.max(1e-6, Math.abs(bottomRight.x - topLeft.x)),
+      y: Math.max(1e-6, Math.abs(bottomRight.y - topLeft.y)),
+    },
+    imagePx: { x: state.info.width, y: state.info.height },
+    pixelSizeUm: calibrated
+      ? { x: Number(pixelSize[1]), y: Number(pixelSize[0]) }
+      : null,
+  };
+}
+
+function postViewportState(reason, extra = {}) {
+  if (window.parent === window) return;
+  const snapshot = viewportSnapshot();
+  if (!snapshot) return;
+  window.parent.postMessage({
+    nd2wsi: "viewport-state",
+    version: VIEWPORT_PROTOCOL_VERSION,
+    sid: currentSlideSid(),
+    seq: ++state.viewportRelay.seq,
+    reason,
+    ...extra,
+    ...snapshot,
+  }, location.origin);
+}
+
+function scheduleViewportState() {
+  if (window.parent === window || Date.now() < state.viewportRelay.suppressUntil) return;
+  if (state.viewportRelay.timer) return;
+  state.viewportRelay.timer = setTimeout(() => {
+    state.viewportRelay.timer = null;
+    if (Date.now() >= state.viewportRelay.suppressUntil) postViewportState("user");
+  }, VIEWPORT_EMIT_MS);
+}
+
+function finiteViewportPoint(value, positive = false) {
+  if (!value || !Number.isFinite(Number(value.x)) || !Number.isFinite(Number(value.y))) {
+    return null;
+  }
+  const point = { x: Number(value.x), y: Number(value.y) };
+  return positive && (point.x <= 0 || point.y <= 0) ? null : point;
+}
+
+function applyLinkedViewport(message) {
+  const center = finiteViewportPoint(message.centerPx);
+  const span = finiteViewportPoint(message.spanPx, true);
+  const commandId = String(message.commandId || "");
+  if (!center || !span || !commandId) return;
+
+  const apply = () => {
+    clearTimeout(state.viewportRelay.timer);
+    state.viewportRelay.timer = null;
+    // OSD may emit several update events while fitBounds applies constraints.
+    // Keep all of those out of the user-event route, then send one explicit
+    // acknowledgement carrying the shell command id.
+    state.viewportRelay.suppressUntil = Date.now() + 180;
+    const imageRect = new OpenSeadragon.Rect(
+      center.x - span.x / 2,
+      center.y - span.y / 2,
+      span.x,
+      span.y
+    );
+    const viewportRect = state.viewer.viewport.imageToViewportRectangle(imageRect);
+    state.viewer.viewport.fitBounds(viewportRect, true);
+    state.viewer.viewport.applyConstraints(true);
+    postViewportState("apply", { echoOf: commandId });
+  };
+
+  if (state.viewer.world && state.viewer.world.getItemCount()) apply();
+  else state.viewer.addOnceHandler("open", apply);
+}
+
+function wireCompareRelay() {
+  window.addEventListener("message", (event) => {
+    if (
+      window.parent === window || event.source !== window.parent ||
+      event.origin !== location.origin || !event.data ||
+      event.data.version !== VIEWPORT_PROTOCOL_VERSION
+    ) return;
+    if (event.data.nd2wsi === "viewport-request") {
+      const requestId = String(event.data.requestId || "");
+      if (!requestId) return;
+      const reply = () => postViewportState("request", { requestId });
+      if (state.viewer.world && state.viewer.world.getItemCount()) reply();
+      else state.viewer.addOnceHandler("open", reply);
+    } else if (event.data.nd2wsi === "viewport-apply") {
+      applyLinkedViewport(event.data);
+    } else if (event.data.nd2wsi === "display-transform") {
+      applyDisplayTransform(event.data);
+    }
+  });
+  if (window.parent !== window) {
+    window.parent.postMessage({
+      nd2wsi: "viewport-ready",
+      version: VIEWPORT_PROTOCOL_VERSION,
+      sid: currentSlideSid(),
+    }, location.origin);
+  }
+}
+
 /* ---- appearance ------------------------------------------------------------
    Auto follows the system for fluorescence and opens RGB brightfield in light
    mode. An explicit light or dark choice is never overwritten by the slide. */
@@ -1800,6 +2605,22 @@ function buildWindows() {
       toolbarBtn: $("tb-annot"),
       startClosed: true,
     }),
+    info: makeMacWindow($("win-info"), {
+      key: "info",
+      def: () => ({
+        x: Math.max(14, stage.clientWidth - 414),
+        y: 14,
+        w: 400,
+        h: null,
+      }),
+      minW: 340,
+      minH: 220,
+      maxW: 720,
+      zoomW: 560,
+      toolbarBtn: $("tb-info"),
+      startClosed: true,
+      onOpen: () => loadSlideInspector(),
+    }),
   };
   window.addEventListener("resize", () => {
     Object.values(state.windows).forEach((w) => w.clampToStage());
@@ -1958,6 +2779,7 @@ function makeMacWindow(el, opts) {
     focus();
     persist();
     if (opts.onResize) opts.onResize();
+    if (opts.onOpen) opts.onOpen();
   }
   el.querySelector(".tl-close").addEventListener("click", () => close(false));
   el.querySelector(".tl-min").addEventListener("click", () => setCollapsed(!st.collapsed));
@@ -2019,19 +2841,50 @@ function wireDragForward() {
 function wireKeys() {
   window.addEventListener("keydown", (ev) => {
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
-    if ((ev.metaKey || ev.ctrlKey) && ["1", "2", "3"].includes(ev.key)) {
+    const command = ev.metaKey || ev.ctrlKey;
+    const k = ev.key.toLowerCase();
+    if (command && !ev.shiftKey && ev.code === "Backslash") {
+      if (window.parent !== window && !ev.repeat) {
+        ev.preventDefault();
+        window.parent.postMessage(
+          { nd2wsi: "compare-toggle", version: VIEWPORT_PROTOCOL_VERSION },
+          location.origin
+        );
+      }
+      return;
+    }
+    if (command && ev.shiftKey && k === "e") {
+      ev.preventDefault();
+      $("ann-geojson").click();
+      return;
+    }
+    if (command && !ev.shiftKey && k === "i") {
+      ev.preventDefault();
+      $("tb-info").click();
+      return;
+    }
+    if (command && ["1", "2", "3"].includes(ev.key)) {
       const btn = { 1: "tb-channels", 2: "tb-region", 3: "tb-annot" }[ev.key];
       ev.preventDefault();
       $(btn).click();  // same toggle the toolbar button performs
       return;
     }
-    if (ev.metaKey || ev.ctrlKey) return;  // leave other shortcuts alone
-    const k = ev.key.toLowerCase();
+    if (command) return;  // leave other shortcuts alone
     if (k === "r") setTool("roi");
     else if (k === "v") { if (state.roi) setTool("move"); }
     else if (k === "m") setTool("measure");
     else if (k === "p") setTool("pin");
     else if (k === "b") setTool("box");
+    else if (k === "i") togglePixelInspector();
+    else if (k === "l" && !ev.altKey && !ev.shiftKey && window.parent !== window) {
+      if (!ev.repeat) {
+        ev.preventDefault();
+        window.parent.postMessage(
+          { nd2wsi: "compare-link-toggle", version: VIEWPORT_PROTOCOL_VERSION },
+          location.origin
+        );
+      }
+    }
     else if (ev.key === "Escape") {
       if (!$("ann-editor").hidden) closeEditor(false);
       else if (state.tool) setTool(state.tool); // toggles off

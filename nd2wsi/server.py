@@ -14,6 +14,9 @@ keep working):
 
 GET  /s/<sid>/                  viewer page
 GET  /s/<sid>/api/info          store metadata as JSON
+GET  /s/<sid>/api/inspect       slide provenance and storage details
+GET  /s/<sid>/api/pixel         one raw sample at displayed-base x/y
+GET  /s/<sid>/api/associated/<thumbnail|label|macro>.jpg
 GET  /s/<sid>/api/histogram     per-channel LUT histograms
 GET  /s/<sid>/api/tile/<L>/<x>/<y>.jpg?c=0,1&win=…
 GET  /s/<sid>/api/roi?level=&x=&y=&w=&h=&format=nd2|tiff|png|jpg&c=&win=
@@ -24,6 +27,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import re
 import tempfile
 import threading
@@ -39,6 +44,9 @@ from .direct import _Lifecycle
 
 STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
+ASSOCIATED_RE = re.compile(
+    r"^/api/associated/(thumbnail|label|macro)\.jpg$"
+)
 SLIDE_RE = re.compile(r"^/s/([0-9a-f]{8})(/.*)?$")
 JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
@@ -103,6 +111,10 @@ class ViewerState:
         annotations_path: Path | None = None,
         generation: str = "",
         trash_path: Path | None = None,
+        source_path: Path | None = None,
+        store_path: Path | None = None,
+        container_path: Path | None = None,
+        manifest: dict[str, Any] | None = None,
     ):
         self.root = root
         self.attrs = attrs
@@ -111,8 +123,231 @@ class ViewerState:
         self.annotations_path = annotations_path
         self.generation = generation  # changes when the pixels could
         self.trash_path = trash_path
+        # These paths are registered by the backend when the slide opens.
+        # Handlers expose read-only properties and never accept a path from
+        # the browser for reveal or associated-image operations.
+        self._source_path = (
+            Path(source_path).expanduser().resolve() if source_path is not None else None
+        )
+        self._store_path = (
+            Path(store_path).expanduser().resolve() if store_path is not None else None
+        )
+        self._container_path = (
+            Path(container_path).expanduser().resolve()
+            if container_path is not None
+            else None
+        )
+        self.manifest = dict(manifest or {})
         self.busy = _Lifecycle()  # in-flight exports, so trash can refuse
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
+        self._inspect_lock = threading.Lock()
+        self._cache_usage_ready = False
+        self._cache_usage: dict[str, int] | None = None
+
+    @property
+    def source_path(self) -> Path | None:
+        return self._source_path
+
+    @property
+    def store_path(self) -> Path | None:
+        return self._store_path
+
+    @property
+    def container_path(self) -> Path | None:
+        return self._container_path
+
+    @property
+    def cache_path(self) -> Path | None:
+        """The one registered path shown/revealed as on-disk viewer data."""
+        return self._container_path or self._store_path
+
+    def cache_usage(self) -> dict[str, int] | None:
+        """Logical and allocated cache bytes, computed once per generation."""
+        with self._inspect_lock:
+            if not self._cache_usage_ready:
+                self._cache_usage = _path_usage(self.cache_path)
+                self._cache_usage_ready = True
+            return dict(self._cache_usage) if self._cache_usage is not None else None
+
+
+def _allocated_bytes(st: os.stat_result) -> int:
+    blocks = getattr(st, "st_blocks", None)
+    return int(blocks) * 512 if blocks is not None else int(st.st_size)
+
+
+def _path_usage(path: Path | None) -> dict[str, int] | None:
+    """Return logical file bytes and actual allocated bytes for ``path``.
+
+    Logical directory size is the sum of file lengths. Allocated size also
+    includes directory records, matching the important "space on disk"
+    distinction on ExFAT caches containing many small chunk files.
+    """
+    if path is None:
+        return None
+    try:
+        root_stat = path.lstat()
+    except OSError:
+        return None
+    if not path.is_dir():
+        return {
+            "bytes": int(root_stat.st_size),
+            "allocated_bytes": _allocated_bytes(root_stat),
+        }
+
+    logical = 0
+    allocated = _allocated_bytes(root_stat)
+    for walk_root, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs:
+            try:
+                allocated += _allocated_bytes((Path(walk_root) / name).lstat())
+            except OSError:
+                continue
+        for name in files:
+            try:
+                st = (Path(walk_root) / name).lstat()
+            except OSError:
+                continue
+            logical += int(st.st_size)
+            allocated += _allocated_bytes(st)
+    return {"bytes": logical, "allocated_bytes": allocated}
+
+
+def _storage_mode(meta: dict[str, Any]) -> str:
+    if meta.get("direct"):
+        return "direct"
+    return {
+        "source-backed": "compact",
+        "overview-degraded": "overview-degraded",
+    }.get(meta.get("kind"), "full")
+
+
+def _inspection_storage_details(
+    st: ViewerState, meta: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge the store descriptor with any managed-container manifest."""
+    details: dict[str, Any] = {}
+    embedded = meta.get("storage")
+    if isinstance(embedded, dict):
+        details.update(embedded)
+    manifested = st.manifest.get("storage")
+    if isinstance(manifested, dict):
+        details.update(manifested)
+    details["mode"] = _storage_mode(meta)
+    return details
+
+
+def _manifest_source_path(container: Path, manifest: dict[str, Any]) -> Path | None:
+    src = manifest.get("source") or {}
+    rel = src.get("relative_path") if isinstance(src, dict) else None
+    if not isinstance(rel, str) or not rel:
+        return None
+    candidate = (container / rel).resolve()
+    recorded_name = src.get("name")
+    if recorded_name and candidate.name != Path(str(recorded_name)).name:
+        return None
+    return candidate
+
+
+def _associated_source_path(st: ViewerState) -> Path | None:
+    """A currently valid registered SVS source, never a request-supplied path."""
+    source = st.source_path
+    if source is None or source.suffix.lower() != ".svs" or not source.is_file():
+        return None
+    source_info = st.manifest.get("source") or {}
+    fingerprint_keys = ("size", "mtime_ns", "quick_sha256")
+    if not isinstance(source_info, dict) or not all(
+        key in source_info for key in fingerprint_keys
+    ):
+        return None
+    from .cache import fingerprints_match, quick_fingerprint
+
+    try:
+        if not fingerprints_match(source_info, quick_fingerprint(source)):
+            return None
+    except OSError:
+        return None
+    return source
+
+
+def _associated_names(st: ViewerState) -> list[str]:
+    source = _associated_source_path(st)
+    if source is None:
+        return []
+    try:
+        from .svs import associated_image_names
+
+        names = associated_image_names(source)
+        return names if _associated_source_path(st) == source else []
+    except Exception:
+        # An auxiliary image must never make the primary slide inspector fail.
+        return []
+
+
+def _pixel_payload(st: ViewerState, x: float, y: float) -> dict[str, Any]:
+    """Read one raw sample at the displayed base level.
+
+    A degraded overview advertises stored path ``1`` as its first/displayed
+    level. Its incoming coordinates already live in that coordinate system,
+    so they must not be divided by two a second time.
+    """
+    meta = st.attrs["nd2wsi"]
+    level = meta["levels"][0]
+    width, height = int(level["width"]), int(level["height"])
+    xi = max(0, min(int(x), width - 1))
+    yi = max(0, min(int(y), height - 1))
+    region = render._read_region(st.root, str(level["path"]), xi, yi, 1, 1)
+    if region.shape[1:] != (1, 1):
+        raise ValueError("pixel is outside the displayed image")
+
+    channels = st.attrs["omero"]["channels"]
+    values = []
+    for i, raw in enumerate(region[:, 0, 0]):
+        value = raw.item() if hasattr(raw, "item") else raw
+        if isinstance(value, float) and not math.isfinite(value):
+            value = None
+        values.append(
+            {
+                "name": channels[i].get("label") or f"Channel {i}",
+                "value": value,
+            }
+        )
+
+    pixel_size = meta.get("pixel_size_um")
+    um = None
+    if pixel_size:
+        py, px = float(pixel_size[0]), float(pixel_size[1])
+        um = [xi * px, yi * py]
+    calibration = meta.get("calibration") or {}
+    path = str(level["path"])
+    probed_level: int | str = int(path) if path.isdigit() else path
+    return {
+        "x": xi,
+        "y": yi,
+        "um": um,
+        "values": values,
+        "probed_level": probed_level,
+        "sample_kind": (
+            "overview-mean" if meta.get("kind") == "overview-degraded" else "native"
+        ),
+        "calibration": {
+            "status": calibration.get("status", "unknown"),
+            "source": calibration.get("source", "unknown"),
+            "pixel_size_um": pixel_size,
+        },
+    }
+
+
+def reveal_in_file_manager(path: Path, *, platform: str | None = None, runner=None) -> None:
+    """Reveal one registered path in Finder without invoking a shell."""
+    import subprocess
+    import sys
+
+    if (platform or sys.platform) != "darwin":
+        raise RuntimeError("Reveal is available only on macOS")
+    if not path.exists():
+        raise FileNotFoundError(path)
+    run = runner or subprocess.run
+    run(["/usr/bin/open", "-R", str(path)], check=True, timeout=10)
 
 
 def _close_state(st: ViewerState | None) -> None:
@@ -311,13 +546,20 @@ class SlideRegistry:
         return hashlib.sha1(str(store_path.resolve()).encode()).hexdigest()[:8]
 
     def add_store(
-        self, store_path: str | Path, *, trash_path: str | Path | None = None
+        self,
+        store_path: str | Path,
+        *,
+        trash_path: str | Path | None = None,
+        source_path: str | Path | None = None,
     ) -> str:
         from .cache import CACHE_SUFFIX, read_manifest
         from .convert import CACHE_DIR_NAME, is_nd2wsi_store, open_store
         from .svs import is_svs
 
         store_path = Path(store_path).resolve()
+        registered_source = (
+            Path(source_path).expanduser().resolve() if source_path is not None else None
+        )
         if trash_path is not None:
             trash_path = Path(trash_path).resolve()
         elif store_path.parent.name.endswith(CACHE_SUFFIX):
@@ -330,27 +572,41 @@ class SlideRegistry:
             # user opened at any other explicit path never is
             trash_path = store_path
         if is_svs(store_path):  # an SVS itself serves with no store
+            slide_path = store_path
             try:
-                return self.add_direct(store_path)
+                return self.add_direct(slide_path)
             except NotImplementedError:
                 from .convert import convert as _convert
                 from .convert import default_store_path as _dsp
 
-                built = _dsp(store_path)
+                built = _dsp(slide_path)
                 if not built.exists():
-                    _convert(store_path, built, progress=False)
+                    _convert(slide_path, built, progress=False)
                 store_path = built
                 trash_path = built
+                registered_source = registered_source or slide_path
+        manifest: dict[str, Any] = {}
+        container_path = None
         if store_path.parent.name.endswith(CACHE_SUFFIX):
-            manifest = read_manifest(store_path.parent) or {}
+            container_path = store_path.parent
+            manifest = read_manifest(container_path) or {}
+            registered_source = registered_source or _manifest_source_path(
+                container_path, manifest
+            )
             if manifest.get("kind") == "overview":
-                return self._add_overview(store_path, manifest)
+                return self._add_overview(
+                    store_path, manifest, source_path=registered_source
+                )
         sid = self.sid_for(store_path)
         gen = store_generation(store_path)
         stale = None
         with self._lock:
             st = self.slides.get(sid)
-            if st is not None and st.generation == gen:
+            if (
+                st is not None
+                and st.generation == gen
+                and (registered_source is None or st.source_path == registered_source)
+            ):
                 return sid
             if st is not None:  # rebuilt underneath: the old root is stale
                 stale = self.slides.pop(sid)
@@ -362,13 +618,22 @@ class SlideRegistry:
                 annotations_path=annotations_sidecar(store_path, attrs),
                 generation=gen,
                 trash_path=Path(trash_path) if trash_path is not None else None,
+                source_path=registered_source,
+                store_path=store_path,
+                container_path=container_path,
+                manifest=manifest,
             )
-            st.store_path = store_path
             self.slides[sid] = st
         _close_state(stale)
         return sid
 
-    def _add_overview(self, store_path: Path, manifest: dict) -> str:
+    def _add_overview(
+        self,
+        store_path: Path,
+        manifest: dict,
+        *,
+        source_path: Path | None = None,
+    ) -> str:
         """An overview store: the source file plays level 0 when it can.
 
         When the source is missing, changed, or cannot back a level at
@@ -384,7 +649,9 @@ class SlideRegistry:
         stale = None
         with self._lock:
             src_info = manifest.get("source", {})
-            source = (store_path.parent / src_info.get("relative_path", "")).resolve()
+            source = source_path or _manifest_source_path(store_path.parent, manifest)
+            if source is None:
+                source = (store_path.parent / src_info.get("relative_path", "")).resolve()
             source_ok = False
             try:
                 source_ok = source.is_file() and fingerprints_match(
@@ -394,7 +661,11 @@ class SlideRegistry:
                 source_ok = False
             st = self.slides.get(sid)
             expected = gen + ("" if source_ok else "-degraded")
-            if st is not None and st.generation == expected:
+            if (
+                st is not None
+                and st.generation == expected
+                and st.source_path == source
+            ):
                 return sid
             if st is not None:  # rebuilt or mode change: the state is stale
                 stale = self.slides.pop(sid)
@@ -435,35 +706,71 @@ class SlideRegistry:
                 # immutable in one must never be revived in the other
                 generation=gen + ("-degraded" if degraded else ""),
                 trash_path=store_path.parent,
+                source_path=source,
+                store_path=store_path,
+                container_path=store_path.parent,
+                manifest=manifest,
             )
-            st.store_path = store_path
             self.slides[sid] = st
         _close_state(stale)
         return sid
 
     def add_direct(self, slide_path: str | Path) -> str:
         """Serve an SVS straight from the file, writing nothing to disk."""
+        from .cache import fingerprints_match, quick_fingerprint
         from .direct import open_direct
 
         slide_path = Path(slide_path).resolve()
         sid = self.sid_for(slide_path)
-        gen = store_generation(slide_path)
         stale = None
         with self._lock:
+            fingerprint = quick_fingerprint(slide_path)
+            gen = (
+                f"{int(fingerprint['mtime_ns']):x}-"
+                f"{str(fingerprint['quick_sha256'])[:16]}"
+            )
             st = self.slides.get(sid)
             if st is not None and st.generation == gen:
                 return sid
-            if st is not None:  # file replaced underneath
-                stale = self.slides.pop(sid)
-            root, attrs = open_direct(slide_path)
+
+            # Fingerprint before and after opening so the registered auxiliary
+            # images can never come from a replacement path while the tiled
+            # root still holds the previous inode.
+            root = attrs = None
+            for _ in range(2):
+                root, attrs = open_direct(slide_path)
+                try:
+                    current = quick_fingerprint(slide_path)
+                except Exception:
+                    close = getattr(root, "close", None)
+                    if close:
+                        close()
+                    raise
+                if fingerprints_match(fingerprint, current):
+                    fingerprint = current
+                    break
+                close = getattr(root, "close", None)
+                if close:
+                    close()
+                root = attrs = None
+                fingerprint = current
+            if root is None or attrs is None:
+                raise RuntimeError(f"{slide_path.name} changed while it was opening")
+
+            gen = (
+                f"{int(fingerprint['mtime_ns']):x}-"
+                f"{str(fingerprint['quick_sha256'])[:16]}"
+            )
+            stale = self.slides.get(sid)
             st = ViewerState(
                 root,
                 attrs,
                 max_render_mpx=self.max_render_mpx,
                 annotations_path=annotations_sidecar(slide_path, attrs),
                 generation=gen,
+                source_path=slide_path,
+                manifest={"source": fingerprint},
             )
-            st.store_path = None  # nothing on disk to trash
             self.slides[sid] = st
         _close_state(stale)
         return sid
@@ -488,7 +795,7 @@ class SlideRegistry:
             raise ValueError(f"not an ND2/SVS slide or pyramid store: {path.name}")
         # no explicit trash_path: add_store promotes a container store to its
         # container, so trashing removes manifest and pixels together
-        return self.add_store(store)
+        return self.add_store(store, source_path=path)
 
     def remove(self, sid: str) -> bool:
         with self._lock:
@@ -798,10 +1105,17 @@ def make_handler(
                     return self._error(404, f"no slide for {path}")
                 if sub == "/api/info":
                     return self._info(st)
+                if sub == "/api/inspect":
+                    return self._inspect(st)
+                if sub == "/api/pixel":
+                    return self._pixel(st, q)
                 if sub == "/api/histogram":
                     return self._histogram(st)
                 if sub == "/api/annotations":
                     return self._annotations_get(st)
+                associated = ASSOCIATED_RE.match(sub)
+                if associated:
+                    return self._associated(st, associated.group(1))
                 m = TILE_RE.match(sub)
                 if m:
                     return self._tile(st, m, q)
@@ -833,6 +1147,8 @@ def make_handler(
                 st, sub = self._resolve(path)
                 if st is not None and sub == "/api/annotations":
                     return self._annotations_post(st)
+                if st is not None and sub == "/api/reveal":
+                    return self._reveal(st)
                 return self._error(404, f"no POST route for {path}")
             except BrokenPipeError:
                 pass
@@ -934,10 +1250,10 @@ def make_handler(
             return self._json({"ok": True, "slides": registry.listing()})
 
         # ---- per-slide endpoints -----------------------------------------
-        def _info(self, st: ViewerState):
+        def _info_payload(self, st: ViewerState) -> dict[str, Any]:
             meta = st.attrs["nd2wsi"]
             lv0 = meta["levels"][0]
-            info = {
+            return {
                 "name": meta["source"],
                 "width": lv0["width"],
                 "height": lv0["height"],
@@ -962,16 +1278,99 @@ def make_handler(
                 "direct": bool(meta.get("direct")),
                 "trashable": st.trash_path is not None,
                 "generation": st.generation,
-                "storage": (
-                    "direct"
-                    if meta.get("direct")
-                    else {
-                        "source-backed": "compact",
-                        "overview-degraded": "overview-degraded",
-                    }.get(meta.get("kind"), "full")
-                ),
+                "storage": _storage_mode(meta),
             }
-            self._json(info)
+
+        def _info(self, st: ViewerState):
+            self._json(self._info_payload(st))
+
+        def _inspect(self, st: ViewerState):
+            meta = st.attrs["nd2wsi"]
+            source_usage = _path_usage(st.source_path)
+            cache_usage = st.cache_usage()
+            storage_details = _inspection_storage_details(st, meta)
+            calibration = dict(meta.get("calibration") or {})
+            calibration.setdefault("status", "unknown")
+            calibration.setdefault("source", "unknown")
+            calibration["pixel_size_um"] = meta.get("pixel_size_um")
+            payload = {
+                **self._info_payload(st),
+                "source_path": str(st.source_path) if st.source_path else None,
+                "store_path": str(st.store_path) if st.store_path else None,
+                "container_path": (
+                    str(st.container_path) if st.container_path else None
+                ),
+                "cache_path": str(st.cache_path) if st.cache_path else None,
+                "source_bytes": source_usage["bytes"] if source_usage else None,
+                "source_allocated_bytes": (
+                    source_usage["allocated_bytes"] if source_usage else None
+                ),
+                "cache_bytes": cache_usage["bytes"] if cache_usage else None,
+                "cache_allocated_bytes": (
+                    cache_usage["allocated_bytes"] if cache_usage else None
+                ),
+                "storage_details": storage_details,
+                "calibration": calibration,
+                "objective": meta.get("objective_magnification"),
+                "objective_magnification": meta.get("objective_magnification"),
+                "selection": dict(meta.get("selection") or {}),
+                "associated": _associated_names(st),
+            }
+            self._json(payload)
+
+        def _pixel(self, st: ViewerState, q: dict):
+            try:
+                x_raw = (q.get("x") or [None])[0]
+                y_raw = (q.get("y") or [None])[0]
+                if x_raw is None or y_raw is None:
+                    raise ValueError("missing parameter x or y")
+                x, y = float(x_raw), float(y_raw)
+                if not math.isfinite(x) or not math.isfinite(y):
+                    raise ValueError("x and y must be finite numbers")
+                payload = _pixel_payload(st, x, y)
+            except (TypeError, ValueError) as e:
+                return self._error(400, str(e))
+            self._json(payload)
+
+        def _associated(self, st: ViewerState, name: str):
+            source = _associated_source_path(st)
+            if source is None:
+                return self._error(404, "associated image source is unavailable")
+            try:
+                from .svs import associated_image_jpeg
+
+                body = associated_image_jpeg(source, name)
+            except (KeyError, OSError, ValueError):
+                return self._error(404, f"associated image {name} is unavailable")
+            # The path may have been atomically replaced while it was decoded.
+            # In that case discard the body instead of mixing auxiliary pixels
+            # from a different file with the already-open primary slide root.
+            if _associated_source_path(st) != source:
+                return self._error(404, "associated image source changed")
+            self._send(200, body, "image/jpeg")
+
+        def _reveal(self, st: ViewerState):
+            import subprocess
+
+            try:
+                data = self._body_json(limit=1000)
+            except (ValueError, json.JSONDecodeError) as e:
+                return self._error(400, str(e))
+            which = data.get("which") if isinstance(data, dict) else None
+            if which not in ("source", "cache"):
+                return self._error(400, 'expected {"which": "source"|"cache"}')
+            target = st.source_path if which == "source" else st.cache_path
+            if target is None or not target.exists():
+                return self._error(404, f"registered {which} path is unavailable")
+            try:
+                reveal_in_file_manager(target)
+            except FileNotFoundError:
+                return self._error(404, f"registered {which} path is unavailable")
+            except RuntimeError as e:
+                return self._error(HTTPStatus.NOT_IMPLEMENTED, str(e))
+            except (OSError, subprocess.SubprocessError) as e:
+                return self._error(500, f"could not reveal {which}: {e}")
+            self._json({"ok": True, "which": which})
 
         def _annotations_get(self, st: ViewerState):
             p = st.annotations_path

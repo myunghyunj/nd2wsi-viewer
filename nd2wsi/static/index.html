@@ -28,6 +28,11 @@
       <button class="tb-btn" id="tb-annot" title="Show or hide Annotations">
         <span class="tb-ico icon-note" aria-hidden="true"></span><span>Annotate</span>
       </button>
+      <button class="tb-btn" id="tb-info" title="Show or hide Slide Info (⌘I)" aria-label="Slide Info">
+        <span class="tb-ico icon-info" aria-hidden="true">
+          <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"></circle><path d="M8 7v4M8 4.5h.01"></path></svg>
+        </span><span>Info</span>
+      </button>
       <button class="tb-btn tb-theme" id="tb-theme" title="Appearance" aria-label="Appearance">
         <span class="tb-ico theme-glyph" aria-hidden="true"></span>
       </button>
@@ -137,10 +142,51 @@
           <button id="ann-open" class="btn" title="Load an annotation file">Open…</button>
           <button id="ann-export" class="btn" title="Download the annotation file">Export</button>
         </div>
+        <div class="tool-row footer geojson-footer">
+          <button id="ann-geojson" class="btn full" title="Export QuPath-compatible GeoJSON (⌘⇧E)">Export GeoJSON</button>
+        </div>
         <div class="hint" id="ann-status"></div>
         <input type="file" id="ann-file" accept=".json,application/json" hidden />
       </div>
     </section>
+
+    <section class="mac-window" id="win-info">
+      <div class="win-titlebar">
+        <div class="traffic">
+          <button class="tl tl-close" title="Close"></button>
+          <button class="tl tl-min" title="Collapse"></button>
+          <button class="tl tl-zoom" title="Zoom"></button>
+        </div>
+        <span class="win-title">Slide Info</span>
+      </div>
+      <div class="win-body">
+        <div class="info-state" id="info-loading">Loading slide metadata…</div>
+        <div class="info-state info-error" id="info-error" hidden>
+          <span>Detailed metadata is unavailable.</span>
+          <button class="btn" id="info-retry">Retry</button>
+        </div>
+        <div id="info-content" hidden>
+          <dl class="info-grid" id="info-grid"></dl>
+          <div class="tool-row info-actions">
+            <button class="btn" id="info-copy">Copy Metadata</button>
+            <button class="btn" id="info-reveal-source">Reveal Source</button>
+            <button class="btn" id="info-reveal-cache">Reveal Cache</button>
+          </div>
+          <div class="hint" id="info-status"></div>
+          <section id="info-associated-section" hidden>
+            <h3 class="info-section-title">Associated Images</h3>
+            <div id="info-associated"></div>
+          </section>
+        </div>
+      </div>
+    </section>
+
+    <div id="pixel-hud" hidden>
+      <div class="pixel-hud-coord" id="pixel-hud-coord">–</div>
+      <div class="pixel-hud-stage" id="pixel-hud-stage">–</div>
+      <div class="pixel-hud-values" id="pixel-hud-values">–</div>
+      <div class="pixel-hud-note" id="pixel-hud-note"></div>
+    </div>
 
     <div id="zoom-cluster" aria-label="Zoom controls">
       <button class="zc-btn" id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
@@ -154,7 +200,7 @@
 
   <footer id="statusbar">
     <span class="cell"><span class="label">Stage</span><span class="value" id="pos-um">–</span></span>
-    <span class="cell optional"><span class="label">Pixel</span><span class="value" id="pos-px">–</span></span>
+    <span class="cell" id="pixel-cell" title="Press I to show the Pixel Inspector"><span class="label">Pixel</span><span class="value" id="pos-px">–</span></span>
     <span class="cell"><span class="label">Zoom</span><span class="value" id="zoom-val">–</span></span>
     <span class="cell"><span class="label">Level</span><span id="level-lamps"></span></span>
     <span class="cell optional" id="hw-cell" hidden><span class="label">Display</span><span class="value" id="hw-val"></span></span>
