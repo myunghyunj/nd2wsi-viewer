@@ -106,17 +106,71 @@ def _nd2_pixel_size(f: Any) -> tuple[tuple[float, float] | None, str]:
     are present they decide; when the metadata lacks them, the voxel size
     is taken at its word.
     """
+    flags = None
+    structured_ok = True
     try:
-        vol = f.metadata.channels[0].volume
-        flags = vol.axesCalibrated
-        if not (bool(flags[0]) and bool(flags[1])):
-            return None, "unknown"
-    except (AttributeError, IndexError, TypeError):
-        pass  # metadata variant without the flags: fall through
-    vs = f.voxel_size()
-    if vs is not None and _finite_positive(vs.x) and _finite_positive(vs.y):
+        channels = f.metadata.channels
+    except Exception:
+        # the structured parser choked on this file (seen: a metadata matrix
+        # whose Data field is a string); the global block still carries the
+        # same calibration fields, so take them from there under the same rule
+        structured_ok = False
+        channels = None
+    if structured_ok:
+        try:
+            flags = channels[0].volume.axesCalibrated
+        except (AttributeError, IndexError, TypeError):
+            flags = None  # metadata variant without the flags: fall through
+    else:
+        vol = _nd2_global_volume(f)
+        if vol is not None:
+            flags = vol.get("axesCalibrated")
+            calib = vol.get("axesCalibration")
+            if flags is not None and not (bool(flags[0]) and bool(flags[1])):
+                return None, "unknown"
+            if (
+                isinstance(calib, (list, tuple)) and len(calib) >= 2
+                and _finite_positive(calib[0]) and _finite_positive(calib[1])
+            ):
+                return (float(calib[1]), float(calib[0])), "nd2-volume-calibration"
+        return None, "unknown"
+    if flags is not None and not (bool(flags[0]) and bool(flags[1])):
+        return None, "unknown"
+    try:
+        vs = f.voxel_size()
+    except Exception:
+        return None, "unknown"
+    if structured_ok and vs is not None and _finite_positive(vs.x) and _finite_positive(vs.y):
         return (float(vs.y), float(vs.x)), "nd2-voxel-size"
     return None, "unknown"
+
+
+def _nd2_global_volume(f: Any) -> dict | None:
+    """The reader's global ``volume`` block, when the structured path is broken."""
+    try:
+        rdr = getattr(f, "_rdr", None)
+        gm = rdr._cached_global_metadata() if rdr is not None else None
+        vol = gm.get("volume") if isinstance(gm, dict) else None
+        return vol if isinstance(vol, dict) else None
+    except Exception:
+        return None
+
+
+def _nd2_raw_planes(f: Any) -> list[tuple[str | None, int | None]]:
+    """(name, uiColor) per picture plane from the raw frame metadata."""
+    try:
+        rdr = getattr(f, "_rdr", None)
+        raw = rdr._cached_raw_metadata() if rdr is not None else None
+        planes = raw.get("sPicturePlanes") if isinstance(raw, dict) else None
+        table = (planes.get("sPlaneNew") or planes.get("sPlane") or {}) if isinstance(planes, dict) else {}
+        out = []
+        for key in sorted(table, key=lambda k: str(k)):
+            v = table[key]
+            if isinstance(v, dict):
+                out.append((v.get("sDescription"), v.get("uiColor")))
+        return out
+    except Exception:
+        return []
 
 
 def _finite_positive(v: Any) -> bool:
@@ -135,10 +189,14 @@ def _channel_infos(f: Any, n_channels: int, rgb: bool) -> list[ChannelInfo]:
         ][:n_channels]
     infos: list[ChannelInfo] = []
     meta_channels = []
+    raw_planes: list[tuple[str | None, int | None]] = []
     try:
         meta_channels = list(getattr(f.metadata, "channels", None) or [])
-    except Exception:  # pragma: no cover - metadata parsing is best effort
+    except Exception:
+        # structured metadata unreadable: the raw picture planes still name
+        # and color the channels (uiColor packs 0x00BBGGRR)
         meta_channels = []
+        raw_planes = _nd2_raw_planes(f)
     for i in range(n_channels):
         name = f"Channel {i}"
         color = (255, 255, 255)
@@ -151,6 +209,12 @@ def _channel_infos(f: Any, n_channels: int, rgb: bool) -> list[ChannelInfo]:
                 color = (int(c.r), int(c.g), int(c.b))
                 if color == (0, 0, 0):  # avoid invisible channels
                     color = (255, 255, 255)
+        elif i < len(raw_planes):
+            raw_name, ui_color = raw_planes[i]
+            if raw_name:
+                name = str(raw_name)
+            if isinstance(ui_color, int) and ui_color > 0:
+                color = (ui_color & 0xFF, (ui_color >> 8) & 0xFF, (ui_color >> 16) & 0xFF)
         infos.append(ChannelInfo(name, color))
     if n_channels == 1:
         infos[0].color = (255, 255, 255)

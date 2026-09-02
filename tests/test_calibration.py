@@ -8,6 +8,7 @@ contract: unknown in, unknown out, on every path.
 
 import io
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -152,3 +153,60 @@ def test_anisotropic_pixels_export_uncalibrated():
     assert _scalar_calibration((0.66, 0.66)) == 0.66
     with pytest.warns(UserWarning, match="anisotropic"):
         assert _scalar_calibration((0.5, 0.7)) is None
+
+
+class _BrokenStructured:
+    """An nd2 handle whose structured metadata parser fails, as one real
+    scan did (a metadata matrix whose Data field is a string), while the
+    global and raw blocks still parse."""
+
+    def __init__(self, volume, planes):
+        self._rdr = SimpleNamespace(
+            _cached_global_metadata=lambda: {"volume": volume},
+            _cached_raw_metadata=lambda: {"sPicturePlanes": {"sPlaneNew": planes}},
+        )
+
+    @property
+    def metadata(self):
+        raise TypeError("'str' object cannot be interpreted as an integer")
+
+    def voxel_size(self):
+        raise TypeError("'str' object cannot be interpreted as an integer")
+
+
+def test_broken_structured_metadata_falls_back_to_the_global_calibration():
+    from nd2wsi.reader import _channel_infos, _nd2_pixel_size
+
+    f = _BrokenStructured(
+        {"axesCalibrated": (True, True, False), "axesCalibration": (0.66, 0.66, 1.0)},
+        {"a0": {"sDescription": "CY5", "uiColor": 255},
+         "a1": {"sDescription": "DAPI", "uiColor": 16738818}},
+    )
+    assert _nd2_pixel_size(f) == ((0.66, 0.66), "nd2-volume-calibration")
+    infos = _channel_infos(f, 2, False)
+    assert [(c.name, c.color) for c in infos] == [("CY5", (255, 0, 0)), ("DAPI", (2, 106, 255))]
+
+
+def test_broken_structured_metadata_still_never_invents_calibration():
+    from nd2wsi.reader import _channel_infos, _nd2_pixel_size
+
+    uncalibrated = _BrokenStructured(
+        {"axesCalibrated": (False, False, False), "axesCalibration": (1.0, 1.0, 1.0)}, {}
+    )
+    assert _nd2_pixel_size(uncalibrated) == (None, "unknown")
+    assert [c.name for c in _channel_infos(uncalibrated, 2, False)] == ["Channel 0", "Channel 1"]
+
+    class _NothingParses:
+        _rdr = SimpleNamespace(
+            _cached_global_metadata=lambda: (_ for _ in ()).throw(RuntimeError("no")),
+            _cached_raw_metadata=lambda: (_ for _ in ()).throw(RuntimeError("no")),
+        )
+
+        @property
+        def metadata(self):
+            raise TypeError("broken")
+
+        def voxel_size(self):
+            raise TypeError("broken")
+
+    assert _nd2_pixel_size(_NothingParses()) == (None, "unknown")

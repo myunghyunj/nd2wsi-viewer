@@ -307,7 +307,7 @@ legacy = [
 
 [[package]]
 name = "nd2wsi-viewer"
-version = "1.0.1"
+version = "1.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "dask", extra = ["array"] },
