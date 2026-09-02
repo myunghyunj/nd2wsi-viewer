@@ -47,14 +47,14 @@
       <div class="sub"><b>.nd2</b>, <b>.svs</b>, or press + to browse</div>
     </div>
   </div>
-  <div id="compare-divider" hidden aria-hidden="true">
-    <div id="compare-controls" role="toolbar" aria-label="Approximate slide alignment">
-      <span id="compare-status">Approximate alignment</span>
-      <button id="compare-partner" class="compare-control compare-partner" type="button"
-              title="Choose another open slide to link" aria-label="Choose the linked slide"
-              aria-haspopup="menu" aria-expanded="false" aria-controls="compare-picker-list">
-        <span class="name">Slide</span><span class="chevron" aria-hidden="true">▾</span>
-      </button>
+  <div id="compare-divider" hidden aria-hidden="true"></div>
+  <div id="compare-controls" role="toolbar" aria-label="Linked slides" hidden>
+    <div class="compare-row">
+      <span id="compare-status">Linked</span>
+      <div id="compare-chips" aria-label="Linked slides"></div>
+      <button id="compare-add" class="compare-control" type="button"
+              title="Link another open slide" aria-label="Link another slide"
+              aria-haspopup="menu" aria-expanded="false" aria-controls="compare-picker-list">+</button>
       <span id="compare-delta" hidden></span>
       <button id="compare-link" class="compare-control linked" type="button"
               aria-label="Unlink views" aria-pressed="true">
@@ -65,23 +65,37 @@
         </svg>
       </button>
       <button id="compare-swap" class="compare-control" type="button"
-              title="Swap sides" aria-label="Swap compared slides">⇄</button>
+              title="Swap sides" aria-label="Swap the anchor and the linked slide">⇄</button>
       <button id="compare-rotate" class="compare-control text-control" type="button"
-              title="Toggle the 180° SVS–ND2 scan orientation"
-              aria-label="Rotate compared orientation 180 degrees"
+              title="Toggle the 180° scan orientation"
+              aria-label="Rotate linked orientation 180 degrees"
               aria-pressed="false">180°</button>
       <button id="compare-mirror" class="compare-control text-control" type="button"
-              title="Mirror the moving slide left-to-right"
-              aria-label="Mirror compared orientation left to right"
+              title="Mirror the linked slides left-to-right"
+              aria-label="Mirror linked orientation left to right"
               aria-pressed="false">Mirror</button>
-      <button id="compare-reset" class="compare-control text-control" type="button"
-              title="Reset alignment" aria-label="Reset approximate alignment">Reset</button>
+      <button id="compare-align" class="compare-control text-control" type="button"
+              title="Align with four points on every slide"
+              aria-label="Align with landmarks" aria-pressed="false">Align</button>
       <button id="compare-close" class="compare-control" type="button"
               title="Close compare" aria-label="Close compare">×</button>
+    </div>
+    <div id="compare-landmarks" class="compare-row landmark-panel" hidden>
+      <div id="compare-landmark-rows"></div>
+      <div id="compare-landmark-hint" class="landmark-hint"></div>
+      <div class="landmark-actions">
+        <button id="compare-landmark-clear" class="compare-control text-control" type="button"
+                title="Remove every point and return to matched centers">Clear</button>
+        <button id="compare-landmark-cancel" class="compare-control text-control" type="button"
+                title="Leave alignment mode and put back the previous alignment (esc)">Cancel</button>
+        <button id="compare-landmark-done" class="compare-control text-control primary" type="button"
+                title="Keep this alignment (⏎)">Done</button>
+      </div>
     </div>
   </div>
 </div>
 <div id="shell-toast" role="alert" aria-live="assertive"></div>
+<script src="static/align-v1.js"></script>
 <script src="static/shell-v1.js"></script>
 </body>
 </html>

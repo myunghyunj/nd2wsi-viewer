@@ -79,32 +79,49 @@ button { color:inherit; font:inherit; }
 #frames { position:fixed; inset:42px 0 0; }
 #frames iframe { position:absolute; inset:0; width:100%; height:100%; border:0; display:none; background:var(--canvas); }
 #frames iframe.active { display:block; }
-#frames iframe.compare-left,
-#frames iframe.compare-right { display:block; top:0; bottom:0; height:100%; }
-#frames iframe.compare-left { left:0; right:auto; width:var(--compare-split); }
-#frames iframe.compare-right { left:var(--compare-split); right:0; width:calc(100% - var(--compare-split)); }
+#frames iframe.compare-cell { display:block; inset:auto; }
 #compare-divider { position:absolute; z-index:80; top:0; bottom:0; left:var(--compare-split); width:16px; transform:translateX(-8px); cursor:col-resize; touch-action:none; }
 #compare-divider[hidden] { display:none; }
 #compare-divider::before { content:""; position:absolute; top:0; bottom:0; left:7.5px; width:1px; background:var(--compare-line); box-shadow:0 0 0 .5px rgba(0,0,0,.20); }
 #compare-divider.dragging::before { width:2px; left:7px; background:var(--accent); }
-#compare-controls { position:absolute; top:10px; left:50%; display:flex; align-items:center; gap:3px; height:34px; padding:3px; border:1px solid var(--hairline); border-radius:11px; transform:translateX(-50%); cursor:default; white-space:nowrap; color:var(--label); background:var(--control-bg); box-shadow:var(--shadow); backdrop-filter:blur(24px) saturate(165%); -webkit-backdrop-filter:blur(24px) saturate(165%); }
-#compare-status { max-width:160px; overflow:hidden; padding:0 7px; color:var(--label-2); font-size:11px; text-overflow:ellipsis; }
+#compare-controls { position:absolute; z-index:90; top:10px; left:50%; display:flex; flex-direction:column; gap:4px; max-width:calc(100% - 24px); padding:3px; border:1px solid var(--hairline); border-radius:12px; transform:translateX(-50%); cursor:default; color:var(--label); background:var(--control-bg); box-shadow:var(--shadow); backdrop-filter:blur(24px) saturate(165%); -webkit-backdrop-filter:blur(24px) saturate(165%); }
+#compare-controls[hidden] { display:none; }
+.compare-row { display:flex; align-items:center; gap:3px; min-height:28px; white-space:nowrap; }
+#compare-status { flex:none; max-width:120px; overflow:hidden; padding:0 7px; color:var(--label-2); font-size:11px; text-overflow:ellipsis; }
+#compare-chips { display:flex; align-items:center; gap:3px; min-width:0; }
+.compare-chip { display:flex; align-items:center; gap:5px; max-width:200px; height:26px; padding:0 6px 0 8px; border:0; border-radius:7px; color:var(--label); background:rgba(255,255,255,.07); font-size:11px; font-weight:600; }
+:root.light .compare-chip { background:rgba(0,0,0,.06); }
+.compare-chip.anchor { color:#fff; background:var(--accent); }
+.compare-chip:not(:disabled):hover { background:rgba(255,255,255,.13); }
+:root.light .compare-chip:not(:disabled):hover { background:rgba(0,0,0,.10); }
+.compare-chip.anchor:hover { background:var(--accent); }
+.compare-chip:disabled { opacity:1; cursor:default; }
+.compare-chip .name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.compare-chip .meta { flex:none; color:var(--label-3); font-weight:500; }
+.compare-chip.anchor .meta { color:rgba(255,255,255,.75); }
+.compare-chip .remove { flex:none; width:16px; height:16px; border-radius:5px; color:var(--label-2); font-size:13px; line-height:16px; text-align:center; }
+.compare-chip .remove:hover { color:#fff; background:#ff453a; }
 .compare-control { display:flex; align-items:center; justify-content:center; min-width:28px; height:26px; padding:0 6px; border:0; border-radius:7px; color:var(--label-2); background:transparent; }
-.compare-control:hover { color:var(--label); background:rgba(255,255,255,.09); }
-:root.light .compare-control:hover { background:rgba(0,0,0,.07); }
+.compare-control:hover:not(:disabled) { color:var(--label); background:rgba(255,255,255,.09); }
+:root.light .compare-control:hover:not(:disabled) { background:rgba(0,0,0,.07); }
 .compare-control:disabled { opacity:.45; cursor:default; }
 .compare-control .hotspot-icon { width:20px; height:14px; }
 .compare-control.linked { color:#fff; background:var(--accent); }
-.compare-control.rotated, .compare-control.mirrored { color:#fff; background:var(--accent); }
+.compare-control.rotated, .compare-control.mirrored, .compare-control.active { color:#fff; background:var(--accent); }
 .compare-control.pending { color:var(--accent); animation:pulse 1s infinite alternate; }
 .compare-control.text-control { padding:0 8px; font-size:11px; font-weight:600; }
-.compare-control.compare-partner { gap:4px; max-width:170px; padding:0 6px 0 8px; font-size:11px; font-weight:600; }
-.compare-partner .name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.compare-partner .chevron { flex:none; font-size:9px; opacity:.7; }
-.compare-partner[aria-expanded="true"] { color:var(--label); background:rgba(255,255,255,.12); }
-:root.light .compare-partner[aria-expanded="true"] { background:rgba(0,0,0,.09); }
+.compare-control.primary { color:#fff; background:var(--accent); }
+#compare-add { font-size:16px; line-height:1; }
 #compare-delta { max-width:190px; overflow:hidden; padding:0 6px; color:var(--accent); font:600 11px "SF Mono", ui-monospace, Menlo, monospace; text-overflow:ellipsis; white-space:nowrap; }
 #compare-delta[hidden] { display:none; }
+.landmark-panel { flex-wrap:wrap; align-items:flex-start; gap:8px; padding:4px 6px 6px; border-top:1px solid var(--hairline); }
+.landmark-panel[hidden] { display:none; }
+#compare-landmark-rows { display:grid; grid-template-columns:auto auto; gap:2px 12px; font-size:11px; }
+.landmark-row .name { color:var(--label-2); }
+.landmark-row .state { font:600 11px "SF Mono", ui-monospace, Menlo, monospace; color:var(--label); }
+.landmark-row.done .state { color:#30d158; }
+.landmark-hint { flex:1 1 220px; min-width:180px; max-width:340px; color:var(--label-2); font-size:11px; white-space:normal; line-height:1.35; }
+.landmark-actions { display:flex; gap:3px; margin-left:auto; }
 .compare-picker-option.current .dot { box-shadow:0 0 0 2px rgba(10,132,255,.28); }
 .compare-picker-option.current .meta { color:var(--accent); }
 #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; }
@@ -124,7 +141,7 @@ button { color:inherit; font:inherit; }
 @keyframes pulse { from{opacity:.3} to{opacity:1} }
 @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration:.01ms!important; transition-duration:.01ms!important; } }
 @media (max-width: 720px) { #compare-status { display:none; } }
-@media (max-width: 960px) { .compare-control.compare-partner { max-width:110px; } }
+@media (max-width: 960px) { .compare-chip { max-width:120px; } .compare-chip .meta { display:none; } }
 
 /* packaged app: the hidden title bar leaves the traffic lights floating
    over the tab strip, so the strip starts past them and its empty areas

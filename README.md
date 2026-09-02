@@ -33,7 +33,7 @@ Nothing is uploaded.
 - Pans and zooms from a full-slide overview to native pixels.
 - Controls fluorescence channels, colors, windows, gamma, and histograms.
 - Reads native pixel values under the cursor and inspects slide/cache metadata.
-- Compares two slides with linked calibrated navigation and a manual alignment offset.
+- Links up to four slides with calibrated navigation, four-point alignment, and manual nudges.
 - Measures calibrated distances.
 - Stores rulers, pins, boxes, and notes in a JSON sidecar.
 - Exports annotations as QuPath-compatible GeoJSON.
@@ -206,6 +206,7 @@ The chrome follows the slide. A brightfield color slide such as an SVS opens in 
 | `⌘⇧E` | export annotations as GeoJSON |
 | `⌘\` | start or stop side-by-side Compare |
 | `L` | link or unlink compared views |
+| `Align` | place four points on every linked slide and fit the alignment |
 | `←` `→` `↑` `↓` | nudge the compared alignment by one screen pixel, ten with Shift |
 | `⌥` drag | move one compared pane alone and keep the difference as the alignment |
 
@@ -223,19 +224,19 @@ Open Slide Info with `⌘I` or the info button. It shows provenance, calibration
 
 ### Compare serial sections
 
-Open at least two slides, then press `⌘\` or click the Personal Hotspot-style link button. The active slide stays as the reference, and a list asks which other open slide to link with it. The choice is always yours, even when only one other slide is open. Neither slide is reloaded. While comparing, the slide name in the alignment capsule opens the same list again to switch the linked slide, so one reference section can be checked against CD31, CD68, a trichrome, and an H&E in turn. Each pair keeps its own alignment for the rest of the session.
+Open at least two slides, then press `⌘\` or click the Personal Hotspot-style link button. The active slide becomes the anchor, and a list asks which other open slide to link with it. The choice is always yours, even when only one other slide is open. Neither slide is reloaded. The `+` in the alignment capsule links further slides, up to four in all, so one reference section can sit beside CD31, CD68, and an H&E at once. Two slides share the screen side by side, three take a column each, and four fill a grid. Each linked slide's chip opens the same list to put a different slide in its place, and its `×` unlinks it. Every pair keeps its alignment for the rest of the session.
 
-When both slides are calibrated, linked navigation maps the center and field of view in micrometers. Otherwise it falls back to relative image coordinates.
+When both slides of a pair are calibrated, linked navigation maps the center and field of view in micrometers. Otherwise it falls back to relative image coordinates.
 
-Serial sections never match exactly. The overview may line up while a zoomed field is displaced by a few cells, so the alignment can be nudged at any zoom without leaving linked mode. The arrow keys move the moving slide by one screen pixel, Shift with an arrow moves it by ten, and an Option-drag on either pane moves that pane alone while the other stays put. Each nudge becomes part of the alignment, and the capsule shows the hand-tuned part as a Δ in micrometers. For a larger correction, press `L` or click the link control to unlink, align either view freely, then relink; the viewer captures that translation. Reset removes the manual offset.
+**Align with four points.** Serial sections never match exactly, and two glass slides are rarely mounted the same way. Press **Align** and click the same four structures on every slide, in the same order. Pan and zoom freely while placing. From the second point on, the viewer fits each linked slide to the anchor with a rotation, a uniform scale, a translation, and a mirror when the section was flipped, and it reports the residual of the fit in micrometers. The linked slide's pane turns to match, while its pixels, annotations, regions, and exports stay in the slide's own coordinates. `⌫` removes the last point, clicking near a marker moves it, `⏎` keeps the alignment, and `esc` puts the previous one back. Clear removes every point and returns to matched centers.
 
-In this acquisition workflow, SVS and ND2 coordinates run in opposite horizontal and vertical directions. A mixed SVS–ND2 pair therefore starts with a 180° orientation automatically: the ND2 pane is visually rotated while linked navigation maps both reversed axes.
+**Nudge at any zoom.** The overview may line up while a zoomed field is displaced by a few cells. While linked, the arrow keys move the linked slide by one screen pixel, Shift with an arrow moves it by ten, and an Option-drag on any pane moves that pane alone while the others stay put. Each nudge becomes part of that pair's alignment. For a larger correction, press `L` or click the link control to unlink, move any view freely, then relink; the viewer captures the new positions.
 
-The **180°** and **Mirror** controls are independent and preserve the current center. Mirror reverses the moving slide left-to-right; using it together with 180° gives the corresponding top-to-bottom reflection. Reset restores the format-based orientation, removes Mirror, and clears the manual offset.
+In this acquisition workflow, SVS and ND2 coordinates run in opposite horizontal and vertical directions. A mixed SVS and ND2 pair therefore starts with a 180° orientation automatically, and the **180°** and **Mirror** controls adjust that for pairs that have no landmark fit. A landmark fit decides orientation on its own.
 
 The rotation and reflection are display-only. Pixel readouts, regions, annotations, GeoJSON, and all exported pixels remain in the source slide's native coordinate system.
 
-This is intentionally a coarse navigation aid for serial sections. It does not claim cell-level registration, infer orientation from tissue appearance, compensate arbitrary rotation or deformation, or imply that cells in sections separated in depth are the same cells.
+This is intentionally a coarse navigation aid for serial sections. A four-point similarity fit compensates rotation, scale, and translation, not local deformation, and it never implies that cells in sections separated in depth are the same cells.
 
 ### Export a region
 

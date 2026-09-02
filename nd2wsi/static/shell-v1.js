@@ -7,29 +7,36 @@ let active = null;
 let busyTab = null;
 let busyTimer = null;
 let toastTimer = null;
-const pairPicker = { open: false, leftSid: null, mode: "start" };
+const pairPicker = { open: false, mode: "start", replaceSid: null };
 
-const VIEWPORT_PROTOCOL_VERSION = 1;
+const Align = window.nd2wsiAlign;
+const VIEWPORT_PROTOCOL_VERSION = 2;
 const VIEWPORT_THROTTLE_MS = 48;
+const MAX_GROUP = 4; // the anchor and up to three linked slides
+const LANDMARKS_NEEDED = 4;
+
+/* A link group has one anchor and up to three members. Each member carries
+   its own similarity transform from anchor space to member space, either
+   the format-based default (matched centers, optional 180° or mirror) or a
+   least-squares fit through the landmarks the user placed. */
 const compare = {
   enabled: false,
-  leftSid: null,
-  rightSid: null,
+  anchorSid: null,
+  members: [], // linked slides other than the anchor, in display order
   linked: true,
   split: 50,
   mru: [],
   states: new Map(),
-  offset: { mode: null, x: 0, y: 0 },
-  orientation: { x: 1, y: 1 },
+  pairs: new Map(), // member sid -> { mode, orientation, transform, fit, landmarks }
+  anchorLandmarks: [],
+  memory: new Map(), // "anchor|member" -> pair snapshot for this session
+  landmark: { active: false, before: null },
   commandSeq: 0,
   requestSeq: 0,
   pendingRequest: null,
   layoutRequestTimer: null,
   routeTimers: new Map(),
   routeLatest: new Map(),
-  // alignment per ordered pair for this session, so switching between
-  // several sections of one case keeps each hand-tuned offset
-  memory: new Map(),
 };
 
 function showError(message) {
@@ -55,6 +62,18 @@ function markNativeChrome() {
 if (window.pywebview !== undefined) markNativeChrome();
 window.addEventListener("pywebviewready", markNativeChrome);
 
+function groupSids() {
+  return compare.enabled ? [compare.anchorSid, ...compare.members] : [];
+}
+
+function inGroup(sid) {
+  return compare.enabled && Boolean(sid) && groupSids().includes(sid);
+}
+
+function slideName(sid) {
+  return slides.find((slide) => slide.sid === sid)?.name || "Slide";
+}
+
 function render() {
   const bar = $("tabbar");
   bar.querySelectorAll(".tab").forEach((tab) => tab.remove());
@@ -66,9 +85,7 @@ function render() {
     if (busy) classes.push("busy");
     else {
       if (slide.sid === active) classes.push("active");
-      if (compare.enabled && [compare.leftSid, compare.rightSid].includes(slide.sid)) {
-        classes.push("compare-member");
-      }
+      if (inGroup(slide.sid)) classes.push("compare-member");
     }
     tab.className = classes.join(" ");
     tab.title = slide.name;
@@ -111,11 +128,9 @@ function render() {
   compareToggle.disabled = slides.length < 2;
   compareToggle.classList.toggle("active", compare.enabled);
   compareToggle.setAttribute("aria-pressed", String(compare.enabled));
-  compareToggle.setAttribute("aria-expanded", String(pairPicker.open));
+  compareToggle.setAttribute("aria-expanded", String(pairPicker.open && pairPicker.mode === "start"));
   if (compare.enabled) {
-    const leftName = slides.find((slide) => slide.sid === compare.leftSid)?.name || "Slide";
-    const rightName = slides.find((slide) => slide.sid === compare.rightSid)?.name || "Slide";
-    document.title = `${leftName} ↔ ${rightName} — nd2wsi-viewer`;
+    document.title = `${groupSids().map(slideName).join(" ↔ ")} — nd2wsi-viewer`;
   } else {
     document.title = active
       ? `${(slides.find((slide) => slide.sid === active) || {}).name || "Slide"} — nd2wsi-viewer`
@@ -133,40 +148,58 @@ function ensureFrame(sid) {
   if (!sid || frames.has(sid)) return frames.get(sid);
   const frame = document.createElement("iframe");
   frame.src = `s/${sid}/`;
-  frame.title = slides.find((slide) => slide.sid === sid)?.name || "Slide";
-  frame.addEventListener("load", () => {
-    if (compare.enabled && [compare.leftSid, compare.rightSid].includes(sid)) {
-      applyDisplayTransform(sid);
-      broadcastCompareState();
-      if (compare.linked || compare.pendingRequest) {
-        requestPairSoon(
-          compare.pendingRequest?.kind || (compare.offset.mode ? "sync" : "initial")
-        );
-      }
-    }
-  });
+  frame.title = slideName(sid);
+  frame.addEventListener("load", () => paneCameUp(sid));
   frames.set(sid, frame);
   $("frames").append(frame);
   return frame;
 }
 
+function paneCameUp(sid) {
+  // a pane loaded or reloaded: give it everything the group knows
+  if (!inGroup(sid)) return;
+  applyDisplayTransform(sid);
+  broadcastCompareState();
+  if (compare.landmark.active) sendLandmarkMode(sid, true);
+  if (compare.linked || compare.pendingRequest) {
+    requestGroupSoon(compare.pendingRequest?.kind || "sync");
+  }
+}
+
 function applyFrameLayout() {
   document.documentElement.style.setProperty("--compare-split", `${compare.split}%`);
+  const group = groupSids();
   const divider = $("compare-divider");
-  divider.hidden = !compare.enabled;
-  divider.setAttribute("aria-hidden", String(!compare.enabled));
+  const twoUp = compare.enabled && group.length === 2;
+  divider.hidden = !twoUp;
+  divider.setAttribute("aria-hidden", String(!twoUp));
+  $("compare-controls").hidden = !compare.enabled;
   for (const [key, frame] of frames) {
+    const index = group.indexOf(key);
     frame.classList.toggle("active", !compare.enabled && key === active);
-    frame.classList.toggle("compare-left", compare.enabled && key === compare.leftSid);
-    frame.classList.toggle("compare-right", compare.enabled && key === compare.rightSid);
+    frame.classList.toggle("compare-cell", index >= 0);
+    frame.style.left = frame.style.top = frame.style.width = frame.style.height = "";
+    if (index < 0) continue;
+    let cell;
+    if (group.length === 2) {
+      cell = index === 0
+        ? { left: 0, top: 0, width: compare.split, height: 100 }
+        : { left: compare.split, top: 0, width: 100 - compare.split, height: 100 };
+    } else if (group.length === 3) {
+      cell = { left: (index * 100) / 3, top: 0, width: 100 / 3, height: 100 };
+    } else {
+      cell = { left: (index % 2) * 50, top: Math.floor(index / 2) * 50, width: 50, height: 50 };
+    }
+    frame.style.left = `${cell.left}%`;
+    frame.style.top = `${cell.top}%`;
+    frame.style.width = `${cell.width}%`;
+    frame.style.height = `${cell.height}%`;
   }
 }
 
 function activate(sid) {
   closePairPicker(false);
-  if (compare.enabled && sid && ![compare.leftSid, compare.rightSid].includes(sid)) {
-    stopCompare();
-  }
+  if (compare.enabled && sid && !inGroup(sid)) stopCompare();
   active = sid;
   rememberSlide(sid);
   ensureFrame(sid);
@@ -192,22 +225,24 @@ function refresh(selectSid) {
         }
       }
       compare.mru = compare.mru.filter((sid) => openSids.has(sid));
-      if (pairPicker.open) {
-        if (!openSids.has(pairPicker.leftSid) || slides.length < 2) {
-          closePairPicker(false);
-        } else {
-          renderPairPicker();
+      if (compare.enabled) {
+        if (!openSids.has(compare.anchorSid)) stopCompare();
+        else {
+          for (const sid of [...compare.members]) {
+            if (!openSids.has(sid)) removeMember(sid, false);
+          }
         }
       }
-      if (compare.enabled &&
-          (!openSids.has(compare.leftSid) || !openSids.has(compare.rightSid))) {
-        stopCompare();
+      if (pairPicker.open) {
+        if (slides.length < 2) closePairPicker(false);
+        else renderPairPicker();
       }
       if (selectSid) activate(selectSid);
       else if (!slides.some((slide) => slide.sid === active)) {
         activate(slides.length ? slides[slides.length - 1].sid : null);
       } else {
         applyFrameLayout();
+        updateCompareControls();
         render();
       }
     })
@@ -274,6 +309,8 @@ function closeTab(sid) {
     .catch((error) => showError(`Close failed: ${error}`));
 }
 
+/* ---- pane messages ------------------------------------------------------- */
+
 function frameSidForSource(source) {
   for (const [sid, frame] of frames) {
     if (frame.contentWindow === source) return sid;
@@ -309,6 +346,7 @@ function normalizeViewportState(data, sid) {
     pixelSizeUm = finitePoint(pixelSizeUm, true);
   }
   if (!pixelSizeUm || pixelSizeUm.x <= 0 || pixelSizeUm.y <= 0) pixelSizeUm = null;
+  const containerPx = finitePoint(data.containerPx, true) || { x: 1, y: 1 };
   return {
     sid,
     seq: Number.isFinite(Number(data.seq)) ? Number(data.seq) : 0,
@@ -318,132 +356,111 @@ function normalizeViewportState(data, sid) {
     centerPx,
     spanPx,
     imagePx,
+    containerPx,
     pixelSizeUm,
   };
 }
 
-function mappingMode(left, right) {
-  return left?.pixelSizeUm && right?.pixelSizeUm ? "physical" : "normalized";
+/* ---- spaces and transforms ------------------------------------------------
+   A pair maps in micrometers when both slides are calibrated and in
+   normalized image coordinates otherwise. Anchor pixels are the hub every
+   relay passes through, so members with different modes still agree. */
+
+function mappingMode(a, b) {
+  return a?.pixelSizeUm && b?.pixelSizeUm ? "physical" : "normalized";
 }
 
-function centerInSpace(view, mode) {
-  if (mode === "physical") {
-    return {
-      x: view.centerPx.x * view.pixelSizeUm.x,
-      y: view.centerPx.y * view.pixelSizeUm.y,
-    };
-  }
-  return {
-    x: view.centerPx.x / view.imagePx.x,
-    y: view.centerPx.y / view.imagePx.y,
-  };
+function pxToSpace(point, st, mode) {
+  return mode === "physical"
+    ? { x: point.x * st.pixelSizeUm.x, y: point.y * st.pixelSizeUm.y }
+    : { x: point.x / st.imagePx.x, y: point.y / st.imagePx.y };
 }
 
-function spanInSpace(view, mode) {
-  if (mode === "physical") {
-    return {
-      x: view.spanPx.x * view.pixelSizeUm.x,
-      y: view.spanPx.y * view.pixelSizeUm.y,
-    };
-  }
-  return {
-    x: view.spanPx.x / view.imagePx.x,
-    y: view.spanPx.y / view.imagePx.y,
-  };
+function spaceToPx(point, st, mode) {
+  return mode === "physical"
+    ? { x: point.x / st.pixelSizeUm.x, y: point.y / st.pixelSizeUm.y }
+    : { x: point.x * st.imagePx.x, y: point.y * st.imagePx.y };
 }
 
-function imageCenterInSpace(view, mode) {
-  if (mode === "physical") {
-    return {
-      x: view.imagePx.x * view.pixelSizeUm.x / 2,
-      y: view.imagePx.y * view.pixelSizeUm.y / 2,
-    };
-  }
-  return { x: 0.5, y: 0.5 };
+function widthPxToSpace(width, st, mode) {
+  return mode === "physical" ? width * st.pixelSizeUm.x : width / st.imagePx.x;
 }
 
-function pointFromSpace(point, target, mode) {
-  if (mode === "physical") {
-    return {
-      x: point.x / target.pixelSizeUm.x,
-      y: point.y / target.pixelSizeUm.y,
-    };
-  }
-  return { x: point.x * target.imagePx.x, y: point.y * target.imagePx.y };
+function widthSpaceToPx(width, st, mode) {
+  return mode === "physical" ? width / st.pixelSizeUm.x : width * st.imagePx.x;
+}
+
+function imageCenterSpace(st, mode) {
+  return pxToSpace({ x: st.imagePx.x / 2, y: st.imagePx.y / 2 }, st, mode);
 }
 
 function slideFormat(sid) {
-  const name = String(
-    slides.find((slide) => slide.sid === sid)?.name || ""
-  ).toLowerCase();
+  const name = String(slideName(sid)).toLowerCase();
   if (name.endsWith(".svs")) return "svs";
   if (name.endsWith(".nd2")) return "nd2";
   return null;
 }
 
-function automaticOrientation(leftSid, rightSid) {
-  const formats = new Set([slideFormat(leftSid), slideFormat(rightSid)]);
-  return formats.has("svs") && formats.has("nd2")
-    ? { x: -1, y: -1 }
-    : { x: 1, y: 1 };
+function automaticOrientation(anchorSid, memberSid) {
+  // this lab's scanners run their axes in opposite directions
+  const formats = new Set([slideFormat(anchorSid), slideFormat(memberSid)]);
+  return formats.has("svs") && formats.has("nd2") ? { x: -1, y: -1 } : { x: 1, y: 1 };
 }
 
-function halfTurnActive() {
-  return compare.orientation.y < 0;
+function newPair(anchorSid, memberSid) {
+  return {
+    mode: null,
+    orientation: automaticOrientation(anchorSid, memberSid),
+    transform: null,
+    fit: null,
+    landmarks: [],
+  };
 }
 
-function mirrorActive() {
-  return compare.orientation.x !== compare.orientation.y;
+function defaultTransform(pair, anchorState, memberState, mode) {
+  const linear = Align.fromOrientation(pair.orientation.x, pair.orientation.y);
+  return Align.translationMatching(
+    linear, imageCenterSpace(anchorState, mode), imageCenterSpace(memberState, mode)
+  );
 }
 
-function orientationStatusNote() {
-  const { x, y } = compare.orientation;
-  if (x > 0 && y > 0) return "";
-  if (x < 0 && y > 0) return " · Horizontal mirror";
-  if (x < 0 && y < 0) return " · 180°";
-  return " · Vertical mirror";
-}
-
-function mixedSvsNd2Pair() {
-  const formats = new Set([slideFormat(compare.leftSid), slideFormat(compare.rightSid)]);
-  return formats.has("svs") && formats.has("nd2");
-}
-
-function movingDisplaySid() {
-  if (mixedSvsNd2Pair()) {
-    return slideFormat(compare.leftSid) === "nd2"
-      ? compare.leftSid
-      : compare.rightSid;
+function ensurePairTransform(sid) {
+  const pair = compare.pairs.get(sid);
+  const anchorState = compare.states.get(compare.anchorSid);
+  const memberState = compare.states.get(sid);
+  if (!pair || !anchorState || !memberState) return null;
+  const mode = mappingMode(anchorState, memberState);
+  if (pair.transform && pair.mode === mode) return pair;
+  pair.mode = mode;
+  if (pair.fit && pair.landmarks.length >= 2) {
+    fitPair(sid, false);
+    if (pair.transform) return pair;
   }
-  // For a same-format/unknown pair, the right pane is the moving image and
-  // the left pane remains the visual reference.
-  return compare.rightSid;
+  pair.transform = defaultTransform(pair, anchorState, memberState, mode);
+  pair.fit = null;
+  return pair;
 }
 
 function displayTransformFor(sid) {
-  if (!compare.enabled || sid !== movingDisplaySid()) {
-    return { degrees: 0, flipped: false };
-  }
-  return {
-    degrees: halfTurnActive() ? 180 : 0,
-    flipped: mirrorActive(),
-  };
+  if (!compare.enabled || sid === compare.anchorSid) return { degrees: 0, flipped: false };
+  const pair = compare.pairs.get(sid);
+  if (!pair) return { degrees: 0, flipped: false };
+  const linear = pair.transform || Align.fromOrientation(pair.orientation.x, pair.orientation.y);
+  // the member holds the anchor turned by theta, so its pane turns back
+  return { degrees: -Align.angleDeg(linear), flipped: Align.mirrored(linear) };
 }
 
 function applyDisplayTransform(sid) {
   if (!sid) return;
-  const transform = displayTransformFor(sid);
   postToSlide(sid, {
     nd2wsi: "display-transform",
     version: VIEWPORT_PROTOCOL_VERSION,
-    ...transform,
+    ...displayTransformFor(sid),
   });
 }
 
 function applyDisplayTransforms() {
-  if (!compare.enabled) return;
-  applyDisplayTransform(compare.leftSid);
-  applyDisplayTransform(compare.rightSid);
+  for (const sid of groupSids()) applyDisplayTransform(sid);
 }
 
 function clearDisplayTransforms(sids) {
@@ -457,169 +474,141 @@ function clearDisplayTransforms(sids) {
   }
 }
 
-function defaultAlignmentOffset(left, right, mode) {
-  const a = imageCenterInSpace(left, mode);
-  const b = imageCenterInSpace(right, mode);
-  return {
-    mode,
-    x: b.x - compare.orientation.x * a.x,
-    y: b.y - compare.orientation.y * a.y,
-  };
-}
-
-function recaptureOffset() {
-  // The two panes as they stand right now define the alignment.
-  const left = compare.states.get(compare.leftSid);
-  const right = compare.states.get(compare.rightSid);
-  if (!left || !right) return false;
-  const mode = mappingMode(left, right);
-  const a = centerInSpace(left, mode);
-  const b = centerInSpace(right, mode);
-  compare.offset = {
-    mode,
-    x: b.x - compare.orientation.x * a.x,
-    y: b.y - compare.orientation.y * a.y,
-  };
+function rematchTranslation(sid) {
+  // keep the pair's rotation, scale and mirror; move its translation so the
+  // two panes as they stand now correspond
+  const pair = ensurePairTransform(sid);
+  const anchorState = compare.states.get(compare.anchorSid);
+  const memberState = compare.states.get(sid);
+  if (!pair || !anchorState || !memberState) return false;
+  pair.transform = Align.translationMatching(
+    pair.transform,
+    pxToSpace(anchorState.centerPx, anchorState, pair.mode),
+    pxToSpace(memberState.centerPx, memberState, pair.mode)
+  );
   return true;
 }
 
-function pairKey(leftSid, rightSid) {
-  return `${leftSid}|${rightSid}`;
+function recaptureAll() {
+  let any = false;
+  for (const sid of compare.members) any = rematchTranslation(sid) || any;
+  return any;
+}
+
+function pairKey(anchorSid, memberSid) {
+  return `${anchorSid}|${memberSid}`;
+}
+
+function clonePoints(points) {
+  return (points || []).map((p) => ({ x: p.x, y: p.y }));
 }
 
 function rememberAlignment() {
-  if (!compare.enabled || !compare.offset.mode) return;
-  compare.memory.set(pairKey(compare.leftSid, compare.rightSid), {
-    offset: { ...compare.offset },
-    orientation: { ...compare.orientation },
-  });
+  if (!compare.enabled) return;
+  for (const sid of compare.members) {
+    const pair = compare.pairs.get(sid);
+    if (!pair || !pair.transform) continue;
+    compare.memory.set(pairKey(compare.anchorSid, sid), {
+      mode: pair.mode,
+      orientation: { ...pair.orientation },
+      transform: { ...pair.transform },
+      fit: pair.fit ? { ...pair.fit } : null,
+      landmarks: clonePoints(pair.landmarks),
+      anchorLandmarks: clonePoints(compare.anchorLandmarks),
+    });
+  }
 }
 
-function restoreAlignment(leftSid, rightSid) {
-  const direct = compare.memory.get(pairKey(leftSid, rightSid));
+function restoreAlignment(anchorSid, memberSid, pair) {
+  const direct = compare.memory.get(pairKey(anchorSid, memberSid));
   if (direct) {
-    compare.offset = { ...direct.offset };
-    compare.orientation = { ...direct.orientation };
+    Object.assign(pair, {
+      mode: direct.mode,
+      orientation: { ...direct.orientation },
+      transform: { ...direct.transform },
+      fit: direct.fit ? { ...direct.fit } : null,
+      landmarks: clonePoints(direct.landmarks),
+    });
+    if (!compare.anchorLandmarks.length) compare.anchorLandmarks = clonePoints(direct.anchorLandmarks);
     return true;
   }
-  const reversed = compare.memory.get(pairKey(rightSid, leftSid));
+  const reversed = compare.memory.get(pairKey(memberSid, anchorSid));
   if (reversed) {
-    compare.orientation = { ...reversed.orientation };
-    compare.offset = {
-      mode: reversed.offset.mode,
-      x: -compare.orientation.x * reversed.offset.x,
-      y: -compare.orientation.y * reversed.offset.y,
-    };
+    const inverse = Align.invert(reversed.transform);
+    if (!inverse) return false;
+    Object.assign(pair, {
+      mode: reversed.mode,
+      orientation: { ...reversed.orientation },
+      transform: inverse,
+      fit: reversed.fit ? { ...reversed.fit, angleDeg: -reversed.fit.angleDeg, scale: 1 / reversed.fit.scale } : null,
+      landmarks: clonePoints(reversed.anchorLandmarks),
+    });
+    if (!compare.anchorLandmarks.length) compare.anchorLandmarks = clonePoints(reversed.landmarks);
     return true;
   }
   return false;
 }
 
-function formatDeltaUm(value) {
-  const sign = value < 0 ? "−" : "+";
-  const abs = Math.abs(value);
-  if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(2)} mm`;
-  return `${sign}${abs.toFixed(abs >= 100 ? 0 : 1)} µm`;
-}
+/* ---- relay ---------------------------------------------------------------- */
 
-function alignmentDeltaLabel() {
-  // the hand-tuned part of the alignment, relative to centers matched
-  const left = compare.states.get(compare.leftSid);
-  const right = compare.states.get(compare.rightSid);
-  if (!left || !right || !compare.offset.mode) return "";
-  const mode = compare.offset.mode;
-  const base = defaultAlignmentOffset(left, right, mode);
-  const dx = compare.offset.x - base.x;
-  const dy = compare.offset.y - base.y;
-  if (mode === "physical") {
-    if (Math.abs(dx) < 0.05 && Math.abs(dy) < 0.05) return "";
-    return `Δ ${formatDeltaUm(dx)}, ${formatDeltaUm(dy)}`;
+function anchorViewFromSource(sourceSid, source) {
+  // where the source pane's field sits in anchor pixels
+  if (sourceSid === compare.anchorSid) {
+    return { centerPx: source.centerPx, widthPx: source.spanPx.x };
   }
-  if (Math.abs(dx) < 0.0005 && Math.abs(dy) < 0.0005) return "";
-  const pct = (value) => `${value < 0 ? "−" : "+"}${(Math.abs(value) * 100).toFixed(1)}%`;
-  return `Δ ${pct(dx)}, ${pct(dy)}`;
-}
-
-function broadcastCompareState() {
-  // each pane learns whether it takes part, whether arrows may nudge, and
-  // whether it is the pane that moves
-  const pending = Boolean(compare.pendingRequest);
-  for (const sid of frames.keys()) {
-    const member = compare.enabled && [compare.leftSid, compare.rightSid].includes(sid);
-    postToSlide(sid, {
-      nd2wsi: "compare-state",
-      version: VIEWPORT_PROTOCOL_VERSION,
-      enabled: member,
-      linked: member && compare.linked && !pending,
-      moving: member && sid === movingDisplaySid(),
-    });
-  }
-}
-
-function nudgeAlignment(dxPx, dyPx) {
-  if (!compare.enabled || !compare.linked || compare.pendingRequest) return;
-  const dx = Number(dxPx), dy = Number(dyPx);
-  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
-  clearViewportRoutes();
-  postToSlide(movingDisplaySid(), {
-    nd2wsi: "viewport-nudge",
-    version: VIEWPORT_PROTOCOL_VERSION,
-    dxPx: Math.max(-200, Math.min(200, dx)),
-    dyPx: Math.max(-200, Math.min(200, dy)),
-  });
-}
-
-function mappedCenter(sourceSid, point) {
-  const sign = compare.orientation;
-  if (sourceSid === compare.leftSid) {
-    return {
-      x: sign.x * point.x + compare.offset.x,
-      y: sign.y * point.y + compare.offset.y,
-    };
-  }
+  const pair = ensurePairTransform(sourceSid);
+  const anchorState = compare.states.get(compare.anchorSid);
+  if (!pair || !anchorState) return null;
+  const inverse = Align.invert(pair.transform);
+  if (!inverse) return null;
+  const centerSpace = Align.apply(inverse, pxToSpace(source.centerPx, source, pair.mode));
+  const widthSpace = widthPxToSpace(source.spanPx.x, source, pair.mode) / Align.scale(pair.transform);
   return {
-    x: sign.x * (point.x - compare.offset.x),
-    y: sign.y * (point.y - compare.offset.y),
+    centerPx: spaceToPx(centerSpace, anchorState, pair.mode),
+    widthPx: widthSpaceToPx(widthSpace, anchorState, pair.mode),
+  };
+}
+
+function targetViewFromAnchor(targetSid, anchorView) {
+  const targetState = compare.states.get(targetSid);
+  if (!targetState) return null;
+  if (targetSid === compare.anchorSid) {
+    return { centerPx: anchorView.centerPx, spanX: anchorView.widthPx, state: targetState };
+  }
+  const pair = ensurePairTransform(targetSid);
+  const anchorState = compare.states.get(compare.anchorSid);
+  if (!pair || !anchorState) return null;
+  const centerSpace = Align.apply(pair.transform, pxToSpace(anchorView.centerPx, anchorState, pair.mode));
+  const widthSpace = widthPxToSpace(anchorView.widthPx, anchorState, pair.mode) * Align.scale(pair.transform);
+  return {
+    centerPx: spaceToPx(centerSpace, targetState, pair.mode),
+    spanX: widthSpaceToPx(widthSpace, targetState, pair.mode),
+    state: targetState,
   };
 }
 
 function forwardViewport(sourceSid, source) {
   if (!compare.enabled || !compare.linked || compare.pendingRequest) return;
-  const targetSid = sourceSid === compare.leftSid
-    ? compare.rightSid
-    : sourceSid === compare.rightSid
-      ? compare.leftSid
-      : null;
-  if (!targetSid) return;
-  const target = compare.states.get(targetSid);
-  if (!target) return;
-  const mode = mappingMode(source, target);
-  if (compare.offset.mode !== mode) {
-    const sourceCenter = centerInSpace(source, mode);
-    const targetCenter = centerInSpace(target, mode);
-    const leftCenter = sourceSid === compare.leftSid ? sourceCenter : targetCenter;
-    const rightCenter = sourceSid === compare.leftSid ? targetCenter : sourceCenter;
-    compare.offset = {
-      mode,
-      x: rightCenter.x - compare.orientation.x * leftCenter.x,
-      y: rightCenter.y - compare.orientation.y * leftCenter.y,
-    };
+  if (!inGroup(sourceSid)) return;
+  const anchorView = anchorViewFromSource(sourceSid, source);
+  if (!anchorView) return;
+  for (const targetSid of groupSids()) {
+    if (targetSid === sourceSid) continue;
+    const view = targetViewFromAnchor(targetSid, anchorView);
+    if (!view || !Number.isFinite(view.spanX) || view.spanX <= 0) continue;
+    const aspect = view.state.containerPx.y / view.state.containerPx.x;
+    const commandId = `shell-vp-${++compare.commandSeq}`;
+    postToSlide(targetSid, {
+      nd2wsi: "viewport-apply",
+      version: VIEWPORT_PROTOCOL_VERSION,
+      commandId,
+      sourceSid,
+      sourceSeq: source.seq,
+      centerPx: view.centerPx,
+      spanPx: { x: view.spanX, y: view.spanX * aspect },
+      animate: false,
+    });
   }
-  const center = mappedCenter(sourceSid, centerInSpace(source, mode));
-  const span = spanInSpace(source, mode);
-  const centerPx = pointFromSpace(center, target, mode);
-  const spanPx = pointFromSpace(span, target, mode);
-  const commandId = `shell-vp-${++compare.commandSeq}`;
-  postToSlide(targetSid, {
-    nd2wsi: "viewport-apply",
-    version: VIEWPORT_PROTOCOL_VERSION,
-    commandId,
-    sourceSid,
-    sourceSeq: source.seq,
-    centerPx,
-    spanPx,
-    animate: false,
-  });
 }
 
 function scheduleViewportRoute(sourceSid, state) {
@@ -647,71 +636,482 @@ function clearPendingRequest() {
   compare.layoutRequestTimer = null;
 }
 
-function updateCompareControls() {
-  const link = $("compare-link");
-  const rotate = $("compare-rotate");
-  const mirror = $("compare-mirror");
+function syncFromAnchor() {
+  const anchorState = compare.states.get(compare.anchorSid);
+  if (anchorState && compare.linked) forwardViewport(compare.anchorSid, anchorState);
+}
+
+function requestGroup(kind) {
+  // ask every pane where it stands, then act once all have answered
+  if (!compare.enabled) return;
+  clearViewportRoutes();
+  clearPendingRequest();
+  const requestId = `shell-request-${++compare.requestSeq}`;
+  const pending = { requestId, kind, seen: new Set(), timer: null };
+  pending.timer = setTimeout(() => {
+    if (compare.pendingRequest !== pending) return;
+    clearPendingRequest();
+    updateCompareControls();
+    if (kind !== "sync") showError("Could not read every linked view; nothing was changed");
+  }, 2500);
+  compare.pendingRequest = pending;
+  updateCompareControls();
+  for (const sid of groupSids()) {
+    postToSlide(sid, {
+      nd2wsi: "viewport-request",
+      version: VIEWPORT_PROTOCOL_VERSION,
+      requestId,
+    });
+  }
+}
+
+function requestGroupSoon(kind) {
+  clearTimeout(compare.layoutRequestTimer);
+  compare.layoutRequestTimer = setTimeout(() => {
+    compare.layoutRequestTimer = null;
+    if (compare.enabled) requestGroup(kind);
+  }, 80);
+}
+
+function finishGroupRequest(pending) {
+  if (compare.pendingRequest !== pending) return;
+  clearPendingRequest();
+  const ready = groupSids().every((sid) => compare.states.has(sid));
+  if (!ready) {
+    updateCompareControls();
+    return;
+  }
+  for (const sid of compare.members) ensurePairTransform(sid);
+  if (pending.kind === "capture") {
+    recaptureAll();
+    compare.linked = true;
+  } else if (pending.kind === "rotate-180" || pending.kind === "mirror") {
+    for (const sid of compare.members) {
+      const pair = compare.pairs.get(sid);
+      if (!pair || pair.fit) continue; // a landmark fit already decided orientation
+      if (pending.kind === "rotate-180") {
+        pair.orientation = { x: -pair.orientation.x, y: -pair.orientation.y };
+      } else {
+        pair.orientation = { x: -pair.orientation.x, y: pair.orientation.y };
+      }
+      const anchorState = compare.states.get(compare.anchorSid);
+      const memberState = compare.states.get(sid);
+      pair.transform = defaultTransform(pair, anchorState, memberState, pair.mode);
+      rematchTranslation(sid);
+    }
+    applyDisplayTransforms();
+  } else if (pending.kind === "clear") {
+    for (const sid of compare.members) {
+      const pair = compare.pairs.get(sid);
+      const anchorState = compare.states.get(compare.anchorSid);
+      const memberState = compare.states.get(sid);
+      pair.orientation = automaticOrientation(compare.anchorSid, sid);
+      pair.fit = null;
+      pair.landmarks = [];
+      pair.transform = defaultTransform(pair, anchorState, memberState, pair.mode);
+    }
+    compare.anchorLandmarks = [];
+    compare.linked = true;
+    applyDisplayTransforms();
+    for (const sid of groupSids()) sendLandmarkMode(sid, compare.landmark.active, { clear: true });
+  }
+  syncFromAnchor();
+  updateCompareControls();
+}
+
+function receiveViewportState(data, sid) {
+  if (data.version !== VIEWPORT_PROTOCOL_VERSION) return;
+  const state = normalizeViewportState(data, sid);
+  if (!state) return;
+  const previous = compare.states.get(sid);
+  if (!state.requestId && state.seq && previous?.seq && state.seq <= previous.seq) return;
+  compare.states.set(sid, state);
+  const pending = compare.pendingRequest;
+  if (pending && state.requestId === pending.requestId && inGroup(sid)) {
+    pending.seen.add(sid);
+    if (pending.seen.size === groupSids().length) finishGroupRequest(pending);
+  }
+  if (!compare.enabled || !compare.linked || compare.pendingRequest ||
+      state.reason !== "user" || state.echoOf) return;
+  if (!inGroup(sid)) return;
+  if (data.nudge === true) {
+    // one pane moved on its own; its pairs absorb the difference, which is
+    // how serial sections get matched at high zoom
+    clearViewportRoutes();
+    const changed = sid === compare.anchorSid ? recaptureAll() : rematchTranslation(sid);
+    if (changed) updateCompareControls();
+    return;
+  }
+  scheduleViewportRoute(sid, state);
+}
+
+/* ---- landmarks ------------------------------------------------------------ */
+
+function sendLandmarkMode(sid, active, extra = {}) {
+  const points = sid === compare.anchorSid
+    ? compare.anchorLandmarks
+    : compare.pairs.get(sid)?.landmarks || [];
+  postToSlide(sid, {
+    nd2wsi: "landmark-mode",
+    version: VIEWPORT_PROTOCOL_VERSION,
+    active: Boolean(active),
+    needed: LANDMARKS_NEEDED,
+    points: extra.clear ? [] : clonePoints(points),
+    ...extra,
+  });
+}
+
+function snapshotAlignment() {
+  return {
+    anchorLandmarks: clonePoints(compare.anchorLandmarks),
+    linked: compare.linked,
+    pairs: new Map([...compare.pairs].map(([sid, pair]) => [sid, {
+      mode: pair.mode,
+      orientation: { ...pair.orientation },
+      transform: pair.transform ? { ...pair.transform } : null,
+      fit: pair.fit ? { ...pair.fit } : null,
+      landmarks: clonePoints(pair.landmarks),
+    }])),
+  };
+}
+
+function restoreSnapshot(snapshot) {
+  compare.anchorLandmarks = clonePoints(snapshot.anchorLandmarks);
+  compare.linked = snapshot.linked;
+  for (const [sid, saved] of snapshot.pairs) {
+    const pair = compare.pairs.get(sid);
+    if (!pair) continue;
+    Object.assign(pair, {
+      mode: saved.mode,
+      orientation: { ...saved.orientation },
+      transform: saved.transform ? { ...saved.transform } : null,
+      fit: saved.fit ? { ...saved.fit } : null,
+      landmarks: clonePoints(saved.landmarks),
+    });
+  }
+}
+
+function startLandmarks() {
+  if (!compare.enabled || compare.pendingRequest || compare.landmark.active) return;
+  closePairPicker(false);
+  compare.landmark.active = true;
+  compare.landmark.before = snapshotAlignment();
+  for (const sid of groupSids()) sendLandmarkMode(sid, true);
+  updateCompareControls();
+}
+
+function finishLandmarks(keep) {
+  if (!compare.landmark.active) return;
+  if (!keep && compare.landmark.before) restoreSnapshot(compare.landmark.before);
+  compare.landmark.active = false;
+  compare.landmark.before = null;
+  for (const sid of groupSids()) sendLandmarkMode(sid, false);
+  applyDisplayTransforms();
+  rememberAlignment();
+  syncFromAnchor();
+  updateCompareControls();
+}
+
+function clearAlignment() {
+  if (!compare.enabled || compare.pendingRequest) return;
+  requestGroup("clear");
+}
+
+function fitPair(sid, announce = true) {
+  const pair = compare.pairs.get(sid);
+  const anchorState = compare.states.get(compare.anchorSid);
+  const memberState = compare.states.get(sid);
+  if (!pair || !anchorState || !memberState) return false;
+  const n = Math.min(compare.anchorLandmarks.length, pair.landmarks.length);
+  if (n < 2) return false;
+  const mode = mappingMode(anchorState, memberState);
+  const from = compare.anchorLandmarks.slice(0, n).map((p) => pxToSpace(p, anchorState, mode));
+  const to = pair.landmarks.slice(0, n).map((p) => pxToSpace(p, memberState, mode));
+  const fit = Align.fitSimilarity(from, to);
+  if (!fit) return false;
+  pair.mode = mode;
+  pair.transform = fit.transform;
+  pair.fit = {
+    pairs: fit.pairs,
+    rms: fit.rms,
+    reflected: fit.reflected,
+    angleDeg: fit.angleDeg,
+    scale: fit.scale,
+  };
+  if (announce) {
+    applyDisplayTransform(sid);
+    syncFromAnchor();
+  }
+  return true;
+}
+
+function receiveLandmarkPoints(sid, data) {
+  if (!compare.landmark.active || !inGroup(sid)) return;
+  const points = (Array.isArray(data.points) ? data.points : [])
+    .map((p) => ({ x: Number(p.x), y: Number(p.y) }))
+    .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+    .slice(0, LANDMARKS_NEEDED);
+  if (sid === compare.anchorSid) {
+    compare.anchorLandmarks = points;
+    for (const member of compare.members) fitPair(member);
+  } else {
+    const pair = compare.pairs.get(sid);
+    if (!pair) return;
+    pair.landmarks = points;
+    fitPair(sid);
+  }
+  updateCompareControls();
+}
+
+/* ---- controls --------------------------------------------------------------- */
+
+function formatDeltaUm(value) {
+  const sign = value < 0 ? "−" : "+";
+  const abs = Math.abs(value);
+  if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(2)} mm`;
+  return `${sign}${abs.toFixed(abs >= 100 ? 0 : 1)} µm`;
+}
+
+function formatRms(pair) {
+  if (!pair.fit) return "";
+  if (pair.mode === "physical") {
+    const v = pair.fit.rms;
+    return v >= 1000 ? `${(v / 1000).toFixed(2)} mm` : `${v.toFixed(v >= 100 ? 0 : 1)} µm`;
+  }
+  return `${(pair.fit.rms * 100).toFixed(2)}%`;
+}
+
+function alignmentDeltaLabel() {
+  // for a single pair without a fit: the hand-tuned part beyond matched centers
+  if (compare.members.length !== 1) return "";
+  const sid = compare.members[0];
+  const pair = compare.pairs.get(sid);
+  const anchorState = compare.states.get(compare.anchorSid);
+  const memberState = compare.states.get(sid);
+  if (!pair || !pair.transform || pair.fit || !anchorState || !memberState) return "";
+  const base = defaultTransform(pair, anchorState, memberState, pair.mode);
+  const dx = pair.transform.tx - base.tx;
+  const dy = pair.transform.ty - base.ty;
+  if (pair.mode === "physical") {
+    if (Math.abs(dx) < 0.05 && Math.abs(dy) < 0.05) return "";
+    return `Δ ${formatDeltaUm(dx)}, ${formatDeltaUm(dy)}`;
+  }
+  if (Math.abs(dx) < 0.0005 && Math.abs(dy) < 0.0005) return "";
+  const pct = (value) => `${value < 0 ? "−" : "+"}${(Math.abs(value) * 100).toFixed(1)}%`;
+  return `Δ ${pct(dx)}, ${pct(dy)}`;
+}
+
+function movingSids() {
+  return compare.members;
+}
+
+function broadcastCompareState() {
   const pending = Boolean(compare.pendingRequest);
-  rotate.disabled = pending;
-  mirror.disabled = pending;
-  $("compare-swap").disabled = pending;
-  $("compare-reset").disabled = pending;
+  for (const sid of frames.keys()) {
+    const member = inGroup(sid);
+    postToSlide(sid, {
+      nd2wsi: "compare-state",
+      version: VIEWPORT_PROTOCOL_VERSION,
+      enabled: member,
+      linked: member && compare.linked && !pending,
+      moving: member && sid !== compare.anchorSid,
+      role: member && sid === compare.anchorSid ? "anchor" : "member",
+    });
+  }
+}
+
+function nudgeAlignment(dxPx, dyPx, fromSid) {
+  if (!compare.enabled || !compare.linked || compare.pendingRequest) return;
+  const dx = Number(dxPx), dy = Number(dyPx);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+  clearViewportRoutes();
+  // arrows nudge the pane they were pressed in when it is a member, and the
+  // first member when pressed in the anchor
+  const target = fromSid && fromSid !== compare.anchorSid ? fromSid : compare.members[0];
+  if (!target) return;
+  postToSlide(target, {
+    nd2wsi: "viewport-nudge",
+    version: VIEWPORT_PROTOCOL_VERSION,
+    dxPx: Math.max(-200, Math.min(200, dx)),
+    dyPx: Math.max(-200, Math.min(200, dy)),
+  });
+}
+
+function orientationNote(pair) {
+  if (pair.fit) {
+    const parts = [`${pair.fit.pairs} pts`];
+    if (pair.fit.pairs >= 3) parts.push(`rms ${formatRms(pair)}`);
+    const deg = Math.round(pair.fit.angleDeg);
+    if (Math.abs(deg) >= 1) parts.push(`${deg}°`);
+    if (pair.fit.reflected) parts.push("mirror");
+    return parts.join(" · ");
+  }
+  const { x, y } = pair.orientation;
+  if (x > 0 && y > 0) return "";
+  if (x < 0 && y > 0) return "mirror";
+  if (x < 0 && y < 0) return "180°";
+  return "vertical mirror";
+}
+
+function renderChips() {
+  const chips = $("compare-chips");
+  chips.replaceChildren();
+  const group = groupSids();
+  group.forEach((sid, index) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "compare-chip" + (index === 0 ? " anchor" : "");
+    chip.dataset.sid = sid;
+    const pair = index === 0 ? null : compare.pairs.get(sid);
+    const note = pair ? orientationNote(pair) : "";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = slideName(sid);
+    chip.append(name);
+    if (note) {
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = note;
+      chip.append(meta);
+    }
+    chip.title = index === 0
+      ? `${slideName(sid)} is the anchor. Every other slide follows it.`
+      : `${slideName(sid)}${note ? " · " + note : ""}. Click to link a different slide in its place.`;
+    chip.disabled = index === 0 || Boolean(compare.pendingRequest) || compare.landmark.active;
+    chip.onclick = () => openPicker("replace", sid);
+    if (index > 0) {
+      const remove = document.createElement("span");
+      remove.className = "remove";
+      remove.textContent = "×";
+      remove.title = `Unlink ${slideName(sid)}`;
+      remove.setAttribute("role", "button");
+      remove.onclick = (event) => {
+        event.stopPropagation();
+        if (!compare.landmark.active) removeMember(sid, true);
+      };
+      chip.append(remove);
+    }
+    chips.append(chip);
+  });
+}
+
+function renderLandmarkPanel() {
+  const panel = $("compare-landmarks");
+  const active = compare.landmark.active;
+  panel.hidden = !active;
+  if (!active) return;
+  const rows = $("compare-landmark-rows");
+  rows.replaceChildren();
+  const anchorCount = compare.anchorLandmarks.length;
+  const line = (label, text, cls) => {
+    const row = document.createElement("div");
+    row.className = "landmark-row" + (cls ? " " + cls : "");
+    const a = document.createElement("span");
+    a.className = "name";
+    a.textContent = label;
+    const b = document.createElement("span");
+    b.className = "state";
+    b.textContent = text;
+    row.append(a, b);
+    rows.append(row);
+  };
+  line(slideName(compare.anchorSid), `${anchorCount} of ${LANDMARKS_NEEDED}`, anchorCount >= LANDMARKS_NEEDED ? "done" : "");
+  for (const sid of compare.members) {
+    const pair = compare.pairs.get(sid);
+    const n = pair?.landmarks.length || 0;
+    const fitText = pair?.fit
+      ? ` · fit ${pair.fit.pairs} pts${pair.fit.pairs >= 3 ? ` · rms ${formatRms(pair)}` : ""}`
+      : "";
+    line(slideName(sid), `${n} of ${LANDMARKS_NEEDED}${fitText}`, n >= LANDMARKS_NEEDED && pair?.fit ? "done" : "");
+  }
+  const every = anchorCount >= LANDMARKS_NEEDED &&
+    compare.members.every((sid) => (compare.pairs.get(sid)?.landmarks.length || 0) >= LANDMARKS_NEEDED);
+  $("compare-landmark-hint").textContent = every
+    ? "All points placed. Check the fit, drag a marker to refine, then Done."
+    : "Click the same four structures on every slide, in the same order. Pan and zoom freely while placing.";
+}
+
+function updateCompareControls() {
+  $("compare-controls").hidden = !compare.enabled;
+  if (!compare.enabled) {
+    renderLandmarkPanel();
+    broadcastCompareState();
+    return;
+  }
+  const pending = Boolean(compare.pendingRequest);
+  const landmarking = compare.landmark.active;
+  const link = $("compare-link");
   link.classList.toggle("linked", compare.linked && !pending);
   link.classList.toggle("pending", pending);
+  link.disabled = pending;
   link.setAttribute("aria-pressed", String(compare.linked && !pending));
   link.setAttribute("aria-label", compare.linked ? "Unlink views" : "Relink and capture alignment");
   link.title = compare.linked
-    ? "Unlink, align either slide, then relink (L). While linked, arrow keys and Option-drag nudge the alignment."
-    : "Relink and keep the current manual offset (L)";
-  const partner = $("compare-partner");
-  const partnerSlide = slides.find((slide) => slide.sid === compare.rightSid);
-  const movingSlide = slides.find((slide) => slide.sid === movingDisplaySid());
-  partner.disabled = pending || slides.length < 3;
-  partner.querySelector(".name").textContent = partnerSlide?.name || "Slide";
-  partner.title = slides.length < 3
-    ? "Open another slide to switch the linked slide"
-    : `Linked with ${partnerSlide?.name || "a slide"}. Choose another open slide to link instead.`;
-  partner.setAttribute("aria-expanded", String(pairPicker.open && pairPicker.mode === "switch"));
-  const halfTurn = halfTurnActive();
-  const mirrored = mirrorActive();
+    ? "Unlink, move any slide, then relink (L). While linked, arrow keys and Option-drag nudge the alignment."
+    : "Relink and keep the current positions as the alignment (L)";
+
+  const members = compare.members.map((sid) => compare.pairs.get(sid)).filter(Boolean);
+  const anyUnfitted = members.some((pair) => !pair.fit);
+  const rotate = $("compare-rotate");
+  const mirror = $("compare-mirror");
+  rotate.disabled = pending || landmarking || !anyUnfitted;
+  mirror.disabled = pending || landmarking || !anyUnfitted;
+  const halfTurn = members.some((pair) => !pair.fit && pair.orientation.y < 0);
+  const mirrored = members.some((pair) => !pair.fit && pair.orientation.x !== pair.orientation.y);
   rotate.classList.toggle("rotated", halfTurn);
   rotate.setAttribute("aria-pressed", String(halfTurn));
   mirror.classList.toggle("mirrored", mirrored);
   mirror.setAttribute("aria-pressed", String(mirrored));
-  const orientationNote = orientationStatusNote();
-  if (pending) {
-    $("compare-status").textContent = "Reading both views…" + orientationNote;
-  } else if (!compare.linked) {
-    $("compare-status").textContent = "Unlinked · align either view" + orientationNote;
-  } else {
-    const left = compare.states.get(compare.leftSid);
-    const right = compare.states.get(compare.rightSid);
-    const mode = compare.offset.mode || (left && right ? mappingMode(left, right) : null);
-    const status = !left || !right
-      ? "Approximate alignment · waiting"
-      : mode === "physical"
-        ? "Approximate alignment · µm"
-        : "Approximate alignment · relative";
-    $("compare-status").textContent = status + orientationNote;
-  }
-  const delta = compare.enabled && compare.linked && !pending ? alignmentDeltaLabel() : "";
+  rotate.title = anyUnfitted
+    ? "Toggle the 180° scan orientation of the linked slides"
+    : "Orientation comes from the landmark fit. Clear the points to set it by hand.";
+  mirror.title = anyUnfitted
+    ? "Mirror the linked slides left-to-right"
+    : "Orientation comes from the landmark fit. Clear the points to set it by hand.";
+
+  $("compare-swap").disabled = pending || landmarking || compare.members.length !== 1;
+  const add = $("compare-add");
+  const others = slides.filter((slide) => !inGroup(slide.sid));
+  add.disabled = pending || landmarking || groupSids().length >= MAX_GROUP || !others.length;
+  add.title = groupSids().length >= MAX_GROUP
+    ? `Up to ${MAX_GROUP} slides can be linked`
+    : others.length ? "Link another open slide" : "Open another slide to link it";
+  const align = $("compare-align");
+  align.disabled = pending;
+  align.classList.toggle("active", landmarking);
+  align.setAttribute("aria-pressed", String(landmarking));
+
+  const modes = new Set(members.map((pair) => pair.mode).filter(Boolean));
+  let status;
+  if (pending) status = "Reading every view…";
+  else if (!compare.linked) status = "Unlinked · move any view";
+  else if (!members.length || !members.every((pair) => pair.transform)) status = "Waiting for views";
+  else status = modes.has("normalized") ? "Linked · relative" : "Linked · µm";
+  $("compare-status").textContent = status;
+
+  const delta = compare.linked && !pending ? alignmentDeltaLabel() : "";
   const deltaEl = $("compare-delta");
   deltaEl.textContent = delta;
   deltaEl.hidden = !delta;
   deltaEl.title = delta
-    ? `Hand-tuned offset of ${movingSlide?.name || "the moving slide"} beyond matched centers. Arrow keys move it one screen pixel, Shift ten, Option-drag moves it freely.`
+    ? "Hand-tuned offset beyond matched centers. Arrow keys move it one screen pixel, Shift ten, Option-drag moves it freely."
     : "";
+
+  renderChips();
+  renderLandmarkPanel();
   rememberAlignment();
   broadcastCompareState();
 }
 
-function mostRecentOther(sid) {
+/* ---- picker --------------------------------------------------------------- */
+
+function mostRecentOther(exclude) {
   const open = new Set(slides.map((slide) => slide.sid));
   for (let i = compare.mru.length - 1; i >= 0; i -= 1) {
-    if (compare.mru[i] !== sid && open.has(compare.mru[i])) return compare.mru[i];
+    if (!exclude.includes(compare.mru[i]) && open.has(compare.mru[i])) return compare.mru[i];
   }
   for (let i = slides.length - 1; i >= 0; i -= 1) {
-    if (slides[i].sid !== sid) return slides[i].sid;
+    if (!exclude.includes(slides[i].sid)) return slides[i].sid;
   }
   return null;
 }
@@ -722,14 +1122,14 @@ function pairPickerIsOpen() {
 
 function closePairPicker(restoreFocus = true) {
   const wasOpen = pairPicker.open;
-  const wasSwitching = pairPicker.mode === "switch";
+  const mode = pairPicker.mode;
   pairPicker.open = false;
-  pairPicker.leftSid = null;
   pairPicker.mode = "start";
+  pairPicker.replaceSid = null;
   $("compare-picker").hidden = true;
   $("compare-toggle").setAttribute("aria-expanded", "false");
-  $("compare-partner").setAttribute("aria-expanded", "false");
-  if (restoreFocus && wasOpen) $(wasSwitching ? "compare-partner" : "compare-toggle").focus();
+  $("compare-add").setAttribute("aria-expanded", "false");
+  if (restoreFocus && wasOpen) $(mode === "start" ? "compare-toggle" : "compare-add").focus();
 }
 
 function slideTypeLabel(slide) {
@@ -744,19 +1144,25 @@ function slideSizeLabel(slide) {
   return `${slideTypeLabel(slide)} · ${Math.round(width).toLocaleString()} × ${Math.round(height).toLocaleString()}`;
 }
 
+function pickerChoices() {
+  const anchor = pairPicker.mode === "start" ? (active || slides[slides.length - 1]?.sid) : compare.anchorSid;
+  const taken = pairPicker.mode === "start" ? [anchor] : groupSids().filter((sid) => sid !== pairPicker.replaceSid);
+  return { anchor, choices: slides.filter((slide) => !taken.includes(slide.sid)) };
+}
+
 function renderPairPicker() {
-  const switching = pairPicker.mode === "switch";
-  const left = slides.find((slide) => slide.sid === pairPicker.leftSid);
-  const choices = slides.filter((slide) => slide.sid !== pairPicker.leftSid);
-  if (!pairPicker.open || !left || !choices.length || (switching && !compare.enabled)) {
+  const { anchor, choices } = pickerChoices();
+  if (!pairPicker.open || !anchor || !choices.length ||
+      (pairPicker.mode !== "start" && !compare.enabled)) {
     closePairPicker(false);
     return;
   }
-
-  $("compare-picker-title").textContent = switching
-    ? "Switch the linked slide"
-    : "Choose the slide to link";
-  $("compare-picker-current-name").textContent = left.name;
+  $("compare-picker-title").textContent = pairPicker.mode === "start"
+    ? "Choose the slide to link"
+    : pairPicker.mode === "add"
+      ? "Link another slide"
+      : `Replace ${slideName(pairPicker.replaceSid)}`;
+  $("compare-picker-current-name").textContent = slideName(anchor);
   const list = $("compare-picker-list");
   const previousOptions = [...list.querySelectorAll(".compare-picker-option")];
   const focusedIndex = previousOptions.indexOf(document.activeElement);
@@ -768,13 +1174,10 @@ function renderPairPicker() {
     option.className = "compare-picker-option";
     option.setAttribute("role", "menuitem");
     option.dataset.sid = slide.sid;
-    const current = switching && slide.sid === compare.rightSid;
+    const current = pairPicker.mode === "replace" && slide.sid === pairPicker.replaceSid;
     option.classList.toggle("current", current);
-    option.title = current
-      ? `${slide.name} is the linked slide now`
-      : `Link ${left.name} with ${slide.name}`;
+    option.title = current ? `${slide.name} is linked now` : `Link ${slideName(anchor)} with ${slide.name}`;
     if (current) option.setAttribute("aria-current", "true");
-
     const dot = document.createElement("span");
     dot.className = "dot";
     dot.setAttribute("aria-hidden", "true");
@@ -785,10 +1188,7 @@ function renderPairPicker() {
     meta.className = "meta";
     meta.textContent = current ? "Linked now" : slideSizeLabel(slide);
     option.append(dot, name, meta);
-    option.onclick = () => {
-      if (switching) switchComparePartner(slide.sid);
-      else startComparePair(pairPicker.leftSid, slide.sid);
-    };
+    option.onclick = () => choosePickerSlide(slide.sid);
     list.append(option);
   }
   if (focusedIndex >= 0) {
@@ -798,16 +1198,22 @@ function renderPairPicker() {
   }
 }
 
-function openPairPicker(mode, leftSid) {
+function openPicker(mode, replaceSid = null) {
   // The user always names the slide to link. With two slides open the list
   // has one entry, and it is still a choice rather than an assignment.
+  if (mode !== "start" && (!compare.enabled || compare.pendingRequest || compare.landmark.active)) return;
+  if (pairPickerIsOpen() && pairPicker.mode === mode && pairPicker.replaceSid === replaceSid) {
+    closePairPicker();
+    return;
+  }
   pairPicker.open = true;
   pairPicker.mode = mode;
-  pairPicker.leftSid = leftSid;
+  pairPicker.replaceSid = replaceSid;
   $("compare-picker").hidden = false;
-  $(mode === "switch" ? "compare-partner" : "compare-toggle").setAttribute("aria-expanded", "true");
+  $(mode === "start" ? "compare-toggle" : "compare-add").setAttribute("aria-expanded", "true");
   renderPairPicker();
-  const suggestedSid = mode === "switch" ? compare.rightSid : mostRecentOther(leftSid);
+  if (!pairPicker.open) return;
+  const suggestedSid = mode === "replace" ? replaceSid : mostRecentOther(groupSids().length ? groupSids() : [pickerChoices().anchor]);
   requestAnimationFrame(() => {
     if (!pairPickerIsOpen()) return;
     const options = [...$("compare-picker-list").querySelectorAll(".compare-picker-option")];
@@ -818,221 +1224,129 @@ function openPairPicker(mode, leftSid) {
 
 function startCompare() {
   if (compare.enabled) return;
-  const leftSid = active || slides[slides.length - 1]?.sid;
-  const choices = slides.filter((slide) => slide.sid !== leftSid);
-  if (!leftSid || !choices.length) {
+  const anchor = active || slides[slides.length - 1]?.sid;
+  if (!anchor || slides.length < 2) {
     showError("Open two slides before starting Compare");
     return;
   }
-  openPairPicker("start", leftSid);
+  openPicker("start");
 }
 
-function openPartnerPicker() {
-  if (!compare.enabled || compare.pendingRequest) return;
-  if (pairPickerIsOpen()) {
-    closePairPicker();
-    return;
-  }
-  if (slides.length < 3) {
-    showError("Open another slide to switch the linked slide");
-    return;
-  }
-  openPairPicker("switch", compare.leftSid);
-}
-
-function requestPair(kind) {
-  if (!compare.enabled) return;
-  clearViewportRoutes();
-  clearPendingRequest();
-  const requestId = `shell-request-${++compare.requestSeq}`;
-  const pending = { requestId, kind, seen: new Set(), timer: null };
-  pending.timer = setTimeout(() => {
-    if (compare.pendingRequest !== pending) return;
-    clearPendingRequest();
-    updateCompareControls();
-    if (
-      kind === "capture" || kind === "rotate-180" ||
-      kind === "mirror" || kind === "reset"
-    ) {
-      showError(
-        kind === "capture"
-          ? "Could not read both views; alignment remains unlinked"
-          : kind === "rotate-180"
-            ? "Could not read both views; orientation was not changed"
-            : kind === "mirror"
-              ? "Could not read both views; mirror was not changed"
-              : "Could not read both views; alignment was not reset"
-      );
-    }
-  }, 2500);
-  compare.pendingRequest = pending;
-  updateCompareControls();
-  for (const sid of [compare.leftSid, compare.rightSid]) {
-    postToSlide(sid, {
-      nd2wsi: "viewport-request",
-      version: VIEWPORT_PROTOCOL_VERSION,
-      requestId,
-    });
-  }
-}
-
-function requestPairSoon(kind) {
-  clearTimeout(compare.layoutRequestTimer);
-  compare.layoutRequestTimer = setTimeout(() => {
-    compare.layoutRequestTimer = null;
-    if (compare.enabled) requestPair(kind);
-  }, 80);
-}
-
-function finishPairRequest(pending) {
-  if (compare.pendingRequest !== pending) return;
-  clearPendingRequest();
-  const left = compare.states.get(compare.leftSid);
-  const right = compare.states.get(compare.rightSid);
-  if (!left || !right) {
-    updateCompareControls();
-    return;
-  }
-  const mode = mappingMode(left, right);
-  if (
-    pending.kind === "capture" || pending.kind === "rotate-180" ||
-    pending.kind === "mirror"
-  ) {
-    if (pending.kind === "rotate-180") {
-      compare.orientation.x *= -1;
-      compare.orientation.y *= -1;
-    } else if (pending.kind === "mirror") {
-      compare.orientation.x *= -1;
-    }
-    recaptureOffset();
-    if (pending.kind === "capture") compare.linked = true;
-    if (pending.kind === "rotate-180" || pending.kind === "mirror") {
-      applyDisplayTransforms();
-    }
-  } else {
-    if (pending.kind === "initial" || pending.kind === "reset") {
-      if (pending.kind === "reset") {
-        compare.orientation = automaticOrientation(compare.leftSid, compare.rightSid);
-        compare.linked = true;
-        applyDisplayTransforms();
-      }
-      compare.offset = defaultAlignmentOffset(left, right, mode);
-    } else if (compare.offset.mode !== mode) {
-      recaptureOffset();
-    }
-    if (compare.linked) forwardViewport(compare.leftSid, left);
-  }
-  updateCompareControls();
-}
-
-function receiveViewportState(data, sid) {
-  if (data.version !== VIEWPORT_PROTOCOL_VERSION) return;
-  const state = normalizeViewportState(data, sid);
-  if (!state) return;
-  const previous = compare.states.get(sid);
-  if (!state.requestId && state.seq && previous?.seq && state.seq <= previous.seq) return;
-  compare.states.set(sid, state);
-  const pending = compare.pendingRequest;
-  if (pending && state.requestId === pending.requestId &&
-      [compare.leftSid, compare.rightSid].includes(sid)) {
-    pending.seen.add(sid);
-    if (pending.seen.size === 2) finishPairRequest(pending);
-  }
-  if (!compare.enabled || !compare.linked || compare.pendingRequest ||
-      state.reason !== "user" || state.echoOf) return;
-  if (![compare.leftSid, compare.rightSid].includes(sid)) return;
-  if (data.nudge === true) {
-    // one pane moved on its own; the partner stays and the alignment absorbs
-    // the difference, which is how serial sections get matched at high zoom
-    clearViewportRoutes();
-    if (recaptureOffset()) updateCompareControls();
-    return;
-  }
-  scheduleViewportRoute(sid, state);
-}
-
-function switchComparePartner(sid) {
-  if (!compare.enabled) {
-    closePairPicker();
-    return;
-  }
+function choosePickerSlide(sid) {
+  const mode = pairPicker.mode;
+  const replaceSid = pairPicker.replaceSid;
+  const { anchor } = pickerChoices();
+  closePairPicker();
   const openSids = new Set(slides.map((slide) => slide.sid));
-  if (!sid || sid === compare.leftSid || !openSids.has(sid)) {
-    closePairPicker();
+  if (!sid || !openSids.has(sid) || sid === anchor) {
     showError("That slide is no longer open. Choose another slide to link.");
     return;
   }
-  closePairPicker();
-  if (sid === compare.rightSid) return;
+  if (mode === "start") startGroup(anchor, sid);
+  else if (mode === "add") addMember(sid);
+  else if (mode === "replace") replaceMember(replaceSid, sid);
+}
+
+/* ---- group membership ------------------------------------------------------ */
+
+function attachMember(sid) {
+  const pair = newPair(compare.anchorSid, sid);
+  restoreAlignment(compare.anchorSid, sid, pair);
+  compare.pairs.set(sid, pair);
+  compare.members.push(sid);
+  rememberSlide(sid);
+  ensureFrame(sid);
+}
+
+function startGroup(anchorSid, memberSid) {
+  if (compare.enabled || !anchorSid || !memberSid || anchorSid === memberSid) return;
+  compare.enabled = true;
+  compare.anchorSid = anchorSid;
+  compare.members = [];
+  compare.pairs = new Map();
+  compare.anchorLandmarks = [];
+  compare.linked = true;
+  active = anchorSid;
+  rememberSlide(anchorSid);
+  ensureFrame(anchorSid);
+  attachMember(memberSid);
+  applyFrameLayout();
+  applyDisplayTransforms();
+  updateCompareControls();
+  render();
+  requestGroupSoon("sync");
+}
+
+function addMember(sid) {
+  if (!compare.enabled || inGroup(sid) || groupSids().length >= MAX_GROUP) return;
+  clearPendingRequest();
+  clearViewportRoutes();
+  attachMember(sid);
+  applyFrameLayout();
+  applyDisplayTransforms();
+  updateCompareControls();
+  render();
+  requestGroupSoon("sync");
+}
+
+function removeMember(sid, andRender) {
+  if (!compare.enabled || !compare.members.includes(sid)) return;
   rememberAlignment();
   clearPendingRequest();
   clearViewportRoutes();
-  const previous = compare.rightSid;
-  compare.rightSid = sid;
-  compare.linked = true;
-  if (!restoreAlignment(compare.leftSid, sid)) {
-    compare.offset = { mode: null, x: 0, y: 0 };
-    compare.orientation = automaticOrientation(compare.leftSid, sid);
+  compare.members = compare.members.filter((item) => item !== sid);
+  compare.pairs.delete(sid);
+  clearDisplayTransforms([sid]);
+  sendLandmarkMode(sid, false, { clear: true });
+  if (!compare.members.length) {
+    stopCompare();
+    return;
   }
-  clearDisplayTransforms([previous]);
-  rememberSlide(sid);
-  ensureFrame(sid);
   applyFrameLayout();
-  applyDisplayTransforms();
   updateCompareControls();
-  render();
-  requestPairSoon(compare.offset.mode ? "sync" : "initial");
+  if (andRender) render();
+  requestGroupSoon("sync");
 }
 
-function startComparePair(leftSid, rightSid) {
-  if (compare.enabled) {
-    closePairPicker();
-    return;
-  }
-  const openSids = new Set(slides.map((slide) => slide.sid));
-  if (!leftSid || !rightSid || leftSid === rightSid ||
-      !openSids.has(leftSid) || !openSids.has(rightSid)) {
-    closePairPicker();
-    showError("That slide is no longer open. Choose another slide to link.");
-    return;
-  }
-  closePairPicker();
-  compare.enabled = true;
-  compare.leftSid = leftSid;
-  compare.rightSid = rightSid;
-  compare.linked = true;
-  if (!restoreAlignment(leftSid, rightSid)) {
-    compare.offset = { mode: null, x: 0, y: 0 };
-    compare.orientation = automaticOrientation(leftSid, rightSid);
-  }
-  active = leftSid;
-  rememberSlide(rightSid);
-  rememberSlide(leftSid);
-  ensureFrame(leftSid);
-  ensureFrame(rightSid);
+function replaceMember(oldSid, newSid) {
+  if (!compare.enabled || !compare.members.includes(oldSid) || inGroup(newSid)) return;
+  rememberAlignment();
+  clearPendingRequest();
+  clearViewportRoutes();
+  const index = compare.members.indexOf(oldSid);
+  compare.pairs.delete(oldSid);
+  clearDisplayTransforms([oldSid]);
+  sendLandmarkMode(oldSid, false, { clear: true });
+  compare.members.splice(index, 1);
+  const pair = newPair(compare.anchorSid, newSid);
+  restoreAlignment(compare.anchorSid, newSid, pair);
+  compare.pairs.set(newSid, pair);
+  compare.members.splice(index, 0, newSid);
+  rememberSlide(newSid);
+  ensureFrame(newSid);
   applyFrameLayout();
   applyDisplayTransforms();
   updateCompareControls();
   render();
-  requestPairSoon(compare.offset.mode ? "sync" : "initial");
+  requestGroupSoon("sync");
 }
 
 function stopCompare() {
   closePairPicker(false);
   if (!compare.enabled) return;
-  const comparedSids = [compare.leftSid, compare.rightSid];
+  if (compare.landmark.active) finishLandmarks(true);
   rememberAlignment();
+  const sids = groupSids();
   clearPendingRequest();
-  clearTimeout(compare.layoutRequestTimer);
-  compare.layoutRequestTimer = null;
   clearViewportRoutes();
-  clearDisplayTransforms(comparedSids);
+  clearDisplayTransforms(sids);
+  for (const sid of sids) sendLandmarkMode(sid, false, { clear: true });
   compare.enabled = false;
-  compare.leftSid = null;
-  compare.rightSid = null;
+  compare.anchorSid = null;
+  compare.members = [];
+  compare.pairs = new Map();
+  compare.anchorLandmarks = [];
   compare.linked = true;
-  compare.offset = { mode: null, x: 0, y: 0 };
-  compare.orientation = { x: 1, y: 1 };
   applyFrameLayout();
   updateCompareControls();
   render();
@@ -1051,60 +1365,74 @@ function toggleViewLink() {
     clearViewportRoutes();
     updateCompareControls();
   } else {
-    requestPair("capture");
+    requestGroup("capture");
   }
 }
 
-function resetAlignment() {
-  if (!compare.enabled || compare.pendingRequest) return;
-  requestPair("reset");
-}
-
 function toggleHalfTurn() {
-  if (!compare.enabled || compare.pendingRequest) return;
-  requestPair("rotate-180");
+  if (!compare.enabled || compare.pendingRequest || compare.landmark.active) return;
+  requestGroup("rotate-180");
 }
 
 function toggleMirror() {
-  if (!compare.enabled || compare.pendingRequest) return;
-  requestPair("mirror");
+  if (!compare.enabled || compare.pendingRequest || compare.landmark.active) return;
+  requestGroup("mirror");
 }
 
 function swapComparedSlides() {
-  if (!compare.enabled) return;
+  // only meaningful for one pair: the member becomes the anchor
+  if (!compare.enabled || compare.members.length !== 1 || compare.landmark.active) return;
   rememberAlignment();
   closePairPicker(false);
   clearPendingRequest();
   clearViewportRoutes();
-  [compare.leftSid, compare.rightSid] = [compare.rightSid, compare.leftSid];
-  compare.offset = {
-    mode: compare.offset.mode,
-    x: -compare.orientation.x * compare.offset.x,
-    y: -compare.orientation.y * compare.offset.y,
-  };
-  active = compare.leftSid;
+  const oldAnchor = compare.anchorSid;
+  const oldMember = compare.members[0];
+  const old = compare.pairs.get(oldMember);
+  const pair = newPair(oldMember, oldAnchor);
+  if (old?.transform) {
+    const inverse = Align.invert(old.transform);
+    if (inverse) {
+      pair.mode = old.mode;
+      pair.orientation = { ...old.orientation };
+      pair.transform = inverse;
+      pair.fit = old.fit ? { ...old.fit, angleDeg: -old.fit.angleDeg, scale: 1 / old.fit.scale } : null;
+    }
+  }
+  pair.landmarks = clonePoints(compare.anchorLandmarks);
+  compare.anchorLandmarks = clonePoints(old?.landmarks || []);
+  compare.anchorSid = oldMember;
+  compare.members = [oldAnchor];
+  compare.pairs = new Map([[oldAnchor, pair]]);
+  active = compare.anchorSid;
   applyFrameLayout();
   applyDisplayTransforms();
   updateCompareControls();
   render();
-  if (compare.linked) requestPairSoon("sync");
+  requestGroupSoon("sync");
 }
 
 $("compare-toggle").onclick = toggleCompare;
 $("compare-picker-close").onclick = () => closePairPicker();
-$("compare-partner").onclick = openPartnerPicker;
+$("compare-add").onclick = () => openPicker("add");
 $("compare-link").onclick = toggleViewLink;
 $("compare-swap").onclick = swapComparedSlides;
 $("compare-rotate").onclick = toggleHalfTurn;
 $("compare-mirror").onclick = toggleMirror;
-$("compare-reset").onclick = resetAlignment;
+$("compare-align").onclick = () => (compare.landmark.active ? finishLandmarks(true) : startLandmarks());
 $("compare-close").onclick = stopCompare;
+$("compare-landmark-clear").onclick = clearAlignment;
+$("compare-landmark-done").onclick = () => finishLandmarks(true);
+$("compare-landmark-cancel").onclick = () => finishLandmarks(false);
 
 window.addEventListener("keydown", (event) => {
   if (event.repeat) return;
   if (event.key === "Escape" && pairPickerIsOpen()) {
     event.preventDefault();
     closePairPicker();
+  } else if (event.key === "Escape" && compare.landmark.active) {
+    event.preventDefault();
+    finishLandmarks(false);
   } else if ((event.metaKey || event.ctrlKey) && event.code === "Backslash") {
     event.preventDefault();
     toggleCompare();
@@ -1147,7 +1475,7 @@ $("compare-picker").addEventListener("keydown", (event) => {
 document.addEventListener("pointerdown", (event) => {
   if (!pairPickerIsOpen()) return;
   if ($("compare-picker").contains(event.target) || $("compare-toggle").contains(event.target) ||
-      $("compare-partner").contains(event.target)) return;
+      $("compare-add").contains(event.target) || $("compare-chips").contains(event.target)) return;
   closePairPicker(false);
 }, true);
 
@@ -1165,13 +1493,13 @@ compareDivider.addEventListener("pointermove", (event) => {
   const rect = $("frames").getBoundingClientRect();
   const pct = ((event.clientX - rect.left) / Math.max(1, rect.width)) * 100;
   compare.split = Math.max(25, Math.min(75, pct));
-  document.documentElement.style.setProperty("--compare-split", `${compare.split}%`);
+  applyFrameLayout();
 });
 function finishDividerDrag(event) {
   if (event.pointerId !== dividerPointer) return;
   dividerPointer = null;
   compareDivider.classList.remove("dragging");
-  if (compare.linked) requestPairSoon("sync");
+  if (compare.linked) requestGroupSoon("sync");
 }
 compareDivider.addEventListener("pointerup", finishDividerDrag);
 compareDivider.addEventListener("pointercancel", finishDividerDrag);
@@ -1218,35 +1546,37 @@ document.addEventListener("drop", (event) => event.preventDefault(), true);
 window.addEventListener("message", (event) => {
   if (event.origin !== location.origin || !event.data) return;
   const senderSid = frameSidForSource(event.source);
-  if (event.data.nd2wsi === "viewport-ready") {
-    if (!senderSid || event.data.version !== VIEWPORT_PROTOCOL_VERSION ||
-        (event.data.sid && event.data.sid !== senderSid)) return;
-    if (compare.enabled && [compare.leftSid, compare.rightSid].includes(senderSid)) {
-      applyDisplayTransform(senderSid);
-      if (compare.linked || compare.pendingRequest) {
-        requestPairSoon(
-          compare.pendingRequest?.kind || (compare.offset.mode ? "sync" : "initial")
-        );
-      }
-    }
-  } else if (event.data.nd2wsi === "viewport-state") {
+  const kind = event.data.nd2wsi;
+  const versioned = event.data.version === VIEWPORT_PROTOCOL_VERSION;
+  if (kind === "viewport-ready") {
+    if (!senderSid || !versioned || (event.data.sid && event.data.sid !== senderSid)) return;
+    paneCameUp(senderSid);
+  } else if (kind === "viewport-state") {
     if (!senderSid || (event.data.sid && event.data.sid !== senderSid)) return;
     receiveViewportState(event.data, senderSid);
-  } else if (event.data.nd2wsi === "compare-toggle") {
-    if (!senderSid || event.data.version !== VIEWPORT_PROTOCOL_VERSION) return;
+  } else if (kind === "compare-toggle") {
+    if (!senderSid || !versioned) return;
     toggleCompare();
-  } else if (event.data.nd2wsi === "compare-link-toggle") {
-    if (!senderSid || event.data.version !== VIEWPORT_PROTOCOL_VERSION) return;
+  } else if (kind === "compare-link-toggle") {
+    if (!senderSid || !versioned) return;
     toggleViewLink();
-  } else if (event.data.nd2wsi === "compare-nudge") {
-    if (!senderSid || event.data.version !== VIEWPORT_PROTOCOL_VERSION) return;
-    if (![compare.leftSid, compare.rightSid].includes(senderSid)) return;
-    nudgeAlignment(event.data.dxPx, event.data.dyPx);
-  } else if (event.data.nd2wsi === "slide-trashed") {
+  } else if (kind === "compare-nudge") {
+    if (!senderSid || !versioned || !inGroup(senderSid)) return;
+    nudgeAlignment(event.data.dxPx, event.data.dyPx, senderSid);
+  } else if (kind === "landmark-points") {
+    if (!senderSid || !versioned || (event.data.sid && event.data.sid !== senderSid)) return;
+    receiveLandmarkPoints(senderSid, event.data);
+  } else if (kind === "landmark-done") {
+    if (!senderSid || !versioned || !inGroup(senderSid)) return;
+    finishLandmarks(true);
+  } else if (kind === "landmark-cancel") {
+    if (!senderSid || !versioned || !inGroup(senderSid)) return;
+    finishLandmarks(false);
+  } else if (kind === "slide-trashed") {
     if (senderSid) refresh();
-  } else if (event.data.nd2wsi === "file-drag") {
+  } else if (kind === "file-drag") {
     if (senderSid) zone.hidden = false;
-  } else if (event.data.nd2wsi === "theme") {
+  } else if (kind === "theme") {
     // only the front tab colors the chrome; each tab keeps its own look
     const front = frames.get(active);
     if (front && event.source === front.contentWindow) {

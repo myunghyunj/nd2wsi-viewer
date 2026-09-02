@@ -42,6 +42,12 @@ const state = {
     altHeld: false, // Option held: a drag adjusts the alignment instead of both views
     compare: null, // what the shell says about this pane's part in Compare
   },
+  landmark: {
+    active: false, // the shell asked for alignment points on this pane
+    points: [], // level-0 image coordinates, in placement order
+    needed: 4,
+    clickToZoom: null, // OpenSeadragon setting restored when the mode ends
+  },
 };
 
 init().catch((e) => {
@@ -986,6 +992,17 @@ function imgPoint(pt) {
   };
 }
 
+function imageBoundsOfScreenRect(a, b) {
+  // the image-space box covering a screen rectangle, whatever the rotation
+  const corners = [
+    imgPoint({ x: a.x, y: a.y }), imgPoint({ x: b.x, y: a.y }),
+    imgPoint({ x: b.x, y: b.y }), imgPoint({ x: a.x, y: b.y }),
+  ];
+  const xs = corners.map((c) => c.x), ys = corners.map((c) => c.y);
+  const x = Math.min(...xs), y = Math.min(...ys);
+  return { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y };
+}
+
 function wireTools() {
   const stage = $("stage");
   const rubber = $("rubber");
@@ -1001,7 +1018,12 @@ function wireTools() {
   $("tool-box").onclick = () => setTool("box");
 
   let moveFrom = null; // roi origin at drag start (move mode)
+  let landmarkStart = null; // a click, not a drag, places an alignment point
   stage.addEventListener("pointerdown", (ev) => {
+    if (state.landmark.active && !state.tool && ev.button === 0) {
+      landmarkStart = elementPoint(ev, stage);
+      return; // OpenSeadragon keeps the drag, so the user can still pan
+    }
     if (!state.tool || ev.button !== 0) return;
     if (state.tool === "move" && !state.roi) return;
     start = elementPoint(ev, stage);
@@ -1040,6 +1062,13 @@ function wireTools() {
   }, true);
 
   stage.addEventListener("pointerup", (ev) => {
+    if (landmarkStart) {
+      const end = elementPoint(ev, stage);
+      const moved = Math.hypot(end.x - landmarkStart.x, end.y - landmarkStart.y);
+      landmarkStart = null;
+      if (moved < 6 && state.landmark.active && !state.tool) placeLandmark(end);
+      return;
+    }
     if (!state.tool || !start) return;
     const end = elementPoint(ev, stage);
     const endImg = imgPoint(end);
@@ -1066,12 +1095,7 @@ function wireTools() {
       renderAnnotations();
     } else if (tool === "box") {
       if (moved >= 6) {
-        const r = {
-          x: Math.min(startImg.x, endImg.x),
-          y: Math.min(startImg.y, endImg.y),
-          w: Math.abs(endImg.x - startImg.x),
-          h: Math.abs(endImg.y - startImg.y),
-        };
+        const r = imageBoundsOfScreenRect(start, end);
         const item = addAnnotation({ type: "box", ...r, text: "" });
         setTool(null);
         openEditor(item.id);
@@ -1294,16 +1318,16 @@ function renderAnnotations() {
   for (const a of state.annotations) {
     if (a.type === "line") drawLine(a, false);
     else if (a.type === "box") {
-      const p1 = toEl(a.x, a.y);
-      const p2 = toEl(a.x + a.w, a.y + a.h);
-      const left = Math.min(p1.x, p2.x);
-      const top = Math.min(p1.y, p2.y);
+      const corners = [
+        toEl(a.x, a.y), toEl(a.x + a.w, a.y), toEl(a.x + a.w, a.y + a.h), toEl(a.x, a.y + a.h),
+      ];
+      const left = Math.min(...corners.map((c) => c.x));
+      const top = Math.min(...corners.map((c) => c.y));
       const g = svgEl("g", { class: "hit" }, layer);
-      svgEl("rect", {
-        x: left, y: top,
-        width: Math.max(1, Math.abs(p2.x - p1.x)),
-        height: Math.max(1, Math.abs(p2.y - p1.y)),
-        fill: hexAlpha(annColor(a), 0.08), stroke: annColor(a), "stroke-width": 1.5, rx: 2,
+      svgEl("polygon", {
+        points: corners.map((c) => c.x + "," + c.y).join(" "),
+        fill: hexAlpha(annColor(a), 0.08), stroke: annColor(a), "stroke-width": 1.5,
+        "stroke-linejoin": "round",
       }, g);
       g.addEventListener("pointerdown", (ev) => { ev.stopPropagation(); openEditor(a.id); });
       chip(layer, left, top - 22, a.text || "Box", a.id);
@@ -1317,6 +1341,135 @@ function renderAnnotations() {
     }
   }
   if (state.tempLine) drawLine({ ...state.tempLine, text: "" }, true);
+  renderLandmarks(layer);
+}
+
+/* ---- alignment landmarks --------------------------------------------------
+   The shell asks each compared pane for numbered points on the same
+   structures. The pane only places and shows them; the shell fits the
+   transform. */
+
+const LANDMARK_COLOR = "#ff9f0a";
+
+function renderLandmarks(layer) {
+  const points = state.landmark.points;
+  if (!points.length) return;
+  const group = svgEl("g", { class: "landmarks" }, layer);
+  points.forEach((pt, i) => {
+    const p = toEl(pt.x, pt.y);
+    const g = svgEl("g", {}, group);
+    svgEl("circle", {
+      cx: p.x, cy: p.y, r: 9.5, fill: LANDMARK_COLOR, stroke: "#fff", "stroke-width": 1.5,
+    }, g);
+    svgEl("line", { x1: p.x - 14, y1: p.y, x2: p.x + 14, y2: p.y, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
+    svgEl("line", { x1: p.x, y1: p.y - 14, x2: p.x, y2: p.y + 14, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
+    const t = svgEl("text", {
+      x: p.x, y: p.y + 3.6, fill: "#1c1c1e", "text-anchor": "middle",
+      "font-size": "10", "font-weight": "700",
+      "font-family": "-apple-system, BlinkMacSystemFont, sans-serif",
+    }, g);
+    t.textContent = String(i + 1);
+  });
+}
+
+function landmarkHint() {
+  let el = $("landmark-hint");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "landmark-hint";
+    el.hidden = true;
+    $("stage-wrap").append(el);
+  }
+  return el;
+}
+
+function updateLandmarkHint() {
+  const el = landmarkHint();
+  const lm = state.landmark;
+  if (!lm.active) {
+    el.hidden = true;
+    return;
+  }
+  const n = lm.points.length;
+  el.textContent = n < lm.needed
+    ? `Align · click point ${n + 1} of ${lm.needed} on a structure you can find on every slide · ⌫ undo · esc cancel`
+    : `Align · ${lm.needed} of ${lm.needed} placed · click near a marker to move it · ⌫ undo · ⏎ done`;
+  el.hidden = false;
+}
+
+function postLandmarkPoints() {
+  if (window.parent === window) return;
+  window.parent.postMessage({
+    nd2wsi: "landmark-points",
+    version: VIEWPORT_PROTOCOL_VERSION,
+    sid: currentSlideSid(),
+    points: state.landmark.points.map((p) => ({ x: p.x, y: p.y })),
+  }, location.origin);
+}
+
+function setLandmarkMode(message) {
+  const lm = state.landmark;
+  const viewer = state.viewer;
+  const active = Boolean(message.active);
+  if (Array.isArray(message.points)) {
+    lm.points = message.points
+      .map((p) => ({ x: Number(p.x), y: Number(p.y) }))
+      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+      .slice(0, lm.needed);
+  }
+  if (message.clear) lm.points = [];
+  if (Number.isFinite(Number(message.needed)) && Number(message.needed) > 0) {
+    lm.needed = Math.min(8, Math.max(2, Number(message.needed)));
+  }
+  if (active && !lm.active) {
+    if (state.tool) setTool(state.tool);
+    if (viewer?.gestureSettingsMouse) {
+      lm.clickToZoom = viewer.gestureSettingsMouse.clickToZoom;
+      viewer.gestureSettingsMouse.clickToZoom = false;
+    }
+    $("stage").classList.add("placing");
+  } else if (!active && lm.active) {
+    if (viewer?.gestureSettingsMouse && lm.clickToZoom !== null) {
+      viewer.gestureSettingsMouse.clickToZoom = lm.clickToZoom;
+    }
+    lm.clickToZoom = null;
+    $("stage").classList.remove("placing");
+  }
+  lm.active = active;
+  updateLandmarkHint();
+  renderAnnotations();
+}
+
+function placeLandmark(screenPoint) {
+  const lm = state.landmark;
+  const img = imgPoint(screenPoint);
+  if (lm.points.length < lm.needed) {
+    lm.points.push({ x: img.x, y: img.y });
+  } else {
+    let nearest = -1, best = 24;
+    lm.points.forEach((pt, i) => {
+      const p = toEl(pt.x, pt.y);
+      const d = Math.hypot(p.x - screenPoint.x, p.y - screenPoint.y);
+      if (d < best) { best = d; nearest = i; }
+    });
+    if (nearest < 0) {
+      showToast(`${lm.needed} points placed · ⌫ removes the last, or click near a marker to move it`);
+      return;
+    }
+    lm.points[nearest] = { x: img.x, y: img.y };
+  }
+  renderAnnotations();
+  updateLandmarkHint();
+  postLandmarkPoints();
+}
+
+function undoLandmark() {
+  const lm = state.landmark;
+  if (!lm.points.length) return;
+  lm.points.pop();
+  renderAnnotations();
+  updateLandmarkHint();
+  postLandmarkPoints();
 }
 
 /* ---- annotation editor + list ---------------------------------------------- */
@@ -1612,13 +1765,12 @@ function flyToAnnotation(a) {
 }
 
 function finishSelection(a, b) {
-  const p1 = viewerElementToImagePoint(a);
-  const p2 = viewerElementToImagePoint(b);
+  const box = imageBoundsOfScreenRect(a, b);
   const info = state.info;
-  const x0 = clamp(Math.min(p1.x, p2.x), 0, info.width);
-  const y0 = clamp(Math.min(p1.y, p2.y), 0, info.height);
-  const x1 = clamp(Math.max(p1.x, p2.x), 0, info.width);
-  const y1 = clamp(Math.max(p1.y, p2.y), 0, info.height);
+  const x0 = clamp(box.x, 0, info.width);
+  const y0 = clamp(box.y, 0, info.height);
+  const x1 = clamp(box.x + box.w, 0, info.width);
+  const y1 = clamp(box.y + box.h, 0, info.height);
   const w = Math.round(x1 - x0);
   const h = Math.round(y1 - y0);
   setTool(null);
@@ -2223,11 +2375,15 @@ async function revealSlidePath(which) {
    image-space fit. Physical mapping is possible when both slides report
    calibration; otherwise the shell uses normalized slide coordinates. */
 
-const VIEWPORT_PROTOCOL_VERSION = 1;
+const VIEWPORT_PROTOCOL_VERSION = 2;
 const VIEWPORT_EMIT_MS = 50;
 
 function normalizedRotation(value) {
   return ((Number(value) % 360) + 360) % 360;
+}
+
+function angleDifference(a, b) {
+  return ((normalizedRotation(a) - normalizedRotation(b) + 540) % 360) - 180;
 }
 
 function applyDesiredDisplayTransform(announce = true) {
@@ -2235,7 +2391,7 @@ function applyDesiredDisplayTransform(announce = true) {
   if (!viewer?.viewport || !viewer.world || !viewer.world.getItemCount()) return false;
   const degrees = state.viewportRelay.displayRotation;
   const flipped = state.viewportRelay.displayFlipped;
-  const rotationChanged = normalizedRotation(viewer.viewport.getRotation()) !== degrees;
+  const rotationChanged = Math.abs(angleDifference(viewer.viewport.getRotation(), degrees)) > 0.01;
   const flipChanged = viewer.viewport.getFlip() !== flipped;
   const changed = rotationChanged || flipChanged;
   clearTimeout(state.viewportRelay.timer);
@@ -2268,11 +2424,8 @@ function applyDesiredDisplayTransform(announce = true) {
 
 function applyDisplayTransform(message) {
   const degrees = Number(message.degrees);
-  if (
-    (degrees !== 0 && degrees !== 180) ||
-    typeof message.flipped !== "boolean"
-  ) return;
-  state.viewportRelay.displayRotation = degrees;
+  if (!Number.isFinite(degrees) || typeof message.flipped !== "boolean") return;
+  state.viewportRelay.displayRotation = normalizedRotation(degrees);
   state.viewportRelay.displayFlipped = message.flipped;
   if (applyDesiredDisplayTransform()) return;
   if (state.viewportRelay.transformWaitingForOpen) return;
@@ -2291,17 +2444,15 @@ function currentSlideSid() {
 function viewportSnapshot() {
   const viewer = state.viewer;
   if (!viewer || !viewer.viewport || !viewer.world || !viewer.world.getItemCount()) return null;
-  const bounds = viewer.viewport.getBounds(true);
-  // A rotated OSD Rect stores its angle separately. Constructing x+width here
-  // would ignore that angle and shift the reported center by a full viewport
-  // after a 180° turn.
-  const viewportTopLeft = bounds.getTopLeft();
-  const viewportBottomRight = bounds.getBottomRight();
+  // The unrotated bounds describe the field independently of any display
+  // rotation or mirror: OSD turns the view about this rectangle's center,
+  // and a rotated Rect's corners would fold the angle into the span.
+  const bounds = viewer.viewport.getBoundsNoRotate(true);
   const topLeft = viewer.viewport.viewportToImageCoordinates(
-    viewportTopLeft
+    new OpenSeadragon.Point(bounds.x, bounds.y)
   );
   const bottomRight = viewer.viewport.viewportToImageCoordinates(
-    viewportBottomRight
+    new OpenSeadragon.Point(bounds.x + bounds.width, bounds.y + bounds.height)
   );
   const numbers = [topLeft.x, topLeft.y, bottomRight.x, bottomRight.y];
   if (!numbers.every(Number.isFinite)) return null;
@@ -2397,15 +2548,17 @@ function applyLinkedViewport(message) {
     // Keep all of those out of the user-event route, then send one explicit
     // acknowledgement carrying the shell command id.
     state.viewportRelay.suppressUntil = Date.now() + 180;
-    const imageRect = new OpenSeadragon.Rect(
-      center.x - span.x / 2,
-      center.y - span.y / 2,
-      span.x,
-      span.y
+    // fitBounds would fit the bounding box of a rotated field and zoom out
+    // under any display rotation, so set the zoom for the field width and
+    // the center directly. Both are independent of rotation and mirror.
+    const viewport = state.viewer.viewport;
+    const screenPerImage = viewport.getContainerSize().x / span.x;
+    viewport.zoomTo(viewport.imageToViewportZoom(screenPerImage), null, true);
+    viewport.panTo(
+      viewport.imageToViewportCoordinates(new OpenSeadragon.Point(center.x, center.y)),
+      true
     );
-    const viewportRect = state.viewer.viewport.imageToViewportRectangle(imageRect);
-    state.viewer.viewport.fitBounds(viewportRect, true);
-    state.viewer.viewport.applyConstraints(true);
+    viewport.applyConstraints(true);
     postViewportState("apply", { echoOf: commandId });
   };
 
@@ -2437,9 +2590,26 @@ function wireCompareRelay() {
         enabled: Boolean(event.data.enabled),
         linked: Boolean(event.data.linked),
         moving: Boolean(event.data.moving),
+        role: event.data.role === "anchor" ? "anchor" : "member",
       };
+      if (!event.data.enabled && state.landmark.active) setLandmarkMode({ active: false, clear: true });
+    } else if (event.data.nd2wsi === "landmark-mode") {
+      setLandmarkMode(event.data);
     }
   });
+  window.addEventListener("keydown", (ev) => {
+    if (!state.landmark.active || window.parent === window) return;
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    let kind = null;
+    if (ev.key === "Backspace" || ev.key === "Delete") { undoLandmark(); ev.preventDefault(); ev.stopPropagation(); return; }
+    if (ev.key === "Escape") kind = "landmark-cancel";
+    else if (ev.key === "Enter") kind = "landmark-done";
+    if (!kind) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    window.parent.postMessage({ nd2wsi: kind, version: VIEWPORT_PROTOCOL_VERSION }, location.origin);
+  }, true);
   // Arrow keys nudge the alignment while linked. This runs in the capture
   // phase so OpenSeadragon's own arrow-key panning never sees the event.
   window.addEventListener("keydown", (ev) => {

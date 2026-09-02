@@ -418,6 +418,18 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 .pixel-hud-values > div span:last-child { color: var(--label); font-family: var(--font-mono); }
 .pixel-hud-note { margin-top: 5px; color: var(--label-3); font-size: 10px; }
 
+/* ---- alignment landmarks --------------------------------------------------- */
+#landmark-hint {
+  position: absolute; z-index: 43; top: 10px; left: 50%; transform: translateX(-50%);
+  max-width: calc(100% - 24px); padding: 6px 12px; border-radius: 9px;
+  color: var(--label); background: var(--material-strong); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+  -webkit-backdrop-filter: blur(24px) saturate(180%); backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: var(--window-shadow);
+}
+#landmark-hint[hidden] { display: none; }
+#stage.placing { cursor: crosshair; }
+
 /* ---- selection marquee (Apple selection blue) ------------------------------ */
 #rubber {
   position: absolute; display: none; z-index: 40; pointer-events: none;
