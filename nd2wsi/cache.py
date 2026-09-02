@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import time
 import uuid
 from pathlib import Path
@@ -46,6 +47,50 @@ KNOWN_FORMATS = (MANIFEST_FORMAT, OVERVIEW_FORMAT)
 ALGORITHM = "box-mean-floor-v1"
 
 _LOCK_STALE_S = 4 * 3600
+# A lock names the machine and boot that took it. A drive carried to
+# another computer brings its lockfiles along, and a pid from the other
+# machine means nothing here: the builder cannot be alive on this side.
+# The same goes for a lock from before a reboot, so the boot time is part
+# of the identity and no network hardware lookup is needed.
+
+
+def _machine_id() -> str:
+    try:
+        booted = round((time.time() - time.clock_gettime(time.CLOCK_UPTIME_RAW)) / 10)
+    except (AttributeError, OSError, ValueError):
+        booted = 0
+    return hashlib.sha1(f"{socket.gethostname()}|{booted}".encode()).hexdigest()[:12]
+
+
+_MACHINE_ID = _machine_id()
+_FOREIGN_LOCK_STALE_S = 60.0
+
+
+class CacheFromNewerApp(RuntimeError):
+    """A complete cache written in a format this build does not know."""
+
+
+def _format_number(fmt: Any) -> int | None:
+    m = re.fullmatch(r"nd2wsi-cache/(\d+)", str(fmt or ""))
+    return int(m.group(1)) if m else None
+
+
+def newer_cache_format(container: str | Path) -> str | None:
+    """The manifest format if it is newer than this build reads, else None.
+
+    An older app must never quarantine and rebuild a cache a newer app
+    wrote: the cache is not broken, the app is behind. The caller refuses
+    to open and names the update instead of destroying work.
+    """
+    try:
+        m = json.loads((Path(container) / MANIFEST_NAME).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(m, dict) or not m.get("complete"):
+        return None
+    number = _format_number(m.get("format"))
+    newest_known = max(_format_number(f) or 0 for f in KNOWN_FORMATS)
+    return str(m.get("format")) if number is not None and number > newest_known else None
 
 
 def selection_tag(selection: Any) -> str:
@@ -246,7 +291,13 @@ class CacheLock:
             except OSError:
                 return False  # vanished: not ours to reclaim
             return age > 30
-        if time.time() - info.get("time", 0) > _LOCK_STALE_S:
+        age = time.time() - info.get("time", 0)
+        machine = info.get("machine")
+        if machine is not None and machine != _MACHINE_ID:
+            # taken on another machine: its process cannot be running
+            # here, and only clock skew argues for a short grace
+            return age > _FOREIGN_LOCK_STALE_S
+        if age > _LOCK_STALE_S:
             # the pid probe alone cannot see a recycled pid: after a crash
             # an unrelated process may wear the builder's number forever,
             # so very old locks age out no matter what the probe says
@@ -273,7 +324,9 @@ class CacheLock:
         deadline = time.time() + timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
         gen = uuid.uuid4().hex
-        payload = json.dumps({"pid": os.getpid(), "time": time.time(), "gen": gen})
+        payload = json.dumps(
+            {"pid": os.getpid(), "time": time.time(), "gen": gen, "machine": _MACHINE_ID}
+        )
         while True:
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -355,13 +408,17 @@ def sweep_stale_builds(caches_dir: Path) -> int:
         info = lock._read()
         live = False
         if info:
-            try:
-                os.kill(int(info.get("pid", -1)), 0)
-                live = True
-            except (ProcessLookupError, ValueError, TypeError):
-                pass
-            except PermissionError:
-                live = True
+            machine = info.get("machine")
+            if machine is not None and machine != _MACHINE_ID:
+                live = False  # a builder on another machine is not running here
+            else:
+                try:
+                    os.kill(int(info.get("pid", -1)), 0)
+                    live = True
+                except (ProcessLookupError, ValueError, TypeError):
+                    pass
+                except PermissionError:
+                    live = True
         if not live:
             shutil.rmtree(item, ignore_errors=True)
             n += 1

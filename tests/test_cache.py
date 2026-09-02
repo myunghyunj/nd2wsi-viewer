@@ -245,3 +245,69 @@ def test_legacy_portable_store_is_not_reused_for_same_stem_other_format(tmp_path
     assert default_store_path(nd2_path) == legacy
     assert default_store_path(svs_path) == tmp_path / "pyramids" / "slide.svs.ome.zarr"
     assert existing_cache_store(svs_path) is None
+
+
+def test_cache_from_a_newer_app_is_left_alone_and_names_the_update(slide):
+    """An older app must not destroy a cache it merely cannot read."""
+    container = cache_container(slide)
+    container.mkdir(parents=True)
+    (container / "manifest.json").write_text(json.dumps({
+        "format": "nd2wsi-cache/99", "complete": True, "kind": "full",
+        "source": {"name": "s.svs"},
+    }))
+    (container / "store.ome.zarr").mkdir()
+
+    with pytest.raises(RuntimeError, match="newer nd2wsi-viewer"):
+        ensure_cache(slide)
+    assert (container / "manifest.json").exists()
+    assert not list(container.parent.glob("*.corrupt-*"))
+
+
+def test_an_unknown_older_format_is_still_quarantined_and_rebuilt(slide):
+    container = cache_container(slide)
+    container.mkdir(parents=True)
+    (container / "manifest.json").write_text(json.dumps({
+        "format": "nd2wsi-cache/1", "complete": True, "kind": "full",
+        "source": {"name": "s.svs"},
+    }))
+    (container / "store.ome.zarr").mkdir()
+
+    store = ensure_cache(slide)
+    open_store(store)
+    assert list(container.parent.glob("*.corrupt-*"))
+
+
+def test_lock_from_another_machine_is_reclaimed_even_with_a_live_pid(slide):
+    import time
+
+    container = cache_container(slide)
+    container.parent.mkdir(parents=True, exist_ok=True)
+    foreign = CacheLock(container)
+    # this process is alive, so a pid probe alone would wait for hours
+    foreign.path.write_text(json.dumps({
+        "pid": os.getpid(), "time": time.time() - 120, "gen": "x", "machine": "elsewhere",
+    }))
+    CacheLock(container).acquire(timeout=2)
+    CacheLock(container).release()  # not ours; must not unlink the new lock
+    # a foreign lock younger than the grace period still holds
+    foreign.path.write_text(json.dumps({
+        "pid": os.getpid(), "time": time.time(), "gen": "y", "machine": "elsewhere",
+    }))
+    with pytest.raises(TimeoutError):
+        CacheLock(container).acquire(timeout=0.4, poll=0.1)
+
+
+def test_sweep_removes_builds_left_by_another_machine(tmp_path):
+    import time
+
+    from nd2wsi.cache import sweep_stale_builds
+
+    caches = tmp_path / "caches"
+    family = "a--t0-p0-zmid.nd2wsi-cache"
+    staging = caches / f"{family}.building-{os.getpid()}"
+    staging.mkdir(parents=True)
+    CacheLock(caches / family).path.write_text(json.dumps({
+        "pid": os.getpid(), "time": time.time(), "machine": "elsewhere",
+    }))
+    assert sweep_stale_builds(caches) == 1
+    assert not staging.exists()

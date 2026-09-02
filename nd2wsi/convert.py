@@ -789,11 +789,14 @@ def ensure_cache(
     either kind is honored. ``kind="full"`` insists on a full store.
     """
     from .cache import (
+        OVERVIEW_FORMAT,
+        CacheFromNewerApp,
         CacheLock,
         cache_container,
         cache_matches,
         commit_container,
         container_store,
+        newer_cache_format,
         quarantine,
         quick_fingerprint,
         sweep_stale_builds,
@@ -806,6 +809,17 @@ def ensure_cache(
 
     container = cache_container(slide, selection)
     store = container_store(container)
+
+    def refuse_if_newer() -> None:
+        newer = newer_cache_format(container)
+        if newer:
+            raise CacheFromNewerApp(
+                f"The cache for {slide.name} was built by a newer nd2wsi-viewer "
+                f"(cache format {newer}; this app reads up to {OVERVIEW_FORMAT}). "
+                f"Update the app, or remove {container.name} to rebuild it here."
+            )
+
+    refuse_if_newer()
     # the common case takes no lock: a valid container serves immediately,
     # and it outranks legacy stores so an old pyramids dir cannot shadow a
     # correct managed cache
@@ -848,6 +862,7 @@ def ensure_cache(
             except ValueError:
                 pass
         if container.exists():
+            refuse_if_newer()  # it may have appeared while we waited
             quarantine(container)
         sweep_stale_builds(container.parent)
         overview = kind == "auto" and _overview_eligible(
