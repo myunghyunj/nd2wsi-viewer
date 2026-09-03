@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nd2wsi-viewer"
-version = "1.0.2"
+version = "1.1.0rc1"
 description = "Local whole-slide viewing for stitched Nikon ND2 and Aperio SVS, with native-value ROI export"
 readme = "README.md"
 requires-python = ">=3.11"

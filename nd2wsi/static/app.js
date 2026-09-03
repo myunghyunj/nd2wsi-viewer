@@ -20,6 +20,8 @@ const state = {
   windows: null, // floating mac-window controllers
   inspect: null, // extended slide metadata, loaded when Slide Info first opens
   inspectLoading: false,
+  plate: null, // {t, z, focus, playing, fps, k, ...} for a time series of sites
+  annDirty: false, // an edit is waiting for the debounced save
   pixel: {
     hudVisible: false,
     cursor: null, // latest displayed-base coordinate and element position
@@ -63,6 +65,22 @@ async function init() {
   state.luts = info.channels.map(() => null);
   state.lutWidgets = [];
 
+  if (info.kind === "plate" && info.plate) {
+    state.plate = {
+      t: 0,
+      z: clamp(Number(info.plate.zHome) || 0, 0, Math.max(0, info.plate.Z - 1)),
+      focus: null, // site index p while one site fills the stage
+      playing: false,
+      fps: 8,
+      k: 8, // reduction of the grid frames; 4 when the cells grow past 260 px
+      timer: null,
+      everFocused: false,
+      stale: false, // the hidden viewer still shows an older frame
+      placed: [], // sites sorted by row then col; the key numbers follow this
+      loaded: new Map(), // "t/z" -> count of sites whose frame has arrived
+    };
+  }
+
   document.title = info.name + " — nd2wsi-viewer";
   $("file-name").textContent = info.name;
   $("file-dims").textContent =
@@ -85,6 +103,8 @@ async function init() {
   buildChannelPanel();
   buildLevelLamps();
   buildViewer();
+  buildPlate();
+  if (state.plate) pollPlateStatus();
   wireCompareRelay();
   wireTools();
   wireKeys();
@@ -101,13 +121,20 @@ async function init() {
   }
 }
 
+function kindMark(info) {
+  // two words: 2D or 3D from the z axis, SLIDE or PLATE from the scan
+  // positions. A plate file reports its loops; a converted scan keeps the
+  // counts in its notes ("file has 7 Z planes", "file has 6 positions").
+  const notes = (info.notes || []).join("\n");
+  const zPlanes = info.plate ? Number(info.plate.Z) : Number((notes.match(/file has (\d+) Z planes/) || [])[1] || 1);
+  const positions = info.plate ? Number(info.plate.P) : Number((notes.match(/file has (\d+) positions/) || [])[1] || 1);
+  return (zPlanes > 1 ? "3D" : "2D") + " " + (positions > 1 ? "PLATE" : "SLIDE");
+}
+
 function fillContextBadges(info) {
-  const name = String(info.name || "").toLowerCase();
-  $("source-badge").textContent = name.endsWith(".svs")
-    ? "SVS"
-    : name.endsWith(".nd2")
-      ? "ND2"
-      : "OME-ZARR";
+  // the app mark names the kind of file; the details live in Slide Info
+  $("source-badge").textContent = kindMark(info);
+  $("file-dims").hidden = info.kind === "plate";
 
   const storage = $("storage-badge");
   const storageLabels = {
@@ -136,6 +163,7 @@ function fillContextBadges(info) {
 }
 
 function planeNote(info) {
+  if (state.plate) return platePlaneNote();
   const s = info.selection || {};
   const bits = [];
   if (s.t !== undefined && s.t !== 0) bits.push("t=" + s.t);
@@ -166,8 +194,9 @@ function lutParam() {
     .join(",");
 }
 
-function tileQuery() {
-  const q = new URLSearchParams();
+function renderParams(q) {
+  // the channel set, the LUT windows and the cache generation, shared by
+  // tiles, plate frames and rendered exports
   if (state.channels.length !== state.info.channels.length)
     q.set("c", state.channels.join(","));
   const win = lutParam();
@@ -175,6 +204,29 @@ function tileQuery() {
   // the cache generation makes tile URLs immutable: the browser may keep
   // them, and a rebuilt cache changes the URLs instead of serving stale
   if (state.info.generation) q.set("g", state.info.generation);
+  return q;
+}
+
+function plateFrameParams() {
+  // the frame the stage shows: current time, the focused site (else the
+  // first) and the current z plane; null for an ordinary slide
+  const pl = state.plate;
+  if (!pl) return null;
+  return { t: pl.t, p: pl.focus === null ? 0 : pl.focus, z: pl.z };
+}
+
+function withPlateParams(q) {
+  const f = plateFrameParams();
+  if (f) {
+    q.set("t", f.t);
+    q.set("p", f.p);
+    q.set("z", f.z);
+  }
+  return q;
+}
+
+function tileQuery() {
+  const q = withPlateParams(renderParams(new URLSearchParams()));
   const s = q.toString();
   return s ? "?" + s : "";
 }
@@ -183,7 +235,6 @@ function makeTileSource() {
   const info = state.info;
   // server levels: index 0 = full resolution; OSD wants level 0 = smallest.
   const lv = info.levels.slice().reverse();
-  const q = tileQuery();
   return {
     width: info.width,
     height: info.height,
@@ -203,7 +254,9 @@ function makeTileSource() {
       );
     },
     getTileUrl: function (l, x, y) {
-      return "api/tile/" + lv[l].path + "/" + x + "/" + y + ".jpg" + q;
+      // read the query at request time so a tile refresh (LUT, channel
+      // switch, frame change) picks up the current settings without a reopen
+      return "api/tile/" + lv[l].path + "/" + x + "/" + y + ".jpg" + tileQuery();
     },
   };
 }
@@ -256,6 +309,10 @@ function buildViewer() {
     imageSmoothingEnabled: true,
     crossOriginPolicy: false,
     drawer: "canvas",
+    // bound the work a tile refresh can queue: at most six tile requests in
+    // flight and a small decoded-tile cache, so LUT drags stay cheap
+    imageLoaderLimit: 6,
+    maxImageCacheCount: 120,
   });
   state.viewer = viewer;
 
@@ -403,7 +460,7 @@ function buildChannelPanel() {
       next ? on.add(i) : on.delete(i);
       if (!on.size) return false; // keep at least one channel lit
       state.channels = [...on].sort((a, b) => a - b);
-      reopenPreservingView();
+      refreshTiles();
     });
     if (info.channels.length < 2) toggle.style.display = "none";
     row.append(sw, name, win, auto, reset, toggle);
@@ -426,7 +483,53 @@ function buildChannelPanel() {
    -- the layout NIS-Elements' LUTs panel uses.  Shift-drag applies to all
    channels. */
 
-const applyLuts = debounce(() => reopenPreservingView(), 250);
+const applyLuts = debounce(() => refreshTiles(), 250);
+
+/* Swap the tiles of the open image in place. The tile source builds every
+   URL through tileQuery() at request time, so dropping the loaded tiles is
+   enough for the next draw to fetch them with the current LUT, channel set
+   and frame. This replaces the full viewer reopen that ran on every LUT
+   change and let the WebKit content process grow past 3 GB during a drag. */
+function refreshTiles() {
+  const viewer = state.viewer;
+  if (state.plate) {
+    // the grid frames follow the same LUT, channel set and t/z; while the
+    // stage is hidden the viewer keeps its old tiles and catches up on focus
+    paintPlate();
+    if (state.plate.focus === null) {
+      state.plate.stale = true;
+      return;
+    }
+    state.plate.stale = false;
+  }
+  // a reopen is already in flight and its tile source reads the current
+  // query when it opens, so there is nothing extra to do
+  if (state.viewportRelay.reopening) return;
+  const item = viewer && viewer.world && viewer.world.getItemAt(0);
+  if (!item || typeof item.reset !== "function") {
+    reopenPreservingView();
+    return;
+  }
+  resetTiledImage(item);
+  const navItem = viewer.navigator && viewer.navigator.world
+    && viewer.navigator.world.getItemAt(0);
+  if (navItem && typeof navItem.reset === "function") resetTiledImage(navItem);
+  viewer.forceRedraw();
+}
+
+function resetTiledImage(item) {
+  // OpenSeadragon 5 TiledImage.reset() clears this image's tiles from the
+  // cache and marks it for redraw. The tile records it keeps in tilesMatrix
+  // still carry the URL they were built with, and a fully loaded image skips
+  // its tile pass until the viewport moves. Emptying the matrix makes the
+  // next pass build fresh records through getTileUrl, and setClip with the
+  // unchanged clip is the public call that schedules that pass.
+  item.reset();
+  if (item.tilesMatrix) item.tilesMatrix = {};
+  if (typeof item.setClip === "function" && typeof item.getClip === "function") {
+    item.setClip(item.getClip());
+  }
+}
 
 function buildLutRow(i, ch, winLabel) {
   const wrap = document.createElement("div");
@@ -675,7 +778,8 @@ function relayoutLuts() {
 }
 
 function loadHistograms() {
-  fetch("api/histogram")
+  const q = withPlateParams(new URLSearchParams()).toString();
+  fetch("api/histogram" + (q ? "?" + q : ""))
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
     .then((d) => {
       d.channels.forEach((hg, i) => {
@@ -684,6 +788,9 @@ function loadHistograms() {
     })
     .catch(() => {}); // panel still works without histograms
 }
+
+// a plate frame change refetches the histogram of the frame on the stage
+const refreshHistograms = debounce(loadHistograms, 300);
 
 function debounce(fn, ms) {
   let t = null;
@@ -728,6 +835,10 @@ function activeLevel() {
 }
 
 function updateReadout() {
+  if (state.plate && state.plate.focus === null) {
+    updateGridReadout();
+    return;
+  }
   const dz = deviceZoom();
   $("zoom-val").textContent =
     (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %" + (Math.abs(dz - 1) < 0.005 ? " · 1:1" : "");
@@ -736,6 +847,23 @@ function updateReadout() {
     $("lamp-" + lv.path).classList.toggle("active", k === act);
   });
   updateScalebar(currentImageZoom());
+}
+
+function updateGridReadout() {
+  // in grid mode the readouts describe a site cell, not the hidden viewer
+  const iz = plateCellZoom();
+  if (!iz) return;
+  const dz = iz * (window.devicePixelRatio || 1);
+  $("zoom-val").textContent = (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %";
+  const levels = state.info.levels;
+  let act = 0;
+  for (let k = levels.length - 1; k >= 0; k--) {
+    if (1 / levels[k].downsample >= Math.min(dz, 1)) { act = k; break; }
+  }
+  levels.forEach((lv, k) => {
+    $("lamp-" + lv.path).classList.toggle("active", k === act);
+  });
+  updateScalebar(iz);
 }
 
 function updateCursor(img, elementPt) {
@@ -890,7 +1018,7 @@ function pumpPixelProbe() {
     state.pixel.queued = null;
     state.pixel.inFlight = true;
     state.pixel.lastStarted = Date.now();
-    const query = new URLSearchParams({ x: requested.x, y: requested.y });
+    const query = withPlateParams(new URLSearchParams({ x: requested.x, y: requested.y }));
     fetch("api/pixel?" + query.toString(), { cache: "no-store" })
       .then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
       .then((data) => {
@@ -1159,6 +1287,7 @@ function removeAnnotation(id) {
 }
 
 function annotationsChanged() {
+  state.annDirty = true;
   renderAnnotations();
   rebuildAnnList();
   scheduleAnnSave();
@@ -1166,12 +1295,21 @@ function annotationsChanged() {
 
 const scheduleAnnSave = debounce(saveAnnotations, 800);
 
-function saveAnnotations() {
+function annotationsUrl(site) {
+  // a plate keeps one sidecar per site, shared across time and z; the
+  // coordinates inside are level-0 pixels of the frame, as for any slide
+  if (!state.plate) return "api/annotations";
+  const p = site === undefined ? plateFrameParams().p : site;
+  return "api/annotations?p=" + p;
+}
+
+function saveAnnotations(site) {
+  state.annDirty = false;
   if (annLocked()) {
     setAnnStatus("Not saved: annotation is locked in this degraded view");
     return;
   }
-  fetch("api/annotations", {
+  fetch(annotationsUrl(site), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ items: state.annotations }),
@@ -1182,7 +1320,7 @@ function saveAnnotations() {
 }
 
 function loadAnnotations() {
-  fetch("api/annotations")
+  fetch(annotationsUrl())
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
     .then((d) => {
       state.annotations = Array.isArray(d.items) ? d.items : [];
@@ -1633,8 +1771,9 @@ function geojsonFilename(info) {
   const stem = name
     .replace(/\.ome\.zarr$/i, "")
     .replace(/\.(nd2|svs)$/i, "");
+  const selection = info === state.info ? currentSelection() : info && info.selection;
   return safeFilenamePart(stem, "slide") + "--" +
-    selectionFilenameTag(info && info.selection) + ".geojson";
+    selectionFilenameTag(selection) + ".geojson";
 }
 
 function exportAnnotationsGeoJSON() {
@@ -1661,9 +1800,16 @@ function annotationDocument() {
           x_um_per_px: ps[1],
         }
       : { status: "unknown", source: "unknown" },
-    selection: state.info.selection || {},
+    selection: currentSelection(),
     items: state.annotations,
   };
+}
+
+function currentSelection() {
+  // the T/P/Z plane the annotations belong to: a plate's sidecar is per
+  // site, an ordinary slide's is the plane the cache was built from
+  if (state.plate) return { p: plateFrameParams().p };
+  return state.info.selection || {};
 }
 
 function normalizedSelection(selection) {
@@ -1702,7 +1848,7 @@ function annotationItemsForThisSlide(data) {
     throw new Error("unsupported annotation coordinate space");
   }
   if (data.selection) {
-    const expected = normalizedSelection(state.info.selection);
+    const expected = normalizedSelection(currentSelection());
     const actual = normalizedSelection(data.selection);
     if (expected.t !== actual.t || expected.p !== actual.p || expected.z !== actual.z) {
       throw new Error("annotations belong to a different T/P/Z plane");
@@ -1906,6 +2052,8 @@ function updateScaleStrip() {
   if (state.channels.length !== state.info.channels.length) {
     winQ += "&c=" + state.channels.join(",");
   }
+  const frame = plateFrameParams();
+  if (frame) winQ += "&t=" + frame.t + "&p=" + frame.p + "&z=" + frame.z;
   // one shared field, sized to the coarsest scale so every patch is honest
   const dMax = opts[opts.length - 1].d;
   const field = Math.min(64 * dMax, r.w, r.h); // native px on a side
@@ -2055,6 +2203,7 @@ function downloadRoi(fmt) {
     const win = lutParam();
     if (win) q.set("win", win); // rendered exports match the screen LUTs
   }
+  withPlateParams(q); // a plate exports the frame on the stage
   let job = null;
   if (fmt === "nd2" || fmt === "tiff") {
     job = Math.random().toString(36).slice(2, 10);
@@ -2244,14 +2393,22 @@ function slideInspectionRows(data) {
   const cachePath = data.cache_path || (
     data.storage !== "direct" && data.container_path ? data.container_path : null
   );
+  const plate = data.kind === "plate" && data.plate && typeof data.plate === "object"
+    ? data.plate
+    : null;
   const rows = [
     ["File", data.name || "Unnamed slide"],
-    ["Dimensions", fmtInt(data.width || 0) + " × " + fmtInt(data.height || 0) + " px"],
+    ...(plate
+      ? [["Kind", "Volumetric temporal · T " + plate.T + " × sites " + plate.P + " × Z " + plate.Z]]
+      : []),
+    ["Dimensions", fmtInt(data.width || 0) + " × " + fmtInt(data.height || 0) + " px" +
+      (plate ? " per frame" : "")],
     ["Pixel type", (data.dtype || "Unknown") + (data.rgb ? " · RGB" : "")],
     ["Channels", data.rgb ? "RGB" : channels],
+    ...(plate ? plateInspectionRows(plate) : []),
     ["Calibration", calibrationLabel(data)],
     ["Objective", formatMetadataValue(data.objective)],
-    ["Plane", selectionLabel(data.selection)],
+    ["Plane", plate ? platePlaneLabel() : selectionLabel(data.selection)],
     ["Pyramid", levels],
     ["Storage", storageLabel(data.storage)],
     ["Source", sourcePath],
@@ -3072,6 +3229,581 @@ function makeMacWindow(el, opts) {
   return api;
 }
 
+/* ---- plate mode ------------------------------------------------------------
+   A time series of camera fields over sites and z planes (info.kind ===
+   "plate"). Grid mode shows every site at the current t and z as a reduced
+   frame in the stage arrangement; focus mode hands one site to the deep
+   zoom viewer, whose tile URLs carry t, p and z through tileQuery(). A t or
+   z change swaps the frames in place, the view never rebuilds. Nothing here
+   runs for an ordinary slide. */
+
+function siteLabel(name) {
+  // "10(5)_MOI" -> {dil: "10", exp: "5", cond: "MOI"}; other names verbatim
+  const m = /^(\d+)\((\d+)\)_(.+)$/.exec(String(name || ""));
+  return m ? { dil: m[1], exp: m[2], cond: m[3] } : { dil: String(name || ""), exp: "", cond: "" };
+}
+
+function superscript(digits) {
+  return String(digits).replace(/\d/g, (c) => "⁰¹²³⁴⁵⁶⁷⁸⁹"[Number(c)]);
+}
+
+function siteLabelText(name) {
+  const l = siteLabel(name);
+  return l.exp ? l.dil + superscript(l.exp) + " " + l.cond : l.dil;
+}
+
+function fillSitePill(pill, name) {
+  pill.replaceChildren();
+  const l = siteLabel(name);
+  const dil = document.createElement("span");
+  dil.className = "dil";
+  dil.textContent = l.dil;
+  if (l.exp) {
+    const sup = document.createElement("sup");
+    sup.textContent = l.exp;
+    dil.append(sup);
+  }
+  pill.append(dil);
+  if (l.cond) {
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    sep.textContent = "·";
+    const cond = document.createElement("span");
+    cond.className = "cond";
+    cond.textContent = l.cond;
+    pill.append(sep, cond);
+  }
+}
+
+function fmtClock(ms) {
+  // "0 H 30 M": whole minutes, hours first, as the time badge reads
+  const total = Math.max(0, Math.round(Number(ms || 0) / 60000));
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return h + " H " + String(m).padStart(2, "0") + " M";
+}
+
+function fmtPeriod(ms) {
+  const total = Math.max(0, Math.round(Number(ms || 0) / 60000));
+  if (total < 60) return total + " M";
+  return fmtClock(ms);
+}
+
+function fmtTickLabel(min) {
+  const h = Math.floor(min / 60);
+  const m = Math.round(min - h * 60);
+  if (h === 0) return m + " m";
+  return m ? h + " h " + m + " m" : h + " h";
+}
+
+function platePeriodMs() {
+  const pl = state.info.plate;
+  if (Number(pl.periodMs) > 0) return Number(pl.periodMs);
+  const times = pl.timesMs || [];
+  if (times.length < 2) return null;
+  const diffs = [];
+  for (let i = 1; i < times.length; i++) diffs.push(times[i] - times[i - 1]);
+  diffs.sort((a, b) => a - b);
+  const mid = diffs[Math.floor(diffs.length / 2)];
+  return mid > 0 ? mid : null;
+}
+
+function plateInspectionRows(plate) {
+  const placed = (plate.sites || []).slice()
+    .sort((a, b) => a.row - b.row || a.col - b.col);
+  const names = placed.map((s) => siteLabelText(s.name)).join(", ");
+  const rows = [
+    ["Sites", plate.P + " · stage arrangement " + plate.cols + " × " + plate.rows +
+      (names ? " · " + names : "")],
+    ["Z", plate.Z + " planes" +
+      (plate.zStepUm ? " · d = " + rawValueLabel(Number(plate.zStepUm)) + " µm" : "") +
+      " · home " + (Number(plate.zHome) + 1)],
+  ];
+  const times = plate.timesMs || [];
+  const period = platePeriodMs();
+  rows.push(["Time", plate.T + " frames" +
+    (times.length ? " · " + fmtClock(times[times.length - 1]) : "") +
+    (period ? " · every " + fmtPeriod(period) : "")]);
+  if (plate.exposureMs !== null && plate.exposureMs !== undefined) {
+    rows.push(["Exposure", rawValueLabel(Number(plate.exposureMs)) + " ms"]);
+  }
+  return rows;
+}
+
+function platePlaneLabel() {
+  const f = plateFrameParams();
+  return "T" + f.t + " · P" + f.p + " · Z" + f.z;
+}
+
+function platePlaneNote() {
+  const pl = state.plate;
+  const info = state.info.plate;
+  const bits = [];
+  if (pl.focus !== null && info.sites[pl.focus]) bits.push(siteLabelText(info.sites[pl.focus].name));
+  bits.push("t " + (pl.t + 1) + "/" + info.T);
+  bits.push("z " + (pl.z + 1) + "/" + info.Z);
+  return bits.join(" · ");
+}
+
+function plateFrameUrl(t, p, z) {
+  const q = renderParams(new URLSearchParams({ k: state.plate.k }));
+  return "api/plate/frame/" + t + "/" + p + "/" + z + ".jpg?" + q.toString();
+}
+
+function plateCellZoom() {
+  // CSS px per image px of one grid cell; null before the first layout
+  const pl = state.plate;
+  return pl && pl.cellW ? pl.cellW / state.info.plate.frameW : null;
+}
+
+function buildPlate() {
+  const pl = state.plate;
+  if (!pl) return;
+  const info = state.info.plate;
+  const wrap = $("stage-wrap");
+  wrap.classList.add("plate-grid");
+
+  // sites in the stage arrangement; the key numbers follow rows then cols
+  pl.placed = (info.sites || []).slice().sort((a, b) => a.row - b.row || a.col - b.col);
+  const grid = $("plate-grid");
+  const strip = $("plate-strip");
+  grid.style.setProperty("--cols", info.cols);
+  grid.style.setProperty("--rows", info.rows);
+  pl.gridEls = [];
+  pl.stripEls = [];
+  pl.placed.forEach((site, k) => {
+    const cell = makeSiteEl(site, k + 1);
+    cell.style.gridRow = site.row + 1;
+    cell.style.gridColumn = site.col + 1;
+    grid.append(cell);
+    pl.gridEls.push(cell);
+    const small = makeSiteEl(site, k + 1);
+    strip.append(small);
+    pl.stripEls.push(small);
+  });
+  $("plate-back").onclick = () => setPlateFocus(null);
+
+  buildZRail();
+  buildTimeLine();
+
+  // wheel over the sites turns the focus knob; shift scrubs time
+  let wheelAcc = 0;
+  $("plate").addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    wheelAcc += ev.deltaY;
+    const step = 40;
+    if (Math.abs(wheelAcc) < step) return;
+    const n = Math.trunc(wheelAcc / step);
+    wheelAcc -= n * step;
+    if (ev.shiftKey) setPlateT(pl.t + n);
+    else setPlateZ(pl.z - n);
+  }, { passive: false });
+
+  window.addEventListener("resize", layoutPlate);
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(() => layoutPlate()).observe($("plate"));
+  }
+  wirePlateKeys();
+  layoutPlate();
+  paintPlate();
+  renderZRail();
+  renderTimeLine();
+  $("plane-note").textContent = platePlaneNote();
+}
+
+function makeSiteEl(site, key) {
+  const el = document.createElement("button");
+  el.type = "button";
+  el.className = "site";
+  el.dataset.p = site.i;
+  el.title = siteLabelText(site.name) + " (" + key + ")";
+  const img = document.createElement("img");
+  img.alt = "";
+  img.draggable = false;
+  img.addEventListener("load", () => markFrameLoaded(img));
+  const pill = document.createElement("span");
+  pill.className = "pill";
+  fillSitePill(pill, site.name);
+  const keyEl = document.createElement("span");
+  keyEl.className = "key";
+  keyEl.textContent = key;
+  el.append(img, pill, keyEl);
+  el.addEventListener("click", () => setPlateFocus(Number(el.dataset.p)));
+  return el;
+}
+
+function markFrameLoaded(img) {
+  // a time tick fills in once every site's frame at that t and z has arrived
+  const pl = state.plate;
+  const key = img.dataset.frame;
+  if (!key) return;
+  const [t, , z] = key.split("/").map(Number);
+  const tz = t + "/" + z;
+  const seen = (pl.loaded.get(tz) || new Set());
+  seen.add(img.dataset.frame);
+  pl.loaded.set(tz, seen);
+  if (seen.size >= state.info.plate.P && pl.tickEls && pl.tickEls[t] && z === pl.z) {
+    pl.tickEls[t].classList.add("loaded");
+  }
+}
+
+function layoutPlate() {
+  const pl = state.plate;
+  if (!pl) return;
+  const info = state.info.plate;
+  const r = $("plate").getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  const gap = 10;
+  const aspect = info.frameW && info.frameH ? info.frameW / info.frameH : 1;
+  const cols = Math.max(1, info.cols), rows = Math.max(1, info.rows);
+  // the largest cell of the frame's aspect that fits the arrangement
+  const cellW = Math.floor(Math.min(
+    (r.width - gap * (cols - 1)) / cols,
+    ((r.height - gap * (rows - 1)) / rows) * aspect
+  ));
+  const cellH = Math.floor(cellW / aspect);
+  if (cellW < 8 || cellH < 8) return;
+  pl.cellW = cellW;
+  pl.cellH = cellH;
+  const grid = $("plate-grid");
+  grid.style.setProperty("--cell-w", cellW + "px");
+  grid.style.setProperty("--cell-h", cellH + "px");
+  const k = cellW <= 260 ? 8 : 4;
+  if (k !== pl.k) {
+    pl.k = k;
+    paintPlate();
+  }
+  if (pl.focus === null) updateReadout();
+}
+
+function paintPlate() {
+  const pl = state.plate;
+  if (!pl || !pl.gridEls) return;
+  pl.placed.forEach((site, k) => {
+    const url = plateFrameUrl(pl.t, site.i, pl.z);
+    for (const el of [pl.gridEls[k], pl.stripEls[k]]) {
+      const img = el.querySelector("img");
+      img.dataset.frame = pl.t + "/" + site.i + "/" + pl.z;
+      if (img.getAttribute("src") !== url) img.src = url;
+    }
+    pl.stripEls[k].classList.toggle("current", pl.focus === site.i);
+    pl.gridEls[k].classList.toggle("current", pl.focus === site.i);
+  });
+}
+
+function plateFrameChanged() {
+  // every t, z or focus change: frames, readouts, histogram, status bar
+  refreshTiles();
+  renderZRail();
+  renderTimeLine();
+  refreshHistograms();
+  $("plane-note").textContent = platePlaneNote();
+  if (state.inspect && !state.windows.info.isHidden()) renderSlideInspector(state.inspect);
+}
+
+function setPlateZ(z) {
+  const pl = state.plate;
+  const next = clamp(Math.round(z), 0, state.info.plate.Z - 1);
+  if (next === pl.z) return;
+  pl.z = next;
+  plateFrameChanged();
+}
+
+function setPlateT(t) {
+  const pl = state.plate;
+  const next = clamp(Math.round(t), 0, state.info.plate.T - 1);
+  if (next === pl.t) return;
+  pl.t = next;
+  plateFrameChanged();
+}
+
+function setPlateFocus(p) {
+  const pl = state.plate;
+  const info = state.info.plate;
+  const next = p === null || p === undefined ? null : clamp(Number(p), 0, info.P - 1);
+  if (next === pl.focus) return;
+  const before = plateFrameParams().p;
+  // the outgoing site's marks are saved before the sidecar switches
+  if (state.annDirty) saveAnnotations(before);
+  if (state.editingId) closeEditor(true);
+  pl.focus = next;
+  const wrap = $("stage-wrap");
+  wrap.classList.toggle("plate-grid", next === null);
+  wrap.classList.toggle("plate-focus", next !== null);
+  if (next !== null) {
+    if (!pl.everFocused) {
+      pl.everFocused = true;
+      state.viewer.viewport.goHome(true);
+    }
+    if (state.viewer.navigator && typeof state.viewer.navigator.update === "function") {
+      state.viewer.navigator.update(state.viewer.viewport);
+    }
+  } else {
+    if (state.tool) setTool(state.tool); // hand the mouse back for the next focus
+    setPlatePlaying(false);
+    layoutPlate();
+  }
+  if (plateFrameParams().p !== before) {
+    state.annotations = [];
+    renderAnnotations();
+    rebuildAnnList();
+    loadAnnotations();
+  }
+  plateFrameChanged();
+  updateReadout();
+}
+
+function setPlatePlaying(on) {
+  const pl = state.plate;
+  pl.playing = !!on;
+  const btn = $("t-play");
+  btn.classList.toggle("on", pl.playing);
+  btn.title = pl.playing ? "Pause (space)" : "Play (space)";
+  btn.innerHTML = pl.playing
+    ? '<svg viewBox="0 0 16 16"><path d="M3 3h4v10H3zM9 3h4v10H9z"/></svg>'
+    : '<svg viewBox="0 0 16 16"><path d="M4 2.5v11L13 8z"/></svg>';
+  clearInterval(pl.timer);
+  pl.timer = null;
+  if (pl.playing) {
+    pl.timer = setInterval(() => {
+      const T = state.info.plate.T;
+      setPlateT(pl.t + 1 >= T ? 0 : pl.t + 1);
+    }, 1000 / pl.fps);
+  }
+}
+
+/* z rail: one tick per plane, the home plane marked, a knob that drags */
+
+function zRailPct(z) {
+  const Z = state.info.plate.Z;
+  return Z > 1 ? (1 - z / (Z - 1)) * 100 : 50;
+}
+
+function buildZRail() {
+  const pl = state.plate;
+  const info = state.info.plate;
+  const ticks = $("z-ticks");
+  pl.zTickEls = [];
+  for (let i = 0; i < info.Z; i++) {
+    const tick = document.createElement("div");
+    tick.className = "ztick" + (i === info.zHome ? " home" : "");
+    tick.style.top = zRailPct(i) + "%";
+    ticks.append(tick);
+    pl.zTickEls.push(tick);
+  }
+  const track = $("z-track");
+  const knob = $("z-knob");
+  const zFromY = (y) => {
+    const r = track.getBoundingClientRect();
+    if (!r.height) return;
+    const f = clamp((y - r.top) / r.height, 0, 1);
+    setPlateZ(Math.round((1 - f) * (info.Z - 1)));
+  };
+  let drag = false;
+  knob.addEventListener("pointerdown", (ev) => {
+    drag = true;
+    try { knob.setPointerCapture(ev.pointerId); } catch (_) { /* optional */ }
+    ev.preventDefault();
+  });
+  knob.addEventListener("pointermove", (ev) => { if (drag) zFromY(ev.clientY); });
+  knob.addEventListener("pointerup", () => { drag = false; });
+  knob.addEventListener("pointercancel", () => { drag = false; });
+  track.addEventListener("pointerdown", (ev) => {
+    if (ev.target !== knob) zFromY(ev.clientY);
+  });
+  knob.addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowUp") { setPlateZ(pl.z + 1); ev.preventDefault(); ev.stopPropagation(); }
+    else if (ev.key === "ArrowDown") { setPlateZ(pl.z - 1); ev.preventDefault(); ev.stopPropagation(); }
+  });
+  knob.setAttribute("aria-valuemin", "1");
+  knob.setAttribute("aria-valuemax", String(info.Z));
+}
+
+function renderZRail() {
+  const pl = state.plate;
+  const info = state.info.plate;
+  pl.zTickEls.forEach((tick, i) => tick.classList.toggle("on", i === pl.z));
+  const knob = $("z-knob");
+  knob.style.top = zRailPct(pl.z) + "%";
+  knob.setAttribute("aria-valuenow", String(pl.z + 1));
+  const n = $("z-read-n");
+  n.textContent = "";
+  n.append(String(pl.z + 1));
+  const of = document.createElement("span");
+  of.textContent = " / " + info.Z;
+  n.append(of);
+  const um = $("z-read-um");
+  if (Number(info.zStepUm) > 0) {
+    const d = (pl.z - info.zHome) * Number(info.zStepUm);
+    um.textContent = (d < 0 ? "−" : "+") + rawValueLabel(Math.abs(d)) + " µm";
+  } else {
+    um.textContent = "";
+  }
+}
+
+/* time line: ticks at the real frame times, hour labels, a playhead */
+
+function timeSpanMs() {
+  const times = state.info.plate.timesMs || [];
+  return times.length ? Math.max(0, times[times.length - 1] - times[0]) : 0;
+}
+
+function timePct(t) {
+  const times = state.info.plate.timesMs || [];
+  const span = timeSpanMs();
+  if (!span || !times.length) return 0;
+  return ((times[t] - times[0]) / span) * 100;
+}
+
+function buildTimeLine() {
+  const pl = state.plate;
+  const info = state.info.plate;
+  const ticks = $("t-ticks");
+  pl.tickEls = [];
+  for (let i = 0; i < info.T; i++) {
+    const tick = document.createElement("div");
+    tick.className = "ttick";
+    tick.style.left = timePct(i) + "%";
+    ticks.append(tick);
+    pl.tickEls.push(tick);
+  }
+  // hour labels: every 6 h on a long run, every 30 min on a short one
+  const spanMin = timeSpanMs() / 60000;
+  if (spanMin > 0) {
+    const stepMin = spanMin > 120 ? 360 : 30;
+    for (let m = 0; m <= spanMin + 1e-6; m += stepMin) {
+      const lab = document.createElement("div");
+      const last = m + stepMin > spanMin;
+      lab.className = "tlabel" + (m === 0 ? " first" : last ? " last" : "");
+      lab.style.left = (m / spanMin) * 100 + "%";
+      lab.textContent = fmtTickLabel(m);
+      ticks.append(lab);
+    }
+  }
+  const track = $("t-track");
+  const tFromX = (x) => {
+    const r = track.getBoundingClientRect();
+    if (!r.width) return;
+    const times = info.timesMs || [];
+    const target = times[0] + clamp((x - r.left) / r.width, 0, 1) * timeSpanMs();
+    let best = 0;
+    for (let i = 1; i < info.T; i++) {
+      if (Math.abs(times[i] - target) < Math.abs(times[best] - target)) best = i;
+    }
+    setPlateT(best);
+  };
+  let drag = false;
+  track.addEventListener("pointerdown", (ev) => {
+    drag = true;
+    try { track.setPointerCapture(ev.pointerId); } catch (_) { /* optional */ }
+    tFromX(ev.clientX);
+    ev.preventDefault();
+  });
+  track.addEventListener("pointermove", (ev) => { if (drag) tFromX(ev.clientX); });
+  track.addEventListener("pointerup", () => { drag = false; });
+  track.addEventListener("pointercancel", () => { drag = false; });
+
+  $("t-first").onclick = () => setPlateT(0);
+  $("t-last").onclick = () => setPlateT(info.T - 1);
+  $("t-prev").onclick = () => setPlateT(pl.t - 1);
+  $("t-next").onclick = () => setPlateT(pl.t + 1);
+  $("t-play").onclick = () => setPlatePlaying(!pl.playing);
+  const speed = $("t-speed");
+  speed.querySelectorAll("button").forEach((b) => {
+    b.onclick = () => {
+      speed.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      pl.fps = Number(b.dataset.fps) || 8;
+      if (pl.playing) setPlatePlaying(true);
+    };
+  });
+}
+
+function pollPlateStatus() {
+  // the store beside the file fills in the background; a tick is solid
+  // once every frame of that time point is in, so the line shows how
+  // much of the series is ready to scrub without touching the ND2
+  const pl = state.plate;
+  if (!pl || pl.statusTimer) return;
+  const ask = () => {
+    fetch("api/plate/status", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+      .then((d) => {
+        pl.storePerT = Array.isArray(d.perT) ? d.perT : null;
+        pl.storeDone = Number(d.done) || 0;
+        pl.storeTotal = Number(d.total) || 0;
+        renderTimeLine();
+        if (pl.storeTotal && pl.storeDone >= pl.storeTotal) {
+          clearInterval(pl.statusTimer);
+          pl.statusTimer = null;
+        }
+      })
+      .catch(() => {});
+  };
+  ask();
+  pl.statusTimer = setInterval(ask, 2000);
+  window.addEventListener("pagehide", () => { clearInterval(pl.statusTimer); pl.statusTimer = null; }, { once: true });
+}
+
+function renderTimeLine() {
+  const pl = state.plate;
+  const info = state.info.plate;
+  const times = info.timesMs || [];
+  const perFrame = (info.P || 1) * (info.Z || 1);
+  pl.tickEls.forEach((tick, i) => {
+    tick.classList.toggle("on", i === pl.t);
+    const seen = pl.loaded.get(i + "/" + pl.z);
+    const stored = pl.storePerT && pl.storePerT[i] >= perFrame;
+    tick.classList.toggle("loaded", stored || !!(seen && seen.size >= info.P));
+  });
+  $("t-playhead").style.left = timePct(pl.t) + "%";
+  $("t-read-clock").textContent = fmtClock(times.length ? times[pl.t] - times[0] : 0);
+  const period = platePeriodMs();
+  $("t-read-frame").textContent = "frame " + (pl.t + 1) + " / " + info.T +
+    (period ? " · every " + fmtPeriod(period) : "");
+  $("t-prev").disabled = pl.t === 0;
+  $("t-first").disabled = pl.t === 0;
+  $("t-next").disabled = pl.t >= info.T - 1;
+  $("t-last").disabled = pl.t >= info.T - 1;
+}
+
+function wirePlateKeys() {
+  // arrows step z and t, space plays, digits open a site. Capture phase so
+  // OpenSeadragon's own arrow panning never sees the keys; text fields, the
+  // command keys, alignment and a linked compare (whose arrows nudge) keep
+  // their meaning.
+  window.addEventListener("keydown", (ev) => {
+    const pl = state.plate;
+    if (!pl) return;
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    if (state.landmark.active) return;
+    const compare = state.viewportRelay.compare;
+    if (compare && compare.enabled && compare.linked) return;
+    let handled = true;
+    if (ev.key === "ArrowUp") setPlateZ(pl.z + 1);
+    else if (ev.key === "ArrowDown") setPlateZ(pl.z - 1);
+    else if (ev.key === "ArrowLeft") setPlateT(pl.t - 1);
+    else if (ev.key === "ArrowRight") setPlateT(pl.t + 1);
+    else if (ev.key === " ") {
+      // a focused transport button would fire its own click on the keyup
+      // and undo the toggle, so the key takes the focus away first
+      if (ev.target && ev.target !== document.body && typeof ev.target.blur === "function") {
+        ev.target.blur();
+      }
+      if (!ev.repeat) setPlatePlaying(!pl.playing);
+    }
+    else if (/^[1-9]$/.test(ev.key) && !ev.shiftKey) {
+      const site = pl.placed[Number(ev.key) - 1];
+      if (site) setPlateFocus(site.i);
+      else handled = false;
+    } else handled = false;
+    if (handled) {
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+  }, true);
+}
+
 /* ---- keys / misc ---------------------------------------------------------- */
 
 function wireDragForward() {
@@ -3140,6 +3872,7 @@ function wireKeys() {
     else if (ev.key === "Escape") {
       if (!$("ann-editor").hidden) closeEditor(false);
       else if (state.tool) setTool(state.tool); // toggles off
+      else if (state.plate && state.plate.focus !== null) setPlateFocus(null);
     } else if (ev.key === "0") state.viewer.viewport.goHome();
   });
 }

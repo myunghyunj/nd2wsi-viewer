@@ -58,6 +58,35 @@
     <svg id="ann-layer" xmlns="http://www.w3.org/2000/svg"></svg>
     <div id="rubber"></div>
 
+    <div id="plate-stage">
+      <div id="plate">
+        <div id="plate-grid" role="grid" aria-label="Sites in stage arrangement"></div>
+        <div id="plate-strip" aria-label="Other sites"></div>
+        <button type="button" id="plate-back" title="Back to all sites (Esc)">‹ All sites</button>
+      </div>
+      <div id="z-rail" aria-label="Z plane">
+        <div class="rail-eyebrow">z</div>
+        <div id="z-track">
+          <div class="line"></div>
+          <div id="z-ticks"></div>
+          <div id="z-knob" role="slider" aria-label="Z plane" tabindex="0"></div>
+        </div>
+        <div id="z-read"><b id="z-read-n"></b><span class="um" id="z-read-um"></span></div>
+      </div>
+      <div id="time-line" aria-label="Time">
+        <div class="transport">
+          <button type="button" id="t-first" title="First frame"><svg viewBox="0 0 16 16"><path d="M3 3h2v10H3zM13 3v10L6 8z"/></svg></button>
+          <button type="button" id="t-prev" title="Previous frame (←)"><svg viewBox="0 0 16 16"><path d="M11 3v10L4 8z"/></svg></button>
+          <button type="button" id="t-play" class="play" title="Play (space)"><svg viewBox="0 0 16 16"><path d="M4 2.5v11L13 8z"/></svg></button>
+          <button type="button" id="t-next" title="Next frame (→)"><svg viewBox="0 0 16 16"><path d="M5 3v10l7-5z"/></svg></button>
+          <button type="button" id="t-last" title="Last frame"><svg viewBox="0 0 16 16"><path d="M11 3h2v10h-2zM3 3v10l7-5z"/></svg></button>
+          <div id="t-read"><b id="t-read-clock"></b><span id="t-read-frame"></span></div>
+        </div>
+        <div id="t-track"><div class="line"></div><div id="t-ticks"></div><div id="t-playhead"></div></div>
+        <div class="speed" id="t-speed"><span>fps</span><button type="button" data-fps="4">4</button><button type="button" data-fps="8" class="on">8</button><button type="button" data-fps="16">16</button></div>
+      </div>
+    </div>
+
     <div id="ann-editor" hidden>
       <textarea id="ann-text" rows="2" placeholder="Annotation…"></textarea>
       <div class="ed-row">

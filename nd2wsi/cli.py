@@ -312,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "view":
         from .convert import convert, default_store_path, ensure_cache, existing_cache_store
+        from .plate import is_plate_file
         from .server import serve
         from .svs import is_svs
 
@@ -326,6 +327,10 @@ def main(argv: list[str] | None = None) -> int:
                 # checked, atomically built, straight from the file for SVS
                 if is_svs(slide) and existing_cache_store(slide) is None:
                     print(f"{Path(slide).name}: serving straight from the file")
+                    stores.append(Path(slide))
+                elif is_plate_file(slide):
+                    # a time series of sites has no pyramid to build
+                    print(f"{Path(slide).name}: time series of sites, served from the file")
                     stores.append(Path(slide))
                 else:
                     stores.append(ensure_cache(slide, selection=_selection(args)))

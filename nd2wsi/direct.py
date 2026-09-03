@@ -151,7 +151,11 @@ class _TileCache:
     def purge(self, owner: str) -> None:
         """Drop every tile whose tag names this owner (a closed slide)."""
         with self._lock:
-            for key in [k for k in self._d if k[0][0] == owner]:
+            for key in [
+                k
+                for k in self._d
+                if k[0] == owner or (isinstance(k[0], tuple) and k[0][0] == owner)
+            ]:
                 self.used -= self._d.pop(key).nbytes
 
 

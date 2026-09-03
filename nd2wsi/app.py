@@ -125,10 +125,15 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     store is built on first open, next to the slide.
     """
     from .convert import ensure_cache, existing_cache_store
+    from .plate import is_plate_file
     from .svs import is_svs
 
     if is_svs(nd2_path) and existing_cache_store(nd2_path) is None:
         return nd2_path  # the registry serves it straight from the file
+    if nd2_path.suffix.lower() == ".nd2" and is_plate_file(nd2_path):
+        if on_status:
+            on_status(f"opening {nd2_path.name} … (plate)")
+        return nd2_path  # camera fields over time are served from the file
     if on_status:
         on_status(f"opening {nd2_path.name} …")
     return ensure_cache(nd2_path, on_progress=on_progress)

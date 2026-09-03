@@ -19,6 +19,8 @@ GET  /s/<sid>/api/pixel         one raw sample at displayed-base x/y
 GET  /s/<sid>/api/associated/<thumbnail|label|macro>.jpg
 GET  /s/<sid>/api/histogram     per-channel LUT histograms
 GET  /s/<sid>/api/tile/<L>/<x>/<y>.jpg?c=0,1&win=…
+GET  /s/<sid>/api/plate/frame/<t>/<p>/<z>.jpg?k=8&c=&win=   reduced frame of one site
+GET  /s/<sid>/api/plate/status  how much of the thumbnail store is filled
 GET  /s/<sid>/api/roi?level=&x=&y=&w=&h=&format=nd2|tiff|png|jpg&c=&win=
 GET/POST /s/<sid>/api/annotations   sidecar annotations
 """
@@ -44,6 +46,7 @@ from .direct import _Lifecycle
 
 STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
+PLATE_FRAME_RE = re.compile(r"^/api/plate/frame/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
 ASSOCIATED_RE = re.compile(
     r"^/api/associated/(thumbnail|label|macro)\.jpg$"
 )
@@ -115,9 +118,11 @@ class ViewerState:
         store_path: Path | None = None,
         container_path: Path | None = None,
         manifest: dict[str, Any] | None = None,
+        plate: Any = None,
     ):
         self.root = root
         self.attrs = attrs
+        self.plate = plate  # a PlateSource when the slide is a time series of sites
         self.max_render_mpx = max_render_mpx
         self.histograms: list | None = None  # computed lazily, once
         self.annotations_path = annotations_path
@@ -283,7 +288,38 @@ def _associated_names(st: ViewerState) -> list[str]:
         return []
 
 
-def _pixel_payload(st: ViewerState, x: float, y: float) -> dict[str, Any]:
+def _frame_args(st: ViewerState, q: dict) -> tuple[int, int, int] | None:
+    """The (t, p, z) a plate request names, or None for an ordinary slide.
+
+    Missing values fall back to t 0, site 0 and the home z plane. Raises
+    ``ValueError`` when a value is not an integer or lies out of range.
+    """
+    plate = st.plate
+    if plate is None:
+        return None
+
+    def qi(name: str, default: int, size: int) -> int:
+        raw = (q.get(name) or [None])[0]
+        if raw is None or raw == "":
+            return default
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be an integer") from None
+        if not 0 <= v < size:
+            raise ValueError(f"{name}={v} out of range (0..{size - 1})")
+        return v
+
+    return (
+        qi("t", 0, plate.T),
+        qi("p", 0, plate.P),
+        qi("z", plate.z_home, plate.Z),
+    )
+
+
+def _pixel_payload(
+    st: ViewerState, x: float, y: float, root: Any = None
+) -> dict[str, Any]:
     """Read one raw sample at the displayed base level.
 
     A degraded overview advertises stored path ``1`` as its first/displayed
@@ -295,7 +331,9 @@ def _pixel_payload(st: ViewerState, x: float, y: float) -> dict[str, Any]:
     width, height = int(level["width"]), int(level["height"])
     xi = max(0, min(int(x), width - 1))
     yi = max(0, min(int(y), height - 1))
-    region = render._read_region(st.root, str(level["path"]), xi, yi, 1, 1)
+    if root is None:
+        root = st.root
+    region = render._read_region(root, str(level["path"]), xi, yi, 1, 1)
     if region.shape[1:] != (1, 1):
         raise ValueError("pixel is outside the displayed image")
 
@@ -533,6 +571,22 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
     return new
 
 
+def plate_annotations_sidecar(path: str | Path, attrs: dict[str, Any], p: int) -> Path:
+    """The sidecar for one site of a plate file, beside the slide.
+
+    Annotations on a plate are per site and shared across time and z, so
+    the site index is the only scope in the name.
+    """
+    from .cache import ANNOTATIONS_DIR, MANAGED_DIR
+
+    path = Path(path).resolve()
+    source_name = Path(attrs["nd2wsi"]["source"]).name or path.name
+    safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", source_name)
+    target_dir = path.parent / MANAGED_DIR / ANNOTATIONS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir / f"annotations_{safe_source}--site{int(p)}.json"
+
+
 class SlideRegistry:
     """The set of slides this server has open, keyed by a stable short id."""
 
@@ -560,6 +614,15 @@ class SlideRegistry:
         registered_source = (
             Path(source_path).expanduser().resolve() if source_path is not None else None
         )
+        if store_path.suffix.lower() == ".nd2" and store_path.is_file():
+            from .plate import is_plate_file
+
+            if is_plate_file(store_path):
+                return self.add_plate(store_path)
+            raise ValueError(
+                f"{store_path.name} is not a time series of sites; open it "
+                "through open_path so its pyramid store is built first"
+            )
         if trash_path is not None:
             trash_path = Path(trash_path).resolve()
         elif store_path.parent.name.endswith(CACHE_SUFFIX):
@@ -775,6 +838,51 @@ class SlideRegistry:
         _close_state(stale)
         return sid
 
+    def add_plate(self, slide_path: str | Path) -> str:
+        """Serve a time series of sites straight from the ND2, writing nothing."""
+        from .cache import quick_fingerprint
+        from .direct import _Root
+        from .plate import PlateSource
+
+        slide_path = Path(slide_path).resolve()
+        sid = self.sid_for(slide_path)
+        stale = None
+        with self._lock:
+            fingerprint = quick_fingerprint(slide_path)
+            gen = (
+                f"{int(fingerprint['mtime_ns']):x}-"
+                f"{str(fingerprint['quick_sha256'])[:16]}"
+            )
+            st = self.slides.get(sid)
+            if st is not None and st.generation == gen and st.plate is not None:
+                return sid
+            source = PlateSource(slide_path)
+            try:
+                root = _Root(
+                    source.root_for(0, 0, source.z_home), closer=source.close
+                )
+                annotations = plate_annotations_sidecar(slide_path, source.attrs, 0)
+            except BaseException:
+                source.close()
+                raise
+            stale = self.slides.get(sid)
+            container = source.store.container if source.store is not None else None
+            st = ViewerState(
+                root,
+                source.attrs,
+                max_render_mpx=self.max_render_mpx,
+                annotations_path=annotations,
+                generation=gen,
+                trash_path=container,
+                source_path=slide_path,
+                container_path=container,
+                manifest={"source": fingerprint},
+                plate=source,
+            )
+            self.slides[sid] = st
+        _close_state(stale)
+        return sid
+
     def open_path(self, path: str | Path, on_progress=None) -> str:
         """A slide file (converted on first open) or an existing store."""
         from .convert import ensure_cache, existing_cache_store
@@ -788,6 +896,12 @@ class SlideRegistry:
                     return self.add_direct(path)
                 except NotImplementedError:
                     pass  # untiled or off-ladder file: build a store instead
+            if path.suffix.lower() == ".nd2":
+                from .plate import is_plate_file
+
+                if is_plate_file(path):
+                    # camera fields over time: no pyramid to build, ever
+                    return self.add_plate(path)
             store = ensure_cache(path, on_progress=on_progress)
         elif path.is_dir():  # a user-supplied *.ome.zarr store
             return self.add_store(path)
@@ -1110,15 +1224,22 @@ def make_handler(
                 if sub == "/api/pixel":
                     return self._pixel(st, q)
                 if sub == "/api/histogram":
-                    return self._histogram(st)
+                    return self._histogram(st, q)
                 if sub == "/api/annotations":
-                    return self._annotations_get(st)
+                    return self._annotations_get(st, q)
                 associated = ASSOCIATED_RE.match(sub)
                 if associated:
                     return self._associated(st, associated.group(1))
                 m = TILE_RE.match(sub)
                 if m:
                     return self._tile(st, m, q)
+                m = PLATE_FRAME_RE.match(sub)
+                if m:
+                    return self._plate_frame(st, m, q)
+                if sub == "/api/plate/status":
+                    if st.plate is None:
+                        return self._error(404, "not a plate slide")
+                    return self._json(st.plate.status())
                 if sub == "/api/roi":
                     return self._roi(st, q)
                 return self._error(404, f"no route for {path}")
@@ -1132,9 +1253,11 @@ def make_handler(
 
         def do_POST(self):  # noqa: N802 (http.server API)
             try:
+                parsed = urllib.parse.urlparse(self.path)
                 path = self._gate()
                 if path is None:
                     return
+                q = urllib.parse.parse_qs(parsed.query)
                 ctype = (self.headers.get("Content-Type") or "").split(";")[0]
                 if ctype.strip().lower() != "application/json":
                     return self._error(415, "expected application/json")
@@ -1146,7 +1269,7 @@ def make_handler(
                     return self._trash()
                 st, sub = self._resolve(path)
                 if st is not None and sub == "/api/annotations":
-                    return self._annotations_post(st)
+                    return self._annotations_post(st, q)
                 if st is not None and sub == "/api/reveal":
                     return self._reveal(st)
                 return self._error(404, f"no POST route for {path}")
@@ -1279,6 +1402,21 @@ def make_handler(
                 "trashable": st.trash_path is not None,
                 "generation": st.generation,
                 "storage": _storage_mode(meta),
+                "kind": "plate" if meta.get("plate") else "slide",
+                "plate": self._plate_block(st),
+            }
+
+        def _plate_block(self, st: ViewerState) -> dict[str, Any] | None:
+            meta = st.attrs["nd2wsi"]
+            block = meta.get("plate")
+            if not block or st.plate is None:
+                return block
+            status = st.plate.status()
+            return {
+                **block,
+                "thumbsDone": status["done"],
+                "thumbsTotal": status["total"],
+                "cachePath": status["path"],
             }
 
         def _info(self, st: ViewerState):
@@ -1327,7 +1465,9 @@ def make_handler(
                 x, y = float(x_raw), float(y_raw)
                 if not math.isfinite(x) or not math.isfinite(y):
                     raise ValueError("x and y must be finite numbers")
-                payload = _pixel_payload(st, x, y)
+                frame = _frame_args(st, q)
+                root = st.plate.root_for(*frame) if frame is not None else None
+                payload = _pixel_payload(st, x, y, root=root)
             except (TypeError, ValueError) as e:
                 return self._error(400, str(e))
             self._json(payload)
@@ -1372,8 +1512,26 @@ def make_handler(
                 return self._error(500, f"could not reveal {which}: {e}")
             self._json({"ok": True, "which": which})
 
-        def _annotations_get(self, st: ViewerState):
-            p = st.annotations_path
+        def _plate_site(self, st: ViewerState, q: dict) -> tuple[Path | None, int | None]:
+            """(sidecar path, site index) for the annotations routes."""
+            if st.plate is None:
+                return st.annotations_path, None
+            raw = (q.get("p") or ["0"])[0]
+            try:
+                p = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError("p must be an integer") from None
+            if not 0 <= p < st.plate.P:
+                raise ValueError(f"p={p} out of range (0..{st.plate.P - 1})")
+            if st.source_path is None:
+                return None, p
+            return plate_annotations_sidecar(st.source_path, st.attrs, p), p
+
+        def _annotations_get(self, st: ViewerState, q: dict | None = None):
+            try:
+                p, _site = self._plate_site(st, q or {})
+            except ValueError as e:
+                return self._error(400, str(e))
             if p is None:
                 return self._json({"items": [], "path": None})
             if p.exists():
@@ -1386,10 +1544,13 @@ def make_handler(
                 items = []
             self._json({"items": items, "path": str(p)})
 
-        def _annotations_post(self, st: ViewerState):
+        def _annotations_post(self, st: ViewerState, q: dict | None = None):
             import uuid as _uuid
 
-            p = st.annotations_path
+            try:
+                p, site = self._plate_site(st, q or {})
+            except ValueError as e:
+                return self._error(400, str(e))
             if p is None:
                 return self._error(400, "no annotation sidecar path for this store")
             try:
@@ -1422,6 +1583,10 @@ def make_handler(
                 "selection": meta.get("selection", {}),
                 "items": data["items"],
             }
+            if site is not None:
+                payload["selection"] = {"p": site}
+                sites = (meta.get("plate") or {}).get("sites") or []
+                payload["site"] = sites[site]["name"] if site < len(sites) else None
             # unique temp + per-slide lock: two tabs saving at once cannot
             # interleave through one shared temp name
             with st.lock:
@@ -1430,11 +1595,28 @@ def make_handler(
                 tmp.replace(p)  # atomic
             self._json({"ok": True, "path": str(p), "count": len(data["items"])})
 
-        def _histogram(self, st: ViewerState):
+        def _histogram(self, st: ViewerState, q: dict | None = None):
+            if st.plate is not None:
+                try:
+                    t, p, z = _frame_args(st, q or {})
+                except ValueError as e:
+                    return self._error(400, str(e))
+                return self._json({"channels": st.plate.histogram(t, p, z)})
             with st.lock:
                 if st.histograms is None:
                     st.histograms = render.compute_histograms(st.root, st.attrs)
             self._json({"channels": st.histograms})
+
+        def _immutable_when_current(self, st: ViewerState, q: dict) -> str:
+            # a URL that names the cache generation can be cached hard: a
+            # rebuild mints a new generation, hence new URLs, so a stale
+            # render can never be revived from the browser cache
+            gen = (q.get("g") or [None])[0]
+            return (
+                "private, max-age=31536000, immutable"
+                if gen and gen == st.generation
+                else "no-store"
+            )
 
         def _tile(self, st: ViewerState, m: re.Match, q: dict):
             level, tx, ty = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -1443,22 +1625,50 @@ def make_handler(
             channels = render.parse_channels((q.get("c") or [None])[0], n)
             win = (q.get("win") or [None])[0]
             try:
+                frame = _frame_args(st, q)
+            except ValueError as e:
+                return self._error(400, str(e))
+            root = st.plate.root_for(*frame) if frame is not None else st.root
+            try:
                 body = render.render_tile(
-                    st.root, st.attrs, level, tx, ty, channels, fmt, win
+                    root, st.attrs, level, tx, ty, channels, fmt, win
                 )
             except KeyError as e:
                 return self._error(404, str(e))
             ctype = "image/jpeg" if fmt in ("jpg", "jpeg") else "image/png"
-            # a URL that names the cache generation can be cached hard: a
-            # rebuild mints a new generation, hence new URLs, so a stale
-            # render can never be revived from the browser cache
-            gen = (q.get("g") or [None])[0]
-            cache = (
-                "private, max-age=31536000, immutable"
-                if gen and gen == st.generation
-                else "no-store"
-            )
-            self._send(200, body, ctype, cache=cache)
+            self._send(200, body, ctype, cache=self._immutable_when_current(st, q))
+
+        def _plate_frame(self, st: ViewerState, m: re.Match, q: dict):
+            """A reduced frame of one site for the grid."""
+            plate = st.plate
+            if plate is None:
+                return self._error(404, "not a plate slide")
+            t, p, z = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            fmt = m.group(4)
+            if not (t < plate.T and p < plate.P and z < plate.Z):
+                return self._error(404, "frame out of range")
+            raw_k = (q.get("k") or ["8"])[0]
+            try:
+                k = int(raw_k)
+            except (TypeError, ValueError):
+                k = -1
+            if k not in (2, 4, 8, 16):
+                return self._error(400, "k must be 2, 4, 8 or 16")
+            n = len(st.attrs["omero"]["channels"])
+            channels = render.parse_channels((q.get("c") or [None])[0], n)
+            win = (q.get("win") or [None])[0]
+            try:
+                body = plate.render_frame(t, p, z, k, channels, fmt, win)
+            except ValueError as e:
+                if "closed" in str(e):
+                    return self._error(409, "slide was closed")
+                return self._error(400, str(e))
+            ctype = "image/jpeg" if fmt in ("jpg", "jpeg") else "image/png"
+            self._send(200, body, ctype, cache=self._immutable_when_current(st, q))
+            try:
+                plate.prefetch(t, z, k)
+            except Exception:  # pragma: no cover - prefetch never reaches a client
+                pass
 
         def _roi(self, st: ViewerState, q: dict):
             try:
@@ -1499,6 +1709,14 @@ def make_handler(
             if job and not JOB_RE.match(job):
                 job = None
             stem = Path(meta["source"]).stem
+            try:
+                frame = _frame_args(st, q)
+            except ValueError as e:
+                return self._error(400, str(e))
+            root = st.root
+            if frame is not None:
+                root = st.plate.root_for(*frame)
+                stem += "_t{}_p{}_z{}".format(*frame)
             fname = f"{stem}_L{level}_x{x}_y{y}_{w}x{h}"
 
             if fmt in ("nd2", "tif", "tiff"):
@@ -1520,7 +1738,7 @@ def make_handler(
 
                         try:
                             export_roi_nd2(
-                                st.root, st.attrs, tmp.name,
+                                root, st.attrs, tmp.name,
                                 level, x, y, w, h, channels,
                                 on_progress=on_progress,
                             )
@@ -1529,7 +1747,7 @@ def make_handler(
                             return self._error(400, str(e))
                     else:
                         render.export_roi_tiff(
-                            st.root, st.attrs, tmp.name,
+                            root, st.attrs, tmp.name,
                             level, x, y, w, h, channels,
                             on_progress=on_progress,
                         )
@@ -1568,7 +1786,7 @@ def make_handler(
                         "(streams any size) or a higher level",
                     )
                 body = render.export_roi_rendered(
-                    st.root, st.attrs, level, x, y, w, h, channels, fmt, win
+                    root, st.attrs, level, x, y, w, h, channels, fmt, win
                 )
                 ext = "png" if fmt == "png" else "jpg"
                 ctype = "image/png" if fmt == "png" else "image/jpeg"

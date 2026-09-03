@@ -32,6 +32,7 @@ Nothing leaves your computer. There is no upload and no account.
 ## What you get
 
 - Opens stitched Nikon `.nd2` scans and Aperio `.svs` slides, several at once in tabs.
+- Plays a time series of a plate, with every site at any z plane and any time, straight from the ND2.
 - Moves from the whole slide to single cells without stutter.
 - Shows each fluorescence channel in its own color, with brightness range, gamma, and an on/off switch.
 - Reads the raw pixel values under your cursor.
@@ -75,6 +76,18 @@ Move the cursor over the slide and the status bar shows the raw value of every c
 Press `⌘I` for Slide Info. It lists the pixel size and where it came from, the objective, the size of the scan, and the space the reduced copies take on disk. For an SVS it also shows the label and the macro photo stored inside the file.
 
 The window has no title bar of its own, so the tab strip and the toolbar take its place. Double-click either one to zoom the window, as you would a title bar, and double-click again to bring it back. The gesture follows the title bar setting in System Settings under Desktop & Dock.
+
+The mark at the left of the toolbar names the kind of file in two words. 2D or 3D says whether the file holds a z stack, and SLIDE or PLATE says whether it holds one scan position or several. A stitched scan reads 2D SLIDE and the phage assay reads 3D PLATE.
+
+### Time series of a plate
+
+Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, and there is nothing to stitch. The viewer opens such a file in plate mode. It reads every frame straight from the ND2 and writes no cache on disk.
+
+The sites appear as squares in their arrangement on the stage, with the name of each site in a pill and a key number in the corner. The rail on the right is the z plane, with the home plane marked and the distance from home in micrometers. The line along the bottom is time, with one tick per frame at the minute it was taken and a playhead. Turn the mouse wheel over the sites to change the z plane and hold Shift to scrub time. The transport buttons step through the frames or play them at 4, 8, or 16 frames per second.
+
+Click a site, or press its number, to fill the stage with it. This is the same deep zoom as a slide, so the ruler, pins, boxes, pixel values, and region export all work on the frame. The other sites wait in a strip on the left, and the arrow keys change the z plane and the time while the view stays where it is. Press Esc or the All sites button to return to the grid.
+
+Marks are kept per site in a small file beside the ND2 and are shared across time and z planes. Slide Info lists the sites and their arrangement, the z planes with their step and home, the length of the series and the interval between frames, and the exposure.
 
 ## Measuring and marking
 
@@ -154,7 +167,11 @@ The trash-can button removes the reduced copies of the slide in front. The scan 
 | `L` | pause or resume the link |
 | `←` `→` `↑` `↓` | nudge the linked slide by a pixel, ten with Shift |
 | `⌥` drag | move one linked pane alone |
-| `Esc` | cancel the active tool |
+| `↑` `↓` | z plane of a plate |
+| `←` `→` | time frame of a plate |
+| `Space` | play or pause a plate |
+| `1` to `9` | open a site of a plate |
+| `Esc` | cancel the active tool, or return to all sites |
 
 ## Questions and requests
 
@@ -193,7 +210,7 @@ nd2wsi tidy FOLDER [FOLDER ...]
 
 ### How it works
 
-An eligible ND2, meaning a modern uncompressed file with one stored T/P/Z plane, gets a compact cache that holds only the reduced levels, while level 0 is the ND2 itself read through its memory map. Compressed and legacy files fall back to a full pyramid. A tiled SVS is served from its own embedded pyramid. A small server on loopback, behind a random capability URL, hands tiles to OpenSeadragon. Regions are read from the raw tiles for TIFF and ND2 export and rendered for PNG and JPEG.
+An eligible ND2, meaning a modern uncompressed file with one stored T/P/Z plane, gets a compact cache that holds only the reduced levels, while level 0 is the ND2 itself read through its memory map. Compressed and legacy files fall back to a full pyramid. A tiled SVS is served from its own embedded pyramid. An ND2 of camera fields over time, sites, or z planes opens in plate mode, where every frame and its reduced copies are read from the memory map on demand and nothing is written to disk. A small server on loopback, behind a random capability URL, hands tiles to OpenSeadragon. Regions are read from the raw tiles for TIFF and ND2 export and rendered for PNG and JPEG.
 
 Rebuilding a working set of 39 scans totalling 190 GB measured the trade. Full pyramids took 152 GB, compact caches 36 GB, and a cold 512 px native window from the largest scan read in 170 ms.
 
