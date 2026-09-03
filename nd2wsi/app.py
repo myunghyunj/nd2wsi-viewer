@@ -142,6 +142,8 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
 _PENDING_OPENS: list = []
 _OPENS_LOCK = threading.Lock()
 _FLUSHER_ALIVE = False
+_LAUNCH_PATH: str | None = None  # the file given at launch, resolved
+_LAUNCH_AT = 0.0
 
 
 def _dispatch_open(paths):
@@ -153,6 +155,18 @@ def _dispatch_open(paths):
     to the page when __pydrop_multi is ready.
     """
     global _FLUSHER_ALIVE
+    import time
+
+    # a launch from a terminal hands the process its own arguments as open
+    # events too, so the file opening right now would open twice at once;
+    # the launch file is dropped while the app is still starting up
+    if _LAUNCH_PATH and time.time() - _LAUNCH_AT < 15:
+        def _same(raw):
+            try:
+                return str(Path(raw).expanduser().resolve()) == _LAUNCH_PATH
+            except OSError:
+                return False
+        paths = [p for p in paths if not _same(p)]
     if not paths:
         return
     with _OPENS_LOCK:
@@ -557,12 +571,14 @@ class Api:
             try:
                 self._frac = 0.0  # bar up while the file opens, before ticks
                 store = open_or_convert(p, on_status=note, on_progress=frac)
-                self._frac = -1.0
+                # a plate file skips conversion; the bar stays up while the
+                # registry opens it, which reads a few frames for its window
                 if self._httpd is None:
                     self._httpd, url = start_server(store)
                 else:
                     self._httpd.registry.add_store(store)
                     url = _server_url(self._httpd)
+                self._frac = -1.0
             except Exception as e:
                 self._frac = -1.0
                 self._status = f"could not open {p.name}: {e}"
@@ -580,13 +596,13 @@ class Api:
 
             self._frac = 0.0  # bar up while the file opens, before ticks
             store = open_or_convert(path, on_status=note, on_progress=frac)
-            self._frac = -1.0
             self._status = "starting viewer …"
             if self._httpd is None:
                 self._httpd, url = start_server(store)
             else:
                 self._httpd.registry.add_store(store)
                 url = _server_url(self._httpd)
+            self._frac = -1.0
             return url  # the tab shell at / lists every open slide
         except Exception as e:  # surfaced in the bootstrap page
             self._frac = -1.0
@@ -667,7 +683,13 @@ def main(argv: list[str] | None = None) -> int:
 
 def create_app_window(initial: Path | None):
     """The app window and its bridge, ready for ``webview.start``."""
+    import time
+
     import webview
+
+    global _LAUNCH_PATH, _LAUNCH_AT
+    _LAUNCH_PATH = str(Path(initial).expanduser().resolve()) if initial else None
+    _LAUNCH_AT = time.time()
 
     try:
         webview.settings["ALLOW_DOWNLOADS"] = True  # ROI exports save natively

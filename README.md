@@ -81,13 +81,17 @@ The mark at the left of the toolbar names the kind of file in two words. 2D or 3
 
 ### Time series of a plate
 
-Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, and there is nothing to stitch. The viewer opens such a file in plate mode. It reads every frame straight from the ND2 and writes no cache on disk.
+![Six sites of a phage assay in plate mode](docs/plate-mode.png)
 
-The sites appear as squares in their arrangement on the stage, with the name of each site in a pill and a key number in the corner. The rail on the right is the z plane, with the home plane marked and the distance from home in micrometers. The line along the bottom is time, with one tick per frame at the minute it was taken and a playhead. Turn the mouse wheel over the sites to change the z plane and hold Shift to scrub time. The transport buttons step through the frames or play them at 4, 8, or 16 frames per second.
+Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, and there is nothing to stitch. The viewer opens such a file in plate mode and reads every frame straight from the ND2. The only thing it writes is a small store of reduced frames beside the file, about two percent of the ND2, which fills in the background so the series becomes instant to scrub. The status bar counts it up while it fills, and the trash button removes it.
 
-Click a site, or press its number, to fill the stage with it. This is the same deep zoom as a slide, so the ruler, pins, boxes, pixel values, and region export all work on the frame. The other sites wait in a strip on the left, and the arrow keys change the z plane and the time while the view stays where it is. Press Esc or the All sites button to return to the grid.
+![Scrubbing time and stepping through z planes](docs/plate-time-z.gif)
 
-Marks are kept per site in a small file beside the ND2 and are shared across time and z planes. Slide Info lists the sites and their arrangement, the z planes with their step and home, the length of the series and the interval between frames, and the exposure.
+The sites sit in a grid with the name of each site in a capsule. When the names follow the lab's pattern, such as `10(5)_MOI`, the grid gets row and column headers, conditions as rows and dilutions as columns. The button above the slider swaps rows and columns, which puts the sites back in their arrangement on the stage, and the choice is remembered. The slider on the right is the z plane, with the home plane marked and the distance from home in micrometers beside the knob. The capsule under the grid is time. It holds the transport buttons, a scrubber with one tick per frame at the minute it was taken, the clock, and the speed at 4, 8, or 16 frames per second.
+
+Two gestures do most of the work. Over the grid, a vertical scroll moves through z and a horizontal swipe on the trackpad scrubs time. Click a site, or press its number, and it fills the stage as a deep zoom, where a vertical scroll zooms, a horizontal swipe still scrubs time, and Option with a vertical scroll moves through z. The arrow keys step z and time in both views, Space plays, and Esc or the All sites capsule returns to the grid.
+
+In the deep zoom the ruler, pins, boxes, pixel values, and region export all work on the frame you are looking at. Marks are kept per site in a small file beside the ND2 and are shared across time and z planes. Slide Info lists the sites and their arrangement, the z planes with their step and home, the length of the series and the interval between frames, and the exposure.
 
 ## Measuring and marking
 
@@ -161,7 +165,8 @@ The trash-can button removes the reduced copies of the slide in front. The scan 
 | `0` | fit the slide |
 | `I` | pixel values under the cursor |
 | `⌘I` | Slide Info |
-| `⌘1` `⌘2` `⌘3` | Channels, Region, and Annotate panels |
+| `⌘C` `⌘R` `⌘A` | Channels, Region, and Annotate panels |
+| `⌘1` … `⌘9` | switch to that tab |
 | `⌘⇧E` | export marks as GeoJSON |
 | `⌘\` | link slides |
 | `L` | pause or resume the link |

@@ -76,7 +76,8 @@ async function init() {
       timer: null,
       everFocused: false,
       stale: false, // the hidden viewer still shows an older frame
-      placed: [], // sites sorted by row then col; the key numbers follow this
+      placed: [], // sites sorted by row then col of the current arrangement
+      transposed: true, // conditions as rows; the button flips it, remembered
       loaded: new Map(), // "t/z" -> count of sites whose frame has arrived
     };
   }
@@ -3356,6 +3357,85 @@ function plateCellZoom() {
   return pl && pl.cellW ? pl.cellW / state.info.plate.frameW : null;
 }
 
+function fmtHm(ms) {
+  // "6:30": hours and minutes, the way a scrubber reads
+  const total = Math.max(0, Math.round(Number(ms || 0) / 60000));
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return h + ":" + String(m).padStart(2, "0");
+}
+
+function fmtPeriodWords(ms) {
+  const total = Math.max(0, Math.round(Number(ms || 0) / 60000));
+  if (total < 60) return total + " min";
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return m ? h + " h " + m + " min" : h + " h";
+}
+
+function plateArrange() {
+  // rows and columns of the grid. The stage arrangement puts dilutions in
+  // rows; transposed, the conditions become the rows, which reads better
+  // in a landscape window and is the default. The choice is remembered.
+  const pl = state.plate;
+  const info = state.info.plate;
+  const tr = pl.transposed;
+  pl.rows = Math.max(1, tr ? info.cols : info.rows);
+  pl.cols = Math.max(1, tr ? info.rows : info.cols);
+  pl.placed = (info.sites || [])
+    .map((s) => ({ ...s, row: tr ? s.col : s.row, col: tr ? s.row : s.col }))
+    .sort((a, b) => a.row - b.row || a.col - b.col);
+  pl.structured = pl.placed.length > 0 &&
+    pl.placed.every((s) => { const l = siteLabel(s.name); return l.exp && l.cond; });
+}
+
+function dilNode(l) {
+  const span = document.createElement("span");
+  span.textContent = l.dil;
+  if (l.exp) {
+    const sup = document.createElement("sup");
+    sup.textContent = l.exp;
+    span.append(sup);
+  }
+  return span;
+}
+
+function placePlate() {
+  const pl = state.plate;
+  const block = $("plate-block");
+  block.style.setProperty("--cols", pl.cols);
+  block.style.setProperty("--rows", pl.rows);
+  pl.placed.forEach((s) => {
+    const el = pl.gridEls[s.i];
+    el.style.gridRow = s.row + 1;
+    el.style.gridColumn = s.col + 1;
+  });
+  const rowHeads = $("plate-row-heads");
+  const colHeads = $("plate-col-heads");
+  rowHeads.replaceChildren();
+  colHeads.replaceChildren();
+  block.classList.toggle("headed", pl.structured);
+  if (pl.structured) {
+    for (let r = 0; r < pl.rows; r++) {
+      const s = pl.placed.find((x) => x.row === r);
+      const l = siteLabel(s ? s.name : "");
+      const head = document.createElement("span");
+      if (pl.transposed) head.textContent = l.cond; else head.append(dilNode(l));
+      rowHeads.append(head);
+    }
+    for (let c = 0; c < pl.cols; c++) {
+      const s = pl.placed.find((x) => x.col === c);
+      const l = siteLabel(s ? s.name : "");
+      const head = document.createElement("span");
+      if (pl.transposed) head.append(dilNode(l)); else head.textContent = l.cond;
+      colHeads.append(head);
+    }
+  }
+  const btn = $("plate-transpose");
+  btn.classList.toggle("on", pl.transposed);
+  btn.setAttribute("aria-pressed", String(pl.transposed));
+}
+
 function buildPlate() {
   const pl = state.plate;
   if (!pl) return;
@@ -3363,60 +3443,56 @@ function buildPlate() {
   const wrap = $("stage-wrap");
   wrap.classList.add("plate-grid");
 
-  // sites in the stage arrangement; the key numbers follow rows then cols
-  pl.placed = (info.sites || []).slice().sort((a, b) => a.row - b.row || a.col - b.col);
+  try {
+    const saved = localStorage.getItem("nd2wsi.plate.transposed");
+    pl.transposed = saved === null ? true : saved === "1";
+  } catch (_) { pl.transposed = true; }
+  plateArrange();
+
   const grid = $("plate-grid");
   const strip = $("plate-strip");
-  grid.style.setProperty("--cols", info.cols);
-  grid.style.setProperty("--rows", info.rows);
   pl.gridEls = [];
   pl.stripEls = [];
-  pl.placed.forEach((site, k) => {
-    const cell = makeSiteEl(site, k + 1);
-    cell.style.gridRow = site.row + 1;
-    cell.style.gridColumn = site.col + 1;
+  (info.sites || []).forEach((site) => {
+    const cell = makeSiteEl(site);
     grid.append(cell);
-    pl.gridEls.push(cell);
-    const small = makeSiteEl(site, k + 1);
+    pl.gridEls[site.i] = cell;
+    const small = makeSiteEl(site);
     strip.append(small);
-    pl.stripEls.push(small);
+    pl.stripEls[site.i] = small;
   });
+  placePlate();
   $("plate-back").onclick = () => setPlateFocus(null);
+  $("plate-transpose").onclick = () => {
+    pl.transposed = !pl.transposed;
+    try { localStorage.setItem("nd2wsi.plate.transposed", pl.transposed ? "1" : "0"); } catch (_) { /* private mode */ }
+    plateArrange();
+    placePlate();
+    layoutPlate();
+  };
 
-  buildZRail();
+  buildZSlider();
   buildTimeLine();
-
-  // wheel over the sites turns the focus knob; shift scrubs time
-  let wheelAcc = 0;
-  $("plate").addEventListener("wheel", (ev) => {
-    ev.preventDefault();
-    wheelAcc += ev.deltaY;
-    const step = 40;
-    if (Math.abs(wheelAcc) < step) return;
-    const n = Math.trunc(wheelAcc / step);
-    wheelAcc -= n * step;
-    if (ev.shiftKey) setPlateT(pl.t + n);
-    else setPlateZ(pl.z - n);
-  }, { passive: false });
+  wirePlateWheel();
+  wirePlateKeys();
 
   window.addEventListener("resize", layoutPlate);
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(() => layoutPlate()).observe($("plate"));
   }
-  wirePlateKeys();
   layoutPlate();
   paintPlate();
-  renderZRail();
+  renderZSlider();
   renderTimeLine();
   $("plane-note").textContent = platePlaneNote();
 }
 
-function makeSiteEl(site, key) {
+function makeSiteEl(site) {
   const el = document.createElement("button");
   el.type = "button";
-  el.className = "site";
+  el.className = "site pending";
   el.dataset.p = site.i;
-  el.title = siteLabelText(site.name) + " (" + key + ")";
+  el.title = siteLabelText(site.name);
   const img = document.createElement("img");
   img.alt = "";
   img.draggable = false;
@@ -3424,17 +3500,17 @@ function makeSiteEl(site, key) {
   const pill = document.createElement("span");
   pill.className = "pill";
   fillSitePill(pill, site.name);
-  const keyEl = document.createElement("span");
-  keyEl.className = "key";
-  keyEl.textContent = key;
-  el.append(img, pill, keyEl);
+  el.append(img, pill);
   el.addEventListener("click", () => setPlateFocus(Number(el.dataset.p)));
   return el;
 }
 
 function markFrameLoaded(img) {
-  // a time tick fills in once every site's frame at that t and z has arrived
+  // the cell drops its placeholder on the first frame; a time tick fills in
+  // once every site's frame at that t and z has arrived
   const pl = state.plate;
+  const cell = img.closest(".site");
+  if (cell) cell.classList.remove("pending");
   const key = img.dataset.frame;
   if (!key) return;
   const [t, , z] = key.split("/").map(Number);
@@ -3442,59 +3518,67 @@ function markFrameLoaded(img) {
   const seen = (pl.loaded.get(tz) || new Set());
   seen.add(img.dataset.frame);
   pl.loaded.set(tz, seen);
-  if (seen.size >= state.info.plate.P && pl.tickEls && pl.tickEls[t] && z === pl.z) {
-    pl.tickEls[t].classList.add("loaded");
-  }
+  if (seen.size >= state.info.plate.P && z === pl.z) renderTimeLine();
 }
 
 function layoutPlate() {
   const pl = state.plate;
   if (!pl) return;
   const info = state.info.plate;
+  const stage = $("stage-wrap").getBoundingClientRect();
   const r = $("plate").getBoundingClientRect();
   if (!r.width || !r.height) return;
-  const gap = 10;
+  const gap = 12;
+  const headW = pl.structured ? 44 : 0;
+  const headH = pl.structured ? 22 : 0;
+  const sliderW = 44 + 12;
   const aspect = info.frameW && info.frameH ? info.frameW / info.frameH : 1;
-  const cols = Math.max(1, info.cols), rows = Math.max(1, info.rows);
-  // the largest cell of the frame's aspect that fits the arrangement
+  const availW = r.width - headW - sliderW - 8;
+  const availH = r.height - headH - 8;
   const cellW = Math.floor(Math.min(
-    (r.width - gap * (cols - 1)) / cols,
-    ((r.height - gap * (rows - 1)) / rows) * aspect
+    (availW - gap * (pl.cols - 1)) / pl.cols,
+    ((availH - gap * (pl.rows - 1)) / pl.rows) * aspect
   ));
   const cellH = Math.floor(cellW / aspect);
   if (cellW < 8 || cellH < 8) return;
   pl.cellW = cellW;
   pl.cellH = cellH;
-  const grid = $("plate-grid");
-  grid.style.setProperty("--cell-w", cellW + "px");
-  grid.style.setProperty("--cell-h", cellH + "px");
+  const block = $("plate-block");
+  block.style.setProperty("--cell-w", cellW + "px");
+  block.style.setProperty("--cell-h", cellH + "px");
+  const gridW = cellW * pl.cols + gap * (pl.cols - 1);
+  const gridH = cellH * pl.rows + gap * (pl.rows - 1);
+  block.style.setProperty("--grid-h", gridH + "px");
+  const capsule = Math.max(420, Math.min(stage.width - 32, Math.max(gridW + 140, 760)));
+  $("plate-stage").style.setProperty("--capsule-w", capsule + "px");
   const k = cellW <= 260 ? 8 : 4;
   if (k !== pl.k) {
     pl.k = k;
     paintPlate();
   }
+  renderZSlider();
   if (pl.focus === null) updateReadout();
 }
 
 function paintPlate() {
   const pl = state.plate;
   if (!pl || !pl.gridEls) return;
-  pl.placed.forEach((site, k) => {
+  (state.info.plate.sites || []).forEach((site) => {
     const url = plateFrameUrl(pl.t, site.i, pl.z);
-    for (const el of [pl.gridEls[k], pl.stripEls[k]]) {
+    for (const el of [pl.gridEls[site.i], pl.stripEls[site.i]]) {
       const img = el.querySelector("img");
       img.dataset.frame = pl.t + "/" + site.i + "/" + pl.z;
       if (img.getAttribute("src") !== url) img.src = url;
     }
-    pl.stripEls[k].classList.toggle("current", pl.focus === site.i);
-    pl.gridEls[k].classList.toggle("current", pl.focus === site.i);
+    pl.stripEls[site.i].classList.toggle("current", pl.focus === site.i);
+    pl.gridEls[site.i].classList.toggle("current", pl.focus === site.i);
   });
 }
 
 function plateFrameChanged() {
   // every t, z or focus change: frames, readouts, histogram, status bar
   refreshTiles();
-  renderZRail();
+  renderZSlider();
   renderTimeLine();
   refreshHistograms();
   $("plane-note").textContent = platePlaneNote();
@@ -3560,8 +3644,8 @@ function setPlatePlaying(on) {
   btn.classList.toggle("on", pl.playing);
   btn.title = pl.playing ? "Pause (space)" : "Play (space)";
   btn.innerHTML = pl.playing
-    ? '<svg viewBox="0 0 16 16"><path d="M3 3h4v10H3zM9 3h4v10H9z"/></svg>'
-    : '<svg viewBox="0 0 16 16"><path d="M4 2.5v11L13 8z"/></svg>';
+    ? '<svg viewBox="0 0 16 16"><path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>'
+    : '<svg viewBox="0 0 16 16"><path d="M4 2.2v11.6c0 .6.6.9 1.1.6l8.6-5.8c.5-.3.5-1 0-1.3L5.1 1.6C4.6 1.3 4 1.6 4 2.2z"/></svg>';
   clearInterval(pl.timer);
   pl.timer = null;
   if (pl.playing) {
@@ -3572,14 +3656,15 @@ function setPlatePlaying(on) {
   }
 }
 
-/* z rail: one tick per plane, the home plane marked, a knob that drags */
+/* z slider: a track that fills up to the knob, a tick per plane, the home
+   plane marked, a value capsule beside the knob */
 
-function zRailPct(z) {
+function zSliderPct(z) {
   const Z = state.info.plate.Z;
   return Z > 1 ? (1 - z / (Z - 1)) * 100 : 50;
 }
 
-function buildZRail() {
+function buildZSlider() {
   const pl = state.plate;
   const info = state.info.plate;
   const ticks = $("z-ticks");
@@ -3587,10 +3672,11 @@ function buildZRail() {
   for (let i = 0; i < info.Z; i++) {
     const tick = document.createElement("div");
     tick.className = "ztick" + (i === info.zHome ? " home" : "");
-    tick.style.top = zRailPct(i) + "%";
+    tick.style.top = zSliderPct(i) + "%";
     ticks.append(tick);
     pl.zTickEls.push(tick);
   }
+  const slider = $("z-slider");
   const track = $("z-track");
   const knob = $("z-knob");
   const zFromY = (y) => {
@@ -3608,8 +3694,8 @@ function buildZRail() {
   knob.addEventListener("pointermove", (ev) => { if (drag) zFromY(ev.clientY); });
   knob.addEventListener("pointerup", () => { drag = false; });
   knob.addEventListener("pointercancel", () => { drag = false; });
-  track.addEventListener("pointerdown", (ev) => {
-    if (ev.target !== knob) zFromY(ev.clientY);
+  slider.addEventListener("pointerdown", (ev) => {
+    if (ev.target !== knob && ev.target.id !== "z-label") zFromY(ev.clientY);
   });
   knob.addEventListener("keydown", (ev) => {
     if (ev.key === "ArrowUp") { setPlateZ(pl.z + 1); ev.preventDefault(); ev.stopPropagation(); }
@@ -3619,29 +3705,44 @@ function buildZRail() {
   knob.setAttribute("aria-valuemax", String(info.Z));
 }
 
-function renderZRail() {
+function renderZSlider() {
   const pl = state.plate;
   const info = state.info.plate;
-  pl.zTickEls.forEach((tick, i) => tick.classList.toggle("on", i === pl.z));
+  if (!pl.zTickEls) return;
+  const pct = zSliderPct(pl.z);
+  // the track is inset 10 px inside the slider, so the knob and the label
+  // follow the track's own extent
+  const slider = $("z-slider");
+  const track = $("z-track");
+  const sr = slider.getBoundingClientRect();
+  const tr = track.getBoundingClientRect();
+  const top = sr.height ? (tr.top - sr.top) + (pct / 100) * tr.height : 0;
+  pl.zTickEls.forEach((tick, i) => {
+    tick.classList.toggle("on", i === pl.z);
+    tick.style.top = (sr.height ? (tr.top - sr.top) + (zSliderPct(i) / 100) * tr.height - 10 : 0) + "px";
+  });
   const knob = $("z-knob");
-  knob.style.top = zRailPct(pl.z) + "%";
+  knob.style.top = top + "px";
   knob.setAttribute("aria-valuenow", String(pl.z + 1));
-  const n = $("z-read-n");
-  n.textContent = "";
-  n.append(String(pl.z + 1));
-  const of = document.createElement("span");
-  of.textContent = " / " + info.Z;
-  n.append(of);
-  const um = $("z-read-um");
+  $("z-fill").style.height = ((1 - pct / 100) * (tr.height || 0)) + "px";
+  const label = $("z-label");
+  label.style.top = top + "px";
+  label.replaceChildren();
+  label.append((pl.z + 1) + " of " + info.Z);
+  const dim = document.createElement("span");
+  dim.className = "dim";
+  let text = "";
   if (Number(info.zStepUm) > 0) {
     const d = (pl.z - info.zHome) * Number(info.zStepUm);
-    um.textContent = (d < 0 ? "−" : "+") + rawValueLabel(Math.abs(d)) + " µm";
-  } else {
-    um.textContent = "";
+    text += " · " + (d < 0 ? "−" : "+") + rawValueLabel(Math.abs(d)) + " µm";
   }
+  if (pl.z === info.zHome) text += " · home";
+  dim.textContent = text;
+  label.append(dim);
 }
 
-/* time line: ticks at the real frame times, hour labels, a playhead */
+/* the transport capsule: buttons, a scrubber with ticks at the real frame
+   times and a cached band, the clock, the speed */
 
 function timeSpanMs() {
   const times = state.info.plate.timesMs || [];
@@ -3659,15 +3760,29 @@ function buildTimeLine() {
   const pl = state.plate;
   const info = state.info.plate;
   const ticks = $("t-ticks");
+  const cached = $("t-cached");
   pl.tickEls = [];
+  pl.cachedEls = [];
+  const showTicks = info.T <= 120;
   for (let i = 0; i < info.T; i++) {
-    const tick = document.createElement("div");
-    tick.className = "ttick";
-    tick.style.left = timePct(i) + "%";
-    ticks.append(tick);
-    pl.tickEls.push(tick);
+    if (showTicks) {
+      const tick = document.createElement("div");
+      tick.className = "ttick";
+      tick.style.left = timePct(i) + "%";
+      ticks.append(tick);
+      pl.tickEls.push(tick);
+    }
+    const band = document.createElement("span");
+    const from = timePct(i);
+    const to = i + 1 < info.T ? timePct(i + 1) : 100;
+    band.style.left = from + "%";
+    band.style.width = Math.max(0, to - from) + "%";
+    band.hidden = true;
+    cached.append(band);
+    pl.cachedEls.push(band);
   }
-  // hour labels: every 6 h on a long run, every 30 min on a short one
+  // hour labels every 6 h on a long run, every 30 min on a short one
+  const labels = $("t-labels");
   const spanMin = timeSpanMs() / 60000;
   if (spanMin > 0) {
     const stepMin = spanMin > 120 ? 360 : 30;
@@ -3676,8 +3791,8 @@ function buildTimeLine() {
       const last = m + stepMin > spanMin;
       lab.className = "tlabel" + (m === 0 ? " first" : last ? " last" : "");
       lab.style.left = (m / spanMin) * 100 + "%";
-      lab.textContent = fmtTickLabel(m);
-      ticks.append(lab);
+      lab.textContent = m === 0 ? "0" : fmtTickLabel(m);
+      labels.append(lab);
     }
   }
   const track = $("t-track");
@@ -3719,11 +3834,12 @@ function buildTimeLine() {
 }
 
 function pollPlateStatus() {
-  // the store beside the file fills in the background; a tick is solid
-  // once every frame of that time point is in, so the line shows how
-  // much of the series is ready to scrub without touching the ND2
+  // the store beside the file fills in the background; a band under the
+  // scrubber shows which time points are in, and the status bar counts,
+  // so the series can be scrubbed without touching the ND2 once it is done
   const pl = state.plate;
   if (!pl || pl.statusTimer) return;
+  const cell = $("plate-cache-cell");
   const ask = () => {
     fetch("api/plate/status", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
@@ -3732,7 +3848,14 @@ function pollPlateStatus() {
         pl.storeDone = Number(d.done) || 0;
         pl.storeTotal = Number(d.total) || 0;
         renderTimeLine();
-        if (pl.storeTotal && pl.storeDone >= pl.storeTotal) {
+        const done = pl.storeTotal && pl.storeDone >= pl.storeTotal;
+        if (cell) {
+          cell.hidden = done || !pl.storeTotal;
+          $("plate-cache-val").textContent = pl.storeTotal
+            ? Math.floor((pl.storeDone / pl.storeTotal) * 100) + " % · " + fmtInt(pl.storeDone) + " of " + fmtInt(pl.storeTotal)
+            : "";
+        }
+        if (done) {
           clearInterval(pl.statusTimer);
           pl.statusTimer = null;
         }
@@ -3749,21 +3872,68 @@ function renderTimeLine() {
   const info = state.info.plate;
   const times = info.timesMs || [];
   const perFrame = (info.P || 1) * (info.Z || 1);
-  pl.tickEls.forEach((tick, i) => {
-    tick.classList.toggle("on", i === pl.t);
+  (pl.tickEls || []).forEach((tick, i) => tick.classList.toggle("on", i === pl.t));
+  (pl.cachedEls || []).forEach((band, i) => {
     const seen = pl.loaded.get(i + "/" + pl.z);
     const stored = pl.storePerT && pl.storePerT[i] >= perFrame;
-    tick.classList.toggle("loaded", stored || !!(seen && seen.size >= info.P));
+    band.hidden = !(stored || !!(seen && seen.size >= info.P));
   });
-  $("t-playhead").style.left = timePct(pl.t) + "%";
-  $("t-read-clock").textContent = fmtClock(times.length ? times[pl.t] - times[0] : 0);
+  const pct = timePct(pl.t);
+  $("t-playhead").style.left = pct + "%";
+  $("t-fill").style.width = pct + "%";
+  $("t-read-clock").textContent = fmtHm(times.length ? times[pl.t] - times[0] : 0);
   const period = platePeriodMs();
-  $("t-read-frame").textContent = "frame " + (pl.t + 1) + " / " + info.T +
-    (period ? " · every " + fmtPeriod(period) : "");
+  $("t-read-frame").textContent = "frame " + (pl.t + 1) + " of " + info.T +
+    (period ? " · every " + fmtPeriodWords(period) : "");
   $("t-prev").disabled = pl.t === 0;
   $("t-first").disabled = pl.t === 0;
   $("t-next").disabled = pl.t >= info.T - 1;
   $("t-last").disabled = pl.t >= info.T - 1;
+}
+
+function wirePlateWheel() {
+  // two levels. Over the grid a vertical scroll turns the z knob and a
+  // horizontal swipe scrubs time. Over a focused site the vertical scroll
+  // belongs to the deep zoom, a horizontal swipe still scrubs time, and
+  // option with a vertical scroll moves z.
+  const pl = state.plate;
+  let accX = 0;
+  let accY = 0;
+  const handle = (ev, mode) => {
+    const horizontal = Math.abs(ev.deltaX) > Math.abs(ev.deltaY);
+    if (horizontal) {
+      accX += ev.deltaX;
+      const step = 60;
+      if (Math.abs(accX) >= step) {
+        const n = Math.trunc(accX / step);
+        accX -= n * step;
+        setPlateT(pl.t + n);
+      }
+      ev.preventDefault();
+      ev.stopPropagation();
+      return;
+    }
+    if (mode === "grid" || ev.altKey) {
+      accY += ev.deltaY;
+      const step = 40;
+      if (Math.abs(accY) >= step) {
+        const n = Math.trunc(accY / step);
+        accY -= n * step;
+        setPlateZ(pl.z - n);
+      }
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+  };
+  $("plate").addEventListener("wheel", (ev) => {
+    if (pl.focus !== null) return;
+    handle(ev, "grid");
+  }, { passive: false });
+  $("stage-wrap").addEventListener("wheel", (ev) => {
+    if (pl.focus === null) return;
+    if (ev.target.closest("#time-line, #plate-block, #plate-strip, #plate-back, .mac-window")) return;
+    handle(ev, "focus");
+  }, { passive: false, capture: true });
 }
 
 function wirePlateKeys() {
@@ -3847,10 +4017,22 @@ function wireKeys() {
       $("tb-info").click();
       return;
     }
-    if (command && ["1", "2", "3"].includes(ev.key)) {
-      const btn = { 1: "tb-channels", 2: "tb-region", 3: "tb-annot" }[ev.key];
+    if (command && !ev.shiftKey && ["c", "r", "a"].includes(k)) {
+      // the panels: ⌘C channels, ⌘R region, ⌘A annotate (outside text fields)
+      const btn = { c: "tb-channels", r: "tb-region", a: "tb-annot" }[k];
       ev.preventDefault();
       $(btn).click();  // same toggle the toolbar button performs
+      return;
+    }
+    if (command && !ev.shiftKey && /^[1-9]$/.test(ev.key)) {
+      // ⌘1 to ⌘9 pick a tab; the shell owns the tabs
+      if (window.parent !== window) {
+        ev.preventDefault();
+        window.parent.postMessage(
+          { nd2wsi: "tab-select", version: VIEWPORT_PROTOCOL_VERSION, index: Number(ev.key) - 1 },
+          location.origin
+        );
+      }
       return;
     }
     if (command) return;  // leave other shortcuts alone

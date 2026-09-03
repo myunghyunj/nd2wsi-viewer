@@ -60,30 +60,37 @@
 
     <div id="plate-stage">
       <div id="plate">
-        <div id="plate-grid" role="grid" aria-label="Sites in stage arrangement"></div>
-        <div id="plate-strip" aria-label="Other sites"></div>
-        <button type="button" id="plate-back" title="Back to all sites (Esc)">‹ All sites</button>
-      </div>
-      <div id="z-rail" aria-label="Z plane">
-        <div class="rail-eyebrow">z</div>
-        <div id="z-track">
-          <div class="line"></div>
-          <div id="z-ticks"></div>
-          <div id="z-knob" role="slider" aria-label="Z plane" tabindex="0"></div>
+        <div id="plate-block">
+          <div id="plate-col-heads"></div>
+          <button type="button" id="plate-transpose" title="Swap rows and columns" aria-pressed="false"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 6.5V4a1.5 1.5 0 0 1 1.5-1.5h2.5M13.5 9.5V12a1.5 1.5 0 0 1-1.5 1.5H9.5"/><path d="M4.5 4.5 6.5 2.5 4.5.5M11.5 11.5l-2 2 2 2"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/></svg></button>
+          <div id="plate-row-heads"></div>
+          <div id="plate-grid" role="grid" aria-label="Sites"></div>
+          <div id="z-slider" aria-label="Z plane">
+            <div id="z-track"><div id="z-fill"></div></div>
+            <div id="z-ticks"></div>
+            <div id="z-knob" role="slider" aria-label="Z plane" tabindex="0"></div>
+            <div id="z-label"></div>
+          </div>
         </div>
-        <div id="z-read"><b id="z-read-n"></b><span class="um" id="z-read-um"></span></div>
+        <div id="plate-strip" aria-label="Other sites"></div>
+        <button type="button" id="plate-back" title="Back to all sites (Esc)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg><span>All sites</span></button>
       </div>
       <div id="time-line" aria-label="Time">
         <div class="transport">
-          <button type="button" id="t-first" title="First frame"><svg viewBox="0 0 16 16"><path d="M3 3h2v10H3zM13 3v10L6 8z"/></svg></button>
-          <button type="button" id="t-prev" title="Previous frame (←)"><svg viewBox="0 0 16 16"><path d="M11 3v10L4 8z"/></svg></button>
-          <button type="button" id="t-play" class="play" title="Play (space)"><svg viewBox="0 0 16 16"><path d="M4 2.5v11L13 8z"/></svg></button>
-          <button type="button" id="t-next" title="Next frame (→)"><svg viewBox="0 0 16 16"><path d="M5 3v10l7-5z"/></svg></button>
-          <button type="button" id="t-last" title="Last frame"><svg viewBox="0 0 16 16"><path d="M11 3h2v10h-2zM3 3v10l7-5z"/></svg></button>
-          <div id="t-read"><b id="t-read-clock"></b><span id="t-read-frame"></span></div>
+          <button type="button" id="t-first" title="First frame"><svg viewBox="0 0 16 16"><path d="M2.5 2.5h1.8v11H2.5zM13 2.6v10.8c0 .5-.6.8-1 .5L5.6 8.7a.6.6 0 0 1 0-1L12 2.1c.4-.3 1 0 1 .5z"/></svg></button>
+          <button type="button" id="t-prev" title="Previous frame (←)"><svg viewBox="0 0 16 16"><path d="M12 2.6v10.8c0 .5-.6.8-1 .5L4.6 8.7a.6.6 0 0 1 0-1L11 2.1c.4-.3 1 0 1 .5z"/></svg></button>
+          <button type="button" id="t-play" class="play" title="Play (space)"><svg viewBox="0 0 16 16"><path d="M4 2.2v11.6c0 .6.6.9 1.1.6l8.6-5.8c.5-.3.5-1 0-1.3L5.1 1.6C4.6 1.3 4 1.6 4 2.2z"/></svg></button>
+          <button type="button" id="t-next" title="Next frame (→)"><svg viewBox="0 0 16 16"><path d="M4 2.6v10.8c0 .5.6.8 1 .5l6.4-5.2a.6.6 0 0 0 0-1L5 2.1c-.4-.3-1 0-1 .5z"/></svg></button>
+          <button type="button" id="t-last" title="Last frame"><svg viewBox="0 0 16 16"><path d="M11.7 2.5h1.8v11h-1.8zM3 2.6v10.8c0 .5.6.8 1 .5l6.4-5.2a.6.6 0 0 0 0-1L4 2.1c-.4-.3-1 0-1 .5z"/></svg></button>
         </div>
-        <div id="t-track"><div class="line"></div><div id="t-ticks"></div><div id="t-playhead"></div></div>
-        <div class="speed" id="t-speed"><span>fps</span><button type="button" data-fps="4">4</button><button type="button" data-fps="8" class="on">8</button><button type="button" data-fps="16">16</button></div>
+        <div id="t-track">
+          <div class="track"><div id="t-cached"></div><div id="t-fill"></div></div>
+          <div id="t-ticks"></div>
+          <div id="t-labels"></div>
+          <div id="t-playhead"></div>
+        </div>
+        <div id="t-read"><b id="t-read-clock"></b><span id="t-read-frame"></span></div>
+        <div class="seg" id="t-speed"><button type="button" data-fps="4">4</button><button type="button" data-fps="8" class="on">8</button><button type="button" data-fps="16">16</button></div>
       </div>
     </div>
 
@@ -233,6 +240,7 @@
     <span class="cell"><span class="label">Zoom</span><span class="value" id="zoom-val">–</span></span>
     <span class="cell"><span class="label">Level</span><span id="level-lamps"></span></span>
     <span class="cell optional" id="hw-cell" hidden><span class="label">Display</span><span class="value" id="hw-val"></span></span>
+    <span class="cell optional" id="plate-cache-cell" hidden title="The thumbnail store beside the file fills in the background"><span class="label">Cache</span><span class="value" id="plate-cache-val"></span></span>
     <span class="cell" id="export-cell" hidden><span class="label">Export</span><span id="export-bar"><span id="export-fill"></span></span><span class="value" id="export-pct">0 %</span></span>
     <span class="spacer"></span>
     <span id="plane-note"></span>

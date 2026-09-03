@@ -66,6 +66,19 @@ window.addEventListener("pywebviewready", markNativeChrome);
 // a double-click on its empty space zooms the window, as a title bar
 // would. Tabs, buttons, and the picker keep their double-clicks. In a
 // plain browser there is no window to zoom, and nothing happens.
+function selectTabByIndex(index) {
+  // ⌘1 to ⌘9: the nth open slide, in tab order
+  const slide = slides[index];
+  if (slide && slide.sid !== active) activate(slide.sid);
+}
+window.addEventListener("keydown", (event) => {
+  if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return;
+  if (!/^[1-9]$/.test(event.key)) return;
+  if (/^(INPUT|SELECT|TEXTAREA)$/.test(event.target.tagName)) return;
+  event.preventDefault();
+  selectTabByIndex(Number(event.key) - 1);
+});
+
 function requestWindowZoom() {
   const api = window.pywebview?.api;
   if (api?.title_bar_double_click) api.title_bar_double_click();
@@ -1596,6 +1609,9 @@ window.addEventListener("message", (event) => {
   } else if (kind === "landmark-cancel") {
     if (!senderSid || !versioned || !inGroup(senderSid)) return;
     finishLandmarks(false);
+  } else if (kind === "tab-select") {
+    if (!senderSid || !versioned) return;
+    selectTabByIndex(Number(event.data.index));
   } else if (kind === "window-zoom") {
     // a double-click on a slide's own toolbar, relayed from its frame
     if (!senderSid || !versioned) return;
