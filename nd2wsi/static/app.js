@@ -2597,6 +2597,17 @@ function wireCompareRelay() {
       setLandmarkMode(event.data);
     }
   });
+  // Under the tab strip the toolbar reads as part of the window chrome, so
+  // a double-click on its empty space zooms the window too. The shell owns
+  // the window and decides; buttons keep their own double-clicks.
+  $("toolbar").addEventListener("dblclick", (ev) => {
+    if (window.parent === window) return;
+    const target = ev.target;
+    const empty = target.id === "toolbar" || target.classList.contains("tb-spacer") || target.classList.contains("tb-group");
+    if (!empty) return;
+    ev.preventDefault();
+    window.parent.postMessage({ nd2wsi: "window-zoom", version: VIEWPORT_PROTOCOL_VERSION }, location.origin);
+  });
   window.addEventListener("keydown", (ev) => {
     if (!state.landmark.active || window.parent === window) return;
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;

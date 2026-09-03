@@ -74,6 +74,8 @@ Move the cursor over the slide and the status bar shows the raw value of every c
 
 Press `⌘I` for Slide Info. It lists the pixel size and where it came from, the objective, the size of the scan, and the space the reduced copies take on disk. For an SVS it also shows the label and the macro photo stored inside the file.
 
+The window has no title bar of its own, so the tab strip and the toolbar take its place. Double-click either one to zoom the window, as you would a title bar, and double-click again to bring it back. The gesture follows the title bar setting in System Settings under Desktop & Dock.
+
 ## Measuring and marking
 
 ![A ruler, a pin, and a box on a slide](docs/annotations-ruler.png)

@@ -323,3 +323,57 @@ def test_auto_workers_respects_cpu_memory_and_absolute_caps(monkeypatch):
     monkeypatch.setattr(c, "available_memory_bytes", lambda: None)
     monkeypatch.setattr(c.os, "cpu_count", lambda: 12)
     assert c.auto_workers() == 10
+
+
+# -- title-bar double-click: the tab strip stands in for the title bar
+
+
+def _fake_foundation(monkeypatch, value):
+    import sys
+    import types
+
+    class _Defaults:
+        def stringForKey_(self, key):
+            assert key == "AppleActionOnDoubleClick"
+            return value
+
+    class _NSUserDefaults:
+        @staticmethod
+        def standardUserDefaults():
+            return _Defaults()
+
+    monkeypatch.setitem(sys.modules, "Foundation", types.SimpleNamespace(NSUserDefaults=_NSUserDefaults))
+
+
+@pytest.mark.parametrize(
+    "stored, action",
+    [
+        (None, "zoom"),  # unset: the macOS default
+        ("Maximize", "zoom"),
+        ("Fill", "zoom"),  # macOS 15+ offers Fill; zoom is the closest public action
+        ("Minimize", "minimize"),
+        ("None", "none"),
+    ],
+)
+def test_title_bar_double_click_follows_the_system_setting(monkeypatch, stored, action):
+    from nd2wsi import app
+
+    _fake_foundation(monkeypatch, stored)
+    assert app.title_bar_double_click_action() == action
+
+
+def test_title_bar_double_click_zooms_when_the_setting_cannot_be_read(monkeypatch):
+    import sys
+    import types
+
+    from nd2wsi import app
+
+    class _Broken:
+        @staticmethod
+        def standardUserDefaults():
+            raise RuntimeError("no defaults here")
+
+    monkeypatch.setitem(sys.modules, "Foundation", types.SimpleNamespace(NSUserDefaults=_Broken))
+    assert app.title_bar_double_click_action() == "zoom"
+    monkeypatch.setitem(sys.modules, "Foundation", None)  # import fails outright, as on Linux CI
+    assert app.title_bar_double_click_action() == "zoom"

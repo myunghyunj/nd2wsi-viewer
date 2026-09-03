@@ -39,5 +39,5 @@ jobs:
           uv build
           uv venv /tmp/wheeltest
           uv pip install -p /tmp/wheeltest dist/*.whl
-          /tmp/wheeltest/bin/python -c "import nd2wsi.convert, nd2wsi.server, nd2wsi.direct"
+          /tmp/wheeltest/bin/python -c "import nd2wsi.convert, nd2wsi.server, nd2wsi.direct, nd2wsi.app"
           /tmp/wheeltest/bin/nd2wsi --help >/dev/null

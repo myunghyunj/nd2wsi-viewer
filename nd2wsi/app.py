@@ -244,6 +244,41 @@ def _install_open_files_handler():
         _dlog(f"openFiles handler install failed: {e}")
 
 
+def _native_window(window):
+    """The NSWindow behind a pywebview window, or None (main thread only)."""
+    import AppKit
+
+    native = getattr(window, "native", None)
+    candidate = getattr(native, "window", None) or native
+    if isinstance(candidate, AppKit.NSWindow):
+        return candidate
+    for win in AppKit.NSApplication.sharedApplication().windows():
+        if win.isVisible():
+            return win
+    return None
+
+
+def title_bar_double_click_action() -> str:
+    """What macOS does when a title bar is double-clicked: zoom, minimize, or nothing.
+
+    Mirrors the Desktop & Dock setting. Its stored values are Maximize,
+    Fill, Minimize, and None; unset means the default, which zooms.
+    """
+    try:
+        from Foundation import NSUserDefaults
+
+        value = NSUserDefaults.standardUserDefaults().stringForKey_(
+            "AppleActionOnDoubleClick"
+        )
+    except Exception:
+        value = None
+    if value == "Minimize":
+        return "minimize"
+    if value == "None":
+        return "none"
+    return "zoom"
+
+
 def _inline_traffic_lights(window):
     """Hide the macOS title bar so the tab strip hosts the traffic lights.
 
@@ -265,14 +300,7 @@ def _inline_traffic_lights(window):
 
         def tweak():
             try:
-                native = getattr(window, "native", None)
-                candidate = getattr(native, "window", None) or native
-                ns = candidate if isinstance(candidate, AppKit.NSWindow) else None
-                if ns is None:
-                    for win in AppKit.NSApplication.sharedApplication().windows():
-                        if win.isVisible():
-                            ns = win
-                            break
+                ns = _native_window(window)
                 if ns is None:
                     return
                 # the style-mask change rebuilds the title bar, wiping any
@@ -470,6 +498,44 @@ class Api:
         )
         return [str(p) for p in picked] if picked else None
 
+    def title_bar_double_click(self) -> str:
+        """The tab strip stands in for the title bar: double-clicking it zooms.
+
+        The window is frameless, so AppKit never sees the double-click;
+        the shell reports it and this does what the system setting asks.
+        In native full screen nothing happens, as with a real title bar.
+        Returns the action taken.
+        """
+        import webview
+
+        action = title_bar_double_click_action()
+        if action == "none" or not webview.windows:
+            return action
+        try:
+            from Foundation import NSOperationQueue
+        except Exception:
+            return "none"
+        window = webview.windows[0]
+
+        def act():
+            try:
+                import AppKit
+
+                ns = _native_window(window)
+                if ns is None:
+                    return
+                if ns.styleMask() & AppKit.NSWindowStyleMaskFullScreen:
+                    return
+                if action == "minimize":
+                    ns.miniaturize_(None)
+                else:
+                    ns.zoom_(None)
+            except Exception as e:
+                _dlog(f"title bar double-click failed: {e!r}")
+
+        NSOperationQueue.mainQueue().addOperationWithBlock_(act)
+        return action
+
     def _launch_many(self, paths):
         url = None
         n = len(paths)
@@ -589,6 +655,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    api, _window = create_app_window(initial)
+    webview.start()
+    return 0
+
+
+def create_app_window(initial: Path | None):
+    """The app window and its bridge, ready for ``webview.start``."""
+    import webview
+
     try:
         webview.settings["ALLOW_DOWNLOADS"] = True  # ROI exports save natively
     except (AttributeError, TypeError, KeyError):
@@ -612,8 +687,7 @@ def main(argv: list[str] | None = None) -> int:
     _inline_traffic_lights(window)
     _wire_file_drop(window)
     _install_open_files_handler()
-    webview.start()
-    return 0
+    return api, window
 
 
 if __name__ == "__main__":

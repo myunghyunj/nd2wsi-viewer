@@ -62,6 +62,30 @@ function markNativeChrome() {
 if (window.pywebview !== undefined) markNativeChrome();
 window.addEventListener("pywebviewready", markNativeChrome);
 
+// The window has no title bar of its own, so the tab strip plays the part:
+// a double-click on its empty space zooms the window, as a title bar
+// would. Tabs, buttons, and the picker keep their double-clicks. In a
+// plain browser there is no window to zoom, and nothing happens.
+function requestWindowZoom() {
+  const api = window.pywebview?.api;
+  if (api?.title_bar_double_click) api.title_bar_double_click();
+}
+// Both presses must land on the strip's empty space (the drag regions):
+// closing a tab rebuilds the strip under the pointer, so the second click
+// of a double-click on a close button would otherwise count as bare.
+const bareStrip = (target) => target instanceof Element && target.classList.contains("pywebview-drag-region");
+let stripPresses = [];
+$("tabbar").addEventListener("pointerdown", (event) => {
+  stripPresses = [...stripPresses.slice(-1), { at: event.timeStamp, bare: bareStrip(event.target) }];
+});
+$("tabbar").addEventListener("dblclick", (event) => {
+  if (!bareStrip(event.target)) return;
+  const recent = stripPresses.filter((press) => event.timeStamp - press.at < 1000);
+  if (recent.length === 2 && !recent.every((press) => press.bare)) return;
+  event.preventDefault();
+  requestWindowZoom();
+});
+
 function groupSids() {
   return compare.enabled ? [compare.anchorSid, ...compare.members] : [];
 }
@@ -1572,6 +1596,10 @@ window.addEventListener("message", (event) => {
   } else if (kind === "landmark-cancel") {
     if (!senderSid || !versioned || !inGroup(senderSid)) return;
     finishLandmarks(false);
+  } else if (kind === "window-zoom") {
+    // a double-click on a slide's own toolbar, relayed from its frame
+    if (!senderSid || !versioned) return;
+    requestWindowZoom();
   } else if (kind === "slide-trashed") {
     if (senderSid) refresh();
   } else if (kind === "file-drag") {
