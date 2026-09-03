@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -215,8 +216,10 @@ class PlateStore:
         expected = (1, shape[1], 1, shape[3], shape[4], shape[5])
         if tuple(root["thumbs"].chunks) != expected:
             # an older layout kept one file per frame; on this kind of drive
-            # every file costs a round trip, so the store is rebuilt
+            # every file costs a round trip, so the store is rebuilt. The old
+            # one is ours and superseded, so it is removed, not set aside.
             with CacheLock(container):
+                shutil.rmtree(container, ignore_errors=True)
                 manifest = cls._create(source, container, fingerprint, shape)
             root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
         store = cls(source, container, root, manifest)

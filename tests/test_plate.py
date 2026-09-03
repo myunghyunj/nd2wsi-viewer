@@ -383,3 +383,31 @@ def test_status_route_and_trash_remove_the_store(served):
     assert not container.exists()
     assert path.exists()  # the source is never touched
     assert (path.parent / "nd2wsi" / "annotations").exists()
+
+
+def test_store_in_the_old_layout_is_rebuilt_not_set_aside(plate_nd2):
+    import zarr
+
+    from nd2wsi.plate import THUMBS_NAME, PlateSource, plate_container
+
+    src = PlateSource(plate_nd2)
+    assert _wait_full(src), src.store.status()
+    src.close()
+    # rewrite the array with one chunk per frame, the layout of the first
+    # release candidate, keeping its data
+    container = plate_container(plate_nd2)
+    root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+    arr = root["thumbs"]
+    data = arr[:]
+    per_frame = (1, 1, 1) + tuple(arr.chunks[3:])
+    del root["thumbs"]
+    root.create_array("thumbs", shape=data.shape, chunks=per_frame, dtype=data.dtype)[:] = data
+    src = PlateSource(plate_nd2)
+    try:
+        assert tuple(src.store._thumbs.chunks) == (1, P, 1) + per_frame[3:]
+        assert src.store.count() == 0
+        assert _wait_full(src), src.store.status()
+    finally:
+        src.close()
+    # the old store was ours and superseded, so nothing is set aside
+    assert not [p for p in container.parent.iterdir() if ".corrupt-" in p.name]
