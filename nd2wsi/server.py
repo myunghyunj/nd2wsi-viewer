@@ -1665,10 +1665,11 @@ def make_handler(
                 return self._error(400, str(e))
             ctype = "image/jpeg" if fmt in ("jpg", "jpeg") else "image/png"
             self._send(200, body, ctype, cache=self._immutable_when_current(st, q))
-            try:
-                plate.prefetch(t, z, k)
-            except Exception:  # pragma: no cover - prefetch never reaches a client
-                pass
+            if k == 8:  # neighbours of the stored reduction only; a sharper pass is on demand
+                try:
+                    plate.prefetch(t, z, k)
+                except Exception:  # pragma: no cover - prefetch never reaches a client
+                    pass
 
         def _roi(self, st: ViewerState, q: dict):
             try:

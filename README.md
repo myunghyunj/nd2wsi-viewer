@@ -83,7 +83,7 @@ The mark at the left of the toolbar names the kind of file in two words. 2D or 3
 
 ![Six sites of a phage assay in plate mode](docs/plate-mode.png)
 
-Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, and there is nothing to stitch. The viewer opens such a file in plate mode and reads every frame straight from the ND2. The only thing it writes is a small store of reduced frames beside the file, about two percent of the ND2, which fills in the background so the series becomes instant to scrub. The status bar counts it up while it fills, and the trash button removes it.
+Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, and there is nothing to stitch. The viewer opens such a file in plate mode and reads every frame straight from the ND2. The only thing it writes is a small store of reduced frames beside the file, about two percent of the ND2, which fills in the background so the series becomes instant to scrub. The status bar counts it up while it fills, and the trash button removes it. Once the store is full its frames are read into memory in the background, one chunk per time point and plane, so a scrub of z or time never waits on the drive.
 
 ![Scrubbing time and stepping through z planes](docs/plate-time-z.gif)
 
@@ -215,7 +215,7 @@ nd2wsi tidy FOLDER [FOLDER ...]
 
 ### How it works
 
-An eligible ND2, meaning a modern uncompressed file with one stored T/P/Z plane, gets a compact cache that holds only the reduced levels, while level 0 is the ND2 itself read through its memory map. Compressed and legacy files fall back to a full pyramid. A tiled SVS is served from its own embedded pyramid. An ND2 of camera fields over time, sites, or z planes opens in plate mode, where every frame and its reduced copies are read from the memory map on demand and nothing is written to disk. A small server on loopback, behind a random capability URL, hands tiles to OpenSeadragon. Regions are read from the raw tiles for TIFF and ND2 export and rendered for PNG and JPEG.
+An eligible ND2, meaning a modern uncompressed file with one stored T/P/Z plane, gets a compact cache that holds only the reduced levels, while level 0 is the ND2 itself read through its memory map. Compressed and legacy files fall back to a full pyramid. A tiled SVS is served from its own embedded pyramid. An ND2 of camera fields over time, sites, or z planes opens in plate mode, where each frame is read from the file with one sequential read and its reduced copies live in a small zarr store beside the file, one chunk per time point and plane, warmed into memory once it is full. A small server on loopback, behind a random capability URL, hands tiles to OpenSeadragon. Regions are read from the raw tiles for TIFF and ND2 export and rendered for PNG and JPEG.
 
 Rebuilding a working set of 39 scans totalling 190 GB measured the trade. Full pyramids took 152 GB, compact caches 36 GB, and a cold 512 px native window from the largest scan read in 170 ms.
 

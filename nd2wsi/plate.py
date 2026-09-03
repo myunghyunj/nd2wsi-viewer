@@ -212,6 +212,13 @@ class PlateStore:
             if manifest is None:
                 manifest = cls._create(source, container, fingerprint, shape)
         root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+        expected = (1, shape[1], 1, shape[3], shape[4], shape[5])
+        if tuple(root["thumbs"].chunks) != expected:
+            # an older layout kept one file per frame; on this kind of drive
+            # every file costs a round trip, so the store is rebuilt
+            with CacheLock(container):
+                manifest = cls._create(source, container, fingerprint, shape)
+            root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
         store = cls(source, container, root, manifest)
         store.sweep()
         return store
@@ -297,12 +304,25 @@ class PlateStore:
 
     # ---- frames -----------------------------------------------------------
     def get(self, t: int, p: int, z: int) -> np.ndarray | None:
+        """The stored reduction of one site, reading the whole chunk.
+
+        All sites of a time point and plane share one chunk file, and a
+        file costs a round trip on an external drive, so the read brings
+        every finished site of that chunk into the memory cache at once.
+        """
         if not self._done_np[t, p, z]:
             return None
         try:
-            return np.ascontiguousarray(self._thumbs[t, p, z])
+            block = np.asarray(self._thumbs[t, :, z])
         except Exception:
             return None
+        owner = self._source._owner
+        for p2 in range(block.shape[0]):
+            if self._done_np[t, p2, z]:
+                key = (owner, int(t), int(p2), int(z), THUMB_K)
+                if _REDUCED_CACHE.get(key) is None:
+                    _REDUCED_CACHE.put(key, np.ascontiguousarray(block[p2]))
+        return np.ascontiguousarray(block[p])
 
     def put(self, t: int, p: int, z: int, frame: np.ndarray) -> None:
         if self._done_np[t, p, z] or self._stop:
@@ -360,11 +380,36 @@ class PlateStore:
                         return (t, p, z)
         return None
 
+    def warm(self) -> None:
+        """Read every finished chunk into the memory cache, one file each,
+        yielding to requests, so a scrub never waits on the drive."""
+        src = self._source
+        T, P, Z = self._done_np.shape
+        t0, z0 = self._cursor
+        order_z = [z0] + [z for d in range(1, Z) for z in (z0 + d, z0 - d) if 0 <= z < Z]
+        for dt in range(T):
+            t = (t0 + dt) % T
+            for z in order_z:
+                if self._stop or src._closed:
+                    return
+                if not self._done_np[t, :, z].all():
+                    continue
+                if _REDUCED_CACHE.get((src._owner, t, 0, z, THUMB_K)) is not None:
+                    continue
+                while src._fg > 0 and not self._stop:
+                    time.sleep(0.02)
+                try:
+                    self.get(t, 0, z)
+                except Exception:
+                    pass
+                time.sleep(0.002)
+
     def _build(self) -> None:
         src = self._source
         while not self._stop:
             item = self._next_missing()
             if item is None:
+                self.warm()
                 return
             while src._fg > 0 and not self._stop:
                 time.sleep(0.02)
@@ -787,7 +832,18 @@ class PlateSource:
             if hit is not None:
                 self._hist.move_to_end(key)
                 return hit
-        hist = render.compute_histograms(self.root_for(t, p, z), self.attrs)
+        # the stored 8x reduction has 65 thousand samples per site, plenty
+        # for a 256 bin display histogram, and it never touches the ND2
+        # once the store holds it
+        small = self.reduced(t, p, z, THUMB_K)
+        attrs = dict(self.attrs)
+        attrs["nd2wsi"] = {
+            **self.attrs["nd2wsi"],
+            "levels": [{"path": "0", "width": small.shape[2], "height": small.shape[1], "downsample": THUMB_K}],
+        }
+        hist = render.compute_histograms({"0": _ArrayLevel(small)}, attrs, min_pixels=1)
+        for h in hist:
+            h["level"] = str(THUMB_K)
         with self._hist_lock:
             self._hist[key] = hist
             while len(self._hist) > HISTOGRAM_LRU:

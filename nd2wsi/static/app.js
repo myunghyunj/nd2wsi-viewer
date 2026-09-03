@@ -306,7 +306,12 @@ function buildViewer() {
     minZoomImageRatio: 0.7,
     // hardware-matched overzoom: cap at ~3 DEVICE pixels per image pixel,
     // whatever the display density (OSD works in CSS pixels here)
-    maxZoomPixelRatio: Math.max(1.25, 3 / (window.devicePixelRatio || 1)),
+    // a stitched scan stops at 1.5 screen pixels per image pixel, which is
+    // plenty for its tiny pixels; a single camera field of a plate is
+    // 2044 px across and wants to be magnified well past that
+    maxZoomPixelRatio: state.info.kind === "plate"
+      ? 8
+      : Math.max(1.25, 3 / (window.devicePixelRatio || 1)),
     imageSmoothingEnabled: true,
     crossOriginPolicy: false,
     drawer: "canvas",
@@ -3346,8 +3351,8 @@ function platePlaneNote() {
   return bits.join(" · ");
 }
 
-function plateFrameUrl(t, p, z) {
-  const q = renderParams(new URLSearchParams({ k: state.plate.k }));
+function plateFrameUrl(t, p, z, k) {
+  const q = renderParams(new URLSearchParams({ k: k || state.plate.k }));
   return "api/plate/frame/" + t + "/" + p + "/" + z + ".jpg?" + q.toString();
 }
 
@@ -3561,10 +3566,15 @@ function layoutPlate() {
 }
 
 function paintPlate() {
+  // the 8x reduction comes from the store beside the file, so a scrub
+  // shows every site at once; a wide cell then gets the sharper 4x pass
+  // once the hand rests, the way a photo app sharpens after a swipe
   const pl = state.plate;
   if (!pl || !pl.gridEls) return;
-  (state.info.plate.sites || []).forEach((site) => {
-    const url = plateFrameUrl(pl.t, site.i, pl.z);
+  const sites = state.info.plate.sites || [];
+  const quick = pl.k === 8 ? null : 8;
+  sites.forEach((site) => {
+    const url = plateFrameUrl(pl.t, site.i, pl.z, quick || pl.k);
     for (const el of [pl.gridEls[site.i], pl.stripEls[site.i]]) {
       const img = el.querySelector("img");
       img.dataset.frame = pl.t + "/" + site.i + "/" + pl.z;
@@ -3573,6 +3583,20 @@ function paintPlate() {
     pl.stripEls[site.i].classList.toggle("current", pl.focus === site.i);
     pl.gridEls[site.i].classList.toggle("current", pl.focus === site.i);
   });
+  clearTimeout(pl.sharpenTimer);
+  pl.sharpenTimer = null;
+  if (quick && pl.focus === null) {
+    const t = pl.t, z = pl.z;
+    pl.sharpenTimer = setTimeout(() => {
+      pl.sharpenTimer = null;
+      if (pl.t !== t || pl.z !== z || pl.focus !== null) return;
+      sites.forEach((site) => {
+        const img = pl.gridEls[site.i].querySelector("img");
+        const url = plateFrameUrl(t, site.i, z, pl.k);
+        if (img.getAttribute("src") !== url) img.src = url;
+      });
+    }, 350);
+  }
 }
 
 function plateFrameChanged() {
