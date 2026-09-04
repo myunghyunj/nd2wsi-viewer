@@ -639,6 +639,13 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 }
 @keyframes plate-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .site.pending::before { animation: none; border-top-color: var(--hairline); } }
+/* a frame the server could not read: the cell says so instead of spinning */
+.site.failed img { opacity: 0; }
+.site.failed::after {
+  content: "!"; position: absolute; left: 50%; top: 50%; width: 20px; height: 20px; margin: -10px 0 0 -10px;
+  border-radius: 50%; display: grid; place-items: center;
+  background: rgba(127, 127, 127, 0.18); color: var(--label-2); font: 700 12px var(--font-text);
+}
 .site:focus-visible, .site.current { box-shadow: 0 0 0 2px var(--canvas), 0 0 0 4px var(--accent); }
 .site .pill {
   position: absolute; left: 10px; bottom: 10px; display: inline-flex; align-items: baseline; gap: 5px;
@@ -706,6 +713,23 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 #t-read { display: flex; flex-direction: column; line-height: 1.15; min-width: 150px; white-space: nowrap; }
 #t-read b { font-size: 13px; font-weight: 600; color: var(--label); font-variant-numeric: tabular-nums; }
 #t-read span { font-size: 11px; color: var(--label-2); font-variant-numeric: tabular-nums; }
+/* the autofocus toggle rides in the transport capsule, because following
+   the sharpest plane is something the user turns on to scrub time */
+#t-auto {
+  display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px 0 8px; border: 0; border-radius: 999px;
+  background: rgba(127, 127, 127, 0.14); color: var(--label-2);
+  font: 600 11px var(--font-text); white-space: nowrap; cursor: default;
+}
+#t-auto svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
+#t-auto:hover:not(:disabled) { background: rgba(127, 127, 127, 0.22); }
+#t-auto:disabled { opacity: 0.35; }
+#t-auto.on {
+  background: var(--accent, #0a84ff); color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 3px rgba(0, 0, 0, 0.22);
+}
+/* the slider is reporting rather than accepting while autofocus drives it */
+#z-slider.auto #z-knob { opacity: 0.55; }
+
 .seg { display: inline-flex; align-items: center; height: 26px; padding: 2px; border-radius: 999px; background: rgba(127, 127, 127, 0.14); }
 .seg button { height: 22px; min-width: 32px; padding: 0 8px; border: 0; border-radius: 999px; background: transparent; color: var(--label-2); font: 600 11px var(--font-text); font-variant-numeric: tabular-nums; cursor: default; }
 .seg button.on { background: var(--material-strong); color: var(--label); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 0 0 0.5px var(--hairline), 0 1px 3px rgba(0, 0, 0, 0.22); }
@@ -713,6 +737,12 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 
 /* focus mode: the deep-zoom stage shows one site; the slider keeps the right
    edge, the capsule the bottom, and the other sites fold into a strip */
+/* the plate layer covers the stage; in focus mode the image underneath
+   must get the wheel and the drag, so the layer lets input through and
+   only its controls catch it */
+#stage-wrap.plate-focus #plate-stage { pointer-events: none; }
+#stage-wrap.plate-focus #plate-block, #stage-wrap.plate-focus #plate-strip,
+#stage-wrap.plate-focus #plate-back, #stage-wrap.plate-focus #time-line { pointer-events: auto; }
 #stage-wrap.plate-focus #plate { pointer-events: none; display: block; inset: 0; }
 #stage-wrap.plate-focus #plate-grid, #stage-wrap.plate-focus #plate-row-heads,
 #stage-wrap.plate-focus #plate-col-heads, #stage-wrap.plate-focus #plate-transpose { display: none; }

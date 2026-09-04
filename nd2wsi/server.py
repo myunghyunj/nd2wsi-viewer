@@ -21,6 +21,7 @@ GET  /s/<sid>/api/histogram     per-channel LUT histograms
 GET  /s/<sid>/api/tile/<L>/<x>/<y>.jpg?c=0,1&win=…
 GET  /s/<sid>/api/plate/frame/<t>/<p>/<z>.jpg?k=8&c=&win=   reduced frame of one site
 GET  /s/<sid>/api/plate/status  how much of the thumbnail store is filled
+GET  /s/<sid>/api/plate/focus   the sharpest plane per time point and site
 GET  /s/<sid>/api/roi?level=&x=&y=&w=&h=&format=nd2|tiff|png|jpg&c=&win=
 GET/POST /s/<sid>/api/annotations   sidecar annotations
 """
@@ -1240,6 +1241,10 @@ def make_handler(
                     if st.plate is None:
                         return self._error(404, "not a plate slide")
                     return self._json(st.plate.status())
+                if sub == "/api/plate/focus":
+                    if st.plate is None:
+                        return self._error(404, "not a plate slide")
+                    return self._json(st.plate.focus_map())
                 if sub == "/api/roi":
                     return self._roi(st, q)
                 return self._error(404, f"no route for {path}")

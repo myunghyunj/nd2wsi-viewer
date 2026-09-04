@@ -60,6 +60,7 @@ PLATE_K = (2, 4, 8, 16)  # box mean factors the grid may ask for
 PREFETCH_PENDING_MAX = 256  # frames queued for warming, oldest dropped first
 HISTOGRAM_LRU = 64
 THUMB_K = 8  # the reduction the store keeps, the one the site grid shows
+UNSCORED = -1.0  # a frame whose sharpness has not been measured yet
 PLATE_FORMAT = "nd2wsi-plate/1"
 PLATE_TAG = "plate"
 THUMBS_NAME = "thumbs.zarr"
@@ -164,6 +165,27 @@ def _loop(f: Any, kind: str) -> Any:
     return None
 
 
+def _sharpness(a: np.ndarray) -> float:
+    """How much fine detail a reduced frame carries.
+
+    The mean squared gradient over the mean level squared. Dividing by the
+    level makes the number survive a lamp that drifts over a day, so the
+    planes of one site stay comparable from the first hour to the last.
+    """
+    x = np.asarray(a, dtype=np.float32)
+    if x.ndim == 3:
+        x = x.mean(axis=0)
+    if x.ndim != 2 or x.shape[0] < 2 or x.shape[1] < 2:
+        return 0.0
+    gy = np.diff(x, axis=0)
+    gx = np.diff(x, axis=1)
+    energy = float(np.mean(gy * gy)) + float(np.mean(gx * gx))
+    level = float(x.mean())
+    if not math.isfinite(energy) or not math.isfinite(level):
+        return 0.0
+    return energy / (level * level + 1e-6)
+
+
 def plate_container(slide: str | Path) -> Path:
     """Where the thumbnail store of a plate file lives, beside the file."""
     slide = Path(slide)
@@ -191,7 +213,18 @@ class PlateStore:
         self.total = int(source.T * source.P * source.Z)
         self._lock = threading.Lock()
         self._done_np = np.asarray(self._done[:]).astype(bool)
+        self._focus_dirty = 0
+        try:
+            self._focus = root["focus"]
+            self._focus_np = np.asarray(self._focus[:], dtype=np.float32)
+        except Exception:
+            self._focus = None
+            self._focus_np = np.full(
+                (source.T, source.P, source.Z), UNSCORED, dtype=np.float32
+            )
         self._cursor = (0, source.z_home)
+        self._warmed = False  # the warm pass has run to the end once
+        self._writer: Any = None  # the container lock, while this store writes
         self._stop = False
         self._thread: threading.Thread | None = None
 
@@ -222,19 +255,74 @@ class PlateStore:
                 shutil.rmtree(container, ignore_errors=True)
                 manifest = cls._create(source, container, fingerprint, shape)
             root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+        cls._ensure_focus(root, shape)
         store = cls(source, container, root, manifest)
+        store._claim_writer()
         store.sweep()
         return store
 
     def sweep(self) -> None:
         """Drop the AppleDouble twins macOS leaves beside every file on
         exFAT and NTFS drives; each one costs a whole allocation block."""
+        if self._writer is None:
+            return  # removing files belongs to the viewer that writes
         try:
             from .convert import sweep_appledouble
 
             sweep_appledouble(self.container)
         except Exception:
             pass
+
+    def _claim_writer(self) -> None:
+        """Take the container's lock for as long as the store is open.
+
+        Only one process may write a container. Sites share a chunk, so two
+        writers would each read that chunk, set their own site and write it
+        back, and one site would be lost while its done flag claimed it was
+        there, which shows as a black cell. A viewer that cannot take the
+        lock still reads the store and falls back to the ND2 for the rest.
+        """
+        # its own lock file: the container's build lock is what a rebuild
+        # and the trash button take, and they must never queue behind a
+        # viewer that holds this one for a whole session
+        lock = CacheLock(self.container.with_name(self.container.name + ".writer"))
+        try:
+            lock.acquire(timeout=0.0)
+        except (TimeoutError, OSError):
+            return
+        self._writer = lock
+
+    @property
+    def writable(self) -> bool:
+        return self._writer is not None
+
+    @staticmethod
+    def _make_focus(root: Any, shape: tuple) -> None:
+        """The sharpness of every frame, one small chunk for the whole
+        series. The single definition, used when a store is created and
+        when an older one is migrated."""
+        root.create_array(
+            name="focus",
+            shape=shape[:3],
+            chunks=shape[:3],
+            dtype=np.float32,
+            overwrite=True,
+            fill_value=UNSCORED,
+        )
+
+    @classmethod
+    def _ensure_focus(cls, root: Any, shape: tuple) -> None:
+        """A store written before autofocus carries no scores; add the array
+        empty and the reads fill it in."""
+        try:
+            root["focus"]
+            return
+        except KeyError:
+            pass
+        try:
+            cls._make_focus(root, shape)
+        except Exception:
+            pass  # a store that cannot hold scores only means no autofocus
 
     @staticmethod
     def _read(container: Path) -> dict | None:
@@ -290,6 +378,7 @@ class PlateStore:
             overwrite=True,
             fill_value=0,
         )
+        PlateStore._make_focus(root, shape)
         manifest = {
             "format": PLATE_FORMAT,
             "kind": "plate",
@@ -320,15 +409,21 @@ class PlateStore:
         except Exception:
             return None
         owner = self._source._owner
+        scored = 0
         for p2 in range(block.shape[0]):
             if self._done_np[t, p2, z]:
                 key = (owner, int(t), int(p2), int(z), THUMB_K)
                 if _REDUCED_CACHE.get(key) is None:
                     _REDUCED_CACHE.put(key, np.ascontiguousarray(block[p2]))
+                if self._focus_np[t, p2, z] < 0:
+                    self._focus_np[t, p2, z] = _sharpness(block[p2])
+                    scored += 1
+        if scored:
+            self._focus_dirty += scored
         return np.ascontiguousarray(block[p])
 
     def put(self, t: int, p: int, z: int, frame: np.ndarray) -> None:
-        if self._done_np[t, p, z] or self._stop:
+        if self._done_np[t, p, z] or self._stop or self._writer is None:
             return
         # sites share a chunk, so writes are serialized: two writers
         # rewriting the same chunk would drop each other's site
@@ -341,6 +436,39 @@ class PlateStore:
                 self._done_np[t, p, z] = True
             except Exception:
                 pass  # a store that cannot be written is only a slower one
+            if self._focus_np[t, p, z] < 0:
+                self._focus_np[t, p, z] = _sharpness(frame)
+                self._focus_dirty += 1
+
+    def flush_focus(self) -> None:
+        """Write the sharpness scores out. One small file, so this is called
+        at the ends of passes rather than on every frame."""
+        if not self._focus_dirty or self._focus is None or self._writer is None:
+            return
+        with self._lock:
+            try:
+                self._focus[:] = self._focus_np
+                self._focus_dirty = 0
+            except Exception:
+                pass
+
+    def focus_map(self) -> dict[str, Any]:
+        """For every time point and site, the plane that reads sharpest.
+
+        Sites whose planes have not been measured fall back to the home
+        plane, so the map is usable from the first frame stored.
+        """
+        scores = self._focus_np
+        home = int(self._source.z_home)
+        measured = scores >= 0
+        any_z = measured.any(axis=2)
+        best = np.where(any_z, np.where(measured, scores, -np.inf).argmax(axis=2), home)
+        return {
+            "best": [[int(v) for v in row] for row in best],
+            "measured": int(any_z.sum()),
+            "total": int(any_z.size),
+            "zHome": home,
+        }
 
     def count(self) -> int:
         return int(self._done_np.sum())
@@ -362,9 +490,18 @@ class PlateStore:
         self._cursor = (int(t), int(z))
 
     def start(self) -> None:
+        """Run the background pass: fill what is missing, then warm.
+
+        A store that is already full still has work, since the warm pass is
+        what puts the series in memory and measures the planes, so the
+        thread starts whatever the count says. It runs at most once per
+        open, so a request that arrives later never sets it going again.
+        """
         if self._thread is not None and self._thread.is_alive():
             return
-        if self.count() >= self.total:
+        if self._stop or self._source._closed:
+            return
+        if self._warmed and self.count() >= self.total:
             return
         self._thread = threading.Thread(target=self._build, name="plate-store", daemon=True)
         self._thread.start()
@@ -406,14 +543,28 @@ class PlateStore:
                 except Exception:
                     pass
                 time.sleep(0.002)
+        self.flush_focus()
+        if not self._stop and not src._closed:
+            self._warmed = True
 
     def _build(self) -> None:
+        """Fill the store frame by frame, then warm what is in it.
+
+        The pass gives up rather than looping when the frames stop
+        arriving: ``put`` swallows a write it cannot make, so a container
+        that is read only or full would otherwise hand back the same
+        missing frame forever, reading it from the ND2 each time.
+        """
         src = self._source
+        if self._writer is None:
+            # another viewer owns the container; this one only reads
+            self.warm()
+            return
+        misses = 0
         while not self._stop:
             item = self._next_missing()
             if item is None:
-                self.warm()
-                return
+                break
             while src._fg > 0 and not self._stop:
                 time.sleep(0.02)
             if self._stop:
@@ -423,19 +574,34 @@ class PlateStore:
             except Exception:
                 if self._stop or src._closed:
                     return
+                misses += 1
+                if misses >= 8:
+                    break  # the file keeps refusing this frame
                 time.sleep(0.5)
+                continue
+            misses = 0
+            if not bool(self._done_np[item]):
+                break  # the reduction was made and the store would not take it
             self._since_sweep = getattr(self, "_since_sweep", 0) + 1
             if self._since_sweep >= 64:
                 self._since_sweep = 0
                 self.sweep()
+                self.flush_focus()
             time.sleep(0.005)
+        self.flush_focus()
         self.sweep()
+        if not self._stop:
+            self.warm()
 
     def close(self) -> None:
         self._stop = True
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=3.0)
+        self.flush_focus()
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
 
 
 class _ArrayLevel:
@@ -820,6 +986,18 @@ class PlateSource:
         if self.store is None:
             return {"done": 0, "total": self.T * self.P * self.Z, "perT": [0] * self.T, "path": None, "building": False}
         return self.store.status()
+
+    def focus_map(self) -> dict[str, Any]:
+        """The plane that reads sharpest, per time point and site."""
+        if self.store is None:
+            home = int(self.z_home)
+            return {
+                "best": [[home] * self.P for _ in range(self.T)],
+                "measured": 0,
+                "total": self.T * self.P,
+                "zHome": home,
+            }
+        return self.store.focus_map()
 
     def root_for(self, t: int, p: int, z: int) -> _Root:
         """A virtual pyramid root for one frame, level 0 from the frame cache."""

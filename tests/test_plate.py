@@ -249,6 +249,17 @@ def test_new_route_is_behind_the_token(served):
     assert _get(f"http://127.0.0.1:{port}/api/plate/frame/0/0/0.jpg")[0] == 404
 
 
+def test_focus_route_reports_a_plane_for_every_site(served):
+    _, base, _ = served
+    status, body, _ = _get(base + "/api/plate/focus")
+    assert status == 200
+    m = json.loads(body)
+    assert m["total"] == T * P
+    assert len(m["best"]) == T and all(len(row) == P for row in m["best"])
+    assert all(0 <= z < Z for row in m["best"] for z in row)
+    assert 0 <= m["zHome"] < Z
+
+
 def test_open_path_registers_a_plate_and_writes_no_cache(plate_nd2):
     from nd2wsi.server import SlideRegistry
 
@@ -411,3 +422,185 @@ def test_store_in_the_old_layout_is_rebuilt_not_set_aside(plate_nd2):
         src.close()
     # the old store was ours and superseded, so nothing is set aside
     assert not [p for p in container.parent.iterdir() if ".corrupt-" in p.name]
+
+
+# ---- autofocus -------------------------------------------------------------
+
+
+def _texture(amp: float) -> np.ndarray:
+    """A coarse checkerboard whose contrast stands for how sharp a plane is.
+
+    The pitch is 16 px so the pattern survives the store's 8x reduction,
+    which is where the sharpness is measured.
+    """
+    yy, xx = np.mgrid[0:H, 0:W]
+    pattern = (((yy // 16) + (xx // 16)) % 2).astype(np.float32)
+    return (1000 + amp * pattern).astype(np.uint16).reshape(H, W, 1)
+
+
+def best_plane(t: int, p: int) -> int:
+    """The plane this site happens to be in focus on at this time point."""
+    return (t + p) % Z
+
+
+def _write_focus_plate(path) -> None:
+    attrs = limnd2.ImageAttributes.create(
+        width=W, height=H, component_count=1, bits=16, sequence_count=T * P * Z
+    )
+    with limnd2.Nd2Writer(str(path)) as f:
+        f.imageAttributes = attrs
+        f.experiment = limnd2.ExperimentFactory(
+            t=T,
+            m={"count": P, "xcoords": [100.0, 7000.0, 100.0], "ycoords": [0.0, 0.0, 6000.0]},
+            z={"count": Z, "step": 5.0},
+        ).createExperiment()
+        seq = 0
+        for t in range(T):
+            for p in range(P):
+                for z in range(Z):
+                    amp = 400.0 if z == best_plane(t, p) else 20.0
+                    f.setImage(seq, _texture(amp))
+                    seq += 1
+        mf = limnd2.MetadataFactory(objective_magnification=20.0, pixel_calibration=0.5)
+        mf.addPlane(name="br", color="#FFFFFF")
+        f.pictureMetadata = mf.createMetadata()
+
+
+def test_sharpness_reads_detail_and_ignores_the_lamp():
+    from nd2wsi.plate import _sharpness
+
+    flat = np.full((24, 32), 1000, np.uint16)
+    detail = _texture(400)[:, :, 0]
+    assert _sharpness(detail) > _sharpness(flat)
+    assert _sharpness(flat) == 0.0
+    # a lamp twice as bright is not a change of focus
+    assert _sharpness(detail.astype(np.float32) * 2) == pytest.approx(
+        _sharpness(detail), rel=1e-3
+    )
+    # a single row or an empty frame is measured, not raised over
+    assert _sharpness(np.zeros((1, 8), np.uint16)) == 0.0
+
+
+def test_autofocus_picks_the_sharpest_plane_of_every_site(tmp_path):
+    from nd2wsi.plate import PlateSource
+
+    path = tmp_path / "focus.nd2"
+    _write_focus_plate(path)
+    src = PlateSource(path)
+    try:
+        assert _wait_full(src), src.store.status()
+        src.store.flush_focus()
+        m = src.focus_map()
+        assert m["measured"] == m["total"] == T * P
+        assert m["zHome"] == src.z_home
+        assert m["best"] == [[best_plane(t, p) for p in range(P)] for t in range(T)]
+    finally:
+        src.close()
+
+
+def test_focus_scores_are_read_back_from_the_store(tmp_path):
+    from nd2wsi.plate import PlateSource
+
+    path = tmp_path / "focus.nd2"
+    _write_focus_plate(path)
+    src = PlateSource(path)
+    assert _wait_full(src), src.store.status()
+    src.close()  # close flushes the scores
+
+    src = PlateSource(path)
+    try:
+        # every plane is already measured, with no frame read at all
+        m = src.focus_map()
+        assert m["measured"] == m["total"]
+        assert m["best"] == [[best_plane(t, p) for p in range(P)] for t in range(T)]
+    finally:
+        src.close()
+
+
+def test_a_store_written_before_autofocus_gains_the_scores(tmp_path):
+    import zarr
+
+    from nd2wsi.plate import THUMBS_NAME, PlateSource, plate_container
+
+    path = tmp_path / "focus.nd2"
+    _write_focus_plate(path)
+    src = PlateSource(path)
+    assert _wait_full(src), src.store.status()
+    src.close()
+
+    # drop the scores the way a store from an earlier release has none
+    root = zarr.open_group(str(plate_container(path) / THUMBS_NAME), mode="r+", zarr_format=2)
+    del root["focus"]
+
+    src = PlateSource(path)
+    try:
+        assert src.store.focus_map()["measured"] == 0
+        # reading the frames back measures them again, from the store only
+        for t in range(T):
+            for p in range(P):
+                for z in range(Z):
+                    src.reduced(t, p, z, 8)
+        m = src.focus_map()
+        assert m["measured"] == m["total"]
+        assert m["best"] == [[best_plane(t, p) for p in range(P)] for t in range(T)]
+    finally:
+        src.close()
+
+
+
+def test_the_builder_gives_up_on_a_store_that_cannot_be_written(plate_nd2, monkeypatch):
+    """A container that refuses writes must not send the builder round the
+    same frame forever, reading it from the ND2 on every turn."""
+    from nd2wsi import plate as plate_mod
+
+    reads = {"n": 0}
+    real_reduced = plate_mod.PlateSource.reduced
+
+    def counting_reduced(self, t, p, z, k):
+        reads["n"] += 1
+        return real_reduced(self, t, p, z, k)
+
+    def refuse(self, t, p, z, frame):
+        return  # the write silently fails, as it does on a full drive
+
+    monkeypatch.setattr(plate_mod.PlateStore, "put", refuse)
+    monkeypatch.setattr(plate_mod.PlateSource, "reduced", counting_reduced)
+    src = plate_mod.PlateSource(plate_nd2)
+    try:
+        thread = src.store._thread
+        assert thread is not None
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "the builder never stopped"
+        assert src.store.count() == 0
+        # it stopped early rather than walking the whole series over and over
+        assert reads["n"] < T * P * Z, reads["n"]
+    finally:
+        src.close()
+
+
+def test_only_one_viewer_writes_the_store(plate_nd2):
+    """Sites share a chunk, so a second viewer of the same file reads the
+    store and the ND2 but never writes: two writers would drop each other's
+    sites while the done flags claimed the frames were there."""
+    from nd2wsi.plate import PlateSource
+
+    first = PlateSource(plate_nd2)
+    try:
+        assert first.store.writable
+        second = PlateSource(plate_nd2)
+        try:
+            assert not second.store.writable
+            # it still serves every frame, straight from the file
+            assert second.reduced(0, 1, 1, 8).shape == first.reduced(0, 1, 1, 8).shape
+            assert int(second.frame_view(1, 2, 0)[0, 0, 0]) == value(1, 2, 0)
+        finally:
+            second.close()
+    finally:
+        first.close()
+
+    # once the first viewer lets go, the next one takes the role
+    third = PlateSource(plate_nd2)
+    try:
+        assert third.store.writable
+    finally:
+        third.close()

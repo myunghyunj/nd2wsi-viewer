@@ -33,6 +33,7 @@ Nothing leaves your computer. There is no upload and no account.
 
 - Opens stitched Nikon `.nd2` scans and Aperio `.svs` slides, several at once in tabs.
 - Plays a time series of a plate, with every site at any z plane and any time, straight from the ND2.
+- Follows the sharpest plane of each site through a time lapse, so focus drift over a day does not blur the series.
 - Moves from the whole slide to single cells without stutter.
 - Shows each fluorescence channel in its own color, with brightness range, gamma, and an on/off switch.
 - Reads the raw pixel values under your cursor.
@@ -87,7 +88,9 @@ Some ND2 files are not scans. A time lapse of a plate stores one camera field pe
 
 ![Scrubbing time and stepping through z planes](docs/plate-time-z.gif)
 
-The sites sit in a grid with the name of each site in a capsule. When the names follow the lab's pattern, such as `10(5)_MOI`, the grid gets row and column headers, conditions as rows and dilutions as columns. The button above the slider swaps rows and columns, which puts the sites back in their arrangement on the stage, and the choice is remembered. The slider on the right is the z plane, with the home plane marked and the distance from home in micrometers beside the knob. The capsule under the grid is time. It holds the transport buttons, a scrubber with one tick per frame at the minute it was taken, the clock, and the speed at 4, 8, or 16 frames per second.
+The sites sit in a grid with the name of each site in a capsule. When the names follow the lab's pattern, such as `10(5)_MOI`, the grid gets row and column headers, conditions as rows and dilutions as columns. The button above the slider swaps rows and columns, which puts the sites back in their arrangement on the stage, and the choice is remembered. The slider on the right is the z plane, with the home plane marked and the distance from home in micrometers beside the knob. The capsule under the grid is time. It holds the transport buttons, a scrubber with one tick per frame at the minute it was taken, the clock, the autofocus toggle, and the speed at 4, 8, or 16 frames per second.
+
+A plate is usually scanned with more z planes than anyone wants to look at, because nobody knows in advance which one the cells will sit on, and over a day of incubation that plane drifts. Autofocus measures the detail in every stored frame and remembers, for each site at each time point, the plane that reads sharpest. Turn it on and each site shows its own plane, so scrubbing time follows the sample instead of the stage. The z label reads `auto`, and reaching for the slider or the arrow keys takes the plane back by hand, stepping from the one on screen. The measuring happens in the background alongside the store, and the button stays dim until there is something to follow.
 
 Two gestures do most of the work. Over the grid, a vertical scroll moves through z and a horizontal swipe on the trackpad scrubs time. Click a site, or press its number, and it fills the stage as a deep zoom, where a vertical scroll zooms, a horizontal swipe still scrubs time, and Option with a vertical scroll moves through z. The arrow keys step z and time in both views, Space plays, and Esc or the All sites capsule returns to the grid.
 
@@ -175,6 +178,7 @@ The trash-can button removes the reduced copies of the slide in front. The scan 
 | `↑` `↓` | z plane of a plate |
 | `←` `→` | time frame of a plate |
 | `Space` | play or pause a plate |
+| `F` | follow the sharpest plane of each site |
 | `1` to `9` | open a site of a plate |
 | `Esc` | cancel the active tool, or return to all sites |
 

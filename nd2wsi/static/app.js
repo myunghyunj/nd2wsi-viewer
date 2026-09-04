@@ -22,6 +22,7 @@ const state = {
   inspectLoading: false,
   plate: null, // {t, z, focus, playing, fps, k, ...} for a time series of sites
   annDirty: false, // an edit is waiting for the debounced save
+  annLoadSeq: 0, // only the newest sidecar load may install its items
   pixel: {
     hudVisible: false,
     cursor: null, // latest displayed-base coordinate and element position
@@ -78,7 +79,9 @@ async function init() {
       stale: false, // the hidden viewer still shows an older frame
       placed: [], // sites sorted by row then col of the current arrangement
       transposed: true, // conditions as rows; the button flips it, remembered
-      loaded: new Map(), // "t/z" -> count of sites whose frame has arrived
+      auto: false, // every site shows its own sharpest plane
+      focusMap: null, // {best: [[z per site] per time point], measured, total}
+      loaded: new Map(), // "t/<plane>" -> the site frames that have arrived
     };
   }
 
@@ -210,10 +213,29 @@ function renderParams(q) {
 
 function plateFrameParams() {
   // the frame the stage shows: current time, the focused site (else the
-  // first) and the current z plane; null for an ordinary slide
+  // first) and its plane; null for an ordinary slide
   const pl = state.plate;
   if (!pl) return null;
-  return { t: pl.t, p: pl.focus === null ? 0 : pl.focus, z: pl.z };
+  const p = pl.focus === null ? 0 : pl.focus;
+  return { t: pl.t, p, z: plateZFor(p) };
+}
+
+function plateZFor(p) {
+  // the plane a site shows: the one the user set, or with autofocus on the
+  // sharpest plane measured for that site at this time point
+  const pl = state.plate;
+  if (!pl) return 0;
+  if (!pl.auto || !pl.focusMap) return pl.z;
+  const row = pl.focusMap.best[pl.t];
+  const z = row ? row[p] : null;
+  return Number.isInteger(z) ? clamp(z, 0, state.info.plate.Z - 1) : pl.z;
+}
+
+function plateGroupKey() {
+  // frames of one time point group under the plane they share; with
+  // autofocus the sites differ, so they group under the mode instead
+  const pl = state.plate;
+  return pl.auto ? "a" : String(pl.z);
 }
 
 function withPlateParams(q) {
@@ -799,11 +821,15 @@ function loadHistograms() {
 const refreshHistograms = debounce(loadHistograms, 300);
 
 function debounce(fn, ms) {
+  // the arguments are deliberately not forwarded: several of these are
+  // wired straight to events, and the event object is not a parameter
   let t = null;
-  return () => {
+  const run = () => {
     clearTimeout(t);
-    t = setTimeout(fn, ms);
+    t = setTimeout(() => { t = null; fn(); }, ms);
   };
+  run.cancel = () => { clearTimeout(t); t = null; };
+  return run;
 }
 
 /* ---- readout strip -------------------------------------------------------- */
@@ -830,14 +856,18 @@ function deviceZoom() {
   return currentImageZoom() * (window.devicePixelRatio || 1);
 }
 
-function activeLevel() {
+function levelForDensity(density) {
   // the coarsest level whose scale still meets the DEVICE sampling density
-  const iz = Math.min(deviceZoom(), 1);
+  const iz = Math.min(density, 1);
   const levels = state.info.levels; // 0 = full res
   for (let k = levels.length - 1; k >= 0; k--) {
     if (1 / levels[k].downsample >= iz) return k;
   }
   return 0;
+}
+
+function activeLevel() {
+  return levelForDensity(deviceZoom());
 }
 
 function updateReadout() {
@@ -861,12 +891,8 @@ function updateGridReadout() {
   if (!iz) return;
   const dz = iz * (window.devicePixelRatio || 1);
   $("zoom-val").textContent = (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %";
-  const levels = state.info.levels;
-  let act = 0;
-  for (let k = levels.length - 1; k >= 0; k--) {
-    if (1 / levels[k].downsample >= Math.min(dz, 1)) { act = k; break; }
-  }
-  levels.forEach((lv, k) => {
+  const act = levelForDensity(dz);
+  state.info.levels.forEach((lv, k) => {
     $("lamp-" + lv.path).classList.toggle("active", k === act);
   });
   updateScalebar(iz);
@@ -1326,9 +1352,13 @@ function saveAnnotations(site) {
 }
 
 function loadAnnotations() {
+  // switching sites twice in a row leaves two loads in flight; the older
+  // one must not install its items over the newer site's
+  const seq = ++state.annLoadSeq;
   fetch(annotationsUrl())
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
     .then((d) => {
+      if (seq !== state.annLoadSeq) return;
       state.annotations = Array.isArray(d.items) ? d.items : [];
       state.annPath = d.path;
       // a skipped legacy-sidecar import must not be silent: the server
@@ -3347,7 +3377,7 @@ function platePlaneNote() {
   const bits = [];
   if (pl.focus !== null && info.sites[pl.focus]) bits.push(siteLabelText(info.sites[pl.focus].name));
   bits.push("t " + (pl.t + 1) + "/" + info.T);
-  bits.push("z " + (pl.z + 1) + "/" + info.Z);
+  bits.push("z " + (plateZFor(pl.focus === null ? 0 : pl.focus) + 1) + "/" + info.Z + (pl.auto ? " auto" : ""));
   return bits.join(" · ");
 }
 
@@ -3480,6 +3510,9 @@ function buildPlate() {
   buildTimeLine();
   wirePlateWheel();
   wirePlateKeys();
+  $("t-auto").addEventListener("click", () => setPlateAuto(!state.plate.auto));
+  renderPlateAuto();
+  loadPlateFocus();
 
   window.addEventListener("resize", layoutPlate);
   if (typeof ResizeObserver === "function") {
@@ -3502,6 +3535,15 @@ function makeSiteEl(site) {
   img.alt = "";
   img.draggable = false;
   img.addEventListener("load", () => markFrameLoaded(img));
+  img.addEventListener("error", () => {
+    // a frame the server could not read would otherwise leave the cell
+    // in its placeholder for good, with nothing said
+    const cell = img.closest(".site");
+    if (!cell || img.dataset.frame !== cell.dataset.shown) return;
+    cell.classList.remove("pending");
+    cell.classList.add("failed");
+    showToast("A frame of " + siteLabelText(site.name) + " could not be read");
+  });
   const pill = document.createElement("span");
   pill.className = "pill";
   fillSitePill(pill, site.name);
@@ -3517,13 +3559,12 @@ function markFrameLoaded(img) {
   const cell = img.closest(".site");
   if (cell) cell.classList.remove("pending");
   const key = img.dataset.frame;
-  if (!key) return;
-  const [t, , z] = key.split("/").map(Number);
-  const tz = t + "/" + z;
+  const tz = img.dataset.group;
+  if (!key || !tz) return;
   const seen = (pl.loaded.get(tz) || new Set());
-  seen.add(img.dataset.frame);
+  seen.add(key);
   pl.loaded.set(tz, seen);
-  if (seen.size >= state.info.plate.P && z === pl.z) renderTimeLine();
+  if (seen.size >= state.info.plate.P && tz.endsWith("/" + plateGroupKey())) renderTimeLine();
 }
 
 function layoutPlate() {
@@ -3573,26 +3614,33 @@ function paintPlate() {
   if (!pl || !pl.gridEls) return;
   const sites = state.info.plate.sites || [];
   const quick = pl.k === 8 ? null : 8;
+  const group = pl.t + "/" + plateGroupKey();
   sites.forEach((site) => {
-    const url = plateFrameUrl(pl.t, site.i, pl.z, quick || pl.k);
-    for (const el of [pl.gridEls[site.i], pl.stripEls[site.i]]) {
-      const img = el.querySelector("img");
-      img.dataset.frame = pl.t + "/" + site.i + "/" + pl.z;
-      if (img.getAttribute("src") !== url) img.src = url;
-    }
+    const z = plateZFor(site.i);
+    const url = plateFrameUrl(pl.t, site.i, z, quick || pl.k);
+    // only the set on screen is loaded: the grid in the overview, the strip
+    // in focus. Loading both doubled every step's requests, half of them
+    // into elements the stylesheet has hidden
+    const shown = pl.focus === null ? pl.gridEls[site.i] : pl.stripEls[site.i];
+    const img = shown.querySelector("img");
+    img.dataset.frame = pl.t + "/" + site.i + "/" + z;
+    img.dataset.group = group;
+    shown.dataset.shown = img.dataset.frame;
+    shown.classList.remove("failed");
+    if (img.getAttribute("src") !== url) img.src = url;
     pl.stripEls[site.i].classList.toggle("current", pl.focus === site.i);
     pl.gridEls[site.i].classList.toggle("current", pl.focus === site.i);
   });
   clearTimeout(pl.sharpenTimer);
   pl.sharpenTimer = null;
   if (quick && pl.focus === null) {
-    const t = pl.t, z = pl.z;
+    const t = pl.t, z = pl.z, auto = pl.auto;
     pl.sharpenTimer = setTimeout(() => {
       pl.sharpenTimer = null;
-      if (pl.t !== t || pl.z !== z || pl.focus !== null) return;
+      if (pl.t !== t || pl.z !== z || pl.auto !== auto || pl.focus !== null) return;
       sites.forEach((site) => {
         const img = pl.gridEls[site.i].querySelector("img");
-        const url = plateFrameUrl(t, site.i, z, pl.k);
+        const url = plateFrameUrl(t, site.i, plateZFor(site.i), pl.k);
         if (img.getAttribute("src") !== url) img.src = url;
       });
     }, 350);
@@ -3610,10 +3658,36 @@ function plateFrameChanged() {
 }
 
 function setPlateZ(z) {
+  // reaching for the plane is how the user takes the wheel back from
+  // autofocus, so this turns it off
   const pl = state.plate;
   const next = clamp(Math.round(z), 0, state.info.plate.Z - 1);
-  if (next === pl.z) return;
+  const wasAuto = pl.auto;
+  if (next === pl.z && !wasAuto) return;
+  pl.auto = false;
   pl.z = next;
+  if (wasAuto) {
+    renderPlateAuto();
+    paintPlate();
+  }
+  plateFrameChanged();
+}
+
+function stepPlateZ(delta) {
+  // with autofocus on, the plane on screen is the site's own, so a step
+  // moves from there rather than from the plane the user last set by hand
+  const pl = state.plate;
+  const from = pl.auto ? plateZFor(pl.focus === null ? 0 : pl.focus) : pl.z;
+  setPlateZ(from + delta);
+}
+
+function setPlateAuto(on) {
+  const pl = state.plate;
+  const next = !!on;
+  if (next === pl.auto) return;
+  pl.auto = next;
+  renderPlateAuto();
+  paintPlate();
   plateFrameChanged();
 }
 
@@ -3631,9 +3705,14 @@ function setPlateFocus(p) {
   const next = p === null || p === undefined ? null : clamp(Number(p), 0, info.P - 1);
   if (next === pl.focus) return;
   const before = plateFrameParams().p;
-  // the outgoing site's marks are saved before the sidecar switches
-  if (state.annDirty) saveAnnotations(before);
+  // an open text edit belongs to the site being left, so it is committed
+  // first. The debounced save is then called off, because it would fire
+  // after the switch and write these marks into the next site's sidecar
   if (state.editingId) closeEditor(true);
+  if (state.annDirty) {
+    scheduleAnnSave.cancel();
+    saveAnnotations(before);
+  }
   pl.focus = next;
   const wrap = $("stage-wrap");
   wrap.classList.toggle("plate-grid", next === null);
@@ -3657,6 +3736,8 @@ function setPlateFocus(p) {
     rebuildAnnList();
     loadAnnotations();
   }
+  if (pl.resetWheel) pl.resetWheel(); // the two levels do not share a stroke
+  paintPlate(); // the set that just became visible carries older frames
   plateFrameChanged();
   updateReadout();
 }
@@ -3722,8 +3803,8 @@ function buildZSlider() {
     if (ev.target !== knob && ev.target.id !== "z-label") zFromY(ev.clientY);
   });
   knob.addEventListener("keydown", (ev) => {
-    if (ev.key === "ArrowUp") { setPlateZ(pl.z + 1); ev.preventDefault(); ev.stopPropagation(); }
-    else if (ev.key === "ArrowDown") { setPlateZ(pl.z - 1); ev.preventDefault(); ev.stopPropagation(); }
+    if (ev.key === "ArrowUp") { stepPlateZ(1); ev.preventDefault(); ev.stopPropagation(); }
+    else if (ev.key === "ArrowDown") { stepPlateZ(-1); ev.preventDefault(); ev.stopPropagation(); }
   });
   knob.setAttribute("aria-valuemin", "1");
   knob.setAttribute("aria-valuemax", String(info.Z));
@@ -3733,7 +3814,9 @@ function renderZSlider() {
   const pl = state.plate;
   const info = state.info.plate;
   if (!pl.zTickEls) return;
-  const pct = zSliderPct(pl.z);
+  // with autofocus on, the slider reports the plane of the site in view
+  const shownZ = pl.auto ? plateZFor(pl.focus === null ? 0 : pl.focus) : pl.z;
+  const pct = zSliderPct(shownZ);
   // the track is inset 10 px inside the slider, so the knob and the label
   // follow the track's own extent
   const slider = $("z-slider");
@@ -3742,25 +3825,27 @@ function renderZSlider() {
   const tr = track.getBoundingClientRect();
   const top = sr.height ? (tr.top - sr.top) + (pct / 100) * tr.height : 0;
   pl.zTickEls.forEach((tick, i) => {
-    tick.classList.toggle("on", i === pl.z);
+    tick.classList.toggle("on", i === shownZ);
     tick.style.top = (sr.height ? (tr.top - sr.top) + (zSliderPct(i) / 100) * tr.height - 10 : 0) + "px";
   });
   const knob = $("z-knob");
   knob.style.top = top + "px";
-  knob.setAttribute("aria-valuenow", String(pl.z + 1));
+  knob.setAttribute("aria-valuenow", String(shownZ + 1));
+  $("z-slider").classList.toggle("auto", !!pl.auto);
   $("z-fill").style.height = ((1 - pct / 100) * (tr.height || 0)) + "px";
   const label = $("z-label");
   label.style.top = top + "px";
   label.replaceChildren();
-  label.append((pl.z + 1) + " of " + info.Z);
+  label.append((shownZ + 1) + " of " + info.Z);
   const dim = document.createElement("span");
   dim.className = "dim";
   let text = "";
   if (Number(info.zStepUm) > 0) {
-    const d = (pl.z - info.zHome) * Number(info.zStepUm);
+    const d = (shownZ - info.zHome) * Number(info.zStepUm);
     text += " · " + (d < 0 ? "−" : "+") + rawValueLabel(Math.abs(d)) + " µm";
   }
-  if (pl.z === info.zHome) text += " · home";
+  if (pl.auto) text += " · auto";
+  else if (shownZ === info.zHome) text += " · home";
   dim.textContent = text;
   label.append(dim);
 }
@@ -3857,6 +3942,46 @@ function buildTimeLine() {
   });
 }
 
+function renderPlateAuto() {
+  const pl = state.plate;
+  const btn = $("t-auto");
+  if (!pl || !btn) return;
+  const measured = pl.focusMap ? Number(pl.focusMap.measured) || 0 : 0;
+  btn.classList.toggle("on", !!pl.auto);
+  btn.setAttribute("aria-pressed", pl.auto ? "true" : "false");
+  btn.disabled = measured === 0;
+  btn.title = measured === 0
+    ? "Autofocus becomes ready as the store measures the planes"
+    : pl.auto
+      ? "Autofocus on: every site shows its sharpest plane (F)"
+      : "Show every site at its sharpest plane (F)";
+}
+
+function loadPlateFocus() {
+  // the sharpest plane of every site at every time point, measured from the
+  // store's own reductions. An extra, so a failure only leaves it off
+  const pl = state.plate;
+  if (!pl) return;
+  fetch("api/plate/focus", { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+    .then((map) => {
+      if (!state.plate || !map || !Array.isArray(map.best)) return;
+      // the map keeps growing while the planes are measured, so a repaint
+      // only happens when the planes on screen actually move; reloading the
+      // deep-zoom stage on every poll would blank it on a two second beat
+      const site = pl.focus === null ? 0 : pl.focus;
+      const wasZ = pl.auto ? plateZFor(site) : null;
+      const wasRow = pl.auto && pl.focusMap ? String(pl.focusMap.best[pl.t]) : null;
+      pl.focusMap = map;
+      renderPlateAuto();
+      if (!pl.auto || String(map.best[pl.t]) === wasRow) return;
+      paintPlate();
+      if (plateZFor(site) !== wasZ) plateFrameChanged();
+      else { renderZSlider(); renderTimeLine(); }
+    })
+    .catch(() => {});
+}
+
 function pollPlateStatus() {
   // the store beside the file fills in the background; a band under the
   // scrubber shows which time points are in, and the status bar counts,
@@ -3879,7 +4004,10 @@ function pollPlateStatus() {
             ? Math.floor((pl.storeDone / pl.storeTotal) * 100) + " % · " + fmtInt(pl.storeDone) + " of " + fmtInt(pl.storeTotal)
             : "";
         }
-        if (done) {
+        const map = pl.focusMap;
+        const measured = map && map.measured >= map.total;
+        if (!measured) loadPlateFocus();
+        if (done && measured) {
           clearInterval(pl.statusTimer);
           pl.statusTimer = null;
         }
@@ -3898,7 +4026,7 @@ function renderTimeLine() {
   const perFrame = (info.P || 1) * (info.Z || 1);
   (pl.tickEls || []).forEach((tick, i) => tick.classList.toggle("on", i === pl.t));
   (pl.cachedEls || []).forEach((band, i) => {
-    const seen = pl.loaded.get(i + "/" + pl.z);
+    const seen = pl.loaded.get(i + "/" + plateGroupKey());
     const stored = pl.storePerT && pl.storePerT[i] >= perFrame;
     band.hidden = !(stored || !!(seen && seen.size >= info.P));
   });
@@ -3925,6 +4053,9 @@ function wirePlateWheel() {
   let accY = 0;
   const handle = (ev, mode) => {
     const horizontal = Math.abs(ev.deltaX) > Math.abs(ev.deltaY);
+    // the leftover of one axis must not push the other one over its step
+    // on the next flick, so changing axis starts from zero
+    if (horizontal) accY = 0; else accX = 0;
     if (horizontal) {
       accX += ev.deltaX;
       const step = 60;
@@ -3943,12 +4074,13 @@ function wirePlateWheel() {
       if (Math.abs(accY) >= step) {
         const n = Math.trunc(accY / step);
         accY -= n * step;
-        setPlateZ(pl.z - n);
+        stepPlateZ(-n);
       }
       ev.preventDefault();
       ev.stopPropagation();
     }
   };
+  pl.resetWheel = () => { accX = 0; accY = 0; };
   $("plate").addEventListener("wheel", (ev) => {
     if (pl.focus !== null) return;
     handle(ev, "grid");
@@ -3974,8 +4106,8 @@ function wirePlateKeys() {
     const compare = state.viewportRelay.compare;
     if (compare && compare.enabled && compare.linked) return;
     let handled = true;
-    if (ev.key === "ArrowUp") setPlateZ(pl.z + 1);
-    else if (ev.key === "ArrowDown") setPlateZ(pl.z - 1);
+    if (ev.key === "ArrowUp") stepPlateZ(1);
+    else if (ev.key === "ArrowDown") stepPlateZ(-1);
     else if (ev.key === "ArrowLeft") setPlateT(pl.t - 1);
     else if (ev.key === "ArrowRight") setPlateT(pl.t + 1);
     else if (ev.key === " ") {
@@ -3985,6 +4117,9 @@ function wirePlateKeys() {
         ev.target.blur();
       }
       if (!ev.repeat) setPlatePlaying(!pl.playing);
+    }
+    else if (ev.key === "f" || ev.key === "F") {
+      if (!$("t-auto").disabled) setPlateAuto(!pl.auto);
     }
     else if (/^[1-9]$/.test(ev.key) && !ev.shiftKey) {
       const site = pl.placed[Number(ev.key) - 1];
