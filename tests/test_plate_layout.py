@@ -103,3 +103,28 @@ def test_a_ninety_six_well_scan_keeps_its_eight_by_twelve_grid():
     layout, rows, cols = _grid(points)
     assert (rows, cols) == (8, 12)
     assert len(set(layout)) == 96
+
+
+def test_sixteen_by_sixteen_serpentine_scan_keeps_well_coordinates():
+    """The supplied spheroid acquisition names a full A01..P16 plate but
+    records alternate rows in opposite orders. Stage geometry, not file
+    order, must place A16 at the visual left and A01 at the visual right."""
+    points = []
+    for row in range(16):
+        numbers = range(1, 17) if row % 2 == 0 else range(16, 0, -1)
+        for number in numbers:
+            points.append(
+                (
+                    f"{chr(65 + row)}{number:02d}",
+                    (16 - number) * 1500.0,
+                    row * 1500.0,
+                )
+            )
+    layout, rows, cols = _grid(points)
+    by_name = {name: rc for (name, _, _), rc in zip(points, layout)}
+    assert (rows, cols) == (16, 16)
+    assert len(set(layout)) == 256
+    assert by_name["A16"] == (0, 0)
+    assert by_name["A01"] == (0, 15)
+    assert by_name["P16"] == (15, 0)
+    assert by_name["P01"] == (15, 15)

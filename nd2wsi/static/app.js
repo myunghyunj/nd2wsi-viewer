@@ -28,6 +28,7 @@ const state = {
   annFailedSaves: new Map(), // URL -> latest captured payload that still needs retry
   quitPreparing: false,
   annLoadSeq: 0, // only the newest sidecar load may install its items
+  tabCount: 0, // supplied by the same-origin shell for conditional Cmd+digit handling
   pixel: {
     hudVisible: false,
     cursor: null, // latest displayed-base coordinate and element position
@@ -87,6 +88,11 @@ async function init() {
       auto: false, // every site shows its own sharpest plane
       focusMap: null, // {best: [[z per site] per time point], measured, total}
       loaded: new Map(), // "t/<plane>" -> the site frames that have arrived
+      view: {
+        siteLabels: null, // decided after the site-name pattern is known
+        timeline: Number(info.plate.T) > 1,
+        zAxis: Number(info.plate.Z) > 1,
+      },
     };
   }
 
@@ -2874,6 +2880,8 @@ function wireCompareRelay() {
       if (!event.data.enabled && state.landmark.active) setLandmarkMode({ active: false, clear: true });
     } else if (event.data.nd2wsi === "landmark-mode") {
       setLandmarkMode(event.data);
+    } else if (event.data.nd2wsi === "tab-shortcut-state") {
+      state.tabCount = Math.max(0, Math.floor(Number(event.data.count) || 0));
     }
   });
   for (const kind of ["pointerdown", "keydown", "beforeinput"]) {
@@ -2897,6 +2905,7 @@ function wireCompareRelay() {
   window.addEventListener("keydown", (ev) => {
     if (!state.landmark.active || window.parent === window) return;
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     let kind = null;
     if (ev.key === "Backspace" || ev.key === "Delete") { undoLandmark(); ev.preventDefault(); ev.stopPropagation(); return; }
@@ -2913,6 +2922,7 @@ function wireCompareRelay() {
     const compare = state.viewportRelay.compare;
     if (window.parent === window || !compare?.enabled || !compare.linked) return;
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     const step = ev.shiftKey ? 10 : 1;
     const delta = {
@@ -3040,7 +3050,10 @@ function wireTrash() {
     return;
   }
   const hide = () => { pop.hidden = true; };
-  btn.onclick = () => { pop.hidden = !pop.hidden; };
+  btn.onclick = () => {
+    if (pop.hidden) setPlateViewMenuOpen(false);
+    pop.hidden = !pop.hidden;
+  };
   $("trash-cancel").onclick = hide;
   document.addEventListener("pointerdown", (ev) => {
     if (!pop.hidden && !pop.contains(ev.target) && ev.target !== btn && !btn.contains(ev.target)) hide();
@@ -3513,8 +3526,15 @@ function plateArrange() {
   pl.placed = (info.sites || [])
     .map((s) => ({ ...s, row: tr ? s.col : s.row, col: tr ? s.row : s.col }))
     .sort((a, b) => a.row - b.row || a.col - b.col);
-  pl.structured = pl.placed.length > 0 &&
+  const assay = pl.placed.length > 0 &&
     pl.placed.every((s) => { const l = siteLabel(s.name); return l.exp && l.cond; });
+  const plateUI = window.Nd2PlateUI;
+  pl.wellHeaders = plateUI && typeof plateUI.wellHeaders === "function"
+    ? plateUI.wellHeaders(pl.placed, pl.rows, pl.cols)
+    : null;
+  pl.headerKind = pl.wellHeaders ? "well" : assay ? "assay" : null;
+  pl.structured = !!pl.headerKind;
+  if (pl.view.siteLabels === null) pl.view.siteLabels = pl.headerKind !== "well";
 }
 
 function dilNode(l) {
@@ -3543,7 +3563,18 @@ function placePlate() {
   rowHeads.replaceChildren();
   colHeads.replaceChildren();
   block.classList.toggle("headed", pl.structured);
-  if (pl.structured) {
+  if (pl.headerKind === "well") {
+    pl.wellHeaders.rows.forEach((label) => {
+      const head = document.createElement("span");
+      head.textContent = label;
+      rowHeads.append(head);
+    });
+    pl.wellHeaders.cols.forEach((label) => {
+      const head = document.createElement("span");
+      head.textContent = label;
+      colHeads.append(head);
+    });
+  } else if (pl.headerKind === "assay") {
     for (let r = 0; r < pl.rows; r++) {
       const s = pl.placed.find((x) => x.row === r);
       const l = siteLabel(s ? s.name : "");
@@ -3564,6 +3595,106 @@ function placePlate() {
   btn.setAttribute("aria-pressed", String(pl.transposed));
 }
 
+function positionPlateViewMenu() {
+  const btn = $("tb-plate-view");
+  const menu = $("plate-view-menu");
+  if (!btn || !menu || menu.hidden) return;
+  const r = btn.getBoundingClientRect();
+  const width = menu.offsetWidth || 184;
+  const height = menu.offsetHeight || 96;
+  menu.style.left = Math.max(8, Math.min(window.innerWidth - width - 8, r.right - width)) + "px";
+  menu.style.top = Math.max(8, Math.min(window.innerHeight - height - 8, r.bottom + 6)) + "px";
+}
+
+function setPlateViewMenuOpen(open) {
+  const btn = $("tb-plate-view");
+  const menu = $("plate-view-menu");
+  if (!btn || !menu) return;
+  const shown = !!open && !btn.hidden;
+  menu.hidden = !shown;
+  btn.classList.toggle("active", shown);
+  btn.setAttribute("aria-expanded", String(shown));
+  if (shown) {
+    const trash = $("trash-confirm");
+    if (trash) trash.hidden = true;
+    positionPlateViewMenu();
+    const items = [...menu.querySelectorAll("[data-plate-view]")];
+    items.forEach((item, i) => { item.tabIndex = i === 0 ? 0 : -1; });
+    const first = items[0];
+    if (first) first.focus({ preventScroll: true });
+  }
+}
+
+function renderPlateViewMenu() {
+  const pl = state.plate;
+  if (!pl) return;
+  $("plate-view-menu").querySelectorAll("[data-plate-view]").forEach((item) => {
+    item.setAttribute("aria-checked", String(!!pl.view[item.dataset.plateView]));
+  });
+}
+
+function applyPlateView(relayout = true) {
+  const pl = state.plate;
+  if (!pl) return;
+  const wrap = $("stage-wrap");
+  wrap.classList.toggle("plate-labels-hidden", !pl.view.siteLabels);
+  wrap.classList.toggle("plate-time-hidden", !pl.view.timeline);
+  wrap.classList.toggle("plate-z-hidden", !pl.view.zAxis);
+  $("time-line").hidden = !pl.view.timeline;
+  $("z-slider").hidden = !pl.view.zAxis;
+  renderPlateViewMenu();
+  if (relayout) layoutPlate();
+}
+
+function wirePlateViewMenu() {
+  const pl = state.plate;
+  const btn = $("tb-plate-view");
+  const menu = $("plate-view-menu");
+  if (!pl || !btn || !menu) return;
+  btn.hidden = false;
+  btn.onclick = () => setPlateViewMenuOpen(menu.hidden);
+  menu.querySelectorAll("[data-plate-view]").forEach((item) => {
+    item.onclick = () => {
+      const key = item.dataset.plateView;
+      pl.view[key] = !pl.view[key];
+      applyPlateView();
+    };
+  });
+  menu.addEventListener("keydown", (ev) => {
+    const items = [...menu.querySelectorAll("[data-plate-view]")];
+    const current = Math.max(0, items.indexOf(document.activeElement));
+    let next = null;
+    if (ev.key === "ArrowDown") next = (current + 1) % items.length;
+    else if (ev.key === "ArrowUp") next = (current + items.length - 1) % items.length;
+    else if (ev.key === "Home") next = 0;
+    else if (ev.key === "End") next = items.length - 1;
+    if (next === null) return;
+    ev.preventDefault();
+    items.forEach((item, i) => { item.tabIndex = i === next ? 0 : -1; });
+    items[next].focus({ preventScroll: true });
+  });
+  menu.addEventListener("focusout", (ev) => {
+    if (!menu.contains(ev.relatedTarget) && ev.relatedTarget !== btn) {
+      setPlateViewMenuOpen(false);
+    }
+  });
+  document.addEventListener("pointerdown", (ev) => {
+    if (!menu.hidden && !menu.contains(ev.target) && ev.target !== btn && !btn.contains(ev.target)) {
+      setPlateViewMenuOpen(false);
+    }
+  });
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape" || menu.hidden) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    setPlateViewMenuOpen(false);
+    btn.focus({ preventScroll: true });
+  });
+  window.addEventListener("resize", positionPlateViewMenu);
+  window.addEventListener("blur", () => setPlateViewMenuOpen(false));
+  renderPlateViewMenu();
+}
+
 function buildPlate() {
   const pl = state.plate;
   if (!pl) return;
@@ -3576,9 +3707,11 @@ function buildPlate() {
     pl.transposed = saved === null ? true : saved === "1";
   } catch (_) { pl.transposed = true; }
   try {
-    pl.auto = localStorage.getItem("nd2wsi.plate.autofocus") === "1";
+    pl.auto = info.Z > 1 && localStorage.getItem("nd2wsi.plate.autofocus") === "1";
   } catch (_) { pl.auto = false; }
   plateArrange();
+  wirePlateViewMenu();
+  applyPlateView(false);
 
   const grid = $("plate-grid");
   const strip = $("plate-strip");
@@ -3608,7 +3741,7 @@ function buildPlate() {
   wirePlateKeys();
   $("t-auto").addEventListener("click", () => setPlateAuto(!state.plate.auto));
   renderPlateAuto();
-  loadPlateFocus();
+  if (info.Z > 1) loadPlateFocus();
 
   window.addEventListener("resize", layoutPlate);
   if (typeof ResizeObserver === "function") {
@@ -3627,6 +3760,7 @@ function makeSiteEl(site) {
   el.className = "site pending";
   el.dataset.p = site.i;
   el.title = siteLabelText(site.name);
+  el.setAttribute("aria-label", siteLabelText(site.name));
   const img = document.createElement("img");
   img.alt = "";
   img.draggable = false;
@@ -3673,12 +3807,15 @@ function layoutPlate() {
   const r = $("plate").getBoundingClientRect();
   if (!r.width || !r.height) return;
   const gap = 12;
-  const headW = pl.structured ? 44 : 0;
-  const headH = pl.structured ? 22 : 0;
-  const sliderW = 44 + 12;
+  // The first column holds either headings or the 28 px transpose button;
+  // the first row always holds that button. Account for the actual chrome so
+  // a dense 16 x 16 grid never clips at the bottom.
+  const leadingW = (pl.structured ? 44 : 28) + gap;
+  const topChromeH = 28 + 10;
+  const sliderW = pl.view.zAxis ? 44 + gap : 0;
   const aspect = info.frameW && info.frameH ? info.frameW / info.frameH : 1;
-  const availW = r.width - headW - sliderW - 8;
-  const availH = r.height - headH - 8;
+  const availW = r.width - leadingW - sliderW;
+  const availH = r.height - topChromeH;
   const cellW = Math.floor(Math.min(
     (availW - gap * (pl.cols - 1)) / pl.cols,
     ((availH - gap * (pl.rows - 1)) / pl.rows) * aspect
@@ -3784,7 +3921,7 @@ function stepPlateZ(delta) {
 
 function setPlateAuto(on) {
   const pl = state.plate;
-  const next = !!on;
+  const next = state.info.plate.Z > 1 && !!on;
   if (next === pl.auto) return;
   pl.auto = next;
   try { localStorage.setItem("nd2wsi.plate.autofocus", next ? "1" : "0"); } catch (_) { /* private mode */ }
@@ -3848,7 +3985,7 @@ function setPlateFocus(p) {
 
 function setPlatePlaying(on) {
   const pl = state.plate;
-  pl.playing = !!on;
+  pl.playing = state.info.plate.T > 1 && !!on;
   const btn = $("t-play");
   btn.classList.toggle("on", pl.playing);
   btn.title = pl.playing ? "Pause (space)" : "Play (space)";
@@ -4038,12 +4175,14 @@ function buildTimeLine() {
   $("t-play").onclick = () => setPlatePlaying(!pl.playing);
   const speed = $("t-speed");
   speed.querySelectorAll("button").forEach((b) => {
+    b.disabled = info.T <= 1;
     b.onclick = () => {
       speed.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
       pl.fps = Number(b.dataset.fps) || 8;
       if (pl.playing) setPlatePlaying(true);
     };
   });
+  $("t-play").disabled = info.T <= 1;
 }
 
 function renderPlateAuto() {
@@ -4053,8 +4192,10 @@ function renderPlateAuto() {
   const measured = pl.focusMap ? Number(pl.focusMap.measured) || 0 : 0;
   btn.classList.toggle("on", !!pl.auto);
   btn.setAttribute("aria-pressed", pl.auto ? "true" : "false");
-  btn.disabled = measured === 0;
-  btn.title = measured === 0
+  btn.disabled = state.info.plate.Z <= 1 || measured === 0;
+  btn.title = state.info.plate.Z <= 1
+    ? "Autofocus needs more than one Z plane"
+    : measured === 0
     ? "Autofocus becomes ready as the store measures the planes"
     : pl.auto
       ? "Autofocus on: every site shows its sharpest plane (F)"
@@ -4109,9 +4250,10 @@ function pollPlateStatus() {
             : "";
         }
         const map = pl.focusMap;
+        const focusNeeded = state.info.plate.Z > 1;
         const measured = map && map.measured >= map.total;
-        if (!measured) loadPlateFocus();
-        if (done && measured) {
+        if (focusNeeded && !measured) loadPlateFocus();
+        if (done && (!focusNeeded || measured)) {
           clearInterval(pl.statusTimer);
           pl.statusTimer = null;
         }
@@ -4145,6 +4287,7 @@ function renderTimeLine() {
   $("t-first").disabled = pl.t === 0;
   $("t-next").disabled = pl.t >= info.T - 1;
   $("t-last").disabled = pl.t >= info.T - 1;
+  $("t-play").disabled = info.T <= 1;
 }
 
 function wirePlateWheel() {
@@ -4233,17 +4376,21 @@ function wirePlateKeys() {
   window.addEventListener("keydown", (ev) => {
     const pl = state.plate;
     if (!pl) return;
-    if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    const shortcuts = window.Nd2ShortcutRouter;
+    if (shortcuts && shortcuts.isTypingEvent(ev)) return;
+    if (!shortcuts && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     if (state.landmark.active) return;
     const compare = state.viewportRelay.compare;
     if (compare && compare.enabled && compare.linked) return;
+    const info = state.info.plate;
     let handled = true;
-    if (ev.key === "ArrowUp") stepPlateZ(1);
-    else if (ev.key === "ArrowDown") stepPlateZ(-1);
-    else if (ev.key === "ArrowLeft") setPlateT(pl.t - 1);
-    else if (ev.key === "ArrowRight") setPlateT(pl.t + 1);
-    else if (ev.key === " ") {
+    if (ev.key === "ArrowUp" && info.Z > 1) stepPlateZ(1);
+    else if (ev.key === "ArrowDown" && info.Z > 1) stepPlateZ(-1);
+    else if (ev.key === "ArrowLeft" && info.T > 1) setPlateT(pl.t - 1);
+    else if (ev.key === "ArrowRight" && info.T > 1) setPlateT(pl.t + 1);
+    else if (ev.key === " " && info.T > 1) {
       // a focused transport button would fire its own click on the keyup
       // and undo the toggle, so the key takes the focus away first
       if (ev.target && ev.target !== document.body && typeof ev.target.blur === "function") {
@@ -4251,7 +4398,7 @@ function wirePlateKeys() {
       }
       if (!ev.repeat) setPlatePlaying(!pl.playing);
     }
-    else if (ev.key === "f" || ev.key === "F") {
+    else if ((ev.key === "f" || ev.key === "F") && info.Z > 1) {
       if (!$("t-auto").disabled) setPlateAuto(!pl.auto);
     }
     else if (/^[1-9]$/.test(ev.key) && !ev.shiftKey) {
@@ -4286,9 +4433,12 @@ function wireDragForward() {
 
 function wireKeys() {
   window.addEventListener("keydown", (ev) => {
-    if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    const shortcuts = window.Nd2ShortcutRouter;
+    if (shortcuts && shortcuts.isTypingEvent(ev)) return;
+    if (!shortcuts && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
     const command = ev.metaKey || ev.ctrlKey;
-    const k = ev.key.toLowerCase();
+    const letterCode = shortcuts ? shortcuts.letterCode(ev) : ev.code;
     if (command && !ev.shiftKey && ev.code === "Backslash") {
       if (window.parent !== window && !ev.repeat) {
         ev.preventDefault();
@@ -4299,42 +4449,45 @@ function wireKeys() {
       }
       return;
     }
-    if (command && ev.shiftKey && k === "e") {
+    if (command && ev.shiftKey && letterCode === "KeyE") {
       ev.preventDefault();
       $("ann-geojson").click();
       return;
     }
-    if (command && !ev.shiftKey && k === "i") {
+    if (command && !ev.shiftKey && letterCode === "KeyI") {
       ev.preventDefault();
       $("tb-info").click();
       return;
     }
-    if (command && !ev.shiftKey && ["c", "r", "a"].includes(k)) {
-      // the panels: ⌘C channels, ⌘R region, ⌘A annotate (outside text fields)
-      const btn = { c: "tb-channels", r: "tb-region", a: "tb-annot" }[k];
-      ev.preventDefault();
-      $(btn).click();  // same toggle the toolbar button performs
-      return;
-    }
-    if (command && !ev.shiftKey && /^[1-9]$/.test(ev.key)) {
+    const tabIndex = shortcuts ? shortcuts.tabIndexForEvent(ev) : null;
+    if (tabIndex !== null) {
       // ⌘1 to ⌘9 pick a tab; the shell owns the tabs
-      if (window.parent !== window) {
+      if (window.parent !== window && tabIndex < state.tabCount) {
         ev.preventDefault();
         window.parent.postMessage(
-          { nd2wsi: "tab-select", version: VIEWPORT_PROTOCOL_VERSION, index: Number(ev.key) - 1 },
+          { nd2wsi: "tab-select", version: VIEWPORT_PROTOCOL_VERSION, index: tabIndex },
           location.origin
         );
       }
       return;
     }
     if (command) return;  // leave other shortcuts alone
-    if (k === "r") setTool("roi");
-    else if (k === "v") { if (state.roi) setTool("move"); }
-    else if (k === "m") setTool("measure");
-    else if (k === "p") setTool("pin");
-    else if (k === "b") setTool("box");
-    else if (k === "i") togglePixelInspector();
-    else if (k === "l" && !ev.altKey && !ev.shiftKey && window.parent !== window) {
+    const panel = shortcuts ? shortcuts.panelForEvent(ev) : null;
+    if (panel) {
+      const btn = $({ channels: "tb-channels", region: "tb-region", annot: "tb-annot" }[panel]);
+      if (btn && !btn.disabled) {
+        ev.preventDefault();
+        btn.click();
+      }
+      return;
+    }
+    const plain = !ev.altKey && !ev.shiftKey && !ev.repeat;
+    if (plain && letterCode === "KeyV") { if (state.roi) setTool("move"); }
+    else if (plain && letterCode === "KeyM") setTool("measure");
+    else if (plain && letterCode === "KeyP") setTool("pin");
+    else if (plain && letterCode === "KeyB") setTool("box");
+    else if (plain && letterCode === "KeyI") togglePixelInspector();
+    else if (plain && letterCode === "KeyL" && window.parent !== window) {
       if (!ev.repeat) {
         ev.preventDefault();
         window.parent.postMessage(
@@ -4347,7 +4500,7 @@ function wireKeys() {
       if (!$("ann-editor").hidden) closeEditor(false);
       else if (state.tool) setTool(state.tool); // toggles off
       else if (state.plate && state.plate.focus !== null) setPlateFocus(null);
-    } else if (ev.key === "0") state.viewer.viewport.goHome();
+    } else if (plain && ["Digit0", "Numpad0"].includes(ev.code)) state.viewer.viewport.goHome();
   });
 }
 

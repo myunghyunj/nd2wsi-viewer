@@ -12,6 +12,7 @@ let quitPreparation = null;
 const pairPicker = { open: false, mode: "start", replaceSid: null };
 
 const Align = window.nd2wsiAlign;
+const ShortcutRouter = window.Nd2ShortcutRouter;
 const VIEWPORT_PROTOCOL_VERSION = 2;
 const VIEWPORT_THROTTLE_MS = 48;
 const MAX_GROUP = 4; // the anchor and up to three linked slides
@@ -138,14 +139,15 @@ window.addEventListener("pywebviewready", () => {
 function selectTabByIndex(index) {
   // ⌘1 to ⌘9: the nth open slide, in tab order
   const slide = slides[index];
-  if (slide && slide.sid !== active) activate(slide.sid);
+  if (!slide) return false;
+  if (slide.sid !== active) activate(slide.sid);
+  return true;
 }
 window.addEventListener("keydown", (event) => {
-  if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return;
-  if (!/^[1-9]$/.test(event.key)) return;
-  if (/^(INPUT|SELECT|TEXTAREA)$/.test(event.target.tagName)) return;
+  const index = ShortcutRouter ? ShortcutRouter.tabIndexForEvent(event) : null;
+  if (index === null || !slides[index]) return;
   event.preventDefault();
-  selectTabByIndex(Number(event.key) - 1);
+  selectTabByIndex(index);
 });
 
 function requestWindowZoom() {
@@ -262,8 +264,23 @@ function ensureFrame(sid) {
   return frame;
 }
 
+function sendTabShortcutState(sid) {
+  const frame = frames.get(sid);
+  if (!frame?.contentWindow) return;
+  frame.contentWindow.postMessage({
+    nd2wsi: "tab-shortcut-state",
+    version: VIEWPORT_PROTOCOL_VERSION,
+    count: slides.length,
+  }, location.origin);
+}
+
+function broadcastTabShortcutState() {
+  for (const sid of frames.keys()) sendTabShortcutState(sid);
+}
+
 function paneCameUp(sid) {
   // a pane loaded or reloaded: give it everything the group knows
+  sendTabShortcutState(sid);
   if (!inGroup(sid)) return;
   applyDisplayTransform(sid);
   broadcastCompareState();
@@ -333,6 +350,7 @@ function refresh(selectSid) {
         }
       }
       compare.mru = compare.mru.filter((sid) => openSids.has(sid));
+      broadcastTabShortcutState();
       if (compare.enabled) {
         if (!openSids.has(compare.anchorSid)) stopCompare();
         else {

@@ -19,14 +19,21 @@
     </div>
     <div class="tb-spacer"></div>
     <div class="tb-group">
-      <button class="tb-btn" id="tb-channels" title="Show or hide Channels &amp; LUTs">
+      <button class="tb-btn" id="tb-channels" title="Show or hide Channels &amp; LUTs (C)" aria-keyshortcuts="C">
         <span class="tb-ico icon-sliders" aria-hidden="true"></span><span>Channels</span>
       </button>
-      <button class="tb-btn" id="tb-region" title="Show or hide Region (R)">
+      <button class="tb-btn" id="tb-region" title="Show or hide Region (R)" aria-keyshortcuts="R">
         <span class="tb-ico icon-region" aria-hidden="true"></span><span>Region</span>
       </button>
-      <button class="tb-btn" id="tb-annot" title="Show or hide Annotations">
+      <button class="tb-btn" id="tb-annot" title="Show or hide Annotations (A)" aria-keyshortcuts="A">
         <span class="tb-ico icon-note" aria-hidden="true"></span><span>Annotate</span>
+      </button>
+      <button class="tb-btn" id="tb-plate-view" title="Plate view options"
+              aria-label="Plate view options" aria-haspopup="menu"
+              aria-expanded="false" aria-controls="plate-view-menu" hidden>
+        <span class="tb-ico plate-view-glyph" aria-hidden="true">
+          <svg viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
+        </span><span>View</span>
       </button>
       <button class="tb-btn" id="tb-info" title="Show or hide Slide Info (⌘I)" aria-label="Slide Info">
         <span class="tb-ico icon-info" aria-hidden="true">
@@ -51,6 +58,18 @@
       <button class="btn" id="trash-cancel">Cancel</button>
       <button class="btn destructive" id="trash-go">Delete Cache</button>
     </div>
+  </div>
+
+  <div id="plate-view-menu" role="menu" aria-label="Plate view options" hidden>
+    <button type="button" role="menuitemcheckbox" aria-checked="false" tabindex="0" data-plate-view="siteLabels">
+      <span class="plate-view-check" aria-hidden="true">✓</span><span>Site Labels</span>
+    </button>
+    <button type="button" role="menuitemcheckbox" aria-checked="false" tabindex="-1" data-plate-view="timeline">
+      <span class="plate-view-check" aria-hidden="true">✓</span><span>Timeline</span>
+    </button>
+    <button type="button" role="menuitemcheckbox" aria-checked="false" tabindex="-1" data-plate-view="zAxis">
+      <span class="plate-view-check" aria-hidden="true">✓</span><span>Z Axis</span>
+    </button>
   </div>
 
   <div id="stage-wrap">
@@ -127,7 +146,7 @@
       </div>
       <div class="win-body">
         <div class="tool-row">
-          <button id="roi-toggle" class="btn" title="Drag on the slide to mark a region (R)">Select Region</button>
+          <button id="roi-toggle" class="btn" title="Drag on the slide to mark a region">Select Region</button>
           <button id="roi-full" class="btn" title="Mark the whole slide">Whole Slide</button>
         </div>
         <div class="hint" id="roi-hint">Drag on the slide, or select the whole slide.</div>
@@ -250,6 +269,8 @@
 </div>
 
 <script src="../../static/vendor/openseadragon/openseadragon.min.js"></script>
+<script src="../../static/plate-ui-v1.js"></script>
+<script src="../../static/shortcut-router-v1.js"></script>
 <script src="../../static/axis-latch-v1.js"></script>
 <script src="../../static/app.js"></script>
 </body>

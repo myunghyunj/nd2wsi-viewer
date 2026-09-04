@@ -95,7 +95,7 @@ Some ND2 files are not scans. A time lapse of a plate stores one camera field pe
 
 ![Scrubbing time and stepping through z planes](docs/plate-time-z.gif)
 
-The sites sit in a grid with the name of each site in a capsule. When the names follow the lab's pattern, such as `10(5)_MOI`, the grid gets row and column headers, conditions as rows and dilutions as columns. The button above the slider swaps rows and columns, which puts the sites back in their arrangement on the stage, and the choice is remembered. The slider on the right is the z plane, with the home plane marked and the distance from home in micrometers beside the knob. The capsule under the grid is time. It holds the transport buttons, a scrubber with one tick per frame at the minute it was taken, the clock, the autofocus toggle, and the speed at 4, 8, or 16 frames per second.
+The sites sit in a grid. Coordinate names such as `A01` become lettered and numbered row and column headers, so a label does not cover every small image. Lab patterns such as `10(5)_MOI` still become condition and dilution headers. The transpose button swaps rows and columns, and the choice is remembered. The slider on the right is the z plane, and the capsule under the grid is time. A plate with only one z plane or one time point hides the corresponding control automatically. The toolbar's **View** menu can show or hide Site Labels, Timeline, and Z Axis at any time.
 
 A plate is usually scanned with more z planes than anyone wants to look at, because nobody knows in advance which one the cells will sit on, and over a day of incubation that plane drifts. Autofocus measures the detail in every stored frame and remembers, for each site at each time point, the plane that reads sharpest. Turn it on and each site shows its own plane, so scrubbing time follows the sample instead of the stage. The z label reads `auto`, and reaching for the slider or the arrow keys takes the plane back by hand, stepping from the one on screen. The measuring happens in the background alongside the store, and the button stays dim until there is something to follow.
 
@@ -117,7 +117,7 @@ Marks are saved automatically in a small `.json` file beside the slide, so they 
 
 ![A region selected for export at high magnification](docs/region-closeup.png)
 
-Press `R` and drag a box, or type a size in pixels or micrometers. Then choose a format.
+Press `R` to open the Region panel, choose **Select Region**, and drag a box, or type a size in pixels or micrometers. Then choose a format.
 
 | Format | What you get |
 |---|---|
@@ -167,15 +167,16 @@ The trash-can button removes the reduced copies of the slide in front. The scan 
 
 | Key | Action |
 |---|---|
+| `C` | show or hide Channels & LUTs |
+| `R` | show or hide Region |
+| `A` | show or hide Annotations |
 | `M` | measure |
 | `P` | place a pin |
 | `B` | draw a box |
-| `R` | select a region |
 | `V` | move the selected region |
 | `0` | fit the slide |
 | `I` | pixel values under the cursor |
 | `⌘I` | Slide Info |
-| `⌘C` `⌘R` `⌘A` | Channels, Region, and Annotate panels |
 | `⌘1` … `⌘9` | switch to that tab |
 | `⌘⇧E` | export marks as GeoJSON |
 | `⌘\` | link slides |
