@@ -42,12 +42,12 @@ process.stdout.write(JSON.stringify([
     assert out == ["x", "x", "x", "y"]
 
 
-def test_latch_waits_for_dominance_uses_magnitude_and_resets_cleanly():
+def test_latch_waits_for_dominance_uses_net_motion_and_resets_cleanly():
     out = _run(
         r"""
 const {AxisLatch}=require(process.argv[1]);
 const latch=new AxisLatch({idleMs:100,dominance:1.2,threshold:4});
-const values=[latch.feed(1,1,0),latch.feed(1,1,10)];
+const values=[latch.feed(2,2,0),latch.feed(2,-2,10)];
 latch.reset();
 values.push(latch.feed(3,0.5,20),latch.feed(-3,0.5,30));
 latch.reset();
@@ -55,7 +55,29 @@ values.push(latch.feed(0,5,40));
 process.stdout.write(JSON.stringify(values));
 """
     )
-    assert out == [None, None, None, "x", "y"]
+    assert out == [None, "x", None, None, "y"]
+
+
+def test_modest_horizontal_swipe_gets_a_responsive_first_time_step():
+    out = _run(
+        r"""
+const {WheelGestureSession}=require(process.argv[1]);
+const gesture=new WheelGestureSession({
+  mode:"grid",idleMs:100,timeStartStep:18,timeStep:60
+});
+const events=[
+  gesture.feed({deltaX:7,deltaY:2,at:0}),
+  gesture.feed({deltaX:6,deltaY:-2,at:15}),
+  gesture.feed({deltaX:5,deltaY:1,at:30}),
+  gesture.feed({deltaX:-9,deltaY:1,at:131}),
+  gesture.feed({deltaX:-9,deltaY:-1,at:146}),
+];
+process.stdout.write(JSON.stringify(events));
+"""
+    )
+    assert [item["axis"] for item in out] == ["x", "x", "x", "x", "x"]
+    assert [item["timeSteps"] for item in out] == [0, 0, 1, 0, -1]
+    assert all(item["zSteps"] == 0 for item in out)
 
 
 def test_grid_diagonal_swipe_stays_on_time_and_idle_clears_remainder():
@@ -76,7 +98,7 @@ process.stdout.write(JSON.stringify({first,afterIdle}));
 """
     )
     assert [item["axis"] for item in out["first"]] == ["x", "x", "x", "x"]
-    assert sum(item["timeSteps"] for item in out["first"]) == 1
+    assert sum(item["timeSteps"] for item in out["first"]) == 2
     assert sum(item["zSteps"] for item in out["first"]) == 0
     assert out["afterIdle"]["axis"] == "y"
     assert out["afterIdle"]["zSteps"] == -1
@@ -131,3 +153,4 @@ def test_page_loads_axis_latch_before_the_app_and_app_uses_sessions():
     assert "Math.abs(ev.deltaX) > Math.abs(ev.deltaY)" not in app
     assert 'new GestureSession({ mode: "grid", idleMs: 100 })' in app
     assert 'new GestureSession({ mode: "focus", idleMs: 100 })' in app
+    assert '$("stage-wrap").addEventListener("wheel"' in app

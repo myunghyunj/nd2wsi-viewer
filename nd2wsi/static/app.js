@@ -4180,13 +4180,13 @@ function wirePlateWheel() {
     gridGesture.reset();
     focusGesture.reset();
   };
-  $("plate").addEventListener("wheel", (ev) => {
-    if (pl.focus !== null) return;
-    handle(ev, gridGesture);
-  }, { passive: false });
   $("stage-wrap").addEventListener("wheel", (ev) => {
-    if (pl.focus === null) return;
-    if (ev.target.closest("#time-line, #plate-block, #plate-strip, #plate-back, .mac-window")) return;
+    if (ev.target.closest("#time-line, #plate-strip, #plate-back, .mac-window")) return;
+    if (pl.focus === null) {
+      handle(ev, gridGesture);
+      return;
+    }
+    if (ev.target.closest("#plate-block")) return;
     handle(ev, focusGesture);
   }, { passive: false, capture: true });
 }

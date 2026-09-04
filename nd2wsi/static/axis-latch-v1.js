@@ -50,12 +50,16 @@
       const now = finiteNumber(at, clockNow());
       if (this.isNewGesture(now)) this.reset();
       this.lastAt = now;
-      this.sumX += Math.abs(finiteNumber(deltaX));
-      this.sumY += Math.abs(finiteNumber(deltaY));
+      // Use net displacement while deciding the axis. A real trackpad adds
+      // small, alternating cross-axis deltas as the fingers wobble; summing
+      // their magnitudes can make a clearly horizontal stroke look diagonal
+      // forever. Once selected, the axis remains latched until idle.
+      this.sumX += finiteNumber(deltaX);
+      this.sumY += finiteNumber(deltaY);
 
       if (!this.axis) {
-        const ax = this.sumX;
-        const ay = this.sumY;
+        const ax = Math.abs(this.sumX);
+        const ay = Math.abs(this.sumY);
         if (Math.max(ax, ay) < this.threshold) return null;
         if (ax >= ay * this.dominance) this.axis = "x";
         else if (ay >= ax * this.dominance) this.axis = "y";
@@ -71,10 +75,15 @@
       dominance = 1.2,
       threshold = 3,
       timeStep = 60,
+      timeStartStep = 18,
       zStep = 40,
     } = {}) {
       this.mode = mode === "focus" ? "focus" : "grid";
       this.timeStep = Math.max(1, finiteNumber(timeStep, 60));
+      this.timeStartStep = Math.min(
+        this.timeStep,
+        Math.max(1, finiteNumber(timeStartStep, 18)),
+      );
       this.zStep = Math.max(1, finiteNumber(zStep, 40));
       this.latch = new AxisLatch({ idleMs, dominance, threshold });
       this.reset();
@@ -84,6 +93,7 @@
       this.latch.reset();
       this.accX = 0;
       this.accY = 0;
+      this.timeStarted = false;
       this.focusYMode = null;
     }
 
@@ -99,6 +109,7 @@
       if (this.latch.isNewGesture(now)) {
         this.accX = 0;
         this.accY = 0;
+        this.timeStarted = false;
         this.focusYMode = this.mode === "focus" ? (altKey ? "z" : "zoom") : null;
       }
 
@@ -117,6 +128,14 @@
       if (!axis) return result;
 
       if (axis === "x") {
+        if (!this.timeStarted && Math.abs(this.accX) >= this.timeStartStep) {
+          const direction = Math.sign(this.accX);
+          this.accX -= direction * this.timeStartStep;
+          this.timeStarted = true;
+          result.timeSteps = direction;
+          return result;
+        }
+        if (!this.timeStarted) return result;
         const steps = Math.trunc(this.accX / this.timeStep);
         this.accX -= steps * this.timeStep;
         result.timeSteps = steps;
