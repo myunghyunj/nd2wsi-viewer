@@ -28,15 +28,18 @@ GET/POST /s/<sid>/api/annotations   sidecar annotations
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -420,27 +423,258 @@ def store_generation(store_path: str | Path) -> str:
 
 
 def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
-    """Lift annotation sidecars out of ``folder`` before it is deleted.
+    """Copy annotation sidecars out of ``folder`` before it is deleted.
 
     Annotations belong beside the slide, but a store built by an older
     version may hold them, and they are work rather than cache. Returns the
-    files moved to safety.
+    new safe copies. Any copy failure is fatal to cache deletion: the caller
+    must never destroy the only copy of user work.
     """
-    import shutil
-
     folder, home = Path(folder), Path(home)
+    try:
+        folder_stat = folder.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise OSError(f"could not inspect annotation source: {folder}") from exc
+    if not stat.S_ISDIR(folder_stat.st_mode):
+        raise ValueError(f"annotation source is not a real directory: {folder}")
     home.mkdir(parents=True, exist_ok=True)
+    folder_resolved = folder.resolve()
+    home_resolved = home.resolve()
+    if home_resolved == folder_resolved or folder_resolved in home_resolved.parents:
+        raise ValueError("annotation rescue destination is inside the doomed cache")
     saved = []
     for path in folder.rglob("annotations_*.json"):
-        target = home / path.name
-        if target.exists():
-            continue
         try:
-            shutil.move(str(path), str(target))
-        except OSError:
-            continue
-        saved.append(target)
+            source = path.read_bytes()
+        except OSError as exc:
+            raise OSError(f"could not read annotation before cache deletion: {path}") from exc
+        target = home / path.name
+        while True:
+            fd = None
+            owned_target = False
+            try:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                owned_target = True
+            except FileExistsError:
+                try:
+                    target_stat = target.lstat()
+                    # Never count a symlink as a safe rescue. It may merely
+                    # point back into the cache that is about to disappear.
+                    target_resolved = target.resolve(strict=True)
+                    outside_doomed = not (
+                        target_resolved == folder_resolved
+                        or folder_resolved in target_resolved.parents
+                    )
+                    if (
+                        stat.S_ISREG(target_stat.st_mode)
+                        and outside_doomed
+                        and target.read_bytes() == source
+                    ):
+                        break  # an identical safe copy already exists
+                except OSError:
+                    pass
+                # A same-named but distinct annotation is still user work.
+                # UUID allocation plus O_EXCL makes concurrent rescues safe.
+                target = home / (
+                    f"{path.stem}.rescued-{time.strftime('%Y%m%dT%H%M%S')}-"
+                    f"{uuid.uuid4().hex[:8]}{path.suffix}"
+                )
+                continue
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    fd = None  # the file object owns it now
+                    out.write(source)
+                    out.flush()
+                    os.fsync(out.fileno())
+                if target.read_bytes() != source:
+                    raise OSError(f"annotation verification failed: {target}")
+                # File fsync does not necessarily persist its new directory
+                # entry. Flush the destination directory when the filesystem
+                # supports it before the embedded original can be deleted.
+                dir_fd = None
+                try:
+                    dir_fd = os.open(
+                        home,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    os.fsync(dir_fd)
+                except OSError as exc:
+                    if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
+                        raise
+                finally:
+                    if dir_fd is not None:
+                        os.close(dir_fd)
+            except BaseException:
+                if fd is not None:
+                    os.close(fd)
+                if owned_target:
+                    try:
+                        target.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise
+            saved.append(target)
+            break
     return saved
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _open_child_directory(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> int:
+    """Open exactly one already-inspected child without following a symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not _same_file_identity(opened, expected)
+            or not _same_file_identity(opened, current)
+        ):
+            raise OSError(errno.EPERM, "cache directory changed during deletion", name)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _tree_totals_fd(directory_fd: int) -> tuple[int, int]:
+    files = 0
+    logical_bytes = 0
+    for name in os.listdir(directory_fd):
+        try:
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(entry.st_mode):
+            child_fd = _open_child_directory(directory_fd, name, entry)
+            try:
+                child_files, child_bytes = _tree_totals_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            files += child_files
+            logical_bytes += child_bytes
+        else:
+            files += 1
+            logical_bytes += int(entry.st_size)
+    return files, logical_bytes
+
+
+def _delete_tree_contents_fd(
+    directory_fd: int,
+    *,
+    total: int,
+    progress: list[int],
+    on_progress: Any,
+) -> int:
+    """Delete one opened tree without ever following a pathname symlink."""
+    freed = 0
+    for name in os.listdir(directory_fd):
+        try:
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(entry.st_mode):
+            child_fd = _open_child_directory(directory_fd, name, entry)
+            try:
+                freed += _delete_tree_contents_fd(
+                    child_fd,
+                    total=total,
+                    progress=progress,
+                    on_progress=on_progress,
+                )
+            finally:
+                os.close(child_fd)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not _same_file_identity(current, entry):
+                raise OSError(
+                    errno.EPERM,
+                    "cache directory changed during deletion",
+                    name,
+                )
+            os.rmdir(name, dir_fd=directory_fd)
+            continue
+
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            continue
+        freed += int(entry.st_size)
+        progress[0] += 1
+        if on_progress:
+            on_progress(min(progress[0] / max(1, total), 0.99))
+    return freed
+
+
+def _delete_verified_cache_tree(
+    path: Path,
+    expected: os.stat_result,
+    on_progress: Any = None,
+    root_fd: int | None = None,
+) -> int:
+    """Remove the captured cache inode with fd-relative, no-follow traversal."""
+    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    parent_fd = None
+    try:
+        # The caller may transfer an already-open cache root. Opening the
+        # parent can itself fail, so enter the cleanup scope before that first
+        # operation or the transferred descriptor would leak.
+        parent_fd = os.open(path.parent, parent_flags)
+        if root_fd is None:
+            root_fd = _open_child_directory(parent_fd, path.name, expected)
+        else:
+            opened = os.fstat(root_fd)
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not _same_file_identity(opened, expected)
+                or not _same_file_identity(opened, current)
+            ):
+                raise OSError(
+                    errno.EPERM,
+                    "cache root changed during deletion",
+                    str(path),
+                )
+        try:
+            total, _ = _tree_totals_fd(root_fd)
+            freed = _delete_tree_contents_fd(
+                root_fd,
+                total=total,
+                progress=[0],
+                on_progress=on_progress,
+            )
+        finally:
+            os.close(root_fd)
+            root_fd = None
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_file_identity(current, expected):
+            raise OSError(
+                errno.EPERM,
+                "cache root changed during deletion",
+                str(path),
+            )
+        os.rmdir(path.name, dir_fd=parent_fd)
+    except Exception as exc:
+        raise OSError(
+            f"cache deletion incomplete; remaining data was kept at {path}: {exc}"
+        ) from exc
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+    if on_progress:
+        on_progress(1.0)
+    return freed
 
 
 def _annotation_source_name(path: Path) -> str | None:
@@ -841,7 +1075,7 @@ class SlideRegistry:
 
     def add_plate(self, slide_path: str | Path) -> str:
         """Serve a time series of sites straight from the ND2, writing nothing."""
-        from .cache import quick_fingerprint
+        from .cache import fingerprints_match, quick_fingerprint
         from .direct import _Root
         from .plate import PlateSource
 
@@ -857,7 +1091,30 @@ class SlideRegistry:
             st = self.slides.get(sid)
             if st is not None and st.generation == gen and st.plate is not None:
                 return sid
-            source = PlateSource(slide_path)
+            # As with direct SVS, bind the registered generation to the exact
+            # source PlateSource opened. PlateSource itself checks its ND2 and
+            # raw handles; this outer retry closes the remaining gap between the
+            # registry fingerprint and that internally consistent open.
+            source = None
+            for _ in range(2):
+                candidate = PlateSource(slide_path)
+                try:
+                    current = quick_fingerprint(slide_path)
+                except BaseException:
+                    candidate.close()
+                    raise
+                if fingerprints_match(fingerprint, current):
+                    source = candidate
+                    fingerprint = current
+                    break
+                candidate.close()
+                fingerprint = current
+            if source is None:
+                raise RuntimeError(f"{slide_path.name} changed while it was opening")
+            gen = (
+                f"{int(fingerprint['mtime_ns']):x}-"
+                f"{str(fingerprint['quick_sha256'])[:16]}"
+            )
             try:
                 root = _Root(
                     source.root_for(0, 0, source.z_home), closer=source.close
@@ -951,6 +1208,16 @@ class SlideRegistry:
         """
         import os
 
+        from .cache import (
+            ANNOTATIONS_DIR,
+            CACHE_SUFFIX,
+            CACHES_DIR,
+            MANAGED_DIR,
+            CacheLock,
+        )
+        from .convert import CACHE_DIR_NAME
+
+        store_guard_fd = None
         with self._lock:
             st = self.slides.get(sid)
             if st is None:
@@ -958,14 +1225,19 @@ class SlideRegistry:
             if st.trash_path is None:
                 raise ValueError("this slide has no cache managed by this app")
             store = Path(st.trash_path)
-            from .cache import CACHE_SUFFIX
-
             if store.name.endswith(".ome.zarr") and store.parent.name.endswith(
                 CACHE_SUFFIX
             ):
                 store = store.parent  # the container owns manifest and store
-            valid_container = store.is_dir() and store.name.endswith(CACHE_SUFFIX)
-            valid_store = store.is_dir() and store.name.endswith(".ome.zarr")
+            try:
+                store_stat = store.stat(follow_symlinks=False)
+            except OSError:
+                store_stat = None
+            real_directory = bool(
+                store_stat is not None and stat.S_ISDIR(store_stat.st_mode)
+            )
+            valid_container = real_directory and store.name.endswith(CACHE_SUFFIX)
+            valid_store = real_directory and store.name.endswith(".ome.zarr")
             if not (valid_container or valid_store):
                 raise ValueError(f"refusing to delete {store}: not a managed cache")
             if st.busy.active:
@@ -973,87 +1245,177 @@ class SlideRegistry:
                     "an export from this slide is still running — try again "
                     "when it finishes"
                 )
-            self.slides.pop(sid, None)
-        # bar any export that raced the check above and wait it out, so the
-        # deletion below can never zero-fill a file someone is still writing
-        st.busy.close(timeout=30)
-        # a plate's builder writes chunks straight into the container, and
-        # zarr makes any directory it writes to, so a builder left running
-        # would put the store back moments after the delete reported it
-        # gone, this time without its manifest
-        if st.plate is not None and st.plate.store is not None:
-            st.plate.store.close()
-        close = getattr(st.root, "close", None)
-        if close:  # a source-backed slide holds the ND2 memory map open
-            close()
+            plate_store = (
+                st.plate.store
+                if st.plate is not None and st.plate.store is not None
+                else None
+            )
+            plate_source = st.plate if plate_store is not None else None
+            local_plate_writer = bool(plate_store is not None and plate_store.writable)
+            guard_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                guard_flags |= os.O_NOFOLLOW
+            store_guard_fd = os.open(store, guard_flags)
+            guarded_stat = os.fstat(store_guard_fd)
+            if not _same_file_identity(guarded_stat, store_stat):
+                os.close(store_guard_fd)
+                store_guard_fd = None
+                raise ValueError(
+                    f"refusing to delete {store}: cache root changed during validation"
+                )
+            store_stat = guarded_stat
 
-        from .cache import ANNOTATIONS_DIR, CACHES_DIR, MANAGED_DIR, CacheLock
-        from .convert import CACHE_DIR_NAME
-
-        if st.annotations_path is not None:
-            annotation_home = st.annotations_path.parent
-        elif store.name.endswith(CACHE_SUFFIX) and store.parent.name == CACHES_DIR:
-            annotation_home = store.parent.parent / ANNOTATIONS_DIR
-        elif store.parent.name == CACHE_DIR_NAME:
-            annotation_home = store.parent.parent / MANAGED_DIR / ANNOTATIONS_DIR
-        else:
-            annotation_home = store.parent / MANAGED_DIR / ANNOTATIONS_DIR
-        annotation_home.mkdir(parents=True, exist_ok=True)
-        rescue_annotations(store, annotation_home)
-
-        # under the build lock, the doomed directory is renamed aside
-        # before deletion: a concurrent opener either sees the intact
-        # container or none at all, never a half-deleted one
+        # Plate mutation uses the same order as open/create: the session writer
+        # first, then the short build lock. A locally writable store already
+        # owns the first lock; a read-only store must prove that its other
+        # process has gone away before deletion can begin.
+        writer = None
+        lock = None
+        ready_to_delete = False
         try:
+            if plate_store is not None and not local_plate_writer:
+                from .plate import PlateWriterLock
+
+                writer = PlateWriterLock(store)
+                try:
+                    writer.acquire(timeout=0.0)
+                except (TimeoutError, OSError):
+                    raise ValueError(
+                        "another viewer is writing this plate cache — close it "
+                        "before deleting"
+                    ) from None
+
             lock = CacheLock(store)
-            lock.acquire(timeout=10)
-        except TimeoutError:
-            raise ValueError(
-                "this slide's cache is being rebuilt right now — try again "
-                "when the build finishes"
-            ) from None
-        try:
-            doomed = store.with_name(f".{store.name}.trashing-{os.getpid()}")
-            store.rename(doomed)
+            try:
+                lock.acquire(timeout=10)
+            except TimeoutError:
+                raise ValueError(
+                    "this slide's cache is being rebuilt right now — try again "
+                    "when the build finishes"
+                ) from None
+
+            # Rescue user work before closing anything. Any read, durable-copy,
+            # or verification failure aborts deletion, leaving the live state
+            # registered and usable.
+            if st.annotations_path is not None:
+                annotation_home = st.annotations_path.parent
+            elif store.name.endswith(CACHE_SUFFIX) and store.parent.name == CACHES_DIR:
+                annotation_home = store.parent.parent / ANNOTATIONS_DIR
+            elif store.parent.name == CACHE_DIR_NAME:
+                annotation_home = store.parent.parent / MANAGED_DIR / ANNOTATIONS_DIR
+            else:
+                annotation_home = store.parent / MANAGED_DIR / ANNOTATIONS_DIR
+            annotation_home.mkdir(parents=True, exist_ok=True)
+            rescue_annotations(store, annotation_home)
+
+            # Lock acquisition can wait. Revalidate while holding the registry
+            # lock, bar late requests, and drain before the state is removed.
+            # Keeping the entry until close succeeds avoids stranding an open
+            # plate (and its writer lease) outside the registry on a timeout.
+            with self._lock:
+                if self.slides.get(sid) is not st:
+                    raise KeyError(sid)
+                if st.busy.active:
+                    raise ValueError(
+                        "an export from this slide is still running — try again "
+                        "when it finishes"
+                    )
+                if local_plate_writer and not plate_store.writable:
+                    raise ValueError(
+                        "this viewer lost the plate cache writer — reopen the "
+                        "slide before deleting"
+                    )
+                if not st.busy.close(timeout=30):
+                    # No resource was closed or renamed. Restore admission so a
+                    # timed-out delete cannot leave a listed but unusable slide.
+                    st.busy.reopen()
+                    raise ValueError(
+                        "an export from this slide did not finish in time — "
+                        "try again when it finishes"
+                    )
+
+                try:
+                    # A plate's builder writes chunks straight into the container.
+                    # Drain all source readers and stop it synchronously without
+                    # dropping a local writer lease; trash owns that lease through
+                    # the rename.
+                    if plate_source is not None:
+                        detached_writer = plate_source.close_for_trash()
+                        if local_plate_writer:
+                            writer = detached_writer
+                            if writer is None or not writer.acquired:
+                                raise RuntimeError(
+                                    "could not retain the plate cache writer"
+                                )
+                        elif detached_writer is not None:
+                            detached_writer.release()
+                            raise RuntimeError(
+                                "read-only plate unexpectedly held a writer"
+                            )
+                    else:
+                        close = getattr(st.root, "close", None)
+                        if close:  # source-backed roots own native file handles
+                            try:
+                                close(delay=0)
+                            except TypeError:
+                                close()
+                except BaseException:
+                    # PlateSource restores itself when a pre-teardown drain times
+                    # out. Once any backend close became irreversible, unregister
+                    # the state so a later open constructs fresh handles instead
+                    # of returning a listed-but-dead same-generation source.
+                    backend_closed = plate_source is None or bool(
+                        getattr(plate_source, "_closed", False)
+                    )
+                    if backend_closed:
+                        self.slides.pop(sid, None)
+                    else:
+                        st.busy.reopen()
+                    raise
+
+                # Closing is irreversible, so unregister and atomically remove
+                # the live pathname before releasing the registry lock. A
+                # concurrent current-build opener can then see either the old
+                # registered state or an absent cache, never install a new state
+                # in the pop-to-rename gap and have it deleted underneath it.
+                self.slides.pop(sid, None)
+                # Rename while the registry plus both filesystem locks are
+                # held. Current opens cannot bind this soon-to-be-deleted inode.
+                doomed = store.with_name(
+                    f".{store.name}.trashing-{os.getpid()}-{time.time_ns():x}"
+                )
+                store.rename(doomed)
+                renamed_stat = doomed.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(renamed_stat.st_mode)
+                    or not _same_file_identity(renamed_stat, store_stat)
+                    or not _same_file_identity(os.fstat(store_guard_fd), renamed_stat)
+                ):
+                    raise OSError(
+                        "cache root changed before deletion; retained safely at "
+                        f"{doomed}"
+                    )
+            # Close/rename is the commit boundary. Scan the renamed container a
+            # second time before releasing the writer/build locks so an old
+            # path-based producer that wrote between the first rescue and the
+            # rename cannot lose its last annotation copy.
+            rescue_annotations(doomed, annotation_home)
+            ready_to_delete = True
         finally:
-            lock.release()
-        store = doomed
-        # two passes, neither holding a path list: a store is hundreds of
-        # thousands of files and their names alone would be real memory
-        total = 0
-        freed = 0
-        for walk_root, _, files in os.walk(store):
-            total += len(files)
-            for name in files:
-                try:
-                    freed += os.stat(os.path.join(walk_root, name)).st_size
-                except OSError:
-                    pass
-        total = max(1, total)
-        step = max(1, total // 100)  # a hundred ticks, whatever the size
-        done = 0
-        for walk_root, _, files in os.walk(store):
-            for name in files:
-                try:
-                    os.unlink(os.path.join(walk_root, name))
-                except OSError:
-                    pass
-                done += 1
-                if on_progress and done % step == 0:
-                    on_progress(done / total)
-        for root, dirs, _ in os.walk(store, topdown=False):
-            for d in dirs:
-                try:
-                    os.rmdir(os.path.join(root, d))
-                except OSError:
-                    pass
-        try:
-            store.rmdir()
-        except OSError:
-            pass
-        if on_progress:
-            on_progress(1.0)
-        return freed
+            if lock is not None:
+                lock.release()
+            if writer is not None:
+                writer.release()
+            if not ready_to_delete and store_guard_fd is not None:
+                os.close(store_guard_fd)
+                store_guard_fd = None
+        guarded_fd, store_guard_fd = store_guard_fd, None
+        return _delete_verified_cache_tree(
+            doomed,
+            store_stat,
+            on_progress,
+            root_fd=guarded_fd,
+        )
 
     def default_sid(self) -> str | None:
         with self._lock:

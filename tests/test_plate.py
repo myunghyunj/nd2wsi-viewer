@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -24,7 +25,7 @@ def value(t: int, p: int, z: int) -> int:
     return 1000 + 100 * t + 10 * p + z
 
 
-def _write_plate(path, offset: int = 0) -> None:
+def _write_plate(path, offset: int = 0, value_at=None) -> None:
     attrs = limnd2.ImageAttributes.create(
         width=W, height=H, component_count=1, bits=16, sequence_count=T * P * Z
     )
@@ -39,7 +40,8 @@ def _write_plate(path, offset: int = 0) -> None:
         for t in range(T):
             for p in range(P):
                 for z in range(Z):
-                    f.setImage(seq, np.full((H, W, 1), value(t, p, z) + offset, np.uint16))
+                    level = value_at(t, p, z) if value_at is not None else value(t, p, z)
+                    f.setImage(seq, np.full((H, W, 1), level + offset, np.uint16))
                     seq += 1
         mf = limnd2.MetadataFactory(objective_magnification=20.0, pixel_calibration=0.5)
         mf.addPlane(name="br", color="#FFFFFF")
@@ -282,6 +284,40 @@ def test_open_path_registers_a_plate_and_writes_no_cache(plate_nd2):
         source.reduced(0, 0, 0, 2)
 
 
+def test_registry_retries_when_plate_fingerprint_changes_during_open(
+    plate_nd2, monkeypatch
+):
+    from nd2wsi import cache as cache_mod
+    from nd2wsi import plate as plate_mod
+    from nd2wsi.server import SlideRegistry
+
+    actual = cache_mod.quick_fingerprint(plate_nd2)
+    before = {**actual, "mtime_ns": int(actual["mtime_ns"]) - 1}
+    fingerprints = iter((before, actual, actual))
+    real_source = plate_mod.PlateSource
+    opened = []
+
+    def changing_fingerprint(_path):
+        return next(fingerprints)
+
+    def recording_source(path):
+        source = real_source(path)
+        opened.append(source)
+        return source
+
+    monkeypatch.setattr(cache_mod, "quick_fingerprint", changing_fingerprint)
+    monkeypatch.setattr(plate_mod, "PlateSource", recording_source)
+    registry = SlideRegistry()
+    try:
+        sid = registry.add_plate(plate_nd2)
+        assert len(opened) == 2
+        assert opened[0]._teardown_complete
+        assert registry.get(sid).plate is opened[1]
+        assert registry.get(sid).manifest["source"] == actual
+    finally:
+        registry.close_all(immediate=True)
+
+
 def test_add_store_takes_a_plate_file_and_refuses_other_nd2(plate_nd2, tmp_path):
     from nd2wsi.server import SlideRegistry
 
@@ -355,6 +391,425 @@ def test_store_fills_in_the_background_and_serves_the_second_open(plate_nd2, mon
         again.close()
 
 
+def test_missing_nonzero_shared_chunk_falls_back_and_repairs(plate_nd2, monkeypatch):
+    import zarr
+
+    from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
+    from nd2wsi.plate_integrity import zarr_v2_chunk_path
+
+    first = PlateSource(plate_nd2)
+    assert _wait_full(first), first.store.status()
+    container = plate_container(plate_nd2)
+    first.close()
+
+    t, p, z = 1, 1, 1
+    payload = zarr_v2_chunk_path(
+        container / THUMBS_NAME / "thumbs", (t, 0, z, 0, 0, 0)
+    )
+    assert payload.is_file()  # this shared block contains nonzero source pixels
+    payload.unlink()
+
+    # Exercise foreground detection and repair without a background warm pass
+    # winning the race first.
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    reads = {"n": 0}
+    real_read = PlateSource._read_raw
+
+    def counting_read(self, seq):
+        reads["n"] += 1
+        return real_read(self, seq)
+
+    monkeypatch.setattr(PlateSource, "_read_raw", counting_read)
+    repaired = PlateSource(plate_nd2)
+    try:
+        before = reads["n"]  # opening samples source pixels for display windows
+        frame = repaired.reduced(t, p, z, THUMB_K)
+        assert int(frame[0, 0, 0]) == value(t, p, z)
+        assert reads["n"] == before + 1
+        assert repaired.store.is_committed(t, p, z)
+        status = repaired.store.status()
+        assert status["integrityErrors"] == 1
+        assert status["repairPending"] == P - 1
+    finally:
+        repaired.close()
+
+    root = zarr.open_group(str(container / THUMBS_NAME), mode="r", zarr_format=2)
+    assert root["done"][t, p, z] == 1
+    assert root["digest"][t, p, z] != 0
+    for other in set(range(P)) - {p}:
+        assert root["done"][t, other, z] == 0
+        assert root["digest"][t, other, z] == 0
+
+    # The repaired frame survives a reopen and no longer needs the ND2.
+    verified = PlateSource(plate_nd2)
+    try:
+        before = reads["n"]
+        frame = verified.reduced(t, p, z, THUMB_K)
+        assert int(frame[0, 0, 0]) == value(t, p, z)
+        assert reads["n"] == before
+        assert verified.store.status()["integrityErrors"] == 0
+    finally:
+        verified.close()
+
+
+def test_decodable_wrong_thumbnail_fails_its_digest_and_repairs(plate_nd2, monkeypatch):
+    import zarr
+
+    from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
+    from nd2wsi.plate_integrity import digest_matches, zarr_v2_chunk_path
+
+    first = PlateSource(plate_nd2)
+    assert _wait_full(first), first.store.status()
+    container = plate_container(plate_nd2)
+    first.close()
+
+    t, p, z = 0, 2, 1
+    root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+    wrong = np.full(root["thumbs"].shape[3:], 42, dtype=np.uint16)
+    root["thumbs"][t, p, z] = wrong
+    assert np.array_equal(root["thumbs"][t, p, z], wrong)
+    payload = zarr_v2_chunk_path(
+        container / THUMBS_NAME / "thumbs", (t, 0, z, 0, 0, 0)
+    )
+    corrupt_payload = payload.read_bytes()
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    reads = {"n": 0}
+    real_read = PlateSource._read_raw
+
+    def counting_read(self, seq):
+        reads["n"] += 1
+        return real_read(self, seq)
+
+    monkeypatch.setattr(PlateSource, "_read_raw", counting_read)
+    repaired = PlateSource(plate_nd2)
+    try:
+        before = reads["n"]  # opening samples source pixels for display windows
+        frame = repaired.reduced(t, p, z, THUMB_K)
+        assert int(frame[0, 0, 0]) == value(t, p, z)
+        assert reads["n"] == before + 1
+        assert repaired.store.is_committed(t, p, z)
+        status = repaired.store.status()
+        assert status["integrityErrors"] == 1
+        assert status["repairPending"] == P - 1
+    finally:
+        repaired.close()
+
+    root = zarr.open_group(str(container / THUMBS_NAME), mode="r", zarr_format=2)
+    stored = np.asarray(root["thumbs"][t, p, z])
+    assert int(stored[0, 0, 0]) == value(t, p, z)
+    assert digest_matches(stored, root["digest"][t, p, z])
+    retained = list(payload.parent.glob(f"{payload.name}.corrupt-*"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == corrupt_payload
+    for other in set(range(P)) - {p}:
+        assert root["done"][t, other, z] == 0
+        assert root["digest"][t, other, z] == 0
+
+
+def test_shared_chunk_get_is_serialized_with_a_sibling_put(plate_nd2, monkeypatch):
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    source = PlateSource(plate_nd2)
+    t, z = 0, 0
+    source.reduced(t, 0, z, THUMB_K)
+    store = source.store
+    real_thumbs = store._thumbs
+    read_started = threading.Event()
+    release_read = threading.Event()
+    put_finished = threading.Event()
+    result = {}
+
+    class GatedThumbs:
+        def __getitem__(self, index):
+            block = real_thumbs[index]
+            if index == (t, slice(None), z):
+                read_started.set()
+                assert release_read.wait(timeout=10)
+            return block
+
+        def __setitem__(self, index, frame):
+            real_thumbs[index] = frame
+
+    store._thumbs = GatedThumbs()
+    reader = threading.Thread(
+        target=lambda: result.setdefault("first", store.get(t, 0, z)), daemon=True
+    )
+    expected = np.full(real_thumbs.shape[3:], value(t, 1, z), dtype=np.uint16)
+
+    def write_sibling():
+        result["put"] = store.put(t, 1, z, expected)
+        put_finished.set()
+
+    writer = threading.Thread(target=write_sibling, daemon=True)
+    try:
+        reader.start()
+        assert read_started.wait(timeout=5)
+        writer.start()
+        assert not put_finished.wait(timeout=0.1), "put raced a shared-chunk read"
+        release_read.set()
+        reader.join(timeout=5)
+        writer.join(timeout=5)
+        assert not reader.is_alive() and not writer.is_alive()
+        assert result["put"] is True
+        assert int(source.reduced(t, 1, z, THUMB_K)[0, 0, 0]) == value(t, 1, z)
+    finally:
+        release_read.set()
+        reader.join(timeout=5)
+        writer.join(timeout=5)
+        source.close()
+
+
+def test_undecodable_shared_chunk_is_quarantined_then_repaired(plate_nd2, monkeypatch):
+    import zarr
+
+    from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
+    from nd2wsi.plate_integrity import digest_matches, zarr_v2_chunk_path
+
+    first = PlateSource(plate_nd2)
+    assert _wait_full(first), first.store.status()
+    container = plate_container(plate_nd2)
+    first.close()
+
+    t, z = 1, 0
+    payload = zarr_v2_chunk_path(
+        container / THUMBS_NAME / "thumbs", (t, 0, z, 0, 0, 0)
+    )
+    assert payload.is_file()
+    payload.write_bytes(b"not-a-valid-zarr-chunk")
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+
+    repaired = PlateSource(plate_nd2)
+    try:
+        for p in range(P):
+            frame = repaired.reduced(t, p, z, THUMB_K)
+            assert int(frame[0, 0, 0]) == value(t, p, z)
+            assert repaired.store.is_committed(t, p, z)
+        status = repaired.store.status()
+        assert status["integrityErrors"] == 1
+        assert status["repairPending"] == 0
+        assert status["done"] == T * P * Z
+    finally:
+        repaired.close()
+
+    root = zarr.open_group(str(container / THUMBS_NAME), mode="r", zarr_format=2)
+    retained = list(payload.parent.glob(f"{payload.name}.corrupt-*"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == b"not-a-valid-zarr-chunk"
+    for p in range(P):
+        stored = np.asarray(root["thumbs"][t, p, z])
+        assert int(stored[0, 0, 0]) == value(t, p, z)
+        assert digest_matches(stored, root["digest"][t, p, z])
+
+
+def test_valid_all_zero_sparse_chunk_stays_committed_after_reopen(tmp_path, monkeypatch):
+    from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
+    from nd2wsi.plate_integrity import zarr_v2_chunk_path
+
+    t, z = 0, 1
+    path = tmp_path / "zero-block.nd2"
+    _write_plate(path, value_at=lambda ti, p, zi: 0 if (ti, zi) == (t, z) else value(ti, p, zi))
+
+    first = PlateSource(path)
+    try:
+        assert _wait_full(first), first.store.status()
+        assert all(first.store.is_committed(t, p, z) for p in range(P))
+    finally:
+        first.close()
+
+    payload = zarr_v2_chunk_path(
+        plate_container(path) / THUMBS_NAME / "thumbs", (t, 0, z, 0, 0, 0)
+    )
+    # Zarr normally elides this all-zero payload. Removing it explicitly also
+    # keeps the regression stable across supported Zarr patch versions.
+    payload.unlink(missing_ok=True)
+    assert not payload.exists()
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+
+    def unexpected_source_read(self, seq):
+        raise AssertionError("a digest-committed sparse zero frame should use the store")
+
+    reopened = PlateSource(path)
+    try:
+        # PlateSource construction legitimately samples the ND2 to choose
+        # display windows; only this cached thumbnail request must avoid it.
+        monkeypatch.setattr(reopened, "_read_raw", unexpected_source_read)
+        for p in range(P):
+            frame = reopened.reduced(t, p, z, THUMB_K)
+            assert not frame.any()
+            assert reopened.store.is_committed(t, p, z)
+        status = reopened.store.status()
+        assert status["done"] == T * P * Z
+        assert status["integrityErrors"] == 0
+        assert status["repairPending"] == 0
+        assert not payload.exists()
+    finally:
+        reopened.close()
+
+
+def test_nonwriter_root_is_read_only_and_refreshes_writer_progress(plate_nd2, monkeypatch):
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    writer = PlateSource(plate_nd2)
+    reader = None
+    try:
+        assert writer.store.writable
+        reader = PlateSource(plate_nd2)
+        assert not reader.store.writable
+        assert reader.store._root.store.read_only is True
+        assert reader.store.count() == 0
+
+        t, p, z = 1, 0, 1
+        written = writer.reduced(t, p, z, THUMB_K)
+        assert writer.store.is_committed(t, p, z)
+        reader.store._refresh(force=True)
+        assert reader.store.count() == 1
+        assert reader.store.is_committed(t, p, z)
+
+        def unexpected_source_read(seq):
+            raise AssertionError("the refreshed reader should use the writer's commit")
+
+        monkeypatch.setattr(reader, "_read_raw", unexpected_source_read)
+        np.testing.assert_array_equal(reader.reduced(t, p, z, THUMB_K), written)
+
+        other = np.full_like(written, 99)
+        assert not reader.store.put(t, 1, z, other)
+        assert writer.store.count() == 1
+    finally:
+        if reader is not None:
+            reader.close()
+        writer.close()
+
+
+def test_nonwriter_revalidates_after_the_writer_repairs_a_bad_site(plate_nd2, monkeypatch):
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    writer = PlateSource(plate_nd2)
+    reader = None
+    try:
+        t, p, z = 0, 1, 0
+        expected = writer.reduced(t, p, z, THUMB_K)
+        reader = PlateSource(plate_nd2)
+        reader.store._refresh(force=True)
+
+        writer.store._thumbs[t, p, z] = np.full_like(expected, 77)
+        assert reader.store.get(t, p, z) is None
+        assert reader.store.status()["repairPending"] == 1
+
+        assert writer.store.get(t, p, z) is None
+        np.testing.assert_array_equal(writer.reduced(t, p, z, THUMB_K), expected)
+        assert writer.store.is_committed(t, p, z)
+
+        reader.store._refresh(force=True)
+        np.testing.assert_array_equal(reader.store.get(t, p, z), expected)
+        assert reader.store.status()["repairPending"] == 0
+    finally:
+        if reader is not None:
+            reader.close()
+        writer.close()
+
+
+def test_each_open_has_a_distinct_ram_cache_owner(plate_nd2):
+    from nd2wsi.plate import PlateSource
+
+    first = PlateSource(plate_nd2, store=False)
+    second = PlateSource(plate_nd2, store=False)
+    try:
+        assert first._owner[0] == second._owner[0] == str(plate_nd2.resolve())
+        assert first._owner != second._owner
+        assert first._open_generation != second._open_generation
+    finally:
+        second.close()
+        first.close()
+
+
+def test_old_inflight_read_cannot_fill_a_replacement_sources_cache(tmp_path, monkeypatch):
+    from nd2wsi.plate import PlateSource
+
+    path = tmp_path / "replace.nd2"
+    replacement = tmp_path / "replacement.nd2"
+    _write_plate(path)
+    _write_plate(replacement, offset=7000)
+    first = PlateSource(path, store=False)
+    started = threading.Event()
+    release = threading.Event()
+    outcome = {}
+    real_read = first._read_raw
+
+    def gated_read(seq):
+        frame = real_read(seq)
+        started.set()
+        assert release.wait(timeout=10)
+        return frame
+
+    monkeypatch.setattr(first, "_read_raw", gated_read)
+    worker = threading.Thread(
+        target=lambda: outcome.setdefault("frame", first.frame(1, 2, 1)), daemon=True
+    )
+    second = None
+    try:
+        worker.start()
+        assert started.wait(timeout=10)
+        replacement.replace(path)
+        second = PlateSource(path, store=False)
+        release.set()
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert int(outcome["frame"][0, 0, 0]) == value(1, 2, 1)
+        assert int(second.frame(1, 2, 1)[0, 0, 0]) == value(1, 2, 1) + 7000
+        assert first._owner != second._owner
+    finally:
+        release.set()
+        worker.join(timeout=10)
+        if second is not None:
+            second.close()
+        first.close()
+
+
+def test_close_drains_inflight_frame_before_the_final_cache_purge(plate_nd2, monkeypatch):
+    from nd2wsi.plate import _FRAME_CACHE, PlateSource
+
+    source = PlateSource(plate_nd2, store=False)
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    outcome = {}
+    real_read = source._read_raw
+
+    def gated_read(seq):
+        frame = real_read(seq)
+        started.set()
+        assert release.wait(timeout=10)
+        return frame
+
+    monkeypatch.setattr(source, "_read_raw", gated_read)
+    key = (source._owner, "frame", 1, 2, 1)
+    reader = threading.Thread(
+        target=lambda: outcome.setdefault("frame", source.frame(1, 2, 1)), daemon=True
+    )
+    closer = threading.Thread(target=lambda: (source.close(), closed.set()), daemon=True)
+    try:
+        reader.start()
+        assert started.wait(timeout=10)
+        closer.start()
+        assert not closed.wait(timeout=0.1), "close did not wait for the active read"
+        release.set()
+        reader.join(timeout=10)
+        closer.join(timeout=10)
+        assert not reader.is_alive() and not closer.is_alive()
+        assert int(outcome["frame"][0, 0, 0]) == value(1, 2, 1)
+        assert _FRAME_CACHE.get(key) is None
+    finally:
+        release.set()
+        reader.join(timeout=10)
+        closer.join(timeout=10)
+        source.close()
+
+
 def test_store_is_rebuilt_when_the_file_changes(plate_nd2):
     from nd2wsi.plate import PlateSource, plate_container
 
@@ -373,6 +828,74 @@ def test_store_is_rebuilt_when_the_file_changes(plate_nd2):
     finally:
         src.close()
     assert plate_container(plate_nd2).exists()
+
+
+def test_legacy_plate_cache_rebuilds_from_source_before_gaining_integrity(
+    plate_nd2, monkeypatch
+):
+    import zarr
+
+    from nd2wsi.plate import (
+        THUMB_K,
+        THUMBS_NAME,
+        PlateSource,
+        PlateStore,
+        plate_container,
+    )
+    from nd2wsi.plate_integrity import DIGEST_NAME
+
+    first = PlateSource(plate_nd2)
+    assert _wait_full(first), first.store.status()
+    container = plate_container(plate_nd2)
+    first.close()
+
+    manifest_path = container / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("integrity", None)
+    manifest_path.write_text(json.dumps(manifest))
+    root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+    del root[DIGEST_NAME]
+    wrong_t, wrong_p, wrong_z = 0, 1, 0
+    root["thumbs"][wrong_t, wrong_p, wrong_z] = np.full(
+        root["thumbs"].shape[3:], 77, dtype=np.uint16
+    )
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    upgraded = PlateSource(plate_nd2)
+    reader = PlateSource(plate_nd2)
+    try:
+        # A V1 done bit cannot prove that decodable bytes still match the ND2.
+        # No legacy frame is served or blessed until source-backed reduction
+        # writes a fresh digest for it.
+        assert upgraded.store.status()["done"] == 0
+        assert reader.store.status()["done"] == 0
+        assert upgraded.store.get(wrong_t, wrong_p, wrong_z) is None
+        first_rebuilt = upgraded.reduced(wrong_t, wrong_p, wrong_z, THUMB_K)
+        reader.store._refresh(force=True)
+        np.testing.assert_array_equal(
+            reader.store.get(wrong_t, wrong_p, wrong_z), first_rebuilt
+        )
+        for t in range(T):
+            for z in range(Z):
+                for p in range(P):
+                    rebuilt = upgraded.reduced(t, p, z, THUMB_K)
+                    assert int(rebuilt[0, 0, 0]) == value(t, p, z)
+        assert upgraded.store.status()["done"] == T * P * Z
+        reader.store._refresh(force=True)
+        assert reader.store.manifest["integrity"]["digest_name"] == DIGEST_NAME
+        assert reader.store.status()["done"] == T * P * Z
+    finally:
+        reader.close()
+        upgraded.close()
+
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["format"] == "nd2wsi-plate/1"
+    assert manifest["integrity"]["digest_name"] == DIGEST_NAME
+    root = zarr.open_group(str(container / THUMBS_NAME), mode="r", zarr_format=2)
+    assert np.asarray(root[DIGEST_NAME][:], dtype=np.uint64).all()
+    assert int(root["thumbs"][wrong_t, wrong_p, wrong_z, 0, 0, 0]) == value(
+        wrong_t, wrong_p, wrong_z
+    )
 
 
 def test_status_route_and_trash_remove_the_store(served):
@@ -396,7 +919,7 @@ def test_status_route_and_trash_remove_the_store(served):
     assert (path.parent / "nd2wsi" / "annotations").exists()
 
 
-def test_store_in_the_old_layout_is_rebuilt_not_set_aside(plate_nd2):
+def test_store_in_the_old_layout_is_quarantined_before_rebuild(plate_nd2):
     import zarr
 
     from nd2wsi.plate import THUMBS_NAME, PlateSource, plate_container
@@ -413,6 +936,9 @@ def test_store_in_the_old_layout_is_rebuilt_not_set_aside(plate_nd2):
     per_frame = (1, 1, 1) + tuple(arr.chunks[3:])
     del root["thumbs"]
     root.create_array("thumbs", shape=data.shape, chunks=per_frame, dtype=data.dtype)[:] = data
+    annotation_name = "annotations_legacy.json"
+    annotation_body = '{"items":[{"kind":"pin"}]}'
+    (container / annotation_name).write_text(annotation_body)
     src = PlateSource(plate_nd2)
     try:
         assert tuple(src.store._thumbs.chunks) == (1, P, 1) + per_frame[3:]
@@ -420,8 +946,45 @@ def test_store_in_the_old_layout_is_rebuilt_not_set_aside(plate_nd2):
         assert _wait_full(src), src.store.status()
     finally:
         src.close()
-    # the old store was ours and superseded, so nothing is set aside
-    assert not [p for p in container.parent.iterdir() if ".corrupt-" in p.name]
+    # Even an obsolete cache may contain user work left by an older build.
+    # Rebuild into a fresh container and preserve the complete predecessor.
+    quarantined = list(container.parent.glob(f"{container.name}.corrupt-*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / annotation_name).read_text() == annotation_body
+    assert container.exists()
+
+
+def test_cached_histogram_rejects_same_path_source_replacement(plate_nd2):
+    from nd2wsi.plate import PlateSource
+
+    source = PlateSource(plate_nd2, store=False)
+    replacement = plate_nd2.with_name("replacement.nd2")
+    try:
+        cached = source.histogram(1, 2, 1)
+        assert source.histogram(1, 2, 1) is cached
+        _write_plate(replacement, offset=7000)
+        replacement.replace(plate_nd2)
+
+        with pytest.raises(ValueError, match="changed while it was open"):
+            source.histogram(1, 2, 1)
+    finally:
+        source.close()
+
+
+def test_focus_map_rejects_same_path_source_replacement(plate_nd2):
+    from nd2wsi.plate import PlateSource
+
+    source = PlateSource(plate_nd2, store=False)
+    replacement = plate_nd2.with_name("focus-replacement.nd2")
+    try:
+        source.focus_map()
+        _write_plate(replacement, offset=8000)
+        replacement.replace(plate_nd2)
+
+        with pytest.raises(ValueError, match="changed while it was open"):
+            source.focus_map()
+    finally:
+        source.close()
 
 
 # ---- autofocus -------------------------------------------------------------
@@ -661,3 +1224,528 @@ def test_two_channel_frames_are_not_interleaved(tmp_path):
         assert int(served[1, 0, 0]) == value(1, 2, 0) + 5000
     finally:
         src.close()
+
+
+# ---- cache correctness and lifecycle regressions ---------------------------
+
+
+def test_status_names_the_writer_and_storeless_fallback(plate_nd2, monkeypatch):
+    from nd2wsi.plate import PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    writer = PlateSource(plate_nd2)
+    reader = PlateSource(plate_nd2)
+    storeless = PlateSource(plate_nd2, store=False)
+    try:
+        assert writer.status()["writer"] is True
+        assert reader.status()["writer"] is False
+        assert writer.status()["format"] == "nd2wsi-plate/1"
+        assert storeless.status() == {
+            "done": 0,
+            "total": T * P * Z,
+            "perT": [0] * T,
+            "path": None,
+            "format": None,
+            "building": False,
+            "writer": False,
+            "integrityErrors": 0,
+            "repairPending": 0,
+        }
+    finally:
+        storeless.close()
+        reader.close()
+        writer.close()
+
+
+def test_status_uses_one_committed_snapshot(plate_nd2, monkeypatch):
+    from nd2wsi.plate import PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    source = PlateSource(plate_nd2)
+    store = source.store
+    real_mask = store._committed_mask
+    calls = {"n": 0}
+
+    def mutate_after_snapshot():
+        snapshot = np.array(real_mask(), copy=True)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            store._digest_np[0, 0, 0] = 1
+            store._done_np[0, 0, 0] = True
+        return snapshot
+
+    monkeypatch.setattr(store, "_committed_mask", mutate_after_snapshot)
+    try:
+        status = store.status()
+        assert calls["n"] == 1
+        assert status["done"] == sum(status["perT"])
+    finally:
+        source.close()
+
+
+def test_integrity_done_without_digest_is_repaired_in_the_same_build(plate_nd2):
+    import zarr
+
+    from nd2wsi.plate import THUMBS_NAME, PlateSource, plate_container
+    from nd2wsi.plate_integrity import DIGEST_NAME, UNCOMMITTED_DIGEST
+
+    first = PlateSource(plate_nd2)
+    assert _wait_full(first), first.store.status()
+    container = plate_container(plate_nd2)
+    first.close()
+
+    t, p, z = 1, 2, 1
+    root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+    assert root["done"][t, p, z] == 1
+    root[DIGEST_NAME][t, p, z] = UNCOMMITTED_DIGEST
+
+    repaired = PlateSource(plate_nd2)
+    try:
+        # The builder must regard done=1/digest=0 as missing.  If it only
+        # discovers the bad commit during its final warm pass, it exits with
+        # eleven effective commits and this wait never succeeds.
+        assert _wait_full(repaired, timeout=5.0), repaired.store.status()
+        assert repaired.store.is_committed(t, p, z)
+        assert repaired.store._digest_np[t, p, z] != UNCOMMITTED_DIGEST
+    finally:
+        repaired.close()
+
+
+def test_focus_map_masks_undone_and_reader_local_invalid_scores(tmp_path, monkeypatch):
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore
+
+    path = tmp_path / "focus-mask.nd2"
+    _write_focus_plate(path)
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    writer = PlateSource(path)
+    reader = None
+    try:
+        t, z = 0, 1
+        writer.reduced(t, 1, z, THUMB_K)
+        # Simulate a stale positive focus score whose payload is not committed.
+        writer.store._focus_np[t, 0, z] = 123.0
+        writer.store._focus_dirty += 1
+        writer.store.flush_focus()
+
+        reader = PlateSource(path)
+        reader.store._invalid[t, 1, z] = True
+        focus = reader.focus_map()
+        assert focus["measured"] == 0
+        assert focus["best"][t] == [reader.z_home] * P
+    finally:
+        if reader is not None:
+            reader.close()
+        writer.close()
+
+
+def test_completed_focus_block_becomes_visible_to_a_second_viewer(
+    tmp_path, monkeypatch
+):
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore
+
+    path = tmp_path / "focus-progress.nd2"
+    _write_focus_plate(path)
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    writer = PlateSource(path)
+    reader = PlateSource(path)
+    try:
+        assert writer.status()["writer"] is True
+        assert reader.status()["writer"] is False
+        assert reader.focus_map()["measured"] == 0
+
+        t, z = 0, 1
+        for p in range(P):
+            writer.reduced(t, p, z, THUMB_K)
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            focus = reader.focus_map()
+            if focus["measured"] == P:
+                break
+            time.sleep(0.05)
+        assert focus["measured"] == P
+        assert focus["best"][t] == [z] * P
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_start_failure_closes_the_opened_store_and_releases_writer(
+    plate_nd2, monkeypatch
+):
+    from nd2wsi.plate import PlateSource, PlateStore
+
+    real_close = PlateStore.close
+    closed = []
+
+    def fail_start(self):
+        raise RuntimeError("synthetic start failure")
+
+    def recording_close(self, *, release_writer=True, timeout=30.0):
+        closed.append(self)
+        return real_close(self, release_writer=release_writer, timeout=timeout)
+
+    monkeypatch.setattr(PlateStore, "start", fail_start)
+    monkeypatch.setattr(PlateStore, "close", recording_close)
+    fallback = PlateSource(plate_nd2)
+    successor = None
+    try:
+        assert fallback.store is None
+        assert len(closed) == 1
+        assert fallback.status()["writer"] is False
+
+        monkeypatch.setattr(PlateStore, "start", lambda self: None)
+        successor = PlateSource(plate_nd2)
+        assert successor.store is not None
+        assert successor.store.writable
+    finally:
+        if successor is not None:
+            successor.close()
+        fallback.close()
+
+
+def test_concurrent_store_starts_create_only_one_worker(plate_nd2, monkeypatch):
+    from nd2wsi.plate import PlateSource, PlateStore
+
+    real_start = PlateStore.start
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    source = PlateSource(plate_nd2)
+    store = source.store
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    calls_lock = threading.Lock()
+
+    def gated_build():
+        with calls_lock:
+            calls.append(threading.current_thread())
+        entered.set()
+        assert release.wait(timeout=10)
+
+    monkeypatch.setattr(store, "_build", gated_build)
+    monkeypatch.setattr(PlateStore, "start", real_start)
+    barrier = threading.Barrier(9)
+    callers = [
+        threading.Thread(target=lambda: (barrier.wait(), store.start()), daemon=True)
+        for _ in range(8)
+    ]
+    try:
+        for caller in callers:
+            caller.start()
+        barrier.wait()
+        for caller in callers:
+            caller.join(timeout=5)
+        assert all(not caller.is_alive() for caller in callers)
+        assert entered.wait(timeout=5)
+        assert len(calls) == 1
+        assert store._thread is calls[0]
+    finally:
+        release.set()
+        for caller in callers:
+            caller.join(timeout=5)
+        source.close()
+
+
+def test_same_size_preserved_mtime_replacement_is_detected_while_opening(
+    tmp_path, monkeypatch
+):
+    from nd2wsi import plate as plate_mod
+
+    path = tmp_path / "opening-swap.nd2"
+    replacement = tmp_path / "replacement.nd2"
+    _write_plate(path)
+    _write_plate(replacement, offset=7000)
+    original = path.stat()
+    replacement_stat = replacement.stat()
+    assert replacement_stat.st_size == original.st_size
+    os.utime(
+        replacement,
+        ns=(replacement.stat().st_atime_ns, original.st_mtime_ns),
+    )
+    assert replacement.stat().st_mtime_ns == original.st_mtime_ns
+
+    real_nd2_file = nd2.ND2File
+
+    def open_then_swap(open_path):
+        handle = real_nd2_file(open_path)
+        replacement.replace(path)
+        return handle
+
+    monkeypatch.setattr(nd2, "ND2File", open_then_swap)
+    with pytest.raises(ValueError, match="changed while it was opening"):
+        plate_mod.PlateSource(path, store=False)
+
+
+def test_reader_detaches_when_cache_generation_at_its_path_changes(
+    plate_nd2, monkeypatch
+):
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore, plate_container
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    writer = PlateSource(plate_nd2)
+    reader = PlateSource(plate_nd2)
+    replacement = None
+    try:
+        old_generation = reader.store.manifest["generation"]
+        container = plate_container(plate_nd2)
+        aside = container.with_name(container.name + ".old-generation")
+        writer.close()
+        writer = None
+        container.rename(aside)
+
+        replacement = PlateSource(plate_nd2)
+        assert replacement.store.manifest["generation"] != old_generation
+
+        t, p, z = 1, 2, 1
+        reader.store._refresh(force=True)
+        assert reader.store.get(t, p, z) is None
+        assert reader.store.count() == 0
+        assert reader.store.writable is False
+        frame = reader.reduced(t, p, z, THUMB_K)
+        assert int(frame[0, 0, 0]) == value(t, p, z)
+    finally:
+        if replacement is not None:
+            replacement.close()
+        reader.close()
+        if writer is not None:
+            writer.close()
+
+
+def test_failed_trash_drain_reopens_the_source_for_reads(plate_nd2):
+    from nd2wsi.plate import PlateSource
+
+    source = PlateSource(plate_nd2, store=False)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_read():
+        with source._life:
+            entered.set()
+            assert release.wait(timeout=10)
+
+    active = threading.Thread(target=hold_read, daemon=True)
+    active.start()
+    try:
+        assert entered.wait(timeout=5)
+        with pytest.raises(RuntimeError, match="timed out waiting for plate reads"):
+            source.close_for_trash(timeout=0.01)
+        assert source._closed is False
+        assert source._life.closed is False
+        assert not source._f.closed
+        release.set()
+        active.join(timeout=5)
+        assert int(source.frame(1, 2, 1)[0, 0, 0]) == value(1, 2, 1)
+    finally:
+        release.set()
+        active.join(timeout=5)
+        source.close()
+
+
+def test_failed_trash_worker_stop_reopens_source_and_keeps_writer(plate_nd2, monkeypatch):
+    from nd2wsi.plate import PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    source = PlateSource(plate_nd2)
+    store = source.store
+
+    class StuckWorker:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            assert timeout == pytest.approx(0.01)
+
+    store._thread = StuckWorker()
+    try:
+        with pytest.raises(RuntimeError, match="timed out stopping"):
+            source.close_for_trash(timeout=0.01)
+        assert source._closed is False
+        assert source._life.closed is False
+        assert store._stop is False
+        assert store.writable
+        assert int(source.frame(1, 2, 1)[0, 0, 0]) == value(1, 2, 1)
+    finally:
+        store._thread = None
+        source.close()
+
+
+@pytest.mark.parametrize("failure_site", ["nd2_close", "prefetch_join"])
+def test_trash_close_returns_writer_after_cleanup_error(
+    plate_nd2, monkeypatch, failure_site
+):
+    from nd2wsi.plate import PlateSource, PlateStore, PlateWriterLock, plate_container
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    source = PlateSource(plate_nd2)
+    real_file = source._f
+
+    class CloseThenError:
+        def __getattr__(self, name):
+            return getattr(real_file, name)
+
+        def close(self):
+            real_file.close()
+            raise OSError("injected close report")
+
+    if failure_site == "nd2_close":
+        source._f = CloseThenError()
+    else:
+        class BrokenPrefetch:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                raise RuntimeError("injected prefetch join failure")
+
+        source._pf_thread = BrokenPrefetch()
+    writer = None
+    try:
+        writer = source.close_for_trash(timeout=1.0)
+        assert writer is not None and writer.acquired
+        assert source._teardown_complete
+        assert source._source_file.closed
+        assert source._fd == -1
+
+        contender = PlateWriterLock(plate_container(plate_nd2))
+        with pytest.raises(TimeoutError):
+            contender.acquire(timeout=0.05)
+    finally:
+        if writer is not None:
+            writer.release()
+        source.close()
+
+    successor = PlateWriterLock(plate_container(plate_nd2))
+    successor.acquire(timeout=0.1)
+    successor.release()
+
+
+def test_ordinary_close_timeout_stays_barred_and_finishes_after_drain(
+    plate_nd2, monkeypatch
+):
+    from nd2wsi.plate import PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    source = PlateSource(plate_nd2)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_read():
+        with source._life:
+            entered.set()
+            assert release.wait(timeout=10)
+
+    active = threading.Thread(target=hold_read, daemon=True)
+    active.start()
+    successor = None
+    try:
+        assert entered.wait(timeout=5)
+        assert source.store.writable
+        source.close(timeout=0.01)
+        retry = source._close_retry
+        assert retry is not None and retry.is_alive()
+        assert source._closed is True
+        assert source._life.closed is True
+        assert not source._f.closed
+        with pytest.raises(ValueError, match="closed"):
+            source.frame(0, 0, 0)
+
+        release.set()
+        active.join(timeout=5)
+        retry.join(timeout=5)
+        assert not retry.is_alive()
+        assert source._teardown_complete
+        assert source._f.closed
+        assert source._fd == -1
+
+        successor = PlateSource(plate_nd2)
+        assert successor.store.writable
+    finally:
+        release.set()
+        active.join(timeout=5)
+        if successor is not None:
+            successor.close()
+        source.close()
+
+
+def test_close_thread_start_failure_finishes_teardown_synchronously(
+    plate_nd2, monkeypatch
+):
+    from nd2wsi.plate import PlateSource, PlateStore, PlateWriterLock, plate_container
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    source = PlateSource(plate_nd2)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_read():
+        with source._life:
+            entered.set()
+            assert release.wait(timeout=10)
+
+    active = threading.Thread(target=hold_read, daemon=True)
+    active.start()
+    assert entered.wait(timeout=5)
+    release_timer = threading.Timer(0.1, release.set)
+    release_timer.start()
+    real_start = threading.Thread.start
+
+    def fail_close_retry(thread):
+        if thread.name == "plate-close-retry":
+            raise RuntimeError("injected close retry start failure")
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_close_retry)
+    try:
+        source.close(timeout=0.01)
+        active.join(timeout=5)
+        release_timer.join(timeout=5)
+        assert source._teardown_complete
+        assert source._close_retry is None
+        assert source._fd == -1
+
+        successor = PlateWriterLock(plate_container(plate_nd2))
+        successor.acquire(timeout=0.1)
+        successor.release()
+    finally:
+        release.set()
+        active.join(timeout=5)
+        release_timer.join(timeout=5)
+        source.close()
+
+
+def test_close_thread_start_failure_after_worker_timeout_releases_writer(
+    plate_nd2, monkeypatch
+):
+    from nd2wsi.plate import PlateSource, PlateStore, PlateWriterLock, plate_container
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    source = PlateSource(plate_nd2)
+
+    class StopsOnlyForUnboundedJoin:
+        def __init__(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            if timeout is None:
+                self.alive = False
+
+    source.store._thread = StopsOnlyForUnboundedJoin()
+    real_start = threading.Thread.start
+
+    def fail_close_retry(thread):
+        if thread.name == "plate-close-retry":
+            raise RuntimeError("injected close retry start failure")
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_close_retry)
+    source.close(timeout=0.01)
+
+    assert source._teardown_complete
+    assert source._close_retry is None
+    assert source._fd == -1
+    successor = PlateWriterLock(plate_container(plate_nd2))
+    successor.acquire(timeout=0.1)
+    successor.release()

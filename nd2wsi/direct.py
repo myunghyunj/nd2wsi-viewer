@@ -89,11 +89,22 @@ class _Lifecycle:
         with self._cv:
             return self._n
 
-    def close(self, timeout: float = 300.0) -> bool:
+    def close(self, timeout: float | None = 300.0) -> bool:
         """Bar new reads, wait for running ones. True when fully drained."""
         with self._cv:
             self.closed = True
             return self._cv.wait_for(lambda: self._n == 0, timeout)
+
+    def reopen(self) -> None:
+        """Admit reads again after a close attempt timed out.
+
+        Callers may only use this when no backing handle was closed.  Active
+        readers can remain counted: they still refer to the same live handle,
+        and a later close attempt will wait for them as usual.
+        """
+        with self._cv:
+            self.closed = False
+            self._cv.notify_all()
 
 
 class _Root(dict):

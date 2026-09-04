@@ -1,4 +1,9 @@
 """Fast unit tests that need no ND2 file."""
+import os
+import stat
+import threading
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -231,9 +236,103 @@ def test_rescue_annotations_lifts_work_out_of_a_doomed_folder(tmp_path):
 
     saved = rescue_annotations(store.parent, tmp_path)
     assert (tmp_path / "annotations_a.json").exists()
-    assert [p.name for p in saved] == ["annotations_a.json"]
+    assert len(saved) == 2
+    assert any(p.name == "annotations_a.json" for p in saved)
     # an existing file beside the slide is never overwritten
     assert (tmp_path / "annotations_b.json").read_text() == "keep me"
+    rescued = [p for p in saved if p.name.startswith("annotations_b.rescued-")]
+    assert len(rescued) == 1
+    assert rescued[0].read_text() == "newer duplicate"
+
+
+def test_concurrent_annotation_rescues_preserve_both_colliding_files(
+    tmp_path, monkeypatch
+):
+    from nd2wsi.server import rescue_annotations
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    home = tmp_path / "safe"
+    first.mkdir()
+    second.mkdir()
+    home.mkdir()
+    name = "annotations_same.json"
+    (first / name).write_text("first")
+    (second / name).write_text("second")
+
+    barrier = threading.Barrier(2)
+    real_open = os.open
+
+    def synchronized_open(path, flags, mode=0o777):
+        if Path(path) == home / name and flags & os.O_EXCL:
+            barrier.wait(timeout=5)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", synchronized_open)
+    errors = []
+
+    def rescue(folder):
+        try:
+            rescue_annotations(folder, home)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=rescue, args=(folder,)) for folder in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert {path.read_text() for path in home.glob("annotations_same*.json")} == {
+        "first",
+        "second",
+    }
+
+
+def test_rescue_never_accepts_a_symlink_back_into_the_doomed_cache(tmp_path):
+    from nd2wsi.server import rescue_annotations
+
+    folder = tmp_path / "doomed"
+    home = tmp_path / "safe"
+    folder.mkdir()
+    home.mkdir()
+    source = folder / "annotations_precious.json"
+    source.write_text('{"items":[1]}')
+    unsafe = home / source.name
+    unsafe.symlink_to(source)
+
+    saved = rescue_annotations(folder, home)
+
+    assert len(saved) == 1
+    assert saved[0] != unsafe and not saved[0].is_symlink()
+    assert saved[0].read_text() == source.read_text()
+    source.unlink()
+    assert saved[0].read_text() == '{"items":[1]}'
+    assert not unsafe.exists()  # the rejected symlink is now dangling
+
+
+def test_rescue_flushes_the_destination_directory(tmp_path, monkeypatch):
+    from nd2wsi.server import rescue_annotations
+
+    folder = tmp_path / "doomed"
+    home = tmp_path / "safe"
+    folder.mkdir()
+    (folder / "annotations_a.json").write_text('{"items":[]}')
+    real_fsync = os.fsync
+    directory_syncs = []
+
+    def record_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_syncs.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    saved = rescue_annotations(folder, home)
+
+    assert len(saved) == 1 and saved[0].read_text() == '{"items":[]}'
+    assert directory_syncs
 
 
 def test_auto_tile_follows_the_volume(monkeypatch, tmp_path):
