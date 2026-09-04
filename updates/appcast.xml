@@ -3,6 +3,15 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>1.2.4</title>
+            <pubDate>Sat, 05 Sep 2026 07:20:30 +0900</pubDate>
+            <sparkle:version>1.2.4</sparkle:version>
+            <sparkle:shortVersionString>1.2.4</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.4/nd2wsi-viewer.dmg" length="69726246" type="application/octet-stream" sparkle:edSignature="wO8tG8AYiRTqDgRsyTydFxMo3j7uBswikpDfXSa/UEpWuz0Ds/drzI50pfd6k+6WlnJ1YPus0UkFwPVHpjZjDQ=="/>
+        </item>
+        <item>
             <title>1.2.3</title>
             <pubDate>Sat, 05 Sep 2026 00:59:22 +0900</pubDate>
             <sparkle:version>1.2.3</sparkle:version>
@@ -19,15 +28,6 @@
             <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.2/nd2wsi-viewer.dmg" length="68757609" type="application/octet-stream" sparkle:edSignature="Cqw7ZHP0Lizo5dkmpUPCtZXKRq2tUcfcryS2a469kYx3OfdPCcs0JY20ucyKzD8dBKQs0G6cNbCfOEm61mRHAQ=="/>
-        </item>
-        <item>
-            <title>1.2.1</title>
-            <pubDate>Fri, 04 Sep 2026 21:38:21 +0900</pubDate>
-            <sparkle:version>1.2.1</sparkle:version>
-            <sparkle:shortVersionString>1.2.1</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.1/nd2wsi-viewer.dmg" length="70389670" type="application/octet-stream" sparkle:edSignature="bgkkd69BiVQuTg0dztrY7JHy946R9XtXli0P/rflbQZezC+uFO6gtoHqusb5tTguxV1r4bVYLAfVVwNstEozBw=="/>
         </item>
     </channel>
 </rss>
