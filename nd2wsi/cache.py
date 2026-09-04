@@ -21,16 +21,21 @@ over in nd2wsi/annotations/ and no cache operation deletes them.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import socket
+import stat
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from .session_lock import SessionFileLock
 
 MANAGED_DIR = "nd2wsi"
 CACHES_DIR = "caches"
@@ -46,7 +51,6 @@ OVERVIEW_FORMAT = "nd2wsi-cache/3"
 KNOWN_FORMATS = (MANIFEST_FORMAT, OVERVIEW_FORMAT)
 ALGORITHM = "box-mean-floor-v1"
 
-_LOCK_STALE_S = 4 * 3600
 # A lock names the machine and boot that took it. A drive carried to
 # another computer brings its lockfiles along, and a pid from the other
 # machine means nothing here: the builder cannot be alive on this side.
@@ -264,97 +268,319 @@ def quarantine(path: Path) -> Path:
 class CacheLock:
     """One build per source and selection, across processes.
 
-    An O_EXCL lockfile beside the container carries pid, start time and a
-    random generation. The payload lands on the raw fd before anything
-    else can matter, release removes only a lock this instance created,
-    and a stale lock is reclaimed by atomically renaming it aside — so
-    two waiters can never both count one reclaim, and nobody ever unlinks
-    a live lock they do not own.
+    The JSON lockfile beside the container remains the public protocol for
+    older nd2wsi-viewer builds.  Current builds additionally serialize each
+    inspect/claim transaction with a persistent kernel-locked arbiter inode.
+    A stale JSON lock is claimed in place through an open descriptor, and
+    release writes a stale tombstone through that same descriptor instead of
+    unlinking by pathname. Consequently current-build contenders cannot remove
+    a successor's lock. Older builds still understand the JSON/tombstone, but
+    cannot participate in the new arbiter protocol.
     """
 
     def __init__(self, container: Path):
         self.path = container.with_name(container.name + ".lock")
         self._gen: str | None = None
+        self._fd: int | None = None
+        self._arbiter = SessionFileLock(
+            self.path.with_name(self.path.name + ".arbiter")
+        )
+        self._mutex = threading.RLock()
 
     def _read(self, path: Path | None = None) -> dict[str, Any] | None:
         try:
-            return json.loads((path or self.path).read_text())
+            info = json.loads((path or self.path).read_text())
         except (OSError, json.JSONDecodeError):
             return None
+        return info if isinstance(info, dict) else None
 
-    def _stale(self) -> bool:
-        info = self._read()
+    @staticmethod
+    def _read_fd(fd: int) -> tuple[dict[str, Any] | None, os.stat_result]:
+        st = os.fstat(fd)
+        try:
+            info = json.loads(os.pread(fd, st.st_size, 0))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            info = None
+        return (info if isinstance(info, dict) else None), st
+
+    @staticmethod
+    def _write_fd(fd: int, payload: bytes) -> None:
+        """Replace one opened lock inode's small payload without path lookup."""
+        view = memoryview(payload)
+        offset = 0
+        while view:
+            written = os.pwrite(fd, view, offset)
+            if written <= 0:
+                raise OSError("short write while updating cache lock")
+            offset += written
+            view = view[written:]
+        os.ftruncate(fd, offset)
+
+    def _path_is_fd(self, fd: int) -> bool:
+        try:
+            held = os.fstat(fd)
+            current = os.stat(self.path, follow_symlinks=False)
+        except OSError:
+            return False
+        return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+    @staticmethod
+    def _safe_lock_inode(st: os.stat_result) -> bool:
+        """Only lockfiles with one regular pathname are safe to overwrite."""
+        return stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+
+    @staticmethod
+    def _payload(gen: str, *, released: bool = False) -> bytes:
+        info: dict[str, Any] = {
+            "pid": None if released else os.getpid(),
+            "time": time.time(),
+            "gen": gen,
+            "machine": _MACHINE_ID,
+        }
+        if released:
+            info["released"] = True
+        return json.dumps(info).encode()
+
+    def _abandon_claim(self, fd: int, gen: str) -> None:
+        """Best-effort stale marker after a claim write could not complete."""
+        try:
+            self._write_fd(fd, self._payload(gen, released=True))
+            return
+        except OSError:
+            pass
+        try:
+            os.ftruncate(fd, 0)
+            os.utime(fd, (0, 0))
+        except OSError:
+            # If even invalidation fails, the ordinary malformed-lock grace is
+            # still preferable to unlinking a pathname a legacy process may
+            # have replaced concurrently.
+            pass
+
+    def _install_claim(self, fd: int, payload: bytes, gen: str) -> bool:
+        """Install a claim, never leaving a valid live orphan on failure."""
+        try:
+            self._write_fd(fd, payload)
+        except OSError:
+            # A final truncate can fail after the complete JSON already landed.
+            # In that case the claim is usable and must be retained rather than
+            # abandoned as an unowned live-PID lock.
+            try:
+                info, _ = self._read_fd(fd)
+            except OSError:
+                info = None
+            if (
+                info is not None
+                and info.get("gen") == gen
+                and info.get("pid") == os.getpid()
+                and info.get("machine") == _MACHINE_ID
+                and info.get("released") is not True
+                and self._path_is_fd(fd)
+            ):
+                return True
+            self._abandon_claim(fd, gen)
+            raise
+
+        if self._path_is_fd(fd):
+            return True
+        # A legacy process replaced the pathname while ignoring the current
+        # arbiter. Make our now-detached inode stale before closing it.
+        self._abandon_claim(fd, gen)
+        return False
+
+    @staticmethod
+    def _stale_info(info: dict[str, Any] | None, mtime: float) -> bool:
         if info is None:
             # unreadable or momentarily empty: only old age makes it stale
-            try:
-                age = time.time() - self.path.stat().st_mtime
-            except OSError:
-                return False  # vanished: not ours to reclaim
-            return age > 30
-        age = time.time() - info.get("time", 0)
+            return time.time() - mtime > 30
+        if info.get("released") is True:
+            return True
         machine = info.get("machine")
         if machine is not None and machine != _MACHINE_ID:
             # taken on another machine: its process cannot be running
             # here, and only clock skew argues for a short grace
+            try:
+                age = time.time() - float(info.get("time", 0))
+            except (TypeError, ValueError, OverflowError):
+                age = time.time() - mtime
             return age > _FOREIGN_LOCK_STALE_S
-        if age > _LOCK_STALE_S:
-            # the pid probe alone cannot see a recycled pid: after a crash
-            # an unrelated process may wear the builder's number forever,
-            # so very old locks age out no matter what the probe says
-            return True
+        # A current or older viewer may hold this compatibility lock for a
+        # whole session.  A PID proven live on this machine therefore wins
+        # over wall-clock age; only a dead/invalid PID is reclaimable.
         pid = info.get("pid")
         try:
-            os.kill(int(pid), 0)
+            pid = int(pid)
+            if pid <= 0:
+                return True
+            os.kill(pid, 0)
             return False
-        except (ProcessLookupError, TypeError, ValueError):
+        except (ProcessLookupError, TypeError, ValueError, OverflowError):
             return True
         except PermissionError:
             return False
 
-    def _reclaim(self) -> None:
-        """Take a stale lock out of play; only one contender can win."""
-        aside = self.path.with_name(f"{self.path.name}.reclaim-{uuid.uuid4().hex[:8]}")
+    def _stale(self) -> bool:
         try:
-            self.path.rename(aside)
+            fd = os.open(self.path, os.O_RDONLY)
         except OSError:
-            return  # someone else reclaimed it first
-        aside.unlink(missing_ok=True)
+            return False
+        try:
+            info, st = self._read_fd(fd)
+            return self._stale_info(info, st.st_mtime)
+        finally:
+            os.close(fd)
 
     def acquire(self, timeout: float = 3600.0, poll: float = 0.5) -> None:
-        deadline = time.time() + timeout
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        gen = uuid.uuid4().hex
-        payload = json.dumps(
-            {"pid": os.getpid(), "time": time.time(), "gen": gen, "machine": _MACHINE_ID}
-        )
-        while True:
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                try:
-                    os.write(fd, payload.encode())
-                finally:
-                    os.close(fd)
-                self._gen = gen
+        timeout = max(0.0, float(timeout))
+        poll = max(0.001, float(poll))
+        deadline = time.monotonic() + timeout
+        with self._mutex:
+            if self._fd is not None:
                 return
-            except FileExistsError:
-                if self._stale():
-                    self._reclaim()
-                    continue
-                if time.time() > deadline:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            gen = uuid.uuid4().hex
+            while True:
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    self._arbiter.acquire(timeout=remaining, poll=poll)
+                except TimeoutError:
                     raise TimeoutError(
                         f"another process is building {self.path.stem}"
                     ) from None
-                time.sleep(poll)
+
+                fd: int | None = None
+                acquired = False
+                try:
+                    # Stamp the claim only after waiting for the arbiter. A
+                    # freshly acquired lock must not inherit its wait time.
+                    payload = self._payload(gen)
+                    try:
+                        fd = os.open(
+                            self.path,
+                            os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                        )
+                        acquired = self._install_claim(fd, payload, gen)
+                    except FileExistsError:
+                        try:
+                            fd = os.open(
+                                self.path,
+                                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                        except FileNotFoundError:
+                            fd = None
+                        except OSError as exc:
+                            # A symlink or other unsafe pathname is an occupied
+                            # lock, not a target to follow or overwrite.
+                            if exc.errno == errno.ELOOP:
+                                fd = None
+                            else:
+                                raise
+                        if fd is not None:
+                            info, st = self._read_fd(fd)
+                            if self._safe_lock_inode(st) and self._stale_info(
+                                info, st.st_mtime
+                            ):
+                                # Claim the exact stale inode we inspected. If
+                                # an older build replaced the path meanwhile,
+                                # this write lands only on the detached inode.
+                                acquired = self._install_claim(fd, payload, gen)
+
+                    if acquired and fd is not None:
+                        self._fd = fd
+                        self._gen = gen
+                        fd = None
+                        return
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+                    self._arbiter.release()
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"another process is building {self.path.stem}"
+                    ) from None
+                time.sleep(min(poll, remaining))
+
+    def refresh(self) -> bool:
+        """Renew this lock's timestamp without touching a successor's lock.
+
+        The descriptor retained at acquisition pins the owned inode. A
+        concurrent legacy replacement receives a different inode and is never
+        overwritten. The generation stored on the opened inode remains the
+        ownership authority.
+        """
+        with self._mutex:
+            gen, fd = self._gen, self._fd
+            if gen is None or fd is None:
+                return False
+            try:
+                self._arbiter.acquire(timeout=5.0, poll=0.05)
+            except (TimeoutError, OSError):
+                return False
+            try:
+                try:
+                    info, _ = self._read_fd(fd)
+                    if info is None or info.get("gen") != gen:
+                        return False
+                    info["time"] = time.time()
+                    self._write_fd(fd, json.dumps(info).encode())
+                    return self._path_is_fd(fd)
+                except OSError:
+                    return False
+            finally:
+                self._arbiter.release()
 
     def release(self) -> None:
-        if self._gen is None:
-            return
-        info = self._read()
-        if info is not None and info.get("gen") != self._gen:
-            self._gen = None
-            return  # reclaimed out from under us: that lock is not ours
-        self.path.unlink(missing_ok=True)
-        self._gen = None
+        with self._mutex:
+            gen, fd = self._gen, self._fd
+            if gen is None or fd is None:
+                return
+            # Serialize the tombstone with current-build claim attempts. If the
+            # arbiter is unavailable, close locally without writing: a contender
+            # may already have this same inode open, and an unsynchronized late
+            # truncate could corrupt its successor claim. That rare path fails
+            # closed (the live-PID JSON remains until process exit) but must not
+            # prevent outer cleanup such as releasing the plate session lock.
+            arbiter_acquired = False
+            try:
+                try:
+                    self._arbiter.acquire(timeout=30.0, poll=0.05)
+                    arbiter_acquired = True
+                except (TimeoutError, OSError):
+                    pass
+                if arbiter_acquired:
+                    try:
+                        info, _ = self._read_fd(fd)
+                        if info is not None and info.get("gen") == gen:
+                            # Keep the pathname/inode intact and make it immediately
+                            # reclaimable by both current and legacy builds. Writing
+                            # through ``fd`` cannot affect a successor that replaced it.
+                            info.update(
+                                {"pid": None, "time": time.time(), "released": True}
+                            )
+                            self._write_fd(fd, json.dumps(info).encode())
+                    except OSError:
+                        # With the arbiter held, invalidating this exact inode is
+                        # safe; the malformed-lock grace can then reclaim it.
+                        try:
+                            os.ftruncate(fd, 0)
+                            os.utime(fd, (0, 0))
+                        except OSError:
+                            pass
+            finally:
+                try:
+                    if arbiter_acquired:
+                        self._arbiter.release()
+                except OSError:
+                    pass
+                finally:
+                    self._gen = None
+                    self._fd = None
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def __enter__(self) -> CacheLock:
         self.acquire()

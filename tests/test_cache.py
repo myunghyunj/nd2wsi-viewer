@@ -9,6 +9,8 @@ all of that.
 
 import json
 import os
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -149,7 +151,195 @@ def test_build_lock_serializes_concurrent_builders(slide):
     container.parent.mkdir(parents=True, exist_ok=True)
     stale = CacheLock(container)
     stale.path.write_text(json.dumps({"pid": 99999999, "time": 0}))
-    CacheLock(container).acquire(timeout=2)
+    reclaimed = CacheLock(container)
+    reclaimed.acquire(timeout=2)
+    reclaimed.release()
+
+
+def test_build_lock_with_live_local_pid_never_ages_out(slide):
+    container = cache_container(slide)
+    held = CacheLock(container)
+    held.acquire()
+    try:
+        info = json.loads(held.path.read_text())
+        info["time"] = time.time() - 5 * 3600
+        held.path.write_text(json.dumps(info))
+
+        with pytest.raises(TimeoutError):
+            CacheLock(container).acquire(timeout=0.1, poll=0.01)
+    finally:
+        held.release()
+
+
+def test_lock_refresh_renews_only_its_own_inode(slide, monkeypatch):
+    container = cache_container(slide)
+    held = CacheLock(container)
+    held.acquire()
+
+    monkeypatch.setattr(time, "time", lambda: 1234.5)
+    assert held.refresh()
+    refreshed = json.loads(held.path.read_text())
+    assert refreshed["time"] == 1234.5
+
+    replacement = {
+        "pid": os.getpid(),
+        "time": 5678.0,
+        "gen": "replacement",
+        "machine": "replacement-machine",
+    }
+
+    def replace_then_report_time():
+        successor = held.path.with_name(held.path.name + ".successor")
+        successor.write_text(json.dumps(replacement))
+        successor.replace(held.path)
+        return 9999.0
+
+    monkeypatch.setattr(time, "time", replace_then_report_time)
+    assert not held.refresh()
+    held.release()
+
+    assert json.loads(held.path.read_text()) == replacement
+
+
+def test_claim_timestamp_is_created_after_waiting_for_arbiter(slide, monkeypatch):
+    container = cache_container(slide)
+    held = CacheLock(container)
+    now = {"value": 10.0}
+    real_acquire = held._arbiter.acquire
+
+    monkeypatch.setattr(time, "time", lambda: now["value"])
+
+    def acquire_after_wait(*args, **kwargs):
+        now["value"] = 90.0
+        return real_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(held._arbiter, "acquire", acquire_after_wait)
+    held.acquire()
+    try:
+        assert json.loads(held.path.read_text())["time"] == 90.0
+    finally:
+        held.release()
+
+
+def test_failed_claim_write_does_not_leave_a_live_orphan(
+    slide, monkeypatch
+):
+    container = cache_container(slide)
+    failed = CacheLock(container)
+    real_write = CacheLock._write_fd
+    fail_once = {"value": True}
+
+    def partial_write_then_fail(fd, payload):
+        info = json.loads(payload)
+        if fail_once["value"] and not info.get("released"):
+            fail_once["value"] = False
+            os.pwrite(fd, payload[:12], 0)
+            os.ftruncate(fd, 12)
+            raise OSError("injected incomplete claim")
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(
+        CacheLock, "_write_fd", staticmethod(partial_write_then_fail)
+    )
+    with pytest.raises(OSError, match="injected incomplete claim"):
+        failed.acquire(timeout=0.1)
+
+    info = json.loads(failed.path.read_text())
+    assert info["released"] is True
+    assert info["pid"] is None
+
+    successor = CacheLock(container)
+    successor.acquire(timeout=0.1, poll=0.01)
+    successor.release()
+
+
+def test_release_closes_without_writing_when_arbiter_is_unavailable(
+    slide, monkeypatch
+):
+    container = cache_container(slide)
+    held = CacheLock(container)
+    held.acquire()
+    owned_fd = held._fd
+    original = held.path.read_bytes()
+    writes = []
+
+    def timeout(*args, **kwargs):
+        raise TimeoutError("injected wedged arbiter")
+
+    real_write = CacheLock._write_fd
+
+    def record_write(fd, payload):
+        writes.append((fd, payload))
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(CacheLock, "_write_fd", staticmethod(record_write))
+    monkeypatch.setattr(held._arbiter, "acquire", timeout)
+    held.release()
+
+    assert writes == []
+    assert held.path.read_bytes() == original
+    assert held._fd is None and held._gen is None
+    with pytest.raises(OSError):
+        os.fstat(owned_fd)
+    info = json.loads(held.path.read_text())
+    assert info.get("released") is not True
+    assert info["pid"] == os.getpid()
+
+    # Safety wins over liveness in this exceptional path: no unsynchronized
+    # writer may corrupt a successor, so the compatibility lease remains live
+    # until this process exits (simulated here with a dead owner).
+    successor = CacheLock(container)
+    with pytest.raises(TimeoutError):
+        successor.acquire(timeout=0.05, poll=0.01)
+    info["pid"] = 99999999
+    held.path.write_text(json.dumps(info))
+    successor.acquire(timeout=0.1, poll=0.01)
+    successor.release()
+
+
+def test_release_write_failure_is_invalidated_under_the_arbiter(
+    slide, monkeypatch
+):
+    container = cache_container(slide)
+    held = CacheLock(container)
+    held.acquire()
+    owned_fd = held._fd
+    real_write = CacheLock._write_fd
+
+    def fail_tombstone(fd, payload):
+        if json.loads(payload).get("released"):
+            raise OSError("injected tombstone failure")
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(CacheLock, "_write_fd", staticmethod(fail_tombstone))
+    held.release()
+
+    assert held._fd is None and held._gen is None
+    with pytest.raises(OSError):
+        os.fstat(owned_fd)
+    assert held.path.read_bytes() == b""
+
+    successor = CacheLock(container)
+    successor.acquire(timeout=0.1, poll=0.01)
+    successor.release()
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_lock_never_overwrites_a_linked_file(slide, tmp_path, link_kind):
+    container = cache_container(slide)
+    lock = CacheLock(container)
+    lock.path.parent.mkdir(parents=True, exist_ok=True)
+    unrelated = tmp_path / f"unrelated-{link_kind}.json"
+    original = '{"do_not_touch": true}'
+    unrelated.write_text(original)
+    if link_kind == "symlink":
+        lock.path.symlink_to(unrelated)
+    else:
+        os.link(unrelated, lock.path)
+
+    with pytest.raises(TimeoutError):
+        lock.acquire(timeout=0.05, poll=0.01)
+    assert unrelated.read_text() == original
 
 
 def test_explicit_convert_is_never_quarantined_mid_build(slide, tmp_path):
@@ -196,6 +386,113 @@ def test_lock_release_never_removes_a_reclaimed_lock(slide):
     with pytest.raises(TimeoutError):
         CacheLock(container).acquire(timeout=0.3, poll=0.1)
     b.release()
+
+
+def test_stale_reclaim_is_serialized_before_a_successor_can_be_claimed(
+    slide, monkeypatch
+):
+    """A delayed stale observer must not take the first claimant's lock."""
+    container = cache_container(slide)
+    stale = CacheLock(container)
+    stale.path.parent.mkdir(parents=True, exist_ok=True)
+    stale.path.write_text(json.dumps({"pid": 99999999, "time": 0}))
+
+    entered_write = threading.Event()
+    allow_write = threading.Event()
+    first_acquired = threading.Event()
+    second_acquired = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    errors = []
+    gate = threading.Lock()
+    paused = {"value": False}
+    real_write = CacheLock._write_fd
+
+    def gated_write(fd, payload):
+        info = json.loads(payload)
+        with gate:
+            should_pause = (
+                info.get("pid") == os.getpid()
+                and not info.get("released")
+                and not paused["value"]
+            )
+            if should_pause:
+                paused["value"] = True
+        if should_pause:
+            entered_write.set()
+            if not allow_write.wait(timeout=5):
+                raise TimeoutError("test did not release the stale claimant")
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(CacheLock, "_write_fd", staticmethod(gated_write))
+    first = CacheLock(container)
+    second = CacheLock(container)
+
+    def hold(lock, acquired, release):
+        try:
+            lock.acquire(timeout=5, poll=0.01)
+            acquired.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release acquired cache lock")
+        except BaseException as exc:  # surfaced in the parent test thread
+            errors.append(exc)
+        finally:
+            lock.release()
+
+    a = threading.Thread(
+        target=hold, args=(first, first_acquired, release_first), daemon=True
+    )
+    b = threading.Thread(
+        target=hold, args=(second, second_acquired, release_second), daemon=True
+    )
+    try:
+        a.start()
+        assert entered_write.wait(timeout=5)
+        b.start()
+        assert not second_acquired.wait(timeout=0.1)
+        allow_write.set()
+        assert first_acquired.wait(timeout=5)
+        assert not second_acquired.wait(timeout=0.1)
+        release_first.set()
+        assert second_acquired.wait(timeout=5)
+    finally:
+        allow_write.set()
+        release_first.set()
+        release_second.set()
+        a.join(timeout=5)
+        b.join(timeout=5)
+
+    assert not a.is_alive() and not b.is_alive()
+    assert not errors
+
+
+def test_release_writes_only_its_fd_when_successor_arrives(slide, monkeypatch):
+    """Replacement at the old read/unlink race point must remain untouched."""
+    container = cache_container(slide)
+    held = CacheLock(container)
+    held.acquire()
+    replacement = {
+        "pid": os.getpid(),
+        "time": 6789.0,
+        "gen": "legacy-successor",
+        "machine": "legacy-machine",
+    }
+    real_write = CacheLock._write_fd
+
+    def replace_during_release(fd, payload):
+        info = json.loads(payload)
+        if info.get("released"):
+            successor = held.path.with_name(held.path.name + ".successor")
+            successor.write_text(json.dumps(replacement))
+            successor.replace(held.path)
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(
+        CacheLock, "_write_fd", staticmethod(replace_during_release)
+    )
+    held.release()
+
+    assert json.loads(held.path.read_text()) == replacement
 
 
 def test_sweep_clears_stranded_backups_and_stagings(tmp_path):
@@ -287,8 +584,9 @@ def test_lock_from_another_machine_is_reclaimed_even_with_a_live_pid(slide):
     foreign.path.write_text(json.dumps({
         "pid": os.getpid(), "time": time.time() - 120, "gen": "x", "machine": "elsewhere",
     }))
-    CacheLock(container).acquire(timeout=2)
-    CacheLock(container).release()  # not ours; must not unlink the new lock
+    reclaimed = CacheLock(container)
+    reclaimed.acquire(timeout=2)
+    reclaimed.release()
     # a foreign lock younger than the grace period still holds
     foreign.path.write_text(json.dumps({
         "pid": os.getpid(), "time": time.time(), "gen": "y", "machine": "elsewhere",
