@@ -670,8 +670,11 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95), 0 0 0 0.5px rgba(0, 0, 0, 0.18), 0 3px 6px rgba(0, 0, 0, 0.22);
 }
 #z-knob:focus-visible { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95), 0 0 0 2px var(--accent), 0 3px 6px rgba(0, 0, 0, 0.22); }
+/* the capsule hangs to the left of the slider in both views: anchored
+   to its right it ran past the window edge in the grid, where the
+   slider is the last column and the page never scrolls */
 #z-label {
-  position: absolute; left: 36px; transform: translateY(-50%); white-space: nowrap; pointer-events: none;
+  position: absolute; right: 30px; transform: translateY(-50%); white-space: nowrap; pointer-events: none;
   height: 22px; display: inline-flex; align-items: center; padding: 0 9px; border-radius: 999px;
   background: var(--material); box-shadow: var(--window-shadow); font-size: 11px; color: var(--label); font-variant-numeric: tabular-nums;
   -webkit-backdrop-filter: blur(20px) saturate(160%); backdrop-filter: blur(20px) saturate(160%);
@@ -748,7 +751,7 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 #stage-wrap.plate-focus #plate-col-heads, #stage-wrap.plate-focus #plate-transpose { display: none; }
 #stage-wrap.plate-focus #plate-block { position: absolute; right: 12px; top: 28px; bottom: 96px; display: block; pointer-events: auto; }
 #stage-wrap.plate-focus #z-slider { height: 100%; }
-#stage-wrap.plate-focus #z-label { left: auto; right: 30px; }
+
 #plate-strip {
   display: none; position: absolute; left: 12px; top: 56px; bottom: 96px; flex-direction: column; gap: 8px; padding: 8px;
   border-radius: 14px; background: var(--material); box-shadow: var(--window-shadow);

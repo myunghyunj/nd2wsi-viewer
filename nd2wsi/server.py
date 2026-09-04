@@ -977,6 +977,12 @@ class SlideRegistry:
         # bar any export that raced the check above and wait it out, so the
         # deletion below can never zero-fill a file someone is still writing
         st.busy.close(timeout=30)
+        # a plate's builder writes chunks straight into the container, and
+        # zarr makes any directory it writes to, so a builder left running
+        # would put the store back moments after the delete reported it
+        # gone, this time without its manifest
+        if st.plate is not None and st.plate.store is not None:
+            st.plate.store.close()
         close = getattr(st.root, "close", None)
         if close:  # a source-backed slide holds the ND2 memory map open
             close()

@@ -3564,8 +3564,10 @@ function markFrameLoaded(img) {
   const key = img.dataset.frame;
   const tz = img.dataset.group;
   if (!key || !tz) return;
+  // the set counts sites, not frames: with autofocus a site whose plane
+  // moved would otherwise count twice and fill the band on its own
   const seen = (pl.loaded.get(tz) || new Set());
-  seen.add(key);
+  seen.add(key.split("/")[1]);
   pl.loaded.set(tz, seen);
   if (seen.size >= state.info.plate.P && tz.endsWith("/" + plateGroupKey())) renderTimeLine();
 }

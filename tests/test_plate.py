@@ -604,3 +604,60 @@ def test_only_one_viewer_writes_the_store(plate_nd2):
         assert third.store.writable
     finally:
         third.close()
+
+
+def _write_two_channel_plate(path) -> None:
+    """A plate whose frames carry two channels, each a flat level, so an
+    interleaved read shows up as a channel that is not flat."""
+    attrs = limnd2.ImageAttributes.create(
+        width=W, height=H, component_count=2, bits=16, sequence_count=T * P * Z
+    )
+    with limnd2.Nd2Writer(str(path)) as f:
+        f.imageAttributes = attrs
+        f.experiment = limnd2.ExperimentFactory(
+            t=T,
+            m={"count": P, "xcoords": [100.0, 7000.0, 100.0], "ycoords": [0.0, 0.0, 6000.0]},
+            z={"count": Z, "step": 5.0},
+        ).createExperiment()
+        seq = 0
+        for t in range(T):
+            for p in range(P):
+                for z in range(Z):
+                    frame = np.empty((H, W, 2), np.uint16)
+                    frame[:, :, 0] = value(t, p, z)
+                    frame[:, :, 1] = value(t, p, z) + 5000
+                    f.setImage(seq, frame)
+                    seq += 1
+        mf = limnd2.MetadataFactory(objective_magnification=20.0, pixel_calibration=0.5)
+        mf.addPlane(name="gfp", color="#00FF00")
+        mf.addPlane(name="br", color="#FFFFFF")
+        f.pictureMetadata = mf.createMetadata()
+
+
+def test_two_channel_frames_are_not_interleaved(tmp_path):
+    """The bytes on disk run (H, W, C); the fast read used to reshape them
+    straight into (C, H, W), which put half of each channel in the other."""
+    from nd2wsi.plate import PlateSource
+
+    path = tmp_path / "twoch.nd2"
+    _write_two_channel_plate(path)
+    src = PlateSource(path)
+    try:
+        assert src.frame_shape[0] == 2, src.frame_shape
+        seq = src.seq(1, 2, 0)
+        fast = src._read_raw(seq)
+        with nd2.ND2File(str(path)) as f:
+            # nd2 hands back a view onto its memory map, which is gone
+            # once the file closes, so the copy happens inside
+            truth = np.array(f.read_frame(seq), copy=True)
+        assert fast.shape == truth.shape == (2, H, W)
+        assert np.array_equal(fast, truth)
+        # each channel is one level, so interleaving could not hide here
+        assert int(fast[0].min()) == int(fast[0].max()) == value(1, 2, 0)
+        assert int(fast[1].min()) == int(fast[1].max()) == value(1, 2, 0) + 5000
+        # and the frame the viewer serves agrees
+        served = src.frame_view(1, 2, 0)
+        assert int(served[0, 0, 0]) == value(1, 2, 0)
+        assert int(served[1, 0, 0]) == value(1, 2, 0) + 5000
+    finally:
+        src.close()

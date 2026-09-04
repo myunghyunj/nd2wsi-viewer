@@ -97,12 +97,22 @@ def is_plate_file(path: str | Path) -> bool:
 
 
 def _cluster_1d(values: list[float]) -> list[int]:
-    """Cluster index per value, ascending, split at gaps wider than
-    ``max(2000 um, 0.3 * span)``."""
+    """Cluster index per value, ascending, split where the step between
+    neighbours stands out.
+
+    The threshold is half the widest step, not a fraction of the whole
+    extent. Measured against the extent, five or more evenly spaced rows
+    had no step wide enough to count as a gap and the plate collapsed
+    into one track; half the widest step splits them and still holds a
+    column together when its sites are spread over a few millimetres.
+    The floor keeps the stage's own wobble, tens of micrometres, from
+    splitting one row in two.
+    """
     n = len(values)
     order = sorted(range(n), key=lambda i: values[i])
-    span = values[order[-1]] - values[order[0]]
-    gap = max(2000.0, 0.3 * span)
+    steps = [d for d in (values[b] - values[a] for a, b in zip(order, order[1:])) if d > 0]
+    widest = max(steps) if steps else 0.0
+    gap = max(1000.0, 0.5 * widest)
     labels = [0] * n
     c = 0
     for prev, cur in zip(order, order[1:]):
@@ -661,8 +671,12 @@ class PlateSource:
         self._pf_queue: deque[tuple[int, int, int, int]] = deque()
         self._pf_set: set[tuple[int, int, int, int]] = set()
         self._pf_thread: threading.Thread | None = None
-        # a replaced file must never alias frames a previous open reduced
+        # a replaced file must never alias frames a previous open reduced.
+        # Both caches are keyed by the path, and frame() answers from its
+        # cache before the size and mtime guard runs, so leaving the frame
+        # cache alone would serve the predecessor's pixels
         _REDUCED_CACHE.purge(self._owner)
+        _FRAME_CACHE.purge(self._owner)
 
         self._fd = -1
         self._fg = 0  # foreground reads in flight; the prefetch worker yields to them
@@ -702,6 +716,15 @@ class PlateSource:
             warnings.simplefilter("ignore")
             raw0 = f.read_frame(0)
         self._raw_shape = tuple(int(v) for v in raw0.shape)
+        # the bytes on disk run (H, W, C, components); read_frame reshapes
+        # to that and then transposes, so the fast read below must do the
+        # same or a multi-channel frame comes out interleaved
+        try:
+            self._disk_shape: tuple[int, ...] | None = tuple(
+                int(v) for v in f._raw_frame_shape
+            )
+        except Exception:
+            self._disk_shape = None
         cyx, rgb = _frame_to_cyx(raw0, self.sizes)
         self.frame_shape = tuple(int(v) for v in cyx.shape)
         self.dtype = np.dtype(cyx.dtype)
@@ -925,10 +948,15 @@ class PlateSource:
         except Exception:
             offset = None
         nbytes = int(np.prod(self._raw_shape)) * int(self.dtype.itemsize)
-        if offset is not None and strides is None and self._fd >= 0:
+        if offset is not None and strides is None and self._fd >= 0 and self._disk_shape:
             buf = os.pread(self._fd, nbytes, int(offset))
             if len(buf) == nbytes:
-                return np.frombuffer(buf, dtype=self.dtype).reshape(self._raw_shape)
+                flat = np.frombuffer(buf, dtype=self.dtype)
+                arr = flat.reshape(self._disk_shape).transpose((2, 0, 1, 3)).squeeze()
+                if arr.shape == self._raw_shape:
+                    # already contiguous with one channel, copied only for
+                    # the interleaved case, which is the one that reorders
+                    return np.ascontiguousarray(arr)
         with self._life:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")

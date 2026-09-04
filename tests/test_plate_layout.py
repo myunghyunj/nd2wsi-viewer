@@ -78,3 +78,28 @@ def test_detection_rejects_what_is_not_an_nd2(tmp_path):
     junk.write_bytes(b"junk")
     assert not is_plate_file(junk)
     assert PLATE_MAX_FRAME_PX == 4_500_000
+
+
+def test_five_evenly_spaced_rows_stay_five_rows():
+    """A threshold taken from the whole extent left no step wide enough to
+    count once a plate had five or more evenly spaced tracks, so every site
+    landed in one cell. Five dilutions by two conditions is an ordinary run."""
+    points = [
+        (f"10({5 + i})_{cond}", x, -23000.0 + i * 22000.0)
+        for i in range(5)
+        for cond, x in (("PC", 16400.0), ("MOI", 24000.0))
+    ]
+    layout, rows, cols = _grid(points)
+    assert (rows, cols) == (5, 2)
+    assert len(set(layout)) == 10  # every site in its own cell
+
+
+def test_a_ninety_six_well_scan_keeps_its_eight_by_twelve_grid():
+    points = [
+        (f"{chr(65 + r)}{c + 1}", 10000.0 + c * 9000.0, 5000.0 + r * 9000.0)
+        for r in range(8)
+        for c in range(12)
+    ]
+    layout, rows, cols = _grid(points)
+    assert (rows, cols) == (8, 12)
+    assert len(set(layout)) == 96
