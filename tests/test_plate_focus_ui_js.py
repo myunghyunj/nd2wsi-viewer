@@ -62,3 +62,10 @@ process.stdout.write(JSON.stringify([
 ]));
 """)
     assert out == [1, 9, 1, 9, 3, None, 1, None]
+
+
+def test_singleton_hiding_outranks_focused_control_display_rules():
+    css = MODULE.with_name("style.css").read_text()
+    for control in ("plate-strip", "plate-back", "plate-transpose"):
+        # The extra class must beat the later .plate-focus display rule.
+        assert f"#stage-wrap.plate-single.plate-focus #{control}" in css

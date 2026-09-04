@@ -629,9 +629,9 @@ def wire_native_trackpad_bridge(
     """Forward horizontal scroll events before WKWebView can discard them.
 
     A process-local NSEvent monitor runs before AppKit sends the event to the
-    deepest private WKWebView scroll subview. It consumes only a gesture that
-    has latched horizontally for this window; all undecided and vertical
-    events are returned to AppKit unchanged.
+    deepest private WKWebView scroll subview. Within an eligible plate stage
+    it holds the undecided precise prefix and consumes horizontal motion.
+    Outside that scope, or after a vertical latch, events return to AppKit.
     """
 
     if sys.platform != "darwin":
