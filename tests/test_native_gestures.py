@@ -8,7 +8,6 @@ from nd2wsi.native_gestures import (
     _native_event_sample,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
