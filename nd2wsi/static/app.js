@@ -4058,46 +4058,41 @@ function wirePlateWheel() {
   // belongs to the deep zoom, a horizontal swipe still scrubs time, and
   // option with a vertical scroll moves z.
   const pl = state.plate;
-  let accX = 0;
-  let accY = 0;
-  const handle = (ev, mode) => {
-    const horizontal = Math.abs(ev.deltaX) > Math.abs(ev.deltaY);
-    // the leftover of one axis must not push the other one over its step
-    // on the next flick, so changing axis starts from zero
-    if (horizontal) accY = 0; else accX = 0;
-    if (horizontal) {
-      accX += ev.deltaX;
-      const step = 60;
-      if (Math.abs(accX) >= step) {
-        const n = Math.trunc(accX / step);
-        accX -= n * step;
-        setPlateT(pl.t + n);
-      }
-      ev.preventDefault();
-      ev.stopPropagation();
-      return;
-    }
-    if (mode === "grid" || ev.altKey) {
-      accY += ev.deltaY;
-      const step = 40;
-      if (Math.abs(accY) >= step) {
-        const n = Math.trunc(accY / step);
-        accY -= n * step;
-        stepPlateZ(-n);
-      }
+  const GestureSession = window.Nd2AxisLatch && window.Nd2AxisLatch.WheelGestureSession;
+  if (!GestureSession) {
+    console.error("Plate gestures are unavailable: axis latch did not load");
+    return;
+  }
+  const gridGesture = new GestureSession({ mode: "grid", idleMs: 100 });
+  const focusGesture = new GestureSession({ mode: "focus", idleMs: 100 });
+  const handle = (ev, gesture) => {
+    const result = gesture.feed({
+      deltaX: ev.deltaX,
+      deltaY: ev.deltaY,
+      deltaMode: ev.deltaMode,
+      pagePixels: $("stage-wrap").clientHeight || window.innerHeight || 800,
+      altKey: ev.altKey,
+      at: performance.now(),
+    });
+    if (result.timeSteps) setPlateT(pl.t + result.timeSteps);
+    if (result.zSteps) stepPlateZ(result.zSteps);
+    if (result.consume) {
       ev.preventDefault();
       ev.stopPropagation();
     }
   };
-  pl.resetWheel = () => { accX = 0; accY = 0; };
+  pl.resetWheel = () => {
+    gridGesture.reset();
+    focusGesture.reset();
+  };
   $("plate").addEventListener("wheel", (ev) => {
     if (pl.focus !== null) return;
-    handle(ev, "grid");
+    handle(ev, gridGesture);
   }, { passive: false });
   $("stage-wrap").addEventListener("wheel", (ev) => {
     if (pl.focus === null) return;
     if (ev.target.closest("#time-line, #plate-block, #plate-strip, #plate-back, .mac-window")) return;
-    handle(ev, "focus");
+    handle(ev, focusGesture);
   }, { passive: false, capture: true });
 }
 
