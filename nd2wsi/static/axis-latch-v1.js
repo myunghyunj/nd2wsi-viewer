@@ -82,7 +82,7 @@
       this.timeStep = Math.max(1, finiteNumber(timeStep, 60));
       this.timeStartStep = Math.min(
         this.timeStep,
-        Math.max(1, finiteNumber(timeStartStep, 18)),
+        Math.max(0.01, finiteNumber(timeStartStep, 18)),
       );
       this.zStep = Math.max(1, finiteNumber(zStep, 40));
       this.latch = new AxisLatch({ idleMs, dominance, threshold });

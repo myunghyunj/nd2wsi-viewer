@@ -68,11 +68,12 @@ window.nd2wsiNativeTrackpad = (input) => {
     nd2wsi: "native-trackpad",
     version: VIEWPORT_PROTOCOL_VERSION,
     deltaX: Number(input?.deltaX) || 0,
+    gestureStart: !!input?.gestureStart,
     clientX: Number.isFinite(x) ? x - rect.left : rect.width / 2,
     clientY: Number.isFinite(y) ? y - rect.top : rect.height / 2,
     altKey: !!input?.altKey,
   }, location.origin);
-  return true;
+  return frame.dataset.sid || true;
 };
 
 async function refreshUpdaterButton() {

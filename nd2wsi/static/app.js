@@ -4163,8 +4163,8 @@ function wirePlateWheel() {
   // Native horizontal input has already passed an AppKit axis latch. Give its
   // first movement a short threshold so a deliberate, modest swipe advances
   // immediately instead of needing a full scroll-wheel notch.
-  const nativeGridGesture = new GestureSession({ mode: "grid", idleMs: 100, threshold: 1, timeStartStep: 3 });
-  const nativeFocusGesture = new GestureSession({ mode: "focus", idleMs: 100, threshold: 1, timeStartStep: 3 });
+  const nativeGridGesture = new GestureSession({ mode: "grid", idleMs: 100, threshold: 0.05, timeStartStep: 0.05 });
+  const nativeFocusGesture = new GestureSession({ mode: "focus", idleMs: 100, threshold: 0.05, timeStartStep: 0.05 });
   const handle = (input, gesture, ev = null) => {
     const result = gesture.feed({
       deltaX: input.deltaX,
@@ -4208,6 +4208,10 @@ function wirePlateWheel() {
     const target = Number.isFinite(x) && Number.isFinite(y)
       ? document.elementFromPoint(x, y)
       : $("plate");
+    if (data.gestureStart) {
+      nativeGridGesture.reset();
+      nativeFocusGesture.reset();
+    }
     route(target, {
       deltaX: Number(data.deltaX) || 0,
       deltaY: 0,

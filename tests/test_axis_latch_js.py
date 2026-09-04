@@ -80,6 +80,23 @@ process.stdout.write(JSON.stringify(events));
     assert all(item["zSteps"] == 0 for item in out)
 
 
+def test_native_fractional_delta_can_trigger_one_immediate_time_step():
+    out = _run(
+        r"""
+const {WheelGestureSession}=require(process.argv[1]);
+const gesture=new WheelGestureSession({
+  mode:"grid",idleMs:100,threshold:0.05,timeStartStep:0.05,timeStep:60
+});
+process.stdout.write(JSON.stringify([
+  gesture.feed({deltaX:0.06,deltaY:0.005,at:0}),
+  gesture.feed({deltaX:0.02,deltaY:0,at:10}),
+]));
+"""
+    )
+    assert [item["axis"] for item in out] == ["x", "x"]
+    assert [item["timeSteps"] for item in out] == [1, 0]
+
+
 def test_grid_diagonal_swipe_stays_on_time_and_idle_clears_remainder():
     out = _run(
         r"""
