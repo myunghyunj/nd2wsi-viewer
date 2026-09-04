@@ -3,6 +3,15 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>1.2.3</title>
+            <pubDate>Sat, 05 Sep 2026 00:59:22 +0900</pubDate>
+            <sparkle:version>1.2.3</sparkle:version>
+            <sparkle:shortVersionString>1.2.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.3/nd2wsi-viewer.dmg" length="68986823" type="application/octet-stream" sparkle:edSignature="z3j4C/RIHqroZO4kDw/35TTt1l1VIdO5CTdA9Q1EYawtB1PX8bY/U3iXwJTWfaniXrvP4J8XZ+daimam/3GTAg=="/>
+        </item>
+        <item>
             <title>1.2.2</title>
             <pubDate>Fri, 04 Sep 2026 22:31:48 +0900</pubDate>
             <sparkle:version>1.2.2</sparkle:version>
