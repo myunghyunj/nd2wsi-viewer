@@ -51,6 +51,30 @@ function showError(message) {
 
 window.nd2wsiUpdateNotice = showError;
 
+// pywebview's WKWebView can consume a horizontal NSEvent in its native
+// scroll view without emitting a DOM wheel event. The macOS bridge calls this
+// function only after the physical gesture has latched horizontally. Route it
+// to the iframe under the pointer (or the front tab as a conservative fallback).
+window.nd2wsiNativeTrackpad = (input) => {
+  const x = Number(input?.clientX);
+  const y = Number(input?.clientY);
+  let frame = Number.isFinite(x) && Number.isFinite(y)
+    ? document.elementFromPoint(x, y)?.closest?.("iframe")
+    : null;
+  if (!frame || !frames.has(frame.dataset.sid)) frame = frames.get(active);
+  if (!frame?.contentWindow) return false;
+  const rect = frame.getBoundingClientRect();
+  frame.contentWindow.postMessage({
+    nd2wsi: "native-trackpad",
+    version: VIEWPORT_PROTOCOL_VERSION,
+    deltaX: Number(input?.deltaX) || 0,
+    clientX: Number.isFinite(x) ? x - rect.left : rect.width / 2,
+    clientY: Number.isFinite(y) ? y - rect.top : rect.height / 2,
+    altKey: !!input?.altKey,
+  }, location.origin);
+  return true;
+};
+
 async function refreshUpdaterButton() {
   const button = $("update-check");
   const api = window.pywebview?.api;
@@ -228,6 +252,7 @@ function rememberSlide(sid) {
 function ensureFrame(sid) {
   if (!sid || frames.has(sid)) return frames.get(sid);
   const frame = document.createElement("iframe");
+  frame.dataset.sid = sid;
   frame.src = `s/${sid}/`;
   frame.title = slideName(sid);
   frame.addEventListener("load", () => paneCameUp(sid));

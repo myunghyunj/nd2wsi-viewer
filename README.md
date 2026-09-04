@@ -50,7 +50,7 @@ Nothing leaves your computer. There is no upload and no account.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
 3. Drop an `.nd2` or `.svs` file onto the window, or press `+` to browse.
 
-Version 1.2.1 is the first release that contains the updater, so it must be
+Version 1.2.2 is the first release that contains the updater, so it must be
 installed from the DMG once. After that, use the circular-arrow button in the
 tab bar or **nd2wsi-viewer → Check for Updates…**. The app checks quietly once
 a day and shows Sparkle's standard update window only when a newer signed

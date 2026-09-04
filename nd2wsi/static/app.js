@@ -4160,35 +4160,65 @@ function wirePlateWheel() {
   }
   const gridGesture = new GestureSession({ mode: "grid", idleMs: 100 });
   const focusGesture = new GestureSession({ mode: "focus", idleMs: 100 });
-  const handle = (ev, gesture) => {
+  // Native horizontal input has already passed an AppKit axis latch. Give its
+  // first movement a short threshold so a deliberate, modest swipe advances
+  // immediately instead of needing a full scroll-wheel notch.
+  const nativeGridGesture = new GestureSession({ mode: "grid", idleMs: 100, threshold: 1, timeStartStep: 3 });
+  const nativeFocusGesture = new GestureSession({ mode: "focus", idleMs: 100, threshold: 1, timeStartStep: 3 });
+  const handle = (input, gesture, ev = null) => {
     const result = gesture.feed({
-      deltaX: ev.deltaX,
-      deltaY: ev.deltaY,
-      deltaMode: ev.deltaMode,
+      deltaX: input.deltaX,
+      deltaY: input.deltaY,
+      deltaMode: input.deltaMode,
       pagePixels: $("stage-wrap").clientHeight || window.innerHeight || 800,
-      altKey: ev.altKey,
+      altKey: input.altKey,
       at: performance.now(),
     });
     if (result.timeSteps) setPlateT(pl.t + result.timeSteps);
     if (result.zSteps) stepPlateZ(result.zSteps);
-    if (result.consume) {
+    if (result.consume && ev) {
       ev.preventDefault();
       ev.stopPropagation();
     }
+    return result.consume;
+  };
+  const route = (target, input, gestures, ev = null) => {
+    if (!(target instanceof Element) || !$("stage-wrap").contains(target)) return false;
+    if (target.closest("#time-line, #plate-strip, #plate-back, .mac-window")) return false;
+    if (pl.focus === null) return handle(input, gestures.grid, ev);
+    if (target.closest("#plate-block")) return false;
+    return handle(input, gestures.focus, ev);
   };
   pl.resetWheel = () => {
     gridGesture.reset();
     focusGesture.reset();
+    nativeGridGesture.reset();
+    nativeFocusGesture.reset();
   };
   $("stage-wrap").addEventListener("wheel", (ev) => {
-    if (ev.target.closest("#time-line, #plate-strip, #plate-back, .mac-window")) return;
-    if (pl.focus === null) {
-      handle(ev, gridGesture);
-      return;
-    }
-    if (ev.target.closest("#plate-block")) return;
-    handle(ev, focusGesture);
+    route(ev.target, ev, { grid: gridGesture, focus: focusGesture }, ev);
   }, { passive: false, capture: true });
+
+  const onNativeTrackpad = (ev) => {
+    if (ev.origin !== location.origin || ev.source !== window.parent) return;
+    const data = ev.data;
+    if (!data || data.nd2wsi !== "native-trackpad" || data.version !== VIEWPORT_PROTOCOL_VERSION) return;
+    const x = Number(data.clientX);
+    const y = Number(data.clientY);
+    const target = Number.isFinite(x) && Number.isFinite(y)
+      ? document.elementFromPoint(x, y)
+      : $("plate");
+    route(target, {
+      deltaX: Number(data.deltaX) || 0,
+      deltaY: 0,
+      deltaMode: 0,
+      altKey: !!data.altKey,
+    }, { grid: nativeGridGesture, focus: nativeFocusGesture });
+  };
+  window.addEventListener("message", onNativeTrackpad);
+  window.addEventListener("pagehide", () => {
+    window.removeEventListener("message", onNativeTrackpad);
+  }, { once: true });
 }
 
 function wirePlateKeys() {

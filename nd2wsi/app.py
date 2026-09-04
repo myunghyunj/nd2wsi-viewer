@@ -919,6 +919,12 @@ def create_app_window(initial: Path | None):
         frameless=True,
         easy_drag=False,
     )
+    # WKWebView can consume horizontal trackpad events in a private scroll
+    # subview without creating DOM wheel events. A local AppKit monitor routes
+    # only clearly horizontal gestures; vertical input keeps its normal path.
+    from .native_gestures import wire_native_trackpad_bridge
+
+    wire_native_trackpad_bridge(window, _dlog)
     _inline_traffic_lights(window)
     _wire_file_drop(window)
     _install_open_files_handler()
