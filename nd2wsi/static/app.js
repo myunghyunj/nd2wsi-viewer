@@ -3482,6 +3482,9 @@ function buildPlate() {
     const saved = localStorage.getItem("nd2wsi.plate.transposed");
     pl.transposed = saved === null ? true : saved === "1";
   } catch (_) { pl.transposed = true; }
+  try {
+    pl.auto = localStorage.getItem("nd2wsi.plate.autofocus") === "1";
+  } catch (_) { pl.auto = false; }
   plateArrange();
 
   const grid = $("plate-grid");
@@ -3665,6 +3668,9 @@ function setPlateZ(z) {
   const wasAuto = pl.auto;
   if (next === pl.z && !wasAuto) return;
   pl.auto = false;
+  if (wasAuto) {
+    try { localStorage.setItem("nd2wsi.plate.autofocus", "0"); } catch (_) { /* private mode */ }
+  }
   pl.z = next;
   if (wasAuto) {
     renderPlateAuto();
@@ -3686,6 +3692,7 @@ function setPlateAuto(on) {
   const next = !!on;
   if (next === pl.auto) return;
   pl.auto = next;
+  try { localStorage.setItem("nd2wsi.plate.autofocus", next ? "1" : "0"); } catch (_) { /* private mode */ }
   renderPlateAuto();
   paintPlate();
   plateFrameChanged();
