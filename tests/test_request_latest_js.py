@@ -43,7 +43,8 @@ def test_production_loads_helper_and_separates_backing_from_user_frames():
     assert "withPlateParams" not in app
     assert 'fetch("api/pixel?"' in app and "requested.context.frame" in app
     assert 'fetch("api/histogram"' in app and "responseMatchesFrameContext(data, context)" in app
-    assert "const p = site === undefined ? state.annSite : Number(site);" in app
+    assert "function normalizeAnnotationSite(site)" in app
+    assert "normalizeAnnotationSite(site === undefined ? state.annSite : site)" in app
     assert "appendFrameParams(q, context.frame); // explicit active frame" in app
 
 

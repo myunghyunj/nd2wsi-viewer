@@ -1564,12 +1564,22 @@ function annotationsChanged() {
 
 const scheduleAnnSave = debounce(saveAnnotations, 800);
 
+function normalizeAnnotationSite(site) {
+  if (
+    site === null || site === undefined ||
+    (typeof site === "string" && site.trim() === "")
+  ) return null;
+  const p = Number(site);
+  if (!Number.isInteger(p) || p < 0 || p >= state.info.plate.P) return null;
+  return p;
+}
+
 function annotationsUrl(site) {
   // a plate keeps one sidecar per site, shared across time and z; the
   // coordinates inside are level-0 pixels of the frame, as for any slide
   if (!state.plate) return "api/annotations";
-  const p = site === undefined ? state.annSite : Number(site);
-  if (!Number.isInteger(p) || p < 0 || p >= state.info.plate.P) return null;
+  const p = normalizeAnnotationSite(site === undefined ? state.annSite : site);
+  if (p === null) return null;
   return "api/annotations?p=" + p;
 }
 
@@ -1685,7 +1695,7 @@ function loadAnnotations(site) {
   const seq = ++state.annLoadSeq;
   const frame = activeFrameParams();
   const targetSite = state.plate
-    ? site === undefined ? (frame ? frame.p : null) : Number(site)
+    ? normalizeAnnotationSite(site === undefined ? (frame ? frame.p : null) : site)
     : null;
   const context = state.annContext;
   const revision = state.annRevision;
@@ -1712,23 +1722,38 @@ function loadAnnotations(site) {
   };
   // A fast A -> B -> A transition must not GET A before the captured A save
   // reaches disk, or the UI would reinstall the older sidecar contents.
-  return state.annSaveTail.then(() => stillCurrent() ? fetch(url) : null)
-    .then((r) => r === null
-      ? null
-      : r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
-    .then((d) => {
-      if (d === null || !stillCurrent() || revision !== state.annRevision) return;
+  return state.annSaveTail.then(() => {
+    if (!stillCurrent()) return null;
+    const failed = state.annFailedSaves.get(url);
+    if (failed) {
+      // Never replace a failed in-memory snapshot with the older sidecar on
+      // disk when the user returns to this site. The next edit, site change,
+      // or update preparation will retry this exact recovered snapshot.
+      const captured = JSON.parse(failed.body);
+      if (captured && Array.isArray(captured.items)) {
+        return { data: captured, recovered: true };
+      }
+    }
+    return fetch(url).then((r) => r.ok
+      ? r.json().then((data) => ({ data, recovered: false }))
+      : Promise.reject(new Error("HTTP " + r.status)));
+  })
+    .then((result) => {
+      if (result === null || !stillCurrent() || revision !== state.annRevision) return;
+      const { data: d, recovered } = result;
       state.annotations = Array.isArray(d.items) ? d.items : [];
-      state.annPath = d.path;
+      state.annPath = recovered ? null : d.path;
       state.annReady = true;
-      state.annDirty = false;
+      state.annDirty = recovered;
       // a skipped legacy-sidecar import must not be silent: the server
       // leaves a note explaining why old annotations are not shown here
       const skipped = ((state.info && state.info.notes) || []).find((n) =>
         n.includes("annotation sidecar")
       );
       setAnnStatus(
-        skipped
+        recovered
+          ? "Recovered unsaved annotations · save will retry"
+          : skipped
           ? skipped
           : state.annotations.length
           ? "Loaded " + state.annotations.length + " from " + basename(d.path)
