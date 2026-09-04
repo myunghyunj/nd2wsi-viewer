@@ -62,6 +62,7 @@ def test_with_the_token_the_viewer_works(served):
     slides = json.loads(urllib.request.urlopen(base + "/api/slides", timeout=30).read())
     assert slides["slides"]
     assert _status(base + "/static/app.js") == 200
+    assert _status(base + "/static/axis-latch-v1.js") == 200
     assert _status(base + "/api/tile/0/0/0.jpg") == 200
 
 
