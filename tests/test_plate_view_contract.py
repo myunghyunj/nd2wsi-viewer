@@ -48,7 +48,7 @@ def test_singleton_axes_default_hidden_and_cannot_start_useless_work():
     assert "zAxis: Number(info.plate.Z) > 1" in app
     assert 'pl.playing = state.info.plate.T > 1 && !!on' in app
     assert '$("t-play").disabled = info.T <= 1' in app
-    assert "state.info.plate.Z <= 1 || measured === 0" in app
+    assert "(!pl.auto && summary.ready === 0)" in app
     assert "if (info.Z > 1) loadPlateFocus();" in app
 
 

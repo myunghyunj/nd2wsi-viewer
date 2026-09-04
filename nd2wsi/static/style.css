@@ -755,6 +755,14 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 #t-auto svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
 #t-auto:hover:not(:disabled) { background: rgba(127, 127, 127, 0.22); }
 #t-auto:disabled { opacity: 0.35; }
+#t-auto[hidden] { display: none; }
+.plate-accessible-row { display: contents; }
+#plate-grid .site:focus-visible, #t-track:focus-visible, #z-knob:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px;
+}
+#stage-wrap.plate-single #plate-strip,
+#stage-wrap.plate-single #plate-back,
+#stage-wrap.plate-single #plate-transpose { display: none; }
 #t-auto.on {
   background: var(--accent, #0a84ff); color: #fff;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 3px rgba(0, 0, 0, 0.22);

@@ -162,6 +162,26 @@ def test_source_reduced_root_and_histogram(plate_nd2):
 # ---- server ----------------------------------------------------------------
 
 
+def test_user_frame_requires_a_site_only_for_multiple_positions():
+    from types import SimpleNamespace
+
+    from nd2wsi.server import _frame_args
+
+    multi = SimpleNamespace(
+        plate=SimpleNamespace(T=2, P=3, Z=2, z_home=1)
+    )
+    with pytest.raises(ValueError, match="p is required"):
+        _frame_args(multi, {}, require_p=True)
+    with pytest.raises(ValueError, match="p is required"):
+        _frame_args(multi, {"p": [""]}, require_p=True)
+    assert _frame_args(multi, {"p": ["2"]}, require_p=True) == (0, 2, 1)
+
+    single = SimpleNamespace(
+        plate=SimpleNamespace(T=1, P=1, Z=2, z_home=1)
+    )
+    assert _frame_args(single, {}, require_p=True) == (0, 0, 1)
+
+
 def test_info_describes_the_plate(served):
     _, base, _ = served
     status, body, _ = _get(base + "/api/info")
@@ -197,6 +217,10 @@ def test_tile_pixel_histogram_and_roi_take_a_frame(served):
 
     tifffile = pytest.importorskip("tifffile")
     _, base, _ = served
+    generation = json.loads(_get(base + "/api/info")[1])["generation"]
+    # Renderer plumbing may keep its default backing frame. User operations
+    # below must not silently turn an unselected grid into P0.
+    assert _get(base + "/api/tile/0/0/0.png")[0] == 200
     status, body, _ = _get(base + "/api/tile/0/0/0.png?t=1&p=2&z=1")
     assert status == 200
     img = np.asarray(Image.open(io.BytesIO(body)))
@@ -209,11 +233,20 @@ def test_tile_pixel_histogram_and_roi_take_a_frame(served):
 
     status, body, _ = _get(base + "/api/pixel?x=1&y=1&t=1&p=2&z=1")
     assert status == 200
-    assert json.loads(body)["values"][0]["value"] == value(1, 2, 1)
+    pixel = json.loads(body)
+    assert pixel["values"][0]["value"] == value(1, 2, 1)
+    assert pixel["generation"] == generation
+    assert pixel["frame"] == {"t": 1, "p": 2, "z": 1}
+    assert _get(base + "/api/pixel?x=1&y=1&t=1&z=1")[0] == 400
+    assert _get(base + "/api/pixel?x=1&y=1&p=&t=1&z=1")[0] == 400
 
     status, body, _ = _get(base + "/api/histogram?t=1&p=2&z=1")
     assert status == 200
-    assert len(json.loads(body)["channels"][0]["bins"]) == 256
+    histogram = json.loads(body)
+    assert len(histogram["channels"][0]["bins"]) == 256
+    assert histogram["generation"] == generation
+    assert histogram["frame"] == {"t": 1, "p": 2, "z": 1}
+    assert _get(base + "/api/histogram?t=1&z=1")[0] == 400
 
     status, body, headers = _get(
         base + "/api/roi?level=0&x=0&y=0&w=8&h=8&format=tiff&t=1&p=2&z=1"
@@ -222,6 +255,9 @@ def test_tile_pixel_histogram_and_roi_take_a_frame(served):
     assert "_t1_p2_z1_" in headers["Content-Disposition"]
     arr = tifffile.imread(io.BytesIO(body))
     assert arr.shape == (8, 8) and int(arr.min()) == int(arr.max()) == value(1, 2, 1)
+    assert _get(
+        base + "/api/roi?level=0&x=0&y=0&w=8&h=8&format=tiff&t=1&z=1"
+    )[0] == 400
 
 
 def test_annotations_are_per_site(served):
@@ -241,7 +277,12 @@ def test_annotations_are_per_site(served):
     assert doc["selection"] == {"p": 1} and doc["site"] == "Site 2"
     assert json.loads(_get(base + "/api/annotations?p=1")[1])["items"] == [pin]
     assert json.loads(_get(base + "/api/annotations?p=2")[1])["items"] == []
-    assert json.loads(_get(base + "/api/annotations")[1])["items"] == []
+    assert _get(base + "/api/annotations")[0] == 400
+    assert _get(base + "/api/annotations?p=")[0] == 400
+    assert _get(
+        base + "/api/annotations", method="POST",
+        data=json.dumps({"items": [pin]}).encode(),
+    )[0] == 400
     assert _get(base + "/api/annotations?p=9")[0] == 400
 
 
@@ -258,6 +299,11 @@ def test_focus_route_reports_a_plane_for_every_site(served):
     m = json.loads(body)
     assert m["total"] == T * P
     assert len(m["best"]) == T and all(len(row) == P for row in m["best"])
+    assert len(m["measuredZ"]) == T and all(len(row) == P for row in m["measuredZ"])
+    assert len(m["complete"]) == T and all(len(row) == P for row in m["complete"])
+    assert m["totalZ"] == Z
+    assert m["completeCount"] == sum(v for row in m["complete"] for v in row)
+    assert m["scoring"]["channelMode"] == "all-channels-mean-image"
     assert all(0 <= z < Z for row in m["best"] for z in row)
     assert 0 <= m["zHome"] < Z
 
@@ -977,7 +1023,11 @@ def test_focus_map_rejects_same_path_source_replacement(plate_nd2):
     source = PlateSource(plate_nd2, store=False)
     replacement = plate_nd2.with_name("focus-replacement.nd2")
     try:
-        source.focus_map()
+        focus = source.focus_map()
+        assert focus["measuredZ"] == [[0] * P for _ in range(T)]
+        assert focus["totalZ"] == Z
+        assert focus["complete"] == [[False] * P for _ in range(T)]
+        assert focus["completeCount"] == 0
         _write_plate(replacement, offset=8000)
         replacement.replace(plate_nd2)
 
@@ -1042,6 +1092,12 @@ def test_sharpness_reads_detail_and_ignores_the_lamp():
     )
     # a single row or an empty frame is measured, not raised over
     assert _sharpness(np.zeros((1, 8), np.uint16)) == 0.0
+    # Multi-channel focus is measured from the mean raw-channel image, not by
+    # averaging independently computed per-channel sharpness scores.
+    inverse = (2000 - detail).astype(np.uint16)
+    channels = np.stack([detail, inverse])
+    assert _sharpness(channels) == pytest.approx(_sharpness(channels.mean(axis=0)))
+    assert _sharpness(channels) == 0.0
 
 
 def test_autofocus_picks_the_sharpest_plane_of_every_site(tmp_path):
@@ -1055,6 +1111,11 @@ def test_autofocus_picks_the_sharpest_plane_of_every_site(tmp_path):
         src.store.flush_focus()
         m = src.focus_map()
         assert m["measured"] == m["total"] == T * P
+        assert m["measuredZ"] == [[Z] * P for _ in range(T)]
+        assert m["complete"] == [[True] * P for _ in range(T)]
+        assert m["completeCount"] == T * P
+        assert m["totalZ"] == Z
+        assert m["scoring"]["channelMode"] == "all-channels-mean-image"
         assert m["zHome"] == src.z_home
         assert m["best"] == [[best_plane(t, p) for p in range(P)] for t in range(T)]
     finally:
@@ -1331,6 +1392,8 @@ def test_focus_map_masks_undone_and_reader_local_invalid_scores(tmp_path, monkey
         reader.store._invalid[t, 1, z] = True
         focus = reader.focus_map()
         assert focus["measured"] == 0
+        assert focus["measuredZ"] == [[0] * P for _ in range(T)]
+        assert focus["completeCount"] == 0
         assert focus["best"][t] == [reader.z_home] * P
     finally:
         if reader is not None:
@@ -1364,7 +1427,18 @@ def test_completed_focus_block_becomes_visible_to_a_second_viewer(
                 break
             time.sleep(0.05)
         assert focus["measured"] == P
+        assert focus["measuredZ"][t] == [1] * P
+        assert focus["complete"][t] == [False] * P
+        assert focus["completeCount"] == 0
         assert focus["best"][t] == [z] * P
+
+        # One completed site is eligible immediately even while its neighbours
+        # remain provisional and the rest of the acquisition is incomplete.
+        writer.reduced(t, 0, 1 - z, THUMB_K)
+        own_focus = writer.focus_map()
+        assert own_focus["measuredZ"][t] == [Z, 1, 1]
+        assert own_focus["complete"][t] == [True, False, False]
+        assert own_focus["completeCount"] == 1
     finally:
         reader.close()
         writer.close()

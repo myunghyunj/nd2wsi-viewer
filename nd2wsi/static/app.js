@@ -10,11 +10,14 @@ const state = {
   luts: [], // per channel {lo, hi, gamma}; null while at store defaults
   lutWidgets: [], // canvas LUT widgets, aligned with luts
   roi: null, // {x, y, w, h} in level-0 pixels
+  roiSite: null, // plate site that owns the ROI; null for WSI or no ROI
   roiOverlayEl: null,
   tool: null, // null | "roi" | "measure" | "pin" | "box"
   renderScale: null, // chosen PNG/JPEG downsample; null = finest that fits
   annotations: [], // {id, type: "line"|"pin"|"box", ...image coords, text}
   annPath: null, // sidecar file, reported by the server
+  annSite: null, // plate site whose sidecar is displayed; null in the grid
+  annReady: false, // sidecar load succeeded for the current annotation owner
   editingId: null,
   tempLine: null, // live ruler while dragging
   windows: null, // floating mac-window controllers
@@ -34,11 +37,18 @@ const state = {
     cursor: null, // latest displayed-base coordinate and element position
     result: null,
     queued: null,
-    inFlight: false,
+    inFlight: null,
+    resultKey: null,
+    requests: null,
     timer: null,
     lastStarted: 0,
     retryAfter: 0,
     failed: false,
+  },
+  histogram: {
+    requests: null,
+    timer: null,
+    ready: false,
   },
   viewportRelay: {
     seq: 0,
@@ -71,12 +81,16 @@ async function init() {
   state.channels = info.channels.map((_, i) => i);
   state.luts = info.channels.map(() => null);
   state.lutWidgets = [];
+  const LatestRequestGate = window.Nd2LatestRequest && window.Nd2LatestRequest.LatestRequestGate;
+  if (!LatestRequestGate) throw new Error("latest-request helper did not load");
+  state.pixel.requests = new LatestRequestGate();
+  state.histogram.requests = new LatestRequestGate();
 
   if (info.kind === "plate" && info.plate) {
     state.plate = {
       t: 0,
       z: clamp(Number(info.plate.zHome) || 0, 0, Math.max(0, info.plate.Z - 1)),
-      focus: null, // site index p while one site fills the stage
+      focus: Number(info.plate.P) === 1 ? 0 : null, // a single-position stack opens focused
       playing: false,
       fps: 8,
       k: 8, // reduction of the grid frames; 4 when the cells grow past 260 px
@@ -122,6 +136,7 @@ async function init() {
   if (state.plate) pollPlateStatus();
   wireCompareRelay();
   wireTools();
+  syncFrameScopedControls();
   wireKeys();
   loadAnnotations();
   if (annLocked()) {
@@ -222,13 +237,43 @@ function renderParams(q) {
   return q;
 }
 
-function plateFrameParams() {
-  // the frame the stage shows: current time, the focused site (else the
-  // first) and its plane; null for an ordinary slide
-  const pl = state.plate;
-  if (!pl) return null;
-  const p = pl.focus === null ? 0 : pl.focus;
-  return { t: pl.t, p, z: plateZFor(p) };
+function activeFrameParams() {
+  // A multi-site grid has no user-selected frame. User operations must never
+  // inherit the hidden viewer's P0 merely because it needs a valid tile source.
+  const api = window.Nd2LatestRequest;
+  return api.plateFrame(state.plate, plateZFor, false);
+}
+
+function backingFrameParams() {
+  // Renderer plumbing still needs one explicit frame while OSD is hidden by
+  // the grid. This is the only place where P0 is an intentional fallback.
+  const api = window.Nd2LatestRequest;
+  return api.plateFrame(state.plate, plateZFor, true);
+}
+
+function appendFrameParams(q, frame) {
+  return window.Nd2LatestRequest.appendFrameParams(q, frame);
+}
+
+function activeFrameContext() {
+  const frame = state.plate ? activeFrameParams() : null;
+  if (state.plate && !frame) return null;
+  const sourceId = currentSlideSid();
+  const generation = state.info && state.info.generation;
+  return {
+    sourceId,
+    generation,
+    frame,
+    key: window.Nd2LatestRequest.identityKey(sourceId, generation, frame),
+  };
+}
+
+function responseMatchesFrameContext(payload, context) {
+  const current = activeFrameContext();
+  return !!(
+    current && context && current.key === context.key &&
+    window.Nd2LatestRequest.responseIdentityMatches(payload, context)
+  );
 }
 
 function plateZFor(p) {
@@ -236,10 +281,7 @@ function plateZFor(p) {
   // sharpest plane measured for that site at this time point
   const pl = state.plate;
   if (!pl) return 0;
-  if (!pl.auto || !pl.focusMap) return pl.z;
-  const row = pl.focusMap.best[pl.t];
-  const z = row ? row[p] : null;
-  return Number.isInteger(z) ? clamp(z, 0, state.info.plate.Z - 1) : pl.z;
+  return window.Nd2PlateUI.displayedZ(pl.focusMap, pl.t, p, pl.z, state.info.plate.Z, pl.auto);
 }
 
 function plateGroupKey() {
@@ -249,18 +291,8 @@ function plateGroupKey() {
   return pl.auto ? "a" : String(pl.z);
 }
 
-function withPlateParams(q) {
-  const f = plateFrameParams();
-  if (f) {
-    q.set("t", f.t);
-    q.set("p", f.p);
-    q.set("z", f.z);
-  }
-  return q;
-}
-
 function tileQuery() {
-  const q = withPlateParams(renderParams(new URLSearchParams()));
+  const q = appendFrameParams(renderParams(new URLSearchParams()), backingFrameParams());
   const s = q.toString();
   return s ? "?" + s : "";
 }
@@ -770,6 +802,12 @@ function buildLutRow(i, ch, winLabel) {
       vmax = Math.max(Number.isFinite(reportedMax) ? reportedMax : vmin + 1, vmin + 1);
       draw();
     },
+    clearHistogram() {
+      bins = null;
+      vmin = Math.min(Number(ch.window.min) || 0, def.lo);
+      vmax = Math.max(def.hi, vmin + 2 * Math.max(def.hi - vmin, 1));
+      draw();
+    },
     reset() {
       setLut({ ...def });
     },
@@ -816,20 +854,76 @@ function relayoutLuts() {
   state.lutWidgets.forEach((wd) => wd && wd.relayout(w));
 }
 
-function loadHistograms() {
-  const q = withPlateParams(new URLSearchParams()).toString();
-  fetch("api/histogram" + (q ? "?" + q : ""))
-    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
-    .then((d) => {
-      d.channels.forEach((hg, i) => {
-        if (state.lutWidgets[i]) state.lutWidgets[i].setHistogram(hg);
-      });
-    })
-    .catch(() => {}); // panel still works without histograms
+function setHistogramReady(ready, unavailable = false) {
+  state.histogram.ready = !!ready;
+  document.querySelectorAll(".lut-auto").forEach((button) => {
+    if (!button.dataset.readyTitle) button.dataset.readyTitle = button.title;
+    button.disabled = !ready;
+    button.title = ready
+      ? button.dataset.readyTitle
+      : unavailable
+        ? "Choose a site to calculate its histogram"
+        : "Histogram is loading for the current frame";
+  });
 }
 
-// a plate frame change refetches the histogram of the frame on the stage
-const refreshHistograms = debounce(loadHistograms, 300);
+function clearHistograms(unavailable = false) {
+  state.lutWidgets.forEach((widget) => widget && widget.clearHistogram());
+  setHistogramReady(false, unavailable);
+}
+
+function requestHistograms(context) {
+  if (!context || activeFrameContext()?.key !== context.key) return;
+  const q = appendFrameParams(new URLSearchParams(), context.frame).toString();
+  const ticket = state.histogram.requests.begin(context.key);
+  fetch("api/histogram" + (q ? "?" + q : ""), {
+    cache: "no-store",
+    signal: ticket.signal,
+  })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+    .then((data) => {
+      if (
+        !state.histogram.requests.isCurrent(ticket, context.key) ||
+        !responseMatchesFrameContext(data, context)
+      ) return;
+      data.channels.forEach((hg, i) => {
+        if (state.lutWidgets[i]) state.lutWidgets[i].setHistogram(hg);
+      });
+      setHistogramReady(true);
+    })
+    .catch((error) => {
+      if (
+        !state.histogram.requests.isCurrent(ticket, context.key) ||
+        window.Nd2LatestRequest.isAbortError(error)
+      ) return;
+      clearHistograms(false); // manual LUT controls remain usable
+    })
+    .finally(() => state.histogram.requests.finish(ticket));
+}
+
+function scheduleHistograms(delay) {
+  clearTimeout(state.histogram.timer);
+  state.histogram.timer = null;
+  state.histogram.requests.invalidate();
+  const context = activeFrameContext();
+  clearHistograms(!context);
+  if (!context) return;
+  const run = () => {
+    state.histogram.timer = null;
+    requestHistograms(context);
+  };
+  if (delay > 0) state.histogram.timer = setTimeout(run, delay);
+  else run();
+}
+
+function loadHistograms() {
+  scheduleHistograms(0);
+}
+
+// Invalidate synchronously, before the debounce window can admit an old frame.
+function refreshHistograms() {
+  scheduleHistograms(300);
+}
 
 function debounce(fn, ms) {
   // the arguments are deliberately not forwarded: several of these are
@@ -918,11 +1012,7 @@ function updateCursor(img, elementPt) {
     $("pos-px").textContent = "–";
     $("pos-px").title = "";
     state.pixel.cursor = null;
-    state.pixel.queued = null;
-    if (state.pixel.timer && !state.pixel.inFlight) {
-      clearTimeout(state.pixel.timer);
-      state.pixel.timer = null;
-    }
+    invalidatePixelProbe(false);
     renderPixelInspector();
     return;
   }
@@ -940,8 +1030,9 @@ function updateCursor(img, elementPt) {
 
 function pixelResultMatchesCursor(result) {
   const c = state.pixel.cursor;
+  const context = activeFrameContext();
   return !!(
-    c && result &&
+    c && result && context && state.pixel.resultKey === context.key &&
     Number(result.x) === c.x && Number(result.y) === c.y
   );
 }
@@ -1042,8 +1133,36 @@ function positionPixelHud(point) {
 }
 
 function queuePixelProbe(x, y) {
-  state.pixel.queued = { x, y };
+  const context = activeFrameContext();
+  if (!context) {
+    invalidatePixelProbe(false);
+    return;
+  }
+  state.pixel.queued = { x, y, context };
   pumpPixelProbe();
+}
+
+function invalidatePixelProbe(requeue = true) {
+  clearTimeout(state.pixel.timer);
+  state.pixel.timer = null;
+  state.pixel.requests.invalidate();
+  state.pixel.inFlight = null;
+  state.pixel.queued = null;
+  state.pixel.result = null;
+  state.pixel.resultKey = null;
+  state.pixel.failed = false;
+  state.pixel.retryAfter = 0;
+  const context = activeFrameContext();
+  if (!context) {
+    state.pixel.cursor = null;
+    $("pos-um").textContent = "–";
+    $("pos-px").textContent = "–";
+    $("pos-px").title = "";
+  }
+  renderPixelInspector();
+  if (requeue && context && state.pixel.cursor) {
+    queuePixelProbe(state.pixel.cursor.x, state.pixel.cursor.y);
+  }
 }
 
 function pumpPixelProbe() {
@@ -1059,30 +1178,56 @@ function pumpPixelProbe() {
     if (!state.pixel.queued) return;
     const requested = state.pixel.queued;
     state.pixel.queued = null;
-    state.pixel.inFlight = true;
+    const current = activeFrameContext();
+    if (!current || current.key !== requested.context.key) return;
+    const ticket = state.pixel.requests.begin(requested.context.key);
+    state.pixel.inFlight = ticket;
     state.pixel.lastStarted = Date.now();
-    const query = withPlateParams(new URLSearchParams({ x: requested.x, y: requested.y }));
-    fetch("api/pixel?" + query.toString(), { cache: "no-store" })
+    const query = appendFrameParams(
+      new URLSearchParams({ x: requested.x, y: requested.y }),
+      requested.context.frame
+    );
+    fetch("api/pixel?" + query.toString(), { cache: "no-store", signal: ticket.signal })
       .then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
       .then((data) => {
+        const cursor = state.pixel.cursor;
+        if (
+          !state.pixel.requests.isCurrent(ticket, requested.context.key) ||
+          !responseMatchesFrameContext(data, requested.context) ||
+          !cursor || cursor.x !== requested.x || cursor.y !== requested.y
+        ) return;
         state.pixel.result = data;
+        state.pixel.resultKey = requested.context.key;
         state.pixel.failed = false;
         state.pixel.retryAfter = 0;
         renderPixelInspector();
       })
-      .catch(() => {
+      .catch((error) => {
+        const cursor = state.pixel.cursor;
+        if (
+          !state.pixel.requests.isCurrent(ticket, requested.context.key) ||
+          window.Nd2LatestRequest.isAbortError(error) ||
+          !cursor || cursor.x !== requested.x || cursor.y !== requested.y
+        ) return;
         state.pixel.failed = true;
         state.pixel.retryAfter = Date.now() + 2500;
         renderPixelInspector();
       })
       .finally(() => {
-        state.pixel.inFlight = false;
+        state.pixel.requests.finish(ticket);
+        if (state.pixel.inFlight === ticket) state.pixel.inFlight = null;
         if (state.pixel.queued) pumpPixelProbe();
       });
   }, wait);
 }
 
 function togglePixelInspector() {
+  if (state.plate && !activeFrameContext()) {
+    state.pixel.hudVisible = false;
+    renderPixelInspector();
+    showToast("Choose a site before using Pixel Inspector");
+    return;
+  }
   state.pixel.hudVisible = !state.pixel.hudVisible;
   renderPixelInspector();
   if (state.pixel.hudVisible && !state.pixel.cursor) {
@@ -1132,7 +1277,86 @@ function annLocked() {
   return state.info && state.info.storage === "overview-degraded";
 }
 
+function frameOwnsRoi(context = activeFrameContext()) {
+  if (!state.roi || !context) return false;
+  if (!state.plate) return true;
+  return window.Nd2LatestRequest.frameOwnsSite(context.frame, state.roiSite);
+}
+
+function annotationOwnerReady() {
+  if (!state.annReady) return false;
+  if (!state.plate) return true;
+  const frame = activeFrameParams();
+  return window.Nd2LatestRequest.frameOwnsSite(frame, state.annSite);
+}
+
+function scopedButton(id, disabled, reason) {
+  const el = $(id);
+  if (!el) return;
+  if (!el.dataset.scopeTitle) el.dataset.scopeTitle = el.title || "";
+  el.disabled = !!disabled;
+  el.title = disabled && reason ? reason : el.dataset.scopeTitle;
+}
+
+function syncFrameScopedControls() {
+  const context = activeFrameContext();
+  const hasFrame = !!context;
+  const chooseSite = "Choose a site first";
+  const hasRoi = frameOwnsRoi(context);
+
+  $("roi-full").textContent = state.plate ? "Full Field" : "Whole Slide";
+  $("roi-full").dataset.scopeTitle = state.plate
+    ? "Mark the full field of the selected site" : "Mark the whole slide";
+  $("roi-hint").textContent = !hasFrame
+    ? "Choose a site in the grid to select or export a region. All-site export is not available yet."
+    : state.plate
+      ? "Drag on the selected site, or select its full field."
+      : "Drag on the slide, or select the whole slide.";
+
+  for (const id of ["roi-toggle", "roi-full"]) {
+    scopedButton(id, !hasFrame, chooseSite);
+  }
+  for (const id of ["roi-dl-tiff", "roi-dl-png", "roi-dl-jpg", "roi-clear"]) {
+    scopedButton(id, !hasRoi, hasFrame ? "Mark a region first" : chooseSite);
+  }
+  scopedButton("roi-move", !hasRoi, hasFrame ? "Mark a region first" : chooseSite);
+  const nd2Unavailable = state.info && state.info.nd2Export === false;
+  scopedButton(
+    "roi-dl-nd2",
+    !hasRoi || nd2Unavailable,
+    nd2Unavailable
+      ? "ND2 export needs the limnd2 package on the server"
+      : hasFrame ? "Mark a region first" : chooseSite
+  );
+
+  const annotationReady = annotationOwnerReady();
+  const annotationReason = hasFrame
+    ? state.annReady ? "Annotations are unavailable for this site" : "Loading annotations for this site"
+    : chooseSite;
+  for (const id of ["tool-measure", "tool-pin", "tool-box", "ann-open"]) {
+    scopedButton(id, !annotationReady || annLocked(), annLocked()
+      ? "The source file is missing; annotation is locked"
+      : annotationReason);
+  }
+  for (const id of ["ann-export", "ann-geojson"]) {
+    scopedButton(id, !annotationReady, annotationReason);
+  }
+}
+
 function setTool(tool) {
+  const turningOff = tool === null || state.tool === tool;
+  if (!turningOff && state.plate && !activeFrameParams()) {
+    showToast("Choose a site before using Region or Annotations");
+    return;
+  }
+  if (
+    !turningOff && (tool === "measure" || tool === "pin" || tool === "box") &&
+    !annotationOwnerReady()
+  ) {
+    setAnnStatus("Choose a site and wait for its annotations to load");
+    return;
+  }
+  if (!turningOff && tool === "move" && !frameOwnsRoi()) return;
   if (annLocked() && (tool === "measure" || tool === "pin" || tool === "box")) {
     setAnnStatus("Annotation is locked while the source file is missing");
     return;
@@ -1344,13 +1568,16 @@ function annotationsUrl(site) {
   // a plate keeps one sidecar per site, shared across time and z; the
   // coordinates inside are level-0 pixels of the frame, as for any slide
   if (!state.plate) return "api/annotations";
-  const p = site === undefined ? plateFrameParams().p : site;
+  const p = site === undefined ? state.annSite : Number(site);
+  if (!Number.isInteger(p) || p < 0 || p >= state.info.plate.P) return null;
   return "api/annotations?p=" + p;
 }
 
 function annotationSaveEntry(site) {
+  const url = annotationsUrl(site);
+  if (!url) return null;
   return {
-    url: annotationsUrl(site),
+    url,
     body: JSON.stringify({ items: state.annotations }),
     revision: state.annRevision,
     context: state.annContext,
@@ -1358,6 +1585,9 @@ function annotationSaveEntry(site) {
 }
 
 function queueAnnotationSave(entry) {
+  if (!entry || !entry.url) {
+    return Promise.resolve({ ok: false, error: "choose a plate site first" });
+  }
   const run = state.annSaveTail.then(async () => {
     try {
       const response = await fetch(entry.url, {
@@ -1374,14 +1604,18 @@ function queueAnnotationSave(entry) {
       if (state.annContext === entry.context && state.annRevision === entry.revision) {
         state.annDirty = false;
       }
-      setAnnStatus("Saved · " + basename(data.path));
+      if (state.annContext === entry.context) {
+        setAnnStatus("Saved · " + basename(data.path));
+      }
       return { ok: true };
     } catch (error) {
       const failed = state.annFailedSaves.get(entry.url);
       if (!failed || failed.revision <= entry.revision) {
         state.annFailedSaves.set(entry.url, entry);
       }
-      setAnnStatus("Save failed: " + error.message);
+      if (state.annContext === entry.context) {
+        setAnnStatus("Save failed: " + error.message);
+      }
       return { ok: false, error: error.message };
     }
   });
@@ -1396,7 +1630,12 @@ function saveAnnotations(site) {
     setAnnStatus("Not saved: annotation is locked in this degraded view");
     return Promise.resolve({ ok: false, error: "annotation is locked" });
   }
-  return queueAnnotationSave(annotationSaveEntry(site));
+  const entry = annotationSaveEntry(site);
+  if (!entry) {
+    setAnnStatus("Not saved: choose a plate site first");
+    return Promise.resolve({ ok: false, error: "choose a plate site first" });
+  }
+  return queueAnnotationSave(entry);
 }
 
 async function flushAnnotationsForUpdate() {
@@ -1440,16 +1679,49 @@ async function acknowledgeUpdatePreparation(requestId) {
   }, location.origin);
 }
 
-function loadAnnotations() {
+function loadAnnotations(site) {
   // switching sites twice in a row leaves two loads in flight; the older
   // one must not install its items over the newer site's
   const seq = ++state.annLoadSeq;
-  fetch(annotationsUrl())
-    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
+  const frame = activeFrameParams();
+  const targetSite = state.plate
+    ? site === undefined ? (frame ? frame.p : null) : Number(site)
+    : null;
+  const context = state.annContext;
+  const revision = state.annRevision;
+  const url = annotationsUrl(targetSite);
+  state.annSite = Number.isInteger(targetSite) ? targetSite : null;
+  state.annReady = false;
+  state.annPath = null;
+  state.annotations = [];
+  state.editingId = null;
+  $("ann-editor").hidden = true;
+  renderAnnotations();
+  rebuildAnnList();
+  syncFrameScopedControls();
+  if (!url) {
+    setAnnStatus(state.plate ? "Choose a site to view its annotations" : "");
+    return Promise.resolve();
+  }
+  const stillCurrent = () => {
+    const currentFrame = activeFrameParams();
+    return !!(
+      seq === state.annLoadSeq && context === state.annContext &&
+      (!state.plate || (currentFrame && currentFrame.p === targetSite && state.annSite === targetSite))
+    );
+  };
+  // A fast A -> B -> A transition must not GET A before the captured A save
+  // reaches disk, or the UI would reinstall the older sidecar contents.
+  return state.annSaveTail.then(() => stillCurrent() ? fetch(url) : null)
+    .then((r) => r === null
+      ? null
+      : r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
     .then((d) => {
-      if (seq !== state.annLoadSeq) return;
+      if (d === null || !stillCurrent() || revision !== state.annRevision) return;
       state.annotations = Array.isArray(d.items) ? d.items : [];
       state.annPath = d.path;
+      state.annReady = true;
+      state.annDirty = false;
       // a skipped legacy-sidecar import must not be silent: the server
       // leaves a note explaining why old annotations are not shown here
       const skipped = ((state.info && state.info.notes) || []).find((n) =>
@@ -1464,8 +1736,14 @@ function loadAnnotations() {
       );
       renderAnnotations();
       rebuildAnnList();
+      syncFrameScopedControls();
     })
-    .catch(() => setAnnStatus(""));
+    .catch(() => {
+      if (!stillCurrent()) return;
+      state.annReady = false;
+      setAnnStatus("Could not load annotations for this site");
+      syncFrameScopedControls();
+    });
 }
 
 function setAnnStatus(msg) {
@@ -1781,6 +2059,10 @@ function wireAnnotationPanel() {
   });
 
   $("ann-export").onclick = () => {
+    if (!annotationOwnerReady()) {
+      showToast("Choose a site before exporting annotations");
+      return;
+    }
     downloadJsonFile(
       annotationDocument(),
       state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
@@ -1788,12 +2070,28 @@ function wireAnnotationPanel() {
     );
   };
   $("ann-geojson").onclick = exportAnnotationsGeoJSON;
-  $("ann-open").onclick = () => $("ann-file").click();
+  $("ann-open").onclick = () => {
+    if (annotationOwnerReady()) $("ann-file").click();
+    else showToast("Choose a site before opening annotations");
+  };
   $("ann-file").addEventListener("change", () => {
     const f = $("ann-file").files[0];
     if (!f) return;
+    const context = state.annContext;
+    const site = state.annSite;
+    if (!annotationOwnerReady()) {
+      $("ann-file").value = "";
+      showToast("Choose a site before opening annotations");
+      return;
+    }
     f.text().then((txt) => {
       try {
+        if (
+          context !== state.annContext || site !== state.annSite ||
+          !annotationOwnerReady()
+        ) {
+          throw new Error("the plate site changed while the file was opening");
+        }
         const data = JSON.parse(txt);
         const { items, verified } = annotationItemsForThisSlide(data);
         state.annotations = items;
@@ -1805,8 +2103,9 @@ function wireAnnotationPanel() {
       } catch (e) {
         showToast("could not open annotations: " + e.message);
       }
-      $("ann-file").value = "";
-    });
+    }).catch((e) => {
+      showToast("could not open annotations: " + e.message);
+    }).finally(() => { $("ann-file").value = ""; });
   });
 }
 
@@ -1902,6 +2201,10 @@ function geojsonFilename(info) {
 }
 
 function exportAnnotationsGeoJSON() {
+  if (!annotationOwnerReady()) {
+    showToast("Choose a site before exporting annotations");
+    return;
+  }
   const doc = annotationsToGeoJSON(state.annotations);
   downloadJsonFile(doc, geojsonFilename(state.info), "application/geo+json");
   showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON");
@@ -1933,7 +2236,10 @@ function annotationDocument() {
 function currentSelection() {
   // the T/P/Z plane the annotations belong to: a plate's sidecar is per
   // site, an ordinary slide's is the plane the cache was built from
-  if (state.plate) return { p: plateFrameParams().p };
+  if (state.plate) {
+    const frame = activeFrameParams();
+    return frame && frame.p === state.annSite ? { p: frame.p } : null;
+  }
   return state.info.selection || {};
 }
 
@@ -1973,7 +2279,9 @@ function annotationItemsForThisSlide(data) {
     throw new Error("unsupported annotation coordinate space");
   }
   if (data.selection) {
-    const expected = normalizedSelection(currentSelection());
+    const current = currentSelection();
+    if (!current) throw new Error("choose a plate site first");
+    const expected = normalizedSelection(current);
     const actual = normalizedSelection(data.selection);
     if (expected.t !== actual.t || expected.p !== actual.p || expected.z !== actual.z) {
       throw new Error("annotations belong to a different T/P/Z plane");
@@ -2050,14 +2358,22 @@ function finishSelection(a, b) {
 }
 
 function applyRoi(x, y, w, h) {
+  const context = activeFrameContext();
+  if (!context) {
+    showToast("Choose a site before marking a region");
+    return false;
+  }
   state.roi = { x, y, w, h };
+  state.roiSite = context.frame ? context.frame.p : null;
   state.renderScale = null; // a new region starts at the finest fitting scale
   drawRoiOverlay();
   updateRoiPanel();
   $("roi-detail").classList.add("active");
   $("roi-hint").style.display = "none";
   $("roi-move").disabled = false;
+  syncFrameScopedControls();
   state.windows.region.fitContent(); // saved heights must not hide the exports
+  return true;
 }
 
 function drawRoiOverlay() {
@@ -2091,11 +2407,14 @@ function moveRoiOverlay() {
 }
 
 function restoreRoiOverlay() {
-  if (state.roi) drawRoiOverlay();
+  if (frameOwnsRoi()) drawRoiOverlay();
 }
 
 function clearRoi() {
   state.roi = null;
+  state.roiSite = null;
+  state.renderScale = null;
+  scaleSeq += 1;
   if (state.roiOverlayEl) {
     state.viewer.removeOverlay(state.roiOverlayEl);
     state.roiOverlayEl = null;
@@ -2104,6 +2423,7 @@ function clearRoi() {
   $("roi-hint").style.display = "";
   $("roi-move").disabled = true;
   if (state.tool === "move") setTool("move"); // toggles the mode off
+  syncFrameScopedControls();
 }
 
 function updateRoiPanel() {
@@ -2163,22 +2483,24 @@ let scaleSeq = 0;
 function updateScaleStrip() {
   const strip = $("roi-scales");
   const dims = $("roi-scale-dims");
-  const r = state.roi;
+  const context = activeFrameContext();
+  const r = state.roi ? { ...state.roi } : null;
   const opts = scaleOptions();
   const seq = ++scaleSeq;
   strip.innerHTML = "";
-  if (!r || !opts.length) {
+  if (!r || !opts.length || !frameOwnsRoi(context)) {
     dims.textContent = "–";
     return;
   }
   const sel = roiScale();
+  const extra = new URLSearchParams();
   const win = lutParam();
-  let winQ = win ? "&win=" + encodeURIComponent(win) : "";
+  if (win) extra.set("win", win);
   if (state.channels.length !== state.info.channels.length) {
-    winQ += "&c=" + state.channels.join(",");
+    extra.set("c", state.channels.join(","));
   }
-  const frame = plateFrameParams();
-  if (frame) winQ += "&t=" + frame.t + "&p=" + frame.p + "&z=" + frame.z;
+  appendFrameParams(extra, context.frame);
+  const winQ = extra.toString() ? "&" + extra.toString() : "";
   // one shared field, sized to the coarsest scale so every patch is honest
   const dMax = opts[opts.length - 1].d;
   const field = Math.min(64 * dMax, r.w, r.h); // native px on a side
@@ -2209,8 +2531,8 @@ function updateScaleStrip() {
   dims.textContent = fmtInt(sel.w) + " × " + fmtInt(sel.h) + " px";
   const note = $("roi-scale-note");
   note.textContent = "ND2 and TIFF stay native.";
-  estimateRenderBytes(sel, winQ).then((t) => {
-    if (seq === scaleSeq && t) {
+  estimateRenderBytes(sel, winQ, r).then((t) => {
+    if (seq === scaleSeq && activeFrameContext()?.key === context.key && t) {
       note.textContent = t + " · ND2 and TIFF stay native.";
     }
   });
@@ -2222,8 +2544,8 @@ function levelPathFor(d) {
 }
 
 const sizeSamples = new Map(); // sid-stable cache: level+fmt+win -> bytes/px
-async function estimateRenderBytes(o, winQ) {
-  const r = state.roi;
+async function estimateRenderBytes(o, winQ, r = state.roi) {
+  if (!r) return "";
   const side = Math.min(512, o.w, o.h);
   const sx = Math.max(0, Math.floor((r.x + r.w / 2) / o.d) - side / 2);
   const sy = Math.max(0, Math.floor((r.y + r.h / 2) / o.d) - side / 2);
@@ -2251,7 +2573,7 @@ async function estimateRenderBytes(o, winQ) {
    the region's top-left corner, clamps to the slide, and syncs both rows. */
 function applyRoiDims(unit) {
   const r = state.roi;
-  if (!r) return;
+  if (!r || !frameOwnsRoi()) return;
   const info = state.info;
   const ps = pixelSize();
   if (unit === "um" && !ps) return; // no physical entry without calibration
@@ -2295,8 +2617,12 @@ function wireRoiDims() {
 }
 
 function downloadRoi(fmt) {
-  const r = state.roi;
-  if (!r) return;
+  const context = activeFrameContext();
+  const r = state.roi ? { ...state.roi } : null;
+  if (!r || !frameOwnsRoi(context)) {
+    showToast("Choose a site and mark a region before exporting");
+    return;
+  }
   // ND2 and TIFF stream raw pixels at native resolution; a rendered PNG or
   // JPEG too big for one image drops to the pyramid level that fits, which
   // is how the whole slide leaves as one picture
@@ -2328,7 +2654,7 @@ function downloadRoi(fmt) {
     const win = lutParam();
     if (win) q.set("win", win); // rendered exports match the screen LUTs
   }
-  withPlateParams(q); // a plate exports the frame on the stage
+  appendFrameParams(q, context.frame); // explicit active frame; never hidden P0
   let job = null;
   if (fmt === "nd2" || fmt === "tiff") {
     job = Math.random().toString(36).slice(2, 10);
@@ -3473,8 +3799,23 @@ function plateInspectionRows(plate) {
 }
 
 function platePlaneLabel() {
-  const f = plateFrameParams();
-  return "T" + f.t + " · P" + f.p + " · Z" + f.z;
+  const f = activeFrameParams();
+  return f ? "T" + f.t + " · P" + f.p + " · Z" + f.z : platePlaneNote();
+}
+
+function currentFocusSummary() {
+  const pl = state.plate;
+  const sites = pl.focus === null ? state.info.plate.sites.map((s) => s.i) : [pl.focus];
+  return window.Nd2PlateUI.focusSummary(pl.focusMap, pl.t, sites, pl.z, state.info.plate.Z, pl.auto);
+}
+
+function plateZText() {
+  const pl = state.plate;
+  const info = state.info.plate;
+  const summary = currentFocusSummary();
+  const range = summary.min === summary.max ? String(summary.min + 1) : (summary.min + 1) + "–" + (summary.max + 1);
+  return "Z " + range + "/" + info.Z + (pl.auto
+    ? " · AF " + summary.ready + "/" + summary.total + " ready" : "");
 }
 
 function platePlaneNote() {
@@ -3483,7 +3824,7 @@ function platePlaneNote() {
   const bits = [];
   if (pl.focus !== null && info.sites[pl.focus]) bits.push(siteLabelText(info.sites[pl.focus].name));
   bits.push("t " + (pl.t + 1) + "/" + info.T);
-  bits.push("z " + (plateZFor(pl.focus === null ? 0 : pl.focus) + 1) + "/" + info.Z + (pl.auto ? " auto" : ""));
+  bits.push(plateZText());
   return bits.join(" · ");
 }
 
@@ -3553,11 +3894,28 @@ function placePlate() {
   const block = $("plate-block");
   block.style.setProperty("--cols", pl.cols);
   block.style.setProperty("--rows", pl.rows);
+  const grid = $("plate-grid");
+  grid.setAttribute("aria-rowcount", String(pl.rows));
+  grid.setAttribute("aria-colcount", String(pl.cols));
+  const rows = Array.from({ length: pl.rows }, (_, i) => {
+    const row = document.createElement("div");
+    row.className = "plate-accessible-row";
+    row.setAttribute("role", "row");
+    row.setAttribute("aria-rowindex", String(i + 1));
+    return row;
+  });
+  if (!pl.placed.some((s) => s.i === pl.gridActive)) pl.gridActive = pl.placed[0]?.i;
   pl.placed.forEach((s) => {
     const el = pl.gridEls[s.i];
     el.style.gridRow = s.row + 1;
     el.style.gridColumn = s.col + 1;
+    el.setAttribute("role", "gridcell");
+    el.setAttribute("aria-rowindex", String(s.row + 1));
+    el.setAttribute("aria-colindex", String(s.col + 1));
+    el.tabIndex = s.i === pl.gridActive ? 0 : -1;
+    rows[s.row].append(el);
   });
+  grid.replaceChildren(...rows);
   const rowHeads = $("plate-row-heads");
   const colHeads = $("plate-col-heads");
   rowHeads.replaceChildren();
@@ -3697,10 +4055,12 @@ function wirePlateViewMenu() {
 
 function buildPlate() {
   const pl = state.plate;
+  wireNativeGestureScope();
   if (!pl) return;
   const info = state.info.plate;
   const wrap = $("stage-wrap");
-  wrap.classList.add("plate-grid");
+  wrap.classList.add(pl.focus === null ? "plate-grid" : "plate-focus");
+  wrap.classList.toggle("plate-single", info.P === 1);
 
   try {
     const saved = localStorage.getItem("nd2wsi.plate.transposed");
@@ -3726,6 +4086,18 @@ function buildPlate() {
     pl.stripEls[site.i] = small;
   });
   placePlate();
+  grid.addEventListener("keydown", (ev) => {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.isComposing) return;
+    const cell = ev.target.closest(".site");
+    if (!cell) return;
+    const next = window.Nd2PlateUI.nextGridSite(pl.placed, Number(cell.dataset.p), ev.key);
+    if (next === null) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    pl.gridActive = next;
+    pl.gridEls.forEach((el, p) => { el.tabIndex = p === next ? 0 : -1; });
+    pl.gridEls[next].focus({ preventScroll: true });
+  });
   $("plate-back").onclick = () => setPlateFocus(null);
   $("plate-transpose").onclick = () => {
     pl.transposed = !pl.transposed;
@@ -3852,6 +4224,13 @@ function paintPlate() {
   const group = pl.t + "/" + plateGroupKey();
   sites.forEach((site) => {
     const z = plateZFor(site.i);
+    const ready = window.Nd2PlateUI.focusReady(pl.focusMap, pl.t, site.i);
+    const detail = siteLabelText(site.name) + " · Z " + (z + 1) + "/" + state.info.plate.Z
+      + (pl.auto ? ready ? " · Autofocus" : " · Manual, autofocus pending" : "");
+    [pl.gridEls[site.i], pl.stripEls[site.i]].forEach((cell) => {
+      cell.setAttribute("aria-label", detail);
+      cell.title = detail;
+    });
     const url = plateFrameUrl(pl.t, site.i, z, quick || pl.k);
     // only the set on screen is loaded: the grid in the overview, the strip
     // in focus. Loading both doubled every step's requests, half of them
@@ -3884,10 +4263,16 @@ function paintPlate() {
 
 function plateFrameChanged() {
   // every t, z or focus change: frames, readouts, histogram, status bar
+  invalidatePixelProbe(true);
+  if (state.roi) {
+    if (frameOwnsRoi()) updateScaleStrip();
+    else clearRoi();
+  }
   refreshTiles();
   renderZSlider();
   renderTimeLine();
   refreshHistograms();
+  syncFrameScopedControls();
   $("plane-note").textContent = platePlaneNote();
   if (state.inspect && !state.windows.info.isHidden()) renderSlideInspector(state.inspect);
 }
@@ -3915,7 +4300,7 @@ function stepPlateZ(delta) {
   // with autofocus on, the plane on screen is the site's own, so a step
   // moves from there rather than from the plane the user last set by hand
   const pl = state.plate;
-  const from = pl.auto ? plateZFor(pl.focus === null ? 0 : pl.focus) : pl.z;
+  const from = pl.auto && pl.focus !== null ? plateZFor(pl.focus) : pl.z;
   setPlateZ(from + delta);
 }
 
@@ -3941,19 +4326,31 @@ function setPlateT(t) {
 function setPlateFocus(p) {
   const pl = state.plate;
   const info = state.info.plate;
-  const next = p === null || p === undefined ? null : clamp(Number(p), 0, info.P - 1);
+  const numeric = p === null || p === undefined ? null : Number(p);
+  if (numeric !== null && !Number.isInteger(numeric)) return;
+  const next = info.P === 1
+    ? 0
+    : numeric === null ? null : clamp(numeric, 0, info.P - 1);
   if (next === pl.focus) return;
-  const before = plateFrameParams().p;
+  const departingSite = state.annSite;
   // an open text edit belongs to the site being left, so it is committed
   // first. The debounced save is then called off, because it would fire
   // after the switch and write these marks into the next site's sidecar
   if (state.editingId) closeEditor(true);
+  scheduleAnnSave.cancel();
   if (state.annDirty) {
-    scheduleAnnSave.cancel();
-    saveAnnotations(before);
+    if (!Number.isInteger(departingSite)) {
+      setAnnStatus("Not saved: annotation owner is unknown");
+      return;
+    }
+    saveAnnotations(departingSite);
   }
+  if (state.tool) setTool(state.tool); // every tool belongs to the site being left
+  if (state.roi) clearRoi();
   state.annContext += 1;
   state.annDirty = false;
+  state.annReady = false;
+  state.annSite = null;
   pl.focus = next;
   const wrap = $("stage-wrap");
   wrap.classList.toggle("plate-grid", next === null);
@@ -3967,16 +4364,10 @@ function setPlateFocus(p) {
       state.viewer.navigator.update(state.viewer.viewport);
     }
   } else {
-    if (state.tool) setTool(state.tool); // hand the mouse back for the next focus
     setPlatePlaying(false);
     layoutPlate();
   }
-  if (plateFrameParams().p !== before) {
-    state.annotations = [];
-    renderAnnotations();
-    rebuildAnnList();
-    loadAnnotations();
-  }
+  loadAnnotations(next);
   if (pl.resetWheel) pl.resetWheel(); // the two levels do not share a stroke
   paintPlate(); // the set that just became visible carries older frames
   plateFrameChanged();
@@ -4046,6 +4437,10 @@ function buildZSlider() {
   knob.addEventListener("keydown", (ev) => {
     if (ev.key === "ArrowUp") { stepPlateZ(1); ev.preventDefault(); ev.stopPropagation(); }
     else if (ev.key === "ArrowDown") { stepPlateZ(-1); ev.preventDefault(); ev.stopPropagation(); }
+    else if (ev.key === "Home" || ev.key === "End") {
+      setPlateZ(ev.key === "Home" ? 0 : info.Z - 1);
+      ev.preventDefault(); ev.stopPropagation();
+    }
   });
   knob.setAttribute("aria-valuemin", "1");
   knob.setAttribute("aria-valuemax", String(info.Z));
@@ -4056,7 +4451,7 @@ function renderZSlider() {
   const info = state.info.plate;
   if (!pl.zTickEls) return;
   // with autofocus on, the slider reports the plane of the site in view
-  const shownZ = pl.auto ? plateZFor(pl.focus === null ? 0 : pl.focus) : pl.z;
+  const shownZ = pl.auto && pl.focus !== null ? plateZFor(pl.focus) : pl.z;
   const pct = zSliderPct(shownZ);
   // the track is inset 10 px inside the slider, so the knob and the label
   // follow the track's own extent
@@ -4072,21 +4467,22 @@ function renderZSlider() {
   const knob = $("z-knob");
   knob.style.top = top + "px";
   knob.setAttribute("aria-valuenow", String(shownZ + 1));
+  knob.setAttribute("aria-valuetext", plateZText() + (pl.auto && pl.focus === null ? ". Adjust to set a shared manual plane." : ""));
   $("z-slider").classList.toggle("auto", !!pl.auto);
   $("z-fill").style.height = ((1 - pct / 100) * (tr.height || 0)) + "px";
   const label = $("z-label");
   label.style.top = top + "px";
   label.replaceChildren();
-  label.append((shownZ + 1) + " of " + info.Z);
+  label.append(pl.auto && pl.focus === null ? plateZText() : (shownZ + 1) + " of " + info.Z);
   const dim = document.createElement("span");
   dim.className = "dim";
   let text = "";
-  if (Number(info.zStepUm) > 0) {
+  if (Number(info.zStepUm) > 0 && !(pl.auto && pl.focus === null)) {
     const d = (shownZ - info.zHome) * Number(info.zStepUm);
     text += " · " + (d < 0 ? "−" : "+") + rawValueLabel(Math.abs(d)) + " µm";
   }
-  if (pl.auto) text += " · auto";
-  else if (shownZ === info.zHome) text += " · home";
+  if (pl.auto && pl.focus !== null) text += window.Nd2PlateUI.focusReady(pl.focusMap, pl.t, pl.focus) ? " · auto" : " · manual, AF pending";
+  else if (!pl.auto && shownZ === info.zHome) text += " · home";
   dim.textContent = text;
   label.append(dim);
 }
@@ -4102,7 +4498,7 @@ function timeSpanMs() {
 function timePct(t) {
   const times = state.info.plate.timesMs || [];
   const span = timeSpanMs();
-  if (!span || !times.length) return 0;
+  if (!span || !times.length) return state.info.plate.T > 1 ? t / (state.info.plate.T - 1) * 100 : 0;
   return ((times[t] - times[0]) / span) * 100;
 }
 
@@ -4146,10 +4542,25 @@ function buildTimeLine() {
     }
   }
   const track = $("t-track");
+  track.setAttribute("aria-valuemin", "1");
+  track.setAttribute("aria-valuemax", String(info.T));
+  track.addEventListener("keydown", (ev) => {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const steps = { ArrowLeft: -1, ArrowRight: 1, ArrowDown: -1, ArrowUp: 1, PageDown: -10, PageUp: 10 };
+    if (ev.key === "Home") setPlateT(0);
+    else if (ev.key === "End") setPlateT(info.T - 1);
+    else if (Object.hasOwn(steps, ev.key)) setPlateT(pl.t + steps[ev.key]);
+    else return;
+    ev.preventDefault(); ev.stopPropagation();
+  });
   const tFromX = (x) => {
     const r = track.getBoundingClientRect();
     if (!r.width) return;
     const times = info.timesMs || [];
+    if (!timeSpanMs() || times.length !== info.T) {
+      setPlateT(Math.round(clamp((x - r.left) / r.width, 0, 1) * (info.T - 1)));
+      return;
+    }
     const target = times[0] + clamp((x - r.left) / r.width, 0, 1) * timeSpanMs();
     let best = 0;
     for (let i = 1; i < info.T; i++) {
@@ -4189,42 +4600,47 @@ function renderPlateAuto() {
   const pl = state.plate;
   const btn = $("t-auto");
   if (!pl || !btn) return;
-  const measured = pl.focusMap ? Number(pl.focusMap.measured) || 0 : 0;
+  const summary = currentFocusSummary();
+  btn.hidden = state.info.plate.Z <= 1;
   btn.classList.toggle("on", !!pl.auto);
   btn.setAttribute("aria-pressed", pl.auto ? "true" : "false");
-  btn.disabled = state.info.plate.Z <= 1 || measured === 0;
-  btn.title = state.info.plate.Z <= 1
-    ? "Autofocus needs more than one Z plane"
-    : measured === 0
-    ? "Autofocus becomes ready as the store measures the planes"
-    : pl.auto
-      ? "Autofocus on: every site shows its sharpest plane (F)"
-      : "Show every site at its sharpest plane (F)";
+  btn.disabled = state.info.plate.Z <= 1 || (!pl.auto && summary.ready === 0);
+  const progress = summary.ready + "/" + summary.total + " ready";
+  btn.querySelector("span").textContent = pl.auto ? "AF · " + progress : "Autofocus";
+  btn.title = "Autofocus: " + progress + ". Only complete Z stacks are applied; other sites use the manual plane. "
+    + "Scoring: mean image of all raw channels. (F)";
 }
 
 function loadPlateFocus() {
   // the sharpest plane of every site at every time point, measured from the
   // store's own reductions. An extra, so a failure only leaves it off
   const pl = state.plate;
-  if (!pl) return;
-  fetch("api/plate/focus", { cache: "no-store" })
+  if (!pl || pl.focusRequest) return;
+  const generation = state.info.generation;
+  const controller = new AbortController();
+  pl.focusRequest = controller;
+  fetch("api/plate/focus", { cache: "no-store", signal: controller.signal })
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
     .then((map) => {
-      if (!state.plate || !map || !Array.isArray(map.best)) return;
+      if (state.plate !== pl || state.info.generation !== generation || pl.focusRequest !== controller
+          || !map || !Array.isArray(map.best) || !Array.isArray(map.complete)) return;
       // the map keeps growing while the planes are measured, so a repaint
       // only happens when the planes on screen actually move; reloading the
       // deep-zoom stage on every poll would blank it on a two second beat
-      const site = pl.focus === null ? 0 : pl.focus;
-      const wasZ = pl.auto ? plateZFor(site) : null;
-      const wasRow = pl.auto && pl.focusMap ? String(pl.focusMap.best[pl.t]) : null;
+      const before = state.info.plate.sites.map((site) => plateZFor(site.i)).join(",");
       pl.focusMap = map;
       renderPlateAuto();
-      if (!pl.auto || String(map.best[pl.t]) === wasRow) return;
-      paintPlate();
-      if (plateZFor(site) !== wasZ) plateFrameChanged();
-      else { renderZSlider(); renderTimeLine(); }
+      const after = state.info.plate.sites.map((site) => plateZFor(site.i)).join(",");
+      if (pl.auto && before !== after) {
+        paintPlate();
+        plateFrameChanged();
+      } else {
+        renderZSlider();
+        $("plane-note").textContent = platePlaneNote();
+      }
     })
-    .catch(() => {});
+    .catch(() => {})
+    .finally(() => { if (pl.focusRequest === controller) pl.focusRequest = null; });
 }
 
 function pollPlateStatus() {
@@ -4251,7 +4667,7 @@ function pollPlateStatus() {
         }
         const map = pl.focusMap;
         const focusNeeded = state.info.plate.Z > 1;
-        const measured = map && map.measured >= map.total;
+        const measured = map && map.completeCount >= map.total;
         if (focusNeeded && !measured) loadPlateFocus();
         if (done && (!focusNeeded || measured)) {
           clearInterval(pl.statusTimer);
@@ -4283,11 +4699,66 @@ function renderTimeLine() {
   const period = platePeriodMs();
   $("t-read-frame").textContent = "frame " + (pl.t + 1) + " of " + info.T +
     (period ? " · every " + fmtPeriodWords(period) : "");
+  const track = $("t-track");
+  track.setAttribute("aria-valuenow", String(pl.t + 1));
+  track.setAttribute("aria-valuetext", (times.length ? fmtPeriodWords(times[pl.t] - times[0]) + ", " : "")
+    + "frame " + (pl.t + 1) + " of " + info.T);
+  track.setAttribute("aria-disabled", String(info.T <= 1));
   $("t-prev").disabled = pl.t === 0;
   $("t-first").disabled = pl.t === 0;
   $("t-next").disabled = pl.t >= info.T - 1;
   $("t-last").disabled = pl.t >= info.T - 1;
   $("t-play").disabled = info.T <= 1;
+  renderPlateAuto();
+}
+
+const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #ann-editor, #trash-confirm, #z-slider, #plate-transpose, #zoom-cluster";
+
+function wireNativeGestureScope() {
+  let pending = false;
+  let previous = "";
+  let closed = false;
+  const rect = (el) => {
+    if (!el || !el.getClientRects().length) return null;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return null;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 ? { left: r.left, top: r.top, right: r.right, bottom: r.bottom } : null;
+  };
+  const report = () => {
+    if (pending || closed) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      if (closed) return;
+      const selectors = NATIVE_GESTURE_EXCLUSIONS + (state.plate?.focus !== null ? ", #plate-block" : "");
+      const payload = {
+        nd2wsi: "native-gesture-scope", version: VIEWPORT_PROTOCOL_VERSION,
+        enabled: !!state.plate && Number(state.info?.plate?.T) > 1, include: rect($("stage-wrap")),
+        exclude: [...document.querySelectorAll(selectors)].map(rect).filter(Boolean),
+      };
+      const key = JSON.stringify(payload);
+      if (key !== previous) { previous = key; window.parent.postMessage(payload, location.origin); }
+    });
+  };
+  // Inspector moves and View/focus changes are DOM style/class changes.
+  const observer = new MutationObserver(report);
+  const observed = [...document.querySelectorAll(NATIVE_GESTURE_EXCLUSIONS + ", #stage-wrap, #plate, #plate-block")];
+  observed.forEach((el) => observer.observe(el, { attributes: true, attributeFilter: ["style", "class", "hidden"] }));
+  const sizes = typeof ResizeObserver === "function" ? new ResizeObserver(report) : null;
+  observed.forEach((el) => sizes?.observe(el));
+  window.addEventListener("resize", report);
+  document.addEventListener("scroll", report, true);
+  window.addEventListener("pagehide", () => {
+    closed = true;
+    state.plate?.focusRequest?.abort();
+    observer.disconnect();
+    sizes?.disconnect();
+    window.removeEventListener("resize", report);
+    document.removeEventListener("scroll", report, true);
+    window.parent.postMessage({ nd2wsi: "native-gesture-scope", version: VIEWPORT_PROTOCOL_VERSION, enabled: false }, location.origin);
+  }, { once: true });
+  report();
 }
 
 function wirePlateWheel() {
@@ -4327,7 +4798,7 @@ function wirePlateWheel() {
   };
   const route = (target, input, gestures, ev = null) => {
     if (!(target instanceof Element) || !$("stage-wrap").contains(target)) return false;
-    if (target.closest("#time-line, #plate-strip, #plate-back, .mac-window")) return false;
+    if (target.closest(NATIVE_GESTURE_EXCLUSIONS)) return false;
     if (pl.focus === null) return handle(input, gestures.grid, ev);
     if (target.closest("#plate-block")) return false;
     return handle(input, gestures.focus, ev);
@@ -4380,6 +4851,7 @@ function wirePlateKeys() {
     if (shortcuts && shortcuts.isTypingEvent(ev)) return;
     if (!shortcuts && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
     if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
+    if (ev.target.closest?.("#plate-grid .site, #t-track, #z-knob")) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     if (state.landmark.active) return;
     const compare = state.viewportRelay.compare;

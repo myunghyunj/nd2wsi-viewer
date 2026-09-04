@@ -28,6 +28,7 @@
       <button class="tb-btn" id="tb-annot" title="Show or hide Annotations (A)" aria-keyshortcuts="A">
         <span class="tb-ico icon-note" aria-hidden="true"></span><span>Annotate</span>
       </button>
+      <button type="button" class="tb-btn" id="t-auto" aria-pressed="false" aria-keyshortcuts="F" title="Autofocus (F)" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3.2"/><path d="M8 1v2.2M8 12.8V15M1 8h2.2M12.8 8H15"/></svg><span>Autofocus</span></button>
       <button class="tb-btn" id="tb-plate-view" title="Plate view options"
               aria-label="Plate view options" aria-haspopup="menu"
               aria-expanded="false" aria-controls="plate-view-menu" hidden>
@@ -87,7 +88,7 @@
           <div id="z-slider" aria-label="Z plane">
             <div id="z-track"><div id="z-fill"></div></div>
             <div id="z-ticks"></div>
-            <div id="z-knob" role="slider" aria-label="Z plane" tabindex="0"></div>
+            <div id="z-knob" role="slider" aria-label="Z plane" aria-orientation="vertical" tabindex="0"></div>
             <div id="z-label"></div>
           </div>
         </div>
@@ -102,14 +103,13 @@
           <button type="button" id="t-next" title="Next frame (→)"><svg viewBox="0 0 16 16"><path d="M4 2.6v10.8c0 .5.6.8 1 .5l6.4-5.2a.6.6 0 0 0 0-1L5 2.1c-.4-.3-1 0-1 .5z"/></svg></button>
           <button type="button" id="t-last" title="Last frame"><svg viewBox="0 0 16 16"><path d="M11.7 2.5h1.8v11h-1.8zM3 2.6v10.8c0 .5.6.8 1 .5l6.4-5.2a.6.6 0 0 0 0-1L4 2.1c-.4-.3-1 0-1 .5z"/></svg></button>
         </div>
-        <div id="t-track">
+        <div id="t-track" role="slider" tabindex="0" aria-label="Time" aria-orientation="horizontal">
           <div class="track"><div id="t-cached"></div><div id="t-fill"></div></div>
           <div id="t-ticks"></div>
           <div id="t-labels"></div>
           <div id="t-playhead"></div>
         </div>
         <div id="t-read"><b id="t-read-clock"></b><span id="t-read-frame"></span></div>
-        <button type="button" id="t-auto" aria-pressed="false" title="Show every site at its sharpest plane (F)"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3.2"/><path d="M8 1v2.2M8 12.8V15M1 8h2.2M12.8 8H15"/></svg><span>Autofocus</span></button>
         <div class="seg" id="t-speed"><button type="button" data-fps="4">4</button><button type="button" data-fps="8" class="on">8</button><button type="button" data-fps="16">16</button></div>
       </div>
     </div>
@@ -272,6 +272,7 @@
 <script src="../../static/plate-ui-v1.js"></script>
 <script src="../../static/shortcut-router-v1.js"></script>
 <script src="../../static/axis-latch-v1.js"></script>
+<script src="../../static/request-latest-v1.js"></script>
 <script src="../../static/app.js"></script>
 </body>
 </html>

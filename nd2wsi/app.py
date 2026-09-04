@@ -605,13 +605,18 @@ def _install_app_updater(api: Api, window) -> None:
 class Api:
     """Bridge exposed to the bootstrap page."""
 
-    def __init__(self, initial: Path | None):
+    def __init__(self, initial: Path | None, native_gesture_scopes=None):
         self._initial = initial
         self._status = ""
         self._frac = -1.0  # conversion progress, -1 = not converting
         self._httpd = None
         self._updater = None
         self._server_lock = threading.Lock()
+        if native_gesture_scopes is None:
+            from .native_gestures import NativeGestureScopeCache
+
+            native_gesture_scopes = NativeGestureScopeCache()
+        self._native_gesture_scopes = native_gesture_scopes
 
     def pending(self) -> bool:
         return self._initial is not None
@@ -621,6 +626,21 @@ class Api:
 
     def progress(self) -> float:
         return self._frac
+
+    def set_native_gesture_scopes(self, payload) -> dict:
+        """Replace the plate-stage geometry used by the AppKit event monitor."""
+
+        return self._native_gesture_scopes.replace(payload)
+
+    def begin_native_gesture_scope_session(self) -> dict:
+        """Issue a token so late calls from an older page cannot restore scopes."""
+
+        token = uuid.uuid4().hex
+        self._native_gesture_scopes.begin(token)
+        return {"ok": True, "token": token}
+
+    def clear_native_gesture_scopes(self) -> None:
+        self._native_gesture_scopes.clear()
 
     def update_status(self) -> dict:
         """Status shown by the shell's persistent update button."""
@@ -924,7 +944,13 @@ def create_app_window(initial: Path | None):
     # only clearly horizontal gestures; vertical input keeps its normal path.
     from .native_gestures import wire_native_trackpad_bridge
 
-    wire_native_trackpad_bridge(window, _dlog)
+    wire_native_trackpad_bridge(
+        window,
+        _dlog,
+        scope_cache=api._native_gesture_scopes,
+    )
+    window.events.before_load += lambda *_args: api.clear_native_gesture_scopes()
+    window.events.closed += lambda *_args: api.clear_native_gesture_scopes()
     _inline_traffic_lights(window)
     _wire_file_drop(window)
     _install_open_files_handler()

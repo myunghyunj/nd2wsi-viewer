@@ -933,23 +933,34 @@ class PlateStore:
                 pass
 
     def focus_map(self) -> dict[str, Any]:
-        """For every time point and site, the plane that reads sharpest.
+        """Focus progress and the best measured plane for each time and site.
 
-        Sites whose planes have not been measured fall back to the home
-        plane, so the map is usable from the first frame stored.
+        ``best`` stays provisionally useful for older clients from the first
+        stored plane. Consumers applying autofocus must require ``complete``;
+        an unmeasured site falls back to the home plane.
         """
         self._refresh()
         committed = self._committed_mask()
         scores = np.where(committed, self._focus_np, UNSCORED)
         home = int(self._source.z_home)
         measured = scores >= 0
+        measured_z = measured.sum(axis=2)
+        complete = measured_z == int(self._source.Z)
         any_z = measured.any(axis=2)
         best = np.where(any_z, np.where(measured, scores, -np.inf).argmax(axis=2), home)
         return {
             "best": [[int(v) for v in row] for row in best],
             "measured": int(any_z.sum()),
             "total": int(any_z.size),
+            "measuredZ": [[int(v) for v in row] for row in measured_z],
+            "totalZ": int(self._source.Z),
+            "complete": [[bool(v) for v in row] for row in complete],
+            "completeCount": int(complete.sum()),
             "zHome": home,
+            "scoring": {
+                "channelMode": "all-channels-mean-image",
+                "metric": "mean-squared-gradient-normalized-by-mean",
+            },
         }
 
     def count(self) -> int:
@@ -1591,7 +1602,7 @@ class PlateSource:
         return self.store.status()
 
     def focus_map(self) -> dict[str, Any]:
-        """The plane that reads sharpest, per time point and site."""
+        """Focus progress and provisional best plane per time point and site."""
         # Autofocus scores are derived from source pixels. A same-path source
         # replacement invalidates them just as it invalidates RAM histograms.
         with self._life:
@@ -1602,7 +1613,15 @@ class PlateSource:
                     "best": [[home] * self.P for _ in range(self.T)],
                     "measured": 0,
                     "total": self.T * self.P,
+                    "measuredZ": [[0] * self.P for _ in range(self.T)],
+                    "totalZ": self.Z,
+                    "complete": [[False] * self.P for _ in range(self.T)],
+                    "completeCount": 0,
                     "zHome": home,
+                    "scoring": {
+                        "channelMode": "all-channels-mean-image",
+                        "metric": "mean-squared-gradient-normalized-by-mean",
+                    },
                 }
             return self.store.focus_map()
 

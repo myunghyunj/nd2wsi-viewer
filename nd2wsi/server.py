@@ -292,15 +292,23 @@ def _associated_names(st: ViewerState) -> list[str]:
         return []
 
 
-def _frame_args(st: ViewerState, q: dict) -> tuple[int, int, int] | None:
+def _frame_args(
+    st: ViewerState, q: dict, *, require_p: bool = False
+) -> tuple[int, int, int] | None:
     """The (t, p, z) a plate request names, or None for an ordinary slide.
 
-    Missing values fall back to t 0, site 0 and the home z plane. Raises
-    ``ValueError`` when a value is not an integer or lies out of range.
+    Missing values fall back to t 0, site 0 and the home z plane. User-facing
+    operations on a multi-position acquisition can set ``require_p`` so an
+    absent site can never silently become P0. Raises ``ValueError`` when a
+    value is not an integer or lies out of range.
     """
     plate = st.plate
     if plate is None:
         return None
+
+    raw_p = (q.get("p") or [None])[0]
+    if require_p and plate.P > 1 and (raw_p is None or raw_p == ""):
+        raise ValueError("p is required; choose a plate site first")
 
     def qi(name: str, default: int, size: int) -> int:
         raw = (q.get(name) or [None])[0]
@@ -1868,9 +1876,15 @@ def make_handler(
                 x, y = float(x_raw), float(y_raw)
                 if not math.isfinite(x) or not math.isfinite(y):
                     raise ValueError("x and y must be finite numbers")
-                frame = _frame_args(st, q)
+                frame = _frame_args(st, q, require_p=True)
                 root = st.plate.root_for(*frame) if frame is not None else None
                 payload = _pixel_payload(st, x, y, root=root)
+                payload["generation"] = st.generation
+                payload["frame"] = (
+                    {"t": frame[0], "p": frame[1], "z": frame[2]}
+                    if frame is not None
+                    else None
+                )
             except (TypeError, ValueError) as e:
                 return self._error(400, str(e))
             self._json(payload)
@@ -1919,7 +1933,11 @@ def make_handler(
             """(sidecar path, site index) for the annotations routes."""
             if st.plate is None:
                 return st.annotations_path, None
-            raw = (q.get("p") or ["0"])[0]
+            raw = (q.get("p") or [None])[0]
+            if st.plate.P > 1 and (raw is None or raw == ""):
+                raise ValueError("p is required; choose a plate site first")
+            if raw is None or raw == "":
+                raw = "0"
             try:
                 p = int(raw)
             except (TypeError, ValueError):
@@ -2001,14 +2019,22 @@ def make_handler(
         def _histogram(self, st: ViewerState, q: dict | None = None):
             if st.plate is not None:
                 try:
-                    t, p, z = _frame_args(st, q or {})
+                    t, p, z = _frame_args(st, q or {}, require_p=True)
                 except ValueError as e:
                     return self._error(400, str(e))
-                return self._json({"channels": st.plate.histogram(t, p, z)})
+                return self._json(
+                    {
+                        "channels": st.plate.histogram(t, p, z),
+                        "generation": st.generation,
+                        "frame": {"t": t, "p": p, "z": z},
+                    }
+                )
             with st.lock:
                 if st.histograms is None:
                     st.histograms = render.compute_histograms(st.root, st.attrs)
-            self._json({"channels": st.histograms})
+            self._json(
+                {"channels": st.histograms, "generation": st.generation, "frame": None}
+            )
 
         def _immutable_when_current(self, st: ViewerState, q: dict) -> str:
             # a URL that names the cache generation can be cached hard: a
@@ -2114,7 +2140,7 @@ def make_handler(
                 job = None
             stem = Path(meta["source"]).stem
             try:
-                frame = _frame_args(st, q)
+                frame = _frame_args(st, q, require_p=True)
             except ValueError as e:
                 return self._error(400, str(e))
             root = st.root

@@ -13,6 +13,7 @@ const pairPicker = { open: false, mode: "start", replaceSid: null };
 
 const Align = window.nd2wsiAlign;
 const ShortcutRouter = window.Nd2ShortcutRouter;
+const NativeScope = window.Nd2NativeScope;
 const VIEWPORT_PROTOCOL_VERSION = 2;
 const VIEWPORT_THROTTLE_MS = 48;
 const MAX_GROUP = 4; // the anchor and up to three linked slides
@@ -57,21 +58,35 @@ window.nd2wsiUpdateNotice = showError;
 // function only after the physical gesture has latched horizontally. Route it
 // to the iframe under the pointer (or the front tab as a conservative fallback).
 window.nd2wsiNativeTrackpad = (input) => {
-  const x = Number(input?.clientX);
-  const y = Number(input?.clientY);
-  let frame = Number.isFinite(x) && Number.isFinite(y)
-    ? document.elementFromPoint(x, y)?.closest?.("iframe")
-    : null;
+  const point = NativeScope?.pointFromInput(input, {
+    width: window.innerWidth,
+    height: window.innerHeight,
+  });
+  const captured = typeof input?.target === "string" ? input.target : null;
+  let frame = captured ? frames.get(captured) : null;
+  if (captured && !frame) return false;
+  if (!frame && point) frame = document.elementFromPoint(point.x, point.y)?.closest?.("iframe");
   if (!frame || !frames.has(frame.dataset.sid)) frame = frames.get(active);
   if (!frame?.contentWindow) return false;
   const rect = frame.getBoundingClientRect();
+  const local = NativeScope?.pointInFrame(point || {
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2,
+  }, {
+    left: rect.left,
+    top: rect.top,
+    right: rect.right,
+    bottom: rect.bottom,
+    clientWidth: frame.clientWidth,
+    clientHeight: frame.clientHeight,
+  });
   frame.contentWindow.postMessage({
     nd2wsi: "native-trackpad",
     version: VIEWPORT_PROTOCOL_VERSION,
     deltaX: Number(input?.deltaX) || 0,
     gestureStart: !!input?.gestureStart,
-    clientX: Number.isFinite(x) ? x - rect.left : rect.width / 2,
-    clientY: Number.isFinite(y) ? y - rect.top : rect.height / 2,
+    clientX: local ? local.x : frame.clientWidth / 2,
+    clientY: local ? local.y : frame.clientHeight / 2,
     altKey: !!input?.altKey,
   }, location.origin);
   return frame.dataset.sid || true;
@@ -130,6 +145,16 @@ window.addEventListener("pywebviewready", () => {
   // a few milliseconds, so refresh once immediately and once after startup.
   refreshUpdaterButton();
   setTimeout(refreshUpdaterButton, 600);
+  const api = window.pywebview?.api;
+  if (api?.begin_native_gesture_scope_session) {
+    Promise.resolve(api.begin_native_gesture_scope_session())
+      .then((result) => {
+        nativeGestureScopeToken = typeof result?.token === "string" ? result.token : null;
+        nativeGestureScopeRevision = 0;
+        scheduleNativeGestureScopes();
+      })
+      .catch(() => { nativeGestureScopeToken = null; });
+  }
 });
 
 // The window has no title bar of its own, so the tab strip plays the part:
@@ -281,6 +306,7 @@ function broadcastTabShortcutState() {
 function paneCameUp(sid) {
   // a pane loaded or reloaded: give it everything the group knows
   sendTabShortcutState(sid);
+  scheduleNativeGestureScopes();
   if (!inGroup(sid)) return;
   applyDisplayTransform(sid);
   broadcastCompareState();
@@ -319,6 +345,7 @@ function applyFrameLayout() {
     frame.style.width = `${cell.width}%`;
     frame.style.height = `${cell.height}%`;
   }
+  scheduleNativeGestureScopes();
 }
 
 function activate(sid) {
@@ -345,6 +372,7 @@ function refresh(selectSid) {
         if (!openSids.has(key)) {
           frame.remove();
           frames.delete(key);
+          nativeGesturePaneScopes.delete(key);
           readyFrames.delete(key);
           compare.states.delete(key);
         }
@@ -444,6 +472,108 @@ function frameSidForSource(source) {
   return null;
 }
 
+const nativeGesturePaneScopes = new Map();
+let nativeGestureScopeRevision = 0;
+let nativeGestureScopeFrame = null;
+let nativeGestureScopeToken = null;
+
+function receiveNativeGestureScope(sid, data) {
+  if (!sid || !NativeScope) return;
+  if (!data.enabled) {
+    nativeGesturePaneScopes.delete(sid);
+    scheduleNativeGestureScopes();
+    return;
+  }
+  const include = NativeScope.rect(data.include);
+  if (!include) {
+    nativeGesturePaneScopes.delete(sid);
+    scheduleNativeGestureScopes();
+    return;
+  }
+  const exclude = (Array.isArray(data.exclude) ? data.exclude : [])
+    .map((item) => NativeScope.rect(item))
+    .filter(Boolean);
+  nativeGesturePaneScopes.set(sid, { include, exclude });
+  scheduleNativeGestureScopes();
+}
+
+function scheduleNativeGestureScopes() {
+  if (nativeGestureScopeFrame !== null) return;
+  nativeGestureScopeFrame = requestAnimationFrame(() => {
+    nativeGestureScopeFrame = null;
+    publishNativeGestureScopes();
+  });
+}
+
+function publishNativeGestureScopes() {
+  const api = window.pywebview?.api;
+  if (!api?.set_native_gesture_scopes || !NativeScope || !nativeGestureScopeToken) return;
+  const entries = [...nativeGesturePaneScopes.entries()].reverse().map(([sid, scope]) => {
+    const frame = frames.get(sid);
+    if (!frame) return { target: sid, visible: false };
+    const bounds = frame.getBoundingClientRect();
+    const style = getComputedStyle(frame);
+    return {
+      target: sid,
+      visible: bounds.width > 0 && bounds.height > 0 &&
+        style.display !== "none" && style.visibility !== "hidden",
+      frame: {
+        left: bounds.left,
+        top: bounds.top,
+        right: bounds.right,
+        bottom: bounds.bottom,
+        clientWidth: frame.clientWidth,
+        clientHeight: frame.clientHeight,
+      },
+      include: scope.include,
+      exclude: scope.exclude,
+    };
+  });
+  const viewport = {
+    width: window.innerWidth,
+    height: window.innerHeight,
+  };
+  let scopes = NativeScope.buildScopes(entries, viewport);
+  const shellBlockers = ["compare-controls", "compare-divider", "compare-picker", "dropzone"]
+    .map((id) => $(id))
+    .filter((element) => {
+      if (!element || element.hidden) return false;
+      const style = getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      return bounds.width > 0 && bounds.height > 0 &&
+        style.display !== "none" && style.visibility !== "hidden";
+    })
+    .map((element) => NativeScope.normalizeRect(element.getBoundingClientRect(), viewport))
+    .filter(Boolean);
+  scopes = scopes.map((scope) => ({
+    ...scope,
+    exclude: [...scope.exclude, ...shellBlockers],
+  }));
+  if (document.documentElement.classList.contains("preparing-update")) scopes = [];
+  const revision = ++nativeGestureScopeRevision;
+  Promise.resolve(api.set_native_gesture_scopes({
+    token: nativeGestureScopeToken,
+    revision,
+    scopes,
+  })).catch(() => {});
+}
+
+window.addEventListener("resize", scheduleNativeGestureScopes);
+const nativeGestureShellBlockers = ["compare-controls", "compare-divider", "compare-picker", "dropzone"]
+  .map((id) => $(id))
+  .filter(Boolean);
+if (typeof MutationObserver === "function") {
+  const blockerObserver = new MutationObserver(scheduleNativeGestureScopes);
+  nativeGestureShellBlockers.forEach((element) => blockerObserver.observe(
+    element,
+    { attributes: true, attributeFilter: ["class", "hidden", "style"] }
+  ));
+}
+if (typeof ResizeObserver === "function") {
+  const blockerSizes = new ResizeObserver(scheduleNativeGestureScopes);
+  nativeGestureShellBlockers.forEach((element) => blockerSizes.observe(element));
+}
+
 function postToSlide(sid, message) {
   const frame = frames.get(sid);
   if (!frame?.contentWindow) return false;
@@ -466,6 +596,7 @@ window.nd2wsiPrepareForUpdate = (requestId) => {
     finishQuitPreparation({ ok: false, error: "update preparation restarted" });
   }
   document.documentElement.classList.add("preparing-update");
+  scheduleNativeGestureScopes();
   if (busyTab) {
     return Promise.resolve({ ok: false, error: "a slide is still opening" });
   }
@@ -1737,6 +1868,9 @@ window.addEventListener("message", (event) => {
         ? { ok: false, error: pending.errors.join("; ") }
         : { ok: true, panes: pending.targets.size });
     }
+  } else if (kind === "native-gesture-scope") {
+    if (!senderSid || !versioned) return;
+    receiveNativeGestureScope(senderSid, event.data);
   } else if (kind === "viewport-ready") {
     if (!senderSid || !versioned || (event.data.sid && event.data.sid !== senderSid)) return;
     readyFrames.add(senderSid);
