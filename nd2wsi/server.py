@@ -1198,6 +1198,36 @@ class SlideRegistry:
                     pass
             close()
 
+    def active_export_count(self) -> int:
+        """Return the number of exports which are still using slide state."""
+        with self._lock:
+            states = list(self.slides.values())
+        return sum(st.busy.active for st in states)
+
+    def close_all_for_relaunch(self) -> None:
+        """Synchronously release every source and writer before an update.
+
+        Unlike ordinary tab closure, this path may not leave delayed native
+        teardown behind: Sparkle is about to replace the application bundle
+        and relaunch the process.  Removing the states first bars new requests;
+        the lifecycle guards then drain work which already obtained a state.
+        """
+        with self._lock:
+            states = list(self.slides.values())
+            self.slides.clear()
+        for st in states:
+            st.busy.close(timeout=None)
+            if st.plate is not None:
+                st.plate.close(timeout=None)
+                continue
+            close = getattr(st.root, "close", None)
+            if close is None:
+                continue
+            try:
+                close(delay=0)
+            except TypeError:
+                close()
+
     def trash_cache(self, sid: str, on_progress=None) -> int:
         """Close the slide and delete its pyramid store. Returns bytes freed.
 
@@ -2223,6 +2253,14 @@ def create_server(
         def shutdown(self) -> None:
             super().shutdown()
             self._close_registry()
+
+        def shutdown_for_relaunch(self) -> None:
+            """Stop accepting work and synchronously release update locks."""
+            super().shutdown()
+            if getattr(self, "_registry_closed", False):
+                return
+            self._registry_closed = True
+            registry.close_all_for_relaunch()
 
         def server_close(self) -> None:
             self._close_registry()

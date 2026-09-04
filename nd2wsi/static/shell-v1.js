@@ -2,11 +2,13 @@
 
 const $ = (id) => document.getElementById(id);
 const frames = new Map();
+const readyFrames = new Set();
 let slides = [];
 let active = null;
 let busyTab = null;
 let busyTimer = null;
 let toastTimer = null;
+let quitPreparation = null;
 const pairPicker = { open: false, mode: "start", replaceSid: null };
 
 const Align = window.nd2wsiAlign;
@@ -47,6 +49,42 @@ function showError(message) {
   toastTimer = setTimeout(() => toast.classList.remove("show"), 4200);
 }
 
+window.nd2wsiUpdateNotice = showError;
+
+async function refreshUpdaterButton() {
+  const button = $("update-check");
+  const api = window.pywebview?.api;
+  if (!api?.update_status) return;
+  try {
+    const status = await api.update_status();
+    button.disabled = !status.available;
+    button.title = status.available
+      ? `Check for Updates… · version ${status.version}`
+      : "Updates are unavailable in this build";
+  } catch (_) {
+    button.disabled = true;
+  }
+}
+
+$("update-check").addEventListener("click", async () => {
+  const button = $("update-check");
+  const api = window.pywebview?.api;
+  if (!api?.check_for_updates) return;
+  button.disabled = true;
+  button.classList.add("checking");
+  button.setAttribute("aria-busy", "true");
+  try {
+    const result = await api.check_for_updates();
+    if (!result.ok) showError(result.message || "Could not open the update window");
+  } catch (error) {
+    showError(`Could not check for updates: ${error}`);
+  } finally {
+    button.classList.remove("checking");
+    button.removeAttribute("aria-busy");
+    setTimeout(refreshUpdaterButton, 400);
+  }
+});
+
 function applyShellTheme(theme) {
   document.documentElement.classList.toggle("light", theme === "light");
 }
@@ -60,7 +98,13 @@ function markNativeChrome() {
   document.documentElement.classList.add("native-chrome");
 }
 if (window.pywebview !== undefined) markNativeChrome();
-window.addEventListener("pywebviewready", markNativeChrome);
+window.addEventListener("pywebviewready", () => {
+  markNativeChrome();
+  // The shown callback which installs Sparkle and this page load may race by
+  // a few milliseconds, so refresh once immediately and once after startup.
+  refreshUpdaterButton();
+  setTimeout(refreshUpdaterButton, 600);
+});
 
 // The window has no title bar of its own, so the tab strip plays the part:
 // a double-click on its empty space zooms the window, as a title bar
@@ -258,6 +302,7 @@ function refresh(selectSid) {
         if (!openSids.has(key)) {
           frame.remove();
           frames.delete(key);
+          readyFrames.delete(key);
           compare.states.delete(key);
         }
       }
@@ -361,6 +406,55 @@ function postToSlide(sid, message) {
   frame.contentWindow.postMessage(message, location.origin);
   return true;
 }
+
+function finishQuitPreparation(result) {
+  const pending = quitPreparation;
+  if (!pending) return;
+  quitPreparation = null;
+  clearTimeout(pending.timer);
+  pending.resolve(result);
+}
+
+window.nd2wsiPrepareForUpdate = (requestId) => {
+  const id = String(requestId || "");
+  if (!id) return Promise.resolve({ ok: false, error: "missing update request" });
+  if (quitPreparation) {
+    finishQuitPreparation({ ok: false, error: "update preparation restarted" });
+  }
+  document.documentElement.classList.add("preparing-update");
+  if (busyTab) {
+    return Promise.resolve({ ok: false, error: "a slide is still opening" });
+  }
+  const targets = new Set([...readyFrames].filter((sid) => frames.has(sid)));
+  if (!targets.size) return Promise.resolve({ ok: true, panes: 0 });
+
+  return new Promise((resolve) => {
+    const pending = {
+      requestId: id,
+      targets,
+      seen: new Set(),
+      errors: [],
+      resolve,
+      timer: null,
+    };
+    pending.timer = setTimeout(() => {
+      if (quitPreparation !== pending) return;
+      const missing = [...targets].filter((sid) => !pending.seen.has(sid));
+      finishQuitPreparation({
+        ok: false,
+        error: `save confirmation timed out for ${missing.length} pane(s)`,
+      });
+    }, 8000);
+    quitPreparation = pending;
+    for (const sid of targets) {
+      postToSlide(sid, {
+        nd2wsi: "prepare-quit",
+        version: VIEWPORT_PROTOCOL_VERSION,
+        requestId: id,
+      });
+    }
+  });
+};
 
 function finitePoint(value, positive = false) {
   if (!value || !Number.isFinite(Number(value.x)) || !Number.isFinite(Number(value.y))) {
@@ -1585,8 +1679,23 @@ window.addEventListener("message", (event) => {
   const senderSid = frameSidForSource(event.source);
   const kind = event.data.nd2wsi;
   const versioned = event.data.version === VIEWPORT_PROTOCOL_VERSION;
-  if (kind === "viewport-ready") {
+  if (kind === "quit-ready") {
+    const pending = quitPreparation;
+    if (!pending || !senderSid || !versioned || !pending.targets.has(senderSid)) return;
+    if (event.data.sid !== senderSid || event.data.requestId !== pending.requestId) return;
+    if (pending.seen.has(senderSid)) return;
+    pending.seen.add(senderSid);
+    if (!event.data.ok) {
+      pending.errors.push(`${slideName(senderSid)}: ${event.data.error || "save failed"}`);
+    }
+    if (pending.seen.size === pending.targets.size) {
+      finishQuitPreparation(pending.errors.length
+        ? { ok: false, error: pending.errors.join("; ") }
+        : { ok: true, panes: pending.targets.size });
+    }
+  } else if (kind === "viewport-ready") {
     if (!senderSid || !versioned || (event.data.sid && event.data.sid !== senderSid)) return;
+    readyFrames.add(senderSid);
     paneCameUp(senderSid);
   } else if (kind === "viewport-state") {
     if (!senderSid || (event.data.sid && event.data.sid !== senderSid)) return;

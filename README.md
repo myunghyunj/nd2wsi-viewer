@@ -42,12 +42,19 @@ Nothing leaves your computer. There is no upload and no account.
 - Cuts out any region as ND2, TIFF, PNG, or JPEG, or exports the whole slide at a reduced size.
 - Puts up to four slides of the same case side by side and keeps them in step while you move.
 - Aligns serial sections with four clicked points.
+- Checks once a day for signed GitHub releases and always asks before installing one.
 
 ## Get started
 
 1. Download `nd2wsi-viewer.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. It runs on Apple silicon Macs.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
 3. Drop an `.nd2` or `.svs` file onto the window, or press `+` to browse.
+
+Version 1.2.0 is the first build that contains the updater, so it must be
+installed from the DMG once. After that, use the circular-arrow button in the
+tab bar or **nd2wsi-viewer → Check for Updates…**. The app checks quietly once
+a day and shows Sparkle's standard update window only when a newer signed
+release exists; it never installs an update without asking.
 
 The first time you open an ND2 scan the viewer builds its reduced copies. A 3 GB scan takes well under a minute on a laptop, and the next open is instant. An SVS opens right away.
 

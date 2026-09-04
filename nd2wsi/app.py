@@ -11,11 +11,16 @@ ND2), then the viewer loads from an ephemeral localhost port.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 
 APP_NAME = "nd2wsi-viewer"
+_UPDATER_HANDLE = None
+_UPDATER_COORDINATOR = None
 
 
 def _dlog(msg: str) -> None:
@@ -58,6 +63,11 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
     font-family:ui-monospace,"SF Mono",Menlo,monospace}
   #drop.over::after{content:"";position:fixed;inset:14px;border-radius:16px;
     border:2px dashed rgba(10,132,255,.9);background:rgba(10,132,255,.06)}
+  #update{position:fixed;right:12px;bottom:10px;height:28px;padding:0 11px;
+    border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.42);
+    font:12px -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
+  #update:hover{background:rgba(255,255,255,.07);color:rgba(255,255,255,.78)}
+  #update:disabled{opacity:.45}
 </style></head><body>
 <div id="drop"><div class="card">
   <div class="pyr"><div class="l1"></div><div class="l2"></div><div class="l3"></div></div>
@@ -67,6 +77,7 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   <div id="bar"><span id="fill"></span></div>
   <div id="pct"></div>
 </div></div>
+<button id="update" type="button">Check for Updates…</button>
 <script>
   let busy = false, polling = null;
   const drop = document.getElementById('drop');
@@ -113,6 +124,14 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   });
   window.addEventListener('pywebviewready', () => {
     pywebview.api.pending().then(p => { if (p) go(pywebview.api.open_slide()); });
+  });
+  document.getElementById('update').addEventListener('click', ev => {
+    const button = ev.currentTarget;
+    button.disabled = true;
+    pywebview.api.check_for_updates()
+      .then(result => { if (!result.ok) setStatus(result.message || 'Could not check for updates.'); })
+      .catch(error => setStatus('Could not check for updates: ' + error))
+      .finally(() => { button.disabled = false; });
   });
 </script></body></html>"""
 
@@ -453,6 +472,136 @@ def start_server(store: Path):
     return httpd, server_url(httpd)
 
 
+class UpdateShutdownCoordinator:
+    """Flush browser work and release native resources before Sparkle relaunches."""
+
+    def __init__(self, api: Api, window):
+        self.api = api
+        self.window = window
+        self._lock = threading.Lock()
+        self._running = False
+        self._request_id = ""
+        self._completion = None
+        self._failure = None
+
+    def prepare_for_update(self, completion, failure) -> None:
+        with self._lock:
+            if self._running:
+                failure("update preparation is already running")
+                return
+            self._running = True
+            self._request_id = uuid.uuid4().hex
+            self._completion = completion
+            self._failure = failure
+        self._flush_panes()
+
+    def _notice(self, message: str) -> None:
+        try:
+            payload = json.dumps(str(message))
+            self.window.evaluate_js(
+                f"window.nd2wsiUpdateNotice && window.nd2wsiUpdateNotice({payload})"
+            )
+        except Exception as exc:
+            _dlog(f"update notice failed: {exc!r}")
+
+    def _report_wait(self, message: str) -> None:
+        self._notice(message)
+        failure = self._failure
+        if failure is not None:
+            failure(message)
+
+    def _flush_panes(self) -> None:
+        # Every retry has a distinct wire id so a late iframe reply from an
+        # earlier timed-out attempt cannot satisfy the new attempt.
+        request = json.dumps(f"{self._request_id}-{uuid.uuid4().hex}")
+        script = (
+            "typeof window.nd2wsiPrepareForUpdate === 'function' "
+            f"? window.nd2wsiPrepareForUpdate({request}) "
+            ": Promise.resolve({ok:true, panes:0})"
+        )
+        try:
+            self.window.evaluate_js(script, callback=self._after_flush)
+        except Exception as exc:
+            self._retry_flush(f"Could not prepare the viewer: {exc}")
+
+    def _after_flush(self, result) -> None:
+        if not isinstance(result, dict) or not result.get("ok"):
+            if isinstance(result, dict):
+                message = str(result.get("error") or "annotations were not saved")
+            else:
+                message = "the viewer did not confirm its saved state"
+            self._retry_flush(f"Update waiting: {message}")
+            return
+        threading.Thread(
+            target=self._drain_and_close,
+            name="updater-safe-relaunch",
+            daemon=True,
+        ).start()
+
+    def _retry_flush(self, message: str) -> None:
+        self._report_wait(message + "; retrying…")
+        retry = threading.Timer(5.0, self._flush_panes)
+        retry.daemon = True
+        retry.start()
+
+    def _drain_and_close(self) -> None:
+        last_reason = None
+        try:
+            while True:
+                reason = self.api.update_block_reason()
+                if reason is None:
+                    break
+                if reason != last_reason:
+                    self._notice(reason)
+                    last_reason = reason
+                time.sleep(0.5)
+            self.api.stop_server_for_update()
+        except Exception as exc:
+            message = f"Update could not close the viewer safely: {exc}"
+            self._report_wait(message)
+            _dlog(message)
+            return
+
+        completion = self._completion
+        if completion is None:
+            return
+        try:
+            from Foundation import NSOperationQueue
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(completion)
+        except Exception:
+            completion()
+
+
+def _install_app_updater(api: Api, window) -> None:
+    global _UPDATER_COORDINATOR, _UPDATER_HANDLE
+    if _UPDATER_COORDINATOR is not None:
+        return
+
+    def install():
+        global _UPDATER_COORDINATOR, _UPDATER_HANDLE
+        try:
+            from .updater import install_sparkle_updater
+
+            coordinator = UpdateShutdownCoordinator(api, window)
+            handle = install_sparkle_updater(
+                shutdown_coordinator=coordinator,
+                logger=_dlog,
+            )
+            _UPDATER_COORDINATOR = coordinator
+            _UPDATER_HANDLE = handle
+            api.attach_updater(handle)
+        except Exception as exc:
+            _dlog(f"updater setup failed: {exc!r}")
+
+    try:
+        from Foundation import NSOperationQueue
+
+        NSOperationQueue.mainQueue().addOperationWithBlock_(install)
+    except Exception:
+        install()
+
+
 class Api:
     """Bridge exposed to the bootstrap page."""
 
@@ -461,6 +610,8 @@ class Api:
         self._status = ""
         self._frac = -1.0  # conversion progress, -1 = not converting
         self._httpd = None
+        self._updater = None
+        self._server_lock = threading.Lock()
 
     def pending(self) -> bool:
         return self._initial is not None
@@ -470,6 +621,61 @@ class Api:
 
     def progress(self) -> float:
         return self._frac
+
+    def update_status(self) -> dict:
+        """Status shown by the shell's persistent update button."""
+        try:
+            from importlib.metadata import version
+
+            current = version("nd2wsi-viewer")
+        except Exception:
+            current = "development"
+        return {"available": self._updater is not None, "version": current}
+
+    def check_for_updates(self) -> dict:
+        """Show Sparkle's standard update window on AppKit's main thread."""
+        handle = self._updater
+        if handle is None:
+            return {
+                "ok": False,
+                "message": "Updates are available in the installed macOS app.",
+            }
+        try:
+            from Foundation import NSOperationQueue
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                handle.check_for_updates
+            )
+            return {"ok": True}
+        except Exception as exc:
+            _dlog(f"manual update check failed: {exc!r}")
+            return {"ok": False, "message": "Could not open the update window."}
+
+    def attach_updater(self, handle) -> None:
+        self._updater = handle
+
+    def update_block_reason(self) -> str | None:
+        if self._frac >= 0:
+            return "Waiting for the slide which is opening…"
+        with self._server_lock:
+            server = self._httpd
+        if server is None:
+            return None
+        count = server.registry.active_export_count()
+        if count:
+            noun = "export" if count == 1 else "exports"
+            return f"Waiting for {count} {noun} to finish…"
+        return None
+
+    def stop_server_for_update(self) -> None:
+        """Synchronously release sockets, ND2 handles, and plate writers."""
+        with self._server_lock:
+            server, self._httpd = self._httpd, None
+        if server is None:
+            return
+        shutdown = getattr(server, "shutdown_for_relaunch", server.shutdown)
+        shutdown()
+        server.server_close()
 
     def open_slide(self):
         import webview
@@ -573,11 +779,12 @@ class Api:
                 store = open_or_convert(p, on_status=note, on_progress=frac)
                 # a plate file skips conversion; the bar stays up while the
                 # registry opens it, which reads a few frames for its window
-                if self._httpd is None:
-                    self._httpd, url = start_server(store)
-                else:
-                    self._httpd.registry.add_store(store)
-                    url = _server_url(self._httpd)
+                with self._server_lock:
+                    if self._httpd is None:
+                        self._httpd, url = start_server(store)
+                    else:
+                        self._httpd.registry.add_store(store)
+                        url = _server_url(self._httpd)
                 self._frac = -1.0
             except Exception as e:
                 self._frac = -1.0
@@ -597,11 +804,12 @@ class Api:
             self._frac = 0.0  # bar up while the file opens, before ticks
             store = open_or_convert(path, on_status=note, on_progress=frac)
             self._status = "starting viewer …"
-            if self._httpd is None:
-                self._httpd, url = start_server(store)
-            else:
-                self._httpd.registry.add_store(store)
-                url = _server_url(self._httpd)
+            with self._server_lock:
+                if self._httpd is None:
+                    self._httpd, url = start_server(store)
+                else:
+                    self._httpd.registry.add_store(store)
+                    url = _server_url(self._httpd)
             self._frac = -1.0
             return url  # the tab shell at / lists every open slide
         except Exception as e:  # surfaced in the bootstrap page
@@ -714,6 +922,7 @@ def create_app_window(initial: Path | None):
     _inline_traffic_lights(window)
     _wire_file_drop(window)
     _install_open_files_handler()
+    window.events.shown += lambda: _install_app_updater(api, window)
     return api, window
 
 

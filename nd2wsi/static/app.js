@@ -22,6 +22,11 @@ const state = {
   inspectLoading: false,
   plate: null, // {t, z, focus, playing, fps, k, ...} for a time series of sites
   annDirty: false, // an edit is waiting for the debounced save
+  annRevision: 0,
+  annContext: 0, // changes when a plate switches to another site's sidecar
+  annSaveTail: Promise.resolve(),
+  annFailedSaves: new Map(), // URL -> latest captured payload that still needs retry
+  quitPreparing: false,
   annLoadSeq: 0, // only the newest sidecar load may install its items
   pixel: {
     hudVisible: false,
@@ -1319,6 +1324,8 @@ function removeAnnotation(id) {
 }
 
 function annotationsChanged() {
+  if (state.quitPreparing) return;
+  state.annRevision += 1;
   state.annDirty = true;
   renderAnnotations();
   rebuildAnnList();
@@ -1335,20 +1342,96 @@ function annotationsUrl(site) {
   return "api/annotations?p=" + p;
 }
 
+function annotationSaveEntry(site) {
+  return {
+    url: annotationsUrl(site),
+    body: JSON.stringify({ items: state.annotations }),
+    revision: state.annRevision,
+    context: state.annContext,
+  };
+}
+
+function queueAnnotationSave(entry) {
+  const run = state.annSaveTail.then(async () => {
+    try {
+      const response = await fetch(entry.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: entry.body,
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const data = await response.json();
+      const failed = state.annFailedSaves.get(entry.url);
+      if (!failed || failed.revision <= entry.revision) {
+        state.annFailedSaves.delete(entry.url);
+      }
+      if (state.annContext === entry.context && state.annRevision === entry.revision) {
+        state.annDirty = false;
+      }
+      setAnnStatus("Saved · " + basename(data.path));
+      return { ok: true };
+    } catch (error) {
+      const failed = state.annFailedSaves.get(entry.url);
+      if (!failed || failed.revision <= entry.revision) {
+        state.annFailedSaves.set(entry.url, entry);
+      }
+      setAnnStatus("Save failed: " + error.message);
+      return { ok: false, error: error.message };
+    }
+  });
+  // Always resolve the tail so one failed request cannot suppress a newer
+  // captured snapshot.  Callers inspect the individual result instead.
+  state.annSaveTail = run.then(() => undefined);
+  return run;
+}
+
 function saveAnnotations(site) {
-  state.annDirty = false;
   if (annLocked()) {
     setAnnStatus("Not saved: annotation is locked in this degraded view");
-    return;
+    return Promise.resolve({ ok: false, error: "annotation is locked" });
   }
-  fetch(annotationsUrl(site), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items: state.annotations }),
-  })
-    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
-    .then((d) => setAnnStatus("Saved · " + basename(d.path)))
-    .catch((e) => setAnnStatus("Save failed: " + e.message));
+  return queueAnnotationSave(annotationSaveEntry(site));
+}
+
+async function flushAnnotationsForUpdate() {
+  if (!$('ann-editor').hidden) closeEditor(true);
+  state.quitPreparing = true;
+  scheduleAnnSave.cancel();
+
+  if (state.annDirty) {
+    const saved = await saveAnnotations();
+    if (!saved.ok) throw new Error(saved.error || "annotation save failed");
+  }
+  await state.annSaveTail;
+
+  // A plate may have changed sites after queueing a save. Retry the exact
+  // URL and payload captured for every older site rather than writing the
+  // current site's marks into it.
+  for (const entry of [...state.annFailedSaves.values()]) {
+    const retried = await queueAnnotationSave(entry);
+    if (!retried.ok) throw new Error(retried.error || "annotation retry failed");
+  }
+  await state.annSaveTail;
+  if (state.annDirty || state.annFailedSaves.size) {
+    throw new Error("annotations are still waiting to be saved");
+  }
+}
+
+async function acknowledgeUpdatePreparation(requestId) {
+  let reply;
+  try {
+    await flushAnnotationsForUpdate();
+    reply = { ok: true };
+  } catch (error) {
+    reply = { ok: false, error: String(error.message || error).slice(0, 240) };
+  }
+  window.parent.postMessage({
+    nd2wsi: "quit-ready",
+    version: VIEWPORT_PROTOCOL_VERSION,
+    requestId,
+    sid: currentSlideSid(),
+    ...reply,
+  }, location.origin);
 }
 
 function loadAnnotations() {
@@ -2766,7 +2849,10 @@ function wireCompareRelay() {
       event.origin !== location.origin || !event.data ||
       event.data.version !== VIEWPORT_PROTOCOL_VERSION
     ) return;
-    if (event.data.nd2wsi === "viewport-request") {
+    if (event.data.nd2wsi === "prepare-quit") {
+      const requestId = String(event.data.requestId || "");
+      if (requestId) acknowledgeUpdatePreparation(requestId);
+    } else if (event.data.nd2wsi === "viewport-request") {
       const requestId = String(event.data.requestId || "");
       if (!requestId) return;
       const reply = () => postViewportState("request", { requestId });
@@ -2790,6 +2876,13 @@ function wireCompareRelay() {
       setLandmarkMode(event.data);
     }
   });
+  for (const kind of ["pointerdown", "keydown", "beforeinput"]) {
+    window.addEventListener(kind, (event) => {
+      if (!state.quitPreparing) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+  }
   // Under the tab strip the toolbar reads as part of the window chrome, so
   // a double-click on its empty space zooms the window too. The shell owns
   // the window and decides; buttons keep their own double-clicks.
@@ -3722,6 +3815,8 @@ function setPlateFocus(p) {
     scheduleAnnSave.cancel();
     saveAnnotations(before);
   }
+  state.annContext += 1;
+  state.annDirty = false;
   pl.focus = next;
   const wrap = $("stage-wrap");
   wrap.classList.toggle("plate-grid", next === null);

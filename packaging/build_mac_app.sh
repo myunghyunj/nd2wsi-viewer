@@ -4,6 +4,12 @@
 #   packaging/build_mac_app.sh [output-dir]
 #
 # Produces:  <output-dir>/nd2wsi-viewer.app  and  <output-dir>/nd2wsi-viewer.dmg
+#
+# Signing is done in /private/tmp.  Finder/iCloud file-provider locations can
+# attach com.apple.FinderInfo while codesign is walking a bundle, which makes
+# the resource seal fail even after xattr -cr.  A signed app is copied back
+# only when the destination preserves that signature; the DMG is always made
+# from the clean staged copy.
 # The app bundles Python, the viewer, and limnd2 (ND2 export) — nothing to
 # install on the target machine. Ad-hoc signed: fine for direct distribution;
 # Gatekeeper-clean distribution additionally needs a Developer ID + notarization.
@@ -14,6 +20,12 @@ REPO="$(dirname "$HERE")"
 OUT="${1:-$REPO/dist}"
 BUILD="$REPO/build/macapp"
 APPNAME="nd2wsi-viewer"
+SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://raw.githubusercontent.com/myunghyunj/nd2wsi-viewer/main/updates/appcast.xml}"
+SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-RSPZ8oXqjqXqByfHTCoiskGziFs+zAHNJ/fGa3N/hvk=}"
+RELEASE_STAGE="$(mktemp -d /private/tmp/nd2wsi-release.XXXXXX)"
+cleanup_release_stage() { rm -rf "$RELEASE_STAGE"; }
+trap cleanup_release_stage EXIT
+STAGED_APP="$RELEASE_STAGE/$APPNAME.app"
 
 # limnd2 pulls in optional GUI helpers that import tkinter, so the bundle
 # Python must carry _tkinter or ND2 export dies inside the app. Pick the
@@ -120,19 +132,32 @@ with open(path, "wb") as fh:
 print("   document types declared")
 PLISTEOF
 
-echo "==> codesign (ad-hoc)"
-# A checkout inside an iCloud-synced folder gets Finder and file-provider
-# attributes stamped onto the fresh bundle, and codesign refuses those as
-# "detritus". Clear every extended attribute first; none of them belongs
-# in a shipped app.
-xattr -cr "$OUT/$APPNAME.app"
-codesign --force --deep -s - "$OUT/$APPNAME.app"
+if [ "${ND2WSI_SKIP_UPDATER:-}" = "1" ]; then
+  echo "==> Sparkle SKIPPED by explicit request — do not ship this build"
+else
+  if [ -z "${SPARKLE_FRAMEWORK:-}" ] || [ ! -d "$SPARKLE_FRAMEWORK" ]; then
+    echo "ERROR: set SPARKLE_FRAMEWORK to the pinned Sparkle.framework directory." >&2
+    echo "       Use ND2WSI_SKIP_UPDATER=1 only for a development build." >&2
+    exit 5
+  fi
+  echo "==> Sparkle updater"
+  "$PY" "$HERE/inject_sparkle.py" \
+    --app "$OUT/$APPNAME.app" \
+    --framework "$SPARKLE_FRAMEWORK" \
+    --feed-url "$SPARKLE_FEED_URL" \
+    --public-ed-key "$SPARKLE_PUBLIC_ED_KEY"
+fi
+
+echo "==> codesign (${CODESIGN_IDENTITY:-ad-hoc})"
+ditto --norsrc --noextattr --noqtn "$OUT/$APPNAME.app" "$STAGED_APP"
+xattr -cr "$STAGED_APP"
+"$HERE/sign_release.sh" "$STAGED_APP"
 
 echo "==> smoke test"
 # A release artifact must prove itself: convert, serve, tile, ND2 round-trip.
 # Only an explicit --skip-smoke (development convenience) may skip it.
 if [ -n "${ND2WSI_SMOKE_FILE:-}" ]; then
-  "$OUT/$APPNAME.app/Contents/MacOS/$APPNAME" --smoke "$ND2WSI_SMOKE_FILE"
+  "$STAGED_APP/Contents/MacOS/$APPNAME" --smoke "$ND2WSI_SMOKE_FILE"
 elif [ "${ND2WSI_SKIP_SMOKE:-}" = "1" ]; then
   echo "   SKIPPED by explicit request — do not ship this build"
 else
@@ -144,12 +169,25 @@ else
 fi
 
 echo "==> dmg"
-DMGDIR="$BUILD/dmgroot"
-rm -rf "$DMGDIR" && mkdir -p "$DMGDIR"
-cp -R "$OUT/$APPNAME.app" "$DMGDIR/"
+DMGDIR="$RELEASE_STAGE/dmgroot"
+mkdir -p "$DMGDIR"
+ditto --norsrc --noextattr --noqtn "$STAGED_APP" "$DMGDIR/$APPNAME.app"
 ln -s /Applications "$DMGDIR/Applications"
 hdiutil create -volname "$APPNAME" -srcfolder "$DMGDIR" -ov -format UDZO \
-  "$OUT/$APPNAME.dmg" >/dev/null
+  "$RELEASE_STAGE/$APPNAME.dmg" >/dev/null
+ditto --norsrc --noextattr --noqtn "$RELEASE_STAGE/$APPNAME.dmg" "$OUT/$APPNAME.dmg"
+
+# Keep the loose app when the requested output directory permits a valid
+# bundle.  File-provider directories may immediately reattach FinderInfo; in
+# that case, remove the misleading loose copy and ship/install from the DMG.
+rm -rf "$OUT/$APPNAME.app"
+ditto --norsrc --noextattr --noqtn "$STAGED_APP" "$OUT/$APPNAME.app"
+xattr -cr "$OUT/$APPNAME.app" || true
+if ! codesign --verify --deep --strict "$OUT/$APPNAME.app" 2>/dev/null; then
+  rm -rf "$OUT/$APPNAME.app"
+  echo "warn: output directory changes app metadata; use the signed app inside the DMG"
+fi
 
 echo "done:"
-du -sh "$OUT/$APPNAME.app" "$OUT/$APPNAME.dmg"
+if [ -d "$OUT/$APPNAME.app" ]; then du -sh "$OUT/$APPNAME.app"; fi
+du -sh "$OUT/$APPNAME.dmg"
