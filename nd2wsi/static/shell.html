@@ -19,6 +19,14 @@
       <path d="M14.7 2.7v3.8h-3.8" />
     </svg>
   </button>
+  <button id="compare-tools-toggle" class="shell-icon-button" type="button"
+          title="Show comparison tools" aria-label="Show comparison tools"
+          aria-expanded="false" aria-controls="compare-controls" hidden>
+    <svg class="hotspot-icon" viewBox="0 0 24 18" aria-hidden="true">
+      <path d="M2 5h5m4 0h11M2 13h11m4 0h5" />
+      <path d="M7 2v6h4V2ZM13 10v6h4v-6Z" />
+    </svg>
+  </button>
   <button id="compare-toggle" class="shell-icon-button" type="button"
           title="Compare slides (⌘\)" aria-label="Compare slides"
           aria-haspopup="menu" aria-expanded="false"
@@ -77,7 +85,8 @@
               title="Align with four points on every slide"
               aria-label="Align with landmarks" aria-pressed="false">Align</button>
       <button id="compare-close" class="compare-control" type="button"
-              title="Close compare" aria-label="Close compare">×</button>
+              title="Hide comparison tools — slides stay linked"
+              aria-label="Hide comparison tools">×</button>
     </div>
     <div id="compare-orientation" class="compare-row orientation-panel" role="group" aria-label="Slide orientation">
       <label for="compare-orientation-target">Orient</label>

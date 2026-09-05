@@ -28,6 +28,7 @@ const compare = {
   anchorSid: null,
   members: [], // linked slides other than the anchor, in display order
   orientationSid: null, // explicit target; never change every member at once
+  toolsVisible: false, // toolbox visibility is independent of group/link state
   toolbarHeight: 0,
   linked: true,
   split: 50,
@@ -264,6 +265,8 @@ function render() {
   compareToggle.classList.toggle("active", compare.enabled);
   compareToggle.setAttribute("aria-pressed", String(compare.enabled));
   compareToggle.setAttribute("aria-expanded", String(pairPicker.open && pairPicker.mode === "start"));
+  compareToggle.setAttribute("aria-label", compare.enabled ? "Stop comparing slides" : "Compare slides");
+  compareToggle.title = compare.enabled ? "Stop comparing slides (⌘\\)" : "Compare slides (⌘\\)";
   if (compare.enabled) {
     document.title = `${groupSids().map(slideName).join(" ↔ ")} — nd2wsi-viewer`;
   } else {
@@ -328,13 +331,38 @@ function paneCameUp(sid) {
 }
 
 function syncCompareToolbarSpace() {
-  const height = compare.enabled
+  const height = compare.enabled && compare.toolsVisible
     ? Math.ceil($("compare-controls").getBoundingClientRect().height) + 20
     : 0;
   if (compare.toolbarHeight === height) return;
   compare.toolbarHeight = height;
   document.documentElement.style.setProperty("--compare-toolbar-height", `${height}px`);
   if (compare.enabled) requestGroupSoon("sync");
+}
+
+function syncCompareToolsVisibility() {
+  const visible = compare.enabled && compare.toolsVisible;
+  $("compare-controls").hidden = !visible;
+  const toggle = $("compare-tools-toggle");
+  toggle.hidden = !compare.enabled;
+  toggle.classList.toggle("active", visible);
+  toggle.setAttribute("aria-expanded", String(visible));
+  const label = visible ? "Hide comparison tools" : "Show comparison tools";
+  toggle.setAttribute("aria-label", label);
+  toggle.title = !visible && compare.landmark.active
+    ? `${label} — alignment in progress` : label;
+  syncCompareToolbarSpace();
+  scheduleNativeGestureScopes();
+}
+
+function setCompareToolsVisible(visible) {
+  if (!compare.enabled) return;
+  closePairPicker(false);
+  compare.toolsVisible = Boolean(visible);
+  syncCompareToolsVisibility();
+  // Hiding tools must not clear the group, transforms, in-flight operations,
+  // or a landmark edit. Keep a keyboard-accessible way to return to those tools.
+  $(compare.toolsVisible ? "compare-close" : "compare-tools-toggle").focus();
 }
 
 function applyFrameLayout() {
@@ -344,7 +372,6 @@ function applyFrameLayout() {
   const twoUp = compare.enabled && group.length === 2;
   divider.hidden = !twoUp;
   divider.setAttribute("aria-hidden", String(!twoUp));
-  $("compare-controls").hidden = !compare.enabled;
   for (const [key, frame] of frames) {
     const index = group.indexOf(key);
     frame.classList.toggle("active", !compare.enabled && key === active);
@@ -366,8 +393,7 @@ function applyFrameLayout() {
     frame.style.width = `${cell.width}%`;
     frame.style.height = `${cell.height}%`;
   }
-  syncCompareToolbarSpace();
-  scheduleNativeGestureScopes();
+  syncCompareToolsVisibility();
 }
 
 function activate(sid) {
@@ -1422,7 +1448,7 @@ function renderLandmarkPanel() {
 }
 
 function updateCompareControls() {
-  $("compare-controls").hidden = !compare.enabled;
+  syncCompareToolsVisibility();
   if (!compare.enabled) {
     renderLandmarkPanel();
     broadcastCompareState();
@@ -1636,6 +1662,7 @@ function attachMember(sid) {
 function startGroup(anchorSid, memberSid) {
   if (compare.enabled || !anchorSid || !memberSid || anchorSid === memberSid) return;
   compare.enabled = true;
+  compare.toolsVisible = true;
   compare.anchorSid = anchorSid;
   compare.orientationSid = memberSid;
   compare.members = [];
@@ -1718,6 +1745,7 @@ function stopCompare() {
   clearDisplayTransforms(sids);
   for (const sid of sids) sendLandmarkMode(sid, false, { clear: true });
   compare.enabled = false;
+  compare.toolsVisible = false;
   compare.anchorSid = null;
   compare.members = [];
   compare.pairs = new Map();
@@ -1791,6 +1819,7 @@ function swapComparedSlides() {
 }
 
 $("compare-toggle").onclick = toggleCompare;
+$("compare-tools-toggle").onclick = () => setCompareToolsVisible(!compare.toolsVisible);
 $("compare-picker-close").onclick = () => closePairPicker();
 $("compare-add").onclick = () => openPicker("add");
 $("compare-link").onclick = toggleViewLink;
@@ -1806,7 +1835,7 @@ $("compare-orientation-target").onchange = (event) => {
   updateOrientationControls();
 };
 $("compare-align").onclick = () => (compare.landmark.active ? finishLandmarks(true) : startLandmarks());
-$("compare-close").onclick = stopCompare;
+$("compare-close").onclick = () => setCompareToolsVisible(false);
 $("compare-landmark-clear").onclick = clearAlignment;
 $("compare-landmark-done").onclick = () => finishLandmarks(true);
 $("compare-landmark-cancel").onclick = () => finishLandmarks(false);

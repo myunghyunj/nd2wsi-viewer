@@ -24,7 +24,7 @@ function production(name) {
   return source.slice(start, source.indexOf('\n}', start) + 2);
 }
 const compare = {
-  enabled: true, anchorSid: 'a', members: ['b', 'c'], orientationSid: 'b',
+  enabled: true, toolsVisible: true, anchorSid: 'a', members: ['b', 'c'], orientationSid: 'b',
   landmark: {active: false}, pendingRequest: null, requestSeq: 0,
   states: new Map(), pairs: new Map(), memory: new Map(), anchorLandmarks: [],
 };
