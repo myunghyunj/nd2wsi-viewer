@@ -133,7 +133,7 @@ ND2 and TIFF keep the raw values, so what you export is what the scanner recorde
 
 The `Full` button selects the entire slide. A very large picture export is made at a reduced size instead of at native resolution, and the panel tells you the size it will produce.
 
-## Comparing serial sections
+## Comparing scans and serial sections
 
 ![The same case linked three ways, H&E, Masson's trichrome, and CD31 immunofluorescence](docs/compare-serial-sections.jpg)
 
@@ -141,11 +141,13 @@ From left: H&E, Masson's trichrome, and CD31 immunofluorescence of the same case
 
 Open two or more slides of the same case, press `⌘\`, and choose which slide to link with the one in front. Press `+` in the capsule to link more, up to four in all, so a reference section can sit beside CD31, CD68, and an H&E at the same time. Two slides share the screen, three take a column each, and four fill a grid. When you move one, the others follow in micrometers.
 
-Two glass slides of serial sections are never mounted the same way. Press **Align** and click the same four structures on every slide, in the same order. The viewer works out the rotation, the scale, the shift, and a mirror if a section was flipped, and it shows how well the points agree in micrometers. A linked pane turns on screen to match, but its pixels, marks, and exports stay in that slide's own coordinates.
+Scans taken through opposite sides of the glass may need a reflection, not just a rotation. In Compare, choose the image in **Orient**, then use **Flip ↔**, **Flip ↕**, **↶ 90°**, **↷ 90°**, or **Transpose** (swap the displayed horizontal and vertical axes). These are image-orientation controls, distinct from transposing the well grid. The reference stays fixed; only the selected linked image changes, around the current view center. **Reset** restores its original orientation without resetting that center. The viewer does not guess the orientation from `.svs` or `.nd2` filenames. Pair orientations are remembered while the app remains open.
+
+To refine the alignment, press **Align** and click the same four structures on every image, in the same order. The viewer works out the rotation, scale, shift, and reflection, and shows the landmark residual in micrometers when calibrated (relative units otherwise). A fitted image's orientation buttons are protected until **Align → Clear** removes the points; Cancel restores the previous alignment. These are display transforms: source pixels, annotation coordinates, and exports remain unchanged.
 
 Even a good alignment drifts by a few cells at high magnification. While linked, the arrow keys move the linked slide by one screen pixel, Shift with an arrow by ten, and an Option-drag moves one pane alone. Each nudge becomes part of the alignment.
 
-This is a navigation aid for serial sections, not registration. It compensates rotation, scale, and shift, not local deformation, and it never claims that cells in sections separated in depth are the same cells.
+This is a navigation and manual similarity-alignment aid, not automatic or deformable image registration. Matching orientation alone does not establish pixel correspondence. For serial sections it never claims that cells in sections separated in depth are the same cells.
 
 ## What the viewer writes on your disk
 

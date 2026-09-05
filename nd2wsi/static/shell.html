@@ -73,19 +73,31 @@
       </button>
       <button id="compare-swap" class="compare-control" type="button"
               title="Swap sides" aria-label="Swap the anchor and the linked slide">⇄</button>
-      <button id="compare-rotate" class="compare-control text-control" type="button"
-              title="Toggle the 180° scan orientation"
-              aria-label="Rotate linked orientation 180 degrees"
-              aria-pressed="false">180°</button>
-      <button id="compare-mirror" class="compare-control text-control" type="button"
-              title="Mirror the linked slides left-to-right"
-              aria-label="Mirror linked orientation left to right"
-              aria-pressed="false">Mirror</button>
       <button id="compare-align" class="compare-control text-control" type="button"
               title="Align with four points on every slide"
               aria-label="Align with landmarks" aria-pressed="false">Align</button>
       <button id="compare-close" class="compare-control" type="button"
               title="Close compare" aria-label="Close compare">×</button>
+    </div>
+    <div id="compare-orientation" class="compare-row orientation-panel" role="group" aria-label="Slide orientation">
+      <label for="compare-orientation-target">Orient</label>
+      <select id="compare-orientation-target" aria-label="Slide to orient" aria-describedby="compare-orientation-hint"></select>
+      <div class="orientation-actions">
+        <button id="compare-flip-horizontal" class="compare-control text-control" type="button"
+                title="Flip the selected image left-to-right on screen" aria-label="Flip horizontally">Flip ↔</button>
+        <button id="compare-flip-vertical" class="compare-control text-control" type="button"
+                title="Flip the selected image top-to-bottom on screen" aria-label="Flip vertically">Flip ↕</button>
+        <button id="compare-rotate-left" class="compare-control text-control" type="button"
+                title="Rotate the selected image 90° counterclockwise" aria-label="Rotate left 90 degrees">↶ 90°</button>
+        <button id="compare-rotate-right" class="compare-control text-control" type="button"
+                title="Rotate the selected image 90° clockwise" aria-label="Rotate right 90 degrees">↷ 90°</button>
+        <button id="compare-transpose" class="compare-control text-control" type="button"
+                title="Swap horizontal and vertical image axes (diagonal reflection)">Transpose</button>
+        <button id="compare-orientation-reset" class="compare-control text-control" type="button"
+                title="Restore the selected image's original orientation, keeping the current center">Reset</button>
+      </div>
+      <output id="compare-orientation-state" aria-live="polite"></output>
+      <span id="compare-orientation-hint">Reference stays fixed · display only</span>
     </div>
     <div id="compare-landmarks" class="compare-row landmark-panel" hidden>
       <div id="compare-landmark-rows"></div>

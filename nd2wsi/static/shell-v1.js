@@ -21,12 +21,14 @@ const LANDMARKS_NEEDED = 4;
 
 /* A link group has one anchor and up to three members. Each member carries
    its own similarity transform from anchor space to member space, either
-   the format-based default (matched centers, optional 180° or mirror) or a
+   a user-selected orientation (matched centers, rotations and reflections) or a
    least-squares fit through the landmarks the user placed. */
 const compare = {
   enabled: false,
   anchorSid: null,
   members: [], // linked slides other than the anchor, in display order
+  orientationSid: null, // explicit target; never change every member at once
+  toolbarHeight: 0,
   linked: true,
   split: 50,
   mru: [],
@@ -311,9 +313,28 @@ function paneCameUp(sid) {
   applyDisplayTransform(sid);
   broadcastCompareState();
   if (compare.landmark.active) sendLandmarkMode(sid, true);
-  if (compare.linked || compare.pendingRequest) {
-    requestGroupSoon(compare.pendingRequest?.kind || "sync");
+  if (compare.pendingRequest) {
+    // The loading pane may have missed the original request. Re-send that
+    // request to this pane, retaining the action and its selected target.
+    compare.pendingRequest.seen.delete(sid);
+    postToSlide(sid, {
+      nd2wsi: "viewport-request",
+      version: VIEWPORT_PROTOCOL_VERSION,
+      requestId: compare.pendingRequest.requestId,
+    });
+  } else if (compare.linked) {
+    requestGroupSoon("sync");
   }
+}
+
+function syncCompareToolbarSpace() {
+  const height = compare.enabled
+    ? Math.ceil($("compare-controls").getBoundingClientRect().height) + 20
+    : 0;
+  if (compare.toolbarHeight === height) return;
+  compare.toolbarHeight = height;
+  document.documentElement.style.setProperty("--compare-toolbar-height", `${height}px`);
+  if (compare.enabled) requestGroupSoon("sync");
 }
 
 function applyFrameLayout() {
@@ -345,6 +366,7 @@ function applyFrameLayout() {
     frame.style.width = `${cell.width}%`;
     frame.style.height = `${cell.height}%`;
   }
+  syncCompareToolbarSpace();
   scheduleNativeGestureScopes();
 }
 
@@ -570,7 +592,10 @@ if (typeof MutationObserver === "function") {
   ));
 }
 if (typeof ResizeObserver === "function") {
-  const blockerSizes = new ResizeObserver(scheduleNativeGestureScopes);
+  const blockerSizes = new ResizeObserver(() => {
+    syncCompareToolbarSpace();
+    scheduleNativeGestureScopes();
+  });
   nativeGestureShellBlockers.forEach((element) => blockerSizes.observe(element));
 }
 
@@ -664,6 +689,7 @@ function normalizeViewportState(data, sid) {
     imagePx,
     containerPx,
     pixelSizeUm,
+    plateGrid: data.plateGrid === true,
   };
 }
 
@@ -679,13 +705,15 @@ function mappingMode(a, b) {
 function pxToSpace(point, st, mode) {
   return mode === "physical"
     ? { x: point.x * st.pixelSizeUm.x, y: point.y * st.pixelSizeUm.y }
-    : { x: point.x / st.imagePx.x, y: point.y / st.imagePx.y };
+    // One unit is an image width on BOTH axes. A unit-square mapping would
+    // distort nonsquare, uncalibrated images when rotated by 90 degrees.
+    : { x: point.x / st.imagePx.x, y: point.y / st.imagePx.x };
 }
 
 function spaceToPx(point, st, mode) {
   return mode === "physical"
     ? { x: point.x / st.pixelSizeUm.x, y: point.y / st.pixelSizeUm.y }
-    : { x: point.x * st.imagePx.x, y: point.y * st.imagePx.y };
+    : { x: point.x * st.imagePx.x, y: point.y * st.imagePx.x };
 }
 
 function widthPxToSpace(width, st, mode) {
@@ -700,23 +728,12 @@ function imageCenterSpace(st, mode) {
   return pxToSpace({ x: st.imagePx.x / 2, y: st.imagePx.y / 2 }, st, mode);
 }
 
-function slideFormat(sid) {
-  const name = String(slideName(sid)).toLowerCase();
-  if (name.endsWith(".svs")) return "svs";
-  if (name.endsWith(".nd2")) return "nd2";
-  return null;
-}
-
-function automaticOrientation(anchorSid, memberSid) {
-  // this lab's scanners run their axes in opposite directions
-  const formats = new Set([slideFormat(anchorSid), slideFormat(memberSid)]);
-  return formats.has("svs") && formats.has("nd2") ? { x: -1, y: -1 } : { x: 1, y: 1 };
-}
-
-function newPair(anchorSid, memberSid) {
+function newPair() {
   return {
     mode: null,
-    orientation: automaticOrientation(anchorSid, memberSid),
+    // File extensions do not establish which side or direction was scanned.
+    // Keep the original view until the user chooses a display orientation.
+    orientation: Align.identity(),
     transform: null,
     fit: null,
     landmarks: [],
@@ -724,7 +741,7 @@ function newPair(anchorSid, memberSid) {
 }
 
 function defaultTransform(pair, anchorState, memberState, mode) {
-  const linear = Align.fromOrientation(pair.orientation.x, pair.orientation.y);
+  const linear = pair.orientation;
   return Align.translationMatching(
     linear, imageCenterSpace(anchorState, mode), imageCenterSpace(memberState, mode)
   );
@@ -751,9 +768,7 @@ function displayTransformFor(sid) {
   if (!compare.enabled || sid === compare.anchorSid) return { degrees: 0, flipped: false };
   const pair = compare.pairs.get(sid);
   if (!pair) return { degrees: 0, flipped: false };
-  const linear = pair.transform || Align.fromOrientation(pair.orientation.x, pair.orientation.y);
-  // the member holds the anchor turned by theta, so its pane turns back
-  return { degrees: -Align.angleDeg(linear), flipped: Align.mirrored(linear) };
+  return Align.displayPose(pair.transform || pair.orientation);
 }
 
 function applyDisplayTransform(sid) {
@@ -844,9 +859,12 @@ function restoreAlignment(anchorSid, memberSid, pair) {
     if (!inverse) return false;
     Object.assign(pair, {
       mode: reversed.mode,
-      orientation: { ...reversed.orientation },
+      orientation: Align.invert(reversed.orientation),
       transform: inverse,
-      fit: reversed.fit ? { ...reversed.fit, angleDeg: -reversed.fit.angleDeg, scale: 1 / reversed.fit.scale } : null,
+      fit: reversed.fit ? {
+        ...reversed.fit, angleDeg: Align.angleDeg(inverse),
+        scale: Align.scale(inverse), rms: reversed.fit.rms / Align.scale(reversed.transform),
+      } : null,
       landmarks: clonePoints(reversed.anchorLandmarks),
     });
     if (!compare.anchorLandmarks.length) compare.anchorLandmarks = clonePoints(reversed.landmarks);
@@ -935,11 +953,13 @@ function clearViewportRoutes() {
   compare.routeLatest.clear();
 }
 
-function clearPendingRequest() {
+function clearPendingRequest(preserveLayout = false) {
   if (compare.pendingRequest?.timer) clearTimeout(compare.pendingRequest.timer);
   compare.pendingRequest = null;
-  clearTimeout(compare.layoutRequestTimer);
-  compare.layoutRequestTimer = null;
+  if (!preserveLayout) {
+    clearTimeout(compare.layoutRequestTimer);
+    compare.layoutRequestTimer = null;
+  }
 }
 
 function syncFromAnchor() {
@@ -947,16 +967,21 @@ function syncFromAnchor() {
   if (anchorState && compare.linked) forwardViewport(compare.anchorSid, anchorState);
 }
 
-function requestGroup(kind) {
+function requestGroup(kind, details = {}) {
   // ask every pane where it stands, then act once all have answered
   if (!compare.enabled) return;
+  if (kind === "sync" && compare.pendingRequest) {
+    // A resize/layout refresh must not cancel an in-flight button action.
+    requestGroupSoon("sync");
+    return;
+  }
   clearViewportRoutes();
-  clearPendingRequest();
+  clearPendingRequest(kind !== "sync");
   const requestId = `shell-request-${++compare.requestSeq}`;
-  const pending = { requestId, kind, seen: new Set(), timer: null };
+  const pending = { ...details, requestId, kind, seen: new Set(), timer: null };
   pending.timer = setTimeout(() => {
     if (compare.pendingRequest !== pending) return;
-    clearPendingRequest();
+    clearPendingRequest(true);
     updateCompareControls();
     if (kind !== "sync") showError("Could not read every linked view; nothing was changed");
   }, 2500);
@@ -981,7 +1006,7 @@ function requestGroupSoon(kind) {
 
 function finishGroupRequest(pending) {
   if (compare.pendingRequest !== pending) return;
-  clearPendingRequest();
+  clearPendingRequest(true);
   const ready = groupSids().every((sid) => compare.states.has(sid));
   if (!ready) {
     updateCompareControls();
@@ -991,27 +1016,31 @@ function finishGroupRequest(pending) {
   if (pending.kind === "capture") {
     recaptureAll();
     compare.linked = true;
-  } else if (pending.kind === "rotate-180" || pending.kind === "mirror") {
-    for (const sid of compare.members) {
-      const pair = compare.pairs.get(sid);
-      if (!pair || pair.fit) continue; // a landmark fit already decided orientation
-      if (pending.kind === "rotate-180") {
-        pair.orientation = { x: -pair.orientation.x, y: -pair.orientation.y };
-      } else {
-        pair.orientation = { x: -pair.orientation.x, y: pair.orientation.y };
+  } else if (pending.kind === "orientation") {
+    const sid = pending.targetSid;
+    const pair = compare.pairs.get(sid);
+    // Capture the target before the asynchronous viewport request. Protect
+    // landmark fits and ignore a removed/replaced target, even if UI state changes.
+    if (compare.members.includes(sid) && pair && !pair.fit && !compare.landmark.active &&
+        !orientationNeedsFocusedSite(sid)) {
+      const next = Align.reorient(pair.orientation, pending.action);
+      if (next) {
+        pair.orientation = next;
+        pair.transform = Align.translationMatching(
+          next,
+          pxToSpace(compare.states.get(compare.anchorSid).centerPx,
+            compare.states.get(compare.anchorSid), pair.mode),
+          pxToSpace(compare.states.get(sid).centerPx, compare.states.get(sid), pair.mode)
+        );
+        applyDisplayTransform(sid);
       }
-      const anchorState = compare.states.get(compare.anchorSid);
-      const memberState = compare.states.get(sid);
-      pair.transform = defaultTransform(pair, anchorState, memberState, pair.mode);
-      rematchTranslation(sid);
     }
-    applyDisplayTransforms();
   } else if (pending.kind === "clear") {
     for (const sid of compare.members) {
       const pair = compare.pairs.get(sid);
       const anchorState = compare.states.get(compare.anchorSid);
       const memberState = compare.states.get(sid);
-      pair.orientation = automaticOrientation(compare.anchorSid, sid);
+      pair.orientation = Align.identity();
       pair.fit = null;
       pair.landmarks = [];
       pair.transform = defaultTransform(pair, anchorState, memberState, pair.mode);
@@ -1021,7 +1050,10 @@ function finishGroupRequest(pending) {
     applyDisplayTransforms();
     for (const sid of groupSids()) sendLandmarkMode(sid, compare.landmark.active, { clear: true });
   }
-  syncFromAnchor();
+  // Orientation is a display-only operation around the captured centers.
+  // Re-fitting the linked field here would invoke rotated viewport constraints
+  // and could change the zoom just because a direction button was pressed.
+  if (pending.kind !== "orientation") syncFromAnchor();
   updateCompareControls();
 }
 
@@ -1032,6 +1064,9 @@ function receiveViewportState(data, sid) {
   const previous = compare.states.get(sid);
   if (!state.requestId && state.seq && previous?.seq && state.seq <= previous.seq) return;
   compare.states.set(sid, state);
+  if (compare.enabled && inGroup(sid) && previous?.plateGrid !== state.plateGrid) {
+    updateOrientationControls();
+  }
   const pending = compare.pendingRequest;
   if (pending && state.requestId === pending.requestId && inGroup(sid)) {
     pending.seen.add(sid);
@@ -1252,11 +1287,60 @@ function orientationNote(pair) {
     if (pair.fit.reflected) parts.push("mirror");
     return parts.join(" · ");
   }
-  const { x, y } = pair.orientation;
-  if (x > 0 && y > 0) return "";
-  if (x < 0 && y > 0) return "mirror";
-  if (x < 0 && y < 0) return "180°";
-  return "vertical mirror";
+  const pose = Align.displayPose(pair.orientation);
+  const degrees = ((Math.round(pose.degrees) % 360) + 360) % 360;
+  const screen = Align.invert(pair.orientation);
+  if (screen.a === -1 && screen.d === 1) return "Flip ↔";
+  if (screen.a === 1 && screen.d === -1) return "Flip ↕";
+  if (screen.b === 1 && screen.c === 1) return "Transposed";
+  if (screen.b === -1 && screen.c === -1) return "Transposed · 180°";
+  return [degrees ? `${degrees}°` : "", pose.flipped ? "mirrored" : ""].filter(Boolean).join(" · ");
+}
+
+const ORIENTATION_ACTIONS = {
+  "compare-flip-horizontal": "flip-horizontal",
+  "compare-flip-vertical": "flip-vertical",
+  "compare-rotate-left": "rotate-left",
+  "compare-rotate-right": "rotate-right",
+  "compare-transpose": "transpose",
+  "compare-orientation-reset": "reset",
+};
+
+function orientationNeedsFocusedSite(sid) {
+  return Boolean(compare.states.get(compare.anchorSid)?.plateGrid ||
+    compare.states.get(sid)?.plateGrid);
+}
+
+function updateOrientationControls() {
+  if (!compare.members.includes(compare.orientationSid)) {
+    compare.orientationSid = compare.members[0] || null;
+  }
+  const select = $("compare-orientation-target");
+  // Preserve the native select and focus while viewport/landmark state updates.
+  const key = JSON.stringify(compare.members.map((sid) => [sid, slideName(sid)]));
+  if (select.dataset.optionsKey !== key) {
+    select.replaceChildren(...compare.members.map((sid) => {
+      const option = document.createElement("option");
+      option.value = sid;
+      option.textContent = slideName(sid);
+      return option;
+    }));
+    select.dataset.optionsKey = key;
+  }
+  select.value = compare.orientationSid || "";
+  select.title = slideName(compare.orientationSid);
+  select.disabled = Boolean(compare.pendingRequest) || compare.landmark.active;
+  const pair = compare.pairs.get(compare.orientationSid);
+  const grid = orientationNeedsFocusedSite(compare.orientationSid);
+  const disabled = select.disabled || !pair || Boolean(pair.fit) || grid;
+  for (const id of Object.keys(ORIENTATION_ACTIONS)) $(id).disabled = disabled;
+  $("compare-orientation-state").textContent = pair ? orientationNote(pair) || "Original" : "";
+  $("compare-orientation-hint").textContent = grid
+    ? "Focus a site in each plate before changing image orientation"
+    : pair?.fit
+    ? "Landmark fit protected · use Align → Clear to change orientation"
+    : compare.landmark.active ? "Finish or cancel Align before changing orientation"
+      : "Reference stays fixed · center preserved · display only";
 }
 
 function renderChips() {
@@ -1357,23 +1441,7 @@ function updateCompareControls() {
     : "Relink and keep the current positions as the alignment (L)";
 
   const members = compare.members.map((sid) => compare.pairs.get(sid)).filter(Boolean);
-  const anyUnfitted = members.some((pair) => !pair.fit);
-  const rotate = $("compare-rotate");
-  const mirror = $("compare-mirror");
-  rotate.disabled = pending || landmarking || !anyUnfitted;
-  mirror.disabled = pending || landmarking || !anyUnfitted;
-  const halfTurn = members.some((pair) => !pair.fit && pair.orientation.y < 0);
-  const mirrored = members.some((pair) => !pair.fit && pair.orientation.x !== pair.orientation.y);
-  rotate.classList.toggle("rotated", halfTurn);
-  rotate.setAttribute("aria-pressed", String(halfTurn));
-  mirror.classList.toggle("mirrored", mirrored);
-  mirror.setAttribute("aria-pressed", String(mirrored));
-  rotate.title = anyUnfitted
-    ? "Toggle the 180° scan orientation of the linked slides"
-    : "Orientation comes from the landmark fit. Clear the points to set it by hand.";
-  mirror.title = anyUnfitted
-    ? "Mirror the linked slides left-to-right"
-    : "Orientation comes from the landmark fit. Clear the points to set it by hand.";
+  updateOrientationControls();
 
   $("compare-swap").disabled = pending || landmarking || compare.members.length !== 1;
   const add = $("compare-add");
@@ -1405,6 +1473,7 @@ function updateCompareControls() {
 
   renderChips();
   renderLandmarkPanel();
+  syncCompareToolbarSpace();
   rememberAlignment();
   broadcastCompareState();
 }
@@ -1568,6 +1637,7 @@ function startGroup(anchorSid, memberSid) {
   if (compare.enabled || !anchorSid || !memberSid || anchorSid === memberSid) return;
   compare.enabled = true;
   compare.anchorSid = anchorSid;
+  compare.orientationSid = memberSid;
   compare.members = [];
   compare.pairs = new Map();
   compare.anchorLandmarks = [];
@@ -1675,14 +1745,13 @@ function toggleViewLink() {
   }
 }
 
-function toggleHalfTurn() {
+function changeOrientation(action) {
   if (!compare.enabled || compare.pendingRequest || compare.landmark.active) return;
-  requestGroup("rotate-180");
-}
-
-function toggleMirror() {
-  if (!compare.enabled || compare.pendingRequest || compare.landmark.active) return;
-  requestGroup("mirror");
+  const targetSid = compare.orientationSid;
+  const pair = compare.pairs.get(targetSid);
+  if (!compare.members.includes(targetSid) || !pair || pair.fit || orientationNeedsFocusedSite(targetSid) ||
+      !Align.reorient(pair.orientation, action)) return;
+  requestGroup("orientation", { targetSid, action });
 }
 
 function swapComparedSlides() {
@@ -1700,9 +1769,12 @@ function swapComparedSlides() {
     const inverse = Align.invert(old.transform);
     if (inverse) {
       pair.mode = old.mode;
-      pair.orientation = { ...old.orientation };
+      pair.orientation = Align.invert(old.orientation);
       pair.transform = inverse;
-      pair.fit = old.fit ? { ...old.fit, angleDeg: -old.fit.angleDeg, scale: 1 / old.fit.scale } : null;
+      pair.fit = old.fit ? {
+        ...old.fit, angleDeg: Align.angleDeg(inverse),
+        scale: Align.scale(inverse), rms: old.fit.rms / Align.scale(old.transform),
+      } : null;
     }
   }
   pair.landmarks = clonePoints(compare.anchorLandmarks);
@@ -1723,8 +1795,16 @@ $("compare-picker-close").onclick = () => closePairPicker();
 $("compare-add").onclick = () => openPicker("add");
 $("compare-link").onclick = toggleViewLink;
 $("compare-swap").onclick = swapComparedSlides;
-$("compare-rotate").onclick = toggleHalfTurn;
-$("compare-mirror").onclick = toggleMirror;
+for (const [id, action] of Object.entries(ORIENTATION_ACTIONS)) {
+  $(id).onclick = () => changeOrientation(action);
+}
+$("compare-orientation-target").onchange = (event) => {
+  if (compare.pendingRequest || compare.landmark.active) return;
+  const sid = event.target.value;
+  if (!compare.members.includes(sid)) return;
+  compare.orientationSid = sid;
+  updateOrientationControls();
+};
 $("compare-align").onclick = () => (compare.landmark.active ? finishLandmarks(true) : startLandmarks());
 $("compare-close").onclick = stopCompare;
 $("compare-landmark-clear").onclick = clearAlignment;

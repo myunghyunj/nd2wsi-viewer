@@ -28,6 +28,27 @@
     return { a: sx < 0 ? -1 : 1, b: 0, c: 0, d: sy < 0 ? -1 : 1, tx: 0, ty: 0 };
   }
 
+  function screenOperation(action) {
+    // Exact D4 operations in image/screen coordinates, where y points down.
+    // A positive quarter turn is therefore clockwise on screen.
+    if (action === "rotate-right") {
+      return { a: 0, b: -1, c: 1, d: 0, tx: 0, ty: 0 };
+    }
+    if (action === "rotate-left") {
+      return { a: 0, b: 1, c: -1, d: 0, tx: 0, ty: 0 };
+    }
+    if (action === "flip-horizontal") {
+      return { a: -1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
+    }
+    if (action === "flip-vertical") {
+      return { a: 1, b: 0, c: 0, d: -1, tx: 0, ty: 0 };
+    }
+    if (action === "transpose") {
+      return { a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0 };
+    }
+    return null;
+  }
+
   function apply(t, p) {
     return { x: t.a * p.x + t.b * p.y + t.tx, y: t.c * p.x + t.d * p.y + t.ty };
   }
@@ -71,6 +92,22 @@
     // s * R(theta) * F: the second column is untouched by F, so it carries
     // the rotation alone: (b, d) = s * (-sin, cos)
     return (Math.atan2(-t.b, t.d) * 180) / Math.PI;
+  }
+
+  function displayPose(t) {
+    // OpenSeadragon presents a flipped viewport as F * R(degrees). For an
+    // anchor-to-member transform R(theta) * F, this pose is its orientation
+    // inverse F * R(-theta), including reflected quarter turns.
+    return { degrees: -angleDeg(t), flipped: mirrored(t) };
+  }
+
+  function reorient(linear, action) {
+    if (action === "reset") return identity();
+    if (!linear) return null;
+    const screen = screenOperation(action);
+    if (!screen) return null;
+    const inverse = invert(screen);
+    return inverse ? compose(linear, inverse) : null;
   }
 
   function withTranslation(t, tx, ty) {
@@ -163,6 +200,7 @@
   return {
     identity,
     fromOrientation,
+    screenOperation,
     apply,
     applyLinear,
     invert,
@@ -171,6 +209,8 @@
     scale,
     mirrored,
     angleDeg,
+    displayPose,
+    reorient,
     withTranslation,
     translationMatching,
     rmsError,

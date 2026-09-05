@@ -11,7 +11,7 @@ const state = {
   lutWidgets: [], // canvas LUT widgets, aligned with luts
   roi: null, // {x, y, w, h} in level-0 pixels
   roiSite: null, // plate site that owns the ROI; null for WSI or no ROI
-  roiOverlayEl: null,
+  roiOverlayEl: null, // projected SVG polygon in raw image coordinates
   tool: null, // null | "roi" | "measure" | "pin" | "box"
   renderScale: null, // chosen PNG/JPEG downsample; null = finest that fits
   annotations: [], // {id, type: "line"|"pin"|"box", ...image coords, text}
@@ -404,6 +404,7 @@ function buildViewer() {
   });
   viewer.addHandler("update-viewport", () => {
     renderAnnotations();
+    moveRoiOverlay();
     scheduleViewportState();
   });
   viewer.addHandler("open", renderAnnotations);
@@ -2401,33 +2402,67 @@ function applyRoi(x, y, w, h) {
   return true;
 }
 
+function roiOverlayPoints(r) {
+  if (!r) return [];
+  return [
+    imageToViewerElementPoint({ x: r.x, y: r.y }),
+    imageToViewerElementPoint({ x: r.x + r.w, y: r.y }),
+    imageToViewerElementPoint({ x: r.x + r.w, y: r.y + r.h }),
+    imageToViewerElementPoint({ x: r.x, y: r.y + r.h }),
+  ];
+}
+
+function ensureRoiOverlayLayer() {
+  let layer = $("roi-layer");
+  if (layer) return layer;
+  layer = document.createElementNS(SVG_NS, "svg");
+  layer.id = "roi-layer";
+  layer.setAttribute("aria-hidden", "true");
+  Object.assign(layer.style, {
+    position: "absolute",
+    inset: "0",
+    zIndex: "21",
+    width: "100%",
+    height: "100%",
+    overflow: "hidden",
+    pointerEvents: "none",
+  });
+  // This layer is deliberately separate: annotation redraws replace every
+  // child of #ann-layer, while a selected ROI must remain on screen.
+  $("ann-layer").before(layer);
+  return layer;
+}
+
 function drawRoiOverlay() {
-  const viewer = state.viewer;
   if (state.roiOverlayEl) {
-    viewer.removeOverlay(state.roiOverlayEl);
+    state.roiOverlayEl.remove();
     state.roiOverlayEl = null;
   }
-  if (!state.roi) return;
-  const el = document.createElement("div");
-  el.className = "roi-overlay";
-  const r = state.roi;
-  viewer.addOverlay({
-    element: el,
-    location: viewer.viewport.imageToViewportRectangle(
-      new OpenSeadragon.Rect(r.x, r.y, r.w, r.h)
-    ),
-  });
-  state.roiOverlayEl = el;
+  if (!state.roi || !frameOwnsRoi()) return;
+  const polygon = document.createElementNS(SVG_NS, "polygon");
+  polygon.classList.add("roi-overlay");
+  polygon.setAttribute("fill", "rgba(10, 132, 255, 0.10)");
+  polygon.setAttribute("stroke", "var(--accent-soft)");
+  polygon.setAttribute("stroke-width", "1.5");
+  polygon.setAttribute("vector-effect", "non-scaling-stroke");
+  ensureRoiOverlayLayer().append(polygon);
+  state.roiOverlayEl = polygon;
+  moveRoiOverlay();
 }
 
 function moveRoiOverlay() {
   const r = state.roi;
-  if (!r || !state.roiOverlayEl) return drawRoiOverlay();
-  state.viewer.updateOverlay(
-    state.roiOverlayEl,
-    state.viewer.viewport.imageToViewportRectangle(
-      new OpenSeadragon.Rect(r.x, r.y, r.w, r.h)
-    )
+  if (!r || !frameOwnsRoi()) {
+    if (state.roiOverlayEl) {
+      state.roiOverlayEl.remove();
+      state.roiOverlayEl = null;
+    }
+    return;
+  }
+  if (!state.roiOverlayEl) return drawRoiOverlay();
+  state.roiOverlayEl.setAttribute(
+    "points",
+    roiOverlayPoints(r).map((p) => p.x + "," + p.y).join(" ")
   );
 }
 
@@ -2441,7 +2476,7 @@ function clearRoi() {
   state.renderScale = null;
   scaleSeq += 1;
   if (state.roiOverlayEl) {
-    state.viewer.removeOverlay(state.roiOverlayEl);
+    state.roiOverlayEl.remove();
     state.roiOverlayEl = null;
   }
   $("roi-detail").classList.remove("active");
@@ -3102,6 +3137,7 @@ function viewportSnapshot() {
       y: Math.max(1e-6, Math.abs(bottomRight.y - topLeft.y)),
     },
     imagePx: { x: state.info.width, y: state.info.height },
+    plateGrid: Boolean(state.plate && state.plate.focus === null),
     containerPx: (() => {
       const size = viewer.viewport.getContainerSize();
       return { x: Math.max(1, size.x), y: Math.max(1, size.y) };
