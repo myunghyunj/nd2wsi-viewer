@@ -252,6 +252,8 @@ ND2WSI_SMOKE_FILE=docs/example_cell.nd2 packaging/build_mac_app.sh dist
 
 CI tests Python 3.11 through 3.13, runs Ruff, builds and installs the wheel, and runs the real-data suite on every tag.
 
+Follow-up proposals: [Alignment/Compare fix suggestions](docs/alignment-compare-fix-suggestions.md) records the 14 proposed fixes, transaction/context contracts, and anisotropic-pixel/scalebar correctness gates. These are not yet implemented; v1.2.6 is a proposed target, not a released version.
+
 ### Prior work
 
 - [`tlambert03/nd2`](https://github.com/tlambert03/nd2) for ND2 reading and metadata
