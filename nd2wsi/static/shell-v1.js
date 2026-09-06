@@ -37,10 +37,18 @@ const compare = {
   pairs: new Map(), // member sid -> { mode, orientation, transform, fit, landmarks }
   anchorLandmarks: [],
   memory: new Map(), // "anchor|member" -> pair snapshot for this session
-  landmark: { active: false, before: null },
+  landmark: { active: false, edit: null },
+  groupSessionId: null,
+  groupEpoch: 0,
+  committedRevision: 0,
+  committedGroup: null,
+  anchorSet: { id: null, revision: 0, points: [] },
+  retiredInstances: new Map(),
   commandSeq: 0,
   requestSeq: 0,
   pendingRequest: null,
+  pendingNudge: null,
+  nudgeQueue: [],
   layoutRequestTimer: null,
   routeTimers: new Map(),
   routeLatest: new Map(),
@@ -309,31 +317,37 @@ function broadcastTabShortcutState() {
 }
 
 function paneCameUp(sid) {
-  // a pane loaded or reloaded: give it everything the group knows
   sendTabShortcutState(sid);
   scheduleNativeGestureScopes();
   if (!inGroup(sid)) return;
-  applyDisplayTransform(sid);
   broadcastCompareState();
-  if (compare.landmark.active) sendLandmarkMode(sid, true);
-  if (compare.pendingRequest) {
-    // The loading pane may have missed the original request. Re-send that
-    // request to this pane, retaining the action and its selected target.
-    compare.pendingRequest.seen.delete(sid);
-    postToSlide(sid, {
-      nd2wsi: "viewport-request",
-      version: VIEWPORT_PROTOCOL_VERSION,
-      requestId: compare.pendingRequest.requestId,
-    });
-  } else if (compare.linked) {
+  if (!compare.pendingRequest && spatialGroupReady("sync")) {
+    applyDisplayTransforms();
+    if (compare.landmark.active) sendLandmarkMode(sid, true);
     requestGroupSoon("sync");
   }
 }
 
 function syncCompareToolbarSpace() {
-  const height = compare.enabled && compare.toolsVisible
-    ? Math.ceil($("compare-controls").getBoundingClientRect().height) + 20
-    : 0;
+  const controls = $("compare-controls");
+  const edit = compare.landmark.edit;
+  const width = window.innerWidth;
+  if (!edit || edit.toolbarLock?.width !== width) {
+    controls.style.height = "";
+    controls.style.overflowY = "";
+  }
+  let height = 0;
+  if (compare.enabled && compare.toolsVisible) {
+    if (edit && edit.toolbarLock?.width === width) height = edit.toolbarLock.height;
+    else {
+      height = Math.ceil(controls.getBoundingClientRect().height) + 20;
+      if (edit) edit.toolbarLock = {width, height};
+    }
+    if (edit) {
+      controls.style.height = (height - 20) + "px";
+      controls.style.overflowY = "auto";
+    }
+  }
   if (compare.toolbarHeight === height) return;
   compare.toolbarHeight = height;
   document.documentElement.style.setProperty("--compare-toolbar-height", `${height}px`);
@@ -695,28 +709,129 @@ function normalizeViewportState(data, sid) {
   const centerPx = finitePoint(data.centerPx);
   const spanPx = finitePoint(data.spanPx, true);
   const imagePx = finitePoint(data.imagePx, true);
-  if (!centerPx || !spanPx || !imagePx) return null;
-  let pixelSizeUm = data.pixelSizeUm;
-  if (Array.isArray(pixelSizeUm)) {
-    pixelSizeUm = { y: Number(pixelSizeUm[0]), x: Number(pixelSizeUm[1]) };
-  } else {
-    pixelSizeUm = finitePoint(pixelSizeUm, true);
-  }
-  if (!pixelSizeUm || pixelSizeUm.x <= 0 || pixelSizeUm.y <= 0) pixelSizeUm = null;
-  const containerPx = finitePoint(data.containerPx, true) || { x: 1, y: 1 };
+  if (typeof data.paneInstanceId !== "string" || !Number.isSafeInteger(data.contextEpoch)) return null;
+  if (data.imageReady === true && (!centerPx || !spanPx || !imagePx)) return null;
+  const pixelSizeUm = Array.isArray(data.pixelSizeUm)
+    ? finitePoint({x: data.pixelSizeUm[1], y: data.pixelSizeUm[0]}, true)
+    : finitePoint(data.pixelSizeUm, true);
   return {
-    sid,
-    seq: Number.isFinite(Number(data.seq)) ? Number(data.seq) : 0,
-    reason: String(data.reason || "user"),
+    sid, seq: Number(data.seq) || 0, reason: String(data.reason || "user"),
     requestId: data.requestId == null ? null : String(data.requestId),
     echoOf: data.echoOf == null ? null : String(data.echoOf),
-    centerPx,
-    spanPx,
-    imagePx,
-    containerPx,
-    pixelSizeUm,
-    plateGrid: data.plateGrid === true,
+    centerPx, spanPx, imagePx, pixelSizeUm,
+    containerPx: finitePoint(data.containerPx, true) || {x: 1, y: 1},
+    plateGrid: data.plateGrid === true, imageReady: data.imageReady === true,
+    paneInstanceId: data.paneInstanceId, contextEpoch: data.contextEpoch,
+    spatialContext: data.spatialContext?.key ? {...data.spatialContext} : null,
+    groupSessionId: data.groupSessionId, groupEpoch: data.groupEpoch,
   };
+}
+
+function uniqueId() {
+  return crypto.randomUUID();
+}
+
+function cloneValue(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function localIdentity(st) {
+  return st ? {
+    paneInstanceId: st.paneInstanceId, contextEpoch: st.contextEpoch,
+    spatialContextKey: st.spatialContext?.key ?? null,
+  } : null;
+}
+
+function sameIdentity(a, b) {
+  return Boolean(a && b && a.paneInstanceId === b.paneInstanceId &&
+    a.contextEpoch === b.contextEpoch && a.spatialContextKey === b.spatialContextKey);
+}
+
+function spatialEnvelope(sid) {
+  const identity = localIdentity(compare.states.get(sid));
+  return identity && compare.groupSessionId ? {
+    ...identity, groupSessionId: compare.groupSessionId, groupEpoch: compare.groupEpoch,
+  } : null;
+}
+
+function currentEnvelope(data, sid) {
+  return sameIdentity(data, localIdentity(compare.states.get(sid))) &&
+    data.groupSessionId === compare.groupSessionId && data.groupEpoch === compare.groupEpoch;
+}
+
+function sendSpatial(sid, message) {
+  const envelope = spatialEnvelope(sid);
+  if (!envelope || !compare.states.get(sid)?.spatialContext) return false;
+  const commandSeq = ++compare.commandSeq;
+  return postToSlide(sid, {
+    ...message, ...envelope, version: VIEWPORT_PROTOCOL_VERSION,
+    commandSeq, commandId: "shell-spatial-" + commandSeq,
+  });
+}
+
+function spatialGroupReady(operation = "spatial") {
+  if (!compare.enabled || !compare.members.length) return false;
+  for (const sid of groupSids()) {
+    const st = compare.states.get(sid);
+    if (!st?.imageReady || st.plateGrid || !st.spatialContext?.key ||
+        !finitePoint(st.imagePx, true) || !finitePoint(st.spanPx, true)) return false;
+  }
+  // Clear/remove/reset still require a real site, but can repair an unsupported fit.
+  if (["orientation", "remove-fit", "relative", "edit"].includes(operation)) return true;
+  return compare.members.every((sid) => {
+    const pair = ensurePairTransform(sid);
+    return pair && rendererForPair(sid, pair).supported;
+  });
+}
+
+function spatialPauseReason() {
+  if (groupSids().some((sid) => compare.states.get(sid)?.plateGrid)) return "Paused · focus a site in every plate";
+  if (!groupSids().every((sid) => compare.states.get(sid)?.imageReady &&
+      compare.states.get(sid)?.spatialContext)) return "Waiting for current views";
+  if (!spatialGroupReady()) return "Paused · anisotropic mapping unsupported; choose Relative explicitly";
+  return "";
+}
+
+function invalidateSpatialWork() {
+  clearNudgeCommands();
+  clearPendingRequest();
+  clearViewportRoutes();
+  compare.groupEpoch += 1;
+  compare.landmark = {active: false, edit: null};
+  broadcastCompareState();
+}
+
+function committedMutation() {
+  compare.committedRevision += 1;
+  compare.committedGroup = snapshotAlignment();
+  rememberAlignment();
+}
+
+function adoptSpatialIdentity(sid, st) {
+  const previous = compare.states.get(sid);
+  const retired = compare.retiredInstances.get(sid) || new Set();
+  if (retired.has(st.paneInstanceId)) return false;
+  if (previous?.paneInstanceId === st.paneInstanceId && st.contextEpoch < previous.contextEpoch) return false;
+  const changed = previous && !sameIdentity(localIdentity(previous), localIdentity(st));
+  if (changed && inGroup(sid)) {
+    // Save only committed geometry under the OLD site identity, before replacement.
+    rememberAlignment();
+    invalidateSpatialWork();
+  }
+  if (previous && previous.paneInstanceId !== st.paneInstanceId) {
+    retired.add(previous.paneInstanceId);
+    compare.retiredInstances.set(sid, retired);
+  }
+  compare.states.set(sid, st);
+  if (changed && inGroup(sid)) {
+    compare.anchorLandmarks = [];
+    compare.anchorSet = {id: uniqueId(), revision: 0, points: []};
+    compare.pairs = new Map(compare.members.map((member) => [member, newPair()]));
+    for (const member of compare.members) restoreAlignment(compare.anchorSid, member, compare.pairs.get(member));
+    compare.committedRevision += 1;
+    compare.committedGroup = snapshotAlignment();
+  }
+  return true;
 }
 
 /* ---- spaces and transforms ------------------------------------------------
@@ -756,13 +871,10 @@ function imageCenterSpace(st, mode) {
 
 function newPair() {
   return {
-    mode: null,
-    // File extensions do not establish which side or direction was scanned.
-    // Keep the original view until the user chooses a display orientation.
-    orientation: Align.identity(),
-    transform: null,
-    fit: null,
-    landmarks: [],
+    mode: null, forceRelative: false, orientation: Align.identity(), transform: null,
+    fitTransform: null, manualOffset: {x: 0, y: 0}, fit: null, currentRms: null,
+    landmarks: [], landmarkSet: {id: uniqueId(), revision: 0, points: []},
+    provenance: null, provenanceMismatch: false,
   };
 }
 
@@ -777,33 +889,58 @@ function ensurePairTransform(sid) {
   const pair = compare.pairs.get(sid);
   const anchorState = compare.states.get(compare.anchorSid);
   const memberState = compare.states.get(sid);
-  if (!pair || !anchorState || !memberState) return null;
-  const mode = mappingMode(anchorState, memberState);
+  if (!pair || !anchorState?.imageReady || !memberState?.imageReady ||
+      !anchorState.spatialContext || !memberState.spatialContext) return null;
+  const mode = pair.forceRelative ? "normalized" : mappingMode(anchorState, memberState);
   if (pair.transform && pair.mode === mode) return pair;
   pair.mode = mode;
-  if (pair.fit && pair.landmarks.length >= 2) {
-    fitPair(sid, false);
-    if (pair.transform) return pair;
-  }
   pair.transform = defaultTransform(pair, anchorState, memberState, mode);
   pair.fit = null;
+  pair.fitTransform = null;
+  pair.provenance = null;
+  pair.manualOffset = {x: 0, y: 0};
   return pair;
 }
 
+function pixelScale(st, mode) {
+  return mode === "physical" ? st.pixelSizeUm : {x: 1 / st.imagePx.x, y: 1 / st.imagePx.x};
+}
+
+function pixelTransform(sid, pair) {
+  const a = compare.states.get(compare.anchorSid), b = compare.states.get(sid);
+  return a && b && pair?.transform ? Align.pixelMapping(
+    pair.transform, pixelScale(a, pair.mode), pixelScale(b, pair.mode)
+  ) : null;
+}
+
+function rendererForPair(sid, pair) {
+  return Align.rendererPose(pixelTransform(sid, pair));
+}
+
+function updatePairResidual(pair) {
+  const provenance = pair.provenance;
+  if (!pair.fitTransform || !provenance || pair.provenanceMismatch) {
+    pair.currentRms = null;
+    return;
+  }
+  pair.currentRms = Align.residual(pair.transform, provenance.from, provenance.to);
+  pair.manualOffset = {
+    x: pair.transform.tx - pair.fitTransform.tx,
+    y: pair.transform.ty - pair.fitTransform.ty,
+  };
+}
+
 function displayTransformFor(sid) {
-  if (!compare.enabled || sid === compare.anchorSid) return { degrees: 0, flipped: false };
-  const pair = compare.pairs.get(sid);
-  if (!pair) return { degrees: 0, flipped: false };
-  return Align.displayPose(pair.transform || pair.orientation);
+  if (!compare.enabled || sid === compare.anchorSid) return {degrees: 0, flipped: false};
+  const pair = ensurePairTransform(sid);
+  const renderer = rendererForPair(sid, pair);
+  return renderer.supported ? renderer.pose : null;
 }
 
 function applyDisplayTransform(sid) {
-  if (!sid) return;
-  postToSlide(sid, {
-    nd2wsi: "display-transform",
-    version: VIEWPORT_PROTOCOL_VERSION,
-    ...displayTransformFor(sid),
-  });
+  if (!sid || !spatialGroupReady()) return;
+  const pose = displayTransformFor(sid);
+  if (pose) sendSpatial(sid, {nd2wsi: "display-transform", ...pose});
 }
 
 function applyDisplayTransforms() {
@@ -811,164 +948,176 @@ function applyDisplayTransforms() {
 }
 
 function clearDisplayTransforms(sids) {
+  // A lifecycle reset, not an unscoped display command. A grid may reset safely.
   for (const sid of new Set(sids.filter(Boolean))) {
-    postToSlide(sid, {
-      nd2wsi: "display-transform",
-      version: VIEWPORT_PROTOCOL_VERSION,
-      degrees: 0,
-      flipped: false,
+    const envelope = spatialEnvelope(sid);
+    if (envelope) postToSlide(sid, {
+      nd2wsi: "compare-state", version: VIEWPORT_PROTOCOL_VERSION,
+      ...envelope, enabled: false, linked: false, moving: false,
     });
   }
 }
 
-function rematchTranslation(sid) {
-  // keep the pair's rotation, scale and mirror; move its translation so the
-  // two panes as they stand now correspond
+function rematchTranslation(sid, states = compare.states) {
+  if (!spatialGroupReady()) return false;
   const pair = ensurePairTransform(sid);
-  const anchorState = compare.states.get(compare.anchorSid);
-  const memberState = compare.states.get(sid);
-  if (!pair || !anchorState || !memberState) return false;
+  const a = states.get(compare.anchorSid), b = states.get(sid);
+  if (!pair || !a || !b) return false;
   pair.transform = Align.translationMatching(
-    pair.transform,
-    pxToSpace(anchorState.centerPx, anchorState, pair.mode),
-    pxToSpace(memberState.centerPx, memberState, pair.mode)
+    pair.transform, pxToSpace(a.centerPx, a, pair.mode), pxToSpace(b.centerPx, b, pair.mode)
   );
+  updatePairResidual(pair);
+  if (!pair.fitTransform) {
+    const base = defaultTransform(pair, a, b, pair.mode);
+    pair.manualOffset = {x: pair.transform.tx - base.tx, y: pair.transform.ty - base.ty};
+  }
   return true;
 }
 
-function recaptureAll() {
+function recaptureAll(states = compare.states) {
   let any = false;
-  for (const sid of compare.members) any = rematchTranslation(sid) || any;
+  for (const sid of compare.members) any = rematchTranslation(sid, states) || any;
   return any;
 }
 
 function pairKey(anchorSid, memberSid) {
-  return `${anchorSid}|${memberSid}`;
+  const a = compare.states.get(anchorSid)?.spatialContext?.key;
+  const b = compare.states.get(memberSid)?.spatialContext?.key;
+  return a && b ? JSON.stringify([a, b]) : null;
 }
 
 function clonePoints(points) {
-  return (points || []).map((p) => ({ x: p.x, y: p.y }));
+  return cloneValue(points || []);
 }
 
 function rememberAlignment() {
   if (!compare.enabled) return;
   for (const sid of compare.members) {
-    const pair = compare.pairs.get(sid);
-    if (!pair || !pair.transform) continue;
-    compare.memory.set(pairKey(compare.anchorSid, sid), {
-      mode: pair.mode,
-      orientation: { ...pair.orientation },
-      transform: { ...pair.transform },
-      fit: pair.fit ? { ...pair.fit } : null,
-      landmarks: clonePoints(pair.landmarks),
-      anchorLandmarks: clonePoints(compare.anchorLandmarks),
+    const pair = compare.pairs.get(sid), key = pairKey(compare.anchorSid, sid);
+    if (!key || !pair?.transform) continue;
+    compare.memory.set(key, {
+      pair: cloneValue(pair), anchorSet: cloneValue(compare.anchorSet),
+      anchorContext: compare.states.get(compare.anchorSid).spatialContext.key,
+      memberContext: compare.states.get(sid).spatialContext.key,
     });
   }
 }
 
 function restoreAlignment(anchorSid, memberSid, pair) {
-  const direct = compare.memory.get(pairKey(anchorSid, memberSid));
-  if (direct) {
-    Object.assign(pair, {
-      mode: direct.mode,
-      orientation: { ...direct.orientation },
-      transform: { ...direct.transform },
-      fit: direct.fit ? { ...direct.fit } : null,
-      landmarks: clonePoints(direct.landmarks),
-    });
-    if (!compare.anchorLandmarks.length) compare.anchorLandmarks = clonePoints(direct.anchorLandmarks);
-    return true;
-  }
+  const key = pairKey(anchorSid, memberSid);
+  if (!key) return false;
+  const direct = compare.memory.get(key);
   const reversed = compare.memory.get(pairKey(memberSid, anchorSid));
-  if (reversed) {
-    const inverse = Align.invert(reversed.transform);
-    if (!inverse) return false;
-    Object.assign(pair, {
-      mode: reversed.mode,
-      orientation: Align.invert(reversed.orientation),
-      transform: inverse,
-      fit: reversed.fit ? {
-        ...reversed.fit, angleDeg: Align.angleDeg(inverse),
-        scale: Align.scale(inverse), rms: reversed.fit.rms / Align.scale(reversed.transform),
-      } : null,
-      landmarks: clonePoints(reversed.anchorLandmarks),
-    });
-    if (!compare.anchorLandmarks.length) compare.anchorLandmarks = clonePoints(reversed.landmarks);
-    return true;
+  if (!direct && !reversed) return false;
+  const saved = direct || reversed;
+  const next = direct ? cloneValue(saved.pair) : reversePair(saved.pair, saved.anchorSet);
+  if (!next) return false;
+  const anchorSet = direct ? cloneValue(saved.anchorSet) : cloneValue(saved.pair.landmarkSet);
+  if (!compare.anchorSet.points.length) {
+    compare.anchorSet = anchorSet;
+    compare.anchorLandmarks = clonePoints(anchorSet.points);
   }
-  return false;
+  next.provenanceMismatch = Boolean(next.provenance && (
+    next.provenance.anchorSetId !== compare.anchorSet.id ||
+    next.provenance.anchorRevision !== compare.anchorSet.revision
+  ));
+  Object.assign(pair, next);
+  updatePairResidual(pair);
+  return true;
+}
+
+function reversePair(old, oldAnchorSet) {
+  const transform = Align.invert(old.transform);
+  if (!transform) return null;
+  const pair = cloneValue(old);
+  pair.orientation = Align.invert(old.orientation);
+  pair.transform = transform;
+  pair.fitTransform = old.fitTransform ? Align.invert(old.fitTransform) : null;
+  if (!pair.fitTransform) {
+    const offset = Align.applyLinear(transform, old.manualOffset || {x: 0, y: 0});
+    pair.manualOffset = {x: -offset.x, y: -offset.y};
+  }
+  pair.landmarkSet = cloneValue(oldAnchorSet);
+  pair.landmarks = clonePoints(oldAnchorSet.points);
+  if (old.provenance && pair.fitTransform) {
+    pair.provenance = {
+      ...cloneValue(old.provenance),
+      from: clonePoints(old.provenance.to), to: clonePoints(old.provenance.from),
+      anchorContext: old.provenance.memberContext, memberContext: old.provenance.anchorContext,
+      anchorSetId: old.landmarkSet.id, anchorRevision: old.landmarkSet.revision,
+      memberSetId: oldAnchorSet.id, memberRevision: oldAnchorSet.revision,
+      anchorPointIds: cloneValue(old.provenance.memberPointIds),
+      memberPointIds: cloneValue(old.provenance.anchorPointIds),
+    };
+    pair.fit = {
+      ...pair.fit, transform: cloneValue(pair.fitTransform),
+      rms: Align.residual(pair.fitTransform, pair.provenance.from, pair.provenance.to),
+      scale: Align.scale(pair.fitTransform), angleDeg: Align.angleDeg(pair.fitTransform),
+    };
+  }
+  updatePairResidual(pair);
+  return pair;
 }
 
 /* ---- relay ---------------------------------------------------------------- */
 
 function anchorViewFromSource(sourceSid, source) {
-  // where the source pane's field sits in anchor pixels
-  if (sourceSid === compare.anchorSid) {
-    return { centerPx: source.centerPx, widthPx: source.spanPx.x };
-  }
+  if (sourceSid === compare.anchorSid) return {centerPx: source.centerPx, widthPx: source.spanPx.x};
   const pair = ensurePairTransform(sourceSid);
-  const anchorState = compare.states.get(compare.anchorSid);
-  if (!pair || !anchorState) return null;
-  const inverse = Align.invert(pair.transform);
-  if (!inverse) return null;
-  const centerSpace = Align.apply(inverse, pxToSpace(source.centerPx, source, pair.mode));
-  const widthSpace = widthPxToSpace(source.spanPx.x, source, pair.mode) / Align.scale(pair.transform);
-  return {
-    centerPx: spaceToPx(centerSpace, anchorState, pair.mode),
-    widthPx: widthSpaceToPx(widthSpace, anchorState, pair.mode),
-  };
+  const renderer = rendererForPair(sourceSid, pair);
+  const inverse = Align.invert(pixelTransform(sourceSid, pair));
+  if (!renderer.supported || !inverse) return null;
+  return {centerPx: Align.apply(inverse, source.centerPx), widthPx: source.spanPx.x / renderer.scale};
 }
 
 function targetViewFromAnchor(targetSid, anchorView) {
   const targetState = compare.states.get(targetSid);
   if (!targetState) return null;
-  if (targetSid === compare.anchorSid) {
-    return { centerPx: anchorView.centerPx, spanX: anchorView.widthPx, state: targetState };
-  }
+  if (targetSid === compare.anchorSid) return {
+    centerPx: anchorView.centerPx, spanX: anchorView.widthPx, state: targetState,
+  };
   const pair = ensurePairTransform(targetSid);
-  const anchorState = compare.states.get(compare.anchorSid);
-  if (!pair || !anchorState) return null;
-  const centerSpace = Align.apply(pair.transform, pxToSpace(anchorView.centerPx, anchorState, pair.mode));
-  const widthSpace = widthPxToSpace(anchorView.widthPx, anchorState, pair.mode) * Align.scale(pair.transform);
+  const renderer = rendererForPair(targetSid, pair);
+  if (!renderer.supported) return null;
   return {
-    centerPx: spaceToPx(centerSpace, targetState, pair.mode),
-    spanX: widthSpaceToPx(widthSpace, targetState, pair.mode),
-    state: targetState,
+    centerPx: Align.apply(pixelTransform(targetSid, pair), anchorView.centerPx),
+    spanX: anchorView.widthPx * renderer.scale, state: targetState,
   };
 }
 
 function forwardViewport(sourceSid, source) {
-  if (!compare.enabled || !compare.linked || compare.pendingRequest) return;
-  if (!inGroup(sourceSid)) return;
+  if (!compare.linked || compare.pendingRequest || compare.landmark.active ||
+      !inGroup(sourceSid) || !spatialGroupReady() ||
+      !sameIdentity(localIdentity(source), localIdentity(compare.states.get(sourceSid)))) return;
   const anchorView = anchorViewFromSource(sourceSid, source);
   if (!anchorView) return;
   for (const targetSid of groupSids()) {
     if (targetSid === sourceSid) continue;
+    if (compare.pendingNudge?.sid === targetSid) continue;
     const view = targetViewFromAnchor(targetSid, anchorView);
     if (!view || !Number.isFinite(view.spanX) || view.spanX <= 0) continue;
-    const aspect = view.state.containerPx.y / view.state.containerPx.x;
-    const commandId = `shell-vp-${++compare.commandSeq}`;
-    postToSlide(targetSid, {
-      nd2wsi: "viewport-apply",
-      version: VIEWPORT_PROTOCOL_VERSION,
-      commandId,
-      sourceSid,
-      sourceSeq: source.seq,
+    sendSpatial(targetSid, {
+      nd2wsi: "viewport-apply", sourceSid, sourceSeq: source.seq,
       centerPx: view.centerPx,
-      spanPx: { x: view.spanX, y: view.spanX * aspect },
+      spanPx: {x: view.spanX, y: view.spanX * view.state.containerPx.y / view.state.containerPx.x},
       animate: false,
     });
   }
 }
 
 function scheduleViewportRoute(sourceSid, state) {
+  if (!spatialGroupReady()) return;
   compare.routeLatest.set(sourceSid, state);
   if (compare.routeTimers.has(sourceSid)) return;
+  const epoch = compare.groupEpoch, session = compare.groupSessionId;
   const timer = setTimeout(() => {
+    if (compare.routeTimers.get(sourceSid) !== timer) return;
     compare.routeTimers.delete(sourceSid);
     const latest = compare.routeLatest.get(sourceSid);
     compare.routeLatest.delete(sourceSid);
-    if (latest) forwardViewport(sourceSid, latest);
+    if (latest && epoch === compare.groupEpoch && session === compare.groupSessionId) {
+      forwardViewport(sourceSid, latest);
+    }
   }, VIEWPORT_THROTTLE_MS);
   compare.routeTimers.set(sourceSid, timer);
 }
@@ -994,239 +1143,356 @@ function syncFromAnchor() {
 }
 
 function requestGroup(kind, details = {}) {
-  // ask every pane where it stands, then act once all have answered
-  if (!compare.enabled) return;
-  if (kind === "sync" && compare.pendingRequest) {
-    // A resize/layout refresh must not cancel an in-flight button action.
-    requestGroupSoon("sync");
-    return;
+  if (compare.pendingNudge) {
+    if (kind === "sync") requestGroupSoon("sync");
+    return false;
+  }
+  if (!spatialGroupReady(kind) || (compare.landmark.active && kind !== "sync")) return false;
+  if (compare.pendingRequest) {
+    if (kind === "sync") requestGroupSoon("sync");
+    return false;
   }
   clearViewportRoutes();
-  clearPendingRequest(kind !== "sync");
-  const requestId = `shell-request-${++compare.requestSeq}`;
-  const pending = { ...details, requestId, kind, seen: new Set(), timer: null };
+  const requestId = "shell-request-" + (++compare.requestSeq);
+  const expectedTargets = Object.freeze([...groupSids()]);
+  const contexts = new Map(expectedTargets.map((sid) => [sid, spatialEnvelope(sid)]));
+  const pending = {
+    ...details, requestId, kind, expectedTargets, contexts, responses: new Map(),
+    groupSessionId: compare.groupSessionId, groupEpoch: compare.groupEpoch,
+    editId: compare.landmark.edit?.editId ?? null,
+    committedRevision: compare.committedRevision, timer: null,
+  };
   pending.timer = setTimeout(() => {
     if (compare.pendingRequest !== pending) return;
     clearPendingRequest(true);
     updateCompareControls();
-    if (kind !== "sync") showError("Could not read every linked view; nothing was changed");
+    if (kind !== "sync") showError("Could not read every current linked view; nothing was changed");
   }, 2500);
   compare.pendingRequest = pending;
+  broadcastCompareState();
+  for (const sid of expectedTargets) sendSpatial(sid, {nd2wsi: "viewport-request", requestId});
   updateCompareControls();
-  for (const sid of groupSids()) {
-    postToSlide(sid, {
-      nd2wsi: "viewport-request",
-      version: VIEWPORT_PROTOCOL_VERSION,
-      requestId,
-    });
-  }
+  return true;
+}
+
+function transactionCurrent(pending) {
+  return pending && compare.pendingRequest === pending &&
+    pending.groupSessionId === compare.groupSessionId && pending.groupEpoch === compare.groupEpoch &&
+    pending.committedRevision === compare.committedRevision &&
+    pending.editId === (compare.landmark.edit?.editId ?? null) &&
+    pending.expectedTargets.length === groupSids().length &&
+    pending.expectedTargets.every((sid) => inGroup(sid) &&
+      sameIdentity(pending.contexts.get(sid), localIdentity(compare.states.get(sid)))) &&
+    spatialGroupReady(pending.kind);
 }
 
 function requestGroupSoon(kind) {
   clearTimeout(compare.layoutRequestTimer);
-  compare.layoutRequestTimer = setTimeout(() => {
+  const epoch = compare.groupEpoch, session = compare.groupSessionId;
+  const timer = setTimeout(() => {
+    if (compare.layoutRequestTimer !== timer) return;
     compare.layoutRequestTimer = null;
-    if (compare.enabled) requestGroup(kind);
+    if (compare.enabled && epoch === compare.groupEpoch && session === compare.groupSessionId) requestGroup(kind);
   }, 80);
+  compare.layoutRequestTimer = timer;
 }
 
 function finishGroupRequest(pending) {
-  if (compare.pendingRequest !== pending) return;
+  if (!transactionCurrent(pending) ||
+      !pending.expectedTargets.every((sid) => pending.responses.has(sid))) return false;
+  const captured = pending.responses;
   clearPendingRequest(true);
-  const ready = groupSids().every((sid) => compare.states.has(sid));
-  if (!ready) {
-    updateCompareControls();
-    return;
-  }
-  for (const sid of compare.members) ensurePairTransform(sid);
+  let changed = false;
   if (pending.kind === "capture") {
-    recaptureAll();
+    changed = recaptureAll(captured);
     compare.linked = true;
-  } else if (pending.kind === "orientation") {
-    const sid = pending.targetSid;
-    const pair = compare.pairs.get(sid);
-    // Capture the target before the asynchronous viewport request. Protect
-    // landmark fits and ignore a removed/replaced target, even if UI state changes.
-    if (compare.members.includes(sid) && pair && !pair.fit && !compare.landmark.active &&
-        !orientationNeedsFocusedSite(sid)) {
+  } else if (["orientation", "remove-fit", "relative"].includes(pending.kind)) {
+    const sid = pending.targetSid, previous = compare.pairs.get(sid);
+    if (!compare.members.includes(sid) || !previous || compare.landmark.active) return false;
+    const pair = cloneValue(previous);
+    const a = captured.get(compare.anchorSid), b = captured.get(sid);
+    if (pending.kind === "orientation") {
+      if (pair.fit) return false;
       const next = Align.reorient(pair.orientation, pending.action);
-      if (next) {
-        pair.orientation = next;
-        pair.transform = Align.translationMatching(
-          next,
-          pxToSpace(compare.states.get(compare.anchorSid).centerPx,
-            compare.states.get(compare.anchorSid), pair.mode),
-          pxToSpace(compare.states.get(sid).centerPx, compare.states.get(sid), pair.mode)
-        );
-        applyDisplayTransform(sid);
+      if (!next) return false;
+      pair.orientation = next;
+    } else {
+      pair.fit = null; pair.fitTransform = null; pair.provenance = null;
+      pair.currentRms = null; pair.provenanceMismatch = false;
+      pair.manualOffset = {x: 0, y: 0};
+      if (pending.kind === "relative") {
+        pair.forceRelative = Boolean(pending.relative);
+        pair.mode = pair.forceRelative ? "normalized" : mappingMode(a, b);
       }
     }
-  } else if (pending.kind === "clear") {
-    for (const sid of compare.members) {
-      const pair = compare.pairs.get(sid);
-      const anchorState = compare.states.get(compare.anchorSid);
-      const memberState = compare.states.get(sid);
-      pair.orientation = Align.identity();
-      pair.fit = null;
-      pair.landmarks = [];
-      pair.transform = defaultTransform(pair, anchorState, memberState, pair.mode);
+    pair.transform = Align.translationMatching(
+      pair.orientation, pxToSpace(a.centerPx, a, pair.mode), pxToSpace(b.centerPx, b, pair.mode)
+    );
+    if (!rendererForPair(sid, pair).supported) {
+      showError("This physical mapping needs anisotropic rendering. Select Relative to use display-only alignment.");
+      updateCompareControls();
+      return false;
     }
-    compare.anchorLandmarks = [];
-    compare.linked = true;
-    applyDisplayTransforms();
-    for (const sid of groupSids()) sendLandmarkMode(sid, compare.landmark.active, { clear: true });
+    compare.pairs.set(sid, pair);
+    changed = true;
   }
-  // Orientation is a display-only operation around the captured centers.
-  // Re-fitting the linked field here would invoke rotated viewport constraints
-  // and could change the zoom just because a direction button was pressed.
-  if (pending.kind !== "orientation") syncFromAnchor();
+  if (changed) committedMutation();
+  // Transaction snapshots never overwrite newer unsolicited viewport states.
+  for (const [sid, st] of captured) {
+    if (st.seq >= (compare.states.get(sid)?.seq || 0)) compare.states.set(sid, st);
+  }
+  broadcastCompareState();
+  if (["orientation", "remove-fit", "relative"].includes(pending.kind)) applyDisplayTransform(pending.targetSid);
+  else applyDisplayTransforms();
+  if (pending.kind === "sync" || pending.kind === "capture") syncFromAnchor();
   updateCompareControls();
+  return true;
 }
 
 function receiveViewportState(data, sid) {
   if (data.version !== VIEWPORT_PROTOCOL_VERSION) return;
   const state = normalizeViewportState(data, sid);
   if (!state) return;
-  const previous = compare.states.get(sid);
-  if (!state.requestId && state.seq && previous?.seq && state.seq <= previous.seq) return;
-  compare.states.set(sid, state);
-  if (compare.enabled && inGroup(sid) && previous?.plateGrid !== state.plateGrid) {
-    updateOrientationControls();
-  }
-  const pending = compare.pendingRequest;
-  if (pending && state.requestId === pending.requestId && inGroup(sid)) {
-    pending.seen.add(sid);
-    if (pending.seen.size === groupSids().length) finishGroupRequest(pending);
-  }
-  if (!compare.enabled || !compare.linked || compare.pendingRequest ||
-      state.reason !== "user" || state.echoOf) return;
-  if (!inGroup(sid)) return;
-  if (data.nudge === true) {
-    // one pane moved on its own; its pairs absorb the difference, which is
-    // how serial sections get matched at high zoom
-    clearViewportRoutes();
-    const changed = sid === compare.anchorSid ? recaptureAll() : rematchTranslation(sid);
-    if (changed) updateCompareControls();
+  if (data.nudgeCommandId) return receiveNudgeReply(data, state, sid);
+  if (data.nudge === true) return receiveDragNudge(data, state, sid);
+  if (state.requestId) {
+    // A cancelled/unknown request must never become a user pan or mutate global state.
+    const pending = compare.pendingRequest;
+    if (!transactionCurrent(pending) || state.requestId !== pending.requestId ||
+        !pending.expectedTargets.includes(sid) || !currentEnvelope(data, sid) ||
+        !sameIdentity(localIdentity(state), pending.contexts.get(sid)) || !state.imageReady || state.plateGrid) return;
+    pending.responses.set(sid, state);
+    if (pending.responses.size === pending.expectedTargets.length) finishGroupRequest(pending);
     return;
   }
+  const previous = compare.states.get(sid);
+  const same = sameIdentity(localIdentity(previous), localIdentity(state));
+  if (same && state.seq <= previous.seq) return false;
+  // Only readiness may introduce a new pane/context. Ordinary late packets cannot revive it.
+  if (data.nd2wsi !== "viewport-ready") {
+    if (!same || (inGroup(sid) && !currentEnvelope(data, sid))) return;
+    compare.states.set(sid, state);
+  } else {
+    if (!adoptSpatialIdentity(sid, state)) return;
+    if (inGroup(sid) && previous?.imageReady && !state.imageReady) {
+      clearPendingRequest();
+      clearNudgeCommands();
+      clearViewportRoutes();
+    }
+    broadcastCompareState();
+    if (inGroup(sid)) {
+      for (const member of compare.members) ensurePairTransform(member);
+      applyDisplayTransforms();
+      updateCompareControls();
+    }
+    return true;
+  }
+  if (!compare.linked || compare.pendingRequest || compare.landmark.active ||
+      !inGroup(sid) || !spatialGroupReady() || state.reason !== "user" || state.echoOf) return;
   scheduleViewportRoute(sid, state);
 }
 
 /* ---- landmarks ------------------------------------------------------------ */
 
 function sendLandmarkMode(sid, active, extra = {}) {
+  const edit = compare.landmark.edit;
   const points = sid === compare.anchorSid
-    ? compare.anchorLandmarks
-    : compare.pairs.get(sid)?.landmarks || [];
-  postToSlide(sid, {
-    nd2wsi: "landmark-mode",
-    version: VIEWPORT_PROTOCOL_VERSION,
-    active: Boolean(active),
-    needed: LANDMARKS_NEEDED,
-    points: extra.clear ? [] : clonePoints(points),
-    ...extra,
+    ? edit?.anchorSet.points || compare.anchorLandmarks
+    : edit?.pairs.get(sid)?.landmarks || compare.pairs.get(sid)?.landmarks || [];
+  sendSpatial(sid, {
+    nd2wsi: "landmark-mode", active: Boolean(active), needed: LANDMARKS_NEEDED,
+    points: clonePoints(points), editId: edit?.editId ?? null,
+    editRevision: edit?.editRevision ?? 0, ...extra,
   });
 }
 
 function snapshotAlignment() {
   return {
-    anchorLandmarks: clonePoints(compare.anchorLandmarks),
-    linked: compare.linked,
-    pairs: new Map([...compare.pairs].map(([sid, pair]) => [sid, {
-      mode: pair.mode,
-      orientation: { ...pair.orientation },
-      transform: pair.transform ? { ...pair.transform } : null,
-      fit: pair.fit ? { ...pair.fit } : null,
-      landmarks: clonePoints(pair.landmarks),
-    }])),
+    anchorSet: cloneValue(compare.anchorSet), anchorLandmarks: clonePoints(compare.anchorLandmarks),
+    linked: compare.linked, pairs: new Map([...compare.pairs].map(([sid, pair]) => [sid, cloneValue(pair)])),
   };
 }
 
 function restoreSnapshot(snapshot) {
+  compare.anchorSet = cloneValue(snapshot.anchorSet);
   compare.anchorLandmarks = clonePoints(snapshot.anchorLandmarks);
   compare.linked = snapshot.linked;
-  for (const [sid, saved] of snapshot.pairs) {
-    const pair = compare.pairs.get(sid);
-    if (!pair) continue;
-    Object.assign(pair, {
-      mode: saved.mode,
-      orientation: { ...saved.orientation },
-      transform: saved.transform ? { ...saved.transform } : null,
-      fit: saved.fit ? { ...saved.fit } : null,
-      landmarks: clonePoints(saved.landmarks),
-    });
-  }
+  compare.pairs = new Map([...snapshot.pairs].map(([sid, pair]) => [sid, cloneValue(pair)]));
 }
 
 function startLandmarks() {
-  if (!compare.enabled || compare.pendingRequest || compare.landmark.active) return;
+  if (compare.pendingNudge) return;
+  if (!spatialGroupReady("edit") || (compare.pendingRequest && compare.pendingRequest.kind !== "sync") ||
+      compare.landmark.active) return;
+  clearPendingRequest();
+  clearViewportRoutes();
   closePairPicker(false);
-  compare.landmark.active = true;
-  compare.landmark.before = snapshotAlignment();
+  const before = snapshotAlignment();
+  for (const pair of before.pairs.values()) {
+    if (pair.provenanceMismatch) {
+      pair.landmarks = [];
+      pair.landmarkSet = {id: uniqueId(), revision: 0, points: []};
+    }
+  }
+  compare.landmark = {active: true, edit: {
+    editId: uniqueId(), editRevision: 0, baseCommittedRevision: compare.committedRevision,
+    groupSessionId: compare.groupSessionId, groupEpoch: compare.groupEpoch,
+    expectedTargets: [...groupSids()],
+    contexts: new Map(groupSids().map((sid) => [sid, spatialEnvelope(sid)])),
+    anchorSet: cloneValue(compare.anchorSet), pairs: before.pairs,
+    candidates: new Map(), pointRevisions: new Map(), reflectionPolicy: "keep",
+  }};
+  for (const sid of compare.members) fitPair(sid);
+  broadcastCompareState();
   for (const sid of groupSids()) sendLandmarkMode(sid, true);
   updateCompareControls();
 }
 
-function finishLandmarks(keep) {
-  if (!compare.landmark.active) return;
-  if (!keep && compare.landmark.before) restoreSnapshot(compare.landmark.before);
-  compare.landmark.active = false;
-  compare.landmark.before = null;
+function validLandmarkMessage(sid, data) {
+  const edit = compare.landmark.edit;
+  return compare.landmark.active && edit && inGroup(sid) && currentEnvelope(data, sid) &&
+    data.editId === edit.editId && data.editRevision === edit.editRevision;
+}
+
+function landmarkCommitReady(edit = compare.landmark.edit) {
+  if (!edit || !compare.landmark.active || !spatialGroupReady("edit") ||
+      (compare.pendingRequest && compare.pendingRequest.kind !== "sync") ||
+      edit.baseCommittedRevision !== compare.committedRevision ||
+      edit.groupSessionId !== compare.groupSessionId || edit.groupEpoch !== compare.groupEpoch ||
+      edit.expectedTargets.length !== groupSids().length ||
+      !edit.expectedTargets.every((sid) => inGroup(sid) &&
+        sameIdentity(edit.contexts.get(sid), localIdentity(compare.states.get(sid))))) return false;
+  return compare.members.every((sid) => {
+    const pair = edit.pairs.get(sid), candidate = edit.candidates.get(sid);
+    return candidate?.status === "valid" && candidate.editRevision === edit.editRevision &&
+      candidate.anchorRevision === edit.anchorSet.revision &&
+      candidate.memberRevision === pair.landmarkSet.revision &&
+      candidate.policy === edit.reflectionPolicy && candidate.renderer.supported;
+  });
+}
+
+function commitLandmarkEdit(editId) {
+  const edit = compare.landmark.edit;
+  if (edit?.editId !== editId || !landmarkCommitReady(edit)) return false;
+  // Validate and construct every member before the one synchronous publication.
+  const nextPairs = new Map();
+  for (const sid of compare.members) {
+    const pair = cloneValue(edit.pairs.get(sid)), candidate = edit.candidates.get(sid);
+    pair.fit = cloneValue(candidate.fit);
+    pair.fitTransform = cloneValue(candidate.fit.transform);
+    pair.transform = cloneValue(pair.fitTransform);
+    pair.mode = candidate.mode;
+    pair.manualOffset = {x: 0, y: 0};
+    pair.provenanceMismatch = false;
+    pair.provenance = {
+      anchorContext: edit.contexts.get(compare.anchorSid).spatialContextKey,
+      memberContext: edit.contexts.get(sid).spatialContextKey,
+      anchorSetId: edit.anchorSet.id, anchorRevision: edit.anchorSet.revision,
+      memberSetId: pair.landmarkSet.id, memberRevision: pair.landmarkSet.revision,
+      anchorPointIds: edit.anchorSet.points.map((p) => p.id),
+      memberPointIds: pair.landmarks.map((p) => p.id),
+      reflectionPolicy: edit.reflectionPolicy,
+      from: clonePoints(candidate.from), to: clonePoints(candidate.to),
+    };
+    updatePairResidual(pair);
+    nextPairs.set(sid, pair);
+  }
+  const next = {
+    anchorSet: cloneValue(edit.anchorSet), anchorLandmarks: clonePoints(edit.anchorSet.points),
+    linked: compare.linked, pairs: nextPairs,
+  };
+  clearPendingRequest();
+  compare.committedGroup = next;
+  restoreSnapshot(next);
+  compare.committedRevision += 1;
+  compare.landmark = {active: false, edit: null};
+  compare.groupEpoch += 1; // invalidate already queued draft/display messages
+  broadcastCompareState();
   for (const sid of groupSids()) sendLandmarkMode(sid, false);
-  applyDisplayTransforms();
   rememberAlignment();
+  applyDisplayTransforms();
   syncFromAnchor();
   updateCompareControls();
-}
-
-function clearAlignment() {
-  if (!compare.enabled || compare.pendingRequest) return;
-  requestGroup("clear");
-}
-
-function fitPair(sid, announce = true) {
-  const pair = compare.pairs.get(sid);
-  const anchorState = compare.states.get(compare.anchorSid);
-  const memberState = compare.states.get(sid);
-  if (!pair || !anchorState || !memberState) return false;
-  const n = Math.min(compare.anchorLandmarks.length, pair.landmarks.length);
-  if (n < 2) return false;
-  const mode = mappingMode(anchorState, memberState);
-  const from = compare.anchorLandmarks.slice(0, n).map((p) => pxToSpace(p, anchorState, mode));
-  const to = pair.landmarks.slice(0, n).map((p) => pxToSpace(p, memberState, mode));
-  const fit = Align.fitSimilarity(from, to);
-  if (!fit) return false;
-  pair.mode = mode;
-  pair.transform = fit.transform;
-  pair.fit = {
-    pairs: fit.pairs,
-    rms: fit.rms,
-    reflected: fit.reflected,
-    angleDeg: fit.angleDeg,
-    scale: fit.scale,
-  };
-  if (announce) {
-    applyDisplayTransform(sid);
-    syncFromAnchor();
-  }
   return true;
 }
 
-function receiveLandmarkPoints(sid, data) {
-  if (!compare.landmark.active || !inGroup(sid)) return;
-  const points = (Array.isArray(data.points) ? data.points : [])
-    .map((p) => ({ x: Number(p.x), y: Number(p.y) }))
-    .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
-    .slice(0, LANDMARKS_NEEDED);
-  if (sid === compare.anchorSid) {
-    compare.anchorLandmarks = points;
-    for (const member of compare.members) fitPair(member);
-  } else {
-    const pair = compare.pairs.get(sid);
-    if (!pair) return;
-    pair.landmarks = points;
-    fitPair(sid);
+function finishLandmarks(keep) {
+  if (!compare.landmark.active) return false;
+  if (keep) return commitLandmarkEdit(compare.landmark.edit.editId);
+  // Drafts never touched committed geometry. Invalidate callbacks BEFORE restoring display.
+  invalidateSpatialWork();
+  for (const sid of groupSids()) sendLandmarkMode(sid, false);
+  applyDisplayTransforms();
+  syncFromAnchor();
+  updateCompareControls();
+  return true;
+}
+
+function clearAlignment() {
+  const edit = compare.landmark.edit;
+  if (!edit || !spatialGroupReady("edit")) return;
+  edit.editRevision += 1;
+  edit.anchorSet = {id: uniqueId(), revision: edit.anchorSet.revision + 1, points: []};
+  for (const pair of edit.pairs.values()) {
+    pair.landmarks = [];
+    pair.landmarkSet = {id: uniqueId(), revision: pair.landmarkSet.revision + 1, points: []};
   }
+  edit.candidates.clear();
+  for (const sid of groupSids()) sendLandmarkMode(sid, true, {clear: true});
+  updateCompareControls();
+}
+
+function fitPair(sid) {
+  const edit = compare.landmark.edit, pair = edit?.pairs.get(sid);
+  const a = compare.states.get(compare.anchorSid), b = compare.states.get(sid);
+  if (!edit || !pair || !a || !b) return false;
+  edit.candidates.delete(sid); // never leave a last-successful fit marked current
+  const mode = pair.forceRelative ? "normalized" : mappingMode(a, b);
+  const from = edit.anchorSet.points.map((p) => pxToSpace(p, a, mode));
+  const to = pair.landmarks.map((p) => pxToSpace(p, b, mode));
+  const reflected = pair.fit ? pair.fit.reflected : Align.mirrored(pair.orientation);
+  const candidate = Align.fitCandidate(from, to, {
+    reflection: edit.reflectionPolicy, reflected, minPoints: LANDMARKS_NEEDED,
+    sourceBounds: {width: a.imagePx.x * pixelScale(a, mode).x,
+      height: a.imagePx.y * pixelScale(a, mode).y},
+    targetBounds: {width: b.imagePx.x * pixelScale(b, mode).x,
+      height: b.imagePx.y * pixelScale(b, mode).y},
+  });
+  const renderer = candidate.fit ? rendererForPair(sid, {mode, transform: candidate.fit.transform}) : {supported: false};
+  if (candidate.status === "valid" && !renderer.supported) {
+    candidate.status = "invalid";
+    candidate.reason = "Physical mapping is not a renderer-supported pixel similarity";
+  }
+  edit.candidates.set(sid, {
+    ...candidate, renderer, mode, from, to, editRevision: edit.editRevision,
+    anchorRevision: edit.anchorSet.revision, memberRevision: pair.landmarkSet.revision,
+    policy: edit.reflectionPolicy,
+  });
+  return candidate.status === "valid";
+}
+
+function receiveLandmarkPoints(sid, data) {
+  if (!validLandmarkMessage(sid, data) || !spatialGroupReady("edit")) return;
+  const edit = compare.landmark.edit;
+  if (!Number.isSafeInteger(data.pointRevision) ||
+      data.pointRevision <= (edit.pointRevisions.get(sid) ?? -1)) return;
+  const raw = data.points;
+  if (!Array.isArray(raw) || raw.length > LANDMARKS_NEEDED ||
+      raw.some((p) => !finitePoint(p) || typeof p.id !== "string") ||
+      new Set(raw.map((p) => p.id)).size !== raw.length) return;
+  edit.pointRevisions.set(sid, data.pointRevision);
+  const points = clonePoints(raw);
+  if (sid === compare.anchorSid) {
+    edit.anchorSet.points = points;
+    edit.anchorSet.revision += 1;
+  } else {
+    const pair = edit.pairs.get(sid);
+    pair.landmarks = points;
+    pair.landmarkSet.points = clonePoints(points);
+    pair.landmarkSet.revision += 1;
+  }
+  // Re-evaluate all members against the shared anchor revision, without moving any view.
+  for (const member of compare.members) fitPair(member);
   updateCompareControls();
 }
 
@@ -1239,33 +1505,21 @@ function formatDeltaUm(value) {
   return `${sign}${abs.toFixed(abs >= 100 ? 0 : 1)} µm`;
 }
 
-function formatRms(pair) {
-  if (!pair.fit) return "";
-  if (pair.mode === "physical") {
-    const v = pair.fit.rms;
-    return v >= 1000 ? `${(v / 1000).toFixed(2)} mm` : `${v.toFixed(v >= 100 ? 0 : 1)} µm`;
-  }
-  return `${(pair.fit.rms * 100).toFixed(2)}%`;
+function formatRms(pair, value = pair.fit?.rms) {
+  if (!Number.isFinite(value)) return "—";
+  if (pair.mode === "physical") return value >= 1000
+    ? (value / 1000).toFixed(2) + " mm" : value.toFixed(value >= 100 ? 0 : 1) + " µm";
+  return (value * 100).toFixed(2) + "%";
 }
 
 function alignmentDeltaLabel() {
-  // for a single pair without a fit: the hand-tuned part beyond matched centers
-  if (compare.members.length !== 1) return "";
-  const sid = compare.members[0];
-  const pair = compare.pairs.get(sid);
-  const anchorState = compare.states.get(compare.anchorSid);
-  const memberState = compare.states.get(sid);
-  if (!pair || !pair.transform || pair.fit || !anchorState || !memberState) return "";
-  const base = defaultTransform(pair, anchorState, memberState, pair.mode);
-  const dx = pair.transform.tx - base.tx;
-  const dy = pair.transform.ty - base.ty;
-  if (pair.mode === "physical") {
-    if (Math.abs(dx) < 0.05 && Math.abs(dy) < 0.05) return "";
-    return `Δ ${formatDeltaUm(dx)}, ${formatDeltaUm(dy)}`;
-  }
-  if (Math.abs(dx) < 0.0005 && Math.abs(dy) < 0.0005) return "";
-  const pct = (value) => `${value < 0 ? "−" : "+"}${(Math.abs(value) * 100).toFixed(1)}%`;
-  return `Δ ${pct(dx)}, ${pct(dy)}`;
+  const sid = compare.orientationSid, pair = compare.pairs.get(sid);
+  const a = compare.states.get(compare.anchorSid), b = compare.states.get(sid);
+  if (!pair?.transform || !a?.imageReady || !b?.imageReady || !a.spatialContext || !b.spatialContext) return "";
+  const base = pair.fitTransform || defaultTransform(pair, a, b, pair.mode);
+  const dx = pair.transform.tx - base.tx, dy = pair.transform.ty - base.ty;
+  if (pair.mode === "physical") return "Δ " + formatDeltaUm(dx) + ", " + formatDeltaUm(dy);
+  return "Δ " + (dx * 100).toFixed(2) + "%, " + (dy * 100).toFixed(2) + "%";
 }
 
 function movingSids() {
@@ -1273,14 +1527,17 @@ function movingSids() {
 }
 
 function broadcastCompareState() {
-  const pending = Boolean(compare.pendingRequest);
+  const ready = spatialGroupReady(), pending = Boolean(compare.pendingRequest);
   for (const sid of frames.keys()) {
+    const envelope = spatialEnvelope(sid);
+    if (!envelope) continue;
     const member = inGroup(sid);
     postToSlide(sid, {
-      nd2wsi: "compare-state",
-      version: VIEWPORT_PROTOCOL_VERSION,
-      enabled: member,
-      linked: member && compare.linked && !pending,
+      nd2wsi: "compare-state", version: VIEWPORT_PROTOCOL_VERSION, ...envelope,
+      enabled: member, spatialReady: member && ready,
+      committedRevision: compare.committedRevision, nudgeBusy: Boolean(compare.pendingNudge),
+      spatialEnabled: member && spatialGroupReady("edit"),
+      linked: member && ready && compare.linked && !pending && !compare.landmark.active,
       moving: member && sid !== compare.anchorSid,
       role: member && sid === compare.anchorSid ? "anchor" : "member",
     });
@@ -1288,39 +1545,135 @@ function broadcastCompareState() {
 }
 
 function nudgeAlignment(dxPx, dyPx, fromSid) {
-  if (!compare.enabled || !compare.linked || compare.pendingRequest) return;
+  if (compare.pendingRequest?.kind === "sync") clearPendingRequest(true);
+  if (!compare.linked || compare.pendingRequest || compare.landmark.active || !spatialGroupReady()) return;
   const dx = Number(dxPx), dy = Number(dyPx);
-  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || (!dx && !dy)) return;
+  const target = fromSid && fromSid !== compare.anchorSid ? fromSid : compare.orientationSid;
+  if (!compare.members.includes(target)) return;
   clearViewportRoutes();
-  // arrows nudge the pane they were pressed in when it is a member, and the
-  // first member when pressed in the anchor
-  const target = fromSid && fromSid !== compare.anchorSid ? fromSid : compare.members[0];
-  if (!target) return;
-  postToSlide(target, {
-    nd2wsi: "viewport-nudge",
-    version: VIEWPORT_PROTOCOL_VERSION,
-    dxPx: Math.max(-200, Math.min(200, dx)),
-    dyPx: Math.max(-200, Math.min(200, dy)),
+  compare.nudgeQueue.push({
+    sid: target, context: spatialEnvelope(target),
+    dxPx: Math.max(-200, Math.min(200, dx)), dyPx: Math.max(-200, Math.min(200, dy)),
   });
+  dispatchNextNudge();
+}
+
+function clearNudgeCommands() {
+  if (compare.pendingNudge?.timer) clearTimeout(compare.pendingNudge.timer);
+  compare.pendingNudge = null;
+  compare.nudgeQueue = [];
+}
+
+function dispatchNextNudge() {
+  if (compare.pendingNudge) return;
+  const item = compare.nudgeQueue.shift();
+  if (!item) return;
+  if (!currentEnvelope(item.context, item.sid) || !compare.members.includes(item.sid) ||
+      !compare.linked || compare.pendingRequest || compare.landmark.active || !spatialGroupReady()) {
+    clearNudgeCommands();
+    return;
+  }
+  const pending = {
+    ...item, committedRevision: compare.committedRevision,
+    commandSeq: compare.commandSeq + 1, commandId: "shell-spatial-" + (compare.commandSeq + 1),
+  };
+  compare.pendingNudge = pending;
+  pending.timer = setTimeout(() => {
+    if (compare.pendingNudge !== pending) return;
+    clearNudgeCommands();
+    syncFromAnchor();
+    updateCompareControls();
+  }, 2500);
+  const sent = sendSpatial(item.sid, {
+    nd2wsi: "viewport-nudge", dxPx: item.dxPx, dyPx: item.dyPx,
+    committedRevision: pending.committedRevision,
+  });
+  if (!sent) clearNudgeCommands();
+  updateCompareControls();
+}
+
+function applyNudgeDelta(sid, deltaPx) {
+  const delta = finitePoint(deltaPx);
+  if (!delta || !spatialGroupReady()) return false;
+  if (sid === compare.anchorSid) {
+    // Move the reference picture without moving its partners. Express the
+    // opposite anchor-space displacement through each pair's linear map.
+    for (const member of compare.members) {
+      const pair = ensurePairTransform(member);
+      const d = pxToSpace(delta, compare.states.get(sid), pair.mode);
+      const tx = -(pair.transform.a * d.x + pair.transform.b * d.y);
+      const ty = -(pair.transform.c * d.x + pair.transform.d * d.y);
+      pair.transform.tx += tx;
+      pair.transform.ty += ty;
+      if (!pair.fitTransform) pair.manualOffset = {
+        x: (pair.manualOffset?.x || 0) + tx, y: (pair.manualOffset?.y || 0) + ty,
+      };
+      updatePairResidual(pair);
+    }
+    return true;
+  }
+  if (!compare.members.includes(sid)) return false;
+  const pair = ensurePairTransform(sid);
+  const d = pxToSpace(delta, compare.states.get(sid), pair.mode);
+  pair.transform.tx += d.x;
+  pair.transform.ty += d.y;
+  if (!pair.fitTransform) pair.manualOffset = {
+    x: (pair.manualOffset?.x || 0) + d.x, y: (pair.manualOffset?.y || 0) + d.y,
+  };
+  updatePairResidual(pair);
+  return true;
+}
+
+function receiveNudgeReply(data, snapshot, sid) {
+  const pending = compare.pendingNudge;
+  if (!pending || pending.sid !== sid || data.nudgeCommandId !== pending.commandId ||
+      data.commandSeq !== pending.commandSeq || !currentEnvelope(data, sid) ||
+      !sameIdentity(localIdentity(snapshot), pending.context)) return false;
+  if (data.committedRevision !== pending.committedRevision ||
+      compare.committedRevision !== pending.committedRevision || !snapshot.imageReady ||
+      !spatialGroupReady() || !finitePoint(data.nudgeDeltaPx)) {
+    clearNudgeCommands(); syncFromAnchor(); updateCompareControls();
+    return false;
+  }
+  clearTimeout(pending.timer);
+  compare.pendingNudge = null;
+  if (snapshot.seq > (compare.states.get(sid)?.seq ?? -1)) compare.states.set(sid, snapshot);
+  if (applyNudgeDelta(sid, data.nudgeDeltaPx)) committedMutation();
+  forwardViewport(sid, compare.states.get(sid)); // the just-adjusted pane owns its current zoom
+  dispatchNextNudge();
+  updateCompareControls();
+  return true;
+}
+
+function receiveDragNudge(data, snapshot, sid) {
+  if (data.nudgeSource !== "drag" || typeof data.dragId !== "string" ||
+      !currentEnvelope(data, sid) || !inGroup(sid) || !snapshot.imageReady ||
+      snapshot.seq <= (compare.states.get(sid)?.seq ?? -1)) return false;
+  if (data.nudgeCancelled || data.committedRevision !== compare.committedRevision ||
+      compare.pendingNudge || compare.pendingRequest || compare.landmark.active ||
+      !compare.linked || !spatialGroupReady() || !finitePoint(data.nudgeDeltaPx)) {
+    syncFromAnchor();
+    return false;
+  }
+  clearViewportRoutes();
+  compare.states.set(sid, snapshot);
+  if (applyNudgeDelta(sid, data.nudgeDeltaPx)) committedMutation();
+  forwardViewport(sid, snapshot);
+  updateCompareControls();
+  return true;
 }
 
 function orientationNote(pair) {
-  if (pair.fit) {
-    const parts = [`${pair.fit.pairs} pts`];
-    if (pair.fit.pairs >= 3) parts.push(`rms ${formatRms(pair)}`);
-    const deg = Math.round(pair.fit.angleDeg);
-    if (Math.abs(deg) >= 1) parts.push(`${deg}°`);
-    if (pair.fit.reflected) parts.push("mirror");
-    return parts.join(" · ");
-  }
+  if (pair.provenanceMismatch) return "Stored transform · Landmark set mismatch";
+  if (pair.fit) return [
+    pair.fit.pairs + " pts", "Fit RMS " + formatRms(pair),
+    "Current RMS " + formatRms(pair, pair.currentRms),
+    Math.round(pair.fit.angleDeg) + "°", pair.fit.reflected ? "mirror" : "",
+  ].filter(Boolean).join(" · ");
   const pose = Align.displayPose(pair.orientation);
   const degrees = ((Math.round(pose.degrees) % 360) + 360) % 360;
-  const screen = Align.invert(pair.orientation);
-  if (screen.a === -1 && screen.d === 1) return "Flip ↔";
-  if (screen.a === 1 && screen.d === -1) return "Flip ↕";
-  if (screen.b === 1 && screen.c === 1) return "Transposed";
-  if (screen.b === -1 && screen.c === -1) return "Transposed · 180°";
-  return [degrees ? `${degrees}°` : "", pose.flipped ? "mirrored" : ""].filter(Boolean).join(" · ");
+  return [degrees ? degrees + "°" : "", pose.flipped ? "mirrored" : ""].filter(Boolean).join(" · ");
 }
 
 const ORIENTATION_ACTIONS = {
@@ -1333,40 +1686,36 @@ const ORIENTATION_ACTIONS = {
 };
 
 function orientationNeedsFocusedSite(sid) {
-  return Boolean(compare.states.get(compare.anchorSid)?.plateGrid ||
-    compare.states.get(sid)?.plateGrid);
+  return !compare.members.includes(sid) || !spatialGroupReady("orientation");
 }
 
 function updateOrientationControls() {
-  if (!compare.members.includes(compare.orientationSid)) {
-    compare.orientationSid = compare.members[0] || null;
-  }
+  if (!compare.members.includes(compare.orientationSid)) compare.orientationSid = compare.members[0] || null;
   const select = $("compare-orientation-target");
-  // Preserve the native select and focus while viewport/landmark state updates.
   const key = JSON.stringify(compare.members.map((sid) => [sid, slideName(sid)]));
   if (select.dataset.optionsKey !== key) {
     select.replaceChildren(...compare.members.map((sid) => {
       const option = document.createElement("option");
-      option.value = sid;
-      option.textContent = slideName(sid);
+      option.value = sid; option.textContent = slideName(sid);
       return option;
     }));
     select.dataset.optionsKey = key;
   }
   select.value = compare.orientationSid || "";
   select.title = slideName(compare.orientationSid);
-  select.disabled = Boolean(compare.pendingRequest) || compare.landmark.active;
+  select.disabled = Boolean(compare.pendingRequest || compare.pendingNudge) || compare.landmark.active;
   const pair = compare.pairs.get(compare.orientationSid);
-  const grid = orientationNeedsFocusedSite(compare.orientationSid);
-  const disabled = select.disabled || !pair || Boolean(pair.fit) || grid;
+  const paused = !spatialGroupReady("orientation");
+  const disabled = select.disabled || !pair || Boolean(pair.fit) || paused;
   for (const id of Object.keys(ORIENTATION_ACTIONS)) $(id).disabled = disabled;
+  $("compare-remove-fit").disabled = select.disabled || paused || !pair?.fit;
+  $("compare-mapping").disabled = select.disabled || paused;
+  $("compare-mapping").value = pair?.forceRelative ? "relative" : "physical";
   $("compare-orientation-state").textContent = pair ? orientationNote(pair) || "Original" : "";
-  $("compare-orientation-hint").textContent = grid
-    ? "Focus a site in each plate before changing image orientation"
-    : pair?.fit
-    ? "Landmark fit protected · use Align → Clear to change orientation"
-    : compare.landmark.active ? "Finish or cancel Align before changing orientation"
-      : "Reference stays fixed · center preserved · display only";
+  $("compare-orientation-hint").textContent = paused ? spatialPauseReason()
+    : pair?.fit ? "Fit protected · Remove Fit retains manual orientation"
+    : compare.landmark.active ? "Draft only · Done applies all fits together"
+    : "Reference stays fixed · center preserved · display only";
 }
 
 function renderChips() {
@@ -1387,7 +1736,11 @@ function renderChips() {
     if (note) {
       const meta = document.createElement("span");
       meta.className = "meta";
-      meta.textContent = note;
+      // Full residuals belong in the active-slide inspector and tooltip;
+      // never let them displace the filename in the compact group chip.
+      meta.textContent = pair?.fit
+        ? Math.round(pair.fit.angleDeg) + "°" + (pair.fit.reflected ? " · mirror" : "")
+        : note;
       chip.append(meta);
     }
     chip.title = index === 0
@@ -1412,54 +1765,51 @@ function renderChips() {
 }
 
 function renderLandmarkPanel() {
-  const panel = $("compare-landmarks");
-  const active = compare.landmark.active;
-  panel.hidden = !active;
-  if (!active) return;
+  const panel = $("compare-landmarks"), edit = compare.landmark.edit;
+  panel.hidden = !compare.landmark.active;
+  if (!compare.landmark.active || !edit) return;
   const rows = $("compare-landmark-rows");
   rows.replaceChildren();
-  const anchorCount = compare.anchorLandmarks.length;
-  const line = (label, text, cls) => {
+  function line(label, text, valid) {
     const row = document.createElement("div");
-    row.className = "landmark-row" + (cls ? " " + cls : "");
-    const a = document.createElement("span");
-    a.className = "name";
-    a.textContent = label;
-    const b = document.createElement("span");
-    b.className = "state";
-    b.textContent = text;
-    row.append(a, b);
-    rows.append(row);
-  };
-  line(slideName(compare.anchorSid), `${anchorCount} of ${LANDMARKS_NEEDED}`, anchorCount >= LANDMARKS_NEEDED ? "done" : "");
-  for (const sid of compare.members) {
-    const pair = compare.pairs.get(sid);
-    const n = pair?.landmarks.length || 0;
-    const fitText = pair?.fit
-      ? ` · fit ${pair.fit.pairs} pts${pair.fit.pairs >= 3 ? ` · rms ${formatRms(pair)}` : ""}`
-      : "";
-    line(slideName(sid), `${n} of ${LANDMARKS_NEEDED}${fitText}`, n >= LANDMARKS_NEEDED && pair?.fit ? "done" : "");
+    row.className = "landmark-row" + (valid ? " done" : "");
+    const a = document.createElement("span"), b = document.createElement("span");
+    a.className = "name"; a.textContent = label;
+    b.className = "state"; b.textContent = text;
+    row.append(a, b); rows.append(row);
   }
-  const every = anchorCount >= LANDMARKS_NEEDED &&
-    compare.members.every((sid) => (compare.pairs.get(sid)?.landmarks.length || 0) >= LANDMARKS_NEEDED);
-  $("compare-landmark-hint").textContent = every
-    ? "All points placed. Check the fit, drag a marker to refine, then Done."
-    : "Click the same four structures on every slide, in the same order. Pan and zoom freely while placing.";
+  line(slideName(compare.anchorSid), edit.anchorSet.points.length + " of " + LANDMARKS_NEEDED,
+    edit.anchorSet.points.length === LANDMARKS_NEEDED);
+  for (const sid of compare.members) {
+    const candidate = edit.candidates.get(sid), pair = edit.pairs.get(sid);
+    const valid = candidate?.status === "valid";
+    const detail = valid
+      ? "Candidate RMS " + formatRms({mode: candidate.mode}, candidate.fit.rms)
+      : "Draft incomplete · Previous alignment shown · " + (candidate?.reason || "no points");
+    line(slideName(sid), pair.landmarks.length + " of " + LANDMARKS_NEEDED + " · " + detail +
+      (candidate?.warnings?.length ? " · " + candidate.warnings.join("; ") : ""), valid);
+  }
+  $("compare-landmark-done").disabled = !landmarkCommitReady();
+  $("compare-mirror-policy").value = edit.reflectionPolicy;
+  $("compare-landmark-hint").textContent = landmarkCommitReady()
+    ? "Done applies every candidate atomically. Low RMS does not establish same-cell registration."
+    : "Place the same four structures in order. Views keep the committed alignment until Done.";
 }
 
 function updateCompareControls() {
+  // Materialize the edit panel before reserving its fixed canvas boundary.
+  renderLandmarkPanel();
   syncCompareToolsVisibility();
   if (!compare.enabled) {
-    renderLandmarkPanel();
     broadcastCompareState();
     return;
   }
-  const pending = Boolean(compare.pendingRequest);
+  const pending = Boolean(compare.pendingRequest || compare.pendingNudge);
   const landmarking = compare.landmark.active;
   const link = $("compare-link");
   link.classList.toggle("linked", compare.linked && !pending);
   link.classList.toggle("pending", pending);
-  link.disabled = pending;
+  link.disabled = pending || landmarking || !spatialGroupReady();
   link.setAttribute("aria-pressed", String(compare.linked && !pending));
   link.setAttribute("aria-label", compare.linked ? "Unlink views" : "Relink and capture alignment");
   link.title = compare.linked
@@ -1477,13 +1827,16 @@ function updateCompareControls() {
     ? `Up to ${MAX_GROUP} slides can be linked`
     : others.length ? "Link another open slide" : "Open another slide to link it";
   const align = $("compare-align");
-  align.disabled = pending;
+  align.disabled = Boolean(compare.pendingNudge) ||
+    (compare.pendingRequest && compare.pendingRequest.kind !== "sync") || !spatialGroupReady("edit");
   align.classList.toggle("active", landmarking);
   align.setAttribute("aria-pressed", String(landmarking));
 
   const modes = new Set(members.map((pair) => pair.mode).filter(Boolean));
   let status;
-  if (pending) status = "Reading every view…";
+  if (spatialPauseReason()) status = spatialPauseReason();
+  else if (compare.pendingNudge) status = "Adjusting alignment…";
+  else if (pending) status = "Reading every view…";
   else if (!compare.linked) status = "Unlinked · move any view";
   else if (!members.length || !members.every((pair) => pair.transform)) status = "Waiting for views";
   else status = modes.has("normalized") ? "Linked · relative" : "Linked · µm";
@@ -1498,9 +1851,7 @@ function updateCompareControls() {
     : "";
 
   renderChips();
-  renderLandmarkPanel();
   syncCompareToolbarSpace();
-  rememberAlignment();
   broadcastCompareState();
 }
 
@@ -1651,7 +2002,7 @@ function choosePickerSlide(sid) {
 /* ---- group membership ------------------------------------------------------ */
 
 function attachMember(sid) {
-  const pair = newPair(compare.anchorSid, sid);
+  const pair = newPair();
   restoreAlignment(compare.anchorSid, sid, pair);
   compare.pairs.set(sid, pair);
   compare.members.push(sid);
@@ -1661,99 +2012,72 @@ function attachMember(sid) {
 
 function startGroup(anchorSid, memberSid) {
   if (compare.enabled || !anchorSid || !memberSid || anchorSid === memberSid) return;
-  compare.enabled = true;
-  compare.toolsVisible = true;
-  compare.anchorSid = anchorSid;
-  compare.orientationSid = memberSid;
-  compare.members = [];
-  compare.pairs = new Map();
-  compare.anchorLandmarks = [];
-  compare.linked = true;
-  active = anchorSid;
-  rememberSlide(anchorSid);
-  ensureFrame(anchorSid);
-  attachMember(memberSid);
+  compare.groupSessionId = uniqueId();
+  compare.groupEpoch += 1;
+  compare.committedRevision = 0;
+  compare.enabled = true; compare.toolsVisible = true;
+  compare.anchorSid = anchorSid; compare.orientationSid = memberSid;
+  compare.members = []; compare.pairs = new Map(); compare.anchorLandmarks = [];
+  compare.anchorSet = {id: uniqueId(), revision: 0, points: []};
+  compare.landmark = {active: false, edit: null};
+  compare.linked = true; active = anchorSid;
+  rememberSlide(anchorSid); ensureFrame(anchorSid); attachMember(memberSid);
   applyFrameLayout();
+  broadcastCompareState();
   applyDisplayTransforms();
-  updateCompareControls();
-  render();
-  requestGroupSoon("sync");
+  compare.committedGroup = snapshotAlignment();
+  updateCompareControls(); render(); requestGroupSoon("sync");
 }
 
 function addMember(sid) {
   if (!compare.enabled || inGroup(sid) || groupSids().length >= MAX_GROUP) return;
-  clearPendingRequest();
-  clearViewportRoutes();
+  invalidateSpatialWork();
   attachMember(sid);
-  applyFrameLayout();
-  applyDisplayTransforms();
-  updateCompareControls();
-  render();
-  requestGroupSoon("sync");
+  applyFrameLayout(); broadcastCompareState(); applyDisplayTransforms();
+  committedMutation();
+  updateCompareControls(); render(); requestGroupSoon("sync");
 }
 
 function removeMember(sid, andRender) {
   if (!compare.enabled || !compare.members.includes(sid)) return;
   rememberAlignment();
-  clearPendingRequest();
-  clearViewportRoutes();
+  invalidateSpatialWork();
+  clearDisplayTransforms([sid]);
   compare.members = compare.members.filter((item) => item !== sid);
   compare.pairs.delete(sid);
-  clearDisplayTransforms([sid]);
-  sendLandmarkMode(sid, false, { clear: true });
-  if (!compare.members.length) {
-    stopCompare();
-    return;
-  }
-  applyFrameLayout();
-  updateCompareControls();
+  if (!compare.members.length) { stopCompare(); return; }
+  committedMutation();
+  applyFrameLayout(); updateCompareControls();
   if (andRender) render();
   requestGroupSoon("sync");
 }
 
 function replaceMember(oldSid, newSid) {
   if (!compare.enabled || !compare.members.includes(oldSid) || inGroup(newSid)) return;
-  rememberAlignment();
-  clearPendingRequest();
-  clearViewportRoutes();
+  rememberAlignment(); invalidateSpatialWork(); clearDisplayTransforms([oldSid]);
   const index = compare.members.indexOf(oldSid);
   compare.pairs.delete(oldSid);
-  clearDisplayTransforms([oldSid]);
-  sendLandmarkMode(oldSid, false, { clear: true });
-  compare.members.splice(index, 1);
-  const pair = newPair(compare.anchorSid, newSid);
+  const pair = newPair();
   restoreAlignment(compare.anchorSid, newSid, pair);
-  compare.pairs.set(newSid, pair);
-  compare.members.splice(index, 0, newSid);
-  rememberSlide(newSid);
-  ensureFrame(newSid);
-  applyFrameLayout();
-  applyDisplayTransforms();
-  updateCompareControls();
-  render();
-  requestGroupSoon("sync");
+  compare.pairs.set(newSid, pair); compare.members.splice(index, 1, newSid);
+  rememberSlide(newSid); ensureFrame(newSid);
+  committedMutation();
+  applyFrameLayout(); broadcastCompareState(); applyDisplayTransforms();
+  updateCompareControls(); render(); requestGroupSoon("sync");
 }
 
 function stopCompare() {
   closePairPicker(false);
   if (!compare.enabled) return;
-  if (compare.landmark.active) finishLandmarks(true);
-  rememberAlignment();
   const sids = groupSids();
-  clearPendingRequest();
-  clearViewportRoutes();
+  rememberAlignment(); // committed only; never finishLandmarks(true) in teardown
+  invalidateSpatialWork();
   clearDisplayTransforms(sids);
-  for (const sid of sids) sendLandmarkMode(sid, false, { clear: true });
-  compare.enabled = false;
-  compare.toolsVisible = false;
-  compare.anchorSid = null;
-  compare.members = [];
-  compare.pairs = new Map();
-  compare.anchorLandmarks = [];
+  compare.enabled = false; compare.toolsVisible = false; compare.anchorSid = null;
+  compare.members = []; compare.pairs = new Map(); compare.anchorLandmarks = [];
+  compare.anchorSet = {id: null, revision: 0, points: []};
   compare.linked = true;
-  applyFrameLayout();
-  updateCompareControls();
-  render();
+  applyFrameLayout(); updateCompareControls(); render();
 }
 
 function toggleCompare() {
@@ -1763,14 +2087,12 @@ function toggleCompare() {
 }
 
 function toggleViewLink() {
-  if (!compare.enabled || compare.pendingRequest) return;
+  if (compare.pendingRequest || compare.landmark.active || !spatialGroupReady()) return;
   if (compare.linked) {
     compare.linked = false;
-    clearViewportRoutes();
+    invalidateSpatialWork();
     updateCompareControls();
-  } else {
-    requestGroup("capture");
-  }
+  } else requestGroup("capture");
 }
 
 function changeOrientation(action) {
@@ -1783,39 +2105,21 @@ function changeOrientation(action) {
 }
 
 function swapComparedSlides() {
-  // only meaningful for one pair: the member becomes the anchor
-  if (!compare.enabled || compare.members.length !== 1 || compare.landmark.active) return;
-  rememberAlignment();
-  closePairPicker(false);
-  clearPendingRequest();
-  clearViewportRoutes();
-  const oldAnchor = compare.anchorSid;
-  const oldMember = compare.members[0];
+  if (compare.members.length !== 1 || compare.landmark.active || compare.pendingRequest ||
+      !spatialGroupReady()) return;
+  rememberAlignment(); closePairPicker(false); invalidateSpatialWork();
+  const oldAnchor = compare.anchorSid, oldMember = compare.members[0];
   const old = compare.pairs.get(oldMember);
-  const pair = newPair(oldMember, oldAnchor);
-  if (old?.transform) {
-    const inverse = Align.invert(old.transform);
-    if (inverse) {
-      pair.mode = old.mode;
-      pair.orientation = Align.invert(old.orientation);
-      pair.transform = inverse;
-      pair.fit = old.fit ? {
-        ...old.fit, angleDeg: Align.angleDeg(inverse),
-        scale: Align.scale(inverse), rms: old.fit.rms / Align.scale(old.transform),
-      } : null;
-    }
-  }
-  pair.landmarks = clonePoints(compare.anchorLandmarks);
-  compare.anchorLandmarks = clonePoints(old?.landmarks || []);
-  compare.anchorSid = oldMember;
-  compare.members = [oldAnchor];
+  const pair = reversePair(old, compare.anchorSet);
+  if (!pair) return;
+  compare.anchorSet = cloneValue(old.landmarkSet);
+  compare.anchorLandmarks = clonePoints(compare.anchorSet.points);
+  compare.anchorSid = oldMember; compare.members = [oldAnchor]; compare.orientationSid = oldAnchor;
   compare.pairs = new Map([[oldAnchor, pair]]);
   active = compare.anchorSid;
-  applyFrameLayout();
-  applyDisplayTransforms();
-  updateCompareControls();
-  render();
-  requestGroupSoon("sync");
+  committedMutation();
+  applyFrameLayout(); broadcastCompareState(); applyDisplayTransforms();
+  updateCompareControls(); render(); requestGroupSoon("sync");
 }
 
 $("compare-toggle").onclick = toggleCompare;
@@ -1832,13 +2136,26 @@ $("compare-orientation-target").onchange = (event) => {
   const sid = event.target.value;
   if (!compare.members.includes(sid)) return;
   compare.orientationSid = sid;
-  updateOrientationControls();
+  updateCompareControls();
 };
 $("compare-align").onclick = () => (compare.landmark.active ? finishLandmarks(true) : startLandmarks());
 $("compare-close").onclick = () => setCompareToolsVisible(false);
 $("compare-landmark-clear").onclick = clearAlignment;
 $("compare-landmark-done").onclick = () => finishLandmarks(true);
 $("compare-landmark-cancel").onclick = () => finishLandmarks(false);
+$("compare-remove-fit").onclick = () => requestGroup("remove-fit", {targetSid: compare.orientationSid});
+$("compare-mapping").onchange = (event) => requestGroup("relative", {
+  targetSid: compare.orientationSid, relative: event.target.value === "relative",
+});
+$("compare-mirror-policy").onchange = (event) => {
+  const edit = compare.landmark.edit;
+  if (!edit || !["keep", "infer"].includes(event.target.value)) return;
+  edit.reflectionPolicy = event.target.value;
+  edit.editRevision += 1;
+  for (const sid of compare.members) fitPair(sid);
+  for (const sid of groupSids()) sendLandmarkMode(sid, true);
+  updateCompareControls();
+};
 
 window.addEventListener("keydown", (event) => {
   if (event.repeat) return;
@@ -1848,6 +2165,10 @@ window.addEventListener("keydown", (event) => {
   } else if (event.key === "Escape" && compare.landmark.active) {
     event.preventDefault();
     finishLandmarks(false);
+  } else if (event.key === "Enter" && compare.landmark.active &&
+      !event.target.closest?.("input, textarea, select, button")) {
+    event.preventDefault();
+    commitLandmarkEdit(compare.landmark.edit.editId);
   } else if ((event.metaKey || event.ctrlKey) && event.code === "Backslash") {
     event.preventDefault();
     toggleCompare();
@@ -1982,6 +2303,7 @@ window.addEventListener("message", (event) => {
     receiveNativeGestureScope(senderSid, event.data);
   } else if (kind === "viewport-ready") {
     if (!senderSid || !versioned || (event.data.sid && event.data.sid !== senderSid)) return;
+    if (!receiveViewportState(event.data, senderSid)) return;
     readyFrames.add(senderSid);
     paneCameUp(senderSid);
   } else if (kind === "viewport-state") {
@@ -1992,19 +2314,19 @@ window.addEventListener("message", (event) => {
     toggleCompare();
   } else if (kind === "compare-link-toggle") {
     if (!senderSid || !versioned) return;
-    toggleViewLink();
+    if (currentEnvelope(event.data, senderSid)) toggleViewLink();
   } else if (kind === "compare-nudge") {
     if (!senderSid || !versioned || !inGroup(senderSid)) return;
-    nudgeAlignment(event.data.dxPx, event.data.dyPx, senderSid);
+    if (currentEnvelope(event.data, senderSid)) nudgeAlignment(event.data.dxPx, event.data.dyPx, senderSid);
   } else if (kind === "landmark-points") {
     if (!senderSid || !versioned || (event.data.sid && event.data.sid !== senderSid)) return;
     receiveLandmarkPoints(senderSid, event.data);
   } else if (kind === "landmark-done") {
     if (!senderSid || !versioned || !inGroup(senderSid)) return;
-    finishLandmarks(true);
+    if (validLandmarkMessage(senderSid, event.data)) commitLandmarkEdit(event.data.editId);
   } else if (kind === "landmark-cancel") {
     if (!senderSid || !versioned || !inGroup(senderSid)) return;
-    finishLandmarks(false);
+    if (validLandmarkMessage(senderSid, event.data)) finishLandmarks(false);
   } else if (kind === "tab-select") {
     if (!senderSid || !versioned) return;
     selectTabByIndex(Number(event.data.index));

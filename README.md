@@ -252,7 +252,7 @@ ND2WSI_SMOKE_FILE=docs/example_cell.nd2 packaging/build_mac_app.sh dist
 
 CI tests Python 3.11 through 3.13, runs Ruff, builds and installs the wheel, and runs the real-data suite on every tag.
 
-Follow-up proposals: [Alignment/Compare fix suggestions](docs/alignment-compare-fix-suggestions.md) records the 14 proposed fixes, transaction/context contracts, and anisotropic-pixel/scalebar correctness gates. This document records proposals only; it does not establish implementation status. v1.2.6 is a proposed target, not a release announcement.
+Alignment/Compare now keeps landmark drafts separate from committed geometry, requires four valid corresponding points before Done, and scopes spatial commands and remembered fits to the current pane/source/site. Clear Points, Reset Orientation, and Remove Fit have separate meanings. Physical links that cannot be represented by the renderer are blocked; Relative mapping is an explicit display-only choice. ROI previews show the final source-aligned export rectangle, and the scalebar accounts for display rotation and X/Y calibration. See [v1.2.6 validation](docs/v1.2.6-validation.md) for coverage and limitations.
 
 ### Prior work
 

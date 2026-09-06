@@ -23,42 +23,82 @@ function production(name) {
   if (start < 0) throw new Error('missing production function: ' + name);
   return source.slice(start, source.indexOf('\n}', start) + 2);
 }
-const compare = {
-  enabled: true, toolsVisible: true, anchorSid: 'a', members: ['b', 'c'], orientationSid: 'b',
-  landmark: {active: false}, pendingRequest: null, requestSeq: 0,
-  states: new Map(), pairs: new Map(), memory: new Map(), anchorLandmarks: [],
-};
 const messages = [];
 const styleValues = {};
 const timers = new Map();
+const listeners = new Map();
 let timerSeq = 0;
+let tokenSeq = 0;
+const elements = new Map();
+const element = id => {
+  if (!elements.has(id)) {
+    const classes = new Set();
+    elements.set(id, {
+      id, style:{}, dataset:{}, hidden:false, disabled:false, textContent:'', value:'',
+      children:[], options:[], classList:{
+        add:(...values)=>values.forEach(value=>classes.add(value)),
+        remove:(...values)=>values.forEach(value=>classes.delete(value)),
+        contains:value=>classes.has(value),
+        toggle:(value,enabled)=>enabled ? classes.add(value) : classes.delete(value),
+      },
+      getBoundingClientRect:()=>({height:100,width:800,left:0,top:0}),
+      setAttribute(){}, removeAttribute(){}, focus(){}, blur(){}, remove(){},
+      replaceChildren(...children){this.children=children;},
+      append(...children){this.children.push(...children);},
+      appendChild(child){this.children.push(child);}, querySelectorAll:()=>[],
+      contains:()=>false,
+    });
+  }
+  return elements.get(id);
+};
 const context = vm.createContext({
-  Align, compare, messages, styleValues, VIEWPORT_PROTOCOL_VERSION: 2,
-  document: {documentElement:{style:{setProperty:(key,value)=>styleValues[key]=value}}},
-  $: () => ({getBoundingClientRect:()=>({height:100})}),
-  groupSids: () => [compare.anchorSid, ...compare.members],
-  postToSlide: (sid, message) => messages.push({sid, ...message}),
-  clearViewportRoutes() {}, updateCompareControls() {},
-  syncFromAnchor: () => messages.push({sync:true}),
+  Align, messages, styleValues, VIEWPORT_PROTOCOL_VERSION:2, VIEWPORT_THROTTLE_MS:48,
+  LANDMARKS_NEEDED:4, MAX_GROUP:4, structuredClone, crypto:{randomUUID:()=>`token-${++tokenSeq}`},
+  document:{documentElement:{style:{setProperty:(key,value)=>styleValues[key]=value}},
+    activeElement:null, createElement:()=>element(`created-${++tokenSeq}`)},
+  window:{innerWidth:1200,innerHeight:900,addEventListener:(kind,fn)=>{
+    if (!listeners.has(kind)) listeners.set(kind,[]);
+    listeners.get(kind).push(fn);
+  }}, location:{origin:'http://qa.invalid'},
+  frames:new Map(), readyFrames:new Set(['a','b','c']),
+  slides:['a','b','c'].map(sid=>({sid,name:sid+'.nd2',path:'/'+sid+'.nd2'})),
+  active:'a', pairPicker:{open:false,mode:'start',replaceSid:null},
+  $:element,
   setTimeout: (fn, delay) => {const id=++timerSeq; timers.set(id,{fn,delay}); return id;},
-  clearTimeout: id => timers.delete(id), showError() {},
+  clearTimeout: id => timers.delete(id),
   runTimers: delay => {
     for (const [id, timer] of [...timers]) if (timer.delay === delay && timers.has(id)) {
       timers.delete(id); timer.fn();
     }
   },
-  sendTabShortcutState() {}, scheduleNativeGestureScopes() {}, broadcastCompareState() {},
-  sendLandmarkMode() {},
-  fitPair() {throw new Error('must not refit during a manual orientation');},
-  clonePoints: (points) => (points || []).map(p => ({...p})),
+  getTimerCallbacks:()=>[...timers.values()].map(timer=>timer.fn),
 });
-for (const name of [
-  'mappingMode', 'pxToSpace', 'spaceToPx', 'imageCenterSpace', 'newPair', 'defaultTransform',
-  'ensurePairTransform', 'displayTransformFor', 'applyDisplayTransform',
-  'clearPendingRequest', 'requestGroup', 'finishGroupRequest', 'changeOrientation',
-  'restoreAlignment', 'pairKey', 'orientationNeedsFocusedSite', 'syncCompareToolbarSpace',
-  'requestGroupSoon', 'paneCameUp', 'inGroup',
-]) vm.runInContext(production(name), context);
+// Load every production function, so a new transaction guard cannot silently
+// become an untested stub just because the old fixture did not know its name.
+for (const match of source.matchAll(/^function (\w+)\(/gm)) {
+  vm.runInContext(production(match[1]), context);
+}
+const compareStart = source.indexOf('const compare = {');
+vm.runInContext(source.slice(compareStart, source.indexOf('\n};',compareStart)+3),context);
+const compare = vm.runInContext('compare',context);
+Object.assign(compare, {
+  enabled:true, toolsVisible:true, anchorSid:'a', members:['b','c'], orientationSid:'b',
+  groupSessionId:'group-qa',groupEpoch:1,committedRevision:0,
+  anchorSet:{id:'anchor-set-qa',revision:0,points:[]},
+});
+// Only browser/UI boundaries are replaced. Geometry, identity validation,
+// timers, transaction replies, fitting, commit and cancellation remain real.
+context.renderRealCompareControls=context.updateCompareControls;
+Object.assign(context, {
+  postToSlide:(sid,message)=>messages.push({sid,...message}),
+  showError:message=>messages.push({error:message}),
+  updateCompareControls(){}, updateOrientationControls(){},
+  render(){}, applyFrameLayout(){}, renderPairPicker(){},
+  sendTabShortcutState(){}, scheduleNativeGestureScopes(){},
+  closePairPicker(){}, ensureFrame(){}, activate:sid=>{context.active=sid;},
+});
+const realSyncFromAnchor = context.syncFromAnchor;
+context.syncFromAnchor = () => {messages.push({sync:true}); realSyncFromAnchor();};
 const realRequestGroupSoon = context.requestGroupSoon;
 context.requestGroupSoon = kind => {
   messages.push({deferred:kind}); realRequestGroupSoon(kind);
@@ -68,14 +108,76 @@ for (const [sid, pixel, center] of [
   ['c', 0.5, {x:200, y:310}],
 ]) {
   compare.states.set(sid, {
+    sid,seq:1,paneInstanceId:`pane-${sid}`,contextEpoch:1,imageReady:true,
+    spatialContext:{key:`context-${sid}`,kind:'slide',sourceGeneration:'gen-'+sid},
     centerPx: center, imagePx: {x:1000, y:800}, pixelSizeUm: {x:pixel, y:pixel},
     spanPx: {x:400, y:300}, containerPx: {x:800, y:600},
   });
+  context.frames.set(sid,{dataset:{sid},style:{},contentWindow:{}});
 }
 for (const sid of compare.members) {
   compare.pairs.set(sid, context.newPair('a.svs', sid + '.nd2'));
   context.ensurePairTransform(sid);
 }
+// Send frozen snapshot replies through the same production entry point as
+// browser postMessage. Calling finishGroupRequest with no responses would
+// bypass the very validation these regressions are intended to exercise.
+context.replyAll = (pending=compare.pendingRequest, replacements={}) => {
+  if (!pending) return;
+  const targets = pending.expectedTargets || [compare.anchorSid,...compare.members];
+  for (const sid of targets) {
+    const snapshot = structuredClone(compare.states.get(sid));
+    context.receiveViewportState({
+      ...snapshot, ...pending.contexts?.get(sid), ...replacements[sid],
+      version:2, requestId:pending.requestId,
+      groupSessionId:pending.groupSessionId || compare.groupSessionId,
+      groupEpoch:pending.groupEpoch ?? compare.groupEpoch,
+      reason:'request', seq:(snapshot?.seq || 0)+1,
+    },sid);
+  }
+};
+const pointRevisions = new Map();
+context.landmarkMessage = (sid,points) => {
+  const mode=messages.filter(m=>m.sid===sid && m.nd2wsi==='landmark-mode').at(-1);
+  if (!mode?.active) throw new Error(`No active production landmark-mode for ${sid}`);
+  const revision=(pointRevisions.get(sid) || 0)+1;
+  pointRevisions.set(sid,revision);
+  return {...mode,nd2wsi:'landmark-points',pointRevision:revision,
+    points:points.map((p,index)=>({id:`${sid}-point-${index+1}`,...p}))};
+};
+context.putLandmarks = (sid,points) => {
+  const message=context.landmarkMessage(sid,points);
+  context.receiveLandmarkPoints(sid,message);
+  return message;
+};
+context.squarePoints=[{x:100,y:100},{x:400,y:100},{x:400,y:400},{x:100,y:400}];
+context.fitAll = () => {
+  context.startLandmarks();
+  for (const sid of [compare.anchorSid,...compare.members]) {
+    context.putLandmarks(sid,context.squarePoints);
+  }
+  return context.commitLandmarkEdit(compare.landmark.edit.editId);
+};
+// Execute real button, keyboard, and message dispatch bindings too: a disabled
+// Done button alone must not stand in for the shared atomic commit gate.
+const bindingStart=source.indexOf('$("compare-orientation-target").onchange');
+const bindingEnd=source.indexOf('$("compare-picker").addEventListener',bindingStart);
+vm.runInContext(source.slice(bindingStart,bindingEnd),context);
+const messageStart=source.indexOf('window.addEventListener("message",');
+vm.runInContext(source.slice(messageStart,source.indexOf('\n});',messageStart)+4),context);
+context.clickControl=id=>element(id).onclick();
+context.changeControl=(id,value)=>element(id).onchange({target:{value}});
+context.pressKey=key=>{
+  for (const listener of listeners.get('keydown') || []) listener({
+    key,repeat:false,metaKey:false,ctrlKey:false,altKey:false,
+    target:{closest:()=>null},preventDefault(){},
+  });
+};
+context.paneMessage=(sid,data)=>{
+  for (const listener of listeners.get('message') || []) listener({
+    source:context.frames.get(sid).contentWindow,origin:'http://qa.invalid',data,
+  });
+};
 const out = vm.runInContext(process.argv[2], context);
 process.stdout.write(JSON.stringify(out));
 """
@@ -100,7 +202,7 @@ def test_orientation_transaction_captures_target_and_keeps_the_view_center():
       changeOrientation('rotate-right');
       const pending = compare.pendingRequest;
       compare.orientationSid = 'c'; // a late selection cannot redirect the request
-      finishGroupRequest(pending);
+      replyAll(pending);
       const pair = compare.pairs.get('b');
       ({target: pending.targetSid, pose: displayTransformFor('b'),
         actual: Align.apply(pair.transform, {x:321*.25, y:211*.25}),
@@ -123,11 +225,11 @@ def test_orientation_transaction_captures_target_and_keeps_the_view_center():
 def test_two_reflections_restore_orientation_and_reset_keeps_position(action):
     result = run(f"""
       for (let i=0; i<2; i++) {{
-        changeOrientation('{action}'); finishGroupRequest(compare.pendingRequest);
+        changeOrientation('{action}'); replyAll();
       }}
       const restored = displayTransformFor('b');
-      changeOrientation('rotate-left'); finishGroupRequest(compare.pendingRequest);
-      changeOrientation('reset'); finishGroupRequest(compare.pendingRequest);
+      changeOrientation('rotate-left'); replyAll();
+      changeOrientation('reset'); replyAll();
       ({{restored, reset: displayTransformFor('b'),
         center: Align.apply(compare.pairs.get('b').transform, {{x:321*.25, y:211*.25}})}});
     """)
@@ -178,7 +280,7 @@ def test_resize_sync_cannot_cancel_an_inflight_orientation_button():
       const pending = compare.pendingRequest;
       requestGroup('sync');
       const preserved = compare.pendingRequest === pending;
-      finishGroupRequest(pending);
+      replyAll(pending);
       ({preserved, pose:displayTransformFor('b'),
         deferred:messages.filter(m => m.deferred).map(m => m.deferred)});
     """)
@@ -188,23 +290,24 @@ def test_resize_sync_cannot_cancel_an_inflight_orientation_button():
     }
 
 
-def test_pane_reload_retains_target_action_and_request_identity():
+def test_pane_reload_invalidates_old_target_action_and_request_identity():
     result = run("""
       changeOrientation('transpose');
       const pending = compare.pendingRequest;
-      pending.seen.add('b');
+      const oldSnapshot={...compare.states.get('b')};
+      receiveViewportState({...oldSnapshot,nd2wsi:'viewport-ready',version:2,
+        paneInstanceId:'pane-b-reloaded',seq:1},'b');
       paneCameUp('b');
-      const retry = messages.filter(m => m.nd2wsi === 'viewport-request').at(-1);
-      const rereadsPane = !pending.seen.has('b');
-      finishGroupRequest(pending);
-      ({rereadsPane, requestId:retry.requestId, originalId:pending.requestId,
-        action:pending.action, target:pending.targetSid, pose:displayTransformFor('b')});
+      replyAll(pending);
+      ({cancelled:compare.pendingRequest!==pending,
+        instance:compare.states.get('b').paneInstanceId,
+        action:pending.action,target:pending.targetSid,pose:displayTransformFor('b')});
     """)
-    assert result["rereadsPane"] is True
-    assert result["requestId"] == result["originalId"]
+    assert result["cancelled"] is True
+    assert result["instance"] == "pane-b-reloaded"
     assert result["action"] == "transpose"
     assert result["target"] == "b"
-    assert result["pose"] == {"degrees": 90, "flipped": True}
+    assert result["pose"] == {"degrees": 0, "flipped": False}
 
 
 def test_deferred_real_layout_timer_runs_after_orientation_completion():
@@ -214,7 +317,7 @@ def test_deferred_real_layout_timer_runs_after_orientation_completion():
       requestGroupSoon('sync');
       runTimers(80); // a resize while the action awaits viewport replies
       const samePending = compare.pendingRequest === pending;
-      finishGroupRequest(pending);
+      replyAll(pending);
       runTimers(80); // finishing must not erase this deferred layout request
       ({samePending, kind:compare.pendingRequest?.kind, pose:displayTransformFor('b')});
     """)
@@ -259,19 +362,35 @@ def test_reverse_pair_restores_inverse_orientation_and_reflected_fit_metadata():
         'rotate-right'), 'flip-horizontal');
       const transform = {...orientation, a:orientation.a*2, b:orientation.b*2,
         c:orientation.c*2, d:orientation.d*2, tx:40, ty:60};
-      compare.memory.set('b|a', {mode:'physical', orientation, transform,
-        fit:{angleDeg:Align.angleDeg(transform), scale:2, rms:10, reflected:true},
-        landmarks:[{x:4,y:5}], anchorLandmarks:[{x:6,y:7}]});
+      const from=[{id:'b1',x:0,y:0},{id:'b2',x:10,y:0},
+        {id:'b3',x:10,y:10},{id:'b4',x:0,y:10}];
+      const to=from.map((p,i)=>({...Align.apply(transform,p),id:'a'+(i+1)}));
+      for(const p of to) p.x+=10;
+      const oldAnchor={id:'set-b',revision:1,points:from};
+      const oldPair=newPair();
+      Object.assign(oldPair,{mode:'physical',orientation,transform,fitTransform:transform,
+        fit:{transform,angleDeg:Align.angleDeg(transform),scale:2,rms:10,reflected:true},
+        landmarks:to,landmarkSet:{id:'set-a',revision:2,points:to},
+        provenance:{anchorContext:'context-b',memberContext:'context-a',
+          anchorSetId:'set-b',anchorRevision:1,memberSetId:'set-a',memberRevision:2,
+          from,to,anchorPointIds:from.map(p=>p.id),memberPointIds:to.map(p=>p.id)}});
+      compare.memory.set(pairKey('b','a'),{pair:oldPair,anchorSet:oldAnchor,
+        anchorContext:'context-b',memberContext:'context-a'});
       const pair = newPair();
       restoreAlignment('a', 'b', pair);
       ({orientation:pair.orientation, expected:Align.invert(orientation),
         angle:pair.fit.angleDeg, expectedAngle:Align.angleDeg(pair.transform),
-        scale:pair.fit.scale, rms:pair.fit.rms});
+        scale:pair.fit.scale, rms:pair.fit.rms,
+        anchorIds:pair.provenance.anchorPointIds,memberIds:pair.provenance.memberPointIds,
+        fitTransformConsistent:JSON.stringify(pair.fit.transform)===JSON.stringify(pair.fitTransform)});
     """)
     assert result["orientation"] == result["expected"]
     assert result["angle"] == result["expectedAngle"]
     assert result["scale"] == .5
     assert result["rms"] == 5
+    assert result["anchorIds"] == ["a1", "a2", "a3", "a4"]
+    assert result["memberIds"] == ["b1", "b2", "b3", "b4"]
+    assert result["fitTransformConsistent"] is True
 
 
 def test_visible_orientation_controls_are_wired_and_explained():
@@ -280,8 +399,10 @@ def test_visible_orientation_controls_are_wired_and_explained():
     for control in ("flip-horizontal", "flip-vertical", "rotate-left", "rotate-right", "transpose"):
         assert f'id="compare-{control}"' in html
         assert f'"compare-{control}": "{control}"' in shell
-    assert 'id="compare-orientation-target" aria-label="Slide to orient"' in html
+    assert 'id="compare-orientation-target" aria-label="Active linked slide"' in html
     assert '"compare-orientation-reset": "reset"' in shell
     assert '$(id).onclick = () => changeOrientation(action)' in shell
-    assert 'Align → Clear' in html + shell
+    assert 'Remove Fit' in html + shell
+    assert 'Clear Points' in html + shell
+    assert 'Keep mirror state' in html + shell
     assert 'Transpose' in (ROOT / "README.md").read_text()

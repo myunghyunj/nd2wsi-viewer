@@ -269,3 +269,243 @@ def test_display_pose_is_the_osd_fr_inverse_for_reflections_and_swaps():
     assert out["arbitrary"]["pose"]["flipped"] is True
     assert out["arbitrary"]["error"] < 1e-10
     assert out["arbitrary"]["inverseError"] < 1e-10
+
+
+def _evaluate_math(script):
+    result = subprocess.run(
+        [NODE, "-e", "const A = require(process.argv[1]);\n" + script, str(ALIGN)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return json.loads(result.stdout)
+
+
+def test_candidate_keeps_parity_without_fixing_rotation_or_scale():
+    out = _evaluate_math(
+        """
+const points = [{x:0,y:0},{x:1000,y:0},{x:1000,y:800},{x:0,y:800}];
+const theta = 37 * Math.PI / 180;
+const T = {a:-1.7*Math.cos(theta), b:-1.7*Math.sin(theta),
+           c:-1.7*Math.sin(theta), d:1.7*Math.cos(theta), tx:100,ty:20};
+const dst = points.map(p => A.apply(T,p));
+const previous = A.fitCandidate(points, dst, {reflection:'infer'});
+const edit = A.fitCandidate(points, dst, {
+  reflection:'keep', reflected:previous.fit.reflected
+});
+const shorter = A.fitCandidate(points.slice(0,1), dst.slice(0,1));
+process.stdout.write(JSON.stringify({previous,edit,shorter}));
+"""
+    )
+    assert out["previous"]["status"] == "valid"
+    assert out["edit"]["status"] == "valid"
+    assert out["edit"]["fit"]["reflected"] is True
+    assert out["edit"]["fit"]["angleDeg"] == pytest.approx(37)
+    assert out["edit"]["fit"]["scale"] == pytest.approx(1.7)
+    assert out["edit"]["fit"]["rms"] < 1e-9
+    assert out["shorter"]["status"] == "incomplete"
+    assert out["shorter"]["fit"] is None
+
+
+def test_two_fixed_parity_pairs_fit_math_but_do_not_pass_four_point_app_qc():
+    out = _evaluate_math(
+        """
+const src = [{x:0,y:0},{x:5,y:9}];
+const dst = [{x:40,y:10},{x:49,y:15}];
+process.stdout.write(JSON.stringify({
+  fixed:A.fitSimilarity(src,dst,{reflection:'keep',reflected:true}),
+  inferred:A.fitSimilarity(src,dst,{reflection:'infer'}),
+  candidate:A.fitCandidate(src,dst,{reflection:'keep',reflected:true}),
+  mathematicalMinimum:A.fitCandidate(src,dst,{reflection:'keep',reflected:true,minPoints:2})
+}));
+"""
+    )
+    assert out["fixed"]["reflected"] is True
+    assert out["fixed"]["rms"] < 1e-9
+    assert out["inferred"] is None
+    assert out["candidate"]["status"] == "incomplete"
+    assert out["candidate"]["fit"] is None
+    assert out["mathematicalMinimum"]["status"] == "valid"
+
+
+def test_infer_rejects_collinear_and_nearly_collinear_points_not_local_coverage():
+    out = _evaluate_math(
+        """
+const points = y => [{x:0,y:0},{x:1,y:0},{x:2,y},{x:3,y:0}];
+const line = points(0), nearLine = points(1e-8);
+const local = [{x:100,y:100},{x:100.001,y:100},
+               {x:100.001,y:100.001},{x:100,y:100.001}];
+process.stdout.write(JSON.stringify({
+  line:A.fitCandidate(line,line,{reflection:'infer'}),
+  nearLine:A.fitCandidate(nearLine,nearLine,{reflection:'infer'}),
+  fixedLine:A.fitCandidate(line,line,{reflection:'keep',reflected:false}),
+  local:A.fitCandidate(local,local,{reflection:'infer',
+    sourceBounds:{width:10000,height:10000},targetBounds:{width:10000,height:10000}})
+}));
+"""
+    )
+    for name in ("line", "nearLine"):
+        assert out[name]["status"] == "degenerate"
+        assert out[name]["reason"] == "mirror-needs-noncollinear-landmarks"
+        assert out[name]["fit"] is None
+    assert out["fixedLine"]["status"] == "valid"
+    assert out["local"]["status"] == "valid"
+    assert out["local"]["fit"]["rms"] < 1e-10
+    assert out["local"]["warnings"] == ["source-local-coverage", "target-local-coverage"]
+
+
+def test_candidate_rejects_duplicates_nonfinite_and_unpaired_points():
+    out = _evaluate_math(
+        """
+const p = [{x:0,y:0},{x:1,y:0},{x:1,y:1},{x:0,y:1}];
+const duplicated = [p[0],p[0],p[2],p[3]];
+const bad = [p[0],p[1],p[2],{x:Infinity,y:1}];
+process.stdout.write(JSON.stringify({
+  duplicate:A.fitCandidate(p,duplicated),
+  bad:A.fitCandidate(p,bad),
+  mismatch:A.fitCandidate(p,p.slice(1)),
+  lowLevelMismatch:A.fitSimilarity(p,p.slice(1)),
+  invalidPolicy:A.fitCandidate(p,p,{reflection:'anything'}),
+  emptyResidual:A.residual(A.identity(),[],[]),
+  mismatchResidual:A.residual(A.identity(),p,p.slice(1))
+}));
+"""
+    )
+    assert out["duplicate"]["reason"] == "duplicate-landmarks"
+    assert out["duplicate"]["status"] == "degenerate"
+    assert out["bad"]["reason"] == "nonfinite-landmarks"
+    assert out["mismatch"]["status"] == "incomplete"
+    assert out["mismatch"]["reason"] == "unpaired-landmarks"
+    assert out["lowLevelMismatch"] is None
+    assert out["invalidPolicy"]["status"] == "degenerate"
+    assert out["emptyResidual"] is None
+    assert out["mismatchResidual"] is None
+
+
+def test_normalized_fit_is_stable_for_tiny_and_translated_local_point_sets():
+    out = _evaluate_math(
+        """
+const cases = [];
+for (const [origin,size] of [[0,1e-9],[1e9,0.001]]) {
+  const p = [{x:origin,y:origin},{x:origin+size,y:origin},
+             {x:origin+size,y:origin+size},{x:origin,y:origin+size}];
+  cases.push(A.fitCandidate(p,p,{reflection:'infer'}));
+}
+process.stdout.write(JSON.stringify(cases));
+"""
+    )
+    assert all(item["status"] == "valid" for item in out)
+    assert all(item["fit"]["scale"] == pytest.approx(1) for item in out)
+    assert all(item["fit"]["rms"] < 1e-10 for item in out)
+
+
+def test_current_residual_tracks_offset_and_swap_in_member_units():
+    out = _evaluate_math(
+        """
+const from = [{x:0,y:0},{x:10,y:0},{x:10,y:10},{x:0,y:10}];
+const F = {a:0,b:-2,c:-2,d:0,tx:80,ty:140};
+const to = from.map(p=>A.apply(F,p));
+const E = A.compose({...A.identity(),tx:100},F);
+const inverseFit = A.invert(F), inverseEffective = A.invert(E);
+// Inverse offset is not simply -100: move it through F^-1's linear part.
+const inverseOffset = A.compose(inverseEffective,F);
+process.stdout.write(JSON.stringify({
+  fit:A.residual(F,from,to), current:A.residual(E,from,to),
+  reverseFit:A.residual(inverseFit,to,from),
+  reverseCurrent:A.residual(inverseEffective,to,from), inverseOffset,
+  composition:A.apply(A.compose(F,E),from[2]),
+  sequential:A.apply(F,A.apply(E,from[2]))
+}));
+"""
+    )
+    assert out["fit"] == pytest.approx(0)
+    assert out["current"] == pytest.approx(100)
+    assert out["reverseFit"] == pytest.approx(0)
+    assert out["reverseCurrent"] == pytest.approx(50)
+    assert out["inverseOffset"]["tx"] == pytest.approx(0)
+    assert out["inverseOffset"]["ty"] == pytest.approx(50)
+    assert out["composition"] == out["sequential"]
+
+
+def test_pixel_mapping_conjugates_physical_transform_and_translation():
+    out = _evaluate_math(
+        """
+const turn = {...A.screenOperation('rotate-right'),tx:10,ty:20};
+const anisotropy = {x:0.25,y:0.5};
+const swapped = {x:0.5,y:0.25};
+const same = A.pixelMapping(turn,anisotropy,anisotropy);
+const swap = A.pixelMapping(turn,anisotropy,swapped);
+process.stdout.write(JSON.stringify({same,swap,
+  samePose:A.rendererPose(same), swapPose:A.rendererPose(swap),
+  noCalibration:A.pixelMapping(turn,{x:null,y:null},anisotropy),
+  zeroCalibration:A.pixelMapping(turn,{x:0,y:0.25},anisotropy)
+}));
+"""
+    )
+    assert out["same"] == {"a": 0, "b": -2, "c": 0.5, "d": 0, "tx": 40, "ty": 40}
+    assert out["samePose"]["supported"] is False
+    assert out["samePose"]["reason"] == "nonuniform-pixel-mapping"
+    assert out["swap"] == {"a": 0, "b": -1, "c": 1, "d": 0, "tx": 20, "ty": 80}
+    assert out["swapPose"]["supported"] is True
+    assert out["swapPose"]["pose"] == {"degrees": -90, "flipped": False}
+    assert out["noCalibration"] is None
+    assert out["zeroCalibration"] is None
+
+
+def test_renderer_checks_full_gram_matrix_not_only_determinant_or_basis_lengths():
+    out = _evaluate_math(
+        """
+const theta = 37*Math.PI/180;
+const rotation = {a:Math.cos(theta),b:-Math.sin(theta),
+                  c:Math.sin(theta),d:Math.cos(theta),tx:0,ty:0};
+const scaleA = {x:0.25,y:0.5};
+const same37 = A.pixelMapping(rotation,scaleA,scaleA);
+const reflected = A.compose(rotation,A.screenOperation('flip-horizontal'));
+const reflected37 = A.pixelMapping(reflected,scaleA,scaleA);
+const result = {};
+for (const [name,mapping] of Object.entries({
+  same37, reflected37,
+  differentRatio:A.pixelMapping(A.identity(),scaleA,{x:0.5,y:0.5}),
+  determinantOne:{a:2,b:0,c:0,d:0.5,tx:0,ty:0},
+  equalLengthShear:{a:1,b:0.5,c:0,d:Math.sqrt(0.75),tx:0,ty:0},
+  square:A.pixelMapping(reflected,{x:0.25,y:0.25},{x:0.66,y:0.66}),
+  axisReflection:A.pixelMapping(A.screenOperation('flip-horizontal'),scaleA,scaleA),
+  relative:A.pixelMapping(reflected,{x:1,y:1},{x:1,y:1})
+})) result[name] = A.rendererPose(mapping);
+process.stdout.write(JSON.stringify(result));
+"""
+    )
+    for name in ("same37", "reflected37", "differentRatio", "determinantOne", "equalLengthShear"):
+        assert out[name]["supported"] is False
+        assert out[name]["pose"] is None
+    for name in ("square", "axisReflection", "relative"):
+        assert out[name]["supported"] is True
+    assert out["square"]["pose"]["degrees"] == pytest.approx(-37)
+    assert out["square"]["pose"]["flipped"] is True
+    assert out["square"]["scale"] == pytest.approx(0.25 / 0.66)
+
+
+def test_renderer_tolerance_is_explicit_roundoff_policy_and_scale_independent():
+    out = _evaluate_math(
+        """
+const check = (size, distortion) => A.rendererPose({
+  a:size,b:0,c:0,d:size*(1+distortion),tx:0,ty:0
+});
+process.stdout.write(JSON.stringify({
+  tolerance:A.RENDERER_SIMILARITY_TOLERANCE,
+  cases:[1e-100,1,1e100].map(size=>({
+    roundoff:check(size,1e-12), reject:check(size,1e-7), onePercent:check(size,0.01)
+  })),
+  zero:A.rendererPose({a:0,b:0,c:0,d:0,tx:0,ty:0}),
+  invalid:A.rendererPose(null)
+}));
+"""
+    )
+    assert out["tolerance"] == 1e-10
+    for item in out["cases"]:
+        assert item["roundoff"]["supported"] is True
+        assert item["reject"]["supported"] is False
+        assert item["onePercent"]["supported"] is False
+    assert out["zero"]["supported"] is False
+    assert out["invalid"]["supported"] is False

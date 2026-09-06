@@ -89,8 +89,8 @@
               aria-label="Hide comparison tools">×</button>
     </div>
     <div id="compare-orientation" class="compare-row orientation-panel" role="group" aria-label="Slide orientation">
-      <label for="compare-orientation-target">Orient</label>
-      <select id="compare-orientation-target" aria-label="Slide to orient" aria-describedby="compare-orientation-hint"></select>
+      <label for="compare-orientation-target">Active linked slide</label>
+      <select id="compare-orientation-target" aria-label="Active linked slide" aria-describedby="compare-orientation-hint"></select>
       <div class="orientation-actions">
         <button id="compare-flip-horizontal" class="compare-control text-control" type="button"
                 title="Flip the selected image left-to-right on screen" aria-label="Flip horizontally">Flip ↔</button>
@@ -103,8 +103,15 @@
         <button id="compare-transpose" class="compare-control text-control" type="button"
                 title="Swap horizontal and vertical image axes (diagonal reflection)">Transpose</button>
         <button id="compare-orientation-reset" class="compare-control text-control" type="button"
-                title="Restore the selected image's original orientation, keeping the current center">Reset</button>
+                title="Restore manual orientation, keeping the current center">Reset Orientation</button>
+        <button id="compare-remove-fit" class="compare-control text-control" type="button"
+                title="Remove the fitted transform and offset; keep manual orientation">Remove Fit</button>
       </div>
+      <label for="compare-mapping">Mapping</label>
+      <select id="compare-mapping" aria-label="Alignment coordinate mapping">
+        <option value="physical">Calibrated when available</option>
+        <option value="relative">Relative · display only</option>
+      </select>
       <output id="compare-orientation-state" aria-live="polite"></output>
       <span id="compare-orientation-hint">Reference stays fixed · display only</span>
     </div>
@@ -112,8 +119,13 @@
       <div id="compare-landmark-rows"></div>
       <div id="compare-landmark-hint" class="landmark-hint"></div>
       <div class="landmark-actions">
+        <label for="compare-mirror-policy">Mirror</label>
+        <select id="compare-mirror-policy" aria-label="Landmark mirror policy">
+          <option value="keep">Keep mirror state</option>
+          <option value="infer">Infer mirror from landmarks</option>
+        </select>
         <button id="compare-landmark-clear" class="compare-control text-control" type="button"
-                title="Remove every point and return to matched centers">Clear</button>
+                title="Clear draft points only; keep the committed alignment">Clear Points</button>
         <button id="compare-landmark-cancel" class="compare-control text-control" type="button"
                 title="Leave alignment mode and put back the previous alignment (esc)">Cancel</button>
         <button id="compare-landmark-done" class="compare-control text-control primary" type="button"

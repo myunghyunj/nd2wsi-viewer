@@ -55,10 +55,13 @@ const state = {
     timer: null,
     suppressUntil: 0,
     reopening: false,
+    contextChanging: false,
     displayRotation: 0,
     displayFlipped: false,
-    transformWaitingForOpen: false,
+    commandGate: new window.Nd2SpatialPane.PaneCommandGate(crypto.randomUUID()),
     altHeld: false, // Option held: a drag adjusts the alignment instead of both views
+    alignmentDrag: null,
+    suppressAlignmentDragEnd: false,
     compare: null, // what the shell says about this pane's part in Compare
   },
   landmark: {
@@ -66,6 +69,9 @@ const state = {
     points: [], // level-0 image coordinates, in placement order
     needed: 4,
     clickToZoom: null, // OpenSeadragon setting restored when the mode ends
+    editId: null,
+    editRevision: -1,
+    pointRevision: 0,
   },
 };
 
@@ -405,8 +411,14 @@ function buildViewer() {
   viewer.addHandler("update-viewport", () => {
     renderAnnotations();
     moveRoiOverlay();
+    updateScalebar(state.plate && state.plate.focus === null ? plateCellZoom() : null);
     scheduleViewportState();
   });
+  for (const event of ["rotate", "flip", "resize"]) {
+    viewer.addHandler(event, () => updateScalebar(
+      state.plate && state.plate.focus === null ? plateCellZoom() : null
+    ));
+  }
   viewer.addHandler("open", renderAnnotations);
   viewer.addHandler("open-failed", () => showToast("could not open tile source"));
   viewer.addHandler("tile-load-failed", debounceToast("some tiles failed to load"));
@@ -421,7 +433,17 @@ function buildViewer() {
   stage.addEventListener("mouseleave", () => updateCursor(null, null));
   stage.addEventListener("pointerdown", (ev) => {
     state.viewportRelay.altHeld = ev.altKey;
+    beginAlignmentDrag(ev);
   }, true);
+  viewer.addHandler("canvas-drag", updateAlignmentDrag);
+  viewer.addHandler("canvas-drag-end", (event) => {
+    if (!state.viewportRelay.suppressAlignmentDragEnd) return;
+    event.preventDefaultAction = true; // no flick or constraint jump after the precise drag
+    state.viewportRelay.suppressAlignmentDragEnd = false;
+    finishAlignmentDrag();
+  });
+  window.addEventListener("pointerup", () => finishAlignmentDrag(), true);
+  window.addEventListener("pointercancel", () => finishAlignmentDrag(true), true);
   window.addEventListener("keydown", (ev) => {
     if (ev.key === "Alt") state.viewportRelay.altHeld = true;
   });
@@ -438,10 +460,15 @@ function buildViewer() {
 function reopenPreservingView() {
   const viewer = state.viewer;
   const bounds = viewer.viewport.getBounds();
+  refreshSpatialContext();
+  const gate = state.viewportRelay.commandGate;
+  const capturedIdentity = JSON.stringify(gate.envelope());
+  const capturedCommandSeq = gate.latestCommandSeq;
   clearTimeout(state.viewportRelay.timer);
   state.viewportRelay.timer = null;
   state.viewportRelay.reopening = true;
   state.viewportRelay.suppressUntil = Number.POSITIVE_INFINITY;
+  postSpatialReadiness(); // stop shell spatial work while the tile source is closed
   const cleanup = () => {
     viewer.removeHandler("open", restored);
     viewer.removeHandler("open-failed", failed);
@@ -449,7 +476,8 @@ function reopenPreservingView() {
   const restored = () => {
     cleanup();
     applyDesiredDisplayTransform(false);
-    viewer.viewport.fitBounds(bounds, true);
+    if (capturedIdentity === JSON.stringify(gate.envelope()) &&
+        capturedCommandSeq === gate.latestCommandSeq) viewer.viewport.fitBounds(bounds, true);
     restoreRoiOverlay();
     state.viewportRelay.reopening = false;
     state.viewportRelay.suppressUntil = Date.now() + 180;
@@ -459,6 +487,7 @@ function reopenPreservingView() {
     cleanup();
     state.viewportRelay.reopening = false;
     state.viewportRelay.suppressUntil = 0;
+    postSpatialReadiness();
   };
   viewer.addHandler("open", restored);
   viewer.addHandler("open-failed", failed);
@@ -1236,16 +1265,39 @@ function togglePixelInspector() {
   }
 }
 
+function screenHorizontalUmPerCssPixel() {
+  const ps = pixelSize(); // [source Y, source X] in µm per source pixel
+  const viewport = state.viewer?.viewport;
+  if (!viewport || !ps || !ps.every((value) => Number.isFinite(value) && value > 0)) {
+    return null;
+  }
+  const size = viewport.getContainerSize();
+  if (!(size.x > 0 && size.y > 0)) return null;
+  const cssLength = 100;
+  const center = { x: size.x / 2, y: size.y / 2 };
+  const a = viewerElementToImagePoint(center);
+  const b = viewerElementToImagePoint({ x: center.x + cssLength, y: center.y });
+  const length = Math.hypot((b.x - a.x) * ps[1], (b.y - a.y) * ps[0]);
+  // Both OSD element points and CSS widths are CSS pixels. DPR must not be
+  // applied here, even though the separate zoom percentage uses device pixels.
+  return Number.isFinite(length) && length > 0 ? length / cssLength : null;
+}
+
 function updateScalebar(iz) {
-  if (!pixelSize()) {
+  const ps = pixelSize();
+  // The plate grid is unrotated <img> cells, not the hidden OSD viewport.
+  const umPerScreenPx = state.plate && state.plate.focus === null
+    ? ps && ps.every((value) => Number.isFinite(value) && value > 0) && iz > 0
+      ? ps[1] / iz : null
+    : screenHorizontalUmPerCssPixel();
+  if (!(umPerScreenPx > 0)) {
     $("scalebar").style.display = "none";
     $("scalebar-label").textContent = "";
     return;
   }
-  const px = pixelSize()[1];
-  const umPerScreenPx = px / iz;
   const target = 110 * umPerScreenPx; // aim for a ~110 px bar
   const nice = niceLength(target);
+  $("scalebar").style.display = "";
   $("scalebar").style.width = nice / umPerScreenPx + "px";
   $("scalebar-label").textContent = nice >= 1000 ? nice / 1000 + " mm" : nice + " µm";
 }
@@ -1311,8 +1363,8 @@ function syncFrameScopedControls() {
   $("roi-hint").textContent = !hasFrame
     ? "Choose a site in the grid to select or export a region. All-site export is not available yet."
     : state.plate
-      ? "Drag on the selected site, or select its full field."
-      : "Drag on the slide, or select the whole slide.";
+      ? "Source-aligned rectangle · Drag on the selected site, or select its full field."
+      : "Source-aligned rectangle · Drag on the slide, or select the whole slide.";
 
   for (const id of ["roi-toggle", "roi-full"]) {
     scopedButton(id, !hasFrame, chooseSite);
@@ -1389,14 +1441,49 @@ function imgPoint(pt) {
 }
 
 function imageBoundsOfScreenRect(a, b) {
-  // the image-space box covering a screen rectangle, whatever the rotation
+  // Establish the raw export bounds once: source AABB -> clip -> integer
+  // edges. The preview reprojects this same rectangle, not the screen drag.
   const corners = [
-    imgPoint({ x: a.x, y: a.y }), imgPoint({ x: b.x, y: a.y }),
-    imgPoint({ x: b.x, y: b.y }), imgPoint({ x: a.x, y: b.y }),
+    viewerElementToImagePoint({ x: a.x, y: a.y }),
+    viewerElementToImagePoint({ x: b.x, y: a.y }),
+    viewerElementToImagePoint({ x: b.x, y: b.y }),
+    viewerElementToImagePoint({ x: a.x, y: b.y }),
   ];
+  if (!corners.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y))) return null;
   const xs = corners.map((c) => c.x), ys = corners.map((c) => c.y);
-  const x = Math.min(...xs), y = Math.min(...ys);
-  return { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y };
+  // Snap only floating point noise around integer source edges. In particular
+  // exact quarter turns must not gain a pixel through sin/cos round-off.
+  const snap = (value) => Math.abs(value - Math.round(value)) < 1e-7
+    ? Math.round(value) : value;
+  const x = Math.floor(snap(clamp(Math.min(...xs), 0, state.info.width)));
+  const y = Math.floor(snap(clamp(Math.min(...ys), 0, state.info.height)));
+  const right = Math.ceil(snap(clamp(Math.max(...xs), 0, state.info.width)));
+  const bottom = Math.ceil(snap(clamp(Math.max(...ys), 0, state.info.height)));
+  return { x, y, w: right - x, h: bottom - y };
+}
+
+function positionRubber(a, b) {
+  const r = imageBoundsOfScreenRect(a, b);
+  const rubber = $("rubber");
+  let svg = rubber.firstElementChild;
+  if (!svg) {
+    svg = svgEl("svg", { width: "100%", height: "100%", "aria-hidden": "true" }, rubber);
+    svgEl("polygon", {
+      fill: "rgba(10, 132, 255, 0.12)", stroke: "var(--accent-soft)",
+      "stroke-width": 1.5, "vector-effect": "non-scaling-stroke",
+    }, svg);
+  }
+  const wrap = $("stage-wrap").getBoundingClientRect();
+  const stage = $("stage").getBoundingClientRect();
+  Object.assign(rubber.style, {
+    left: stage.left - wrap.left + "px", top: stage.top - wrap.top + "px",
+    width: stage.width + "px", height: stage.height + "px",
+    border: "0", borderRadius: "0", background: "none", overflow: "hidden",
+  });
+  svg.firstElementChild.setAttribute(
+    "points", roiOverlayPoints(r).map((p) => p.x + "," + p.y).join(" ")
+  );
+  return r;
 }
 
 function wireTools() {
@@ -1411,6 +1498,7 @@ function wireTools() {
   };
   $("tool-measure").onclick = () => setTool("measure");
   $("tool-pin").onclick = () => setTool("pin");
+  $("tool-box").title = "Source-aligned rectangle";
   $("tool-box").onclick = () => setTool("box");
 
   let moveFrom = null; // roi origin at drag start (move mode)
@@ -1468,6 +1556,8 @@ function wireTools() {
     if (!state.tool || !start) return;
     const end = elementPoint(ev, stage);
     const endImg = imgPoint(end);
+    const rectangle = state.tool === "roi" || state.tool === "box"
+      ? positionRubber(start, end) : null;
     rubber.style.display = "none";
     const tool = state.tool;
     const moved = Math.hypot(end.x - start.x, end.y - start.y);
@@ -1477,7 +1567,7 @@ function wireTools() {
       stage.classList.remove("grabbing");
       updateRoiPanel(); // position changed; size and readouts stay
     } else if (tool === "roi") {
-      finishSelection(start, end);
+      finishSelection(rectangle);
     } else if (tool === "measure") {
       state.tempLine = null;
       if (moved >= 6) {
@@ -1490,9 +1580,8 @@ function wireTools() {
       }
       renderAnnotations();
     } else if (tool === "box") {
-      if (moved >= 6) {
-        const r = imageBoundsOfScreenRect(start, end);
-        const item = addAnnotation({ type: "box", ...r, text: "" });
+      if (moved >= 6 && rectangle && rectangle.w > 0 && rectangle.h > 0) {
+        const item = addAnnotation({ type: "box", ...rectangle, text: "" });
         setTool(null);
         openEditor(item.id);
       }
@@ -1521,16 +1610,6 @@ function wireTools() {
     b.title =
       "ND2 export needs the limnd2 package on the server — " +
       "pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2";
-  }
-
-  function positionRubber(a, b) {
-    const r = rectFrom(a, b);
-    const wrap = $("stage-wrap").getBoundingClientRect();
-    const st = stage.getBoundingClientRect();
-    rubber.style.left = r.x + (st.left - wrap.left) + "px";
-    rubber.style.top = r.y + (st.top - wrap.top) + "px";
-    rubber.style.width = r.w + "px";
-    rubber.style.height = r.h + "px";
   }
 
   wireRoiDims();
@@ -1965,12 +2044,13 @@ function updateLandmarkHint() {
 }
 
 function postLandmarkPoints() {
-  if (window.parent === window) return;
+  if (window.parent === window || !spatialPaneReady() || !state.landmark.active) return;
   window.parent.postMessage({
     nd2wsi: "landmark-points",
     version: VIEWPORT_PROTOCOL_VERSION,
     sid: currentSlideSid(),
-    points: state.landmark.points.map((p) => ({ x: p.x, y: p.y })),
+    ...landmarkEnvelope(),
+    points: state.landmark.points.map((p) => ({ ...p })),
   }, location.origin);
 }
 
@@ -1978,9 +2058,14 @@ function setLandmarkMode(message) {
   const lm = state.landmark;
   const viewer = state.viewer;
   const active = Boolean(message.active);
+  if (active && (!spatialPaneReady() || !state.viewportRelay.commandGate.current(message) || !message.editId ||
+      !Number.isSafeInteger(message.editRevision))) return;
+  if (active && message.editId === lm.editId && message.editRevision < lm.editRevision) return;
+  lm.editId = active ? message.editId : null;
+  lm.editRevision = active ? message.editRevision : -1;
   if (Array.isArray(message.points)) {
     lm.points = message.points
-      .map((p) => ({ x: Number(p.x), y: Number(p.y) }))
+      .map((p) => ({ ...p, id: p.id || crypto.randomUUID(), x: Number(p.x), y: Number(p.y) }))
       .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
       .slice(0, lm.needed);
   }
@@ -2009,9 +2094,12 @@ function setLandmarkMode(message) {
 
 function placeLandmark(screenPoint) {
   const lm = state.landmark;
+  if (!lm.active || !spatialPaneReady()) return;
   const img = imgPoint(screenPoint);
+  const frame = activeFrameContext()?.frame;
+  const acquired = { t: frame?.t ?? null, z: frame?.z ?? null };
   if (lm.points.length < lm.needed) {
-    lm.points.push({ x: img.x, y: img.y });
+    lm.points.push({ id: crypto.randomUUID(), x: img.x, y: img.y, acquired });
   } else {
     let nearest = -1, best = 24;
     lm.points.forEach((pt, i) => {
@@ -2023,8 +2111,9 @@ function placeLandmark(screenPoint) {
       showToast(`${lm.needed} points placed · ⌫ removes the last, or click near a marker to move it`);
       return;
     }
-    lm.points[nearest] = { x: img.x, y: img.y };
+    lm.points[nearest] = { ...lm.points[nearest], x: img.x, y: img.y, acquired };
   }
+  lm.pointRevision += 1;
   renderAnnotations();
   updateLandmarkHint();
   postLandmarkPoints();
@@ -2032,8 +2121,9 @@ function placeLandmark(screenPoint) {
 
 function undoLandmark() {
   const lm = state.landmark;
-  if (!lm.points.length) return;
+  if (!lm.active || !spatialPaneReady() || !lm.points.length) return;
   lm.points.pop();
+  lm.pointRevision += 1;
   renderAnnotations();
   updateLandmarkHint();
   postLandmarkPoints();
@@ -2369,18 +2459,10 @@ function flyToAnnotation(a) {
   }
 }
 
-function finishSelection(a, b) {
-  const box = imageBoundsOfScreenRect(a, b);
-  const info = state.info;
-  const x0 = clamp(box.x, 0, info.width);
-  const y0 = clamp(box.y, 0, info.height);
-  const x1 = clamp(box.x + box.w, 0, info.width);
-  const y1 = clamp(box.y + box.h, 0, info.height);
-  const w = Math.round(x1 - x0);
-  const h = Math.round(y1 - y0);
+function finishSelection(box) {
   setTool(null);
-  if (w < 4 || h < 4) return; // treat as an aborted drag
-  applyRoi(Math.round(x0), Math.round(y0), w, h);
+  if (!box || box.w < 4 || box.h < 4) return; // treat as an aborted drag
+  applyRoi(box.x, box.y, box.w, box.h);
 }
 
 function applyRoi(x, y, w, h) {
@@ -3046,6 +3128,105 @@ async function revealSlidePath(which) {
 const VIEWPORT_PROTOCOL_VERSION = 2;
 const VIEWPORT_EMIT_MS = 50;
 
+function spatialIdentity() {
+  const gate = state.viewportRelay.commandGate;
+  return { ...gate.envelope(), spatialContext: gate.spatialContext };
+}
+
+function spatialImageReady() {
+  const viewer = state.viewer;
+  return Boolean(viewer?.viewport && viewer.world?.getItemCount() &&
+    !state.viewportRelay.reopening && !state.viewportRelay.contextChanging);
+}
+
+function spatialPaneReady() {
+  refreshSpatialContext();
+  const gate = state.viewportRelay.commandGate;
+  return gate.enabled && gate.spatialEnabled && Boolean(gate.spatialContext) && spatialImageReady();
+}
+
+function clearPaneSpatialWork(resetPose = true) {
+  const relay = state.viewportRelay;
+  relay.commandGate.pendingViewportCommand = null;
+  relay.alignmentDrag = null;
+  relay.suppressAlignmentDragEnd = false;
+  clearTimeout(relay.timer);
+  relay.timer = null;
+  if (state.landmark.active || state.landmark.points.length) {
+    setLandmarkMode({ active: false, clear: true });
+  }
+  if (resetPose) {
+    relay.displayRotation = 0;
+    relay.displayFlipped = false;
+    applyDesiredDisplayTransform(false);
+  }
+}
+
+function refreshSpatialContext() {
+  if (!state.info) return false;
+  const context = window.Nd2SpatialPane.spatialContext(activeFrameContext(), Boolean(state.plate));
+  const changed = state.viewportRelay.commandGate.setContext(context);
+  if (changed) {
+    clearPaneSpatialWork();
+    postSpatialReadiness();
+  }
+  return changed;
+}
+
+function postSpatialReadiness() {
+  if (window.parent === window) return;
+  window.parent.postMessage({
+    nd2wsi: "viewport-ready", version: VIEWPORT_PROTOCOL_VERSION,
+    sid: currentSlideSid(), seq: ++state.viewportRelay.seq, ...viewportSnapshot(),
+  }, location.origin);
+}
+
+function landmarkEnvelope() {
+  return {
+    ...spatialIdentity(),
+    editId: state.landmark.editId,
+    editRevision: state.landmark.editRevision,
+    pointRevision: state.landmark.pointRevision,
+  };
+}
+
+function receiveCompareLifecycle(message) {
+  refreshSpatialContext();
+  const relay = state.viewportRelay;
+  const oldSession = relay.commandGate.groupSessionId;
+  const oldEpoch = relay.commandGate.groupEpoch;
+  if (!relay.commandGate.bind(message)) return;
+  if (oldSession !== message.groupSessionId || oldEpoch !== message.groupEpoch || !message.enabled) {
+    clearPaneSpatialWork(!message.enabled || oldSession !== message.groupSessionId);
+  }
+  relay.compare = {
+    enabled: Boolean(message.enabled), linked: Boolean(message.linked),
+    moving: Boolean(message.moving), role: message.role === "anchor" ? "anchor" : "member",
+    committedRevision: message.committedRevision,
+    nudgeBusy: Boolean(message.nudgeBusy),
+  };
+}
+
+function receiveSpatialCommand(message) {
+  refreshSpatialContext();
+  if (!state.viewportRelay.commandGate.receive(message)) return;
+  flushPendingSpatialCommand();
+}
+
+function flushPendingSpatialCommand() {
+  refreshSpatialContext();
+  const message = state.viewportRelay.commandGate.takeReady(spatialImageReady());
+  if (!message) return;
+  // One latest slot, revalidated here even when an old OSD-open callback runs.
+  if (message.nd2wsi === "viewport-request") {
+    const requestId = String(message.requestId || "");
+    if (requestId) postViewportState("request", { requestId });
+  } else if (message.nd2wsi === "viewport-apply") applyLinkedViewport(message);
+  else if (message.nd2wsi === "viewport-nudge") nudgeView(message.dxPx, message.dyPx, message);
+  else if (message.nd2wsi === "display-transform") applyDisplayTransform(message);
+  else if (message.nd2wsi === "landmark-mode") setLandmarkMode(message);
+}
+
 function normalizedRotation(value) {
   return ((Number(value) % 360) + 360) % 360;
 }
@@ -3091,17 +3272,12 @@ function applyDesiredDisplayTransform(announce = true) {
 }
 
 function applyDisplayTransform(message) {
+  if (!state.viewportRelay.commandGate.current(message) || !spatialImageReady()) return;
   const degrees = Number(message.degrees);
   if (!Number.isFinite(degrees) || typeof message.flipped !== "boolean") return;
   state.viewportRelay.displayRotation = normalizedRotation(degrees);
   state.viewportRelay.displayFlipped = message.flipped;
-  if (applyDesiredDisplayTransform()) return;
-  if (state.viewportRelay.transformWaitingForOpen) return;
-  state.viewportRelay.transformWaitingForOpen = true;
-  state.viewer.addOnceHandler("open", () => {
-    state.viewportRelay.transformWaitingForOpen = false;
-    applyDesiredDisplayTransform();
-  });
+  applyDesiredDisplayTransform();
 }
 
 function currentSlideSid() {
@@ -3111,7 +3287,16 @@ function currentSlideSid() {
 
 function viewportSnapshot() {
   const viewer = state.viewer;
-  if (!viewer || !viewer.viewport || !viewer.world || !viewer.world.getItemCount()) return null;
+  const pixelSize = state.info?.pixelSizeUm;
+  const calibrated = Array.isArray(pixelSize) && pixelSize.length >= 2 &&
+    Number(pixelSize[0]) > 0 && Number(pixelSize[1]) > 0;
+  const identity = {
+    ...spatialIdentity(), imageReady: spatialImageReady(),
+    imagePx: { x: state.info?.width, y: state.info?.height },
+    plateGrid: Boolean(state.plate && state.plate.focus === null),
+    pixelSizeUm: calibrated ? { x: Number(pixelSize[1]), y: Number(pixelSize[0]) } : null,
+  };
+  if (!identity.imageReady) return identity;
   // The unrotated bounds describe the field independently of any display
   // rotation or mirror: OSD turns the view about this rectangle's center,
   // and a rotated Rect's corners would fold the angle into the span.
@@ -3123,11 +3308,9 @@ function viewportSnapshot() {
     new OpenSeadragon.Point(bounds.x + bounds.width, bounds.y + bounds.height)
   );
   const numbers = [topLeft.x, topLeft.y, bottomRight.x, bottomRight.y];
-  if (!numbers.every(Number.isFinite)) return null;
-  const pixelSize = state.info.pixelSizeUm;
-  const calibrated = Array.isArray(pixelSize) && pixelSize.length >= 2 &&
-    Number(pixelSize[0]) > 0 && Number(pixelSize[1]) > 0;
+  if (!numbers.every(Number.isFinite)) return { ...identity, imageReady: false };
   return {
+    ...identity,
     centerPx: {
       x: (topLeft.x + bottomRight.x) / 2,
       y: (topLeft.y + bottomRight.y) / 2,
@@ -3150,6 +3333,7 @@ function viewportSnapshot() {
 
 function postViewportState(reason, extra = {}) {
   if (window.parent === window) return;
+  refreshSpatialContext();
   const snapshot = viewportSnapshot();
   if (!snapshot) return;
   window.parent.postMessage({
@@ -3165,23 +3349,21 @@ function postViewportState(reason, extra = {}) {
 
 function scheduleViewportState() {
   if (window.parent === window || Date.now() < state.viewportRelay.suppressUntil) return;
+  if (state.viewportRelay.alignmentDrag) return;
   if (state.viewportRelay.timer) return;
   state.viewportRelay.timer = setTimeout(() => {
     state.viewportRelay.timer = null;
     if (Date.now() < state.viewportRelay.suppressUntil) return;
-    // An Option-drag moves only this pane. The shell reads the resulting
-    // relative position as the new alignment instead of steering the partner.
-    postViewportState("user", state.viewportRelay.altHeld ? { nudge: true } : {});
+    if (state.viewportRelay.alignmentDrag) return;
+    postViewportState("user");
   }, VIEWPORT_EMIT_MS);
 }
 
-function nudgeView(dxPx, dyPx) {
-  // Move this pane's picture by a screen-pixel delta, whatever its display
-  // rotation or mirror, then report the move as an alignment nudge.
+function panByScreenDelta(dxPx, dyPx) {
   const viewer = state.viewer;
-  if (!viewer?.viewport || !viewer.world || !viewer.world.getItemCount()) return;
+  if (!viewer?.viewport || !viewer.world || !viewer.world.getItemCount()) return null;
   const dx = Number(dxPx), dy = Number(dyPx);
-  if (!Number.isFinite(dx) || !Number.isFinite(dy) || (!dx && !dy)) return;
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || (!dx && !dy)) return null;
   const viewport = viewer.viewport;
   const size = viewport.getContainerSize();
   const origin = { x: size.x / 2, y: size.y / 2 };
@@ -3193,7 +3375,55 @@ function nudgeView(dxPx, dyPx) {
   state.viewportRelay.timer = null;
   state.viewportRelay.suppressUntil = Date.now() + 180;
   viewport.panTo(viewport.imageToViewportCoordinates(target), true);
-  postViewportState("user", { nudge: true });
+  return {x: target.x - center.x, y: target.y - center.y};
+}
+
+function nudgeView(dxPx, dyPx, command = {}) {
+  if (!spatialPaneReady() || !state.viewportRelay.commandGate.current(command)) return;
+  const delta = panByScreenDelta(dxPx, dyPx);
+  if (!delta) return;
+  postViewportState("user", {
+    nudge: true, nudgeCommandId: command.commandId || null,
+    commandSeq: command.commandSeq, nudgeDeltaPx: delta,
+    committedRevision: command.committedRevision,
+  });
+}
+
+function beginAlignmentDrag(event) {
+  const relay = state.viewportRelay;
+  relay.suppressAlignmentDragEnd = false;
+  if (event.button !== 0 || !event.altKey || !spatialPaneReady() ||
+      !relay.compare?.linked || relay.compare.nudgeBusy || state.tool || state.landmark.active) return;
+  clearTimeout(relay.timer);
+  relay.timer = null;
+  relay.suppressAlignmentDragEnd = true;
+  relay.alignmentDrag = {
+    ...spatialIdentity(), dragId: crypto.randomUUID(),
+    committedRevision: relay.compare.committedRevision,
+    deltaPx: {x: 0, y: 0},
+  };
+}
+
+function updateAlignmentDrag(event) {
+  const drag = state.viewportRelay.alignmentDrag;
+  if (!drag || !state.viewportRelay.commandGate.valid(drag)) return;
+  event.preventDefaultAction = true;
+  const delta = panByScreenDelta(event.delta?.x, event.delta?.y);
+  if (!delta) return;
+  drag.deltaPx.x += delta.x;
+  drag.deltaPx.y += delta.y;
+}
+
+function finishAlignmentDrag(cancelled = false) {
+  const relay = state.viewportRelay, drag = relay.alignmentDrag;
+  relay.alignmentDrag = null;
+  if (!drag || !spatialPaneReady() || !relay.commandGate.valid(drag)) return;
+  if (!drag.deltaPx.x && !drag.deltaPx.y) return;
+  postViewportState("user", {
+    nudge: true, nudgeSource: "drag", dragId: drag.dragId,
+    nudgeDeltaPx: drag.deltaPx, nudgeCancelled: cancelled,
+    committedRevision: drag.committedRevision,
+  });
 }
 
 function finiteViewportPoint(value, positive = false) {
@@ -3205,12 +3435,14 @@ function finiteViewportPoint(value, positive = false) {
 }
 
 function applyLinkedViewport(message) {
+  if (!state.viewportRelay.commandGate.current(message) || !spatialImageReady()) return;
+  if (state.viewportRelay.alignmentDrag) return; // the user's precise drag owns this pane
   const center = finiteViewportPoint(message.centerPx);
   const span = finiteViewportPoint(message.spanPx, true);
   const commandId = String(message.commandId || "");
   if (!center || !span || !commandId) return;
 
-  const apply = () => {
+  {
     clearTimeout(state.viewportRelay.timer);
     state.viewportRelay.timer = null;
     // OSD may emit several update events while fitBounds applies constraints.
@@ -3229,10 +3461,7 @@ function applyLinkedViewport(message) {
     );
     viewport.applyConstraints(true);
     postViewportState("apply", { echoOf: commandId });
-  };
-
-  if (state.viewer.world && state.viewer.world.getItemCount()) apply();
-  else state.viewer.addOnceHandler("open", apply);
+  }
 }
 
 function wireCompareRelay() {
@@ -3245,28 +3474,10 @@ function wireCompareRelay() {
     if (event.data.nd2wsi === "prepare-quit") {
       const requestId = String(event.data.requestId || "");
       if (requestId) acknowledgeUpdatePreparation(requestId);
-    } else if (event.data.nd2wsi === "viewport-request") {
-      const requestId = String(event.data.requestId || "");
-      if (!requestId) return;
-      const reply = () => postViewportState("request", { requestId });
-      if (state.viewer.world && state.viewer.world.getItemCount()) reply();
-      else state.viewer.addOnceHandler("open", reply);
-    } else if (event.data.nd2wsi === "viewport-apply") {
-      applyLinkedViewport(event.data);
-    } else if (event.data.nd2wsi === "viewport-nudge") {
-      nudgeView(event.data.dxPx, event.data.dyPx);
-    } else if (event.data.nd2wsi === "display-transform") {
-      applyDisplayTransform(event.data);
+    } else if (["viewport-request", "viewport-apply", "viewport-nudge", "display-transform", "landmark-mode"].includes(event.data.nd2wsi)) {
+      receiveSpatialCommand(event.data);
     } else if (event.data.nd2wsi === "compare-state") {
-      state.viewportRelay.compare = {
-        enabled: Boolean(event.data.enabled),
-        linked: Boolean(event.data.linked),
-        moving: Boolean(event.data.moving),
-        role: event.data.role === "anchor" ? "anchor" : "member",
-      };
-      if (!event.data.enabled && state.landmark.active) setLandmarkMode({ active: false, clear: true });
-    } else if (event.data.nd2wsi === "landmark-mode") {
-      setLandmarkMode(event.data);
+      receiveCompareLifecycle(event.data);
     } else if (event.data.nd2wsi === "tab-shortcut-state") {
       state.tabCount = Math.max(0, Math.floor(Number(event.data.count) || 0));
     }
@@ -3290,7 +3501,7 @@ function wireCompareRelay() {
     window.parent.postMessage({ nd2wsi: "window-zoom", version: VIEWPORT_PROTOCOL_VERSION }, location.origin);
   });
   window.addEventListener("keydown", (ev) => {
-    if (!state.landmark.active || window.parent === window) return;
+    if (!state.landmark.active || window.parent === window || !spatialPaneReady()) return;
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
     if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
@@ -3301,7 +3512,8 @@ function wireCompareRelay() {
     if (!kind) return;
     ev.preventDefault();
     ev.stopPropagation();
-    window.parent.postMessage({ nd2wsi: kind, version: VIEWPORT_PROTOCOL_VERSION }, location.origin);
+    window.parent.postMessage({ nd2wsi: kind, version: VIEWPORT_PROTOCOL_VERSION,
+      sid: currentSlideSid(), ...landmarkEnvelope() }, location.origin);
   }, true);
   // Arrow keys nudge the alignment while linked. This runs in the capture
   // phase so OpenSeadragon's own arrow-key panning never sees the event.
@@ -3319,20 +3531,23 @@ function wireCompareRelay() {
     if (!delta) return;
     ev.preventDefault();
     ev.stopPropagation();
+    if (state.viewportRelay.alignmentDrag) return;
+    if (!spatialPaneReady()) return; // grid has no hidden-P0 spatial target
     window.parent.postMessage({
       nd2wsi: "compare-nudge",
       version: VIEWPORT_PROTOCOL_VERSION,
+      sid: currentSlideSid(), ...spatialIdentity(),
       dxPx: delta[0],
       dyPx: delta[1],
     }, location.origin);
   }, true);
-  if (window.parent !== window) {
-    window.parent.postMessage({
-      nd2wsi: "viewport-ready",
-      version: VIEWPORT_PROTOCOL_VERSION,
-      sid: currentSlideSid(),
-    }, location.origin);
-  }
+  // Exactly one listener, never a closure holding an old command or viewport.
+  state.viewer.addHandler("open", () => queueMicrotask(() => {
+    flushPendingSpatialCommand();
+    postSpatialReadiness();
+  }));
+  refreshSpatialContext();
+  postSpatialReadiness();
 }
 
 /* ---- appearance ------------------------------------------------------------
@@ -4412,7 +4627,9 @@ function setPlateFocus(p) {
   state.annDirty = false;
   state.annReady = false;
   state.annSite = null;
+  state.viewportRelay.contextChanging = true;
   pl.focus = next;
+  refreshSpatialContext(); // invalidate old P commands before any asynchronous work
   const wrap = $("stage-wrap");
   wrap.classList.toggle("plate-grid", next === null);
   wrap.classList.toggle("plate-focus", next !== null);
@@ -4433,6 +4650,8 @@ function setPlateFocus(p) {
   paintPlate(); // the set that just became visible carries older frames
   plateFrameChanged();
   updateReadout();
+  state.viewportRelay.contextChanging = false;
+  postSpatialReadiness();
 }
 
 function setPlatePlaying(on) {
@@ -5023,8 +5242,10 @@ function wireKeys() {
     else if (plain && letterCode === "KeyL" && window.parent !== window) {
       if (!ev.repeat) {
         ev.preventDefault();
+        if (!spatialPaneReady()) return;
         window.parent.postMessage(
-          { nd2wsi: "compare-link-toggle", version: VIEWPORT_PROTOCOL_VERSION },
+          { nd2wsi: "compare-link-toggle", version: VIEWPORT_PROTOCOL_VERSION,
+            sid: currentSlideSid(), ...spatialIdentity() },
           location.origin
         );
       }
