@@ -393,6 +393,12 @@ function buildViewer() {
   });
   state.viewer = viewer;
 
+  viewer.addHandler("canvas-key", (event) => {
+    const original = event.originalEvent;
+    // Let the browser compose text, without OSD interpreting a composition
+    // key as its built-in rotate, flip, or pan command.
+    if (original?.isComposing || original?.keyCode === 229) event.preventDefaultAction = true;
+  });
   viewer.addHandler("open", () => {
     applyDesiredDisplayTransform(false);
     $("boot").style.display = "none";
@@ -3480,6 +3486,14 @@ function wireCompareRelay() {
       receiveCompareLifecycle(event.data);
     } else if (event.data.nd2wsi === "tab-shortcut-state") {
       state.tabCount = Math.max(0, Math.floor(Number(event.data.count) || 0));
+    } else if (event.data.nd2wsi === "pane-orientation-shortcut") {
+      refreshSpatialContext();
+      // A shell-focused shortcut captures one pane/site. Never replay it on a
+      // new site, a reloaded pane, or a newly established Compare group.
+      if (!state.viewportRelay.compare?.enabled &&
+          state.viewportRelay.commandGate.matchesLocal(event.data)) {
+        applyOrientationShortcut(event.data.action);
+      }
     }
   });
   for (const kind of ["pointerdown", "keydown", "beforeinput"]) {
@@ -5150,8 +5164,9 @@ function wirePlateKeys() {
       }
       if (!ev.repeat) setPlatePlaying(!pl.playing);
     }
-    else if ((ev.key === "f" || ev.key === "F") && info.Z > 1) {
-      if (!$("t-auto").disabled) setPlateAuto(!pl.auto);
+    else if ((shortcuts ? shortcuts.letterCode(ev) === "KeyF" : ev.code === "KeyF") &&
+        !ev.shiftKey && info.Z > 1) {
+      if (!ev.repeat && !$("t-auto").disabled) setPlateAuto(!pl.auto);
     }
     else if (/^[1-9]$/.test(ev.key) && !ev.shiftKey) {
       const site = pl.placed[Number(ev.key) - 1];
@@ -5183,14 +5198,55 @@ function wireDragForward() {
   document.addEventListener("drop", (ev) => ev.preventDefault(), true);
 }
 
+function applyOrientationShortcut(action) {
+  if (!["rotate-right", "flip-horizontal"].includes(action) || state.quitPreparing) return false;
+  refreshSpatialContext();
+  const relay = state.viewportRelay;
+  if (relay.compare?.enabled && window.parent !== window) {
+    if (!spatialPaneReady()) {
+      showToast("Focus a ready site in every linked pane before changing orientation");
+      return false;
+    }
+    // The shell owns alignment and the Active linked slide selection. Never
+    // rotate this viewport behind a committed fit or independently of its pair.
+    window.parent.postMessage({
+      nd2wsi: "compare-orientation-shortcut", version: VIEWPORT_PROTOCOL_VERSION,
+      sid: currentSlideSid(), action, ...spatialIdentity(),
+    }, location.origin);
+    return true;
+  }
+  if (!relay.commandGate.spatialContext || !spatialImageReady()) {
+    showToast(state.plate?.focus === null
+      ? "Open a site before rotating or flipping the image"
+      : "Wait for the image to finish opening");
+    return false;
+  }
+  if (action === "flip-horizontal") relay.displayFlipped = !relay.displayFlipped;
+  else {
+    // OSD displays F * R(theta): a clockwise screen turn reverses the
+    // rotation increment when the viewport is already reflected.
+    relay.displayRotation = normalizedRotation(relay.displayRotation +
+      (relay.displayFlipped ? -90 : 90));
+  }
+  return applyDesiredDisplayTransform();
+}
+
 function wireKeys() {
   window.addEventListener("keydown", (ev) => {
     const shortcuts = window.Nd2ShortcutRouter;
+    if (ev.defaultPrevented) return;
     if (shortcuts && shortcuts.isTypingEvent(ev)) return;
     if (!shortcuts && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
     if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
     const command = ev.metaKey || ev.ctrlKey;
     const letterCode = shortcuts ? shortcuts.letterCode(ev) : ev.code;
+    if (shortcuts?.isOrientationShortcut(ev)) {
+      const action = shortcuts.orientationForEvent(ev);
+      ev.preventDefault(); // reserve Reload/Find, including held-key repeats
+      ev.stopPropagation();
+      if (action) applyOrientationShortcut(action);
+      return;
+    }
     if (command && !ev.shiftKey && ev.code === "Backslash") {
       if (window.parent !== window && !ev.repeat) {
         ev.preventDefault();
@@ -5225,23 +5281,32 @@ function wireKeys() {
     }
     if (command) return;  // leave other shortcuts alone
     const panel = shortcuts ? shortcuts.panelForEvent(ev) : null;
-    if (panel) {
-      const btn = $({ channels: "tb-channels", region: "tb-region", annot: "tb-annot" }[panel]);
-      if (btn && !btn.disabled) {
-        ev.preventDefault();
-        btn.click();
-      }
+    // Own these letters before the target OSD canvas sees them. In particular
+    // OSD's R rotates, A pans and F flips before a bubble listener can react.
+    // Repeats/Shift variants stay reserved but do not repeatedly toggle tools.
+    const ownedLetter = !ev.altKey &&
+      ["KeyC", "KeyR", "KeyA", "KeyV", "KeyM", "KeyP", "KeyB", "KeyI", "KeyF"].includes(letterCode);
+    if (ownedLetter) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (ev.repeat || ev.shiftKey) return;
+      if (panel) {
+        const btn = $({ channels: "tb-channels", region: "tb-region", annot: "tb-annot" }[panel]);
+        if (btn && !btn.disabled) btn.click();
+      } else if (letterCode === "KeyV") { if (state.roi) setTool("move"); }
+      else if (letterCode === "KeyM") setTool("measure");
+      else if (letterCode === "KeyP") setTool("pin");
+      else if (letterCode === "KeyB") setTool("box");
+      else if (letterCode === "KeyI") togglePixelInspector();
+      // Plain F is reserved for plate autofocus, handled by wirePlateKeys in
+      // an earlier capture listener. It must never fall through to OSD flip.
       return;
     }
     const plain = !ev.altKey && !ev.shiftKey && !ev.repeat;
-    if (plain && letterCode === "KeyV") { if (state.roi) setTool("move"); }
-    else if (plain && letterCode === "KeyM") setTool("measure");
-    else if (plain && letterCode === "KeyP") setTool("pin");
-    else if (plain && letterCode === "KeyB") setTool("box");
-    else if (plain && letterCode === "KeyI") togglePixelInspector();
-    else if (plain && letterCode === "KeyL" && window.parent !== window) {
+    if (plain && letterCode === "KeyL" && window.parent !== window) {
       if (!ev.repeat) {
         ev.preventDefault();
+        ev.stopPropagation();
         if (!spatialPaneReady()) return;
         window.parent.postMessage(
           { nd2wsi: "compare-link-toggle", version: VIEWPORT_PROTOCOL_VERSION,
@@ -5254,8 +5319,12 @@ function wireKeys() {
       if (!$("ann-editor").hidden) closeEditor(false);
       else if (state.tool) setTool(state.tool); // toggles off
       else if (state.plate && state.plate.focus !== null) setPlateFocus(null);
-    } else if (plain && ["Digit0", "Numpad0"].includes(ev.code)) state.viewer.viewport.goHome();
-  });
+    } else if (plain && ["Digit0", "Numpad0"].includes(ev.code)) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      state.viewer.viewport.goHome();
+    }
+  }, true);
 }
 
 function elementPoint(ev, el) {

@@ -16,6 +16,7 @@ SCRIPT = r"""
 const fs = require('fs');
 const vm = require('vm');
 const Align = require(process.argv[1] + '/align-v1.js');
+const ShortcutRouter = require(process.argv[1] + '/shortcut-router-v1.js');
 const source = fs.readFileSync(process.argv[1] + '/shell-v1.js', 'utf8');
 // Top-level function closing braces are unindented in the production file.
 function production(name) {
@@ -52,7 +53,8 @@ const element = id => {
   return elements.get(id);
 };
 const context = vm.createContext({
-  Align, messages, styleValues, VIEWPORT_PROTOCOL_VERSION:2, VIEWPORT_THROTTLE_MS:48,
+  Align, ShortcutRouter, quitPreparation:null, messages, styleValues,
+  VIEWPORT_PROTOCOL_VERSION:2, VIEWPORT_THROTTLE_MS:48,
   LANDMARKS_NEEDED:4, MAX_GROUP:4, structuredClone, crypto:{randomUUID:()=>`token-${++tokenSeq}`},
   document:{documentElement:{style:{setProperty:(key,value)=>styleValues[key]=value}},
     activeElement:null, createElement:()=>element(`created-${++tokenSeq}`)},
@@ -167,11 +169,15 @@ const messageStart=source.indexOf('window.addEventListener("message",');
 vm.runInContext(source.slice(messageStart,source.indexOf('\n});',messageStart)+4),context);
 context.clickControl=id=>element(id).onclick();
 context.changeControl=(id,value)=>element(id).onchange({target:{value}});
-context.pressKey=key=>{
-  for (const listener of listeners.get('keydown') || []) listener({
-    key,repeat:false,metaKey:false,ctrlKey:false,altKey:false,
-    target:{closest:()=>null},preventDefault(){},
-  });
+context.pressKey=(key,overrides={})=>{
+  const event={
+    key,repeat:false,metaKey:false,ctrlKey:false,altKey:false,shiftKey:false,
+    target:{tagName:'DIV',closest:()=>null},defaultPrevented:false,stopped:false,
+    preventDefault(){this.defaultPrevented=true;},
+    stopPropagation(){this.stopped=true;},...overrides,
+  };
+  for (const listener of listeners.get('keydown') || []) listener(event);
+  return {prevented:event.defaultPrevented,stopped:event.stopped};
 };
 context.paneMessage=(sid,data)=>{
   for (const listener of listeners.get('message') || []) listener({

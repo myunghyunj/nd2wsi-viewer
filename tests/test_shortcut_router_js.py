@@ -47,6 +47,8 @@ const out = cases.map((entry) => {
     typing: Router.isTypingEvent(event),
     letter: Router.letterCode(event),
     panel: Router.panelForEvent(event),
+    orientationShortcut: Router.isOrientationShortcut(event),
+    orientation: Router.orientationForEvent(event),
     tab: Router.tabIndexForEvent(event),
   };
 });
@@ -124,6 +126,70 @@ def test_panel_shortcuts_reject_modifiers_repeats_and_prevented_events():
     assert all(item["panel"] is None for item in out)
 
 
+def test_command_r_and_f_rotate_clockwise_and_flip_horizontally():
+    out = _run(
+        [
+            {"event": {"code": "KeyR", "key": "r", "metaKey": True}},
+            {"event": {"code": "KeyF", "key": "f", "metaKey": True}},
+            {"event": {"code": "KeyR", "key": "ㄱ", "metaKey": True}},
+            {"event": {"code": "KeyF", "key": "ㄹ", "metaKey": True}},
+            {"event": {"code": "KeyP", "key": "r", "metaKey": True}},
+            {"event": {"code": "KeyU", "key": "F", "metaKey": True}},
+        ]
+    )
+    assert [item["orientation"] for item in out] == [
+        "rotate-right", "flip-horizontal", "rotate-right", "flip-horizontal",
+        "rotate-right", "flip-horizontal",
+    ]
+    assert all(item["orientationShortcut"] for item in out)
+    assert all(item["panel"] is None and item["tab"] is None for item in out)
+
+
+@pytest.mark.parametrize("code", ["KeyR", "KeyF"])
+def test_orientation_shortcuts_require_command_alone_and_reject_repeats(code):
+    out = _run(
+        [
+            {"event": {"code": code}},
+            {"event": {"code": code, "ctrlKey": True}},
+            {"event": {"code": code, "metaKey": True, "ctrlKey": True}},
+            {"event": {"code": code, "metaKey": True, "altKey": True}},
+            {"event": {"code": code, "metaKey": True, "shiftKey": True}},
+            {"event": {"code": code, "metaKey": True, "repeat": True}},
+            {"event": {"code": code, "metaKey": True, "defaultPrevented": True}},
+            {"event": {"code": "KeyA", "metaKey": True}},
+        ]
+    )
+    assert all(item["orientation"] is None for item in out)
+    assert [item["orientationShortcut"] for item in out] == [
+        False, False, False, False, False, True, False, False,
+    ]
+    assert out[0]["panel"] == ("region" if code == "KeyR" else None)
+
+
+@pytest.mark.parametrize("code", ["KeyR", "KeyF"])
+def test_orientation_shortcuts_respect_text_entry_and_ime_composition(code):
+    out = _run(
+        [
+            {"event": {"code": code, "metaKey": True}, "target": target}
+            for target in [
+                {"tag": "INPUT"},
+                {"tag": "textarea"},
+                {"tag": "Select"},
+                {"contentEditable": True},
+                {"insideEditable": True},
+                {"insideTextbox": True},
+            ]
+        ]
+        + [
+            {"event": {"code": code, "metaKey": True, "isComposing": True}},
+            {"event": {"code": code, "metaKey": True, "keyCode": 229}},
+        ]
+    )
+    assert all(item["typing"] for item in out)
+    assert all(item["orientation"] is None for item in out)
+    assert all(not item["orientationShortcut"] for item in out)
+
+
 def test_command_digits_select_tabs_and_accept_the_numeric_keypad():
     out = _run(
         [
@@ -167,7 +233,14 @@ def test_contenteditable_false_does_not_hide_a_panel_shortcut():
         ]
     )
     assert out == [
-        {"typing": False, "letter": "KeyC", "panel": "channels", "tab": None}
+        {
+            "typing": False,
+            "letter": "KeyC",
+            "panel": "channels",
+            "orientationShortcut": False,
+            "orientation": None,
+            "tab": None,
+        }
     ]
 
 

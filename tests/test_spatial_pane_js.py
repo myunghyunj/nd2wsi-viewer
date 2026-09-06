@@ -163,7 +163,7 @@ def test_production_routes_share_one_guarded_slot_and_one_open_listener():
     focus = app[app.index("function setPlateFocus(") : app.index("function setPlatePlaying(")]
     assert focus.index("refreshSpatialContext();") < focus.index("loadAnnotations(next)")
     assert "postSpatialReadiness();" in focus
-    shortcut = app[app.index('else if (plain && letterCode === "KeyL"') :]
+    shortcut = app[app.index('if (plain && letterCode === "KeyL"') :]
     shortcut = shortcut[:shortcut.index('else if (ev.key === "Escape")')]
     assert "if (!spatialPaneReady()) return;" in shortcut
     assert "...spatialIdentity()" in shortcut

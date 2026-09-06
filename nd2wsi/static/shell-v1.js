@@ -2104,6 +2104,32 @@ function changeOrientation(action) {
   requestGroup("orientation", { targetSid, action });
 }
 
+function orientationShortcut(action) {
+  if (!["rotate-right", "flip-horizontal"].includes(action) || quitPreparation) return false;
+  if (compare.enabled) {
+    if (compare.landmark.active || compare.pendingRequest || compare.pendingNudge) return false;
+    if (compare.pairs.get(compare.orientationSid)?.fit) {
+      showError("Fit protected — use Remove Fit before changing orientation");
+      return false;
+    }
+    if (!spatialGroupReady("orientation")) {
+      showError("Focus a ready site in every linked pane before changing orientation");
+      return false;
+    }
+    changeOrientation(action);
+    return Boolean(compare.pendingRequest);
+  }
+  const st = compare.states.get(active);
+  if (!st?.imageReady || !st.spatialContext || st.plateGrid) {
+    showError("Open a ready slide or focused site before changing orientation");
+    return false;
+  }
+  return postToSlide(active, {
+    nd2wsi: "pane-orientation-shortcut", version: VIEWPORT_PROTOCOL_VERSION,
+    action, ...localIdentity(st),
+  });
+}
+
 function swapComparedSlides() {
   if (compare.members.length !== 1 || compare.landmark.active || compare.pendingRequest ||
       !spatialGroupReady()) return;
@@ -2158,6 +2184,13 @@ $("compare-mirror-policy").onchange = (event) => {
 };
 
 window.addEventListener("keydown", (event) => {
+  if (ShortcutRouter?.isOrientationShortcut(event)) {
+    const action = ShortcutRouter.orientationForEvent(event);
+    event.preventDefault();
+    event.stopPropagation();
+    if (action) orientationShortcut(action);
+    return;
+  }
   if (event.repeat) return;
   if (event.key === "Escape" && pairPickerIsOpen()) {
     event.preventDefault();
@@ -2177,7 +2210,7 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     toggleViewLink();
   }
-});
+}, true);
 
 $("compare-picker").addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
@@ -2318,6 +2351,9 @@ window.addEventListener("message", (event) => {
   } else if (kind === "compare-nudge") {
     if (!senderSid || !versioned || !inGroup(senderSid)) return;
     if (currentEnvelope(event.data, senderSid)) nudgeAlignment(event.data.dxPx, event.data.dyPx, senderSid);
+  } else if (kind === "compare-orientation-shortcut") {
+    if (!senderSid || !versioned || !inGroup(senderSid) || event.data.sid !== senderSid) return;
+    if (currentEnvelope(event.data, senderSid)) orientationShortcut(event.data.action);
   } else if (kind === "landmark-points") {
     if (!senderSid || !versioned || (event.data.sid && event.data.sid !== senderSid)) return;
     receiveLandmarkPoints(senderSid, event.data);

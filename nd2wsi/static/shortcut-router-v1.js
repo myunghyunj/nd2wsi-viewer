@@ -11,6 +11,10 @@
     KeyR: "region",
     KeyA: "annot",
   });
+  const ORIENTATION_BY_CODE = Object.freeze({
+    KeyR: "rotate-right",
+    KeyF: "flip-horizontal",
+  });
   const EDITABLE_SELECTOR = [
     "input",
     "select",
@@ -56,6 +60,19 @@
     return PANEL_BY_CODE[letterCode(event)] || null;
   }
 
+  function isOrientationShortcut(event) {
+    if (
+      isBlocked(event) || !event.metaKey || event.ctrlKey ||
+      event.altKey || event.shiftKey
+    ) return false;
+    return Boolean(ORIENTATION_BY_CODE[letterCode(event)]);
+  }
+
+  function orientationForEvent(event) {
+    if (!isOrientationShortcut(event) || event.repeat) return null;
+    return ORIENTATION_BY_CODE[letterCode(event)];
+  }
+
   function tabIndexForEvent(event) {
     if (
       isBlocked(event) || event.repeat || !event.metaKey || event.ctrlKey ||
@@ -65,5 +82,8 @@
     return match ? Number(match[1]) - 1 : null;
   }
 
-  return { isTypingEvent, letterCode, panelForEvent, tabIndexForEvent };
+  return {
+    isTypingEvent, letterCode, panelForEvent, isOrientationShortcut,
+    orientationForEvent, tabIndexForEvent,
+  };
 });

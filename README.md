@@ -141,11 +141,11 @@ From left: H&E, Masson's trichrome, and CD31 immunofluorescence of the same case
 
 Open two or more slides of the same case, press `⌘\`, and choose which slide to link with the one in front. Press `+` in the capsule to link more, up to four in all, so a reference section can sit beside CD31, CD68, and an H&E at the same time. Two slides share the screen, three take a column each, and four fill a grid. When you move one, the others follow in micrometers.
 
-Scans taken through opposite sides of the glass may need a reflection, not just a rotation. In Compare, choose the image in **Orient**, then use **Flip ↔**, **Flip ↕**, **↶ 90°**, **↷ 90°**, or **Transpose** (swap the displayed horizontal and vertical axes). These are image-orientation controls, distinct from transposing the well grid. The reference stays fixed; only the selected linked image changes, around the current view center. **Reset** restores its original orientation without resetting that center. The viewer does not guess the orientation from `.svs` or `.nd2` filenames. Pair orientations are remembered while the app remains open.
+Scans taken through opposite sides of the glass may need a reflection, not just a rotation. In Compare, choose the image in **Active linked slide**, then use **Flip ↔** (`⌘F`), **Flip ↕**, **↶ 90°**, **↷ 90°** (`⌘R`), or **Transpose** (swap the displayed horizontal and vertical axes). These are image-orientation controls, distinct from transposing the well grid. The reference stays fixed; only the selected linked image changes, around the current view center. **Reset Orientation** restores its original orientation without resetting that center. The viewer does not guess the orientation from `.svs` or `.nd2` filenames. Pair orientations are remembered while the app remains open.
 
 The comparison toolbox's **×** only hides the tools: the linked panes and their alignment stay active. Use the **Show comparison tools** sliders button beside the tab-bar link button to reopen them. The tab-bar **link** button (or `⌘\`) ends the comparison; the link button inside the toolbox pauses/resumes linked movement without closing the panes. Hiding tools also preserves an in-progress landmark edit, which can be resumed by reopening the toolbox.
 
-To refine the alignment, press **Align** and click the same four structures on every image, in the same order. The viewer works out the rotation, scale, shift, and reflection, and shows the landmark residual in micrometers when calibrated (relative units otherwise). A fitted image's orientation buttons are protected until **Align → Clear** removes the points; Cancel restores the previous alignment. These are display transforms: source pixels, annotation coordinates, and exports remain unchanged.
+To refine the alignment, press **Align** and click the same four structures on every image, in the same order. The viewer fits rotation, uniform scale and shift, preserving the current mirror state unless **Infer mirror** is selected. This is similarity alignment, not perspective or deformable registration. Landmark residuals are shown in micrometers when calibrated (relative units otherwise). **Done** commits a valid draft; **Cancel** preserves the previous alignment. **Clear Points** clears only the draft. A fitted image's orientation buttons and shortcuts remain protected until **Remove Fit** removes the committed fit. These are display transforms: source pixels, annotation coordinates, and raw exports remain unchanged.
 
 Even a good alignment drifts by a few cells at high magnification. While linked, the arrow keys move the linked slide by one screen pixel, Shift with an arrow by ten, and an Option-drag moves one pane alone. Each nudge becomes part of the alignment.
 
@@ -171,6 +171,10 @@ The trash-can button removes the reduced copies of the slide in front. The scan 
 
 ## Keyboard
 
+Shortcuts act on the image workspace. They are ignored while typing in a text field, editing a note, or composing text with an input method (IME), so normal text-entry shortcuts remain available.
+
+### Panels and tools
+
 | Key | Action |
 |---|---|
 | `C` | show or hide Channels & LUTs |
@@ -185,16 +189,34 @@ The trash-can button removes the reduced copies of the slide in front. The scan 
 | `⌘I` | Slide Info |
 | `⌘1` … `⌘9` | switch to that tab |
 | `⌘⇧E` | export marks as GeoJSON |
+| `Esc` | cancel the active tool, or return to all sites |
+
+### Orientation and comparison
+
+| Key | Action |
+|---|---|
+| `⌘R` | rotate the image 90° clockwise on screen |
+| `⌘F` | flip the image horizontally on screen |
 | `⌘\` | link slides |
 | `L` | pause or resume the link |
 | `←` `→` `↑` `↓` | nudge the linked slide by a pixel, ten with Shift |
 | `⌥` drag | move one linked pane alone |
+
+`⌘R` and `⌘F` change the focused image when slides are unlinked. In Compare, they change the image selected in **Active linked slide**, while the reference stays fixed. They follow the same protections as the orientation buttons: choose **Remove Fit** before changing a fitted image, and open a site before orienting a plate image. They do not rotate or flip the plate grid.
+
+In the image workspace, `⌘R` and `⌘F` take the place of browser Reload and Find. Holding either shortcut applies only one change; release and press again for another. Plain `R` still opens Region, `A` opens Annotations, and `P` places a pin.
+
+### Plate navigation
+
+| Key | Action |
+|---|---|
 | `↑` `↓` | z plane of a plate |
 | `←` `→` | time frame of a plate |
 | `Space` | play or pause a plate |
 | `F` | follow the sharpest plane of each site |
 | `1` to `9` | open a site of a plate |
-| `Esc` | cancel the active tool, or return to all sites |
+
+These navigation shortcuts apply on the image stage; arrows instead move between sites when a grid cell has keyboard focus, and Enter opens that site. While movement is linked in Compare, arrows nudge the linked image and plate navigation shortcuts are paused. Plain `F` toggles autofocus only for an eligible plate with multiple Z planes when autofocus is ready; otherwise it does nothing. Use `⌘F` to flip an image.
 
 ## Questions and requests
 
