@@ -9,6 +9,8 @@ let busyTab = null;
 let busyTimer = null;
 let toastTimer = null;
 let quitPreparation = null;
+let quitPreparationRequestId = "";
+const quitPreparedPanes = new Map(); // sid -> most recent full preparation id
 const pairPicker = { open: false, mode: "start", replaceSid: null };
 
 const Align = window.nd2wsiAlign;
@@ -660,6 +662,7 @@ window.nd2wsiPrepareForUpdate = (requestId) => {
   if (quitPreparation) {
     finishQuitPreparation({ ok: false, error: "update preparation restarted" });
   }
+  quitPreparationRequestId = id;
   document.documentElement.classList.add("preparing-update");
   scheduleNativeGestureScopes();
   if (busyTab) {
@@ -687,6 +690,7 @@ window.nd2wsiPrepareForUpdate = (requestId) => {
     }, 8000);
     quitPreparation = pending;
     for (const sid of targets) {
+      quitPreparedPanes.set(sid, id);
       postToSlide(sid, {
         nd2wsi: "prepare-quit",
         version: VIEWPORT_PROTOCOL_VERSION,
@@ -694,6 +698,28 @@ window.nd2wsiPrepareForUpdate = (requestId) => {
       });
     }
   });
+};
+
+window.nd2wsiCancelUpdate = (requestId, afterTeardown = false) => {
+  const id = String(requestId || "");
+  if (!id || id !== quitPreparationRequestId) return false;
+  quitPreparationRequestId = "";
+  finishQuitPreparation({ ok: false, cancelled: true, error: "update cancelled" });
+  // A retry can fail before contacting panes (for example while a new slide
+  // is opening), so retain each earlier pane's exact request id until abort.
+  for (const [sid, paneRequestId] of quitPreparedPanes) {
+    postToSlide(sid, {
+      nd2wsi: "cancel-quit", version: VIEWPORT_PROTOCOL_VERSION,
+      requestId: paneRequestId,
+    });
+  }
+  quitPreparedPanes.clear();
+  document.documentElement.classList.remove("preparing-update");
+  scheduleNativeGestureScopes();
+  if (afterTeardown === true) {
+    showError("Update stopped after saving annotations and releasing images. Reopen the slide or restart the app.");
+  }
+  return true;
 };
 
 function finitePoint(value, positive = false) {

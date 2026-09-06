@@ -8,6 +8,7 @@ deliberately best-effort and never prevents the viewer from opening.
 from __future__ import annotations
 
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,9 @@ class ShutdownCoordinator(Protocol):
         self,
         completion: Callable[[], None],
         failure: Callable[[str], None],
-    ) -> None: ...
+    ) -> bool: ...
+
+    def cancel_preparation(self) -> None: ...
 
 
 @dataclass
@@ -101,7 +104,10 @@ def _delegate_class(protocol: Any):
                 return None
             self.coordinator = coordinator
             self.logger = logger
+            self._install_lock = threading.RLock()
             self._pending_install_handler = None
+            self._pending_install_token = None
+            self._pending_install_timer = None
             return self
 
         # Sparkle asks this immediately before terminating and replacing the
@@ -110,25 +116,64 @@ def _delegate_class(protocol: Any):
         def updater_shouldPostponeRelaunchForUpdate_untilInvokingBlock_(
             self, updater, item, install_handler
         ):
-            self._pending_install_handler = install_handler
+            with self._install_lock:
+                if self._pending_install_token is not None:
+                    return True
+                token = self._pending_install_token = object()
+                self._pending_install_handler = install_handler
+            last_failure = None
 
             def complete():
-                handler = self._pending_install_handler
-                self._pending_install_handler = None
-                if handler is not None:
-                    handler()
+                with self._install_lock:
+                    if self._pending_install_token is not token:
+                        return
+                    self._pending_install_token = None
+                    self._pending_install_handler = None
+                    timer, self._pending_install_timer = self._pending_install_timer, None
+                    if timer is not None:
+                        timer.cancel()
+                    # The coordinator dispatches this to AppKit's main queue.
+                    # Capture this request's block, even if it re-enters us.
+                    install_handler()
 
             def fail(message: str):
-                self.logger(f"Sparkle relaunch postponed: {message}")
+                nonlocal last_failure
+                with self._install_lock:
+                    if self._pending_install_token is not token:
+                        return
+                    if message == "update preparation is already running" or message == last_failure:
+                        return
+                    last_failure = message
+                    self.logger(f"Sparkle relaunch postponed: {message}")
 
-            self.coordinator.prepare_for_update(complete, fail)
+            def attempt():
+                with self._install_lock:
+                    if self._pending_install_token is not token:
+                        return
+                    self._pending_install_timer = None
+                    accepted = self.coordinator.prepare_for_update(complete, fail)
+                    if accepted is False and self._pending_install_token is token:
+                        # An aborted worker retains ownership through recovery.
+                        # Retry admission only; Sparkle's block stays on main.
+                        timer = threading.Timer(0.1, attempt)
+                        timer.daemon = True
+                        self._pending_install_timer = timer
+                        timer.start()
+
+            attempt()
             return True
 
         def updaterWillRelaunchApplication_(self, updater):
             self.logger("Sparkle will relaunch application")
 
         def updater_didAbortWithError_(self, updater, error):
-            self._pending_install_handler = None
+            with self._install_lock:
+                self._pending_install_token = None
+                self._pending_install_handler = None
+                timer, self._pending_install_timer = self._pending_install_timer, None
+                if timer is not None:
+                    timer.cancel()
+                self.coordinator.cancel_preparation()
             self.logger(f"Sparkle update aborted: {error}")
 
     _DELEGATE_TYPE = Nd2wsiUpdaterDelegate

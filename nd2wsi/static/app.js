@@ -30,6 +30,7 @@ const state = {
   annSaveTail: Promise.resolve(),
   annFailedSaves: new Map(), // URL -> latest captured payload that still needs retry
   quitPreparing: false,
+  quitRequestId: null,
   annLoadSeq: 0, // only the newest sidecar load may install its items
   tabCount: 0, // supplied by the same-origin shell for conditional Cmd+digit handling
   pixel: {
@@ -1759,6 +1760,7 @@ async function flushAnnotationsForUpdate() {
 }
 
 async function acknowledgeUpdatePreparation(requestId) {
+  state.quitRequestId = requestId;
   let reply;
   try {
     await flushAnnotationsForUpdate();
@@ -1766,6 +1768,10 @@ async function acknowledgeUpdatePreparation(requestId) {
   } catch (error) {
     reply = { ok: false, error: String(error.message || error).slice(0, 240) };
   }
+  // Cancellation or a later preparation may overtake an in-flight save.
+  // The save still owns its captured annotation payload, but its reply must
+  // never finish a different installation attempt.
+  if (!state.quitPreparing || state.quitRequestId !== requestId) return;
   window.parent.postMessage({
     nd2wsi: "quit-ready",
     version: VIEWPORT_PROTOCOL_VERSION,
@@ -1773,6 +1779,16 @@ async function acknowledgeUpdatePreparation(requestId) {
     sid: currentSlideSid(),
     ...reply,
   }, location.origin);
+}
+
+function cancelUpdatePreparation(requestId) {
+  if (!requestId || state.quitRequestId !== requestId) return false;
+  state.quitRequestId = null;
+  state.quitPreparing = false;
+  // Keep in-flight saves and failed snapshots intact. If saving failed while
+  // preparation had cancelled the debounce, ordinary editing can retry it.
+  if (state.annDirty) scheduleAnnSave();
+  return true;
 }
 
 function loadAnnotations(site) {
@@ -3480,6 +3496,8 @@ function wireCompareRelay() {
     if (event.data.nd2wsi === "prepare-quit") {
       const requestId = String(event.data.requestId || "");
       if (requestId) acknowledgeUpdatePreparation(requestId);
+    } else if (event.data.nd2wsi === "cancel-quit") {
+      cancelUpdatePreparation(String(event.data.requestId || ""));
     } else if (["viewport-request", "viewport-apply", "viewport-nudge", "display-transform", "landmark-mode"].includes(event.data.nd2wsi)) {
       receiveSpatialCommand(event.data);
     } else if (event.data.nd2wsi === "compare-state") {

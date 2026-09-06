@@ -220,6 +220,12 @@ These navigation shortcuts apply on the image stage; arrows instead move between
 
 ## Questions and requests
 
+### An older version freezes while installing an update
+
+Version 1.2.8 fixes a main-thread deadlock in the app's preparation for an update. Annotation saving and file-handle cleanup now run in the background; Sparkle resumes on the main thread only after they finish. Aborted attempts cannot resume a later installation.
+
+An older app still runs its old updater code before it can replace itself. If it freezes at this step, save your work and close the viewer, download the latest DMG from [Releases](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest), and replace the app in Applications once. Keep your slide files, annotation sidecars, and viewing caches; none need to be deleted for this repair.
+
 The viewer grew out of one lab's need for speed, so it does what that lab needed first. If something is missing or unclear, open an [issue](https://github.com/myunghyunj/nd2wsi-viewer/issues).
 
 <details>

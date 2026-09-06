@@ -475,25 +475,83 @@ def start_server(store: Path):
 class UpdateShutdownCoordinator:
     """Flush browser work and release native resources before Sparkle relaunches."""
 
+    _FLUSH_TIMEOUT = 30.0
+    _RETRY_DELAY = 5.0
+    _DRAIN_POLL = 0.5
+
     def __init__(self, api: Api, window):
         self.api = api
         self.window = window
         self._lock = threading.Lock()
         self._running = False
         self._request_id = ""
-        self._completion = None
-        self._failure = None
+        self._cancelled = threading.Event()
+        self._wire_request_id = ""
+        self._teardown_started = False
 
-    def prepare_for_update(self, completion, failure) -> None:
+    def prepare_for_update(self, completion, failure) -> bool:
         with self._lock:
-            if self._running:
-                failure("update preparation is already running")
+            already_running = self._running
+            if not already_running:
+                self._running = True
+                request_id = self._request_id = uuid.uuid4().hex
+                cancelled = self._cancelled = threading.Event()
+                self._wire_request_id = ""
+                self._teardown_started = False
+        if already_running:
+            # Callbacks may re-enter the coordinator; never call one under its lock.
+            failure("update preparation is already running")
+            return False
+        # Sparkle invokes its delegate on AppKit's main thread. Even with a
+        # promise callback, pywebview.evaluate_js queues work to that thread and
+        # synchronously waits for it. Doing any preparation here deadlocks it.
+        worker = threading.Thread(
+            target=self._prepare_worker,
+            args=(request_id, cancelled, completion, failure),
+            name="updater-safe-relaunch",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception as exc:
+            self._finish_request(request_id)
+            failure(f"Could not start update preparation: {exc}")
+            return False
+        return True
+
+    def cancel_preparation(self) -> None:
+        """Invalidate retries and queued completions after Sparkle aborts."""
+        with self._lock:
+            self._cancelled.set()
+        # Only the worker releases ownership, after any in-flight teardown and
+        # browser recovery finish. A new installer must not overtake old I/O.
+
+    def _is_current(self, request_id, cancelled) -> bool:
+        with self._lock:
+            return self._request_id == request_id and not cancelled.is_set()
+
+    def _finish_request(self, request_id) -> None:
+        with self._lock:
+            if self._request_id == request_id:
+                self._request_id = ""
+                self._running = False
+                self._wire_request_id = ""
+
+    def _recover_browser(self, request_id) -> None:
+        with self._lock:
+            if self._request_id != request_id:
                 return
-            self._running = True
-            self._request_id = uuid.uuid4().hex
-            self._completion = completion
-            self._failure = failure
-        self._flush_panes()
+            wire_id = self._wire_request_id
+            after_teardown = self._teardown_started
+        if not wire_id:
+            return
+        try:
+            self.window.evaluate_js(
+                "window.nd2wsiCancelUpdate && window.nd2wsiCancelUpdate("
+                f"{json.dumps(wire_id)}, {json.dumps(after_teardown)})"
+            )
+        except Exception as exc:
+            _dlog(f"update cancellation recovery failed: {exc!r}")
 
     def _notice(self, message: str) -> None:
         try:
@@ -504,73 +562,121 @@ class UpdateShutdownCoordinator:
         except Exception as exc:
             _dlog(f"update notice failed: {exc!r}")
 
-    def _report_wait(self, message: str) -> None:
+    def _report_wait(self, message: str, failure) -> None:
         self._notice(message)
-        failure = self._failure
-        if failure is not None:
-            failure(message)
+        failure(message)
 
-    def _flush_panes(self) -> None:
+    def _flush_panes(self, request_id, cancelled):
         # Every retry has a distinct wire id so a late iframe reply from an
         # earlier timed-out attempt cannot satisfy the new attempt.
-        request = json.dumps(f"{self._request_id}-{uuid.uuid4().hex}")
+        wire_id = f"{request_id}-{uuid.uuid4().hex}"
+        with self._lock:
+            if self._request_id != request_id or cancelled.is_set():
+                return None
+            self._wire_request_id = wire_id
+        request = json.dumps(wire_id)
         script = (
             "typeof window.nd2wsiPrepareForUpdate === 'function' "
             f"? window.nd2wsiPrepareForUpdate({request}) "
             ": Promise.resolve({ok:true, panes:0})"
         )
+        answered = threading.Event()
+        results = []
+
+        def after_flush(result):
+            # This callback can arrive on any thread, or after cancellation.
+            # Each attempt owns its result/event, so late replies cannot satisfy
+            # a later attempt. It never calls a blocking browser API itself.
+            if self._is_current(request_id, cancelled):
+                results.append(result)
+                answered.set()
+
+        self.window.evaluate_js(script, callback=after_flush)
+        deadline = time.monotonic() + self._FLUSH_TIMEOUT
+        while not answered.is_set():
+            if cancelled.wait(min(0.05, max(0, deadline - time.monotonic()))):
+                return None
+            if time.monotonic() >= deadline:
+                return {"ok": False, "error": "the viewer did not confirm its saved state"}
+        return results[0]
+
+    def _prepare_worker(self, request_id, cancelled, completion, failure) -> None:
+        completed = threading.Event()
+        completion_errors = []
         try:
-            self.window.evaluate_js(script, callback=self._after_flush)
-        except Exception as exc:
-            self._retry_flush(f"Could not prepare the viewer: {exc}")
-
-    def _after_flush(self, result) -> None:
-        if not isinstance(result, dict) or not result.get("ok"):
-            if isinstance(result, dict):
-                message = str(result.get("error") or "annotations were not saved")
-            else:
-                message = "the viewer did not confirm its saved state"
-            self._retry_flush(f"Update waiting: {message}")
-            return
-        threading.Thread(
-            target=self._drain_and_close,
-            name="updater-safe-relaunch",
-            daemon=True,
-        ).start()
-
-    def _retry_flush(self, message: str) -> None:
-        self._report_wait(message + "; retrying…")
-        retry = threading.Timer(5.0, self._flush_panes)
-        retry.daemon = True
-        retry.start()
-
-    def _drain_and_close(self) -> None:
-        last_reason = None
-        try:
-            while True:
-                reason = self.api.update_block_reason()
-                if reason is None:
+            _dlog("Sparkle shutdown preparation started in background")
+            while self._is_current(request_id, cancelled):
+                try:
+                    result = self._flush_panes(request_id, cancelled)
+                except Exception as exc:
+                    result = {"ok": False, "error": f"Could not prepare the viewer: {exc}"}
+                if not self._is_current(request_id, cancelled):
+                    return
+                if isinstance(result, dict) and result.get("ok"):
                     break
-                if reason != last_reason:
-                    self._notice(reason)
-                    last_reason = reason
-                time.sleep(0.5)
-            self.api.stop_server_for_update()
-        except Exception as exc:
-            message = f"Update could not close the viewer safely: {exc}"
-            self._report_wait(message)
-            _dlog(message)
-            return
-
-        completion = self._completion
-        if completion is None:
-            return
-        try:
+                message = (result.get("error") if isinstance(result, dict) else None)
+                self._report_wait(
+                    f"Update waiting: {message or 'annotations were not saved'}; retrying…",
+                    failure,
+                )
+                if cancelled.wait(self._RETRY_DELAY):
+                    return
+            else:
+                return
+            _dlog("Sparkle shutdown: annotations saved")
+            if not self._drain_and_close(request_id, cancelled):
+                return
             from Foundation import NSOperationQueue
 
-            NSOperationQueue.mainQueue().addOperationWithBlock_(completion)
-        except Exception:
-            completion()
+            def finish():
+                if not self._is_current(request_id, cancelled):
+                    return
+                try:
+                    _dlog("Sparkle shutdown: resources released; resuming installer")
+                    completion()
+                except Exception as exc:
+                    completion_errors.append(exc)
+                finally:
+                    completed.set()
+
+            # Never fall back to invoking Sparkle on a worker thread.
+            NSOperationQueue.mainQueue().addOperationWithBlock_(finish)
+            while not completed.wait(0.05):
+                if cancelled.is_set():
+                    return
+            if completion_errors:
+                raise completion_errors[0]
+            # The continuation starts installation; it does not prove Sparkle
+            # has terminated us. Keep the saved-state token and worker alive
+            # so a later native abort can unlock panes even after this return.
+            cancelled.wait()
+        except Exception as exc:
+            if self._is_current(request_id, cancelled):
+                message = f"Update could not close the viewer safely: {exc}"
+                _dlog(message)
+                self._report_wait(message, failure)
+        finally:
+            if cancelled.is_set() or not completed.is_set() or completion_errors:
+                self._recover_browser(request_id)
+            self._finish_request(request_id)
+
+    def _drain_and_close(self, request_id, cancelled) -> bool:
+        last_reason = None
+        while self._is_current(request_id, cancelled):
+            reason = self.api.update_block_reason()
+            if reason is None:
+                break
+            if reason != last_reason:
+                self._notice(reason)
+                last_reason = reason
+            if cancelled.wait(self._DRAIN_POLL):
+                return False
+        with self._lock:
+            if self._request_id != request_id or cancelled.is_set():
+                return False
+            self._teardown_started = True
+        self.api.stop_server_for_update()
+        return self._is_current(request_id, cancelled)
 
 
 def _install_app_updater(api: Api, window) -> None:
