@@ -32,8 +32,8 @@ def _run(script):
 
 
 def test_production_loads_helper_and_separates_backing_from_user_frames():
-    app = APP.read_text()
-    index = INDEX.read_text()
+    app = APP.read_text(encoding="utf-8")
+    index = INDEX.read_text(encoding="utf-8")
 
     assert index.index("request-latest-v1.js") < index.index("app.js")
     assert "function activeFrameParams()" in app

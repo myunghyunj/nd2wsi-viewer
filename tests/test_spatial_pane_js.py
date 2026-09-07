@@ -151,7 +151,7 @@ def test_every_envelope_field_is_checked_at_receive_and_actual_apply(field, valu
 
 
 def test_production_routes_share_one_guarded_slot_and_one_open_listener():
-    app = (STATIC / "app.js").read_text()
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
     relay = app[app.index("function wireCompareRelay()") : app.index("/* ---- appearance")]
     assert relay.count('addHandler("open"') == 1
     assert 'addOnceHandler("open"' not in app[app.index("/* ---- linked compare") :]
@@ -170,7 +170,7 @@ def test_production_routes_share_one_guarded_slot_and_one_open_listener():
 
 
 def test_landmarks_keep_point_identity_and_record_acquisition_provenance():
-    app = (STATIC / "app.js").read_text()
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
     place = app[app.index("function placeLandmark(") : app.index("function undoLandmark(")]
     assert "id: crypto.randomUUID()" in place
     assert "...lm.points[nearest]" in place

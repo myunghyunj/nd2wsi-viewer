@@ -23,6 +23,32 @@
     '[role="textbox"]',
   ].join(",");
 
+  function isMac(platform) {
+    if (platform === undefined) {
+      const nav = typeof navigator === "undefined" ? null : navigator;
+      platform = nav?.userAgentData?.platform || nav?.platform || "MacIntel";
+    }
+    return /mac|iphone|ipad|ipod/i.test(String(platform));
+  }
+
+  function commandPressed(event, platform) {
+    if (!event) return false;
+    return isMac(platform) ? !!event.metaKey && !event.ctrlKey : !!event.ctrlKey && !event.metaKey;
+  }
+
+  function formatShortcutText(text, platform) {
+    if (isMac(platform)) return text;
+    return String(text).replaceAll("⌘", "Ctrl+").replaceAll("⌥", "Alt+")
+      .replaceAll("⇧", "Shift+").replaceAll("Option-drag", "Alt-drag");
+  }
+
+  function localizeLabels(document) {
+    document.documentElement.classList.toggle("platform-windows", !isMac());
+    for (const element of document.querySelectorAll("[title]")) {
+      element.title = formatShortcutText(element.title);
+    }
+  }
+
   function targetElement(target) {
     if (target && typeof target.closest === "function") return target;
     const parent = target && target.parentElement;
@@ -60,22 +86,22 @@
     return PANEL_BY_CODE[letterCode(event)] || null;
   }
 
-  function isOrientationShortcut(event) {
+  function isOrientationShortcut(event, platform) {
     if (
-      isBlocked(event) || !event.metaKey || event.ctrlKey ||
+      isBlocked(event) || !commandPressed(event, platform) ||
       event.altKey || event.shiftKey
     ) return false;
     return Boolean(ORIENTATION_BY_CODE[letterCode(event)]);
   }
 
-  function orientationForEvent(event) {
-    if (!isOrientationShortcut(event) || event.repeat) return null;
+  function orientationForEvent(event, platform) {
+    if (!isOrientationShortcut(event, platform) || event.repeat) return null;
     return ORIENTATION_BY_CODE[letterCode(event)];
   }
 
-  function tabIndexForEvent(event) {
+  function tabIndexForEvent(event, platform) {
     if (
-      isBlocked(event) || event.repeat || !event.metaKey || event.ctrlKey ||
+      isBlocked(event) || event.repeat || !commandPressed(event, platform) ||
       event.altKey || event.shiftKey
     ) return null;
     const match = /^(?:Digit|Numpad)([1-9])$/.exec(String(event.code || ""));
@@ -84,6 +110,7 @@
 
   return {
     isTypingEvent, letterCode, panelForEvent, isOrientationShortcut,
-    orientationForEvent, tabIndexForEvent,
+    orientationForEvent, tabIndexForEvent, isMac, commandPressed,
+    formatShortcutText, localizeLabels,
   };
 });

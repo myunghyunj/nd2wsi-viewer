@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import plistlib
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ spec.loader.exec_module(inject_sparkle)
 PUBLIC_KEY = base64.b64encode(bytes(range(32))).decode()
 
 
-def _fake_app_and_framework(tmp_path: Path, version: str = "2.9.6"):
+def _fake_app_and_framework(tmp_path: Path, version: str = "2.9.6", *, symlinks: bool = False):
     app = tmp_path / "nd2wsi-viewer.app"
     plist = app / "Contents" / "Info.plist"
     plist.parent.mkdir(parents=True)
@@ -30,18 +31,23 @@ def _fake_app_and_framework(tmp_path: Path, version: str = "2.9.6"):
         plistlib.dump({"CFBundleVersion": "1.1.1"}, handle)
 
     framework = tmp_path / "Sparkle.framework"
-    resources = framework / "Versions" / "B" / "Resources"
+    # Key/version/plist validation needs the resolved directory layout, not
+    # macOS framework symlinks or Windows symlink privileges.
+    version_dir = "B" if symlinks else "Current"
+    resources = framework / "Versions" / version_dir / "Resources"
     resources.mkdir(parents=True)
     with (resources / "Info.plist").open("wb") as handle:
         plistlib.dump({"CFBundleShortVersionString": version}, handle)
-    (framework / "Versions" / "B" / "Sparkle").write_bytes(b"fake")
-    (framework / "Versions" / "Current").symlink_to("B")
-    (framework / "Sparkle").symlink_to("Versions/Current/Sparkle")
+    (framework / "Versions" / version_dir / "Sparkle").write_bytes(b"fake")
+    if symlinks:
+        (framework / "Versions" / "Current").symlink_to("B", target_is_directory=True)
+        (framework / "Sparkle").symlink_to("Versions/Current/Sparkle")
     return app, plist, framework
 
 
-def test_inject_preserves_symlinks_and_requires_user_approval(tmp_path):
-    app, plist, framework = _fake_app_and_framework(tmp_path)
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS app/framework packaging symlink layout")
+def test_inject_preserves_mac_framework_symlinks(tmp_path):
+    app, _, framework = _fake_app_and_framework(tmp_path, symlinks=True)
     copied = inject_sparkle.inject(
         app=app,
         framework=framework,
@@ -50,6 +56,17 @@ def test_inject_preserves_symlinks_and_requires_user_approval(tmp_path):
     )
 
     assert (copied / "Sparkle").is_symlink()
+    assert (copied / "Versions" / "Current").is_symlink()
+
+
+def test_inject_requires_user_approval(tmp_path):
+    app, plist, framework = _fake_app_and_framework(tmp_path)
+    inject_sparkle.inject(
+        app=app,
+        framework=framework,
+        feed_url="https://updates.example.invalid/appcast.xml",
+        public_ed_key=PUBLIC_KEY,
+    )
     with plist.open("rb") as handle:
         info = plistlib.load(handle)
     assert info["SUEnableAutomaticChecks"] is True
@@ -124,10 +141,10 @@ def test_strict_relaunch_close_waits_and_closes_plate_without_timeout():
 
 
 def test_updater_ui_and_annotation_flush_are_wired():
-    shell = (ROOT / "nd2wsi" / "static" / "shell.html").read_text()
-    shell_js = (ROOT / "nd2wsi" / "static" / "shell-v1.js").read_text()
-    pane_js = (ROOT / "nd2wsi" / "static" / "app.js").read_text()
-    app_py = (ROOT / "nd2wsi" / "app.py").read_text()
+    shell = (ROOT / "nd2wsi" / "static" / "shell.html").read_text(encoding="utf-8")
+    shell_js = (ROOT / "nd2wsi" / "static" / "shell-v1.js").read_text(encoding="utf-8")
+    pane_js = (ROOT / "nd2wsi" / "static" / "app.js").read_text(encoding="utf-8")
+    app_py = (ROOT / "nd2wsi" / "app.py").read_text(encoding="utf-8")
 
     assert 'id="update-check"' in shell
     assert "window.nd2wsiPrepareForUpdate" in shell_js

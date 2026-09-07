@@ -2,6 +2,7 @@
 
 import io
 import json
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -185,12 +186,26 @@ def test_direct_svs_hides_auxiliary_images_after_atomic_source_replacement(
         decode = svs_module.associated_image_jpeg
 
         def replace_then_decode(source, name, **kwargs):
-            replacement.replace(path)
+            if sys.platform == "win32":
+                # Windows protects the mapped source with its sharing rules.
+                # A refused replacement must leave the original auxiliary
+                # images available and tied to the original fingerprint.
+                with pytest.raises(PermissionError):
+                    replacement.replace(path)
+            else:
+                replacement.replace(path)
             return decode(source, name, **kwargs)
 
         monkeypatch.setattr(svs_module, "associated_image_jpeg", replace_then_decode)
-        _http_error(base + "/api/associated/label.jpg", 404)
-        assert _get_json(base + "/api/inspect")["associated"] == []
+        if sys.platform == "win32":
+            response = urllib.request.urlopen(base + "/api/associated/label.jpg", timeout=30)
+            assert response.headers.get_content_type() == "image/jpeg"
+            assert response.read().startswith(b"\xff\xd8")
+            assert _get_json(base + "/api/inspect")["associated"] == ["thumbnail", "label", "macro"]
+            assert replacement.is_file()
+        else:
+            _http_error(base + "/api/associated/label.jpg", 404)
+            assert _get_json(base + "/api/inspect")["associated"] == []
 
 
 def test_associated_shape_guard_uses_checked_pixel_and_byte_limits():
@@ -348,3 +363,16 @@ def test_finder_reveal_uses_an_argument_vector_and_is_platform_guarded(tmp_path)
     ]
     with pytest.raises(RuntimeError, match="macOS"):
         reveal_in_file_manager(path, platform="linux", runner=runner)
+
+
+def test_explorer_reveal_preserves_unicode_spaces_and_metacharacters(tmp_path):
+    path = tmp_path / "한글 scan & sample.svs"
+    path.write_bytes(b"slide")
+    calls = []
+    reveal_in_file_manager(path, platform="win32", runner=lambda command, **kwargs: calls.append((command, kwargs)))
+    assert calls == [
+        (["explorer.exe", "/select,", str(path.resolve())], {"check": False, "timeout": 10})
+    ]
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        reveal_in_file_manager(path, platform="win32", runner=lambda *_args, **_kw: pytest.fail("opened missing path"))

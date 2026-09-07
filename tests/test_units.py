@@ -291,7 +291,7 @@ def test_concurrent_annotation_rescues_preserve_both_colliding_files(
     }
 
 
-def test_rescue_never_accepts_a_symlink_back_into_the_doomed_cache(tmp_path):
+def test_rescue_never_accepts_a_symlink_back_into_the_doomed_cache(tmp_path, symlink_support):
     from nd2wsi.server import rescue_annotations
 
     folder = tmp_path / "doomed"
@@ -313,7 +313,7 @@ def test_rescue_never_accepts_a_symlink_back_into_the_doomed_cache(tmp_path):
     assert not unsafe.exists()  # the rejected symlink is now dangling
 
 
-def test_rescue_flushes_the_destination_directory(tmp_path, monkeypatch):
+def test_rescue_flushes_the_file_and_supported_destination_directory(tmp_path, monkeypatch):
     from nd2wsi.server import rescue_annotations
 
     folder = tmp_path / "doomed"
@@ -322,17 +322,22 @@ def test_rescue_flushes_the_destination_directory(tmp_path, monkeypatch):
     (folder / "annotations_a.json").write_text('{"items":[]}')
     real_fsync = os.fsync
     directory_syncs = []
+    file_syncs = []
 
     def record_fsync(fd):
         if stat.S_ISDIR(os.fstat(fd).st_mode):
             directory_syncs.append(fd)
+        else:
+            file_syncs.append(fd)
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", record_fsync)
     saved = rescue_annotations(folder, home)
 
     assert len(saved) == 1 and saved[0].read_text() == '{"items":[]}'
-    assert directory_syncs
+    assert file_syncs
+    if os.name != "nt":
+        assert directory_syncs
 
 
 def test_auto_tile_follows_the_volume(monkeypatch, tmp_path):
@@ -422,6 +427,18 @@ def test_auto_workers_respects_cpu_memory_and_absolute_caps(monkeypatch):
     monkeypatch.setattr(c, "available_memory_bytes", lambda: None)
     monkeypatch.setattr(c.os, "cpu_count", lambda: 12)
     assert c.auto_workers() == 10
+
+
+def test_windows_worker_and_tile_policies_use_os_memory_and_cluster_size(monkeypatch):
+    from types import SimpleNamespace
+
+    from nd2wsi import convert as c
+
+    monkeypatch.setattr(c, "os", SimpleNamespace(name="nt", cpu_count=lambda: 32))
+    monkeypatch.setattr(c, "windows_available_memory_bytes", lambda: 192 * 1024**2)
+    monkeypatch.setattr(c, "windows_allocation_block_bytes", lambda _path: 1024**2)
+    assert c.auto_workers() == 2
+    assert c._block_bytes("X:\\microscopy") == 1024**2
 
 
 # -- title-bar double-click: the tab strip stands in for the title bar

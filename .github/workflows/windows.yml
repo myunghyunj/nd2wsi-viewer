@@ -1,0 +1,121 @@
+name: windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact 40-character commit SHA to build and verify
+        required: true
+        type: string
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Verify the requested source commit
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: |
+          if ($env:REQUESTED_REF -cnotmatch '^[0-9a-f]{40}$') { throw 'ref must be a full lowercase commit SHA' }
+          if ((git rev-parse HEAD) -ne $env:REQUESTED_REF) { throw 'Checked out the wrong commit' }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.14'
+          architecture: x64
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.12.10'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install the locked runtime and build tools
+        shell: pwsh
+        run: |
+          uv sync --frozen --all-extras --python "$env:pythonLocation\python.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Locked runtime installation failed' }
+          uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --default-index https://pypi.org/simple -r packaging/windows-build-requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Locked build tooling installation failed' }
+      - name: Windows unit and integration tests
+        run: .venv/Scripts/python.exe -m pytest tests -q -m 'not realdata'
+      - name: Fetch checksum-verified real ND2 acquisitions
+        run: .venv/Scripts/python.exe scripts/fetch_testdata.py
+      - name: Windows real-data tests
+        run: .venv/Scripts/python.exe -m pytest tests -q -m realdata
+      - name: Prepare Microsoft WebView2
+        shell: pwsh
+        run: ./packaging/ensure_webview2.ps1
+      - name: Build executable and require packaged headless and GUI smoke
+        run: .venv/Scripts/python.exe packaging/build_windows.py --smoke-file docs/example_cell.nd2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-portable
+          path: |
+            dist/windows/*.zip
+            dist/windows/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-fixture
+          path: docs/example_cell.nd2
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-build-evidence
+          path: dist/windows/build-smoke/
+          retention-days: 30
+
+  verify:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            platform: x64
+          - runner: windows-11-arm
+            platform: arm64-emulation
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-portable
+          path: dist/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-smoke-fixture
+          path: testdata
+      - name: Prepare Microsoft WebView2
+        shell: pwsh
+        run: ./packaging/ensure_webview2.ps1
+      - name: Verify the shipped EXE with Korean and space-containing paths
+        shell: pwsh
+        run: |
+          $archive = @(Get-ChildItem -LiteralPath dist/windows -Filter '*.zip')
+          if ($archive.Count -ne 1) { throw 'Expected exactly one portable ZIP' }
+          ./packaging/verify_windows.ps1 -Archive $archive[0].FullName -SmokeFile testdata/example_cell.nd2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-verification-${{ matrix.platform }}
+          path: dist/windows/verification/
+          retention-days: 30

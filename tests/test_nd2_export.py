@@ -1,4 +1,6 @@
 """ND2 export round-trips (need limnd2, from Laboratory Imaging's index)."""
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -117,8 +119,10 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
     base = server_url(httpd).rstrip("/")
     try:
         first = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
-        assert first["items"] == [] and first["path"].endswith(
-            "nd2wsi/annotations/annotations_fluor.nd2--t0-p0-z0.json"
+        assert first["items"] == []
+        reported_path = Path(first["path"])
+        assert reported_path.parts[-3:] == (
+            "nd2wsi", "annotations", "annotations_fluor.nd2--t0-p0-z0.json",
         )
 
         items = [
@@ -141,6 +145,7 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
             / "annotations_fluor.nd2--t0-p0-z0.json"
         )
         assert sidecar.exists()
+        assert reported_path.samefile(sidecar)
         on_disk = json.loads(sidecar.read_text())
         assert on_disk["items"] == items
         assert on_disk["format"] == "nd2wsi-annotations/2"

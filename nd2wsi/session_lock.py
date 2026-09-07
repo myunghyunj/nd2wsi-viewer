@@ -7,14 +7,14 @@ own exclusivity.  The lock file is deliberately never unlinked: keeping one
 inode avoids two contenders locking different files under the same pathname.
 
 The JSON payload is diagnostic only.  Lock ownership depends exclusively on
-``flock`` and is released when the descriptor is closed, including on process
-exit.
+the kernel lock and is released when the descriptor is closed, including on
+process exit. Windows uses a byte-range lock beyond the diagnostic payload;
+POSIX uses ``flock``.
 """
 
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import os
 import socket
@@ -23,6 +23,29 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from .platform_io import BINARY
+
+if os.name == "nt":
+    import msvcrt
+
+    # Locking past EOF is supported on Windows and does not extend the file.
+    # Keeping the range outside the JSON lets other readers inspect metadata:
+    # unlike flock, Windows range locks also deny ordinary reads and writes.
+    _LOCK_OFFSET = 0x7FFFFFFF
+
+    def _kernel_lock(fd: int, *, unlock: bool = False) -> None:
+        position = os.lseek(fd, 0, os.SEEK_CUR)
+        try:
+            os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
+        finally:
+            os.lseek(fd, position, os.SEEK_SET)
+else:
+    import fcntl
+
+    def _kernel_lock(fd: int, *, unlock: bool = False) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 class SessionFileLock:
@@ -51,7 +74,7 @@ class SessionFileLock:
         poll = max(0.001, float(poll))
         deadline = time.monotonic() + timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_CREAT | os.O_RDWR
+        flags = os.O_CREAT | os.O_RDWR | BINARY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         while True:
@@ -67,7 +90,7 @@ class SessionFileLock:
                     )
                 while True:
                     try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        _kernel_lock(fd)
                         locked = True
                         break
                     except OSError as exc:
@@ -93,7 +116,7 @@ class SessionFileLock:
                 if not path_is_opened_inode:
                     # The pathname changed between open and flock. Never hold a
                     # detached inode while a contender locks its replacement.
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    _kernel_lock(fd, unlock=True)
                     locked = False
                     os.close(fd)
                     remaining = deadline - time.monotonic()
@@ -112,7 +135,7 @@ class SessionFileLock:
                     self._fd = None
                 if locked:
                     try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        _kernel_lock(fd, unlock=True)
                     except OSError:
                         pass
                 try:
@@ -142,7 +165,7 @@ class SessionFileLock:
                 view = view[written:]
             os.fsync(fd)
         except OSError:
-            # The open descriptor and flock are the authority.  Diagnostics
+            # The open descriptor and kernel lock are the authority. Diagnostics
             # must never turn a successfully held kernel lock into a failure.
             pass
 
@@ -153,7 +176,7 @@ class SessionFileLock:
         if fd is None:
             return
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _kernel_lock(fd, unlock=True)
         finally:
             os.close(fd)
 

@@ -53,6 +53,7 @@ from .plate_integrity import (
     quarantine_chunk,
     zarr_v2_chunk_path,
 )
+from .platform_io import BINARY, filesystem_path, read_at
 from .reader import (
     FRAME_AXES,
     PlaneSource,
@@ -422,7 +423,7 @@ class PlateStore:
             expected = (1, shape[1], 1, shape[3], shape[4], shape[5])
             try:
                 root = zarr.open_group(
-                    str(container / THUMBS_NAME), mode=mode, zarr_format=2
+                    filesystem_path(container / THUMBS_NAME), mode=mode, zarr_format=2
                 )
                 chunks = tuple(root["thumbs"].chunks)
             except Exception:
@@ -440,7 +441,7 @@ class PlateStore:
                 quarantine(container)
                 manifest = cls._create(source, container, fingerprint, shape)
                 root = zarr.open_group(
-                    str(container / THUMBS_NAME), mode="r+", zarr_format=2
+                    filesystem_path(container / THUMBS_NAME), mode="r+", zarr_format=2
                 )
             elif root is None:
                 if writer is None:
@@ -448,7 +449,7 @@ class PlateStore:
                 quarantine(container)
                 manifest = cls._create(source, container, fingerprint, shape)
                 root = zarr.open_group(
-                    str(container / THUMBS_NAME), mode="r+", zarr_format=2
+                    filesystem_path(container / THUMBS_NAME), mode="r+", zarr_format=2
                 )
 
             try:
@@ -467,7 +468,7 @@ class PlateStore:
                 quarantine(container)
                 manifest = cls._create(source, container, fingerprint, shape)
                 root = zarr.open_group(
-                    str(container / THUMBS_NAME), mode="r+", zarr_format=2
+                    filesystem_path(container / THUMBS_NAME), mode="r+", zarr_format=2
                 )
                 cls._validate_root(root, shape, source.dtype, require_digest=True)
 
@@ -571,8 +572,8 @@ class PlateStore:
     @staticmethod
     def _read(container: Path) -> dict | None:
         try:
-            m = json.loads((container / MANIFEST_NAME).read_text())
-        except (OSError, json.JSONDecodeError):
+            m = json.loads((container / MANIFEST_NAME).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return None
         if not isinstance(m, dict):
             return None
@@ -609,7 +610,7 @@ class PlateStore:
         if container.exists():
             quarantine(container)
         container.mkdir(parents=True, exist_ok=True)
-        root = zarr.open_group(str(container / THUMBS_NAME), mode="w", zarr_format=2)
+        root = zarr.open_group(filesystem_path(container / THUMBS_NAME), mode="w", zarr_format=2)
         c, h8, w8 = shape[3], shape[4], shape[5]
         # one chunk per time point and z plane holding every site: that is
         # what the grid reads in one go, and it keeps the file count low on
@@ -639,7 +640,10 @@ class PlateStore:
             "kind": "plate",
             "complete": True,
             "generation": uuid.uuid4().hex,
-            "source": {**fingerprint, "relative_path": os.path.relpath(source.path, container)},
+            "source": {
+                **fingerprint,
+                "relative_path": Path(os.path.relpath(source.path, container)).as_posix(),
+            },
             "thumbs": {"k": THUMB_K, "shape": list(shape), "dtype": str(source.dtype)},
             "thumbs_name": THUMBS_NAME,
             "integrity": {
@@ -655,7 +659,7 @@ class PlateStore:
     @staticmethod
     def _write_manifest(container: Path, manifest: dict) -> None:
         tmp = container / f".{MANIFEST_NAME}.{uuid.uuid4().hex}.tmp"
-        tmp.write_text(json.dumps(manifest, indent=1))
+        tmp.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
         tmp.replace(container / MANIFEST_NAME)
 
     # ---- frames -----------------------------------------------------------
@@ -683,13 +687,13 @@ class PlateStore:
                 return True
             self._last_generation_check = now
             try:
-                current = json.loads((self.container / MANIFEST_NAME).read_text())
+                current = json.loads((self.container / MANIFEST_NAME).read_text(encoding="utf-8"))
                 matches = (
                     isinstance(current, dict)
                     and current.get("generation")
                     == self.manifest.get("generation")
                 )
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeError, json.JSONDecodeError):
                 matches = False
             if matches:
                 # Capabilities such as per-frame integrity are published in the
@@ -763,7 +767,7 @@ class PlateStore:
             return False
         try:
             path = zarr_v2_chunk_path(
-                self.container / THUMBS_NAME / "thumbs",
+                Path(filesystem_path(self.container / THUMBS_NAME / "thumbs")),
                 (int(t), 0, int(z), 0, 0, 0),
             )
             return quarantine_chunk(path) is not None
@@ -1223,10 +1227,19 @@ class PlateSource:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 self._f = nd2.ND2File(self._source_file)
-            self._fd = os.dup(self._source_file.fileno())
+            # The Windows positional-read fallback owns its file position;
+            # dup would share that position with nd2's buffered source reader.
+            self._fd = (
+                os.open(self.path, os.O_RDONLY | BINARY)
+                if os.name == "nt"
+                else os.dup(self._source_file.fileno())
+            )
             opened = os.fstat(self._fd)
             after = os.stat(self.path)
-            if _file_identity(opened) != _file_identity(after):
+            if (
+                _file_identity(opened) != _file_identity(after)
+                or _file_identity(opened) != _file_identity(os.fstat(self._source_file.fileno()))
+            ):
                 raise ValueError(
                     "the source file changed while it was opening; retry the open"
                 )
@@ -1492,7 +1505,7 @@ class PlateSource:
     def _read_raw(self, seq: int) -> np.ndarray:
         """The frame's pixels as an array that owns its memory.
 
-        One ``pread`` of the frame's bytes: a whole frame arrives in one
+        One positional read of the frame's bytes: a whole frame arrives in one
         sequential read instead of thousands of page faults. Falls back to
         a copy out of the memory map when the file pads its rows or the
         reader gives no offset.
@@ -1507,7 +1520,7 @@ class PlateSource:
             offset = None
         nbytes = int(np.prod(self._raw_shape)) * int(self.dtype.itemsize)
         if offset is not None and strides is None and self._fd >= 0 and self._disk_shape:
-            buf = os.pread(self._fd, nbytes, int(offset))
+            buf = read_at(self._fd, nbytes, int(offset))
             if len(buf) == nbytes:
                 flat = np.frombuffer(buf, dtype=self.dtype)
                 arr = flat.reshape(self._disk_shape).transpose((2, 0, 1, 3)).squeeze()

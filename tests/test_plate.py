@@ -55,6 +55,48 @@ def plate_nd2(tmp_path):
     return path
 
 
+def test_plate_positional_read_fallback_keeps_frames_separate(plate_nd2, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from itertools import product
+
+    from nd2wsi.plate import PlateSource
+
+    monkeypatch.delattr(os, "pread", raising=False)
+    source = PlateSource(plate_nd2, store=False)
+    try:
+        coords = list(product(range(T), range(P), range(Z)))
+
+        def read_frame(coord):
+            frame = source.frame(*coord)
+            assert np.all(frame == value(*coord))
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(read_frame, coords))
+    finally:
+        source.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows denies replacement of an open ND2 file")
+def test_windows_source_replacement_requires_closing_the_reader(plate_nd2, tmp_path):
+    from nd2wsi.plate import PlateSource
+
+    replacement = tmp_path / "replacement.nd2"
+    _write_plate(replacement, offset=7000)
+    source = PlateSource(plate_nd2, store=False)
+    try:
+        with pytest.raises(PermissionError):
+            replacement.replace(plate_nd2)
+        assert np.all(source.frame(0, 0, 0) == value(0, 0, 0))
+    finally:
+        source.close()
+    replacement.replace(plate_nd2)
+    reopened = PlateSource(plate_nd2, store=False)
+    try:
+        assert np.all(reopened.frame(0, 0, 0) == value(0, 0, 0) + 7000)
+    finally:
+        reopened.close()
+
+
 @pytest.fixture(scope="module")
 def served(tmp_path_factory):
     from nd2wsi.server import create_server, server_url
@@ -773,6 +815,7 @@ def test_each_open_has_a_distinct_ram_cache_owner(plate_nd2):
         first.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies replacement of an open ND2 file")
 def test_old_inflight_read_cannot_fill_a_replacement_sources_cache(tmp_path, monkeypatch):
     from nd2wsi.plate import PlateSource
 
@@ -1000,6 +1043,7 @@ def test_store_in_the_old_layout_is_quarantined_before_rebuild(plate_nd2):
     assert container.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies replacement of an open ND2 file")
 def test_cached_histogram_rejects_same_path_source_replacement(plate_nd2):
     from nd2wsi.plate import PlateSource
 
@@ -1017,6 +1061,7 @@ def test_cached_histogram_rejects_same_path_source_replacement(plate_nd2):
         source.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies replacement of an open ND2 file")
 def test_focus_map_rejects_same_path_source_replacement(plate_nd2):
     from nd2wsi.plate import PlateSource
 
@@ -1520,6 +1565,7 @@ def test_concurrent_store_starts_create_only_one_worker(plate_nd2, monkeypatch):
         source.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies replacement of an open ND2 file")
 def test_same_size_preserved_mtime_replacement_is_detected_while_opening(
     tmp_path, monkeypatch
 ):

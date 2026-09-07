@@ -76,7 +76,7 @@ const emit = (value) => process.stdout.write(JSON.stringify(value));
     result = subprocess.run(
         [NODE, "-e", script, str(APP)],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         check=True,
         timeout=20,
     )

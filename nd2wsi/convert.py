@@ -24,6 +24,11 @@ from typing import Any
 
 import numpy as np
 
+from .platform_io import (
+    filesystem_path,
+    windows_allocation_block_bytes,
+    windows_available_memory_bytes,
+)
 from .reader import PlaneSelection, PlaneSource, level_shapes, nice_bytes, open_plane
 from .storage import DEFAULT_STORAGE, StorageBackend
 
@@ -56,11 +61,17 @@ def available_memory_bytes() -> int | None:
 
     Linux publishes MemAvailable, which counts reclaimable page cache too.
     The bare free-page count would throttle a healthy machine whose RAM is
-    rightly full of cache, so it is never used. macOS has no cheap
+    rightly full of cache, so it is never used. Windows supplies available
+    physical memory through GlobalMemoryStatusEx. macOS has no cheap
     equivalent; the memory ceiling simply does not apply there.
     """
+    if os.name == "nt":
+        try:
+            return windows_available_memory_bytes()
+        except OSError:
+            return None
     try:
-        with open("/proc/meminfo") as fh:
+        with open("/proc/meminfo", encoding="ascii") as fh:
             for line in fh:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024
@@ -617,7 +628,11 @@ def sweep_appledouble(folder: str | Path) -> tuple[int, int]:
                 continue
             path = os.path.join(root, name)
             try:
-                size = os.stat(path).st_blocks * 512 or block
+                entry = os.stat(path)
+                allocated = getattr(entry, "st_blocks", None)
+                size = (allocated * 512 or block) if allocated is not None else (
+                    max(1, math.ceil(entry.st_size / block)) * block
+                )
                 os.unlink(path)
             except OSError:
                 continue
@@ -628,12 +643,12 @@ def sweep_appledouble(folder: str | Path) -> tuple[int, int]:
 
 def _block_bytes(folder: str | Path) -> int:
     """Smallest number of bytes a file can occupy on this volume."""
-    import os
-
     try:
+        if os.name == "nt":
+            return windows_allocation_block_bytes(folder)
         st = os.statvfs(str(folder))
         return max(512, int(st.f_frsize))
-    except (OSError, ValueError):
+    except (AttributeError, OSError, ValueError):
         return 4096
 
 
@@ -1035,8 +1050,8 @@ def is_nd2wsi_store(path: str | Path) -> bool:
     """True for a directory this tool wrote, cheaply and without opening it."""
     attrs = Path(path) / ".zattrs"
     try:
-        return '"nd2wsi"' in attrs.read_text()
-    except OSError:
+        return '"nd2wsi"' in attrs.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
         return False
 
 
@@ -1087,7 +1102,7 @@ def open_store(path: str | Path) -> tuple[Any, dict[str, Any]]:
     """Open a converted store, returning (zarr group, attrs dict)."""
     import zarr
 
-    root = zarr.open_group(str(path), mode="r")
+    root = zarr.open_group(filesystem_path(path), mode="r")
     attrs = json.loads(json.dumps(dict(root.attrs)))
     if "nd2wsi" not in attrs or "multiscales" not in attrs:
         raise ValueError(

@@ -77,7 +77,7 @@ def test_roi_projects_all_four_raw_corners_through_display_transform():
 
 
 def test_roi_uses_a_separate_svg_layer_and_refreshes_with_the_viewport():
-    app = APP.read_text()
+    app = APP.read_text(encoding="utf-8")
     draw = app[app.index("function ensureRoiOverlayLayer(") : app.index("function restoreRoiOverlay(")]
     viewport_handler = app[
         app.index('viewer.addHandler("update-viewport"') :

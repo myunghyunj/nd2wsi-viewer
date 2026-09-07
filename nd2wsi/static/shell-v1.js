@@ -15,6 +15,7 @@ const pairPicker = { open: false, mode: "start", replaceSid: null };
 
 const Align = window.nd2wsiAlign;
 const ShortcutRouter = window.Nd2ShortcutRouter;
+ShortcutRouter?.localizeLabels(document);
 const NativeScope = window.Nd2NativeScope;
 const VIEWPORT_PROTOCOL_VERSION = 2;
 const VIEWPORT_THROTTLE_MS = 48;
@@ -112,8 +113,10 @@ async function refreshUpdaterButton() {
   try {
     const status = await api.update_status();
     button.disabled = !status.available;
+    const label = status.mode === "download" ? "Download Updates…" : "Check for Updates…";
+    button.setAttribute("aria-label", label);
     button.title = status.available
-      ? `Check for Updates… · version ${status.version}`
+      ? `${label} · version ${status.version}`
       : "Updates are unavailable in this build";
   } catch (_) {
     button.disabled = true;
@@ -149,7 +152,7 @@ function applyShellTheme(theme) {
 function markNativeChrome() {
   // inside the packaged app the title bar is hidden and the traffic
   // lights float over the tab strip, which needs room and a drag handle
-  document.documentElement.classList.add("native-chrome");
+  document.documentElement.classList.toggle("native-chrome", ShortcutRouter?.isMac() ?? false);
 }
 if (window.pywebview !== undefined) markNativeChrome();
 window.addEventListener("pywebviewready", () => {
@@ -276,7 +279,9 @@ function render() {
   compareToggle.setAttribute("aria-pressed", String(compare.enabled));
   compareToggle.setAttribute("aria-expanded", String(pairPicker.open && pairPicker.mode === "start"));
   compareToggle.setAttribute("aria-label", compare.enabled ? "Stop comparing slides" : "Compare slides");
-  compareToggle.title = compare.enabled ? "Stop comparing slides (⌘\\)" : "Compare slides (⌘\\)";
+  compareToggle.title = ShortcutRouter.formatShortcutText(
+    compare.enabled ? "Stop comparing slides (⌘\\)" : "Compare slides (⌘\\)"
+  );
   if (compare.enabled) {
     document.title = `${groupSids().map(slideName).join(" ↔ ")} — nd2wsi-viewer`;
   } else {
@@ -1838,9 +1843,9 @@ function updateCompareControls() {
   link.disabled = pending || landmarking || !spatialGroupReady();
   link.setAttribute("aria-pressed", String(compare.linked && !pending));
   link.setAttribute("aria-label", compare.linked ? "Unlink views" : "Relink and capture alignment");
-  link.title = compare.linked
+  link.title = ShortcutRouter.formatShortcutText(compare.linked
     ? "Unlink, move any slide, then relink (L). While linked, arrow keys and Option-drag nudge the alignment."
-    : "Relink and keep the current positions as the alignment (L)";
+    : "Relink and keep the current positions as the alignment (L)");
 
   const members = compare.members.map((sid) => compare.pairs.get(sid)).filter(Boolean);
   updateOrientationControls();
@@ -1872,9 +1877,9 @@ function updateCompareControls() {
   const deltaEl = $("compare-delta");
   deltaEl.textContent = delta;
   deltaEl.hidden = !delta;
-  deltaEl.title = delta
+  deltaEl.title = ShortcutRouter.formatShortcutText(delta
     ? "Hand-tuned offset beyond matched centers. Arrow keys move it one screen pixel, Shift ten, Option-drag moves it freely."
-    : "";
+    : "");
 
   renderChips();
   syncCompareToolbarSpace();
@@ -2332,7 +2337,7 @@ zone.addEventListener("drop", (event) => {
     .map((file) => file.pywebviewFullPath || file.path)
     .filter(Boolean);
   if (paths.length) openMany(paths);
-  else showError("The browser hid the dropped file paths. Use + or the macOS app.");
+  else showError("The browser hid the dropped file paths. Use + or the desktop app.");
 });
 window.addEventListener("drop", (event) => event.preventDefault());
 document.addEventListener("dragover", (event) => event.preventDefault(), true);

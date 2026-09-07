@@ -5,7 +5,7 @@
 <h1 align="center">nd2wsi-viewer</h1>
 
 <p align="center">
-  <strong>A fast slide viewer for Nikon ND2 scans and Aperio SVS slides, on a Mac.</strong><br>
+  <strong>A fast slide viewer for Nikon ND2 scans and Aperio SVS slides, on macOS and Windows.</strong><br>
   Open a scan, fly from the whole slide to single cells, measure, mark, and cut out what you need.
 </p>
 
@@ -42,9 +42,38 @@ Nothing leaves your computer. There is no upload and no account.
 - Cuts out any region as ND2, TIFF, PNG, or JPEG, or exports the whole slide at a reduced size.
 - Puts up to four slides of the same case side by side and keeps them in step while you move.
 - Aligns serial sections with four clicked points.
-- Checks once a day for signed GitHub releases and always asks before installing one.
+- On macOS, checks once a day for signed GitHub releases and always asks before installing one.
 
 ## Get started
+
+### Windows (Intel, AMD, and ARM PCs)
+
+Download [nd2wsi-viewer-1.2.8-Setup.exe](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.8/nd2wsi-viewer-1.2.8-Setup.exe)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.8/nd2wsi-viewer-1.2.8-Setup.exe.sha256).
+Run Setup to install the app for your Windows account. Python and scientific
+libraries are included; no separate Python installation or GPU is required.
+Use the Start Menu or Desktop shortcut to open the app, and Windows Settings >
+Apps to uninstall it. Images, annotations, and viewing caches are preserved.
+
+The x64 app targets Windows 10 version 1709 or later and Windows 11 on
+Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
+silicon, it uses Windows x64 emulation. The exact installer was verified on
+Windows 11 ARM64; actual Windows 10 Education and separate native x64 hardware
+were not tested in that run. .NET Framework 4.6.2 or later and Microsoft Edge
+WebView2 Runtime are required. Setup can install missing WebView2 with an
+Internet connection.
+
+Use **Ctrl** in place of the Mac **⌘** shortcuts below, and **Alt** for
+**Option**. Open files using `+`, drag and drop, or pass a file to the executable.
+Windows uses its standard title bar and window buttons. Updates are installed
+manually from [Releases](https://github.com/myunghyunj/nd2wsi-viewer/releases);
+Windows does not use the macOS Sparkle updater.
+
+The app and Setup are not Authenticode-signed, so Windows may display an
+unknown-publisher warning. See [Windows distribution and verification](docs/windows.md)
+for requirements, tested behavior, and build instructions.
+
+### macOS (Apple silicon)
 
 1. Download `nd2wsi-viewer.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. It runs on Apple silicon Macs.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.

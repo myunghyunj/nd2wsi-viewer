@@ -15,7 +15,11 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 SCRIPT = r"""
 const fs = require('fs');
 const vm = require('vm');
+Object.defineProperty(globalThis, 'navigator', {
+  value: {platform: 'MacIntel'}, configurable: true,
+});
 const Align = require(process.argv[1] + '/align-v1.js');
+const ShortcutRouter = require(process.argv[1] + '/shortcut-router-v1.js');
 const source = fs.readFileSync(process.argv[1] + '/shell-v1.js', 'utf8');
 function production(name) {
   const start = source.indexOf('function ' + name + '(');
@@ -71,7 +75,7 @@ const originalPair = {mode: 'physical', transform: {a:1,b:0,c:0,d:1,tx:10,ty:20}
 const frames = new Map([['a', $('frame-a')], ['b', $('frame-b')]]);
 const context = vm.createContext({
   $, document, calls, styleValues, frames, active: 'a', MAX_GROUP: 4,
-  Align, VIEWPORT_PROTOCOL_VERSION: 2, VIEWPORT_THROTTLE_MS: 48, LANDMARKS_NEEDED: 4,
+  Align, ShortcutRouter, VIEWPORT_PROTOCOL_VERSION: 2, VIEWPORT_THROTTLE_MS: 48, LANDMARKS_NEEDED: 4,
   structuredClone, crypto: {randomUUID: () => `token-${++tokenSeq}`},
   readyFrames: new Set(['a','b','c']),
   window: {innerWidth: 1200, innerHeight: 900}, location: {origin: 'http://qa.invalid'},
@@ -385,8 +389,8 @@ def test_leaving_compare_hides_reopen_button_and_next_group_starts_with_tools():
 
 
 def test_close_button_only_hides_tools_and_link_button_still_stops_comparison():
-    shell = (STATIC / "shell-v1.js").read_text()
-    html = (STATIC / "shell.html").read_text()
+    shell = (STATIC / "shell-v1.js").read_text(encoding="utf-8")
+    html = (STATIC / "shell.html").read_text(encoding="utf-8")
     assert '$("compare-close").onclick = () => setCompareToolsVisible(false)' in shell
     assert '$("compare-close").onclick = stopCompare' not in shell
     assert '$("compare-toggle").onclick = toggleCompare' in shell

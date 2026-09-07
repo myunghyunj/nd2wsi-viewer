@@ -18,6 +18,10 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 SCRIPT = r"""
 const fs=require('fs'), vm=require('vm');
 const root=process.argv[1], config=JSON.parse(process.argv[2]);
+// Never let the machine running Node select the scenario's keyboard layout.
+Object.defineProperty(globalThis,'navigator',{
+  value:{platform:config.platform || 'MacIntel'},configurable:true,
+});
 const source=fs.readFileSync(root+'/app.js','utf8');
 const vendor=fs.readFileSync(root+'/vendor/openseadragon/openseadragon.min.js','utf8');
 const Router=require(root+'/shortcut-router-v1.js');
@@ -173,7 +177,7 @@ process.stdout.write(JSON.stringify(out));
 def pane(events=(), **config):
     result = subprocess.run(
         [NODE, "-e", SCRIPT, str(STATIC), json.dumps({"events": events, **config})],
-        capture_output=True, text=True, timeout=20,
+        capture_output=True, text=True, encoding="utf-8", timeout=20,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -260,8 +264,9 @@ def test_osd_vetoes_composition_even_when_the_browser_reports_a_latin_keycode(
     ("R", "rotate-right", {"degrees": 90, "flipped": False}),
     ("F", "flip-horizontal", {"degrees": 0, "flipped": True}),
 ])
-def test_command_orientation_runs_the_production_action_once(letter, action, pose):
-    out = pane([key(letter, metaKey=True)])
+@pytest.mark.parametrize("platform,modifier", [("MacIntel", "metaKey"), ("Win32", "ctrlKey")])
+def test_command_orientation_runs_the_production_action_once(letter, action, pose, platform, modifier):
+    out = pane([key(letter, **{modifier: True})], platform=platform)
     assert out["orientationCalls"] == [action]
     assert out["applied"] == [pose]
     assert out["pose"] == pose
@@ -356,14 +361,15 @@ def test_shell_focused_message_is_bound_to_the_same_local_pane_context(config, a
     ("r", {"degrees": 90, "flipped": False}),
     ("f", {"degrees": 0, "flipped": True}),
 ])
-def test_shell_command_orientation_targets_active_linked_slide(letter, pose):
+@pytest.mark.parametrize("platform,modifier", [("MacIntel", "metaKey"), ("Win32", "ctrlKey")])
+def test_shell_command_orientation_targets_active_linked_slide(letter, pose, platform, modifier):
     out = run_shell(f"""
       active='a'; compare.orientationSid='c';
-      const consumed=pressKey('{letter}',{{code:'Key{letter.upper()}',metaKey:true}});
+      const consumed=pressKey('{letter}',{{code:'Key{letter.upper()}',{modifier}:true}});
       const target=compare.pendingRequest?.targetSid;
       replyAll();
       ({{consumed,target,pose:displayTransformFor('c'),other:displayTransformFor('b')}});
-    """)
+    """, platform=platform)
     assert out == {"consumed": {"prevented": True, "stopped": True}, "target": "c",
                    "pose": pose, "other": {"degrees": 0, "flipped": False}}
 

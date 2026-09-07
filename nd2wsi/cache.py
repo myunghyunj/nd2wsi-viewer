@@ -35,6 +35,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .platform_io import BINARY, process_is_alive, read_at, set_fd_times, write_at
 from .session_lock import SessionFileLock
 
 MANAGED_DIR = "nd2wsi"
@@ -87,8 +88,8 @@ def newer_cache_format(container: str | Path) -> str | None:
     to open and names the update instead of destroying work.
     """
     try:
-        m = json.loads((Path(container) / MANIFEST_NAME).read_text())
-    except (OSError, json.JSONDecodeError):
+        m = json.loads((Path(container) / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(m, dict) or not m.get("complete"):
         return None
@@ -200,7 +201,7 @@ def write_manifest(
         "generation": uuid.uuid4().hex,
         "source": {
             **fingerprint,
-            "relative_path": os.path.relpath(slide, container),
+            "relative_path": Path(os.path.relpath(slide, container)).as_posix(),
         },
         "selection": {**selection, "z_resolved": resolved_z},
         "image": {"shape_cyx": list(shape_cyx), "dtype": dtype},
@@ -215,14 +216,14 @@ def write_manifest(
         "created_by": {"nd2wsi_version": __version__},
     }
     tmp = container / f".{MANIFEST_NAME}.tmp"
-    tmp.write_text(json.dumps(manifest, indent=1))
+    tmp.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     tmp.replace(container / MANIFEST_NAME)
 
 
 def read_manifest(container: str | Path) -> dict[str, Any] | None:
     try:
-        m = json.loads((Path(container) / MANIFEST_NAME).read_text())
-    except (OSError, json.JSONDecodeError):
+        m = json.loads((Path(container) / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return m if isinstance(m, dict) and m.get("complete") else None
 
@@ -289,8 +290,8 @@ class CacheLock:
 
     def _read(self, path: Path | None = None) -> dict[str, Any] | None:
         try:
-            info = json.loads((path or self.path).read_text())
-        except (OSError, json.JSONDecodeError):
+            info = json.loads((path or self.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return None
         return info if isinstance(info, dict) else None
 
@@ -298,7 +299,7 @@ class CacheLock:
     def _read_fd(fd: int) -> tuple[dict[str, Any] | None, os.stat_result]:
         st = os.fstat(fd)
         try:
-            info = json.loads(os.pread(fd, st.st_size, 0))
+            info = json.loads(read_at(fd, st.st_size, 0))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             info = None
         return (info if isinstance(info, dict) else None), st
@@ -309,7 +310,7 @@ class CacheLock:
         view = memoryview(payload)
         offset = 0
         while view:
-            written = os.pwrite(fd, view, offset)
+            written = write_at(fd, view, offset)
             if written <= 0:
                 raise OSError("short write while updating cache lock")
             offset += written
@@ -350,7 +351,7 @@ class CacheLock:
             pass
         try:
             os.ftruncate(fd, 0)
-            os.utime(fd, (0, 0))
+            set_fd_times(fd, 0, 0)
         except OSError:
             # If even invalidation fails, the ordinary malformed-lock grace is
             # still preferable to unlinking a pathname a legacy process may
@@ -412,8 +413,7 @@ class CacheLock:
             pid = int(pid)
             if pid <= 0:
                 return True
-            os.kill(pid, 0)
-            return False
+            return not process_is_alive(pid)
         except (ProcessLookupError, TypeError, ValueError, OverflowError):
             return True
         except PermissionError:
@@ -421,7 +421,7 @@ class CacheLock:
 
     def _stale(self) -> bool:
         try:
-            fd = os.open(self.path, os.O_RDONLY)
+            fd = os.open(self.path, os.O_RDONLY | BINARY)
         except OSError:
             return False
         try:
@@ -457,14 +457,14 @@ class CacheLock:
                     try:
                         fd = os.open(
                             self.path,
-                            os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                            os.O_CREAT | os.O_EXCL | os.O_RDWR | BINARY,
                         )
                         acquired = self._install_claim(fd, payload, gen)
                     except FileExistsError:
                         try:
                             fd = os.open(
                                 self.path,
-                                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                                os.O_RDWR | BINARY | getattr(os, "O_NOFOLLOW", 0),
                             )
                         except FileNotFoundError:
                             fd = None
@@ -477,8 +477,10 @@ class CacheLock:
                                 raise
                         if fd is not None:
                             info, st = self._read_fd(fd)
-                            if self._safe_lock_inode(st) and self._stale_info(
-                                info, st.st_mtime
+                            if (
+                                self._safe_lock_inode(st)
+                                and self._path_is_fd(fd)
+                                and self._stale_info(info, st.st_mtime)
                             ):
                                 # Claim the exact stale inode we inspected. If
                                 # an older build replaced the path meanwhile,
@@ -565,7 +567,7 @@ class CacheLock:
                         # safe; the malformed-lock grace can then reclaim it.
                         try:
                             os.ftruncate(fd, 0)
-                            os.utime(fd, (0, 0))
+                            set_fd_times(fd, 0, 0)
                         except OSError:
                             pass
             finally:
@@ -639,9 +641,8 @@ def sweep_stale_builds(caches_dir: Path) -> int:
                 live = False  # a builder on another machine is not running here
             else:
                 try:
-                    os.kill(int(info.get("pid", -1)), 0)
-                    live = True
-                except (ProcessLookupError, ValueError, TypeError):
+                    live = process_is_alive(int(info.get("pid", -1)))
+                except (ProcessLookupError, ValueError, TypeError, OverflowError):
                     pass
                 except PermissionError:
                     live = True

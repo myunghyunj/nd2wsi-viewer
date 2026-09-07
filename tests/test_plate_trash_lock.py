@@ -290,14 +290,28 @@ def test_cache_trash_reports_unlink_failure_and_keeps_remainder(
     sid = "unlink-failure"
     registry.slides[sid] = state
     progress = []
-    real_unlink = os.unlink
+    if os.name == "nt":
+        from nd2wsi import windows_fs
 
-    def fail_stubborn(path, *args, **kwargs):
-        if Path(path).name == stubborn.name:
-            raise PermissionError("injected unlink failure")
-        return real_unlink(path, *args, **kwargs)
+        original = stubborn.stat()
+        real_delete = windows_fs._delete_handle
 
-    monkeypatch.setattr(os, "unlink", fail_stubborn)
+        def fail_stubborn_handle(fd):
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) == (original.st_dev, original.st_ino):
+                raise PermissionError("injected handle deletion failure")
+            return real_delete(fd)
+
+        monkeypatch.setattr(windows_fs, "_delete_handle", fail_stubborn_handle)
+    else:
+        real_unlink = os.unlink
+
+        def fail_stubborn(path, *args, **kwargs):
+            if Path(path).name == stubborn.name:
+                raise PermissionError("injected unlink failure")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", fail_stubborn)
     with pytest.raises(OSError, match="remaining data was kept"):
         registry.trash_cache(sid, on_progress=progress.append)
 
@@ -367,7 +381,7 @@ def test_cache_trash_unregisters_nonplate_after_close_failure(tmp_path: Path):
 
 
 def test_cache_trash_refuses_a_symlink_root_without_touching_its_target(
-    tmp_path: Path,
+    tmp_path: Path, symlink_support,
 ):
     target = tmp_path / "unrelated-user-folder"
     target.mkdir()
@@ -389,7 +403,7 @@ def test_cache_trash_refuses_a_symlink_root_without_touching_its_target(
 
 
 def test_cache_trash_detects_root_substitution_at_rename(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, symlink_support
 ):
     container = tmp_path / f"rename-substitution{CACHE_SUFFIX}"
     container.mkdir()
@@ -466,6 +480,7 @@ def test_cache_trash_hides_live_path_before_current_reopen(
     assert not container.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory descriptor lifecycle")
 def test_guarded_delete_closes_root_when_parent_open_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -500,7 +515,7 @@ def test_guarded_delete_closes_root_when_parent_open_fails(
     assert probe.read_bytes() == b"preserved"
 
 
-def test_cache_trash_unlinks_nested_symlink_without_following_it(tmp_path: Path):
+def test_cache_trash_unlinks_nested_symlink_without_following_it(tmp_path: Path, symlink_support):
     container = tmp_path / f"nested-link{CACHE_SUFFIX}"
     container.mkdir()
     unrelated = tmp_path / "unrelated-nested"
