@@ -1,3 +1,8 @@
+> [!NOTE]
+> **Windows support is now available, including ARM PCs.**<br>
+> Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
+> [Download the Windows installer (.exe)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.8/nd2wsi-viewer-1.2.8-Setup.exe) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
 </p>
@@ -11,6 +16,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-Apple%20silicon-1d1d1f?style=flat-square&logo=apple&logoColor=white" alt="macOS, Apple silicon">
+  <img src="https://img.shields.io/badge/Windows-x64%20%2F%20ARM64-0078D4?style=flat-square" alt="Windows x64 and Windows 11 ARM64 via x64 emulation">
   <img src="https://img.shields.io/badge/Python-3.11%2B-0A84FF?style=flat-square" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/license-MIT-8E8E93?style=flat-square" alt="MIT">
 </p>
