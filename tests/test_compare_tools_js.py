@@ -389,8 +389,8 @@ def test_leaving_compare_hides_reopen_button_and_next_group_starts_with_tools():
 
 
 def test_close_button_only_hides_tools_and_link_button_still_stops_comparison():
-    shell = (STATIC / "shell-v1.js").read_text()
-    html = (STATIC / "shell.html").read_text()
+    shell = (STATIC / "shell-v1.js").read_text(encoding="utf-8")
+    html = (STATIC / "shell.html").read_text(encoding="utf-8")
     assert '$("compare-close").onclick = () => setCompareToolsVisible(false)' in shell
     assert '$("compare-close").onclick = stopCompare' not in shell
     assert '$("compare-toggle").onclick = toggleCompare' in shell

@@ -163,8 +163,8 @@ process.stdout.write(JSON.stringify({
 
 
 def test_page_loads_axis_latch_before_the_app_and_app_uses_sessions():
-    index = INDEX.read_text()
-    app = APP.read_text()
+    index = INDEX.read_text(encoding="utf-8")
+    app = APP.read_text(encoding="utf-8")
     assert index.index("axis-latch-v1.js") < index.index("app.js")
     assert "Nd2AxisLatch.WheelGestureSession" in app
     assert "Math.abs(ev.deltaX) > Math.abs(ev.deltaY)" not in app

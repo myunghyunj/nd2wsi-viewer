@@ -141,10 +141,10 @@ def test_strict_relaunch_close_waits_and_closes_plate_without_timeout():
 
 
 def test_updater_ui_and_annotation_flush_are_wired():
-    shell = (ROOT / "nd2wsi" / "static" / "shell.html").read_text()
-    shell_js = (ROOT / "nd2wsi" / "static" / "shell-v1.js").read_text()
-    pane_js = (ROOT / "nd2wsi" / "static" / "app.js").read_text()
-    app_py = (ROOT / "nd2wsi" / "app.py").read_text()
+    shell = (ROOT / "nd2wsi" / "static" / "shell.html").read_text(encoding="utf-8")
+    shell_js = (ROOT / "nd2wsi" / "static" / "shell-v1.js").read_text(encoding="utf-8")
+    pane_js = (ROOT / "nd2wsi" / "static" / "app.js").read_text(encoding="utf-8")
+    app_py = (ROOT / "nd2wsi" / "app.py").read_text(encoding="utf-8")
 
     assert 'id="update-check"' in shell
     assert "window.nd2wsiPrepareForUpdate" in shell_js

@@ -14,8 +14,8 @@ README = ROOT / "README.md"
 
 
 def test_well_headers_and_view_menu_are_loaded_and_wired():
-    app = APP.read_text()
-    index = INDEX.read_text()
+    app = APP.read_text(encoding="utf-8")
+    index = INDEX.read_text(encoding="utf-8")
 
     assert index.index("plate-ui-v1.js") < index.index("app.js")
     assert 'id="tb-plate-view"' in index
@@ -42,7 +42,7 @@ def test_well_headers_and_view_menu_are_loaded_and_wired():
 
 
 def test_singleton_axes_default_hidden_and_cannot_start_useless_work():
-    app = APP.read_text()
+    app = APP.read_text(encoding="utf-8")
 
     assert "timeline: Number(info.plate.T) > 1" in app
     assert "zAxis: Number(info.plate.Z) > 1" in app
@@ -53,7 +53,7 @@ def test_singleton_axes_default_hidden_and_cannot_start_useless_work():
 
 
 def test_hidden_controls_reclaim_space_without_hiding_focus_strip_labels():
-    css = CSS.read_text()
+    css = CSS.read_text(encoding="utf-8")
 
     assert "#stage-wrap.plate-grid.plate-time-hidden #plate { bottom: 14px; }" in css
     assert "#stage-wrap.plate-grid.plate-z-hidden #plate-block" in css
@@ -64,7 +64,7 @@ def test_hidden_controls_reclaim_space_without_hiding_focus_strip_labels():
 
 
 def test_readme_explains_coordinate_headers_and_view_options():
-    readme = README.read_text()
+    readme = README.read_text(encoding="utf-8")
 
     assert "Coordinate names such as `A01` become lettered and numbered" in readme
     assert "one z plane or one time point hides the corresponding control" in readme

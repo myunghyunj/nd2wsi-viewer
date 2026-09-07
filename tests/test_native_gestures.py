@@ -670,10 +670,10 @@ def test_monitor_stops_consuming_when_captured_pane_is_removed_from_scope():
 
 
 def test_native_bridge_is_wired_through_shell_and_plate_page():
-    app = (ROOT / "nd2wsi" / "app.py").read_text()
-    shell = (ROOT / "nd2wsi" / "static" / "shell-v1.js").read_text()
-    shell_html = (ROOT / "nd2wsi" / "static" / "shell.html").read_text()
-    page = (ROOT / "nd2wsi" / "static" / "app.js").read_text()
+    app = (ROOT / "nd2wsi" / "app.py").read_text(encoding="utf-8")
+    shell = (ROOT / "nd2wsi" / "static" / "shell-v1.js").read_text(encoding="utf-8")
+    shell_html = (ROOT / "nd2wsi" / "static" / "shell.html").read_text(encoding="utf-8")
+    page = (ROOT / "nd2wsi" / "static" / "app.js").read_text(encoding="utf-8")
 
     assert "wire_native_trackpad_bridge(" in app
     assert "scope_cache=api._native_gesture_scopes" in app
@@ -688,7 +688,7 @@ def test_native_bridge_is_wired_through_shell_and_plate_page():
     assert shell_html.index("native-scope-v1.js") < shell_html.index("shell-v1.js")
     assert '"target": routed.target' in (
         ROOT / "nd2wsi" / "native_gestures.py"
-    ).read_text()
+    ).read_text(encoding="utf-8")
     assert 'nd2wsi: "native-trackpad"' in shell
     assert "gestureStart: !!input?.gestureStart" in shell
     assert 'data.nd2wsi !== "native-trackpad"' in page
@@ -701,7 +701,7 @@ def test_native_bridge_is_wired_through_shell_and_plate_page():
     assert "target.closest(NATIVE_GESTURE_EXCLUSIONS)" in page
     assert "NSEventMaskScrollWheel | AppKit.NSEventMaskSwipe" in (
         ROOT / "nd2wsi" / "native_gestures.py"
-    ).read_text()
+    ).read_text(encoding="utf-8")
     assert "setAllowsBackForwardNavigationGestures_(False)" in (
         ROOT / "nd2wsi" / "native_gestures.py"
-    ).read_text()
+    ).read_text(encoding="utf-8")

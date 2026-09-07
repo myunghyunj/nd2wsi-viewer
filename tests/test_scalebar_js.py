@@ -98,7 +98,7 @@ def test_unknown_invalid_calibration_and_zero_size_hide_bar():
 
 
 def test_scalebar_refreshes_on_rotation_flip_resize_and_viewport_changes():
-    source = APP.read_text()
+    source = APP.read_text(encoding="utf-8")
     assert 'for (const event of ["rotate", "flip", "resize"])' in source
     viewport = source[source.index('viewer.addHandler("update-viewport"'):
                       source.index('viewer.addHandler("open", renderAnnotations)')]

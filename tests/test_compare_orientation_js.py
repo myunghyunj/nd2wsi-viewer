@@ -195,7 +195,7 @@ process.stdout.write(JSON.stringify(out));
 def run(body, *, platform="MacIntel"):
     result = subprocess.run(
         [NODE, "-e", SCRIPT, str(STATIC), body, platform],
-        capture_output=True, text=True, timeout=20,
+        capture_output=True, text=True, encoding="utf-8", timeout=20,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -361,7 +361,7 @@ def test_toolbar_reserves_space_once_and_releases_it_on_leaving_compare():
       ({reserved, updates, released:styleValues['--compare-toolbar-height']});
     """)
     assert result == {"reserved": "120px", "updates": 1, "released": "0px"}
-    css = (STATIC / "native-shell-v1.css").read_text()
+    css = (STATIC / "native-shell-v1.css").read_text(encoding="utf-8")
     assert "inset:calc(42px + var(--compare-toolbar-height, 0px))" in css
 
 
@@ -403,8 +403,8 @@ def test_reverse_pair_restores_inverse_orientation_and_reflected_fit_metadata():
 
 
 def test_visible_orientation_controls_are_wired_and_explained():
-    html = (STATIC / "shell.html").read_text()
-    shell = (STATIC / "shell-v1.js").read_text()
+    html = (STATIC / "shell.html").read_text(encoding="utf-8")
+    shell = (STATIC / "shell-v1.js").read_text(encoding="utf-8")
     for control in ("flip-horizontal", "flip-vertical", "rotate-left", "rotate-right", "transpose"):
         assert f'id="compare-{control}"' in html
         assert f'"compare-{control}": "{control}"' in shell
@@ -414,4 +414,4 @@ def test_visible_orientation_controls_are_wired_and_explained():
     assert 'Remove Fit' in html + shell
     assert 'Clear Points' in html + shell
     assert 'Keep mirror state' in html + shell
-    assert 'Transpose' in (ROOT / "README.md").read_text()
+    assert 'Transpose' in (ROOT / "README.md").read_text(encoding="utf-8")

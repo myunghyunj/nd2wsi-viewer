@@ -177,7 +177,7 @@ process.stdout.write(JSON.stringify(out));
 def pane(events=(), **config):
     result = subprocess.run(
         [NODE, "-e", SCRIPT, str(STATIC), json.dumps({"events": events, **config})],
-        capture_output=True, text=True, timeout=20,
+        capture_output=True, text=True, encoding="utf-8", timeout=20,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)

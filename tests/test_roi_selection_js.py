@@ -171,6 +171,6 @@ def test_exact_quarter_turn_edges_do_not_expand_for_trigonometric_roundoff():
 
 
 def test_roi_hint_names_the_source_aligned_selection_contract():
-    source = APP.read_text()
+    source = APP.read_text(encoding="utf-8")
     assert 'Source-aligned rectangle · Drag' in source
     assert '$("tool-box").title = "Source-aligned rectangle"' in source

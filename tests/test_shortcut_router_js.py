@@ -270,11 +270,11 @@ def test_contenteditable_false_does_not_hide_a_panel_shortcut():
 
 
 def test_production_pages_use_the_router_and_document_the_same_shortcuts():
-    app = APP.read_text()
-    index = INDEX.read_text()
-    shell_js = SHELL_JS.read_text()
-    shell_html = SHELL_HTML.read_text()
-    readme = README.read_text()
+    app = APP.read_text(encoding="utf-8")
+    index = INDEX.read_text(encoding="utf-8")
+    shell_js = SHELL_JS.read_text(encoding="utf-8")
+    shell_html = SHELL_HTML.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
 
     assert index.index("shortcut-router-v1.js") < index.index("app.js")
     assert shell_html.index("shortcut-router-v1.js") < shell_html.index("shell-v1.js")
