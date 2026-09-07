@@ -1,6 +1,6 @@
-"""nd2wsi-viewer: the native macOS shell.
+"""nd2wsi-viewer: the native macOS and Windows shell.
 
-A WKWebView window (via pywebview) around the same local server the CLI
+A WKWebView or Edge WebView2 window around the same local server the CLI
 uses.  Opening a slide converts it once (pyramid + sidecar live next to the
 ND2), then the viewer loads from an ephemeral localhost port.
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -19,19 +20,28 @@ import uuid
 from pathlib import Path
 
 APP_NAME = "nd2wsi-viewer"
+RELEASES_URL = "https://github.com/myunghyunj/nd2wsi-viewer/releases/latest"
 _UPDATER_HANDLE = None
 _UPDATER_COORDINATOR = None
 
 
+def log_path() -> Path:
+    """A user-writable log location, including a portable Windows launch."""
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        return root / APP_NAME / "Logs" / f"{APP_NAME}.log"
+    return Path.home() / "Library" / "Logs" / f"{APP_NAME}.log"
+
+
 def _dlog(msg: str) -> None:
-    """Append one line to ~/Library/Logs/nd2wsi-viewer.log (best effort)."""
+    """Append one diagnostic line to the per-user app log (best effort)."""
     import datetime
 
     try:
-        log = Path.home() / "Library" / "Logs" / "nd2wsi-viewer.log"
+        log = log_path()
         log.parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
-        with open(log, "a") as fh:
+        with open(log, "a", encoding="utf-8") as fh:
             fh.write(f"{stamp} {msg}\n")
     except OSError:
         pass
@@ -124,6 +134,13 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   });
   window.addEventListener('pywebviewready', () => {
     pywebview.api.pending().then(p => { if (p) go(pywebview.api.open_slide()); });
+    const refreshUpdates = () => pywebview.api.update_status().then(s => {
+        const button = document.getElementById('update');
+        button.disabled = !s.available;
+        if (s.mode === 'download') button.textContent = 'Download Updates…';
+      });
+    refreshUpdates();
+    setTimeout(refreshUpdates, 600);
   });
   document.getElementById('update').addEventListener('click', ev => {
     const button = ev.currentTarget;
@@ -681,6 +698,8 @@ class UpdateShutdownCoordinator:
 
 def _install_app_updater(api: Api, window) -> None:
     global _UPDATER_COORDINATOR, _UPDATER_HANDLE
+    if sys.platform != "darwin":
+        return
     if _UPDATER_COORDINATOR is not None:
         return
 
@@ -717,6 +736,7 @@ class Api:
         self._frac = -1.0  # conversion progress, -1 = not converting
         self._httpd = None
         self._updater = None
+        self._startup_error = None
         self._server_lock = threading.Lock()
         if native_gesture_scopes is None:
             from .native_gestures import NativeGestureScopeCache
@@ -756,10 +776,28 @@ class Api:
             current = version("nd2wsi-viewer")
         except Exception:
             current = "development"
-        return {"available": self._updater is not None, "version": current}
+        manual = sys.platform == "win32"
+        return {
+            "available": manual or self._updater is not None,
+            "version": current,
+            "mode": "download" if manual else "sparkle",
+        }
 
     def check_for_updates(self) -> dict:
-        """Show Sparkle's standard update window on AppKit's main thread."""
+        """Open Windows release downloads or the macOS Sparkle update window."""
+        if sys.platform == "win32":
+            import webbrowser
+
+            try:
+                opened = webbrowser.open(RELEASES_URL)
+                return {
+                    "ok": bool(opened),
+                    "message": "Download the latest Windows build from the releases page."
+                    if opened else "Could not open the releases page in your browser.",
+                }
+            except Exception as exc:
+                _dlog(f"release downloads failed: {exc!r}")
+                return {"ok": False, "message": "Could not open the releases page."}
         handle = self._updater
         if handle is None:
             return {
@@ -857,6 +895,9 @@ class Api:
         In native full screen nothing happens, as with a real title bar.
         Returns the action taken.
         """
+        # Windows keeps its own title bar and native maximize behavior.
+        if sys.platform != "darwin":
+            return "none"
         import webview
 
         action = title_bar_double_click_action()
@@ -945,53 +986,81 @@ class Api:
 
 
 def smoke(nd2_path: Path) -> int:
-    """Headless self-test for the packaged binary: convert, serve, fetch."""
-    import json
-    import urllib.request
+    """Headless release gate run inside the packaged executable."""
+    from .smoke import run
 
-    store = open_or_convert(nd2_path, on_status=print)
-    httpd, url = start_server(store)
-    info = json.loads(urllib.request.urlopen(url + "api/info", timeout=30).read())
-    tile = urllib.request.urlopen(url + "api/tile/0/0/0.jpg", timeout=30).read()
+    return run(nd2_path)
 
-    # ND2 export must work in the shipped bundle: crop 64x64 and read it back
-    nd2_ok = "no"
+
+def _startup_error(message: str, *, show_dialog: bool = True) -> None:
+    _dlog(message)
+    print(message, file=sys.stderr)
+    if sys.platform == "win32" and show_dialog:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, APP_NAME, 0x10)
+        except Exception:
+            pass
+
+
+def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 90) -> dict:
+    """Exercise the real renderer, bridge and slide DOM, then close the app."""
+    started = time.monotonic()
+    report = {"ok": False, "platform": sys.platform, "renderer": None}
     try:
-        roi = urllib.request.urlopen(
-            url + "api/roi?level=0&x=0&y=0&w=64&h=64&format=nd2", timeout=60
-        ).read()
-        import tempfile
+        import webview
 
-        import nd2 as nd2lib
-
-        with tempfile.NamedTemporaryFile(suffix=".nd2", delete=False) as tf:
-            tf.write(roi)
-        with nd2lib.ND2File(tf.name) as f:
-            assert f.sizes["X"] == 64 and f.sizes["Y"] == 64
-        Path(tf.name).unlink(missing_ok=True)
-        nd2_ok = f"yes ({len(roi)} bytes)"
-    except urllib.error.HTTPError as e:
-        print(f"smoke FAIL: ND2 export -> HTTP {e.code}: {e.read().decode()[:300]}",
-              file=sys.stderr)
-    except Exception as e:
-        print(f"smoke FAIL: ND2 export -> {type(e).__name__}: {e}", file=sys.stderr)
+        report["renderer"] = webview.renderer
+        if sys.platform == "win32" and webview.renderer != "edgechromium":
+            raise RuntimeError("GUI smoke requires the Edge WebView2 renderer")
+        while time.monotonic() - started < timeout:
+            try:
+                result = window.evaluate_js("""(() => {
+                  const api = window.pywebview && window.pywebview.api;
+                  if (!api || !api.update_status || document.readyState !== 'complete') return null;
+                  if (!window.__nd2wsiSmokeBridge) {
+                    window.__nd2wsiSmokeBridge = 'pending';
+                    api.update_status().then(status => { window.__nd2wsiSmokeBridge = status; })
+                      .catch(() => { window.__nd2wsiSmokeBridge = 'failed'; });
+                  }
+                  const bridge = window.__nd2wsiSmokeBridge;
+                  if (!bridge || typeof bridge !== 'object' || !bridge.version) return null;
+                  const frame = document.querySelector('#frames iframe.active');
+                  const page = frame && frame.contentDocument;
+                  const canvas = page && page.querySelector('#stage canvas');
+                  const plate = page && page.querySelector('#plate img');
+                  return {bridge: true, version: bridge.version,
+                    boot: !!document.getElementById('drop'),
+                    slide: !!(frame && typeof readyFrames !== 'undefined' &&
+                      readyFrames.has(frame.dataset.sid) &&
+                      ((canvas && canvas.width > 0 && canvas.height > 0) ||
+                      (plate && plate.complete && plate.naturalWidth > 0)))};
+                })()""")
+                if result and result.get("bridge") and result.get("slide" if expect_slide else "boot"):
+                    report.update(result, ok=True)
+                    break
+            except Exception as exc:
+                report["last_error"] = str(exc)
+            time.sleep(0.25)
+        else:
+            raise TimeoutError("GUI did not finish loading the app bridge and slide within 90 seconds")
+    except Exception as exc:
+        report["error"] = str(exc)
     finally:
-        httpd.shutdown()
-        httpd.server_close()
-        httpd.registry.close_all(immediate=True)
-
-    print(
-        f"smoke ok: {info['name']} {info['width']}x{info['height']} "
-        f"{len(info['levels'])} levels, tile {len(tile)} bytes, "
-        f"nd2 export {nd2_ok}"
-    )
-    return 0 if nd2_ok.startswith("yes") else 3
+        report["elapsed_seconds"] = round(time.monotonic() - started, 2)
+        # Set the result before destroy; the GUI's main loop can return at once.
+        api._gui_smoke_report = report
+        window.destroy()
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog=APP_NAME, description=__doc__)
     ap.add_argument("nd2", nargs="?", help="ND2 or SVS file to open at launch")
     ap.add_argument("--smoke", action="store_true", help="headless self-test")
+    ap.add_argument("--gui-smoke", action="store_true", help="open, verify and close the native window")
+    ap.add_argument("--smoke-report", type=Path, help="write the native GUI self-test result as JSON")
     args, _ = ap.parse_known_args(argv)  # tolerate Finder's -psn_* args
 
     initial = Path(args.nd2).expanduser() if args.nd2 else None
@@ -1010,9 +1079,32 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    api, _window = create_app_window(initial)
-    webview.start()
-    return 0
+    api = None
+    try:
+        api, window = create_app_window(initial)
+        kwargs = {"gui": "edgechromium"} if sys.platform == "win32" else {}
+        if args.gui_smoke:
+            webview.start(lambda: gui_smoke(api, window, expect_slide=initial is not None), **kwargs)
+        else:
+            webview.start(**kwargs)
+        if api._startup_error:
+            raise RuntimeError(api._startup_error)
+        report = getattr(api, "_gui_smoke_report", {"ok": False, "error": "GUI closed before verification"})
+        result = 0 if not args.gui_smoke or report["ok"] else 4
+    except Exception as exc:
+        message = f"Could not start {APP_NAME}: {exc}"
+        _startup_error(message, show_dialog=not args.gui_smoke)
+        report = {"ok": False, "error": message, "platform": sys.platform}
+        result = 4
+    finally:
+        if api is not None:
+            api.stop_server_for_update()
+    if args.gui_smoke:
+        print(json.dumps(report, ensure_ascii=False))
+        if args.smoke_report:
+            args.smoke_report.parent.mkdir(parents=True, exist_ok=True)
+            args.smoke_report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return result
 
 
 def create_app_window(initial: Path | None):
@@ -1042,7 +1134,7 @@ def create_app_window(initial: Path | None):
         # FullSizeContentView from birth — the only point where WebKit
         # decides whether the page composites under the title bar. The
         # traffic lights it hides come back in _inline_traffic_lights.
-        frameless=True,
+        frameless=sys.platform == "darwin",
         easy_drag=False,
     )
     # WKWebView can consume horizontal trackpad events in a private scroll
@@ -1057,10 +1149,24 @@ def create_app_window(initial: Path | None):
     )
     window.events.before_load += lambda *_args: api.clear_native_gesture_scopes()
     window.events.closed += lambda *_args: api.clear_native_gesture_scopes()
-    _inline_traffic_lights(window)
     _wire_file_drop(window)
-    _install_open_files_handler()
-    window.events.shown += lambda: _install_app_updater(api, window)
+    if sys.platform == "darwin":
+        _inline_traffic_lights(window)
+        _install_open_files_handler()
+        window.events.shown += lambda: _install_app_updater(api, window)
+    elif sys.platform == "win32":
+        def require_webview2(renderer):
+            # pywebview can silently fall back to legacy MSHTML even when
+            # edgechromium was requested. Never show a broken legacy viewer.
+            if renderer != "edgechromium":
+                api._startup_error = (
+                    "Microsoft Edge WebView2 Runtime is required. Install it from "
+                    "https://developer.microsoft.com/microsoft-edge/webview2/ and reopen the app."
+                )
+                return False
+            return True
+
+        window.events.initialized += require_webview2
     return api, window
 
 

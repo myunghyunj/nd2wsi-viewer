@@ -307,7 +307,7 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         series = tf.series[0]
         if series.ndim != 3 or series.shape[-1] not in (3, 4):
             raise NotImplementedError(f"unexpected SVS layout {series.shape}")
-        fd = os.open(str(path), os.O_RDONLY)
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
 
         H, W = int(series.shape[0]), int(series.shape[1])
         shapes = level_shapes(H, W, 512)

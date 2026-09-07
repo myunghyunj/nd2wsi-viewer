@@ -41,6 +41,36 @@ def test_zarr_v2_backend_handles_fill_chunks_and_edge_padding(tmp_path):
     assert not chunks.read((0, 1, 1)).any()
 
 
+def test_nested_store_metadata_and_direct_chunks_work_beyond_windows_max_path(tmp_path):
+    """Zarr's UUID .partial files and chunk I/O must survive long cache paths."""
+    import shutil
+
+    from nd2wsi.convert import open_store
+    from nd2wsi.platform_io import filesystem_path
+
+    subtree = tmp_path / ("nested-cache-" + "a" * 90)
+    path = subtree / ("selection-" + "b" * 90) / ("stage-" + "c" * 70) / "store.ome.zarr"
+    assert len(str(path)) > 260
+    storage = ZarrV2Storage()
+    try:
+        root = storage.create_group(path)
+        root.attrs.update({"nd2wsi": {"source": "한글 원본.nd2"}, "multiscales": []})
+        array = storage.create_array(root, "0", (1, 6, 7), np.dtype("uint16"), tile=4)
+        chunks = storage.chunk_array(array)
+        values = np.arange(16, dtype=np.uint16).reshape(1, 4, 4)
+        assert chunks.write((0, 0, 0), values)
+        assert np.array_equal(chunks.read((0, 0, 0)), values)
+
+        # Callers retain the ordinary public Path; only disk access is prefixed.
+        reopened, attrs = open_store(path)
+        assert attrs["nd2wsi"]["source"] == "한글 원본.nd2"
+        assert np.array_equal(np.asarray(reopened["0"][:, :4, :4]), values)
+        assert not str(path).startswith("\\\\?\\")
+    finally:
+        # Cleanup also uses an extended I/O path on machines with MAX_PATH enabled.
+        shutil.rmtree(filesystem_path(subtree), ignore_errors=False)
+
+
 def test_manifest_records_storage_and_metadata_versions(tmp_path):
     slide = tmp_path / "slide.nd2"
     slide.write_bytes(b"nd2")

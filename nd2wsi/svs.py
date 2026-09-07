@@ -2,8 +2,9 @@
 
 SVS is a pyramidal TIFF with JPEG or JPEG 2000 tiles. The baseline level is
 exposed as a lazy dask array whose tasks read each compressed tile straight
-off the file with ``os.pread`` and decode it with ``TiffPage.decode`` -- no
-shared file lock, so decoding scales across all worker threads, and blocks
+off the file with positional reads and decode it with ``TiffPage.decode``.
+POSIX uses pread; Windows serializes the short binary reads. Decoding scales
+across all worker threads, and blocks
 are aligned to the file's own tile grid so every tile is decoded exactly
 once. Decoding needs ``imagecodecs`` (``pip install "nd2wsi-viewer[svs]"``).
 
@@ -22,6 +23,7 @@ from typing import Any
 
 import numpy as np
 
+from .platform_io import BINARY, read_at
 from .reader import ChannelInfo, PlaneSource
 
 SVS_SUFFIXES = {".svs"}
@@ -231,7 +233,7 @@ def _grid_chunks(size: int, step: int) -> tuple[int, ...]:
 def _window_reader(page: Any, fd: int):
     """Return ``read(y0, y1, x0, x1) -> (h, w, S)`` for one tiled TIFF page.
 
-    Each call fetches the native tiles covering the window with ``os.pread``
+    Each call fetches the native tiles covering the window with ``read_at``
     on ``fd`` and decodes them with ``page.decode``. imagecodecs releases the
     GIL, so many threads may share one reader and one descriptor.
     """
@@ -258,7 +260,7 @@ def _window_reader(page: Any, fd: int):
                 seg = ty * across + tx
                 if counts[seg] == 0:  # sparse tile, leave it at zero
                     continue
-                data = os.pread(fd, counts[seg], offsets[seg])
+                data = read_at(fd, counts[seg], offsets[seg])
                 decoded = np.asarray(page.decode(data, seg, **tables)[0]).reshape(
                     -1, tw, samples
                 )[:th]
@@ -284,7 +286,7 @@ def _tiled_baseline(page: Any, path: Path, stack: ExitStack, tile: int) -> Any:
 
     h, w = page.imagelength, page.imagewidth
     samples = page.samplesperpixel
-    fd = os.open(str(path), os.O_RDONLY)
+    fd = os.open(str(path), os.O_RDONLY | BINARY)
     stack.callback(os.close, fd)
     read = _window_reader(page, fd)
     block = tile * 8
@@ -317,7 +319,7 @@ def sample_planes(path: str | Path, tile: int = 512, points: int = 24) -> list:
         if not getattr(page, "is_tiled", False):
             return out
         h, w = page.imagelength, page.imagewidth
-        fd = os.open(str(path), os.O_RDONLY)
+        fd = os.open(str(path), os.O_RDONLY | BINARY)
         try:
             read = _window_reader(page, fd)
             side = max(1, int(round(points**0.5)))

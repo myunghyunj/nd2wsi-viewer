@@ -1,5 +1,6 @@
 /* nd2wsi viewer ------------------------------------------------------------ */
 "use strict";
+window.Nd2ShortcutRouter?.localizeLabels(document);
 
 const $ = (id) => document.getElementById(id);
 
@@ -3129,7 +3130,7 @@ async function revealSlidePath(which) {
       throw new Error((data && data.error) || "HTTP " + res.status);
     }
     const label = which === "source" ? "Source" : "Cache";
-    $("info-status").textContent = label + " revealed in Finder";
+    $("info-status").textContent = label + " revealed in the file manager";
   } catch (error) {
     $("info-status").textContent = "Could not reveal " + which + ": " + error.message;
   } finally {

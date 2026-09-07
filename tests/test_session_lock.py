@@ -135,7 +135,7 @@ def test_metadata_write_failure_does_not_drop_kernel_lock(tmp_path: Path, monkey
         first.release()
 
 
-def test_symlink_lock_path_cannot_modify_its_target(tmp_path: Path):
+def test_symlink_lock_path_cannot_modify_its_target(tmp_path: Path, symlink_support):
     target = tmp_path / "user-data.txt"
     target.write_bytes(b"precious")
     path = tmp_path / "plate.writer-session"
@@ -165,6 +165,7 @@ def test_hardlinked_lock_path_cannot_modify_its_target(tmp_path: Path):
     assert not lock.acquired
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies replacement of the open lock file")
 def test_path_replacement_during_acquire_retries_the_current_inode(
     tmp_path: Path, monkeypatch
 ):
@@ -197,3 +198,37 @@ def test_path_replacement_during_acquire_retries_the_current_inode(
         assert (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
     finally:
         lock.release()
+
+
+def _child_hold_until_terminated(path: str, result: object) -> None:
+    lock = SessionFileLock(path)
+    lock.acquire()
+    result.put("acquired")
+    time.sleep(60)
+
+
+def test_process_exit_releases_kernel_lock_without_cleanup(tmp_path):
+    path = tmp_path / "terminated.writer-session"
+    ctx = mp.get_context("spawn")
+    result = ctx.Queue()
+    child = ctx.Process(target=_child_hold_until_terminated, args=(str(path), result))
+    child.start()
+    contender = SessionFileLock(path)
+    try:
+        assert result.get(timeout=10) == "acquired"
+        # The Windows byte lock must not grow the small JSON coordination file.
+        assert 0 < path.stat().st_size < 1024
+        with pytest.raises(TimeoutError):
+            contender.acquire(timeout=0.02)
+        child.terminate()
+        child.join(timeout=10)
+        assert not child.is_alive()
+        contender.acquire(timeout=0.2)
+        assert contender.acquired
+    finally:
+        contender.release()
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=10)
+        result.close()
+        result.join_thread()

@@ -43,13 +43,15 @@ function makeTarget(spec) {
 
 const out = cases.map((entry) => {
   const event = {...entry.event, target: makeTarget(entry.target)};
+  // Historical Command-key cases model a Mac, even when Node runs on Windows.
+  const platform = entry.platform || 'MacIntel';
   return {
     typing: Router.isTypingEvent(event),
     letter: Router.letterCode(event),
     panel: Router.panelForEvent(event),
-    orientationShortcut: Router.isOrientationShortcut(event),
-    orientation: Router.orientationForEvent(event),
-    tab: Router.tabIndexForEvent(event),
+    orientationShortcut: Router.isOrientationShortcut(event, platform),
+    orientation: Router.orientationForEvent(event, platform),
+    tab: Router.tabIndexForEvent(event, platform),
   };
 });
 process.stdout.write(JSON.stringify(out));
@@ -200,6 +202,29 @@ def test_command_digits_select_tabs_and_accept_the_numeric_keypad():
     )
     assert [item["tab"] for item in out] == [0, 8, 3]
     assert all(item["panel"] is None for item in out)
+
+
+def test_windows_control_shortcuts_preserve_ime_and_modifier_guards():
+    out = _run([
+        {"platform": "Win32", "event": {"code": "KeyR", "key": "ㄱ", "ctrlKey": True}},
+        {"platform": "Windows", "event": {"code": "KeyF", "ctrlKey": True}},
+        {"platform": "Win32", "event": {"code": "Numpad3", "ctrlKey": True}},
+        {"platform": "Win32", "event": {"code": "KeyR", "metaKey": True}},
+        {"platform": "Win32", "event": {"code": "KeyF", "ctrlKey": True, "altKey": True}},
+        {"platform": "Win32", "event": {"code": "Digit1", "ctrlKey": True, "metaKey": True}},
+        {"platform": "Win32", "event": {"code": "KeyR", "ctrlKey": True, "isComposing": True}},
+        {"platform": "Win32", "event": {"code": "KeyF", "ctrlKey": True}, "target": {"tag": "INPUT"}},
+    ])
+    assert [item["orientation"] for item in out] == ["rotate-right", "flip-horizontal", None, None, None, None, None, None]
+    assert [item["tab"] for item in out] == [None, None, 2, None, None, None, None, None]
+
+
+def test_shortcut_labels_match_the_windows_keyboard():
+    result = subprocess.run(
+        [NODE, "-e", "const R=require(process.argv[1]); console.log(R.formatShortcutText('Export (⌘⇧E); Option-drag', 'Win32'));", str(MODULE)],
+        capture_output=True, text=True, check=True, timeout=20,
+    )
+    assert result.stdout.strip() == "Export (Ctrl+Shift+E); Alt-drag"
 
 
 def test_tab_shortcuts_reject_wrong_modifiers_targets_and_keys():

@@ -15,6 +15,9 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 SCRIPT = r"""
 const fs = require('fs');
 const vm = require('vm');
+Object.defineProperty(globalThis, 'navigator', {
+  value: {platform: process.argv[3]}, configurable: true,
+});
 const Align = require(process.argv[1] + '/align-v1.js');
 const ShortcutRouter = require(process.argv[1] + '/shortcut-router-v1.js');
 const source = fs.readFileSync(process.argv[1] + '/shell-v1.js', 'utf8');
@@ -189,9 +192,9 @@ process.stdout.write(JSON.stringify(out));
 """
 
 
-def run(body):
+def run(body, *, platform="MacIntel"):
     result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(STATIC), body],
+        [NODE, "-e", SCRIPT, str(STATIC), body, platform],
         capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stderr

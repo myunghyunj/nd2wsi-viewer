@@ -13,6 +13,8 @@ from typing import Any
 
 import numpy as np
 
+from ..platform_io import filesystem_path
+
 
 class ZarrV2ChunkArray:
     """Direct chunk access for one local, C-order Zarr v2 array."""
@@ -22,8 +24,8 @@ class ZarrV2ChunkArray:
 
         self.shape = tuple(int(value) for value in array.shape)
         self.dtype = np.dtype(array.dtype)
-        self._path = Path(array.store.root) / array.path
-        metadata = json.loads((self._path / ".zarray").read_text())
+        self._path = Path(filesystem_path(array.store.root)) / array.path
+        metadata = json.loads((self._path / ".zarray").read_text(encoding="utf-8"))
         if metadata.get("order", "C") != "C":
             raise ValueError("expected C-order chunks")
         if metadata.get("fill_value", 0) not in (0, 0.0, None):
@@ -95,7 +97,7 @@ class ZarrV2Storage:
     def create_group(self, path: str | Path) -> Any:
         import zarr
 
-        return zarr.open_group(str(path), mode="w", zarr_format=2)
+        return zarr.open_group(filesystem_path(path), mode="w", zarr_format=2)
 
     def create_array(
         self,

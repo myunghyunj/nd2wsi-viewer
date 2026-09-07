@@ -179,9 +179,22 @@ class ViewerState:
             return dict(self._cache_usage) if self._cache_usage is not None else None
 
 
-def _allocated_bytes(st: os.stat_result) -> int:
+def _allocated_bytes(st: os.stat_result, path: Path | None = None) -> int | None:
     blocks = getattr(st, "st_blocks", None)
-    return int(blocks) * 512 if blocks is not None else int(st.st_size)
+    if blocks is not None:
+        return int(blocks) * 512
+    if os.name == "nt" and path is not None:
+        from .windows_fs import allocated_bytes
+
+        try:
+            return allocated_bytes(path)
+        except OSError:
+            pass
+    return None
+
+
+def _add_allocation(left: int | None, right: int | None) -> int | None:
+    return left + right if left is not None and right is not None else None
 
 
 def _path_usage(path: Path | None) -> dict[str, int] | None:
@@ -200,15 +213,16 @@ def _path_usage(path: Path | None) -> dict[str, int] | None:
     if not path.is_dir():
         return {
             "bytes": int(root_stat.st_size),
-            "allocated_bytes": _allocated_bytes(root_stat),
+            "allocated_bytes": _allocated_bytes(root_stat, path),
         }
 
     logical = 0
-    allocated = _allocated_bytes(root_stat)
+    allocated = _allocated_bytes(root_stat, path)
     for walk_root, dirs, files in os.walk(path, followlinks=False):
         for name in dirs:
             try:
-                allocated += _allocated_bytes((Path(walk_root) / name).lstat())
+                entry_path = Path(walk_root) / name
+                allocated = _add_allocation(allocated, _allocated_bytes(entry_path.lstat(), entry_path))
             except OSError:
                 continue
         for name in files:
@@ -217,7 +231,7 @@ def _path_usage(path: Path | None) -> dict[str, int] | None:
             except OSError:
                 continue
             logical += int(st.st_size)
-            allocated += _allocated_bytes(st)
+            allocated = _add_allocation(allocated, _allocated_bytes(st, Path(walk_root) / name))
     return {"bytes": logical, "allocated_bytes": allocated}
 
 
@@ -388,16 +402,23 @@ def _pixel_payload(
 
 
 def reveal_in_file_manager(path: Path, *, platform: str | None = None, runner=None) -> None:
-    """Reveal one registered path in Finder without invoking a shell."""
+    """Reveal one registered path in Finder or Explorer without a shell."""
     import subprocess
     import sys
 
-    if (platform or sys.platform) != "darwin":
-        raise RuntimeError("Reveal is available only on macOS")
+    platform = platform or sys.platform
+    if platform not in ("darwin", "win32"):
+        raise RuntimeError("Reveal is available on macOS and Windows")
     if not path.exists():
         raise FileNotFoundError(path)
     run = runner or subprocess.run
-    run(["/usr/bin/open", "-R", str(path)], check=True, timeout=10)
+    if platform == "win32":
+        # Explorer may return a nonzero status when handing off to an existing
+        # window. Its comma switch and full path are separate arguments so
+        # spaces, Unicode and shell metacharacters remain ordinary path text.
+        run(["explorer.exe", "/select,", str(path.resolve())], check=False, timeout=10)
+    else:
+        run(["/usr/bin/open", "-R", str(path)], check=True, timeout=10)
 
 
 def _close_state(st: ViewerState | None) -> None:
@@ -501,11 +522,14 @@ def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
                 # supports it before the embedded original can be deleted.
                 dir_fd = None
                 try:
-                    dir_fd = os.open(
-                        home,
-                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                    )
-                    os.fsync(dir_fd)
+                    # CRT directory fsync is unavailable on Windows. The file
+                    # itself was flushed with FlushFileBuffers via os.fsync.
+                    if os.name != "nt":
+                        dir_fd = os.open(
+                            home,
+                            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        )
+                        os.fsync(dir_fd)
                 except OSError as exc:
                     if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
                         raise
@@ -630,6 +654,12 @@ def _delete_verified_cache_tree(
     root_fd: int | None = None,
 ) -> int:
     """Remove the captured cache inode with fd-relative, no-follow traversal."""
+    if os.name == "nt":
+        from .windows_fs import delete_verified_tree
+
+        if root_fd is not None:
+            os.close(root_fd)
+        return delete_verified_tree(path, expected, on_progress)
     parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     parent_fd = None
     try:
@@ -688,8 +718,8 @@ def _delete_verified_cache_tree(
 def _annotation_source_name(path: Path) -> str | None:
     """Return a legacy sidecar's declared source name, when present."""
     try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -1273,6 +1303,7 @@ class SlideRegistry:
                 store_stat = None
             real_directory = bool(
                 store_stat is not None and stat.S_ISDIR(store_stat.st_mode)
+                and not (getattr(store_stat, "st_file_attributes", 0) & 0x400)
             )
             valid_container = real_directory and store.name.endswith(CACHE_SUFFIX)
             valid_store = real_directory and store.name.endswith(".ome.zarr")
@@ -1293,7 +1324,12 @@ class SlideRegistry:
             guard_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
             if hasattr(os, "O_NOFOLLOW"):
                 guard_flags |= os.O_NOFOLLOW
-            store_guard_fd = os.open(store, guard_flags)
+            if os.name == "nt":
+                from .windows_fs import open_guard
+
+                store_guard_fd = open_guard(store, allow_rename=True)
+            else:
+                store_guard_fd = os.open(store, guard_flags)
             guarded_stat = os.fstat(store_guard_fd)
             if not _same_file_identity(guarded_stat, store_stat):
                 os.close(store_guard_fd)
@@ -1507,6 +1543,32 @@ def make_handler(
         server_version = "nd2wsi"
 
         # ---- helpers -----------------------------------------------------
+        def _discard_rejected_body(self) -> None:
+            """Discard at most 64 KiB / 250 ms after sending a rejection.
+
+            Closing over unread bytes can reset a Windows TCP connection and
+            discard the error response. The write side is already shut down,
+            and this connection will not be reused: even bytes after an invalid
+            or ambiguous body are discarded, never parsed as another request.
+            """
+            remaining = 65_536
+            previous_timeout = self.connection.gettimeout()
+            deadline = time.monotonic() + 0.25
+            try:
+                while remaining:
+                    wait = deadline - time.monotonic()
+                    if wait <= 0:
+                        break
+                    self.connection.settimeout(wait)
+                    body = self.rfile.read1(min(remaining, 8192))
+                    if not body:
+                        break
+                    remaining -= len(body)
+            except OSError:
+                pass  # a partial/slow body is dropped when this socket closes
+            finally:
+                self.connection.settimeout(previous_timeout)
+
         def _send(
             self,
             code: int,
@@ -1515,16 +1577,30 @@ def make_handler(
             extra: dict | None = None,
             cache: str = "no-store",
         ):
+            rejecting_post = self.command == "POST" and code >= 300
+            if rejecting_post:
+                self.close_connection = True
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            if self.close_connection:
+                self.send_header("Connection", "close")
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
+            if rejecting_post:
+                import socket
+
+                self.wfile.flush()
+                try:
+                    self.connection.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                self._discard_rejected_body()
 
         def _json(self, obj: Any, code: int = 200):
             self._send(code, json.dumps(obj).encode(), "application/json")
@@ -1533,6 +1609,8 @@ def make_handler(
             self._json({"error": msg}, code)
 
         def _body_json(self, limit: int = 10_000_000) -> Any:
+            if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+                raise ValueError("expected one Content-Length and no Transfer-Encoding")
             n = int(self.headers.get("Content-Length") or 0)
             if not 0 < n <= limit:
                 raise ValueError("payload missing or too large")
@@ -1957,9 +2035,9 @@ def make_handler(
                 return self._json({"items": [], "path": None})
             if p.exists():
                 try:
-                    data = json.loads(p.read_text())
+                    data = json.loads(p.read_text(encoding="utf-8"))
                     items = data.get("items", []) if isinstance(data, dict) else []
-                except (json.JSONDecodeError, OSError) as e:
+                except (json.JSONDecodeError, UnicodeError, OSError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             else:
                 items = []

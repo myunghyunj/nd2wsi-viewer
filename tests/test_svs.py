@@ -36,6 +36,18 @@ def test_open_svs_reads_every_pixel(slide):
     assert (got == img).all()
 
 
+def test_svs_positional_read_fallback_preserves_every_pixel(slide, monkeypatch):
+    import os
+    from contextlib import ExitStack
+
+    monkeypatch.delattr(os, "pread", raising=False)
+    path, expected = slide
+    with ExitStack() as stack:
+        source = open_svs(stack, path, tile=64)
+        actual = np.moveaxis(source.data.compute(scheduler="threads", num_workers=8), 0, -1)
+    assert np.array_equal(actual, expected)
+
+
 def test_convert_matches_a_plain_numpy_pyramid(slide, tmp_path):
     import zarr
 

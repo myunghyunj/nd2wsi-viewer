@@ -26,6 +26,7 @@ from nd2wsi.cache import (  # noqa: E402
     read_manifest,
 )
 from nd2wsi.convert import ensure_cache, open_store  # noqa: E402
+from nd2wsi.platform_io import write_at  # noqa: E402
 from nd2wsi.reader import PlaneSelection  # noqa: E402
 
 
@@ -156,6 +157,23 @@ def test_build_lock_serializes_concurrent_builders(slide):
     reclaimed.release()
 
 
+def test_cache_claim_and_release_with_positional_io_fallback(tmp_path, monkeypatch):
+    monkeypatch.delattr(os, "pread", raising=False)
+    monkeypatch.delattr(os, "pwrite", raising=False)
+    container = tmp_path / "slide.nd2wsi-cache"
+    first, second = CacheLock(container), CacheLock(container)
+    first.acquire()
+    try:
+        assert first.refresh()
+        with pytest.raises(TimeoutError):
+            second.acquire(timeout=0.02, poll=0.005)
+    finally:
+        first.release()
+    assert json.loads(first.path.read_bytes())["released"]
+    second.acquire(timeout=0.2)
+    second.release()
+
+
 def test_build_lock_with_live_local_pid_never_ages_out(slide):
     container = cache_container(slide)
     held = CacheLock(container)
@@ -171,6 +189,7 @@ def test_build_lock_with_live_local_pid_never_ages_out(slide):
         held.release()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies replacement of an open lock file")
 def test_lock_refresh_renews_only_its_own_inode(slide, monkeypatch):
     container = cache_container(slide)
     held = CacheLock(container)
@@ -233,7 +252,7 @@ def test_failed_claim_write_does_not_leave_a_live_orphan(
         info = json.loads(payload)
         if fail_once["value"] and not info.get("released"):
             fail_once["value"] = False
-            os.pwrite(fd, payload[:12], 0)
+            write_at(fd, payload[:12], 0)
             os.ftruncate(fd, 12)
             raise OSError("injected incomplete claim")
         return real_write(fd, payload)
@@ -325,7 +344,7 @@ def test_release_write_failure_is_invalidated_under_the_arbiter(
 
 
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
-def test_lock_never_overwrites_a_linked_file(slide, tmp_path, link_kind):
+def test_lock_never_overwrites_a_linked_file(slide, tmp_path, link_kind, request):
     container = cache_container(slide)
     lock = CacheLock(container)
     lock.path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,6 +352,7 @@ def test_lock_never_overwrites_a_linked_file(slide, tmp_path, link_kind):
     original = '{"do_not_touch": true}'
     unrelated.write_text(original)
     if link_kind == "symlink":
+        request.getfixturevalue("symlink_support")
         lock.path.symlink_to(unrelated)
     else:
         os.link(unrelated, lock.path)
@@ -340,6 +360,19 @@ def test_lock_never_overwrites_a_linked_file(slide, tmp_path, link_kind):
     with pytest.raises(TimeoutError):
         lock.acquire(timeout=0.05, poll=0.01)
     assert unrelated.read_text() == original
+
+
+def test_lock_without_nofollow_never_overwrites_a_stale_symlink_target(tmp_path, monkeypatch, symlink_support):
+    """Windows lacks O_NOFOLLOW: verify identity before overwriting a claim."""
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    lock = CacheLock(tmp_path / "slide.nd2wsi-cache")
+    target = tmp_path / "unrelated.json"
+    original = b'{"pid": -1, "released": true}'
+    target.write_bytes(original)
+    lock.path.symlink_to(target)
+    with pytest.raises(TimeoutError):
+        lock.acquire(timeout=0.02, poll=0.005)
+    assert target.read_bytes() == original
 
 
 def test_explicit_convert_is_never_quarantined_mid_build(slide, tmp_path):
@@ -373,6 +406,7 @@ def test_legacy_store_for_another_timepoint_is_not_the_default_view(slide, tmp_p
     assert not attrs["nd2wsi"]["selection"].get("t")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies unlinking an open lock file")
 def test_lock_release_never_removes_a_reclaimed_lock(slide):
     container = cache_container(slide)
     a = CacheLock(container)
@@ -466,6 +500,7 @@ def test_stale_reclaim_is_serialized_before_a_successor_can_be_claimed(
     assert not errors
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies replacement of an open lock file")
 def test_release_writes_only_its_fd_when_successor_arrives(slide, monkeypatch):
     """Replacement at the old read/unlink race point must remain untouched."""
     container = cache_container(slide)
@@ -506,6 +541,44 @@ def test_sweep_clears_stranded_backups_and_stagings(tmp_path):
         d.mkdir(parents=True)
     assert sweep_stale_builds(caches) == 3
     assert not dead1.exists() and not dead2.exists() and not weird.exists()
+
+
+def test_sweep_preserves_the_staging_directory_of_a_live_process(tmp_path):
+    from nd2wsi.cache import sweep_stale_builds
+
+    container = tmp_path / "slide.nd2wsi-cache"
+    staging = tmp_path / "slide.nd2wsi-cache.building-current"
+    staging.mkdir()
+    marker = staging / "current-chunk"
+    marker.write_bytes(b"in-progress data")
+    lock = CacheLock(container)
+    lock.acquire()
+    try:
+        assert sweep_stale_builds(tmp_path) == 0
+        assert marker.read_bytes() == b"in-progress data"
+    finally:
+        lock.release()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows denies replacement of an open lock file")
+def test_windows_open_cache_claim_prevents_replacement(tmp_path):
+    container = tmp_path / "slide.nd2wsi-cache"
+    lock = CacheLock(container)
+    successor = tmp_path / "replacement.lock"
+    successor.write_bytes(b'{"released": true}')
+    lock.acquire()
+    try:
+        with pytest.raises(PermissionError):
+            successor.replace(lock.path)
+        assert lock.refresh()
+        with pytest.raises(TimeoutError):
+            CacheLock(container).acquire(timeout=0.02, poll=0.005)
+    finally:
+        lock.release()
+    successor.replace(lock.path)
+    resumed = CacheLock(container)
+    resumed.acquire(timeout=0.2)
+    resumed.release()
 
 
 def test_same_stem_sources_get_distinct_new_cache_names(tmp_path):
