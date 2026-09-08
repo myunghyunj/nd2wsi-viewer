@@ -46,6 +46,23 @@ def _make_companion(path, suffix, symlink):
     return companion
 
 
+def test_quarantine_reports_windows_busy_cache_without_removing_it(tmp_path, monkeypatch):
+    cache = tmp_path / 'busy.nd2svs'
+    _write_cache(cache)
+    before = cache.read_bytes()
+
+    def busy(*args):
+        error = PermissionError('simulated sharing violation')
+        error.winerror = 32
+        raise error
+
+    monkeypatch.setattr(Path, 'rename', busy)
+    with pytest.raises(PermissionError, match='close all windows'):
+        quarantine(cache)
+    assert cache.read_bytes() == before
+    assert not list(tmp_path.glob('*.corrupt-*'))
+
+
 def test_ensure_cache_refuses_future_storage_header_without_opening_sqlite_or_changing_files(tmp_path, monkeypatch):
     source = tmp_path / "source.nd2"
     source.write_bytes(b"synthetic source must not be parsed or modified")

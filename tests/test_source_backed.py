@@ -192,6 +192,13 @@ def test_rebuild_evicts_the_registered_state(big_nd2):
     gen0 = reg.get(sid).generation
     # the slide's mtime changes, so the cache rebuilds with a new generation
     os.utime(path, ns=(0, 0))
+    if os.name == 'nt':
+        original_bytes = store.read_bytes()
+        with pytest.raises(PermissionError, match='close all windows'):
+            ensure_cache(path, tile=512)
+        assert store.read_bytes() == original_bytes
+        assert reg.get(sid).generation == gen0
+        reg.close_all(immediate=True)
     assert ensure_cache(path, tile=512) == store
     assert reg.add_store(store) == sid
     st = reg.get(sid)

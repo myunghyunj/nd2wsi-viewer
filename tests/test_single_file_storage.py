@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urlsplit
@@ -649,7 +650,10 @@ def test_invalid_prefix_is_rejected_before_file_creation(tmp_path, prefix):
 
 def test_unicode_uri_characters_and_long_portable_path(tmp_path):
     subtree = tmp_path / ("nested-" + "a" * 90)
-    path = subtree / ("selection-" + "b" * 90) / ("stage-" + "c" * 80) / "원본 # ? % &.nd2svs"
+    # '?' is a valid POSIX filename character but is rejected by Windows
+    # before SQLite opens it. Keep URI escaping coverage legal on each OS.
+    filename = "원본 # % &.nd2svs" if os.name == "nt" else "원본 # ? % &.nd2svs"
+    path = subtree / ("selection-" + "b" * 90) / ("stage-" + "c" * 80) / filename
     assert len(str(path)) > 260
     try:
         write_entry(path, "한글/μ/.zattrs", "원본 이름".encode())

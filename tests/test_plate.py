@@ -1680,6 +1680,29 @@ def test_reader_detaches_when_cache_generation_at_its_path_changes(
         aside = container.with_name(container.name + ".old-generation")
         writer.close()
         writer = None
+        if os.name == "nt":
+            # An open Windows SQLite reader prevents pathname replacement.
+            original_bytes = container.read_bytes()
+            with pytest.raises(OSError) as denied:
+                container.rename(aside)
+            assert denied.value.winerror in (32, 33)
+            assert container.is_file() and not aside.exists()
+            assert container.read_bytes() == original_bytes
+            reader.store._refresh(force=True)
+            assert reader.store.manifest["generation"] == old_generation
+            assert reader.store.writable is False
+            assert np.all(reader.reduced(1, 2, 1, THUMB_K) == value(1, 2, 1))
+            assert container.read_bytes() == original_bytes
+            reader.close()
+            reader = None
+            container.rename(aside)
+            assert not container.exists()
+            assert aside.read_bytes() == original_bytes
+            replacement = PlateSource(plate_nd2)
+            assert replacement.store is not None
+            assert replacement.store.manifest["generation"] != old_generation
+            assert np.all(replacement.reduced(1, 2, 1, THUMB_K) == value(1, 2, 1))
+            return
         container.rename(aside)
 
         replacement = PlateSource(plate_nd2)
@@ -1695,7 +1718,8 @@ def test_reader_detaches_when_cache_generation_at_its_path_changes(
     finally:
         if replacement is not None:
             replacement.close()
-        reader.close()
+        if reader is not None:
+            reader.close()
         if writer is not None:
             writer.close()
 

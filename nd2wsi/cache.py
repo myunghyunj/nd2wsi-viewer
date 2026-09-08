@@ -327,7 +327,15 @@ def quarantine(path: Path) -> Path:
     while target.exists():
         n += 1
         target = path.with_name(f"{path.name}.corrupt-{stamp}-{n}")
-    path.rename(target)
+    try:
+        path.rename(target)
+    except PermissionError as exc:
+        if getattr(exc, 'winerror', None) in (32, 33):
+            raise PermissionError(
+                f"This cache is still open in a viewer. Save annotations, close all windows "
+                f"using {path.name}, and reopen the source to rebuild it. The cache was preserved."
+            ) from exc
+        raise
     return target
 
 
