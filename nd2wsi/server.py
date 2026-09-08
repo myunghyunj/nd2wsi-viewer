@@ -260,11 +260,13 @@ def _inspection_storage_details(
 
 
 def _manifest_source_path(container: Path, manifest: dict[str, Any]) -> Path | None:
+    from .cache import source_base
+
     src = manifest.get("source") or {}
     rel = src.get("relative_path") if isinstance(src, dict) else None
     if not isinstance(rel, str) or not rel:
         return None
-    candidate = (container / rel).resolve()
+    candidate = (source_base(container) / rel).resolve()
     recorded_name = src.get("name")
     if recorded_name and candidate.name != Path(str(recorded_name)).name:
         return None
@@ -437,11 +439,12 @@ def store_generation(store_path: str | Path) -> str:
     what lets the browser cache tiles at all: a rebuilt cache mints new
     URLs instead of reviving stale renders.
     """
-    from .cache import CACHE_SUFFIX, read_manifest
+    from .cache import manifest_container, read_manifest
 
     store_path = Path(store_path)
-    if store_path.parent.name.endswith(CACHE_SUFFIX):
-        m = read_manifest(store_path.parent)
+    container = manifest_container(store_path)
+    if container is not None:
+        m = read_manifest(container)
         if m and m.get("generation"):
             return str(m["generation"])
     probe = store_path / ".zattrs" if store_path.is_dir() else store_path
@@ -449,6 +452,81 @@ def store_generation(store_path: str | Path) -> str:
         return format(probe.stat().st_mtime_ns, "x")
     except OSError:
         return ""
+
+
+def _validate_file_cache_for_trash(path: Path, manifest: dict[str, Any]) -> None:
+    """Fail closed on embedded user work, unfamiliar formats, or active journals."""
+    from .cache import MANIFEST_NAME, SINGLE_FILE_FORMAT, STORE_NAME
+    from .storage.single_file import SQLiteStore
+
+    for suffix in ("-journal", "-wal", "-shm"):
+        companion = path.with_name(path.name + suffix)
+        if companion.exists() or companion.is_symlink():
+            raise ValueError("cache has a SQLite journal; close its writer before deleting")
+    with SQLiteStore(path, read_only=True) as store:
+        current = json.loads(store.read_bytes(MANIFEST_NAME))
+        if not isinstance(current, dict) or not current.get("complete"):
+            raise ValueError("refusing to delete an incomplete cache")
+        kind = current.get("kind")
+        expected_format = "nd2wsi-plate/2" if kind == "plate" else SINGLE_FILE_FORMAT
+        if kind not in ("full", "overview", "plate") or current.get("format") != expected_format:
+            raise ValueError("refusing to delete an unfamiliar cache format")
+        if not manifest.get("generation") or current.get("generation") != manifest.get("generation"):
+            raise ValueError("cache generation changed; reopen before deleting")
+        prefix = "thumbs.zarr" if kind == "plate" else STORE_NAME
+        arrays = {"thumbs", "done", "digest", "focus"} if kind == "plate" else None
+        for key in store.list_keys():
+            if key == MANIFEST_NAME:
+                continue
+            parts = key.split("/")
+            owned = len(parts) == 2 and parts[0] == prefix and parts[1] in (
+                ".zattrs", ".zgroup", ".zmetadata",
+            )
+            if len(parts) == 3 and parts[0] == prefix:
+                array = parts[1] in arrays if arrays is not None else parts[1].isdigit()
+                owned = array and (
+                    parts[2] in (".zarray", ".zattrs")
+                    or re.fullmatch(r"\d+(?:\.\d+)*", parts[2]) is not None
+                )
+            if not owned:
+                raise ValueError(f"unknown or user-owned embedded entry; cache preserved: {key}")
+
+
+def _delete_verified_cache_file(path: Path, expected: os.stat_result, root_fd: int,
+                                on_progress=None) -> int:
+    """Unlink only the renamed, still-guarded regular file; never follow links."""
+    try:
+        current = path.stat(follow_symlinks=False)
+        if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                or not _same_file_identity(current, expected)
+                or not _same_file_identity(os.fstat(root_fd), current)):
+            raise OSError(f"cache changed before deletion; retained safely at {path}")
+        size = current.st_size
+        if os.name == "nt":
+            from .windows_fs import _delete_handle, open_guard
+
+            fd = open_guard(path, delete=True)
+            try:
+                if not _same_file_identity(os.fstat(fd), expected):
+                    raise OSError(f"cache changed before deletion: {path}")
+                _delete_handle(fd)
+            finally:
+                os.close(fd)
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            parent_fd = os.open(path.parent, flags)
+            try:
+                current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISREG(current.st_mode) or not _same_file_identity(current, expected):
+                    raise OSError(f"cache changed before deletion: {path}")
+                os.unlink(path.name, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+        if on_progress:
+            on_progress(1.0)
+        return size
+    finally:
+        os.close(root_fd)
 
 
 def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
@@ -761,8 +839,8 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
     """
     from .cache import (
         ANNOTATIONS_DIR,
-        CACHE_SUFFIX,
         MANAGED_DIR,
+        manifest_container,
         read_manifest,
         selection_tag,
     )
@@ -773,16 +851,18 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
     source_name = Path(meta["source"]).name
     stem = Path(source_name).stem
 
-    home = store_path.parent
-    container = home if home.name.endswith(CACHE_SUFFIX) else None
-    if container is not None:
-        home = home.parent
+    container = manifest_container(store_path)
+    home = container.parent if container is not None else store_path.parent
     if home.name in (CACHE_DIR_NAME, "caches"):
         home = home.parent
     if home.name == MANAGED_DIR:
         home = home.parent
 
     manifest = read_manifest(container) if container is not None else None
+    if manifest and container is not None:
+        source = _manifest_source_path(container, manifest)
+        if source is not None and source.is_file() and source.name == source_name:
+            home = source.parent
     raw_selection = (manifest or {}).get("selection") or meta.get("selection") or {}
     selection = {
         key: raw_selection[key]
@@ -879,11 +959,19 @@ class SlideRegistry:
         trash_path: str | Path | None = None,
         source_path: str | Path | None = None,
     ) -> str:
-        from .cache import CACHE_SUFFIX, read_manifest
+        from .cache import (
+            CACHE_SUFFIX,
+            SINGLE_FILE_SUFFIX,
+            manifest_container,
+            read_manifest,
+        )
         from .convert import CACHE_DIR_NAME, is_nd2wsi_store, open_store
         from .svs import is_svs
 
-        store_path = Path(store_path).resolve()
+        requested_path = Path(store_path).expanduser()
+        if requested_path.suffix.lower() == SINGLE_FILE_SUFFIX and requested_path.is_symlink():
+            raise ValueError("open the actual .nd2svs cache file, not a symbolic link")
+        store_path = requested_path.resolve()
         registered_source = (
             Path(source_path).expanduser().resolve() if source_path is not None else None
         )
@@ -898,6 +986,8 @@ class SlideRegistry:
             )
         if trash_path is not None:
             trash_path = Path(trash_path).resolve()
+        elif store_path.suffix.lower() == SINGLE_FILE_SUFFIX:
+            trash_path = store_path
         elif store_path.parent.name.endswith(CACHE_SUFFIX):
             trash_path = store_path.parent
         elif store_path.parent.name == CACHE_DIR_NAME and is_nd2wsi_store(
@@ -922,13 +1012,23 @@ class SlideRegistry:
                 trash_path = built
                 registered_source = registered_source or slide_path
         manifest: dict[str, Any] = {}
-        container_path = None
-        if store_path.parent.name.endswith(CACHE_SUFFIX):
-            container_path = store_path.parent
+        container_path = manifest_container(store_path)
+        if container_path is not None:
             manifest = read_manifest(container_path) or {}
+            if store_path.suffix.lower() == SINGLE_FILE_SUFFIX and not manifest:
+                raise ValueError("single-file cache has no complete manifest")
+            if store_path.suffix.lower() == SINGLE_FILE_SUFFIX:
+                expected_format = (
+                    "nd2wsi-plate/2" if manifest.get("kind") == "plate" else "nd2wsi-cache/4"
+                )
+                if (manifest.get("format") != expected_format
+                        or manifest.get("kind") not in ("full", "overview", "plate")):
+                    raise ValueError("unsupported single-file cache format; update the viewer")
             registered_source = registered_source or _manifest_source_path(
                 container_path, manifest
             )
+            if manifest.get("kind") == "plate":
+                return self._add_plate_cache(store_path, manifest)
             if manifest.get("kind") == "overview":
                 return self._add_overview(
                     store_path, manifest, source_path=registered_source
@@ -944,21 +1044,30 @@ class SlideRegistry:
                 and (registered_source is None or st.source_path == registered_source)
             ):
                 return sid
-            if st is not None:  # rebuilt underneath: the old root is stale
-                stale = self.slides.pop(sid)
+            if st is not None:  # keep the old state usable if opening fails
+                stale = st
             root, attrs = open_store(store_path)
-            st = ViewerState(
-                root,
-                attrs,
-                max_render_mpx=self.max_render_mpx,
-                annotations_path=annotations_sidecar(store_path, attrs),
-                generation=gen,
-                trash_path=Path(trash_path) if trash_path is not None else None,
-                source_path=registered_source,
-                store_path=store_path,
-                container_path=container_path,
-                manifest=manifest,
-            )
+            try:
+                st = ViewerState(
+                    root,
+                    attrs,
+                    max_render_mpx=self.max_render_mpx,
+                    annotations_path=annotations_sidecar(store_path, attrs),
+                    generation=gen,
+                    trash_path=Path(trash_path) if trash_path is not None else None,
+                    source_path=registered_source,
+                    store_path=store_path,
+                    container_path=container_path,
+                    manifest=manifest,
+                )
+            except BaseException:
+                close = getattr(root, "close", None)
+                if close is not None:
+                    try:
+                        close(delay=0)
+                    except TypeError:
+                        close()
+                raise
             self.slides[sid] = st
         _close_state(stale)
         return sid
@@ -976,18 +1085,19 @@ class SlideRegistry:
         runtime, the stored overview still shows — at half resolution,
         with a note saying why — rather than failing to open at all.
         """
-        from .cache import fingerprints_match, quick_fingerprint
+        from .cache import fingerprints_match, manifest_container, quick_fingerprint, source_base
         from .convert import open_store
         from .direct import open_nd2_backed
 
         sid = self.sid_for(store_path)
         gen = store_generation(store_path)
+        container = manifest_container(store_path) or store_path.parent
         stale = None
         with self._lock:
             src_info = manifest.get("source", {})
-            source = source_path or _manifest_source_path(store_path.parent, manifest)
+            source = source_path or _manifest_source_path(container, manifest)
             if source is None:
-                source = (store_path.parent / src_info.get("relative_path", "")).resolve()
+                source = (source_base(container) / src_info.get("relative_path", "")).resolve()
             source_ok = False
             try:
                 source_ok = source.is_file() and fingerprints_match(
@@ -1003,8 +1113,8 @@ class SlideRegistry:
                 and st.source_path == source
             ):
                 return sid
-            if st is not None:  # rebuilt or mode change: the state is stale
-                stale = self.slides.pop(sid)
+            if st is not None:  # keep the old state usable if opening fails
+                stale = st
             root = attrs = None
             reason = f"{src_info.get('name', 'source')} is missing"
             if source.is_file() and not source_ok:
@@ -1029,22 +1139,30 @@ class SlideRegistry:
                 meta["notes"] = meta.get("notes", []) + [
                     f"{reason}; showing the stored overview at half resolution"
                 ]
+            try:
+                annotations = None if degraded else annotations_sidecar(store_path, attrs)
+            except BaseException:
+                close = getattr(root, "close", None)
+                if close is not None:
+                    try:
+                        close(delay=0)
+                    except TypeError:
+                        close()
+                raise
             st = ViewerState(
                 root,
                 attrs,
                 max_render_mpx=self.max_render_mpx,
                 # annotations live in level-0 pixels; a degraded view's base
                 # is level 1, so editing here would silently corrupt them
-                annotations_path=None
-                if degraded
-                else annotations_sidecar(store_path, attrs),
+                annotations_path=annotations,
                 # the two modes map levels differently, so tiles cached as
                 # immutable in one must never be revived in the other
                 generation=gen + ("-degraded" if degraded else ""),
-                trash_path=store_path.parent,
+                trash_path=container,
                 source_path=source,
                 store_path=store_path,
-                container_path=store_path.parent,
+                container_path=container,
                 manifest=manifest,
             )
             self.slides[sid] = st
@@ -1111,14 +1229,24 @@ class SlideRegistry:
         _close_state(stale)
         return sid
 
-    def add_plate(self, slide_path: str | Path) -> str:
+    def _add_plate_cache(self, cache_path: Path, manifest: dict) -> str:
+        from .cache import fingerprints_match, quick_fingerprint
+
+        source = _manifest_source_path(cache_path, manifest)
+        if source is None or source.suffix.lower() != ".nd2" or not source.is_file():
+            raise ValueError("plate cache needs its original ND2 source; restore the source first")
+        if not fingerprints_match(manifest.get("source", {}), quick_fingerprint(source)):
+            raise ValueError("plate cache source has changed; open the original ND2 to rebuild")
+        return self.add_plate(source, cache_path=cache_path)
+
+    def add_plate(self, slide_path: str | Path, *, cache_path: Path | None = None) -> str:
         """Serve a time series of sites straight from the ND2, writing nothing."""
         from .cache import fingerprints_match, quick_fingerprint
         from .direct import _Root
         from .plate import PlateSource
 
         slide_path = Path(slide_path).resolve()
-        sid = self.sid_for(slide_path)
+        sid = self.sid_for(cache_path if cache_path is not None else slide_path)
         stale = None
         with self._lock:
             fingerprint = quick_fingerprint(slide_path)
@@ -1126,6 +1254,8 @@ class SlideRegistry:
                 f"{int(fingerprint['mtime_ns']):x}-"
                 f"{str(fingerprint['quick_sha256'])[:16]}"
             )
+            if cache_path is not None:
+                gen += "-" + store_generation(cache_path)
             st = self.slides.get(sid)
             if st is not None and st.generation == gen and st.plate is not None:
                 return sid
@@ -1135,7 +1265,10 @@ class SlideRegistry:
             # registry fingerprint and that internally consistent open.
             source = None
             for _ in range(2):
-                candidate = PlateSource(slide_path)
+                candidate = (
+                    PlateSource(slide_path, cache_path=cache_path)
+                    if cache_path is not None else PlateSource(slide_path)
+                )
                 try:
                     current = quick_fingerprint(slide_path)
                 except BaseException:
@@ -1153,6 +1286,8 @@ class SlideRegistry:
                 f"{int(fingerprint['mtime_ns']):x}-"
                 f"{str(fingerprint['quick_sha256'])[:16]}"
             )
+            if cache_path is not None and source.store is not None:
+                gen += "-" + str(source.store.manifest.get("generation", ""))
             try:
                 root = _Root(
                     source.root_for(0, 0, source.z_home), closer=source.close
@@ -1172,7 +1307,8 @@ class SlideRegistry:
                 trash_path=container,
                 source_path=slide_path,
                 container_path=container,
-                manifest={"source": fingerprint},
+                manifest=(dict(source.store.manifest) if source.store is not None
+                          else {"source": fingerprint}),
                 plate=source,
             )
             self.slides[sid] = st
@@ -1181,10 +1317,14 @@ class SlideRegistry:
 
     def open_path(self, path: str | Path, on_progress=None) -> str:
         """A slide file (converted on first open) or an existing store."""
+        from .cache import SINGLE_FILE_SUFFIX
         from .convert import ensure_cache, existing_cache_store
         from .svs import is_svs
 
-        path = Path(path).expanduser().resolve()
+        path = Path(path).expanduser()
+        if path.suffix.lower() == SINGLE_FILE_SUFFIX:
+            return self.add_store(path)
+        path = path.resolve()
         if path.suffix.lower() in SLIDE_SUFFIXES:
             if is_svs(path) and existing_cache_store(path) is None:
                 try:
@@ -1202,7 +1342,7 @@ class SlideRegistry:
         elif path.is_dir():  # a user-supplied *.ome.zarr store
             return self.add_store(path)
         else:
-            raise ValueError(f"not an ND2/SVS slide or pyramid store: {path.name}")
+            raise ValueError(f"not an ND2/SVS slide, .nd2svs cache, or pyramid store: {path.name}")
         # no explicit trash_path: add_store promotes a container store to its
         # container, so trashing removes manifest and pixels together
         return self.add_store(store, source_path=path)
@@ -1281,6 +1421,7 @@ class SlideRegistry:
             CACHE_SUFFIX,
             CACHES_DIR,
             MANAGED_DIR,
+            SINGLE_FILE_SUFFIX,
             CacheLock,
         )
         from .convert import CACHE_DIR_NAME
@@ -1307,7 +1448,13 @@ class SlideRegistry:
             )
             valid_container = real_directory and store.name.endswith(CACHE_SUFFIX)
             valid_store = real_directory and store.name.endswith(".ome.zarr")
-            if not (valid_container or valid_store):
+            single_file = bool(
+                store_stat is not None and stat.S_ISREG(store_stat.st_mode)
+                and store_stat.st_nlink == 1
+                and not (getattr(store_stat, "st_file_attributes", 0) & 0x400)
+                and store.suffix.lower() == SINGLE_FILE_SUFFIX
+            )
+            if not (valid_container or valid_store or single_file):
                 raise ValueError(f"refusing to delete {store}: not a managed cache")
             if st.busy.active:
                 raise ValueError(
@@ -1321,7 +1468,9 @@ class SlideRegistry:
             )
             plate_source = st.plate if plate_store is not None else None
             local_plate_writer = bool(plate_store is not None and plate_store.writable)
-            guard_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            guard_flags = os.O_RDONLY
+            if not single_file:
+                guard_flags |= getattr(os, "O_DIRECTORY", 0)
             if hasattr(os, "O_NOFOLLOW"):
                 guard_flags |= os.O_NOFOLLOW
             if os.name == "nt":
@@ -1379,8 +1528,11 @@ class SlideRegistry:
                 annotation_home = store.parent.parent / MANAGED_DIR / ANNOTATIONS_DIR
             else:
                 annotation_home = store.parent / MANAGED_DIR / ANNOTATIONS_DIR
-            annotation_home.mkdir(parents=True, exist_ok=True)
-            rescue_annotations(store, annotation_home)
+            if single_file:
+                _validate_file_cache_for_trash(store, st.manifest)
+            else:
+                annotation_home.mkdir(parents=True, exist_ok=True)
+                rescue_annotations(store, annotation_home)
 
             # Lock acquisition can wait. Revalidate while holding the registry
             # lock, bar late requests, and drain before the state is removed.
@@ -1461,7 +1613,8 @@ class SlideRegistry:
                 store.rename(doomed)
                 renamed_stat = doomed.stat(follow_symlinks=False)
                 if (
-                    not stat.S_ISDIR(renamed_stat.st_mode)
+                    not (stat.S_ISREG(renamed_stat.st_mode) if single_file
+                         else stat.S_ISDIR(renamed_stat.st_mode))
                     or not _same_file_identity(renamed_stat, store_stat)
                     or not _same_file_identity(os.fstat(store_guard_fd), renamed_stat)
                 ):
@@ -1473,7 +1626,10 @@ class SlideRegistry:
             # second time before releasing the writer/build locks so an old
             # path-based producer that wrote between the first rescue and the
             # rename cannot lose its last annotation copy.
-            rescue_annotations(doomed, annotation_home)
+            if single_file:
+                _validate_file_cache_for_trash(doomed, st.manifest)
+            else:
+                rescue_annotations(doomed, annotation_home)
             ready_to_delete = True
         finally:
             if lock is not None:
@@ -1484,6 +1640,8 @@ class SlideRegistry:
                 os.close(store_guard_fd)
                 store_guard_fd = None
         guarded_fd, store_guard_fd = store_guard_fd, None
+        if single_file:
+            return _delete_verified_cache_file(doomed, store_stat, guarded_fd, on_progress)
         return _delete_verified_cache_tree(
             doomed,
             store_stat,

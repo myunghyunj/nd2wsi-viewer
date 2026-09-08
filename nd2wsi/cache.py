@@ -8,9 +8,10 @@ served stale, and two selections fought over one directory.
 
 Now every cache lives in a container named for its source and selection,
 
-    <slide dir>/nd2wsi/caches/<source-name>--t0-p0-zmid.nd2wsi-cache/
-        manifest.json     identity, fingerprint, completion — written last
-        store.ome.zarr/   the pyramid
+    <slide dir>/nd2wsi/caches/<source-name>--t0-p0-zmid.nd2svs
+
+The file contains the manifest and compressed Zarr chunks. Legacy
+``.nd2wsi-cache`` directories remain readable for compatibility.
 
 built in a staging sibling under an interprocess lock and renamed into
 place only when complete. A cache that fails validation is quarantined,
@@ -42,6 +43,7 @@ MANAGED_DIR = "nd2wsi"
 CACHES_DIR = "caches"
 ANNOTATIONS_DIR = "annotations"
 CACHE_SUFFIX = ".nd2wsi-cache"
+SINGLE_FILE_SUFFIX = ".nd2svs"
 STORE_NAME = "store.ome.zarr"
 MANIFEST_NAME = "manifest.json"
 MANIFEST_FORMAT = "nd2wsi-cache/2"
@@ -49,7 +51,8 @@ MANIFEST_FORMAT = "nd2wsi-cache/2"
 # as a full store at half resolution with level-0 calibration — so they
 # carry a format that old readers reject (and quarantine) instead
 OVERVIEW_FORMAT = "nd2wsi-cache/3"
-KNOWN_FORMATS = (MANIFEST_FORMAT, OVERVIEW_FORMAT)
+SINGLE_FILE_FORMAT = "nd2wsi-cache/4"
+KNOWN_FORMATS = (MANIFEST_FORMAT, OVERVIEW_FORMAT, SINGLE_FILE_FORMAT)
 ALGORITHM = "box-mean-floor-v1"
 
 # A lock names the machine and boot that took it. A drive carried to
@@ -87,9 +90,15 @@ def newer_cache_format(container: str | Path) -> str | None:
     wrote: the cache is not broken, the app is behind. The caller refuses
     to open and names the update instead of destroying work.
     """
+    if is_file_container(container):
+        from .storage.single_file import newer_file_format
+
+        newer_storage = newer_file_format(container)
+        if newer_storage is not None:
+            return f"nd2svs-sqlite/{newer_storage}"
     try:
-        m = json.loads((Path(container) / MANIFEST_NAME).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        m = _manifest_data(Path(container))
+    except (OSError, UnicodeError, ValueError):
         return None
     if not isinstance(m, dict) or not m.get("complete"):
         return None
@@ -133,7 +142,7 @@ def legacy_cache_container(
     return base / f"{slide.stem}--{tag}{CACHE_SUFFIX}"
 
 
-def cache_container(
+def directory_cache_container(
     slide: str | Path, selection: Any = None, cache_dir: str | Path | None = None
 ) -> Path:
     """The v1 cache path, keyed by source filename and selected plane."""
@@ -145,8 +154,47 @@ def cache_container(
     return base / f"{source_tag(slide)}--{tag}{CACHE_SUFFIX}"
 
 
+def cache_container(
+    slide: str | Path, selection: Any = None, cache_dir: str | Path | None = None
+) -> Path:
+    """The v2 single-file cache, keyed by source filename and selected plane."""
+    old = directory_cache_container(slide, selection, cache_dir)
+    return old.with_name(old.name[:-len(CACHE_SUFFIX)] + SINGLE_FILE_SUFFIX)
+
+
+def is_file_container(path: str | Path) -> bool:
+    """Include our staging siblings; existence is not required during a build."""
+    if Path(path).is_dir():
+        return False
+    return Path(path).name.lower().endswith(SINGLE_FILE_SUFFIX) or (
+        SINGLE_FILE_SUFFIX + ".building-" in Path(path).name.lower()
+    )
+
+
 def container_store(container: str | Path) -> Path:
-    return Path(container) / STORE_NAME
+    return Path(container) if is_file_container(container) else Path(container) / STORE_NAME
+
+
+def manifest_container(store: str | Path) -> Path | None:
+    store = Path(store)
+    if is_file_container(store):
+        return store
+    if store.name.endswith(CACHE_SUFFIX):
+        return store
+    return store.parent if store.parent.name.endswith(CACHE_SUFFIX) else None
+
+
+def source_base(container: str | Path) -> Path:
+    container = Path(container)
+    return container.parent if is_file_container(container) else container
+
+
+def _manifest_data(container: Path) -> Any:
+    if is_file_container(container):
+        from .storage.single_file import read_entry
+
+        return json.loads(read_entry(container, MANIFEST_NAME))
+    return json.loads((container / MANIFEST_NAME).read_text(encoding="utf-8"))
 
 
 def quick_fingerprint(path: str | Path) -> dict[str, Any]:
@@ -195,13 +243,15 @@ def write_manifest(
     from . import __version__
 
     manifest = {
-        "format": MANIFEST_FORMAT if kind == "full" else OVERVIEW_FORMAT,
+        "format": SINGLE_FILE_FORMAT if is_file_container(container) else (
+            MANIFEST_FORMAT if kind == "full" else OVERVIEW_FORMAT
+        ),
         "kind": kind,
         "complete": True,
         "generation": uuid.uuid4().hex,
         "source": {
             **fingerprint,
-            "relative_path": Path(os.path.relpath(slide, container)).as_posix(),
+            "relative_path": Path(os.path.relpath(slide, source_base(container))).as_posix(),
         },
         "selection": {**selection, "z_resolved": resolved_z},
         "image": {"shape_cyx": list(shape_cyx), "dtype": dtype},
@@ -215,6 +265,12 @@ def write_manifest(
         },
         "created_by": {"nd2wsi_version": __version__},
     }
+    if is_file_container(container):
+        from .storage.single_file import write_entry
+
+        manifest["storage"].update({"container": "nd2svs-sqlite/2"})
+        write_entry(container, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
+        return
     tmp = container / f".{MANIFEST_NAME}.tmp"
     tmp.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     tmp.replace(container / MANIFEST_NAME)
@@ -222,8 +278,8 @@ def write_manifest(
 
 def read_manifest(container: str | Path) -> dict[str, Any] | None:
     try:
-        m = json.loads((Path(container) / MANIFEST_NAME).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        m = _manifest_data(Path(container))
+    except (OSError, UnicodeError, ValueError):
         return None
     return m if isinstance(m, dict) and m.get("complete") else None
 
@@ -254,8 +310,17 @@ def cache_matches(
         return False
 
 
+def _refuse_database_companions(path: Path) -> None:
+    """Never detach a database from a possible recovery journal."""
+    for suffix in ('-journal', '-wal', '-shm'):
+        companion = path.with_name(path.name + suffix)
+        if companion.exists() or companion.is_symlink():
+            raise RuntimeError(f"cache has a database journal; preserve and recover it before replacement: {companion}")
+
+
 def quarantine(path: Path) -> Path:
     """Set a broken artifact aside instead of destroying it."""
+    _refuse_database_companions(path)
     stamp = time.strftime("%Y%m%dT%H%M%S")
     target = path.with_name(f"{path.name}.corrupt-{stamp}")
     n = 0
@@ -599,6 +664,8 @@ def commit_container(staging: Path, final: Path) -> None:
     aside first and removed after the new one is in place; a failure puts
     it back.
     """
+    _refuse_database_companions(staging)
+    _refuse_database_companions(final)
     backup = None
     if final.exists():
         backup = final.with_name(final.name + f".replaced-{uuid.uuid4().hex[:8]}")
@@ -610,7 +677,16 @@ def commit_container(staging: Path, final: Path) -> None:
             backup.rename(final)
         raise
     if backup is not None:
-        shutil.rmtree(backup, ignore_errors=True)
+        _remove_artifact(backup)
+
+
+def _remove_artifact(path: Path) -> None:
+    """Remove one exact app-owned staging artifact, whether file or directory."""
+    _refuse_database_companions(path)
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path)
 
 
 def sweep_stale_builds(caches_dir: Path) -> int:
@@ -626,12 +702,10 @@ def sweep_stale_builds(caches_dir: Path) -> int:
         return 0
     for item in caches_dir.iterdir():
         name = item.name
-        if ".building-" in name:
-            family = name.split(".building-")[0].lstrip(".")
-        elif ".replaced-" in name:
-            family = name.split(".replaced-")[0]
-        else:
+        match = re.fullmatch(r"(.+\.(?:nd2wsi-cache|nd2svs))\.(?:building|replaced)-[^/]+", name)
+        if match is None:
             continue
+        family = match.group(1)
         lock = CacheLock(caches_dir / family)
         info = lock._read()
         live = False
@@ -647,6 +721,15 @@ def sweep_stale_builds(caches_dir: Path) -> int:
                 except PermissionError:
                     live = True
         if not live:
-            shutil.rmtree(item, ignore_errors=True)
-            n += 1
+            try:
+                _refuse_database_companions(item)
+                if item.is_file():
+                    from .storage.single_file import is_single_file
+
+                    if not is_single_file(item):
+                        continue  # an arbitrary file with a staging-like name is not cache
+                _remove_artifact(item)
+                n += 1
+            except (OSError, RuntimeError):
+                pass  # leave inaccessible artifacts in place; do not report them removed
     return n

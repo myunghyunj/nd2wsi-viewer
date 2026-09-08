@@ -416,13 +416,15 @@ def open_nd2_backed(
     import copy
 
     import nd2
-    import zarr
 
-    from .cache import read_manifest
+    from .cache import manifest_container, read_manifest
+    from .convert import open_store
     from .reader import PlaneSelection, is_source_backable, plane_view
 
     slide, store = Path(slide), Path(store)
-    manifest = read_manifest(store.parent) or {}
+    container = manifest_container(store)
+    manifest = read_manifest(container) if container is not None else {}
+    manifest = manifest or {}
     sel = manifest.get("selection", {})
     selection = PlaneSelection(
         t=int(sel.get("t", 0)),
@@ -431,14 +433,15 @@ def open_nd2_backed(
     )
 
     f = nd2.ND2File(str(slide))
+    zroot = None
     try:
         ok, why = is_source_backable(f, selection)
         if not ok:
             raise NotImplementedError(f"{slide.name}: {why}")
         view, _ = plane_view(f, selection)
 
-        zroot = zarr.open_group(str(store), mode="r")
-        attrs = copy.deepcopy(dict(zroot.attrs))
+        zroot, stored_attrs = open_store(store)
+        attrs = copy.deepcopy(stored_attrs)
         meta = attrs.get("nd2wsi") or {}
         ov = meta.get("overview_of")
         if meta.get("kind") != "overview" or not ov:
@@ -472,7 +475,12 @@ def open_nd2_backed(
             )
         attrs["nd2wsi"] = meta
     except BaseException:
-        f.close()
+        try:
+            f.close()
+        finally:
+            close = getattr(zroot, "close", None)
+            if close is not None:
+                close()
         raise
 
     def _teardown() -> None:
@@ -486,5 +494,9 @@ def open_nd2_backed(
             f.close()
         except BufferError:  # pragma: no cover - defensive
             pass
+        finally:
+            close = getattr(zroot, "close", None)
+            if close is not None:
+                close()
 
     return _Root(levels, _teardown), attrs

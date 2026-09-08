@@ -266,10 +266,10 @@ def test_cached_svs_keeps_provenance_but_hides_associated_when_source_is_missing
         inspect = _get_json(base + "/api/inspect")
         assert state.source_path == path.resolve()
         assert state.store_path == store.resolve()
-        assert state.container_path == store.parent.resolve()
+        assert state.container_path == store.resolve()
         assert inspect["source_path"] == str(path.resolve())
         assert inspect["source_bytes"] is None
-        assert inspect["cache_path"] == str(store.parent.resolve())
+        assert inspect["cache_path"] == str(store.resolve())
         assert inspect["cache_bytes"] > 0
         assert inspect["cache_allocated_bytes"] is not None
         assert inspect["storage_details"]["mode"] == "full"

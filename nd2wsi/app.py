@@ -82,7 +82,7 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
 <div id="drop"><div class="card">
   <div class="pyr"><div class="l1"></div><div class="l2"></div><div class="l3"></div></div>
   <h1>Drop a slide to open</h1>
-  <div class="sub"><b>.nd2</b> or <b>.svs</b> &nbsp;·&nbsp; or click anywhere to browse</div>
+  <div class="sub"><b>.nd2</b>, <b>.svs</b>, or <b>.nd2svs</b> &nbsp;·&nbsp; click anywhere to browse</div>
   <div id="status"></div>
   <div id="bar"><span id="fill"></span></div>
   <div id="pct"></div>
@@ -160,10 +160,15 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     and nothing is built or asked. An ND2 has no pyramid inside, so its
     store is built on first open, next to the slide.
     """
+    from .cache import SINGLE_FILE_SUFFIX
     from .convert import ensure_cache, existing_cache_store
     from .plate import is_plate_file
     from .svs import is_svs
 
+    if nd2_path.suffix.lower() == SINGLE_FILE_SUFFIX:
+        if on_status:
+            on_status(f"opening {nd2_path.name} …")
+        return nd2_path
     if is_svs(nd2_path) and existing_cache_store(nd2_path) is None:
         return nd2_path  # the registry serves it straight from the file
     if nd2_path.suffix.lower() == ".nd2" and is_plate_file(nd2_path):
@@ -261,7 +266,7 @@ def _install_open_files_handler():
         def application_openFiles_(self, app, filenames):
             paths = [str(f) for f in filenames]
             _dlog(f"openFiles event {paths}")
-            good = [p for p in paths if p.lower().endswith((".nd2", ".svs"))]
+            good = [p for p in paths if p.lower().endswith((".nd2", ".svs", ".nd2svs"))]
             if good:
                 _dispatch_open(good)
             try:
@@ -274,7 +279,7 @@ def _install_open_files_handler():
         def application_openFile_(self, app, filename):
             _dlog(f"openFile event {filename}")
             p = str(filename)
-            if p.lower().endswith((".nd2", ".svs")):
+            if p.lower().endswith((".nd2", ".svs", ".nd2svs")):
                 _dispatch_open([p])
                 return True
             return False
@@ -850,7 +855,7 @@ class Api:
             picked = webview.windows[0].create_file_dialog(
                 webview.OPEN_DIALOG,
                 allow_multiple=True,
-                file_types=("Slide scans (*.nd2;*.svs)",),
+                file_types=("Slides and caches (*.nd2;*.svs;*.nd2svs)",),
             )
             if not picked:
                 return None
@@ -866,8 +871,8 @@ class Api:
         good = []
         for raw in paths or []:
             p = Path(raw)
-            if p.suffix.lower() not in (".nd2", ".svs"):
-                self._status = f"{p.name}: not an .nd2 or .svs file"
+            if p.suffix.lower() not in (".nd2", ".svs", ".nd2svs"):
+                self._status = f"{p.name}: not an .nd2, .svs, or .nd2svs file"
             elif not p.is_file():
                 self._status = f"could not find {p.name}"
             else:
@@ -883,7 +888,7 @@ class Api:
         picked = webview.windows[0].create_file_dialog(
             webview.OPEN_DIALOG,
             allow_multiple=True,
-            file_types=("Slide scans (*.nd2;*.svs)",),
+            file_types=("Slides and caches (*.nd2;*.svs;*.nd2svs)",),
         )
         return [str(p) for p in picked] if picked else None
 

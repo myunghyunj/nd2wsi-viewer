@@ -89,12 +89,14 @@ def test_compact_cache_serves_the_source_and_saves_space(tmp_path):
     copy = tmp_path / CELL.name
     copy.write_bytes(CELL.read_bytes())
     store = ensure_cache(copy)
-    assert read_manifest(store.parent)["kind"] == "overview"
+    assert read_manifest(store)["kind"] == "overview"
 
     full = tmp_path / "full.ome.zarr"
     convert(copy, full, progress=False)
 
     def du(p):
+        if p.is_file():
+            return p.stat().st_size
         return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
 
     # levels 1..n hold a third of a full pyramid's pixels

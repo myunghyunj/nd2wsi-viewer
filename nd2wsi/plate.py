@@ -37,9 +37,12 @@ from .cache import (
     MANIFEST_NAME,
     CacheLock,
     fingerprints_match,
+    is_file_container,
     managed_dir,
     quarantine,
     quick_fingerprint,
+    read_manifest,
+    source_base,
     source_tag,
 )
 from .direct import _Lifecycle, _parse_cyx_index, _Root, _TileCache
@@ -74,11 +77,10 @@ PREFETCH_PENDING_MAX = 256  # frames queued for warming, oldest dropped first
 HISTOGRAM_LRU = 64
 THUMB_K = 8  # the reduction the store keeps, the one the site grid shows
 UNSCORED = -1.0  # a frame whose sharpness has not been measured yet
-# Keep the container format readable by v1.1.0. That build quarantines any
-# unfamiliar format before it checks the writer lock, so changing this string
-# in place would let an old app replace a live new cache. Integrity is an
-# additive manifest capability instead.
-PLATE_FORMAT = "nd2wsi-plate/1"
+# Single-file containers use /2 at a new .nd2svs path. Legacy /1 directories
+# remain read-only compatible and are never rewritten on ordinary open.
+PLATE_FORMAT = "nd2wsi-plate/2"
+LEGACY_PLATE_FORMAT = "nd2wsi-plate/1"
 PLATE_TAG = "plate"
 THUMBS_NAME = "thumbs.zarr"
 READER_REFRESH_S = 0.5
@@ -231,7 +233,22 @@ def _sharpness(a: np.ndarray) -> float:
 def plate_container(slide: str | Path) -> Path:
     """Where the thumbnail store of a plate file lives, beside the file."""
     slide = Path(slide)
-    return managed_dir(slide) / CACHES_DIR / f"{source_tag(slide)}--{PLATE_TAG}{CACHE_SUFFIX}"
+    return managed_dir(slide) / CACHES_DIR / f"{source_tag(slide)}--{PLATE_TAG}.nd2svs"
+
+
+def _plate_group(container: Path, mode: str):
+    if is_file_container(container):
+        from .storage.single_file import open_zarr_group
+        return open_zarr_group(container, prefix=THUMBS_NAME, mode=mode)
+    import zarr
+    return zarr.open_group(filesystem_path(container / THUMBS_NAME), mode=mode, zarr_format=2)
+
+
+def _close_plate_group(root: Any) -> None:
+    if root is not None:
+        close = getattr(root.store, "close", None)
+        if close is not None:
+            close()
 
 
 def plate_session_lock_path(container: str | Path) -> Path:
@@ -385,13 +402,29 @@ class PlateStore:
 
     # ---- open or create -------------------------------------------------
     @classmethod
-    def open_or_create(cls, source: PlateSource) -> PlateStore:
-        import zarr
-
-        container = plate_container(source.path)
+    def open_or_create(cls, source: PlateSource, *, cache_path: str | Path | None = None) -> PlateStore:
+        explicit = cache_path is not None
+        container = Path(cache_path).expanduser().resolve() if explicit else plate_container(source.path)
+        if not explicit and not container.exists():
+            legacy = container.with_name(container.name[:-len('.nd2svs')] + CACHE_SUFFIX)
+            if legacy.is_dir():
+                container = legacy
         fingerprint = quick_fingerprint(source.path)
         c, h, w = source.frame_shape
         shape = (source.T, source.P, source.Z, c, h // THUMB_K, w // THUMB_K)
+        manifest = cls._read(container)
+        if explicit and (manifest is None or not cls._matches(manifest, fingerprint, shape, source)):
+            raise ValueError('explicit plate cache is missing or does not match its source')
+        if container.is_dir():
+            if manifest is None or not cls._matches(manifest, fingerprint, shape, source):
+                raise ValueError('legacy plate cache does not match its source')
+            root = _plate_group(container, 'r')
+            try:
+                cls._validate_root(root, shape, source.dtype, require_digest=_has_integrity(manifest))
+                return cls(source, container, root, manifest, None)
+            except BaseException:
+                _close_plate_group(root)
+                raise
         container.parent.mkdir(parents=True, exist_ok=True)
         writer = PlateWriterLock(container)
         try:
@@ -400,20 +433,21 @@ class PlateStore:
             writer = None
 
         build_lock = CacheLock(container)
+        root = None
         try:
             build_lock.acquire(timeout=30.0)
             manifest = cls._read(container)
             if manifest is not None and not cls._matches(
                 manifest, fingerprint, shape, source
             ):
-                if writer is None:
+                if writer is None or explicit:
                     raise RuntimeError(
                         "thumbnail cache changed while another viewer owns its writer"
                     )
                 quarantine(container)
                 manifest = None
             if manifest is None:
-                if writer is None:
+                if writer is None or explicit:
                     raise RuntimeError(
                         "thumbnail cache is not ready while another viewer owns its writer"
                     )
@@ -422,15 +456,14 @@ class PlateStore:
             mode = "r+" if writer is not None else "r"
             expected = (1, shape[1], 1, shape[3], shape[4], shape[5])
             try:
-                root = zarr.open_group(
-                    filesystem_path(container / THUMBS_NAME), mode=mode, zarr_format=2
-                )
+                root = _plate_group(container, mode)
                 chunks = tuple(root["thumbs"].chunks)
             except Exception:
+                _close_plate_group(root)
                 root = None
                 chunks = None
             if chunks is not None and chunks != expected:
-                if writer is None:
+                if writer is None or explicit:
                     raise RuntimeError(
                         "thumbnail cache needs rebuilding by its writer"
                     )
@@ -438,19 +471,17 @@ class PlateStore:
                 # per site. Keep the whole superseded container rather than
                 # recursively deleting it: an old build may have placed user
                 # annotations inside what otherwise looks like cache data.
+                _close_plate_group(root)
+                root = None
                 quarantine(container)
                 manifest = cls._create(source, container, fingerprint, shape)
-                root = zarr.open_group(
-                    filesystem_path(container / THUMBS_NAME), mode="r+", zarr_format=2
-                )
+                root = _plate_group(container, 'r+')
             elif root is None:
-                if writer is None:
+                if writer is None or explicit:
                     raise RuntimeError("thumbnail cache is structurally unreadable")
                 quarantine(container)
                 manifest = cls._create(source, container, fingerprint, shape)
-                root = zarr.open_group(
-                    filesystem_path(container / THUMBS_NAME), mode="r+", zarr_format=2
-                )
+                root = _plate_group(container, 'r+')
 
             try:
                 if writer is not None:
@@ -463,18 +494,19 @@ class PlateStore:
                     require_digest=_has_integrity(manifest),
                 )
             except Exception:
-                if writer is None:
+                if writer is None or explicit:
                     raise RuntimeError("thumbnail cache has an invalid array schema") from None
+                _close_plate_group(root)
+                root = None
                 quarantine(container)
                 manifest = cls._create(source, container, fingerprint, shape)
-                root = zarr.open_group(
-                    filesystem_path(container / THUMBS_NAME), mode="r+", zarr_format=2
-                )
+                root = _plate_group(container, 'r+')
                 cls._validate_root(root, shape, source.dtype, require_digest=True)
 
             store = cls(source, container, root, manifest, writer)
             store.sweep()
         except BaseException:
+            _close_plate_group(root)
             if writer is not None:
                 writer.release()
             raise
@@ -485,7 +517,7 @@ class PlateStore:
     def sweep(self) -> None:
         """Drop the AppleDouble twins macOS leaves beside every file on
         exFAT and NTFS drives; each one costs a whole allocation block."""
-        if not self.writable:
+        if not self.writable or is_file_container(self.container):
             return  # removing files belongs to the viewer that writes
         try:
             from .convert import sweep_appledouble
@@ -571,17 +603,19 @@ class PlateStore:
 
     @staticmethod
     def _read(container: Path) -> dict | None:
-        try:
-            m = json.loads((container / MANIFEST_NAME).read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
+        if is_file_container(container):
+            from .storage.single_file import newer_file_format
+            newer = newer_file_format(container)
+            if newer is not None:
+                raise RuntimeError(f'thumbnail cache uses newer storage format {newer}; update nd2wsi-viewer')
+        m = read_manifest(container)
         if not isinstance(m, dict):
             return None
         fmt = str(m.get("format") or "")
-        if fmt == PLATE_FORMAT:
+        if fmt in (PLATE_FORMAT, LEGACY_PLATE_FORMAT):
             return m
         match = re.fullmatch(r"nd2wsi-plate/(\d+)", fmt)
-        if match and int(match.group(1)) > 1:
+        if match and int(match.group(1)) > 2:
             raise RuntimeError(
                 f"thumbnail cache uses newer format {fmt}; update nd2wsi-viewer"
             )
@@ -592,6 +626,7 @@ class PlateStore:
         thumbs = manifest.get("thumbs") or {}
         return (
             fingerprints_match(manifest.get("source") or {}, fingerprint)
+            and (manifest.get('source') or {}).get('name') == Path(source.path).name
             and list(thumbs.get("shape") or []) == list(shape)
             and thumbs.get("dtype") == str(source.dtype)
             and thumbs.get("k") == THUMB_K
@@ -602,15 +637,46 @@ class PlateStore:
 
     @staticmethod
     def _create(source: PlateSource, container: Path, fingerprint: dict, shape: tuple) -> dict:
-        import zarr
+        if is_file_container(container):
+            from .storage.single_file import SQLiteStore
+            staging = container.with_name(container.name + '.building-' + uuid.uuid4().hex)
+            SQLiteStore.create_exclusive(staging).close()
+            root = None
+            try:
+                root = _plate_group(staging, 'w')
+                manifest = PlateStore._create_contents(source, staging, fingerprint, shape, root)
+                _close_plate_group(root)
+                root = None
+                PlateStore._write_manifest(staging, manifest)
+                predecessor = quarantine(container) if container.exists() else None
+                try:
+                    staging.replace(container)
+                except OSError:
+                    if predecessor is not None:
+                        predecessor.rename(container)
+                    raise
+                return manifest
+            except BaseException:
+                _close_plate_group(root)
+                staging.unlink(missing_ok=True)
+                raise
+        if container.exists():
+            quarantine(container)
+        container.mkdir(parents=True, exist_ok=True)
+        root = _plate_group(container, 'w')
+        try:
+            manifest = PlateStore._create_contents(source, container, fingerprint, shape, root)
+        finally:
+            _close_plate_group(root)
+        PlateStore._write_manifest(container, manifest)
+        return manifest
+
+    @staticmethod
+    def _create_contents(source: PlateSource, container: Path, fingerprint: dict, shape: tuple, root: Any) -> dict:
         from numcodecs import Blosc
 
         from . import __version__
 
-        if container.exists():
-            quarantine(container)
-        container.mkdir(parents=True, exist_ok=True)
-        root = zarr.open_group(filesystem_path(container / THUMBS_NAME), mode="w", zarr_format=2)
         c, h8, w8 = shape[3], shape[4], shape[5]
         # one chunk per time point and z plane holding every site: that is
         # what the grid reads in one go, and it keeps the file count low on
@@ -636,13 +702,13 @@ class PlateStore:
         ensure_digest_array(root, shape[:3])
         PlateStore._make_focus(root, shape)
         manifest = {
-            "format": PLATE_FORMAT,
+            "format": PLATE_FORMAT if is_file_container(container) else LEGACY_PLATE_FORMAT,
             "kind": "plate",
             "complete": True,
             "generation": uuid.uuid4().hex,
             "source": {
                 **fingerprint,
-                "relative_path": Path(os.path.relpath(source.path, container)).as_posix(),
+                "relative_path": Path(os.path.relpath(source.path, source_base(container))).as_posix(),
             },
             "thumbs": {"k": THUMB_K, "shape": list(shape), "dtype": str(source.dtype)},
             "thumbs_name": THUMBS_NAME,
@@ -653,11 +719,14 @@ class PlateStore:
             },
             "created_by": {"nd2wsi_version": __version__},
         }
-        PlateStore._write_manifest(container, manifest)
         return manifest
 
     @staticmethod
     def _write_manifest(container: Path, manifest: dict) -> None:
+        if is_file_container(container):
+            from .storage.single_file import write_entry
+            write_entry(container, MANIFEST_NAME, json.dumps(manifest, indent=1).encode('utf-8'))
+            return
         tmp = container / f".{MANIFEST_NAME}.{uuid.uuid4().hex}.tmp"
         tmp.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
         tmp.replace(container / MANIFEST_NAME)
@@ -687,7 +756,7 @@ class PlateStore:
                 return True
             self._last_generation_check = now
             try:
-                current = json.loads((self.container / MANIFEST_NAME).read_text(encoding="utf-8"))
+                current = self._read(self.container)
                 matches = (
                     isinstance(current, dict)
                     and current.get("generation")
@@ -766,6 +835,16 @@ class PlateStore:
         if not self.writable:
             return False
         try:
+            if is_file_container(self.container):
+                store = self._root.store
+                metadata = json.loads(store.read_bytes('thumbs/.zarray'))
+                separator = metadata.get('dimension_separator', '.')
+                key = 'thumbs/' + separator.join(map(str, (int(t), 0, int(z), 0, 0, 0)))
+                with store.batch():
+                    payload = store.read_bytes(key)
+                    store.write_bytes(key + '.corrupt-' + uuid.uuid4().hex, payload)
+                    store.delete_sync(key)
+                return True
             path = zarr_v2_chunk_path(
                 Path(filesystem_path(self.container / THUMBS_NAME / "thumbs")),
                 (int(t), 0, int(z), 0, 0, 0),
@@ -1149,6 +1228,8 @@ class PlateStore:
                         self._stop = False
                     raise RuntimeError("timed out stopping the plate cache worker")
             self.flush_focus()
+            with self._lock:
+                _close_plate_group(self._root)
             writer, self._writer = self._writer, None
             if writer is not None and release_writer:
                 writer.release()
@@ -1197,7 +1278,7 @@ class PlateSource:
     for a zero copy view, inside the lifecycle guard.
     """
 
-    def __init__(self, path: str | Path, tile: int = 512, store: bool = True):
+    def __init__(self, path: str | Path, tile: int = 512, store: bool = True, *, cache_path: str | Path | None = None):
         import nd2
 
         self.path = Path(path)
@@ -1248,13 +1329,16 @@ class PlateSource:
             if store:
                 opened_store = None
                 try:
-                    opened_store = PlateStore.open_or_create(self)
+                    opened_store = (PlateStore.open_or_create(self) if cache_path is None
+                                    else PlateStore.open_or_create(self, cache_path=cache_path))
                     self.store = opened_store
                     opened_store.start()
                 except Exception as e:  # a store that will not open is only a slower view
                     if opened_store is not None:
                         opened_store.close()
                     self.store = None
+                    if cache_path is not None:
+                        raise
                     self.attrs["nd2wsi"].setdefault("notes", []).append(
                         f"thumbnail store unavailable ({type(e).__name__}); frames are read each time"
                     )

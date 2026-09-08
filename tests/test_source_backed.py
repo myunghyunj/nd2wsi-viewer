@@ -93,10 +93,12 @@ def test_ensure_cache_prefers_a_compact_overview(big_nd2):
 
     path, _ = big_nd2
     store = ensure_cache(path, tile=512)
-    m = read_manifest(store.parent)
+    m = read_manifest(store)
     assert m and m["kind"] == "overview"
     assert m["image"]["shape_cyx"] == [2, 1400, 1600]
-    assert not (store / "0").exists()
+    root, _ = open_store(store)
+    assert "0" not in root.array_keys()
+    root.close()
     assert ensure_cache(path, tile=512) == store  # fast path, no rebuild
 
 
@@ -105,8 +107,10 @@ def test_ensure_cache_full_still_available(big_nd2):
 
     path, _ = big_nd2
     store = ensure_cache(path, tile=512, kind="full")
-    assert (store / "0").exists()
-    assert read_manifest(store.parent)["kind"] == "full"
+    root, _ = open_store(store)
+    assert "0" in root.array_keys()
+    root.close()
+    assert read_manifest(store)["kind"] == "full"
 
 
 def test_registry_serves_the_source_as_level_zero(big_nd2):
@@ -229,16 +233,16 @@ def test_source_changed_while_open_raises_instead_of_serving_garbage(big_nd2):
 
 
 def test_overview_manifest_uses_the_new_format(big_nd2):
-    from nd2wsi.cache import OVERVIEW_FORMAT, read_manifest
+    from nd2wsi.cache import SINGLE_FILE_FORMAT, read_manifest
 
     path, _ = big_nd2
     store = ensure_cache(path, tile=512)
-    m = read_manifest(store.parent)
+    m = read_manifest(store)
     # a pre-0.9 reader must reject this container instead of serving the
     # overview as a full store at half resolution
-    assert m["format"] == OVERVIEW_FORMAT
+    assert m["format"] == SINGLE_FILE_FORMAT
     full = ensure_cache(path, tile=512, kind="full")
-    assert read_manifest(full.parent)["format"] == "nd2wsi-cache/2"
+    assert read_manifest(full)["format"] == SINGLE_FILE_FORMAT
 
 
 def test_trash_refuses_while_an_export_runs(big_nd2):
@@ -265,7 +269,7 @@ def test_trash_removes_the_container_and_spares_the_source(big_nd2):
     sid = reg.add_store(store)
     freed = reg.trash_cache(sid)
     assert freed > 0
-    assert not store.parent.exists()
+    assert not store.exists()
     assert path.exists()
 
 

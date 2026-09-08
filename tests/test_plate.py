@@ -21,6 +21,84 @@ T, P, Z = 2, 3, 2
 H, W = 96, 128
 
 
+_TEST_GROUPS = []
+
+
+@pytest.fixture(autouse=True)
+def close_test_groups():
+    yield
+    while _TEST_GROUPS:
+        _TEST_GROUPS.pop().store.close()
+
+
+def _open_test_group(container, mode='r'):
+    from nd2wsi.plate import _plate_group
+    group = _plate_group(container, mode)
+    _TEST_GROUPS.append(group)
+    return group
+
+
+class _CacheEntry:
+    """Encoded object fault injection; no extracted directory is created."""
+    def __init__(self, container, key):
+        self.container, self.key = container, key
+        self.name = key.rsplit('/', 1)[-1]
+        self.parent = self
+
+    def read_bytes(self):
+        from nd2wsi.storage.single_file import read_entry
+        return read_entry(self.container, self.key)
+
+    def write_bytes(self, payload):
+        from nd2wsi.storage.single_file import write_entry
+        write_entry(self.container, self.key, payload)
+
+    def read_text(self):
+        return self.read_bytes().decode('utf-8')
+
+    def write_text(self, text):
+        self.write_bytes(text.encode('utf-8'))
+
+    def exists(self):
+        try:
+            self.read_bytes()
+            return True
+        except FileNotFoundError:
+            return False
+
+    is_file = exists
+
+    def unlink(self, missing_ok=False):
+        from nd2wsi.storage.single_file import SQLiteStore
+        if not missing_ok and not self.exists():
+            raise FileNotFoundError(self.key)
+        store = SQLiteStore(self.container)
+        try:
+            store.delete_sync(self.key)
+        finally:
+            store.close()
+
+    def glob(self, pattern):
+        import fnmatch
+
+        from nd2wsi.storage.single_file import SQLiteStore
+        store = SQLiteStore(self.container, read_only=True)
+        try:
+            prefix = self.key.rsplit('/', 1)[0] + '/'
+            return [_CacheEntry(self.container, key) for key in store.list_keys(prefix)
+                    if fnmatch.fnmatchcase(key.rsplit('/', 1)[-1], pattern)]
+        finally:
+            store.close()
+
+
+def _test_chunk_entry(array_path, index):
+    container = next(p for p in array_path.parents if p.name.endswith('.nd2svs'))
+    prefix = array_path.relative_to(container).as_posix()
+    metadata = json.loads(_CacheEntry(container, prefix + '/.zarray').read_bytes())
+    key = prefix + '/' + metadata.get('dimension_separator', '.').join(map(str, index))
+    return _CacheEntry(container, key)
+
+
 def value(t: int, p: int, z: int) -> int:
     return 1000 + 100 * t + 10 * p + z
 
@@ -236,7 +314,7 @@ def test_info_describes_the_plate(served):
     assert plate["zHome"] == 0
     assert info["storage"] == "direct" and info["trashable"] is True
     assert info["plate"]["thumbsTotal"] == T * P * Z
-    assert info["plate"]["cachePath"].endswith("--plate.nd2wsi-cache")
+    assert info["plate"]["cachePath"].endswith("--plate.nd2svs")
     status, body, _ = _get(base + "/api/inspect")
     assert status == 200 and json.loads(body)["kind"] == "plate"
 
@@ -360,10 +438,10 @@ def test_open_path_registers_a_plate_and_writes_no_cache(plate_nd2):
     assert st.attrs["nd2wsi"]["kind"] == "plate"
     assert reg.open_path(plate_nd2) == sid  # same generation, reused
     caches = plate_nd2.parent / "nd2wsi" / "caches"
-    names = sorted(d.name for d in caches.iterdir() if d.is_dir()) if caches.exists() else []
-    assert names == [f"{plate_nd2.name}--plate.nd2wsi-cache"], names
+    names = sorted(d.name for d in caches.iterdir() if d.is_file() and d.suffix == '.nd2svs') if caches.exists() else []
+    assert names == [f"{plate_nd2.name}--plate.nd2svs"], names
     assert not (plate_nd2.parent / "pyramids").exists()
-    assert st.trash_path == caches / f"{plate_nd2.name}--plate.nd2wsi-cache"
+    assert st.trash_path == caches / f"{plate_nd2.name}--plate.nd2svs"
     source = st.plate
     reg.close_all(immediate=True)
     assert source._life.closed
@@ -401,7 +479,7 @@ def test_registry_retries_when_plate_fingerprint_changes_during_open(
         assert len(opened) == 2
         assert opened[0]._teardown_complete
         assert registry.get(sid).plate is opened[1]
-        assert registry.get(sid).manifest["source"] == actual
+        assert {key: registry.get(sid).manifest["source"][key] for key in actual} == actual
     finally:
         registry.close_all(immediate=True)
 
@@ -453,7 +531,7 @@ def test_store_fills_in_the_background_and_serves_the_second_open(plate_nd2, mon
     try:
         container = plate_container(plate_nd2)
         assert src.store is not None and src.store.container == container
-        assert (container / "manifest.json").exists()
+        assert container.is_file() and _CacheEntry(container, "manifest.json").exists()
         assert _wait_full(src), src.store.status()
         status = src.status()
         assert status["done"] == T * P * Z and status["perT"] == [P * Z] * T
@@ -480,10 +558,8 @@ def test_store_fills_in_the_background_and_serves_the_second_open(plate_nd2, mon
 
 
 def test_missing_nonzero_shared_chunk_falls_back_and_repairs(plate_nd2, monkeypatch):
-    import zarr
 
     from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
-    from nd2wsi.plate_integrity import zarr_v2_chunk_path
 
     first = PlateSource(plate_nd2)
     assert _wait_full(first), first.store.status()
@@ -491,7 +567,7 @@ def test_missing_nonzero_shared_chunk_falls_back_and_repairs(plate_nd2, monkeypa
     first.close()
 
     t, p, z = 1, 1, 1
-    payload = zarr_v2_chunk_path(
+    payload = _test_chunk_entry(
         container / THUMBS_NAME / "thumbs", (t, 0, z, 0, 0, 0)
     )
     assert payload.is_file()  # this shared block contains nonzero source pixels
@@ -521,7 +597,7 @@ def test_missing_nonzero_shared_chunk_falls_back_and_repairs(plate_nd2, monkeypa
     finally:
         repaired.close()
 
-    root = zarr.open_group(str(container / THUMBS_NAME), mode="r", zarr_format=2)
+    root = _open_test_group(container, "r")
     assert root["done"][t, p, z] == 1
     assert root["digest"][t, p, z] != 0
     for other in set(range(P)) - {p}:
@@ -541,10 +617,9 @@ def test_missing_nonzero_shared_chunk_falls_back_and_repairs(plate_nd2, monkeypa
 
 
 def test_decodable_wrong_thumbnail_fails_its_digest_and_repairs(plate_nd2, monkeypatch):
-    import zarr
 
     from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
-    from nd2wsi.plate_integrity import digest_matches, zarr_v2_chunk_path
+    from nd2wsi.plate_integrity import digest_matches
 
     first = PlateSource(plate_nd2)
     assert _wait_full(first), first.store.status()
@@ -552,11 +627,11 @@ def test_decodable_wrong_thumbnail_fails_its_digest_and_repairs(plate_nd2, monke
     first.close()
 
     t, p, z = 0, 2, 1
-    root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+    root = _open_test_group(container, "r+")
     wrong = np.full(root["thumbs"].shape[3:], 42, dtype=np.uint16)
     root["thumbs"][t, p, z] = wrong
     assert np.array_equal(root["thumbs"][t, p, z], wrong)
-    payload = zarr_v2_chunk_path(
+    payload = _test_chunk_entry(
         container / THUMBS_NAME / "thumbs", (t, 0, z, 0, 0, 0)
     )
     corrupt_payload = payload.read_bytes()
@@ -583,7 +658,7 @@ def test_decodable_wrong_thumbnail_fails_its_digest_and_repairs(plate_nd2, monke
     finally:
         repaired.close()
 
-    root = zarr.open_group(str(container / THUMBS_NAME), mode="r", zarr_format=2)
+    root = _open_test_group(container, "r")
     stored = np.asarray(root["thumbs"][t, p, z])
     assert int(stored[0, 0, 0]) == value(t, p, z)
     assert digest_matches(stored, root["digest"][t, p, z])
@@ -650,10 +725,9 @@ def test_shared_chunk_get_is_serialized_with_a_sibling_put(plate_nd2, monkeypatc
 
 
 def test_undecodable_shared_chunk_is_quarantined_then_repaired(plate_nd2, monkeypatch):
-    import zarr
 
     from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
-    from nd2wsi.plate_integrity import digest_matches, zarr_v2_chunk_path
+    from nd2wsi.plate_integrity import digest_matches
 
     first = PlateSource(plate_nd2)
     assert _wait_full(first), first.store.status()
@@ -661,7 +735,7 @@ def test_undecodable_shared_chunk_is_quarantined_then_repaired(plate_nd2, monkey
     first.close()
 
     t, z = 1, 0
-    payload = zarr_v2_chunk_path(
+    payload = _test_chunk_entry(
         container / THUMBS_NAME / "thumbs", (t, 0, z, 0, 0, 0)
     )
     assert payload.is_file()
@@ -681,7 +755,7 @@ def test_undecodable_shared_chunk_is_quarantined_then_repaired(plate_nd2, monkey
     finally:
         repaired.close()
 
-    root = zarr.open_group(str(container / THUMBS_NAME), mode="r", zarr_format=2)
+    root = _open_test_group(container, "r")
     retained = list(payload.parent.glob(f"{payload.name}.corrupt-*"))
     assert len(retained) == 1
     assert retained[0].read_bytes() == b"not-a-valid-zarr-chunk"
@@ -693,7 +767,6 @@ def test_undecodable_shared_chunk_is_quarantined_then_repaired(plate_nd2, monkey
 
 def test_valid_all_zero_sparse_chunk_stays_committed_after_reopen(tmp_path, monkeypatch):
     from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
-    from nd2wsi.plate_integrity import zarr_v2_chunk_path
 
     t, z = 0, 1
     path = tmp_path / "zero-block.nd2"
@@ -706,7 +779,7 @@ def test_valid_all_zero_sparse_chunk_stays_committed_after_reopen(tmp_path, monk
     finally:
         first.close()
 
-    payload = zarr_v2_chunk_path(
+    payload = _test_chunk_entry(
         plate_container(path) / THUMBS_NAME / "thumbs", (t, 0, z, 0, 0, 0)
     )
     # Zarr normally elides this all-zero payload. Removing it explicitly also
@@ -922,11 +995,9 @@ def test_store_is_rebuilt_when_the_file_changes(plate_nd2):
 def test_legacy_plate_cache_rebuilds_from_source_before_gaining_integrity(
     plate_nd2, monkeypatch
 ):
-    import zarr
 
     from nd2wsi.plate import (
         THUMB_K,
-        THUMBS_NAME,
         PlateSource,
         PlateStore,
         plate_container,
@@ -938,11 +1009,11 @@ def test_legacy_plate_cache_rebuilds_from_source_before_gaining_integrity(
     container = plate_container(plate_nd2)
     first.close()
 
-    manifest_path = container / "manifest.json"
+    manifest_path = _CacheEntry(container, 'manifest.json')
     manifest = json.loads(manifest_path.read_text())
     manifest.pop("integrity", None)
     manifest_path.write_text(json.dumps(manifest))
-    root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+    root = _open_test_group(container, "r+")
     del root[DIGEST_NAME]
     wrong_t, wrong_p, wrong_z = 0, 1, 0
     root["thumbs"][wrong_t, wrong_p, wrong_z] = np.full(
@@ -978,9 +1049,9 @@ def test_legacy_plate_cache_rebuilds_from_source_before_gaining_integrity(
         upgraded.close()
 
     manifest = json.loads(manifest_path.read_text())
-    assert manifest["format"] == "nd2wsi-plate/1"
+    assert manifest["format"] == "nd2wsi-plate/2"
     assert manifest["integrity"]["digest_name"] == DIGEST_NAME
-    root = zarr.open_group(str(container / THUMBS_NAME), mode="r", zarr_format=2)
+    root = _open_test_group(container, "r")
     assert np.asarray(root[DIGEST_NAME][:], dtype=np.uint64).all()
     assert int(root["thumbs"][wrong_t, wrong_p, wrong_z, 0, 0, 0]) == value(
         wrong_t, wrong_p, wrong_z
@@ -994,7 +1065,7 @@ def test_status_route_and_trash_remove_the_store(served):
     assert status == 200
     d = json.loads(body)
     assert d["total"] == T * P * Z and len(d["perT"]) == T
-    assert d["path"].endswith("--plate.nd2wsi-cache")
+    assert d["path"].endswith("--plate.nd2svs")
     bare = f"http://127.0.0.1:{httpd.server_address[1]}"
     assert _get(f"{bare}/s/{sid}/api/plate/status")[0] == 404
 
@@ -1009,9 +1080,8 @@ def test_status_route_and_trash_remove_the_store(served):
 
 
 def test_store_in_the_old_layout_is_quarantined_before_rebuild(plate_nd2):
-    import zarr
 
-    from nd2wsi.plate import THUMBS_NAME, PlateSource, plate_container
+    from nd2wsi.plate import PlateSource, plate_container
 
     src = PlateSource(plate_nd2)
     assert _wait_full(src), src.store.status()
@@ -1019,7 +1089,7 @@ def test_store_in_the_old_layout_is_quarantined_before_rebuild(plate_nd2):
     # rewrite the array with one chunk per frame, the layout of the first
     # release candidate, keeping its data
     container = plate_container(plate_nd2)
-    root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+    root = _open_test_group(container, "r+")
     arr = root["thumbs"]
     data = arr[:]
     per_frame = (1, 1, 1) + tuple(arr.chunks[3:])
@@ -1027,7 +1097,8 @@ def test_store_in_the_old_layout_is_quarantined_before_rebuild(plate_nd2):
     root.create_array("thumbs", shape=data.shape, chunks=per_frame, dtype=data.dtype)[:] = data
     annotation_name = "annotations_legacy.json"
     annotation_body = '{"items":[{"kind":"pin"}]}'
-    (container / annotation_name).write_text(annotation_body)
+    _CacheEntry(container, annotation_name).write_text(annotation_body)
+    root.store.close()  # Release SQLite before the schema rebuild renames its file.
     src = PlateSource(plate_nd2)
     try:
         assert tuple(src.store._thumbs.chunks) == (1, P, 1) + per_frame[3:]
@@ -1039,7 +1110,7 @@ def test_store_in_the_old_layout_is_quarantined_before_rebuild(plate_nd2):
     # Rebuild into a fresh container and preserve the complete predecessor.
     quarantined = list(container.parent.glob(f"{container.name}.corrupt-*"))
     assert len(quarantined) == 1
-    assert (quarantined[0] / annotation_name).read_text() == annotation_body
+    assert _CacheEntry(quarantined[0], annotation_name).read_text() == annotation_body
     assert container.exists()
 
 
@@ -1187,9 +1258,8 @@ def test_focus_scores_are_read_back_from_the_store(tmp_path):
 
 
 def test_a_store_written_before_autofocus_gains_the_scores(tmp_path):
-    import zarr
 
-    from nd2wsi.plate import THUMBS_NAME, PlateSource, plate_container
+    from nd2wsi.plate import PlateSource, plate_container
 
     path = tmp_path / "focus.nd2"
     _write_focus_plate(path)
@@ -1198,7 +1268,7 @@ def test_a_store_written_before_autofocus_gains_the_scores(tmp_path):
     src.close()
 
     # drop the scores the way a store from an earlier release has none
-    root = zarr.open_group(str(plate_container(path) / THUMBS_NAME), mode="r+", zarr_format=2)
+    root = _open_test_group(plate_container(path), "r+")
     del root["focus"]
 
     src = PlateSource(path)
@@ -1345,7 +1415,7 @@ def test_status_names_the_writer_and_storeless_fallback(plate_nd2, monkeypatch):
     try:
         assert writer.status()["writer"] is True
         assert reader.status()["writer"] is False
-        assert writer.status()["format"] == "nd2wsi-plate/1"
+        assert writer.status()["format"] == "nd2wsi-plate/2"
         assert storeless.status() == {
             "done": 0,
             "total": T * P * Z,
@@ -1390,9 +1460,8 @@ def test_status_uses_one_committed_snapshot(plate_nd2, monkeypatch):
 
 
 def test_integrity_done_without_digest_is_repaired_in_the_same_build(plate_nd2):
-    import zarr
 
-    from nd2wsi.plate import THUMBS_NAME, PlateSource, plate_container
+    from nd2wsi.plate import PlateSource, plate_container
     from nd2wsi.plate_integrity import DIGEST_NAME, UNCOMMITTED_DIGEST
 
     first = PlateSource(plate_nd2)
@@ -1401,7 +1470,7 @@ def test_integrity_done_without_digest_is_repaired_in_the_same_build(plate_nd2):
     first.close()
 
     t, p, z = 1, 2, 1
-    root = zarr.open_group(str(container / THUMBS_NAME), mode="r+", zarr_format=2)
+    root = _open_test_group(container, "r+")
     assert root["done"][t, p, z] == 1
     root[DIGEST_NAME][t, p, z] = UNCOMMITTED_DIGEST
 

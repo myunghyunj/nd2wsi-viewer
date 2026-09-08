@@ -67,13 +67,13 @@ def test_selections_get_their_own_containers(slide):
     b = cache_container(slide, PlaneSelection(z=3))
     c = cache_container(slide, PlaneSelection(t=1, p=2, z="max"))
     assert len({a, b, c}) == 3
-    assert a.name.endswith("--t0-p0-zmid.nd2wsi-cache")
-    assert c.name.endswith("--t1-p2-zmax.nd2wsi-cache")
+    assert a.name.endswith("--t0-p0-zmid.nd2svs")
+    assert c.name.endswith("--t1-p2-zmax.nd2svs")
 
 
 def test_changed_source_is_never_served_stale(slide):
     first = ensure_cache(slide)
-    marker = container_store(cache_container(slide)) / ".zattrs"
+    marker = cache_container(slide)
     stamp0 = marker.stat().st_mtime_ns
 
     # rewrite the slide with different pixels (and a bumped mtime)

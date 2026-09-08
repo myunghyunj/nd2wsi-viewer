@@ -48,7 +48,9 @@ $script:sentinels = [Collections.Generic.List[object]]::new()
 $script:uninstallFaultChecks = [Collections.Generic.List[object]]::new()
 $script:activeProcess = $null
 $script:payloadFiles = $null
-$script:version = '1.2.8'
+# The exact build/payload manifests determine the version under test.
+# Never silently validate a new installer using an older release's identity.
+$script:version = $null
 $previousLog = [Environment]::GetEnvironmentVariable('ND2WSI_LOG_FILE', 'Process')
 $transcriptStarted = $false
 $qaCreated = $false
@@ -592,6 +594,8 @@ function Install-FaultFixture {
     Add-Sentinel (Join-Path $Directory 'scientific-data\keep.nd2')
     Add-Sentinel (Join-Path $Directory 'scientific-data\nd2wsi\annotations\keep.json')
     Add-Sentinel (Join-Path $Directory 'nd2wsi\caches\keep.txt')
+    # Extension-preservation sentinel, not a claim of SQLite decoding coverage.
+    Add-Sentinel (Join-Path $Directory 'nd2wsi\caches\keep.nd2svs')
     Assert-Sentinels
 }
 
@@ -774,6 +778,8 @@ try {
     }
     if ($buildManifestData.schema_version -ne 1) { throw 'Unsupported installer build manifest schema.' }
     if ($installerHash -cne $buildManifestData.installer_sha256 -or $manifestHash -cne $buildManifestData.payload_manifest_sha256 -or $bootstrapperHash -cne $buildManifestData.webview2_bootstrapper_sha256) { throw 'Setup, payload manifest, or WebView2 bootstrapper does not match the exact installer build manifest.' }
+    $script:version = [string]$buildManifestData.app_version
+    if ($script:version -cnotmatch '^\d+\.\d+\.\d+$') { throw 'Build manifest app_version must contain three numeric components.' }
     if ($bootstrapperHash -cne $WebView2BootstrapperSha256) { throw 'The official WebView2 bootstrapper checksum does not match the installer build input.' }
     $bootstrapperSignature = Get-AuthenticodeSignature -LiteralPath $bootstrapperPath
     if ($bootstrapperSignature.Status -ne 'Valid' -or $null -eq $bootstrapperSignature.SignerCertificate -or $bootstrapperSignature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') { throw 'The embedded WebView2 bootstrapper does not have a valid Microsoft Corporation Authenticode signature.' }
@@ -819,6 +825,7 @@ try {
     Add-Sentinel (Join-Path $installPath 'scientific-data\keep.nd2')
     Add-Sentinel (Join-Path $installPath 'scientific-data\nd2wsi\annotations\keep.json')
     Add-Sentinel (Join-Path $installPath 'nd2wsi\caches\keep.txt')
+    Add-Sentinel (Join-Path $installPath 'nd2wsi\caches\keep.nd2svs')
     Add-Sentinel $appDataSentinel
     $installedNames = @(Get-InstalledFileNames $installPath)
     Invoke-AppSmoke $installPath 'installed'
@@ -875,6 +882,7 @@ try {
         gui_smoke = $true; same_version_reinstall = $true; uninstall_verified = $uninstallVerified
         junction_reinstall_and_uninstall_rejected_without_data_loss = $true
         uninstall_fault_checks = $script:uninstallFaultChecks.ToArray()
+        single_file_cache_sentinels_preserved = $true
         scientific_and_appdata_sentinels_preserved = $true; qa_directory_removed = -not (Test-LiteralEntry $qaRoot)
         no_runtime_files_written_inside_installation = $true
         webview2_before = $webviewBefore; webview2_after_uninstall = $webviewAfter

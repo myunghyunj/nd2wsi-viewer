@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -804,13 +805,14 @@ def ensure_cache(
     either kind is honored. ``kind="full"`` insists on a full store.
     """
     from .cache import (
-        OVERVIEW_FORMAT,
+        SINGLE_FILE_FORMAT,
         CacheFromNewerApp,
         CacheLock,
         cache_container,
         cache_matches,
         commit_container,
         container_store,
+        directory_cache_container,
         newer_cache_format,
         quarantine,
         quick_fingerprint,
@@ -823,14 +825,14 @@ def ensure_cache(
     want = None if kind == "auto" else kind
 
     container = cache_container(slide, selection)
-    store = container_store(container)
+    store = container  # a v2 destination is a file, even if a damaged directory occupies it
 
     def refuse_if_newer() -> None:
         newer = newer_cache_format(container)
         if newer:
             raise CacheFromNewerApp(
                 f"The cache for {slide.name} was built by a newer nd2wsi-viewer "
-                f"(cache format {newer}; this app reads up to {OVERVIEW_FORMAT}). "
+                f"(cache format {newer}; this app reads up to {SINGLE_FILE_FORMAT}). "
                 f"Update the app, or remove {container.name} to rebuild it here."
             )
 
@@ -838,9 +840,15 @@ def ensure_cache(
     # the common case takes no lock: a valid container serves immediately,
     # and it outranks legacy stores so an old pyramids dir cannot shadow a
     # correct managed cache
-    if cache_matches(container, slide, selection, kind=want) and store.is_dir():
+    def validate(candidate: Path) -> None:
+        root, _ = open_store(candidate)
+        close = getattr(root, "close", None)
+        if close:
+            close()
+
+    if cache_matches(container, slide, selection, kind=want) and store.exists():
         try:
-            open_store(store)
+            validate(store)
             return store
         except ValueError:
             pass  # damaged despite its manifest: handled under the lock
@@ -850,18 +858,21 @@ def ensure_cache(
     # ``slide.svs`` may live together.
     from .cache import legacy_cache_container
 
-    old_container = legacy_cache_container(slide, selection)
-    old_store = container_store(old_container)
-    if old_container != container and cache_matches(
-        old_container, slide, selection, kind=want
-    ) and old_store.is_dir():
-        try:
-            open_store(old_store)
-            return old_store
-        except ValueError:
-            pass  # leave it for explicit cleanup; build the new identity
+    old_valid = None
+    for old_container in (
+        directory_cache_container(slide, selection),
+        legacy_cache_container(slide, selection),
+    ):
+        old_store = container_store(old_container)
+        if cache_matches(old_container, slide, selection, kind=want) and old_store.is_dir():
+            try:
+                validate(old_store)
+                old_valid = old_container
+                break
+            except ValueError:
+                pass  # old cache remains preserved
 
-    if selection == PlaneSelection():
+    if old_valid is None and selection == PlaneSelection():
         legacy = _legacy_store(slide)
         if legacy is not None:
             return legacy
@@ -870,27 +881,43 @@ def ensure_cache(
         # someone else may have finished it while this process waited, and
         # quarantining under the lock means two openers cannot both grab
         # the same stale container
-        if cache_matches(container, slide, selection, kind=want) and store.is_dir():
+        if cache_matches(container, slide, selection, kind=want) and store.exists():
             try:
-                open_store(store)
+                validate(store)
                 return store
             except ValueError:
                 pass
         if container.exists():
             refuse_if_newer()  # it may have appeared while we waited
             quarantine(container)
+        if old_valid is not None:
+            from .migration import pack_directory
+
+            packed = container.with_name(f"{container.name}.building-{uuid.uuid4().hex}")
+            with CacheLock(old_valid):
+                if not cache_matches(old_valid, slide, selection, kind=want):
+                    raise RuntimeError("legacy cache changed before import; reopen the slide")
+                try:
+                    pack_directory(old_valid, packed, source=slide, on_progress=on_progress)
+                    validate(packed)
+                    commit_container(packed, container)
+                except FileExistsError:
+                    raise  # do not remove a competing or pre-existing artifact
+                except BaseException:
+                    packed.unlink(missing_ok=True)
+                    raise
+            return store  # explicit cleanup, never an automatic open, removes the old tree
         sweep_stale_builds(container.parent)
         overview = kind == "auto" and _overview_eligible(
             slide, selection, tile or auto_tile(container)
         )
         before = quick_fingerprint(slide)
-        staging = container.with_name(f"{container.name}.building-{os.getpid()}")
-        shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(parents=True)
+        staging = container.with_name(f"{container.name}.building-{uuid.uuid4().hex}")
+        staging.mkdir(parents=True, exist_ok=False)
         try:
             convert(
                 slide,
-                staging / store.name,
+                staging / "store.ome.zarr",
                 tile=tile,
                 selection=selection,
                 progress=False,
@@ -904,7 +931,7 @@ def ensure_cache(
                     "(still copying, or being written by the scanner?) — "
                     "try again once the file is settled"
                 )
-            _, attrs = open_store(staging / store.name)
+            _, attrs = open_store(staging / "store.ome.zarr")
             meta = attrs["nd2wsi"]
             ov = meta.get("overview_of")
             if ov:
@@ -924,7 +951,19 @@ def ensure_cache(
                 kind="overview" if ov else "full",
                 storage=meta.get("storage"),
             )
-            commit_container(staging, container)
+            from .migration import pack_directory
+
+            packed = container.with_name(f"{container.name}.building-packed-{uuid.uuid4().hex}")
+            try:
+                pack_directory(staging, packed, source=slide)
+                validate(packed)
+                commit_container(packed, container)
+            except FileExistsError:
+                raise
+            except BaseException:
+                packed.unlink(missing_ok=True)
+                raise
+            shutil.rmtree(staging)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
@@ -935,26 +974,28 @@ def existing_cache_store(
     slide: str | Path, selection: PlaneSelection | None = None
 ) -> Path | None:
     """A valid, already-built store for this slide, or None. Never builds."""
-    from .cache import cache_container, cache_matches, container_store
+    from .cache import (
+        cache_container,
+        cache_matches,
+        container_store,
+        directory_cache_container,
+        legacy_cache_container,
+    )
 
     slide = Path(slide).resolve()
     selection = selection or PlaneSelection()
+    for container in (
+        cache_container(slide, selection),
+        directory_cache_container(slide, selection),
+        legacy_cache_container(slide, selection),
+    ):
+        store = container_store(container)
+        if cache_matches(container, slide, selection) and store.exists():
+            return store
     if selection == PlaneSelection():
         legacy = _legacy_store(slide)
         if legacy is not None:
             return legacy
-    container = cache_container(slide, selection)
-    store = container_store(container)
-    if cache_matches(container, slide, selection) and store.is_dir():
-        return store
-    from .cache import legacy_cache_container
-
-    old_container = legacy_cache_container(slide, selection)
-    old_store = container_store(old_container)
-    if old_container != container and cache_matches(
-        old_container, slide, selection
-    ) and old_store.is_dir():
-        return old_store
     return None
 
 
@@ -1102,11 +1143,37 @@ def open_store(path: str | Path) -> tuple[Any, dict[str, Any]]:
     """Open a converted store, returning (zarr group, attrs dict)."""
     import zarr
 
-    root = zarr.open_group(filesystem_path(path), mode="r")
-    attrs = json.loads(json.dumps(dict(root.attrs)))
-    if "nd2wsi" not in attrs or "multiscales" not in attrs:
-        raise ValueError(
-            f"{path} does not look like an nd2wsi store "
-            "(missing multiscales/nd2wsi metadata)"
-        )
+    if Path(path).is_file():
+        from .storage.single_file import open_zarr_group
+
+        root = _ClosableGroup(open_zarr_group(path, prefix="store.ome.zarr", mode="r"))
+    else:
+        root = zarr.open_group(filesystem_path(path), mode="r")
+    try:
+        attrs = json.loads(json.dumps(dict(root.attrs)))
+        if "nd2wsi" not in attrs or "multiscales" not in attrs:
+            raise ValueError(
+                f"{path} does not look like an nd2wsi store "
+                "(missing multiscales/nd2wsi metadata)"
+            )
+    except BaseException:
+        if hasattr(root, "close"):
+            root.close()
+        raise
     return root, attrs
+
+
+class _ClosableGroup:
+    """A Zarr group with an explicit lifetime for its single-file connection."""
+
+    def __init__(self, group: Any):
+        self._group = group
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._group, name)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._group[key]
+
+    def close(self, **_: Any) -> None:
+        self._group.store.close()

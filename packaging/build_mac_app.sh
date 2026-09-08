@@ -114,6 +114,12 @@ info["UTImportedTypeDeclarations"] = [
 ]
 info["CFBundleDocumentTypes"] = [
     {
+        "CFBundleTypeName": "nd2svs single-file viewing cache",
+        "LSItemContentTypes": ["com.nd2wsi.nd2svs"],
+        "CFBundleTypeRole": "Viewer",
+        "LSHandlerRank": "Owner",
+    },
+    {
         "CFBundleTypeName": "Nikon ND2 slide scan",
         "LSItemContentTypes": ["com.nikon.nis-elements.nd2"],
         "CFBundleTypeRole": "Viewer",
@@ -126,6 +132,13 @@ info["CFBundleDocumentTypes"] = [
         "LSHandlerRank": "Default",
     },
 ]
+
+info["UTExportedTypeDeclarations"] = [{
+    "UTTypeIdentifier": "com.nd2wsi.nd2svs",
+    "UTTypeDescription": "nd2svs single-file viewing cache",
+    "UTTypeConformsTo": ["public.data"],
+    "UTTypeTagSpecification": {"public.filename-extension": ["nd2svs"]},
+}]
 
 with open(path, "wb") as fh:
     plistlib.dump(info, fh)

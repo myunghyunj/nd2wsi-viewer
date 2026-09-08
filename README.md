@@ -38,6 +38,7 @@ Nothing leaves your computer. There is no upload and no account.
 ## What you get
 
 - Opens stitched Nikon `.nd2` scans and Aperio `.svs` slides, several at once in tabs.
+- Keeps each viewing cache in one `.nd2svs` file, easy to copy to an external SSD.
 - Plays a time series of a plate, with every site at any z plane and any time, straight from the ND2.
 - Follows the sharpest plane of each site through a time lapse, so focus drift over a day does not blur the series.
 - Moves from the whole slide to single cells without stutter.
@@ -195,10 +196,30 @@ experiment/
 ├── slide.nd2
 └── nd2wsi/
     ├── annotations/     your pins, rulers, boxes, and notes
-    └── caches/          the reduced copies of the scan
+    └── caches/
+        └── slide.nd2--t0-p0-zmid.nd2svs
 ```
 
-The original scan is never modified. The reduced copies of an ND2 take about a quarter of its size, measured at 23 to 30 percent on two dozen scans. An SVS gets no cache at all.
+Version 2.0 stores each cache as one `.nd2svs` file. It contains the manifest,
+OME-Zarr v2 metadata and compressed image chunks in an application-owned SQLite
+container, with no permanent companion database files. This avoids the allocation
+overhead of thousands of small files on external drives. Open the source scan or
+the `.nd2svs` file directly in the viewer; no unpacking is required.
+
+The original scan is never modified. A compact cache contains reduced levels,
+**not the original full-resolution ND2**. Move the scan and its `nd2wsi` folder
+together to retain native-resolution viewing and annotations. Moving only a
+compact cache allows overview-only viewing, with annotation editing disabled
+until the matching source is available. Pins, rulers and ROIs remain separate in
+`nd2wsi/annotations/` and are never discarded with the cache.
+
+Older directory caches remain readable. Opening a source scan with a matching
+managed scan-pyramid directory cache creates a verified single-file copy and
+keeps the old directory; deletion of the old copy is a separate explicit cleanup.
+Legacy multi-site plate directory caches are reused read-only without conversion.
+Portable `.ome.zarr` exports
+remain supported and are not converted or removed automatically. A tiled SVS
+normally needs no additional cache.
 
 ![The dialog that removes a cache](docs/delete-cache.png)
 

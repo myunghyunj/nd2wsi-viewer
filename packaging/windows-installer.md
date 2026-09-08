@@ -1,4 +1,4 @@
-# Local Windows Setup build
+# Windows Setup build (v2.0.0)
 
 `windows-installer.nsi` wraps an already verified Windows portable build. It does
 not build Python, modify the portable payload, publish a GitHub Release, or alter
@@ -17,14 +17,19 @@ establish that this Setup or app has passed Windows 10 testing.
 Compatibility claims cover the tested microscopy paths; optional codecs need
 separate validation.
 
+The current source targets v2.0.0. The v1.2.8 Windows 11 ARM64-emulation results
+are historical and do not verify a v2.0.0 executable or Setup. Generate and
+retain fresh build, payload, smoke, and installer-verification evidence for the
+exact v2.0.0 artifacts before reporting Windows compatibility results.
+
 ## Compiler inputs
 
 Pass each input as a makensis define (use `-D` on macOS/Linux, `/D` on Windows):
 
 | Define | Value |
 | --- | --- |
-| `APP_VERSION` | Display/ownership version, for example `1.2.8` |
-| `APP_VERSION_QUAD` | Four-component Windows version, for example `1.2.8.0` |
+| `APP_VERSION` | Portable build manifest's display/ownership version, for example `2.0.0` |
+| `APP_VERSION_QUAD` | The same version plus `.0`, for example `2.0.0.0` |
 | `OUTPUT_FILE` | Absolute destination of the generated Setup `.exe` |
 | `PAYLOAD_INSTALL_INCLUDE` | Absolute path of generated installation commands |
 | `PAYLOAD_UNINSTALL_INCLUDE` | Absolute path of generated uninstall commands |
@@ -40,6 +45,12 @@ under Windows's case-insensitive rules. Reject collisions with installer-owned
 `.nd2wsi-install.ini` and `Uninstall.exe`. Escape NSIS dollar signs and quotes in
 both source and relative paths. Never use a recursive `File /r` input that can
 accidentally absorb unrelated files or omit the reviewed manifest.
+
+`build_windows_installer.py` derives these version values from the portable
+`build-info.json`; changing a filename or this document does not change the
+executable's version. The verifier derives its expected version from the exact
+build manifest and checks the payload manifest's version when present, so no
+historical release number is used as an implicit fallback.
 
 The install include emits a `SetOutPath` for each parent directory and one `File`
 instruction for each exact source file. For example:
@@ -99,7 +110,7 @@ Its `InstallLocation` must agree with the selected destination and the marker:
 ```ini
 [Installation]
 ProductId=nd2wsi-viewer.windows.x64.current-user
-Version=1.2.8
+Version=2.0.0
 InstallLocation=C:\Users\example\AppData\Local\Programs\nd2wsi-viewer
 UninstallState=
 ```
@@ -116,6 +127,9 @@ marker together with its matching uninstall registry location. This local
 installer does not implement migration between versions or two simultaneous
 registered installations. Uninstall the previous installation before changing
 version or location. User-created files are retained.
+If those retained files make the old destination nonempty, choose a new empty
+installation folder; never remove scientific data to satisfy the installer's
+ownership checks. This also applies to the transition from v1.x to v2.0.0.
 
 The ownership marker, uninstall program, and uninstall registry records are
 created before copying the payload. Setup records whether the destination was
@@ -177,6 +191,16 @@ back to native machine data when that API is unavailable, so architecture
 detection does not itself require Windows 10 1709.
 
 ## Uninstall and validation
+
+For v2.0.0, include single-file `.nd2svs` caches among the scientific-data
+sentinels that must survive app uninstall. Validate creation, read-only reopen,
+legacy-directory import, Unicode/long paths, and closing all cache handles before
+rename or removal on the actual Windows target. These cache containers retain
+Zarr v2 encoded chunks in SQLite; they are not TIFF/SVS files, and source-backed
+overviews still require their original acquisition. Annotations remain external.
+Move a cache only after its writers/viewers close; do not delete active SQLite
+journals to force a one-file appearance. These are v2 acceptance requirements,
+not claims that the Windows runtime checks have already passed.
 
 Uninstall checks the marker and registered location before removing files. It
 deletes only the literal manifest-listed payload files, its own marker and

@@ -250,10 +250,13 @@ def main(argv: list[str] | None = None) -> int:
                 for corpse in sorted(caches.glob("*.corrupt-*")) + sorted(
                     (folder / CACHE_DIR_NAME).glob("*.corrupt-*")
                 ):
+                    if corpse.is_file() or corpse.is_symlink():
+                        print(f"kept {corpse.name} (quarantined single files may contain preserved work; review explicitly)")
+                        continue
                     if args.dry_run:
                         print(f"would remove {corpse.name}")
                     else:
-                        shutil.rmtree(corpse, ignore_errors=True)
+                        shutil.rmtree(corpse)
                         print(f"removed {corpse.name}")
         print(f"{total} store(s) {'to move' if args.dry_run else 'collected'}")
         if swept:
@@ -311,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "view":
+        from .cache import SINGLE_FILE_SUFFIX
         from .convert import convert, default_store_path, ensure_cache, existing_cache_store
         from .plate import is_plate_file
         from .server import serve
@@ -322,6 +326,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         stores = []
         for slide in args.nd2:
+            if Path(slide).suffix.lower() == SINGLE_FILE_SUFFIX:
+                if explicit:
+                    parser.error("a .nd2svs cache cannot use conversion or plane-selection options")
+                stores.append(Path(slide))
+                continue
             if not explicit:
                 # the default view goes through the managed cache: identity
                 # checked, atomically built, straight from the file for SVS
