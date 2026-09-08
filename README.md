@@ -1,7 +1,7 @@
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download the Windows installer (.exe)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.8/nd2wsi-viewer-1.2.8-Setup.exe) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.0.0 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.0.0/nd2wsi-viewer-2.0.0-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -55,20 +55,20 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-1.2.8-Setup.exe](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.8/nd2wsi-viewer-1.2.8-Setup.exe)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v1.2.8/nd2wsi-viewer-1.2.8-Setup.exe.sha256).
-Run Setup to install the app for your Windows account. Python and scientific
-libraries are included; no separate Python installation or GPU is required.
-Use the Start Menu or Desktop shortcut to open the app, and Windows Settings >
-Apps to uninstall it. Images, annotations, and viewing caches are preserved.
+Download [nd2wsi-viewer-2.0.0-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.0.0/nd2wsi-viewer-2.0.0-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.0.0/nd2wsi-viewer-2.0.0-windows-x64.zip.sha256).
+Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
+Python and scientific libraries are included; no separate Python installation
+or GPU is required. This release provides the tested portable ZIP, not a v2.0
+Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
-silicon, it uses Windows x64 emulation. The exact installer was verified on
-Windows 11 ARM64; actual Windows 10 Education and separate native x64 hardware
-were not tested in that run. .NET Framework 4.6.2 or later and Microsoft Edge
-WebView2 Runtime are required. Setup can install missing WebView2 with an
-Internet connection.
+silicon, it uses Windows x64 emulation. The exact v2.0 portable archive passed
+scientific and GUI checks on GitHub x64 and Windows 11 ARM64-emulation runners.
+Windows 10 Education and local Parallels were not tested for this release.
+.NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
+install WebView2 separately if it is missing.
 
 Use **Ctrl** in place of the Mac **⌘** shortcuts below, and **Alt** for
 **Option**. Open files using `+`, drag and drop, or pass a file to the executable.

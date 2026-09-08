@@ -1,5 +1,22 @@
 # Windows distribution
 
+## Published v2.0.0 download
+
+Use the [v2.0.0 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.0.0),
+SHA-256 `fd31a16ba74c0df8b445ed46b5dc65d070d6c04b526cbff05fba045f7176a5ea`.
+The exact archive built from `836b05d98d3d18a309e1e6fd0ab936a95589e29c`
+passed scientific and native GUI verification on x64 and Windows 11 ARM64-emulation
+[CI runners](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/34181559081).
+Extract the complete ZIP; retain `_internal` beside the executable. Install
+WebView2 separately if absent. The archive's historical READ-ME local/unpublished
+delivery statements are superseded by the release notes; the archive was not repacked.
+
+No v2.0 Setup installer is published or verified. The installer information below
+describes available build tooling and historical v1.2.8 evidence, not the v2.0
+download. Windows 10 Education and local Parallels remain untested for v2.0.
+
+## Installer build tooling
+
 The current source targets viewer 2.0.0, with a native Windows frame
 and Microsoft Edge WebView2. `nd2wsi-viewer-2.0.0-Setup.exe` is the expected installer
 name for that version. Setup installs the app
@@ -15,7 +32,7 @@ Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
 v1.2.8 results below do not establish v2.0.0 Windows hardware verification.
-The portable ZIP is a local build output; the public Windows download is Setup.
+The current public v2.0 download is the verified portable ZIP described above.
 
 Target execution modes (exact v2.0.0 build verification is still required):
 
