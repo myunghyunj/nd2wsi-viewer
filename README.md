@@ -1,3 +1,8 @@
+> **Local macOS Metal beta 2.1.0b1.** This branch experiments with exact GPU pyramid
+> reduction, not a zero-copy native display. Stable v2.0.0, its updater and Windows
+> are unchanged. Read the [review, measurements and limitations](docs/macos-metal-beta.md)
+> before using the separate beta app. Existing cached-slide rendering is unchanged.
+
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
