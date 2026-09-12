@@ -38,17 +38,34 @@ def child_environment(*, app_name: str | None = None) -> dict[str, str]:
     # own its runtime so closing the parent cannot invalidate the child.
     environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     environment["ND2WSI_WINDOW_CHILD"] = "1"
+    for key in ("ND2WSI_VIEWPORT_REPLAY", "ND2WSI_VIEWPORT_AUTOQUIT",
+                "ND2WSI_VIEWPORT_CAPTURE_AFTER_REPLAY", "MTL_CAPTURE_ENABLED"):
+        environment.pop(key, None)
     if app_name:
         environment["ND2WSI_APP_NAME"] = app_name
     return environment
 
 
-def launch_window(role: str = "agent", *, app_name: str | None = None) -> dict:
+def launch_window(role: str = "agent", *, app_name: str | None = None,
+                  source: str | Path | None = None, prefer_metal: bool = False,
+                  handoff_state: str | Path | None = None, retry_metal: bool = False) -> dict:
     if sys.platform != "darwin":
         return {"ok": False, "message": "Independent windows are macOS-only in this beta."}
     try:
         frozen = bool(getattr(sys, "frozen", False))
         command = build_window_command(role, frozen=frozen)
+        if prefer_metal or retry_metal:
+            # Product opt-in retains fallback; strict diagnostic --renderer
+            # metal is intentionally not used by this user-facing action.
+            if not frozen and command[1:3] == ["-m", "nd2wsi.app"]:
+                command[2] = "nd2wsi.desktop"
+            command.append("--prefer-metal")
+        if retry_metal:
+            command.append("--retry-metal")
+        if handoff_state is not None:
+            command.extend(["--handoff-state", str(Path(handoff_state).resolve())])
+        if source is not None:
+            command.append(str(Path(source).expanduser().resolve()))
         environment = child_environment(app_name=app_name)
         kwargs = {}
         if not frozen:

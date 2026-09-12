@@ -17,6 +17,75 @@
 #define MAX_REQUESTS 4
 #define MAX_BACKPRESSURE_RETRIES 5
 
+static BOOL VPNumber(id value, double low, double high) {
+    return [value isKindOfClass:NSNumber.class] &&
+        CFGetTypeID((__bridge CFTypeRef)value)!=CFBooleanGetTypeID() &&
+        isfinite([value doubleValue]) && [value doubleValue]>=low && [value doubleValue]<=high;
+}
+static BOOL VPArray(id value, NSUInteger count) {
+    return [value isKindOfClass:NSArray.class] && [value count]==count;
+}
+static BOOL VPInteger(id value, double low, double high) {
+    return VPNumber(value,low,high) && floor([value doubleValue])==[value doubleValue];
+}
+static BOOL VPBlocksReplayInput(BOOL replaying, BOOL agent, BOOL ownWindow) {
+    return replaying && agent && ownWindow;
+}
+API int nd2wsi_viewport_replay_input_scope(int replaying, int agent, int own_window) {
+    return VPBlocksReplayInput(replaying!=0,agent!=0,own_window!=0)?1:0;
+}
+static BOOL VPMetadataValid(id meta) {
+    if(![meta isKindOfClass:NSDictionary.class] || ![meta[@"dtype"] isEqual:@"uint16"] ||
+       !VPInteger(meta[@"width"],1,INT32_MAX) || !VPInteger(meta[@"height"],1,INT32_MAX) ||
+       !VPInteger(meta[@"tile_size"],1,512) || ![meta[@"levels"] isKindOfClass:NSArray.class] ||
+       ![meta[@"levels"] count] || ![meta[@"channels"] isKindOfClass:NSArray.class] ||
+       ![meta[@"channels"] count] || [meta[@"channels"] count]>8)return NO;
+    NSMutableSet *paths=[NSMutableSet new]; double previous=0, width=[meta[@"width"] doubleValue],height=[meta[@"height"] doubleValue];
+    for(id level in meta[@"levels"]) {
+        if(![level isKindOfClass:NSDictionary.class] || !VPInteger(level[@"width"],1,width) ||
+           !VPInteger(level[@"height"],1,height) || !VPInteger(level[@"downsample"],1,INT32_MAX) ||
+           [level[@"downsample"] doubleValue]<=previous || ![level[@"path"] isKindOfClass:NSString.class] ||
+           ![level[@"path"] length] || [level[@"path"] length]>9 || [paths containsObject:level[@"path"]] ||
+           [level[@"path"] rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet].location!=NSNotFound)return NO;
+        if(!previous && ([level[@"downsample"] doubleValue]!=1 || [level[@"width"] doubleValue]!=width || [level[@"height"] doubleValue]!=height))return NO;
+        previous=[level[@"downsample"] doubleValue];width=[level[@"width"] doubleValue];height=[level[@"height"] doubleValue];[paths addObject:level[@"path"]];
+    }
+    for(id channel in meta[@"channels"]) {
+        if(![channel isKindOfClass:NSDictionary.class] || ![channel[@"label"] isKindOfClass:NSString.class] ||
+           !VPArray(channel[@"window"],2) || !VPNumber(channel[@"window"][0],0,65535) ||
+           !VPNumber(channel[@"window"][1],0,65536) || [channel[@"window"][1] doubleValue]<=[channel[@"window"][0] doubleValue] ||
+           !VPArray(channel[@"color"],3))return NO;
+        for(id value in channel[@"color"])if(!VPNumber(value,0,255))return NO;
+    } return YES;
+}
+static BOOL VPStateValid(id state, double width, double height, NSUInteger channels) {
+    if(![state isKindOfClass:NSDictionary.class] || !VPNumber(state[@"version"],1,1) ||
+       !VPArray(state[@"source_dimensions"],2) || !VPNumber(state[@"source_dimensions"][0],width,width) ||
+       !VPNumber(state[@"source_dimensions"][1],height,height) || !VPArray(state[@"center"],2) ||
+       !VPNumber(state[@"center"][0],0,width) || !VPNumber(state[@"center"][1],0,height) ||
+       !VPNumber(state[@"zoom"],1e-12,32) || !VPArray(state[@"channels"],channels))return NO;
+    for(id channel in state[@"channels"]) {
+        if(![channel isKindOfClass:NSDictionary.class] || !VPArray(channel[@"window"],2) ||
+           !VPNumber(channel[@"window"][0],0,65535) || !VPNumber(channel[@"window"][1],0,65536) ||
+           [channel[@"window"][1] doubleValue]<=[channel[@"window"][0] doubleValue] ||
+           !VPNumber(channel[@"gamma"],.1,10) || !VPArray(channel[@"color"],3) ||
+           ![channel[@"visible"] isKindOfClass:NSNumber.class] ||
+           CFGetTypeID((__bridge CFTypeRef)channel[@"visible"])!=CFBooleanGetTypeID())return NO;
+        for(id value in channel[@"color"])if(!VPNumber(value,0,255))return NO;
+    }return YES;
+}
+// Validation ABI: pure metadata checks, no window, file access or pixel readback.
+API int nd2wsi_viewport_validate_contract(const char *metadata_json, const char *state_json) {
+    @autoreleasepool {
+        if(!metadata_json)return 1;
+        id metadata=[NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:metadata_json] dataUsingEncoding:NSUTF8StringEncoding] options:NSJSONReadingFragmentsAllowed error:nil];
+        if(!VPMetadataValid(metadata))return 1;
+        if(!state_json)return 0;
+        id state=[NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:state_json] dataUsingEncoding:NSUTF8StringEncoding] options:NSJSONReadingFragmentsAllowed error:nil];
+        return VPStateValid(state,[metadata[@"width"] doubleValue],[metadata[@"height"] doubleValue],[metadata[@"channels"] count])?0:2;
+    }
+}
+
 typedef struct { vector_float4 positionUV; } VPVertex;
 typedef struct {
     vector_uint4 dimensions;
@@ -203,11 +272,17 @@ API int nd2wsi_viewport_composite(const uint16_t *raw, uint32_t channels,
 @property NSMutableArray<NSDictionary *> *actions, *errors;
 @property NSArray<NSDictionary *> *levels;
 @property NSDictionary *backendMetrics;
+@property NSMutableDictionary *outcome;
+@property NSURLSessionDataTask *metadataTask;
+@property id replayInputMonitor;
+@property NSMutableArray<NSArray *> *initialColors;
 @property NSMutableDictionary *capture;
 @property double centerX, centerY, zoom, imageWidth, imageHeight, lastInput, previousPresentation, backpressureUntil;
 @property NSUInteger channels, tileSize, activeLevel, replayStep, activeCommands;
 @property uint64_t generation, actionID, residentBytes, pendingBytes, peakBytes, peakFootprint, uploadedBytes, requestCount, cancelledRequests, backpressureResponses, backpressureRetries, exhaustedRetries, presentedCount, droppedCount, encodeCount;
 @property BOOL ready, closed, capturePending, captureRunning, replaying, frameStreamed;
+@property BOOL stopping, internalClose, finalized, firstPresented, faultUsed;
+@property NSUInteger memoryFailures;
 @property NSString *mode;
 @property double replayWaitStart;
 - (void)pan:(NSPoint)delta;
@@ -215,6 +290,13 @@ API int nd2wsi_viewport_composite(const uint16_t *raw, uint32_t channels,
 - (void)viewportChanged:(NSString *)action;
 - (void)saveReport;
 - (NSString *)actionToken;
+- (void)finishKind:(NSString *)kind failure:(NSString *)failure reason:(NSString *)reason;
+- (void)finishIfDrained;
+- (NSDictionary *)viewState;
+- (BOOL)fault:(NSString *)name;
+- (VPUniforms)uniformsFor:(VPTile *)tile;
+- (void)confirmFirstPresentation:(NSDictionary *)frame;
+- (void)stopReplayInputMonitor;
 @end
 
 @implementation VPView
@@ -265,6 +347,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
         _frames=[NSMutableArray new]; _actions=[NSMutableArray new]; _errors=[NSMutableArray new];
         _lows=[NSMutableArray new]; _highs=[NSMutableArray new]; _gammas=[NSMutableArray new];
         _checks=[NSMutableArray new]; _colorMenus=[NSMutableArray new];
+        _initialColors=[NSMutableArray new];
         _capture=[@{@"requested":@NO,@"completed":@NO} mutableCopy]; _mode=@"interactive";
         NSURLSessionConfiguration *config=[NSURLSessionConfiguration ephemeralSessionConfiguration];
         config.HTTPMaximumConnectionsPerHost=MAX_REQUESTS;
@@ -280,7 +363,56 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
     if (self.errors.count<100) [self.errors addObject:@{@"time":@(CACurrentMediaTime()),@"reason":reason?:@"unknown"}];
     self.status.stringValue=reason?:@"Unknown failure";
 }
+- (BOOL)fault:(NSString *)name {
+    id diagnostic=self.session[@"diagnostics"];
+    return [self.session[@"role"] isEqual:@"agent"] && [diagnostic isKindOfClass:NSDictionary.class] &&
+        [diagnostic[@"enabled"] isEqual:@YES] && [diagnostic[@"fault"] isEqual:name];
+}
+- (void)confirmFirstPresentation:(NSDictionary *)frame {
+    if(self.firstPresented || [frame[@"presented_time"] doubleValue]<=0 ||
+       ![frame[@"tiles_drawn"] unsignedIntegerValue] || ![frame[@"gpu_status"] isEqual:@"completed"])return;
+    self.firstPresented=YES;[self saveReport];
+    id diagnostic=self.session[@"diagnostics"];
+    if([self.session[@"role"] isEqual:@"agent"] && [diagnostic isKindOfClass:NSDictionary.class] &&
+       [diagnostic[@"enabled"] isEqual:@YES] && [diagnostic[@"close_after_first_presented"] isEqual:@YES])
+        dispatch_async(dispatch_get_main_queue(),^{[self finishKind:@"closed" failure:nil reason:nil];});
+    else if([self.session[@"role"] isEqual:@"agent"] && [diagnostic isKindOfClass:NSDictionary.class] &&
+       [diagnostic[@"enabled"] isEqual:@YES] && [diagnostic[@"handoff_after_first_presented"] isEqual:@YES])
+        dispatch_async(dispatch_get_main_queue(),^{[self standardViewer:nil];});
+}
+- (void)finishKind:(NSString *)kind failure:(NSString *)failure reason:(NSString *)reason {
+    NSAssert(NSThread.isMainThread,@"Lifecycle transitions are main-thread serialized");
+    if(self.finalized)return;
+    // A close already in progress wins over late metadata/GPU/network errors.
+    if(self.stopping && ![kind isEqual:@"closed"])return;
+    if(reason)[self recordError:reason];
+    self.outcome=[@{@"kind":kind,@"first_presented":@(self.firstPresented)} mutableCopy];
+    if(failure)self.outcome[@"failure_kind"]=failure;
+    NSDictionary *state=[self viewState];if(state)self.outcome[@"view_state"]=state;
+    self.stopping=YES;self.closed=YES;self.replaying=NO;self.capturePending=NO;
+    [self stopReplayInputMonitor];
+    self.view.paused=YES;self.view.delegate=nil;
+    [self.metadataTask cancel];
+    for(VPRequest *request in self.requests.allValues)[request.task cancel];
+    for(VPRequest *request in self.retiringRequests)[request.task cancel];
+    [self.network invalidateAndCancel];
+    // Keep the event loop alive until all committed GPU work has released its
+    // retained tiles. No waitUntilCompleted on the UI thread and no early pool reuse.
+    if([self fault:@"close_race"] && ![kind isEqual:@"closed"])
+        dispatch_async(dispatch_get_main_queue(),^{[self finishKind:@"closed" failure:nil reason:nil];});
+    dispatch_async(dispatch_get_main_queue(),^{[self finishIfDrained];});
+}
+- (void)finishIfDrained {
+    if(!self.stopping || self.finalized || self.activeCommands)return;
+    self.finalized=YES;
+    if(self.captureRunning){[MTLCaptureManager.sharedCaptureManager stopCapture];self.captureRunning=NO;}
+    self.outcome[@"first_presented"]=@(self.firstPresented);
+    [self saveReport];self.internalClose=YES;[self.window close];
+    [NSApp stop:nil];
+    [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0] atStart:NO];
+}
 - (void)launchWindowCommand:(NSString *)key {
+    if(self.closed)return;
     NSArray *command=self.session[@"window_commands"][key];
     if(![command isKindOfClass:NSArray.class] || command.count<2 ||
        ![command[0] isKindOfClass:NSString.class] || ![command[0] hasPrefix:@"/"])return;
@@ -301,7 +433,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
 }
 - (void)newUserWindow:(id)sender { (void)sender; [self launchWindowCommand:@"user"]; }
 - (void)newAgentWindow:(id)sender { (void)sender; [self launchWindowCommand:@"agent"]; }
-- (void)standardViewer:(id)sender { (void)sender; [self launchWindowCommand:@"standard"]; }
+- (void)standardViewer:(id)sender { (void)sender; [self finishKind:@"handoff" failure:nil reason:nil]; }
 - (void)checkUpdates:(id)sender { (void)sender; [self launchWindowCommand:@"updates"]; }
 - (void)closeOwnWindow:(id)sender { (void)sender; [self.window performClose:nil]; }
 - (void)installMenus {
@@ -331,9 +463,14 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
     if(!VPViewportDimension("ND2WSI_VIEWPORT_WIDTH",930,510,1600,&viewportWidth,error) ||
        !VPViewportDimension("ND2WSI_VIEWPORT_HEIGHT",800,400,1600,&viewportHeight,error))return NO;
     self.device=MTLCreateSystemDefaultDevice();
-    if (!self.device || !self.device.hasUnifiedMemory) return NO;
-    self.pipeline=VPPipeline(self.device,error); if(!self.pipeline)return NO;
+    if (!self.device || !self.device.hasUnifiedMemory) {
+        self.outcome=[@{@"kind":@"fatal",@"failure_kind":@"gpu_device_unavailable",@"first_presented":@NO} mutableCopy];return NO;
+    }
+    self.pipeline=VPPipeline(self.device,error); if(!self.pipeline){
+        self.outcome=[@{@"kind":@"fatal",@"failure_kind":@"gpu_pipeline_failure",@"first_presented":@NO} mutableCopy];return NO;
+    }
     self.queue=[self.device newCommandQueue]; self.queue.label=@"ND2 direct viewport queue";
+    if(!self.queue){self.outcome=[@{@"kind":@"fatal",@"failure_kind":@"memory_pressure",@"first_presented":@NO} mutableCopy];return NO;}
     // Benchmark overrides change actual native points, not DPR or a simulated
     // viewport. The 270-point controls column is outside the image viewport.
     self.window=[[NSWindow alloc] initWithContentRect:NSMakeRect(180,180,270+viewportWidth,viewportHeight)
@@ -394,33 +531,36 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
     [self.controls addArrangedSubview:self.status];
     [self.window makeKeyAndOrderFront:nil]; [self.window makeFirstResponder:self.view];
     __weak VPController *weak=self;
-    [[self.network dataTaskWithURL:[self URLFor:@"metadata"] completionHandler:^(NSData *data,NSURLResponse *response,NSError *problem){
+    self.metadataTask=[self.network dataTaskWithURL:[self URLFor:@"metadata"] completionHandler:^(NSData *data,NSURLResponse *response,NSError *problem){
         dispatch_async(dispatch_get_main_queue(),^{
             VPController *owner=weak; if(!owner || owner.closed)return;
-            if(problem || ((NSHTTPURLResponse *)response).statusCode!=200) { [owner recordError:problem.localizedDescription?:@"Metadata request failed"]; return; }
-            NSDictionary *meta=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if([owner fault:@"metadata_timeout"])return;
+            if(problem || ![response isKindOfClass:NSHTTPURLResponse.class] || ((NSHTTPURLResponse *)response).statusCode!=200) {
+                [owner finishKind:@"fatal" failure:problem.code==NSURLErrorTimedOut?@"metadata_timeout":@"metadata_invalid" reason:problem.localizedDescription?:@"Metadata request failed"]; return;
+            }
+            NSDictionary *meta=data.length && data.length<=2*1024*1024 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            if([owner fault:@"metadata_invalid"] || [owner fault:@"close_race"])meta=nil;
             [owner configure:meta];
         });
-    }] resume];
+    }];[self.metadataTask resume];
+    double timeout=[self fault:@"metadata_timeout"]?.15:20;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(timeout*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+        VPController *owner=weak;if(owner && !owner.closed && !owner.ready)
+            [owner finishKind:@"fatal" failure:@"metadata_timeout" reason:@"Metadata response timed out"];
+    });
     return YES;
 }
 - (void)configure:(NSDictionary *)meta {
-    if(![meta isKindOfClass:NSDictionary.class] || ![meta[@"dtype"] isEqual:@"uint16"] ||
-       ![meta[@"levels"] isKindOfClass:NSArray.class] || ![meta[@"channels"] isKindOfClass:NSArray.class] ||
-       ![meta[@"channels"] count] || [meta[@"channels"] count]>MAX_CHANNELS ||
-       [meta[@"width"] doubleValue]<=0 || [meta[@"height"] doubleValue]<=0 ||
-       [meta[@"tile_size"] unsignedIntegerValue]==0 || [meta[@"tile_size"] unsignedIntegerValue]>2048) {
-        [self recordError:@"Unsupported raw metadata (uint16 fluorescence, 1–32 channels required)"]; return;
+    if(self.closed)return;
+    if(!VPMetadataValid(meta)) {
+        [self finishKind:@"fatal" failure:@"metadata_invalid" reason:@"Invalid raw fluorescence metadata"];return;
     }
     self.metadata=meta; self.imageWidth=[meta[@"width"] doubleValue]; self.imageHeight=[meta[@"height"] doubleValue];
     self.tileSize=[meta[@"tile_size"] unsignedIntegerValue]; self.channels=[meta[@"channels"] count];
     self.levels=[meta[@"levels"] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a,NSDictionary *b){return [a[@"downsample"] compare:b[@"downsample"]];}];
-    if(!self.levels.count){[self recordError:@"No image levels"];return;}
-    for(NSDictionary *level in self.levels) if([level[@"width"] doubleValue]<=0 || [level[@"height"] doubleValue]<=0 || [level[@"downsample"] doubleValue]<=0 || ![level[@"path"] isKindOfClass:NSString.class]) {
-        [self recordError:@"Invalid pyramid level metadata"];return;
-    }
     for(NSUInteger c=0;c<self.channels;c++) {
         NSDictionary *channel=meta[@"channels"][c]; NSString *name=channel[@"label"]?:[NSString stringWithFormat:@"Channel %lu",(unsigned long)c];
+        [self.initialColors addObject:channel[@"color"]];
         NSButton *check=[NSButton checkboxWithTitle:name target:self action:@selector(displayChanged:)];
         check.state=NSControlStateValueOn; check.tag=c; check.accessibilityLabel=[NSString stringWithFormat:@"Channel %lu visible %@",(unsigned long)c,name];
         [self.checks addObject:check]; [self.controls addArrangedSubview:check];
@@ -441,10 +581,42 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
         menu.accessibilityLabel=[NSString stringWithFormat:@"Channel %lu color LUT",(unsigned long)c];
         [self.colorMenus addObject:menu]; [self.controls addArrangedSubview:menu];
     }
-    self.ready=YES; [self fit:nil];
+    self.ready=YES;
+    NSDictionary *initial=self.session[@"initial_view_state"];
+    // JSON null is the normal launcher representation of "no handoff", not
+    // malformed user state. Keep genuinely supplied invalid state diagnostic.
+    if((id)initial==NSNull.null)initial=nil;
+    if(initial && VPStateValid(initial,self.imageWidth,self.imageHeight,self.channels)) {
+        self.centerX=[initial[@"center"][0] doubleValue];self.centerY=[initial[@"center"][1] doubleValue];self.zoom=[initial[@"zoom"] doubleValue];
+        for(NSUInteger c=0;c<self.channels;c++) {
+            NSDictionary *channel=initial[@"channels"][c];
+            self.lows[c].doubleValue=[channel[@"window"][0] doubleValue];self.highs[c].maxValue=65536;
+            self.highs[c].doubleValue=[channel[@"window"][1] doubleValue];self.gammas[c].doubleValue=[channel[@"gamma"] doubleValue];
+            self.checks[c].state=[channel[@"visible"] boolValue]?NSControlStateValueOn:NSControlStateValueOff;
+            self.initialColors[c]=channel[@"color"];
+        }[self viewportChanged:@"initial_view_state"];
+    } else {
+        if(initial)[self recordError:@"Invalid initial view state ignored; using fitted view"];
+        [self fit:nil];
+    }
     if(getenv("ND2WSI_VIEWPORT_REPLAY")) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),dispatch_get_main_queue(),^{if(!self.closed)[self replay:nil];});
     }
+}
+- (NSDictionary *)viewState {
+    if(!self.ready)return nil;
+    NSMutableArray *channels=[NSMutableArray new];VPTile *dummy=[VPTile new];VPUniforms uniforms=[self uniformsFor:dummy];
+    for(NSUInteger c=0;c<self.channels;c++) {
+        vector_float4 color=uniforms.colors[c], window=uniforms.windowGamma[c];
+        // Preserve arbitrary user RGB values, rather than silently snapping the
+        // browser's LUT to one of the native preset menu colors.
+        NSArray *rgb=self.initialColors[c];
+        if(self.colorMenus[c].indexOfSelectedItem>0)rgb=@[@(round(color.x*255)),@(round(color.y*255)),@(round(color.z*255))];
+        [channels addObject:@{@"window":@[@(window.x),@(window.y)],@"gamma":@(window.z),@"color":rgb,@"visible":@((BOOL)(window.w>.5))}];
+    }
+    NSDictionary *state=@{@"version":@1,@"source_dimensions":@[@(self.imageWidth),@(self.imageHeight)],
+        @"center":@[@(fmax(0,fmin(self.imageWidth,self.centerX))),@(fmax(0,fmin(self.imageHeight,self.centerY)))],@"zoom":@(self.zoom),@"channels":channels};
+    return VPStateValid(state,self.imageWidth,self.imageHeight,self.channels)?state:nil;
 }
 - (void)fit:(id)sender {
     (void)sender; if(!self.ready)return;
@@ -561,8 +733,11 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
                     dispatch_async(dispatch_get_main_queue(),^{[owner scheduleTiles];}); return;
                 }
                 if(owner.requests[key]!=request || request.generation!=owner.generation)return;
+                NSInteger status=[response isKindOfClass:NSHTTPURLResponse.class]?((NSHTTPURLResponse *)response).statusCode:0;
+                if([owner fault:@"all_tiles_failed"])status=500;
+                if([owner fault:@"tile_503"] && [owner.retryCounts[key] unsignedIntegerValue]<2)status=503;
                 // Reservation remains in force through response/buffer overlap.
-                if(!problem && ((NSHTTPURLResponse *)response).statusCode==200 && data.length==bytes) {
+                if(!problem && status==200 && data.length==bytes) {
                     id<MTLBuffer> buffer=[owner.device newBufferWithBytes:data.bytes length:bytes options:MTLResourceStorageModeShared];
                     if(buffer) {
                         buffer.label=[@"Raw CYX ushort tile " stringByAppendingString:key];
@@ -571,8 +746,8 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
                         tile.width=[item[@"width"] unsignedIntegerValue]; tile.height=[item[@"height"] unsignedIntegerValue];
                         tile.level=[item[@"level"] unsignedIntegerValue]; tile.lastUse=CACurrentMediaTime();
                         owner.tiles[key]=tile; owner.residentBytes+=bytes; owner.uploadedBytes+=bytes;
-                    } else { [owner.failedKeys addObject:key]; [owner recordError:@"Shared tile buffer allocation failed"]; }
-                } else if(!problem && ((NSHTTPURLResponse *)response).statusCode==503) {
+                    } else { owner.memoryFailures++;[owner.failedKeys addObject:key]; [owner recordError:@"Shared tile buffer allocation failed"]; }
+                } else if(!problem && status==503) {
                     owner.backpressureResponses++;
                     NSUInteger attempts=[owner.retryCounts[key] unsignedIntegerValue];
                     if(attempts<MAX_BACKPRESSURE_RETRIES) {
@@ -598,6 +773,11 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
             });
         }]; [request.task resume];
     } [self updateStatus];
+    if(!self.firstPresented && self.wanted.count && !self.requests.count && !self.retiringRequests.count) {
+        BOOL exhausted=YES;
+        for(NSDictionary *item in self.wanted)if(![self.failedKeys containsObject:item[@"key"]]){exhausted=NO;break;}
+        if(exhausted)[self finishKind:@"fatal" failure:self.memoryFailures?@"memory_pressure":@"tile_unavailable" reason:@"No first-screen image tile could be loaded after bounded retries"];
+    }
 }
 - (void)wakeSchedulerAt:(double)deadline generation:(uint64_t)generation {
     // Capture only a weak owner and scalars: retry timers must not extend the
@@ -627,7 +807,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
         if(high<=low)high=low+1; // Existing browser parse_windows convention.
         u.windowGamma[c]=(vector_float4){low,high,self.gammas[c].floatValue,self.checks[c].state==NSControlStateValueOn?1:0};
         NSInteger selected=self.colorMenus[c].indexOfSelectedItem;
-        NSArray *color=self.metadata[@"channels"][c][@"color"];
+        NSArray *color=self.initialColors[c];
         if(selected>0)u.colors[c]=(vector_float4){presets[selected-1][0]/255.f,presets[selected-1][1]/255.f,presets[selected-1][2]/255.f,0};
         else if(color.count==3)u.colors[c]=(vector_float4){[color[0] floatValue]/255.f,[color[1] floatValue]/255.f,[color[2] floatValue]/255.f,0};
         else u.colors[c]=(vector_float4){1,1,1,0};
@@ -665,6 +845,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
     pass.colorAttachments[0].loadAction=MTLLoadActionClear; pass.colorAttachments[0].storeAction=MTLStoreActionStore;
     id<MTLCommandBuffer> command=[self.queue commandBuffer]; command.label=@"Viewport frame — one fused raw-channel render pass";
     id<MTLRenderCommandEncoder> encoder=[command renderCommandEncoderWithDescriptor:pass];
+    if(!command || !encoder){[self finishKind:@"fatal" failure:@"memory_pressure" reason:@"Metal command allocation failed"];return;}
     encoder.label=@"Viewport clear/store; no intermediate attachments; no CPU readback";
     [encoder setRenderPipelineState:self.pipeline];
     NSMutableArray<VPTile *> *retained=[NSMutableArray new];
@@ -706,6 +887,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
             if(presented>0 && owner.previousPresentation>0)frame[@"presentation_interval_ms"]=@((presented-owner.previousPresentation)*1000);
             if(presented>0)owner.previousPresentation=presented;
             if(presented>0)owner.presentedCount++; else owner.droppedCount++;
+            [owner confirmFirstPresentation:frame];
             [owner updateStatus];
         });
     }];
@@ -717,7 +899,14 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
             frame[@"gpu_ms"]=@(MAX(0,(done.GPUEndTime-done.GPUStartTime)*1000));
             frame[@"gpu_start"]=@(done.GPUStartTime); frame[@"gpu_end"]=@(done.GPUEndTime);
             frame[@"gpu_status"]=done.status==MTLCommandBufferStatusCompleted?@"completed":@"failed";
-            if(done.status!=MTLCommandBufferStatusCompleted)[owner recordError:done.error.localizedDescription];
+            BOOL injected=([owner fault:@"gpu_fatal"] || [owner fault:@"gpu_memory_pressure"]) && retained.count && !owner.faultUsed;
+            if(injected)owner.faultUsed=YES;
+            if(injected)frame[@"gpu_status"]=@"failed";
+            [owner confirmFirstPresentation:frame];
+            if(done.status!=MTLCommandBufferStatusCompleted || injected) {
+                BOOL memory=([done.error.domain isEqual:MTLCommandBufferErrorDomain] && done.error.code==MTLCommandBufferErrorOutOfMemory) || [owner fault:@"gpu_memory_pressure"];
+                [owner finishKind:@"fatal" failure:memory?@"memory_pressure":@"gpu_execution_failure" reason:injected?@"Diagnostic injected GPU execution failure":done.error.localizedDescription];
+            }
             if(captureThis) {
                 [MTLCaptureManager.sharedCaptureManager stopCapture]; owner.captureRunning=NO;
                 owner.capture[@"completed"]=@(done.status==MTLCommandBufferStatusCompleted);
@@ -727,6 +916,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
                 if(!owner.closed)[owner.view setNeedsDisplay:YES];
             }
             [owner scheduleTiles];
+            [owner finishIfDrained];
         });
     }];
     [command presentDrawable:drawable]; [command commit];
@@ -753,8 +943,27 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
 - (void)replay:(id)sender {
     (void)sender;if(!self.ready || self.replaying)return;
     self.replaying=YES; self.replayStep=0;self.replayWaitStart=CACurrentMediaTime();self.mode=@"benchmark";
+    if([self.session[@"role"] isEqual:@"agent"] && !self.replayInputMonitor) {
+        // This local monitor consumes only physical input directed at this
+        // diagnostic Agent window. Other apps/windows remain interactive, no
+        // click-through is enabled, and programmatic replay calls are unchanged.
+        NSEventMask mask=NSEventMaskLeftMouseDown|NSEventMaskLeftMouseUp|NSEventMaskRightMouseDown|
+            NSEventMaskRightMouseUp|NSEventMaskOtherMouseDown|NSEventMaskOtherMouseUp|
+            NSEventMaskLeftMouseDragged|NSEventMaskRightMouseDragged|NSEventMaskOtherMouseDragged|
+            NSEventMaskMouseMoved|NSEventMaskScrollWheel|NSEventMaskMagnify|NSEventMaskRotate|
+            NSEventMaskSwipe|NSEventMaskKeyDown|NSEventMaskKeyUp|NSEventMaskFlagsChanged;
+        __weak VPController *weak=self;
+        self.replayInputMonitor=[NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent *(NSEvent *event){
+            VPController *owner=weak;
+            if(owner && VPBlocksReplayInput(owner.replaying,[owner.session[@"role"] isEqual:@"agent"],event.window==owner.window))return nil;
+            return event;
+        }];
+    }
     [self.actions addObject:@{@"kind":@"replay_start",@"time":@(CACurrentMediaTime()),@"viewport_points":@[@(self.view.bounds.size.width),@(self.view.bounds.size.height)],@"drawable_pixels":@[@(self.view.drawableSize.width),@(self.view.drawableSize.height)]}];
     [self replayNext];
+}
+- (void)stopReplayInputMonitor {
+    if(self.replayInputMonitor){[NSEvent removeMonitor:self.replayInputMonitor];self.replayInputMonitor=nil;}
 }
 - (NSString *)actionToken {
     return self.replaying && self.replayStep ? [NSString stringWithFormat:@"step-%lu",(unsigned long)(self.replayStep-1)] : [NSString stringWithFormat:@"interaction-%llu",self.actionID];
@@ -782,6 +991,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
     } else if(step==43){[self fit:nil];}
     else {
         self.replaying=NO;self.mode=@"interactive";
+        [self stopReplayInputMonitor];
         [self.actions addObject:@{@"kind":@"replay_complete",@"time":@(CACurrentMediaTime()),@"steps":@(step)}];
         [self refreshBackendAndSave];[self updateStatus];
         // Capture is deliberately outside the timed replay. It has its own
@@ -815,12 +1025,16 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
         [counters addObject:@{@"set":set.name,@"counters":names}];
     }
     NSMutableDictionary *memory=[VPProcessMemory() mutableCopy]; memory[@"peak_physical_footprint_bytes"]=@(self.peakFootprint);
+    NSDictionary *state=self.outcome[@"view_state"]?:[self viewState];
     NSDictionary *report=@{@"schema":@"nd2wsi-native-viewport-v1",@"session":self.session?:@{},
+        @"open_attempt_id":self.session[@"open_attempt_id"]?:@"",@"fallback_consumed":self.session[@"fallback_consumed"]?:@NO,
+        @"outcome":self.outcome?:@{@"kind":@"running",@"first_presented":@(self.firstPresented)},@"view_state":state?:[NSNull null],
+        @"lifecycle":@{@"stopping":@(self.stopping),@"finalized":@(self.finalized),@"active_gpu_commands":@(self.activeCommands)},
         @"context":self.session[@"context"]?:@{},@"timing_kind":@"metal_drawable_presented",
         @"resource":memory,
         @"source":[self.metadata[@"source"] lastPathComponent]?:@"",@"device":self.device.name?:@"",
         @"unified_memory":@(self.device.hasUnifiedMemory),@"backend":self.backendMetrics?:@{},
-        @"scope":@"Direct fluorescence display. Not disk-to-display zero-copy; raw tiles copied once into shared Metal buffers.",
+        @"scope":@"Direct fluorescence display. Input includes source packing and shared-buffer copies plus possible HTTP/NSData copies; no production CPU pixel readback.",
         @"viewport":@{@"points":@[@(self.view.bounds.size.width),@(self.view.bounds.size.height)],@"drawable_pixels":@[@(self.view.drawableSize.width),@(self.view.drawableSize.height)],@"center":@[@(self.centerX),@(self.centerY)],@"zoom":@(self.zoom),@"level":self.ready?self.levels[self.activeLevel][@"path"]:@""},
         @"memory":@{@"tile_pipeline_budget_bytes":@(MEMORY_BUDGET),@"resident_bytes":@(self.residentBytes),@"inflight_reserved_bytes":@(self.pendingBytes),@"peak_resident_plus_inflight_reserved_bytes":@(self.peakBytes),@"scope":@"Raw tile buffers plus two-times HTTP in-flight payload reservation; excludes drawable textures, framework caches and backend process."},
         @"transfers":@{@"raw_tile_requests":@(self.requestCount),@"cancelled_requests":@(self.cancelledRequests),@"explicit_shared_buffer_input_copy_bytes":@(self.uploadedBytes),@"production_cpu_pixel_readbacks":@0,@"cpu_rgb_or_jpeg_frames":@0},
@@ -836,11 +1050,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
     if(error)fprintf(stderr,"Metal viewport report: %s\n",error.localizedDescription.UTF8String);
 }
 - (void)windowWillClose:(NSNotification *)notification {
-    (void)notification;self.closed=YES;
-    for(VPRequest *request in self.requests.allValues)[request.task cancel];
-    [self saveReport];[self.network invalidateAndCancel];
-    [NSApp stop:nil];
-    [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0] atStart:NO];
+    (void)notification;if(!self.internalClose)[self finishKind:@"closed" failure:nil reason:nil];
 }
 @end
 
@@ -859,8 +1069,12 @@ API int nd2wsi_viewport_run(const char *base_url,const char *session_json,const 
         VPController *controller=[VPController new]; controller.baseURL=base;controller.session=session;
         controller.reportPath=[NSString stringWithUTF8String:report_path]; NSApp.delegate=controller;
         NSError *error=nil;
-        if(![controller open:&error]){fprintf(stderr,"Metal viewport: %s\n",error.localizedDescription.UTF8String?:"No unified-memory Metal device");return 4;}
+        if(![controller open:&error]){
+            if(!controller.outcome)controller.outcome=[@{@"kind":@"fatal",@"failure_kind":@"renderer_initialization_failure",@"first_presented":@NO} mutableCopy];
+            [controller.network invalidateAndCancel];[controller saveReport];
+            fprintf(stderr,"Metal viewport: %s\n",error.localizedDescription.UTF8String?:"No unified-memory Metal device");return 4;
+        }
         [NSApp activateIgnoringOtherApps:NO]; [NSApp run];
-        [controller saveReport]; return 0;
+        [controller saveReport]; return [controller.outcome[@"kind"] isEqual:@"fatal"]?5:0;
     }
 }

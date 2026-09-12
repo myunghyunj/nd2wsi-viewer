@@ -831,6 +831,24 @@ def _install_window_menu(api: Api, window) -> None:
                         if not result.get("ok"):
                             api._status = result.get("message", "Could not open an Agent window.")
 
+                    def openInMetal_(self, _sender):
+                        # evaluate_js must not synchronously wait on AppKit's
+                        # main thread. The page resolves the active tab itself.
+                        def request():
+                            try:
+                                window.evaluate_js("window.nd2OpenActiveInMetal?.(); true")
+                            except Exception as exc:
+                                api._status = f"Could not open in Metal: {exc}"
+                        threading.Thread(target=request, daemon=True).start()
+
+                    def retryInMetal_(self, _sender):
+                        def request():
+                            try:
+                                window.evaluate_js("window.nd2OpenActiveInMetal?.(true); true")
+                            except Exception as exc:
+                                api._status = f"Could not retry Metal: {exc}"
+                        threading.Thread(target=request, daemon=True).start()
+
                 target = ND2WSIWindowMenuTarget.alloc().init()
                 main_menu = AppKit.NSApplication.sharedApplication().mainMenu()
                 if main_menu is None:
@@ -850,6 +868,10 @@ def _install_window_menu(api: Api, window) -> None:
                     item = file_menu.addItemWithTitle_action_keyEquivalent_(title, action, "n")
                     item.setKeyEquivalentModifierMask_(modifiers)
                     item.setTarget_(target)
+                item = file_menu.addItemWithTitle_action_keyEquivalent_("Open in Metal", "openInMetal:", "")
+                item.setTarget_(target)
+                item = file_menu.addItemWithTitle_action_keyEquivalent_("Retry in Metal", "retryInMetal:", "")
+                item.setTarget_(target)
                 api._window_menu_target = target
             except Exception as exc:
                 _dlog(f"window menu install failed: {exc!r}")
@@ -897,12 +919,19 @@ class Api:
 
     def __init__(self, initial: Path | None, native_gesture_scopes=None, window_session=None):
         self._initial = initial
+        self._launch_source = initial
         self._status = ""
         self._frac = -1.0  # conversion progress, -1 = not converting
         self._httpd = None
         self._updater = None
         self._startup_error = None
         self._window_session = window_session
+        self._handoff_state = None
+        self._handoff_source = None
+        self._handoff_states = {}
+        self._browser_benchmark_enabled = False
+        self._open_attempt_id = None
+        self._fallback_consumed = False
         self._updates_disabled = sys.platform == "darwin" and (
             window_session is not None or os.environ.get("ND2WSI_WINDOW_CHILD") == "1"
         )
@@ -919,13 +948,80 @@ class Api:
 
         return launch_window(role, app_name=APP_NAME)
 
+    def open_in_metal(self, sid: str, view_state: dict, retry: bool = False) -> dict:
+        """Open only a registered slide in a fresh process of this same role."""
+        if sys.platform != "darwin" or self._window_session is None:
+            return {"ok": False, "message": "Metal windows are available only in the macOS app."}
+        try:
+            from .view_state import validate_view_state, write_handoff
+            from .window_launch import launch_window
+
+            if type(retry) is not bool:
+                raise ValueError("Retry must be an explicit boolean choice")
+
+            st = self._httpd.registry.get(sid) if self._httpd is not None and isinstance(sid, str) else None
+            if st is None or st.source_path is None:
+                raise ValueError("Open a source slide before choosing Metal")
+            meta = st.attrs["nd2wsi"]
+            if meta.get("plate") or meta.get("rgb"):
+                raise ValueError("This slide requires the standard viewer")
+            level = meta["levels"][0]
+            state = validate_view_state(view_state, dimensions=[level["width"], level["height"]],
+                                        channel_count=len(st.attrs["omero"]["channels"]))
+            path = write_handoff(state, source=st.source_path, role=self._window_session.role,
+                                 root=self._window_session.root / "handoffs")
+            return launch_window(self._window_session.role, app_name=APP_NAME,
+                                 source=st.source_path, prefer_metal=True, handoff_state=path, retry_metal=retry)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return {"ok": False, "message": f"Could not open in Metal: {exc}"}
+
+    def initial_view_state(self, sid: str) -> dict | None:
+        """Only the registered destination slide receives display-only state."""
+        return self._handoff_states.get(sid) if isinstance(sid, str) else None
+
+    def benchmark_metrics(self) -> dict:
+        if not self._browser_benchmark_enabled:
+            return {"ok": False, "message": "Replay diagnostics were not enabled for this process"}
+        from .viewport_benchmark import metrics_snapshot
+
+        return metrics_snapshot()
+
+    def _prepare_handoff(self) -> None:
+        if self._handoff_state is None or self._httpd is None:
+            return
+        from copy import deepcopy
+
+        from .view_state import validate_view_state
+
+        for item in self._httpd.registry.listing():
+            st = self._httpd.registry.get(item["sid"])
+            if st.source_path != self._handoff_source:
+                continue
+            meta = st.attrs["nd2wsi"]
+            level = meta["levels"][0]
+            state = validate_view_state(self._handoff_state,
+                                        dimensions=[level["width"], level["height"]],
+                                        channel_count=len(st.attrs["omero"]["channels"]))
+            if meta.get("plate") or meta.get("rgb"):
+                raise ValueError("Display handoff requires a fluorescence slide")
+            # Colors are renderer defaults in the browser. Change only this
+            # process's detached metadata, never zarr/manifest/source attrs.
+            attrs = deepcopy(st.attrs)
+            for channel, display in zip(attrs["omero"]["channels"], state["channels"]):
+                channel["color"] = "".join(f"{component:02X}" for component in display["color"])
+            with st.lock:
+                st.attrs = attrs
+            self._handoff_states[item["sid"]] = state
+        self._handoff_state = None
+
     def window_context(self) -> dict:
         """Identify this window before automation reads or changes viewer state."""
         if self._window_session is None:
             return {"enabled": False, "role": "user", "id": None,
                     "agent_directive": "Use an isolated macOS Agent window for automation."}
         return {**self._window_session.as_dict(), "enabled": True, "pid": os.getpid(),
-                "new_window_default_role": "agent"}
+                "new_window_default_role": "agent", "metal_opt_in_supported": sys.platform == "darwin",
+                "open_attempt_id": self._open_attempt_id, "fallback_consumed": self._fallback_consumed}
 
     def pending(self) -> bool:
         return self._initial is not None
@@ -1119,6 +1215,7 @@ class Api:
                 if self._httpd is None:
                     self._httpd, _ = start_server([], window_session=self._window_session)
                 self._httpd.registry.open_path(path, on_progress=frac)
+                self._prepare_handoff()
                 return _server_url(self._httpd)
         store = open_or_convert(path, on_status=note, on_progress=frac)
         with self._server_lock:
@@ -1128,6 +1225,7 @@ class Api:
             else:
                 self._httpd.registry.add_store(store)
                 url = _server_url(self._httpd)
+        self._prepare_handoff()
         return url
 
     def _launch_many(self, paths):
@@ -1198,13 +1296,22 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
     """Exercise the real renderer, bridge and slide DOM, then close the app."""
     started = time.monotonic()
     report = {"ok": False, "platform": sys.platform, "renderer": None}
+    expected = getattr(api, "_requested_handoff", None)
     try:
         import webview
 
+        report["window_context"] = api.window_context()
+        if expected is not None:
+            report["handoff_requested"] = expected
+            source = Path(api._launch_source).resolve()
+            info = source.stat()
+            report["handoff_source"] = {"path": str(source), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
         report["renderer"] = webview.renderer
         if sys.platform == "win32" and webview.renderer != "edgechromium":
             raise RuntimeError("GUI smoke requires the Edge WebView2 renderer")
         while time.monotonic() - started < timeout:
+            if api._status.startswith("could not open"):
+                raise RuntimeError(api._status)
             try:
                 result = window.evaluate_js("""(() => {
                   const api = window.pywebview && window.pywebview.api;
@@ -1220,14 +1327,26 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                   const page = frame && frame.contentDocument;
                   const canvas = page && page.querySelector('#stage canvas');
                   const plate = page && page.querySelector('#plate img');
+                  const handoff = __HANDOFF_CHECK__ && frame?.contentWindow.nd2HandoffApplied === true;
                   return {bridge: true, version: bridge.version,
+                    ...(__HANDOFF_CHECK__ ? {handoff_applied:handoff,
+                      observed_display:handoff ? frame.contentWindow.nd2CaptureViewState() : null} : {}),
                     boot: !!document.getElementById('drop'),
                     slide: !!(frame && typeof readyFrames !== 'undefined' &&
                       readyFrames.has(frame.dataset.sid) &&
                       ((canvas && canvas.width > 0 && canvas.height > 0) ||
                       (plate && plate.complete && plate.naturalWidth > 0)))};
-                })()""")
+                })()""".replace("__HANDOFF_CHECK__", "true" if expected is not None else "false"))
                 if result and result.get("bridge") and result.get("slide" if expect_slide else "boot"):
+                    if expected is not None:
+                        from .view_state import matches_view_state
+
+                        if not result.get("handoff_applied"):
+                            time.sleep(0.05)
+                            continue
+                        report.update(result)
+                        if not matches_view_state(expected, result.get("observed_display")):
+                            raise ValueError("Actual browser display state differs from the requested handoff")
                     report.update(result, ok=True)
                     break
             except Exception as exc:
@@ -1251,12 +1370,36 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--smoke", action="store_true", help="headless self-test")
     ap.add_argument("--gui-smoke", action="store_true", help="open, verify and close the native window")
     ap.add_argument("--smoke-report", type=Path, help="write the native GUI self-test result as JSON")
+    ap.add_argument("--handoff-state", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--handoff-check-report", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--open-attempt-id", help=argparse.SUPPRESS)
+    ap.add_argument("--fallback-consumed", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--renderer", choices=("auto", "browser", "metal"), help=argparse.SUPPRESS)
+    ap.add_argument("--prefer-metal", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--retry-metal", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--browser-replay-report", type=Path, help="write an isolated Agent browser replay diagnostic")
+    ap.add_argument("--benchmark-context", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--benchmark-test-root", type=Path, help=argparse.SUPPRESS)
     role_args = ap.add_mutually_exclusive_group()
     role_args.add_argument("--new-window", action="store_true", help="open a fresh macOS User window")
     role_args.add_argument("--agent-window", action="store_true", help="open an isolated macOS Agent window")
     args, _ = ap.parse_known_args(argv)  # tolerate Finder's -psn_* args
 
     initial = Path(args.nd2).expanduser() if args.nd2 else None
+    if args.handoff_check_report:
+        if (sys.platform != "darwin" or not args.agent_window or initial is None
+                or args.benchmark_test_root is None
+                or not initial.resolve().is_relative_to(args.benchmark_test_root.resolve())):
+            print("Window verification requires a macOS Agent and isolated test root", file=sys.stderr)
+            return 2
+        args.gui_smoke = True
+        args.smoke_report = args.handoff_check_report
+    if args.browser_replay_report:
+        if (sys.platform != "darwin" or not args.agent_window or initial is None
+                or args.benchmark_context is None or args.benchmark_test_root is None
+                or not initial.resolve().is_relative_to(args.benchmark_test_root.resolve())):
+            print("Browser replay requires a macOS Agent window and source inside an explicit test root", file=sys.stderr)
+            return 2
     if args.smoke:
         if not initial:
             print("--smoke needs an ND2 path", file=sys.stderr)
@@ -1280,12 +1423,31 @@ def main(argv: list[str] | None = None) -> int:
 
             window_session = create_window_session("agent" if args.agent_window else "user")
             api, window = create_app_window(initial, window_session=window_session)
+            from .renderer_policy import open_attempt_id
+
+            api._open_attempt_id = open_attempt_id(args.open_attempt_id)
+            api._fallback_consumed = args.fallback_consumed
         else:
             api, window = create_app_window(initial)
+        if args.handoff_state:
+            if sys.platform != "darwin" or initial is None:
+                raise ValueError("Display handoff requires a macOS source opening")
+            from .view_state import read_handoff
+
+            api._handoff_state = read_handoff(args.handoff_state, source=initial, role=window_session.role)
+            api._requested_handoff = api._handoff_state
+            api._handoff_source = initial.resolve()
         kwargs = {"gui": "edgechromium"} if sys.platform == "win32" else {}
         if sys.platform == "darwin":
             kwargs["private_mode"] = True
-        if args.gui_smoke:
+        if args.browser_replay_report:
+            from .viewport_benchmark import run_browser_replay
+
+            api._browser_benchmark_enabled = True
+            window._nd2_benchmark_input_authorized = window_session.role == "agent"
+            webview.start(lambda: run_browser_replay(api, window, args.browser_replay_report,
+                                                    args.benchmark_context, args.benchmark_test_root), **kwargs)
+        elif args.gui_smoke:
             webview.start(lambda: gui_smoke(api, window, expect_slide=initial is not None), **kwargs)
         else:
             webview.start(**kwargs)
@@ -1293,9 +1455,12 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(api._startup_error)
         report = getattr(api, "_gui_smoke_report", {"ok": False, "error": "GUI closed before verification"})
         result = 0 if not args.gui_smoke or report["ok"] else 4
+        if args.browser_replay_report:
+            report = getattr(api, "_browser_replay_report", {"ok": False, "error": "Replay did not complete"})
+            result = 0 if report.get("ok") else 4
     except Exception as exc:
         message = f"Could not start {APP_NAME}: {exc}"
-        _startup_error(message, show_dialog=not args.gui_smoke)
+        _startup_error(message, show_dialog=not (args.gui_smoke or args.browser_replay_report))
         report = {"ok": False, "error": message, "platform": sys.platform}
         result = 4
     finally:
@@ -1312,7 +1477,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False))
         if args.smoke_report:
             args.smoke_report.parent.mkdir(parents=True, exist_ok=True)
-            args.smoke_report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            if args.handoff_check_report:
+                with args.smoke_report.open("x", encoding="utf-8") as handle:
+                    handle.write(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+            else:
+                args.smoke_report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if args.browser_replay_report and not getattr(api, "_browser_replay_report", None):
+        try:
+            args.browser_replay_report.parent.mkdir(parents=True, exist_ok=True)
+            with args.browser_replay_report.open("x", encoding="utf-8") as handle:
+                json.dump(report, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
+        except OSError as exc:
+            print(f"Could not create replay failure report: {exc}", file=sys.stderr)
     return result
 
 

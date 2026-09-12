@@ -195,7 +195,7 @@ def test_agent_uncached_source_never_enters_shared_builder(source, tmp_path, mon
     session = create_window_session("agent", tmp_path / "sessions")
     registry = SlideRegistry(window_session=session)
     monkeypatch.setattr(plate, "is_plate_file", lambda _: False)
-    monkeypatch.setattr(convert, "existing_cache_store", lambda _: None)
+    monkeypatch.setattr(convert, "existing_cache_store", lambda _, **kwargs: None)
 
     def forbidden(*args, **kwargs):
         pytest.fail("agent entered shared cache build/repair")

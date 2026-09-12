@@ -204,6 +204,91 @@ def test_native_window_matching_uses_window_number_and_safe_nil_fallback():
     )
 
 
+def test_replay_guard_consumes_only_own_window_and_unlocks_without_clickthrough():
+    from nd2wsi.native_gestures import _replay_input_monitor
+
+    native, other = _FakeWindow(17, key=True), _FakeWindow(23)
+    locked = [True]
+    monitor = _replay_input_monitor(native, lambda: locked[0], lambda: native)
+    own, foreign = _FakeEvent(window=native), _FakeEvent(window=other)
+    assert monitor(own) is None
+    assert monitor(foreign) is foreign
+    locked[0] = False
+    assert monitor(own) is own
+
+
+def test_replay_nil_window_never_substitutes_nonkey_main_window():
+    from nd2wsi.native_gestures import _replay_input_targets_window
+
+    native, other = _FakeWindow(17, main=True), _FakeWindow(23, key=True)
+    event = _FakeEvent(window=None)
+    assert not _replay_input_targets_window(event, native, other)
+    assert not _replay_input_targets_window(event, native)
+    assert _replay_input_targets_window(event, native, _FakeWindow(17, key=True))
+
+
+def test_locked_native_trackpad_bridge_cannot_forward_input_around_guard():
+    native = _FakeWindow(17, key=True)
+    sent = []
+    monitor = _make_native_trackpad_monitor(
+        appkit=_FakeAppKit, native_window=native, native_webview=_FakeWebView(),
+        scope_cache=_scope_cache(), sequence=NativeGestureSequence(_phase_masks()),
+        logger=lambda _: None, dispatch=lambda *args: sent.append(args), input_locked=lambda: True)
+    own = _FakeEvent(window=native, scrolling=(10, 0), precise=True, location=(150, 400))
+    other = _FakeEvent(window=_FakeWindow(23), scrolling=(10, 0), precise=True, location=(150, 400))
+    assert monitor(own) is None
+    assert monitor(other) is other
+    assert sent == []
+
+
+def test_replay_guard_requires_explicit_agent_diagnostic_authorization(monkeypatch):
+    import nd2wsi.native_gestures as gestures
+
+    monkeypatch.setattr(gestures.sys, "platform", "darwin")
+    with pytest.raises(ValueError, match="authorized"):
+        gestures.install_replay_input_guard(SimpleNamespace())
+
+
+def test_replay_guard_installs_locally_and_restores_idempotently(monkeypatch):
+    import sys
+
+    import nd2wsi.native_gestures as gestures
+
+    class Event:
+        def __init__(self):
+            self.handlers = []
+        def __iadd__(self, handler):
+            self.handlers.append(handler)
+            return self
+
+    native = _FakeWindow(17)
+    window = SimpleNamespace(uid="agent", _nd2_benchmark_input_authorized=True,
+                             events=SimpleNamespace(closed=Event()))
+    installed, removed = [], []
+    def install(mask, handler):
+        installed.append((mask, handler))
+        return "local-token"
+    appkit = SimpleNamespace(NSEventMaskScrollWheel=1, NSEventMaskKeyDown=2,
+                             NSEvent=SimpleNamespace(addLocalMonitorForEventsMatchingMask_handler_=install,
+                                                     removeMonitor_=removed.append),
+                             NSApplication=SimpleNamespace(sharedApplication=lambda: SimpleNamespace(keyWindow=lambda: native)))
+    monkeypatch.setattr(gestures.sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+    monkeypatch.setitem(sys.modules, "Foundation", SimpleNamespace(NSThread=SimpleNamespace(isMainThread=lambda: True),
+                                                                  NSOperationQueue=SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "webview.platforms.cocoa", SimpleNamespace(
+        BrowserView=SimpleNamespace(instances={"agent": SimpleNamespace(window=native)})))
+    restore = gestures.install_replay_input_guard(window)
+    assert window._nd2_benchmark_input_locked is True
+    assert installed[0][0] == 3
+    assert installed[0][1](_FakeEvent(window=native)) is None
+    restore()
+    restore()
+    window.events.closed.handlers[0]()
+    assert window._nd2_benchmark_input_locked is False
+    assert removed == ["local-token"]
+
+
 def _phase_masks():
     return NativeGesturePhaseMasks.from_appkit(_FakeAppKit)
 

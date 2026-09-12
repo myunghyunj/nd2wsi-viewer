@@ -79,6 +79,8 @@ const state = {
   },
 };
 
+window.nd2CaptureViewState = () => window.Nd2ViewState.capture(state);
+
 init().catch((e) => {
   $("boot").textContent = "failed to load: " + e.message;
 });
@@ -91,6 +93,16 @@ async function init() {
   state.channels = info.channels.map((_, i) => i);
   state.luts = info.channels.map(() => null);
   state.lutWidgets = [];
+  // The native bridge binds this state to the registered source and role.
+  // Apply display settings before panels/tile URLs, and camera after OSD opens.
+  const handoffApi = window.parent !== window ? window.parent.pywebview?.api : null;
+  if (handoffApi?.initial_view_state) {
+    const display = await handoffApi.initial_view_state(currentSlideSid());
+    if (display) {
+      window.Nd2ViewState.applyDisplay(state, display);
+      state.initialViewHandoff = display;
+    }
+  }
   const LatestRequestGate = window.Nd2LatestRequest && window.Nd2LatestRequest.LatestRequestGate;
   if (!LatestRequestGate) throw new Error("latest-request helper did not load");
   state.pixel.requests = new LatestRequestGate();
@@ -238,7 +250,7 @@ function renderParams(q) {
   // the channel set, the LUT windows and the cache generation, shared by
   // tiles, plate frames and rendered exports
   if (state.channels.length !== state.info.channels.length)
-    q.set("c", state.channels.join(","));
+    q.set("c", state.channels.length ? state.channels.join(",") : "none");
   const win = lutParam();
   if (win) q.set("win", win);
   // the cache generation makes tile URLs immutable: the browser may keep
@@ -405,6 +417,11 @@ function buildViewer() {
   });
   viewer.addHandler("open", () => {
     applyDesiredDisplayTransform(false);
+    if (state.initialViewHandoff) {
+      window.Nd2ViewState.applyCamera(viewer, state.initialViewHandoff);
+      state.initialViewHandoff = null;
+      window.nd2HandoffApplied = true;
+    }
     $("boot").style.display = "none";
     updateReadout();
     restoreRoiOverlay();
@@ -566,7 +583,7 @@ function buildChannelPanel() {
       ev.preventDefault();
       state.lutWidgets[i].reset();
     });
-    const toggle = macSwitch(true, (next) => {
+    const toggle = macSwitch(state.channels.includes(i), (next) => {
       const on = new Set(state.channels);
       next ? on.add(i) : on.delete(i);
       if (!on.size) return false; // keep at least one channel lit
@@ -669,7 +686,7 @@ function buildLutRow(i, ch, winLabel) {
   }
 
   const def = { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
-  const cur = { ...def };
+  const cur = { ...(state.luts[i] || def) };
   let vmin = Math.min(Number(ch.window.min) || 0, def.lo);
   let vmax = Math.max(
     def.hi,

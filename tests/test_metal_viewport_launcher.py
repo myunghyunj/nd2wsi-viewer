@@ -200,3 +200,49 @@ def test_source_close_failure_cannot_leave_session_starting(rig):
     with pytest.raises(RuntimeError, match="simulated close failure"):
         launcher.main([str(rig.path)])
     assert _record(rig.sessions[0])["state"] == "closed"
+
+
+def test_structured_fatal_result_is_returned_only_after_source_cleanup(rig):
+    def fail(base, context, report):
+        context = json.loads(context)
+        assert context["open_attempt_id"] == "a" * 32
+        assert context["fallback_consumed"] is False
+        Path(report.decode()).write_text(json.dumps({"outcome": {"kind": "fatal",
+            "failure_kind": "metadata_timeout", "first_presented": False}}))
+        return 5
+
+    rig.library.nd2wsi_viewport_run = fail
+    result = launcher.main([str(rig.path)], return_result=True, open_attempt_id="a" * 32)
+    assert result.kind == "fatal" and result.failure_kind == "metadata_timeout"
+    assert result.code == 5 and not result.first_presented
+    assert rig.calls[-1] == "close" and _record(rig.sessions[0])["state"] == "closed"
+
+
+def test_first_real_present_notifies_while_native_window_is_still_running(rig):
+    import threading
+
+    notified = threading.Event()
+
+    def present(base, context, report):
+        Path(report.decode()).write_text(json.dumps({"outcome": {"kind": "running", "first_presented": True}}))
+        assert notified.wait(2), "failure ledger must clear before the user closes the window"
+        assert "close" not in rig.calls
+        Path(report.decode()).write_text(json.dumps({"outcome": {"kind": "closed", "first_presented": True}}))
+        return 0
+
+    rig.library.nd2wsi_viewport_run = present
+    result = launcher.main([str(rig.path)], return_result=True, on_first_presented=notified.set)
+    assert result.first_presented and result.presentation_notified
+    assert result.kind == "closed" and rig.calls[-1] == "close"
+
+
+def test_invalid_native_report_does_not_accept_unknown_view_state(rig):
+    def invalid(base, context, report):
+        Path(report.decode()).write_text(json.dumps({"outcome": {"kind": "handoff"},
+                                                   "view_state": {"role": "user", "version": 999}}))
+        return 0
+
+    rig.library.nd2wsi_viewport_run = invalid
+    result = launcher.main([str(rig.path)], return_result=True)
+    assert result.kind == "fatal" and result.failure_kind == "metadata_invalid"
+    assert result.view_state is None and rig.calls[-1] == "close"

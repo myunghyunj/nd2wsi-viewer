@@ -25,6 +25,11 @@
     menu.dataset.role = context.role;
     menu.dataset.sessionId = context.id;
     menu.hidden = false;
+    const metalButton = doc.getElementById("open-metal-window");
+    if (metalButton && context.metal_opt_in_supported && api.open_in_metal) {
+      metalButton.hidden = false;
+      metalButton.onclick = () => doc.defaultView?.nd2OpenActiveInMetal?.();
+    }
     if (menu.dataset.wired) return context;
     menu.dataset.wired = "true";
     let opening = false;

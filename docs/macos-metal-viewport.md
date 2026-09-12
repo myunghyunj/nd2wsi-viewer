@@ -1,11 +1,20 @@
 # Native Metal viewport RC (macOS, Apple silicon)
 
-Version 2.1.0rc1 keeps the original `nd2wsi-viewer` name, bundle identity and file
-associations. Its macOS entry automatically selects native Metal for supported
-Apple-silicon hardware and compatible cached fluorescence slides. Unsupported
-input or native startup failure uses the existing standard viewer. The native
-window also opens the same slide in a separate standard window for annotations,
-measurements and export. Windows distribution remains at the existing release.
+Version 2.1.0rc2 keeps the original `nd2wsi-viewer` name, bundle identity and file
+associations. The standard viewer is the default for both User and Agent windows.
+Metal is an explicit opt-in for supported Apple-silicon hardware and compatible
+cached fluorescence slides. No valid common presentation endpoint has yet been
+established for the packaged browser/Metal comparison, so the performance gate
+is **unverified**, not passed. User windows remain standard by default even if a
+future Agent performance gate passes, until annotation/measurement/export parity.
+Windows distribution and the stable release remain unchanged.
+
+**Open in Metal** opens the current slide in a fresh same-role window, leaving
+the original window alone. **Open in Standard Viewer** exits only the current
+Metal window and opens a fresh standard process after GPU/source cleanup.
+Validated camera center/scale, channel windows, gamma, colors and visibility
+are handed over. Annotation snapshots are not merged. Native lookup never builds,
+migrates, repairs or quarantines shared caches, including invalid legacy caches.
 
 Update checks select a compatible OS/CPU asset and version channel. RC installs
 accept newer RC or final releases; stable installs do not automatically opt into
@@ -69,12 +78,44 @@ script does not install or publish. The older `build_metal_viewport.sh` remains
 an isolated developer package builder.
 
 The executable accepts a slide path, `--session-root`, and a **new** `--report`
-path. Without a source path, its own native file panel selects a slide.
+path. `--prefer-metal` requests the product Metal path, including safe fallback.
+Without a source path, its own native file panel selects a slide for that request.
 `--capture-enabled` enables diagnostic GPU capture; use this in a separate run
 from ordinary timing measurements. `--renderer browser` explicitly selects the
-standard viewer; `--renderer metal` exposes native startup errors instead of
-falling back. Automatic mode falls back for unsupported sources; native display
-itself never rebuilds or migrates a cache.
+standard viewer; `--renderer metal` is a strict diagnostic mode without automatic
+fallback. `--retry-metal` explicitly bypasses a matching persistent failure entry
+once; a successful presented frame clears it.
+
+## Failure recovery
+
+Each logical opening has an `open_attempt_id`, preserved across processes. A
+local SQLite transaction consumes fallback at most once; its child explicitly
+selects browser and carries `fallback_consumed`. Closing wins over delayed errors.
+The failed native session drains committed GPU work and closes its source before
+the new process is started. A partial-view tile error does not destroy a working
+viewport; irrecoverable first-screen tile failure does trigger recovery.
+
+Persistent GPU device/pipeline/execution failures are stored by sampled source
+fingerprint, **full** package version (including `rc2`) and canonical failure kind
+under app-owned local state. Timeouts, metadata/cache errors, 503, I/O and memory
+pressure are not persistent blocks. Changed files and new app versions are
+reevaluated. The database stores no source paths or raw driver messages; it is
+not a device-wide blacklist. If recording the once-only transition fails, no
+additional process is opened.
+
+## Packaged performance evidence
+
+`scripts/benchmark_rc2_paired.py` runs a separate warmup pair and five alternating
+pairs in the actual packaged app, on isolated input/cache copies. It retains the
+44 ordered actions, raw hit/miss counters, missing/dropped samples, per-run and
+pooled percentiles. The browser endpoint remains a stable-rAF **proxy**; Metal
+uses drawable presentation. No speedup ratio or browser input-to-present value
+is produced. Camera workload is not synonymous with actual raw-tile streaming.
+The generated summary therefore leaves the automatic default gate unverified.
+
+Diagnostic fault injection and auto-close are explicit Agent-only CLI/context
+options and do not propagate into newly opened product windows. Fault injection
+does not poison persistent GPU failure entries.
 
 ## Explicitly deferred
 

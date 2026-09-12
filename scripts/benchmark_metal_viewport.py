@@ -21,12 +21,16 @@ import argparse
 import hashlib
 import json
 import math
-import resource
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+try:
+    import resource
+except ImportError:  # Windows can still run pure report/reference helpers.
+    resource = None
 
 RUN_SCHEMA = "nd2wsi-viewport-run/1"
 CONTEXT_FIELDS = (
@@ -312,7 +316,8 @@ def serve_browser_baseline(args) -> None:
                         {
                             "counters": dict(counts),
                             **timing,
-                            "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                            "peak_rss_bytes": (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                                               if resource is not None else None),
                         }
                     )
             if path == benchmark_base + "/driver.js":
@@ -468,6 +473,10 @@ def validate_run(run: dict) -> None:
                 if _finite_nonnegative(value, key) != int(value):
                     raise ValueError(f"logical counter {key} must be an integer")
     for key, value in run.get("resources", {}).items():
+        if key == "memory_note":
+            if not isinstance(value, str):
+                raise ValueError("memory_note must describe the measured process scope")
+            continue
         if value is not None:
             _finite_nonnegative(value, key)
     for key, measurement in run.get("hardware", {}).items():

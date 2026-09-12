@@ -20,6 +20,9 @@ import numpy as np
 
 
 def parse_channels(param: str | None, n: int) -> list[int]:
+    # Explicit all-hidden handoffs must not be mistaken for omitted defaults.
+    if param == "none":
+        return []
     if not param:
         return list(range(n))
     out = []

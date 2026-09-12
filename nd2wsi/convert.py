@@ -986,9 +986,13 @@ def ensure_cache(
 
 
 def existing_cache_store(
-    slide: str | Path, selection: PlaneSelection | None = None
+    slide: str | Path, selection: PlaneSelection | None = None, *, read_only: bool = False
 ) -> Path | None:
-    """A valid, already-built store for this slide, or None. Never builds."""
+    """A valid, already-built store, or None. Never builds.
+
+    Selection/Agent callers must use ``read_only=True``: historical broken
+    directory stores are skipped without quarantine, repair or migration.
+    """
     from .cache import (
         cache_container,
         cache_matches,
@@ -1008,7 +1012,7 @@ def existing_cache_store(
         if cache_matches(container, slide, selection) and store.exists():
             return store
     if selection == PlaneSelection():
-        legacy = _legacy_store(slide)
+        legacy = _legacy_store(slide, read_only=read_only)
         if legacy is not None:
             return legacy
     return None
@@ -1044,7 +1048,7 @@ def _legacy_store_matches_source(
     return len(siblings) == 1
 
 
-def _legacy_store(slide: Path) -> Path | None:
+def _legacy_store(slide: Path, *, read_only: bool = False) -> Path | None:
     """A complete portable store found beside this source.
 
     The current suffix-aware name is checked first, followed by historical
@@ -1064,8 +1068,13 @@ def _legacy_store(slide: Path) -> Path | None:
         if not cand.exists():
             continue
         try:
-            _, attrs = open_store(cand)
+            root, attrs = open_store(cand)
+            close = getattr(root, "close", None)
+            if close is not None:
+                close()
         except (ValueError, FileNotFoundError):
+            if read_only:
+                continue
             # 0.8 converts atomically, so a store that exists but does not
             # open is a wedge from an older version, never work in progress
             try:

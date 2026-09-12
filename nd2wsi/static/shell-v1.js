@@ -13,6 +13,33 @@ let quitPreparationRequestId = "";
 const quitPreparedPanes = new Map(); // sid -> most recent full preparation id
 const pairPicker = { open: false, mode: "start", replaceSid: null };
 
+let metalOpening = false;
+window.nd2OpenActiveInMetal = async function (retry = false) {
+  if (metalOpening) return {ok:false, message:"A new window is already opening"};
+  const button = document.getElementById("open-metal-window");
+  const status = document.getElementById("window-action-status");
+  metalOpening = true;
+  if (button) button.disabled = true;
+  try {
+    const frame = frames.get(active);
+    if (!frame || !readyFrames.has(active) || !window.pywebview?.api?.open_in_metal)
+      throw new Error("Open a slide before choosing Metal");
+    const display = frame.contentWindow.nd2CaptureViewState();
+    const result = await window.pywebview.api.open_in_metal(active, display, retry === true);
+    if (!result?.ok) throw new Error(result?.message || "Window could not be opened");
+    if (status) status.textContent = "New window started; this window and its annotations are unchanged";
+    return result;
+  } catch (error) {
+    const message = `Could not open in Metal: ${error.message || error}`;
+    if (status) status.textContent = message;
+    if (typeof showError === "function") showError(message);
+    return {ok:false, message};
+  } finally {
+    metalOpening = false;
+    if (button) button.disabled = false;
+  }
+};
+
 const Align = window.nd2wsiAlign;
 const ShortcutRouter = window.Nd2ShortcutRouter;
 ShortcutRouter?.localizeLabels(document);

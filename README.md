@@ -1,7 +1,10 @@
-> **Local macOS Metal beta 2.1.0b1.** This branch experiments with exact GPU pyramid
-> reduction, not a zero-copy native display. Stable v2.0.0, its updater and Windows
-> are unchanged. Read the [review, measurements and limitations](docs/macos-metal-beta.md)
-> before using the separate beta app. Existing cached-slide rendering is unchanged.
+> **macOS v2.1 RC2.** The standard viewer remains the default. On Apple silicon,
+> **Open in Metal** offers direct GPU display for compatible cached fluorescence
+> slides, with safe recovery to the standard viewer. Multiple independent windows
+> are supported. Metal is opt-in pending a comparable performance measurement;
+> annotations, measurements and export remain in the standard viewer.
+> [Scope and limitations](docs/macos-metal-viewport.md). Stable v2.0.0 and Windows
+> downloads are unchanged. This is not disk-to-display zero-copy.
 
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>

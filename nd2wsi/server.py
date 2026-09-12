@@ -1362,7 +1362,7 @@ class SlideRegistry:
             return self.add_store(path)
         path = path.resolve()
         if path.suffix.lower() in SLIDE_SUFFIXES:
-            if is_svs(path) and existing_cache_store(path) is None:
+            if is_svs(path) and existing_cache_store(path, read_only=self.agent_window) is None:
                 try:
                     # the file already holds a pyramid, so serve it as it lies
                     return self.add_direct(path)
@@ -1375,7 +1375,7 @@ class SlideRegistry:
                     # camera fields over time: no pyramid to build, ever
                     return self.add_plate(path)
             if self.agent_window:
-                store = existing_cache_store(path)
+                store = existing_cache_store(path, read_only=True)
                 if store is None:
                     raise PermissionError("Agent windows cannot build or repair a shared cache; open an existing cache instead")
             else:
