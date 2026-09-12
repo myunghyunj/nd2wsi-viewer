@@ -2467,8 +2467,6 @@ window.addEventListener("message", (event) => {
     // a double-click on a slide's own toolbar, relayed from its frame
     if (!senderSid || !versioned) return;
     requestWindowZoom();
-  } else if (kind === "slide-trashed") {
-    if (senderSid) refresh();
   } else if (kind === "file-drag") {
     if (senderSid) zone.hidden = false;
   } else if (kind === "theme") {

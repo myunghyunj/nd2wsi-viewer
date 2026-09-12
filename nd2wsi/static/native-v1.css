@@ -94,8 +94,7 @@
 .icon-sliders,
 .icon-region,
 .icon-note,
-.icon-info,
-.icon-trash {
+.icon-info {
   position: relative;
   color: currentColor;
 }
@@ -149,28 +148,6 @@
   height: 1.2px;
   background: currentColor;
   transform: rotate(-43deg);
-}
-
-.icon-trash::before {
-  content: "";
-  position: absolute;
-  left: 3px;
-  top: 4px;
-  width: 7px;
-  height: 8px;
-  border: 1.2px solid currentColor;
-  border-top: 0;
-  border-radius: 0 0 2px 2px;
-}
-.icon-trash::after {
-  content: "";
-  position: absolute;
-  left: 2px;
-  top: 2px;
-  width: 9px;
-  height: 1.2px;
-  background: currentColor;
-  box-shadow: 2.5px -1.8px 0 -0.1px currentColor;
 }
 
 .mac-window {
@@ -231,7 +208,6 @@
   backdrop-filter: blur(24px) saturate(165%);
 }
 
-#trash-confirm,
 #ann-editor {
   border-radius: 13px;
   background: var(--material-strong);
@@ -292,8 +268,7 @@
   outline-offset: 2px;
 }
 
-#tb-theme,
-#tb-trash {
+#tb-theme {
   width: 28px;
   padding: 0;
   justify-content: center;

@@ -149,7 +149,6 @@ async function init() {
   buildWindows();
   wireSlideInspector();
   wireTheme();
-  wireTrash();
   wireDragForward();
   buildChannelPanel();
   buildLevelLamps();
@@ -3727,74 +3726,6 @@ function inkColor(a) {
     : "rgba(255,255,255," + a + ")";
 }
 
-/* ---- cache trashcan --------------------------------------------------------
-   Deletes this slide's pyramid store on disk (annotations stay). The tab
-   closes because the tiles are gone; the slide re-converts on next open. */
-
-function wireTrash() {
-  const btn = $("tb-trash");
-  const pop = $("trash-confirm");
-  if (state.info && !state.info.trashable) {
-    btn.hidden = true; // direct source or user-owned portable store
-    return;
-  }
-  const hide = () => { pop.hidden = true; };
-  btn.onclick = () => {
-    if (pop.hidden) setPlateViewMenuOpen(false);
-    pop.hidden = !pop.hidden;
-  };
-  $("trash-cancel").onclick = hide;
-  document.addEventListener("pointerdown", (ev) => {
-    if (!pop.hidden && !pop.contains(ev.target) && ev.target !== btn && !btn.contains(ev.target)) hide();
-  });
-  window.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") hide();
-  });
-  $("trash-go").onclick = () => {
-    const m = location.pathname.match(/\/s\/([0-9a-f]{8})\//);
-    if (!m) { hide(); showToast("cannot resolve slide id"); return; }
-    const go = $("trash-go");
-    const label = go.textContent;
-    go.disabled = true;
-    // a store is hundreds of thousands of small files, and on a USB disk
-    // that takes minutes, so the button carries the count while it runs
-    const job = Math.random().toString(36).slice(2, 10);
-    const timer = setInterval(() => {
-      fetch("api/roi/progress?job=" + job, { cache: "no-store" })
-        .then((r) => r.json())
-        .then((d) => {
-          if (d.state === "deleting") go.textContent = "Deleting… " + (d.pct || 0) + " %";
-        })
-        .catch(() => {});
-    }, 400);
-    const stop = () => { clearInterval(timer); go.textContent = label; };
-    fetch("../../api/trash", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sid: m[1], job }),
-    })
-      .then((r) => r.json())
-      .then((d) => {
-        stop();
-        if (d.error) throw new Error(d.error);
-        showToast("cache deleted — freed " + fmtBytes(d.freed || 0));
-        setTimeout(() => {
-          if (window.parent !== window) {
-            window.parent.postMessage({ nd2wsi: "slide-trashed" }, location.origin);
-          } else {
-            location.href = "../../";
-          }
-        }, 900);
-      })
-      .catch((e) => {
-        stop();
-        go.disabled = false;
-        hide();
-        showToast("could not delete cache: " + e.message);
-      });
-  };
-}
-
 /* ---- floating mac windows --------------------------------------------------
    Each panel is a small macOS-style window over the slide: draggable by its
    title bar, resizable from every edge and corner, with working traffic
@@ -4336,8 +4267,6 @@ function setPlateViewMenuOpen(open) {
   btn.classList.toggle("active", shown);
   btn.setAttribute("aria-expanded", String(shown));
   if (shown) {
-    const trash = $("trash-confirm");
-    if (trash) trash.hidden = true;
     positionPlateViewMenu();
     const items = [...menu.querySelectorAll("[data-plate-view]")];
     items.forEach((item, i) => { item.tabIndex = i === 0 ? 0 : -1; });
@@ -5079,7 +5008,7 @@ function renderTimeLine() {
   renderPlateAuto();
 }
 
-const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #ann-editor, #trash-confirm, #z-slider, #plate-transpose, #zoom-cluster";
+const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #ann-editor, #z-slider, #plate-transpose, #zoom-cluster";
 
 function wireNativeGestureScope() {
   let pending = false;

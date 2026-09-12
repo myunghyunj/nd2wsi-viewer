@@ -1,10 +1,11 @@
-> **macOS v2.1 RC2.** The standard viewer remains the default. On Apple silicon,
+> **macOS v2.1.1.** The unused cache-delete toolbar button has been removed.
+> The standard viewer remains the default. On Apple silicon,
 > **Open in Metal** offers direct GPU display for compatible cached fluorescence
 > slides, with safe recovery to the standard viewer. Multiple independent windows
 > are supported. Metal is opt-in pending a comparable performance measurement;
 > annotations, measurements and export remain in the standard viewer.
-> [Scope and limitations](docs/macos-metal-viewport.md). Stable v2.0.0 and Windows
-> downloads are unchanged. This is not disk-to-display zero-copy.
+> [Scope and limitations](docs/macos-metal-viewport.md). Windows remains on v2.0.0.
+> This is not disk-to-display zero-copy.
 
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
@@ -90,7 +91,7 @@ for requirements, tested behavior, and build instructions.
 
 ### macOS (Apple silicon)
 
-1. Download `nd2wsi-viewer.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. It runs on Apple silicon Macs.
+1. Download the `macos-arm64.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. It runs on Apple silicon Macs.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
 3. Drop an `.nd2` or `.svs` file onto the window, or press `+` to browse.
 
@@ -135,7 +136,7 @@ The mark at the left of the toolbar names the kind of file in two words. 2D or 3
 
 ![Six sites of a phage assay in plate mode](docs/plate-mode.png)
 
-Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, and there is nothing to stitch. The viewer opens such a file in plate mode and reads every frame straight from the ND2. The only thing it writes is a small store of reduced frames beside the file, about two percent of the ND2, which fills in the background so the series becomes instant to scrub. The status bar counts it up while it fills, and the trash button removes it. Once the store is full its frames are read into memory in the background, one chunk per time point and plane, so a scrub of z or time never waits on the drive.
+Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, and there is nothing to stitch. The viewer opens such a file in plate mode and reads every frame straight from the ND2. The only thing it writes is a small store of reduced frames beside the file, about two percent of the ND2, which fills in the background so the series becomes instant to scrub. The status bar counts it up while it fills. Once the store is full its frames are read into memory in the background, one chunk per time point and plane, so a scrub of z or time never waits on the drive.
 
 ![Scrubbing time and stepping through z planes](docs/plate-time-z.gif)
 
@@ -229,9 +230,8 @@ Portable `.ome.zarr` exports
 remain supported and are not converted or removed automatically. A tiled SVS
 normally needs no additional cache.
 
-![The dialog that removes a cache](docs/delete-cache.png)
-
-The trash-can button removes the reduced copies of the slide in front. The scan and your marks stay. The copies are simply rebuilt the next time you open the file.
+Viewing caches are retained for future opens. macOS 2.1.1 no longer exposes a
+cache-delete button in the viewer; source scans and annotations remain separate.
 
 ## Keyboard
 

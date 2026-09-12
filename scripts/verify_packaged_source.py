@@ -3,6 +3,7 @@
 import argparse
 import json
 import plistlib
+import tomllib
 from pathlib import Path
 from types import CodeType
 
@@ -41,7 +42,8 @@ def main():
             assert (args.app / "Contents/Resources" / relative).read_bytes() == source.read_bytes(), str(relative)
             assets.append(str(relative))
     info = plistlib.loads((args.app / "Contents/Info.plist").read_bytes())
-    assert info["ND2WSIPackageVersion"] == "2.1.0rc2"
+    expected_version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    assert info["ND2WSIPackageVersion"] == expected_version
     assert info["CFBundleName"] == "nd2wsi-viewer"
     assert info["CFBundleIdentifier"] == "com.nd2wsi.viewer"
     report = {"ok": True, "version": info["ND2WSIPackageVersion"], "python_modules": checked,
