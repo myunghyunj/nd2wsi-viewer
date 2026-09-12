@@ -521,15 +521,54 @@ function openPath(path) {
     });
 }
 
-function closeTab(sid) {
-  fetch("api/close", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sid }),
-  })
-    .then((response) => response.json())
-    .then((data) => data.error ? showError(data.error) : refresh())
-    .catch((error) => showError(`Close failed: ${error}`));
+let tabClosePending = false;
+
+async function closeTab(sid) {
+  if (!slides.some((slide) => slide.sid === sid)) return false;
+  if (tabClosePending || quitPreparation || quitPreparationRequestId) {
+    showError("Finish the current save or close operation before closing another tab.");
+    return false;
+  }
+  if (frames.has(sid) && !readyFrames.has(sid)) {
+    showError("This slide is still loading. Wait before closing its tab.");
+    return false;
+  }
+  const requestId = `tab-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  tabClosePending = true;
+  try {
+    const api = window.pywebview?.api;
+    if (api?.update_block_reason) {
+      const reason = await api.update_block_reason();
+      if (reason) throw new Error(reason);
+    }
+    // Removing an iframe would discard its editor, debounce and failed-save
+    // snapshots. Reuse the acknowledged flush, including older plate sites,
+    // and keep every local pane locked until the server accepts the close.
+    const prepared = await window.nd2wsiPrepareForUpdate(requestId);
+    if (!prepared?.ok) throw new Error(prepared?.error || "Annotations were not saved");
+    if (quitPreparationRequestId !== requestId) {
+      throw new Error("Close was superseded by another save operation");
+    }
+    const response = await fetch("api/close", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid }),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error || data.ok !== true) {
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    await refresh();
+    return true;
+  } catch (error) {
+    showError(`Close cancelled: ${error.message || error}`);
+    return false;
+  } finally {
+    // Also runs after conflicts, export refusal, timeout or network failure.
+    // Cancellation is request-scoped; it cannot unlock a later preparation.
+    window.nd2wsiCancelUpdate(requestId);
+    tabClosePending = false;
+  }
 }
 
 /* ---- pane messages ------------------------------------------------------- */

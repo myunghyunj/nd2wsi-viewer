@@ -46,6 +46,17 @@ button { color:inherit; font:inherit; }
 .tab .tprog span.indet { width:26%; animation:slide 1.1s ease-in-out infinite; }
 #newtab { width:30px; height:30px; padding:0; border:0; border-radius:8px; background:transparent; color:var(--label-2); font-size:18px; line-height:1; }
 #newtab:hover { background:rgba(255,255,255,.065); color:var(--label); }
+#window-menu { position:relative; flex:none; color:var(--label-2); font-size:11px; }
+#window-menu[hidden] { display:none; }
+#window-identity { padding:7px 9px; border:1px solid var(--hairline); border-radius:7px; cursor:pointer; white-space:nowrap; list-style:none; }
+#window-identity::-webkit-details-marker { display:none; }
+#window-menu[data-role="agent"] #window-identity { color:#dca8ff; border-color:rgba(191,90,242,.42); }
+:root.light #window-menu[data-role="agent"] #window-identity { color:#8536ad; }
+.window-actions { position:absolute; right:0; top:calc(100% + 7px); width:270px; padding:6px; border:1px solid var(--hairline); border-radius:10px; background:var(--control-bg); box-shadow:var(--shadow); }
+.window-actions button { display:flex; justify-content:space-between; gap:16px; width:100%; padding:9px; border:0; border-radius:6px; text-align:left; background:transparent; }
+.window-actions button:hover:not(:disabled) { background:rgba(10,132,255,.16); }
+.window-actions kbd { color:var(--label-3); font:inherit; }
+#window-action-status { display:block; padding:3px 9px; font-size:10px; white-space:normal; }
 :root.light #newtab:hover { background:rgba(0,0,0,.05); }
 .shell-icon-button { display:flex; align-items:center; justify-content:center; width:34px; height:30px; padding:0; border:0; border-radius:8px; background:transparent; color:var(--label-2); }
 .shell-icon-button:hover:not(:disabled) { background:rgba(255,255,255,.065); color:var(--label); }

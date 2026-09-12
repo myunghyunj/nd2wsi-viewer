@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-APP_NAME = "nd2wsi-viewer"
+APP_NAME = os.environ.get("ND2WSI_APP_NAME", "nd2wsi-viewer") if sys.platform == "darwin" else "nd2wsi-viewer"
 RELEASES_URL = "https://github.com/myunghyunj/nd2wsi-viewer/releases/latest"
 _UPDATER_HANDLE = None
 _UPDATER_COORDINATOR = None
@@ -485,13 +485,20 @@ def _server_url(httpd) -> str:
     return server_url(httpd)
 
 
-def start_server(store: Path):
+def start_server(store: Path | list[Path], window_session=None):
     """Serve the store on an ephemeral localhost port; returns (httpd, url)."""
     from .server import create_server, server_url
 
-    httpd = create_server(store, host="127.0.0.1", port=0)
+    kwargs = {"window_session": window_session} if window_session is not None else {}
+    httpd = create_server(store, host="127.0.0.1", port=0, **kwargs)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd, server_url(httpd)
+    url = server_url(httpd)
+    if window_session is not None:
+        try:
+            window_session.record_endpoint(url)
+        except Exception as exc:
+            _dlog(f"window endpoint record failed: {exc!r}")
+    return httpd, url
 
 
 class UpdateShutdownCoordinator:
@@ -600,7 +607,7 @@ class UpdateShutdownCoordinator:
         script = (
             "typeof window.nd2wsiPrepareForUpdate === 'function' "
             f"? window.nd2wsiPrepareForUpdate({request}) "
-            ": Promise.resolve({ok:true, panes:0})"
+            f": Promise.resolve({self._missing_flush_result()})"
         )
         answered = threading.Event()
         results = []
@@ -618,9 +625,12 @@ class UpdateShutdownCoordinator:
         while not answered.is_set():
             if cancelled.wait(min(0.05, max(0, deadline - time.monotonic()))):
                 return None
-            if time.monotonic() >= deadline:
+            if not answered.is_set() and time.monotonic() >= deadline:
                 return {"ok": False, "error": "the viewer did not confirm its saved state"}
         return results[0]
+
+    def _missing_flush_result(self) -> str:
+        return "{ok:true, panes:0}"
 
     def _prepare_worker(self, request_id, cancelled, completion, failure) -> None:
         completed = threading.Event()
@@ -701,9 +711,159 @@ class UpdateShutdownCoordinator:
         return self._is_current(request_id, cancelled)
 
 
+class WindowCloseCoordinator(UpdateShutdownCoordinator):
+    """Veto native close until this window confirms saved annotations.
+
+    Cocoa invokes closing on its main thread; no browser call can block there.
+    The existing save protocol freezes editing while a worker awaits acknowledg-
+    ments and active exports. Failure restores editing and leaves the window open.
+    """
+
+    _DRAIN_TIMEOUT = 30.0
+
+    def __init__(self, api, window):
+        super().__init__(api, window)
+        self._approved = False
+
+    def on_closing(self) -> bool:
+        with self._lock:
+            if self._approved:
+                return True
+            if self._running:
+                return False
+            self._running = True
+            request_id = self._request_id = uuid.uuid4().hex
+            cancelled = self._cancelled = threading.Event()
+            self._wire_request_id = ""
+            self._teardown_started = False
+        try:
+            threading.Thread(target=self._close_worker, args=(request_id, cancelled),
+                             name="window-safe-close", daemon=True).start()
+        except Exception as exc:
+            self._finish_request(request_id)
+            self.api._status = f"Window remains open: could not begin saving ({exc})."
+            _dlog(self.api._status)
+        return False
+
+    def _missing_flush_result(self) -> str:
+        server = self.api._httpd
+        slides = getattr(getattr(server, "registry", None), "slides", None)
+        if self.api._frac < 0 and (server is None or slides is not None and not slides):
+            return "{ok:true, panes:0}"
+        return "{ok:false, error:'the viewer is not ready to confirm saved annotations'}"
+
+    def _close_worker(self, request_id, cancelled) -> None:
+        closing = threading.Event()
+        failures = []
+        try:
+            result = self._flush_panes(request_id, cancelled)
+            if not self._is_current(request_id, cancelled):
+                return
+            if not isinstance(result, dict) or not result.get("ok"):
+                reason = result.get("error") if isinstance(result, dict) else None
+                raise RuntimeError(reason or "annotations were not confirmed saved")
+            deadline = time.monotonic() + self._DRAIN_TIMEOUT
+            while self._is_current(request_id, cancelled):
+                reason = self.api.update_block_reason()
+                if reason is None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(reason + " Close was cancelled; try again when it finishes.")
+                if cancelled.wait(min(self._DRAIN_POLL, max(0, deadline - time.monotonic()))):
+                    return
+            if not self._is_current(request_id, cancelled):
+                return
+            from Foundation import NSOperationQueue
+
+            def finish():
+                if not self._is_current(request_id, cancelled):
+                    closing.set()
+                    return
+                try:
+                    with self._lock:
+                        self._approved = True
+                    self.window.destroy()
+                except Exception as exc:
+                    with self._lock:
+                        self._approved = False
+                    failures.append(exc)
+                finally:
+                    closing.set()
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(finish)
+            while not closing.wait(0.05):
+                if cancelled.is_set():
+                    return
+            if failures:
+                raise failures[0]
+        except Exception as exc:
+            message = f"Window remains open: {exc}"
+            self.api._status = message
+            _dlog(message)
+            self._notice(message)
+        finally:
+            if not self._approved:
+                self._recover_browser(request_id)
+            self._finish_request(request_id)
+
+
+def _install_window_menu(api: Api, window) -> None:
+    """Add native shortcuts after pywebview creates the application's menu."""
+    if sys.platform != "darwin" or getattr(api, "_window_menu_target", None) is not None:
+        return
+    try:
+        import AppKit
+        from Foundation import NSOperationQueue
+
+        def install():
+            try:
+                if getattr(api, "_window_menu_target", None) is not None:
+                    return
+                # NSMenuItem does not retain its target; keep it on this Api.
+                class ND2WSIWindowMenuTarget(AppKit.NSObject):
+                    def newUserWindow_(self, _sender):
+                        result = api.new_window("user")
+                        if not result.get("ok"):
+                            api._status = result.get("message", "Could not open a window.")
+
+                    def newAgentWindow_(self, _sender):
+                        result = api.new_window("agent")
+                        if not result.get("ok"):
+                            api._status = result.get("message", "Could not open an Agent window.")
+
+                target = ND2WSIWindowMenuTarget.alloc().init()
+                main_menu = AppKit.NSApplication.sharedApplication().mainMenu()
+                if main_menu is None:
+                    raise RuntimeError("native menu is not ready")
+                file_item = main_menu.itemWithTitle_("File")
+                if file_item is None:
+                    file_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("File", None, "")
+                    file_item.setSubmenu_(AppKit.NSMenu.alloc().initWithTitle_("File"))
+                    main_menu.insertItem_atIndex_(file_item, min(1, main_menu.numberOfItems()))
+                file_menu = file_item.submenu()
+                command = AppKit.NSEventModifierFlagCommand
+                shift = AppKit.NSEventModifierFlagShift
+                for title, action, modifiers in (
+                    ("New Window", "newUserWindow:", command),
+                    ("New Agent Window", "newAgentWindow:", command | shift),
+                ):
+                    item = file_menu.addItemWithTitle_action_keyEquivalent_(title, action, "n")
+                    item.setKeyEquivalentModifierMask_(modifiers)
+                    item.setTarget_(target)
+                api._window_menu_target = target
+            except Exception as exc:
+                _dlog(f"window menu install failed: {exc!r}")
+
+        NSOperationQueue.mainQueue().addOperationWithBlock_(install)
+    except Exception as exc:
+        _dlog(f"window menu setup failed: {exc!r}")
+
+
 def _install_app_updater(api: Api, window) -> None:
     global _UPDATER_COORDINATOR, _UPDATER_HANDLE
     if sys.platform != "darwin":
+        return
+    if getattr(api, "_updates_disabled", False):
         return
     if _UPDATER_COORDINATOR is not None:
         return
@@ -735,19 +895,37 @@ def _install_app_updater(api: Api, window) -> None:
 class Api:
     """Bridge exposed to the bootstrap page."""
 
-    def __init__(self, initial: Path | None, native_gesture_scopes=None):
+    def __init__(self, initial: Path | None, native_gesture_scopes=None, window_session=None):
         self._initial = initial
         self._status = ""
         self._frac = -1.0  # conversion progress, -1 = not converting
         self._httpd = None
         self._updater = None
         self._startup_error = None
+        self._window_session = window_session
+        self._updates_disabled = sys.platform == "darwin" and (
+            window_session is not None or os.environ.get("ND2WSI_WINDOW_CHILD") == "1"
+        )
         self._server_lock = threading.Lock()
         if native_gesture_scopes is None:
             from .native_gestures import NativeGestureScopeCache
 
             native_gesture_scopes = NativeGestureScopeCache()
         self._native_gesture_scopes = native_gesture_scopes
+
+    def new_window(self, role: str = "agent") -> dict:
+        """Automation defaults to a separate Agent process, never the User window."""
+        from .window_launch import launch_window
+
+        return launch_window(role, app_name=APP_NAME)
+
+    def window_context(self) -> dict:
+        """Identify this window before automation reads or changes viewer state."""
+        if self._window_session is None:
+            return {"enabled": False, "role": "user", "id": None,
+                    "agent_directive": "Use an isolated macOS Agent window for automation."}
+        return {**self._window_session.as_dict(), "enabled": True, "pid": os.getpid(),
+                "new_window_default_role": "agent"}
 
     def pending(self) -> bool:
         return self._initial is not None
@@ -782,6 +960,9 @@ class Api:
         except Exception:
             current = "development"
         manual = sys.platform == "win32"
+        if self._updates_disabled:
+            return {"available": False, "version": current, "mode": "disabled-multiwindow",
+                    "message": "Automatic updates are disabled in this multiwindow beta. Close every window before replacing the app manually."}
         return {
             "available": manual or self._updater is not None,
             "version": current,
@@ -790,6 +971,8 @@ class Api:
 
     def check_for_updates(self) -> dict:
         """Open Windows release downloads or the macOS Sparkle update window."""
+        if self._updates_disabled:
+            return {"ok": False, "message": self.update_status()["message"]}
         if sys.platform == "win32":
             import webbrowser
 
@@ -933,6 +1116,27 @@ class Api:
         NSOperationQueue.mainQueue().addOperationWithBlock_(act)
         return action
 
+    def _open_registered(self, path: Path, note, frac) -> str:
+        if self._window_session is not None and self._window_session.role == "agent":
+            # Do not call open_or_convert/ensure_cache before the registry can
+            # apply Agent policy. Existing ND2 caches, native SVS and plates
+            # are opened read-only; missing/shared-cache repair is refused.
+            note("opening in isolated Agent window")
+            with self._server_lock:
+                if self._httpd is None:
+                    self._httpd, _ = start_server([], window_session=self._window_session)
+                self._httpd.registry.open_path(path, on_progress=frac)
+                return _server_url(self._httpd)
+        store = open_or_convert(path, on_status=note, on_progress=frac)
+        with self._server_lock:
+            if self._httpd is None:
+                kwargs = {"window_session": self._window_session} if self._window_session is not None else {}
+                self._httpd, url = start_server(store, **kwargs)
+            else:
+                self._httpd.registry.add_store(store)
+                url = _server_url(self._httpd)
+        return url
+
     def _launch_many(self, paths):
         url = None
         n = len(paths)
@@ -948,15 +1152,9 @@ class Api:
             _dlog(f"open {p}")
             try:
                 self._frac = 0.0  # bar up while the file opens, before ticks
-                store = open_or_convert(p, on_status=note, on_progress=frac)
                 # a plate file skips conversion; the bar stays up while the
                 # registry opens it, which reads a few frames for its window
-                with self._server_lock:
-                    if self._httpd is None:
-                        self._httpd, url = start_server(store)
-                    else:
-                        self._httpd.registry.add_store(store)
-                        url = _server_url(self._httpd)
+                url = self._open_registered(p, note, frac)
                 self._frac = -1.0
             except Exception as e:
                 self._frac = -1.0
@@ -974,14 +1172,8 @@ class Api:
                 self._frac = f
 
             self._frac = 0.0  # bar up while the file opens, before ticks
-            store = open_or_convert(path, on_status=note, on_progress=frac)
+            url = self._open_registered(path, note, frac)
             self._status = "starting viewer …"
-            with self._server_lock:
-                if self._httpd is None:
-                    self._httpd, url = start_server(store)
-                else:
-                    self._httpd.registry.add_store(store)
-                    url = _server_url(self._httpd)
             self._frac = -1.0
             return url  # the tab shell at / lists every open slide
         except Exception as e:  # surfaced in the bootstrap page
@@ -1066,6 +1258,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--smoke", action="store_true", help="headless self-test")
     ap.add_argument("--gui-smoke", action="store_true", help="open, verify and close the native window")
     ap.add_argument("--smoke-report", type=Path, help="write the native GUI self-test result as JSON")
+    role_args = ap.add_mutually_exclusive_group()
+    role_args.add_argument("--new-window", action="store_true", help="open a fresh macOS User window")
+    role_args.add_argument("--agent-window", action="store_true", help="open an isolated macOS Agent window")
     args, _ = ap.parse_known_args(argv)  # tolerate Finder's -psn_* args
 
     initial = Path(args.nd2).expanduser() if args.nd2 else None
@@ -1085,9 +1280,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     api = None
+    window_session = None
     try:
-        api, window = create_app_window(initial)
+        if sys.platform == "darwin":
+            from .window_sessions import create_window_session
+
+            window_session = create_window_session("agent" if args.agent_window else "user")
+            api, window = create_app_window(initial, window_session=window_session)
+        else:
+            api, window = create_app_window(initial)
         kwargs = {"gui": "edgechromium"} if sys.platform == "win32" else {}
+        if sys.platform == "darwin":
+            kwargs["private_mode"] = True
         if args.gui_smoke:
             webview.start(lambda: gui_smoke(api, window, expect_slide=initial is not None), **kwargs)
         else:
@@ -1102,8 +1306,15 @@ def main(argv: list[str] | None = None) -> int:
         report = {"ok": False, "error": message, "platform": sys.platform}
         result = 4
     finally:
-        if api is not None:
-            api.stop_server_for_update()
+        try:
+            if api is not None:
+                api.stop_server_for_update()
+        finally:
+            if window_session is not None:
+                try:
+                    window_session.mark_closed()
+                except Exception as exc:
+                    _dlog(f"window session close record failed: {exc!r}")
     if args.gui_smoke:
         print(json.dumps(report, ensure_ascii=False))
         if args.smoke_report:
@@ -1112,7 +1323,7 @@ def main(argv: list[str] | None = None) -> int:
     return result
 
 
-def create_app_window(initial: Path | None):
+def create_app_window(initial: Path | None, window_session=None):
     """The app window and its bridge, ready for ``webview.start``."""
     import time
 
@@ -1126,9 +1337,16 @@ def create_app_window(initial: Path | None):
         webview.settings["ALLOW_DOWNLOADS"] = True  # ROI exports save natively
     except (AttributeError, TypeError, KeyError):
         pass
-    api = Api(initial)
+    if sys.platform == "darwin" and window_session is None:
+        from .window_sessions import create_window_session
+
+        window_session = create_window_session("user")
+    api = Api(initial, window_session=window_session)
+    title = APP_NAME
+    if window_session is not None:
+        title += f" — {window_session.role.title()} · {window_session.id}"
     window = webview.create_window(
-        APP_NAME,
+        title,
         html=BOOT_HTML,
         js_api=api,
         width=1280,
@@ -1158,7 +1376,12 @@ def create_app_window(initial: Path | None):
     if sys.platform == "darwin":
         _inline_traffic_lights(window)
         _install_open_files_handler()
-        window.events.shown += lambda: _install_app_updater(api, window)
+        window.events.shown += lambda: _install_window_menu(api, window)
+        api._close_coordinator = WindowCloseCoordinator(api, window)
+        window.events.closing += api._close_coordinator.on_closing
+        window.events.closed += api._close_coordinator.cancel_preparation
+        if not api._updates_disabled:
+            window.events.shown += lambda: _install_app_updater(api, window)
     elif sys.platform == "win32":
         def require_webview2(renderer):
             # pywebview can silently fall back to legacy MSHTML even when

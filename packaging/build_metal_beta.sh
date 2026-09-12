@@ -26,8 +26,8 @@ APP="$STAGE/dist/$NAME.app"
 import plistlib, sys
 path = sys.argv[1]
 with open(path, 'rb') as f: info = plistlib.load(f)
-info.update(CFBundleShortVersionString='2.1.0', CFBundleVersion='2.1.0b1',
-            ND2WSIPackageVersion='2.1.0b1', LSMinimumSystemVersion='11.0',
+info.update(CFBundleShortVersionString='2.1.0', CFBundleVersion='2.1.0b2',
+            ND2WSIPackageVersion='2.1.0b2', LSMinimumSystemVersion='11.0',
             CFBundleDisplayName='nd2wsi-viewer Metal Beta')
 for key in ('CFBundleDocumentTypes', 'UTExportedTypeDeclarations',
             'UTImportedTypeDeclarations', 'SUFeedURL', 'SUPublicEDKey'):
@@ -41,10 +41,10 @@ PY
 mkdir -p "$STAGE/dmgroot"
 ditto --norsrc --noextattr --noqtn "$APP" "$STAGE/dmgroot/$NAME.app"
 hdiutil create -volname "$NAME" -srcfolder "$STAGE/dmgroot" -format UDZO \
-  "$STAGE/nd2wsi-viewer-2.1.0b1-metal-macos.dmg"
-hdiutil verify "$STAGE/nd2wsi-viewer-2.1.0b1-metal-macos.dmg"
+  "$STAGE/nd2wsi-viewer-2.1.0b2-metal-macos.dmg"
+hdiutil verify "$STAGE/nd2wsi-viewer-2.1.0b2-metal-macos.dmg"
 mkdir "$OUT"
 ditto --norsrc --noextattr --noqtn "$APP" "$OUT/$NAME.app"
-cp "$STAGE/nd2wsi-viewer-2.1.0b1-metal-macos.dmg" "$OUT/"
+cp "$STAGE/nd2wsi-viewer-2.1.0b2-metal-macos.dmg" "$OUT/"
 codesign --verify --deep --strict "$OUT/$NAME.app"
 echo "Local beta ready: $OUT; stable app, associations, updater and Windows untouched"

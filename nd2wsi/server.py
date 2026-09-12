@@ -829,7 +829,10 @@ def _legacy_sidecar_matches(path: Path, source_name: str, home: Path) -> bool:
     return len(siblings) <= 1
 
 
-def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
+def annotations_sidecar(
+    store_path: str | Path, attrs: dict[str, Any], *,
+    migrate: bool = True, legacy_paths: list[Path] | None = None,
+) -> Path:
     """Return a sidecar path scoped to the source file and selected plane.
 
     An annotation belongs to one level-0 coordinate space. T, P, and Z are
@@ -881,7 +884,8 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
     filename += ".json"
 
     target_dir = home / MANAGED_DIR / ANNOTATIONS_DIR
-    target_dir.mkdir(parents=True, exist_ok=True)
+    if migrate:
+        target_dir.mkdir(parents=True, exist_ok=True)
     new = target_dir / filename
 
     if not new.exists():
@@ -905,6 +909,10 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
                 if note not in meta.setdefault("notes", []):
                     meta["notes"].append(note)
                 continue
+            if not migrate:
+                if legacy_paths is not None:
+                    legacy_paths.append(old)
+                break
             # the default plane inherits the unscoped file outright; any
             # other selection takes a copy, because one unscoped sidecar
             # used to serve every plane and the rest must keep finding it
@@ -924,7 +932,9 @@ def annotations_sidecar(store_path: str | Path, attrs: dict[str, Any]) -> Path:
     return new
 
 
-def plate_annotations_sidecar(path: str | Path, attrs: dict[str, Any], p: int) -> Path:
+def plate_annotations_sidecar(
+    path: str | Path, attrs: dict[str, Any], p: int, *, create_directory: bool = True,
+) -> Path:
     """The sidecar for one site of a plate file, beside the slide.
 
     Annotations on a plate are per site and shared across time and z, so
@@ -936,17 +946,42 @@ def plate_annotations_sidecar(path: str | Path, attrs: dict[str, Any], p: int) -
     source_name = Path(attrs["nd2wsi"]["source"]).name or path.name
     safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", source_name)
     target_dir = path.parent / MANAGED_DIR / ANNOTATIONS_DIR
-    target_dir.mkdir(parents=True, exist_ok=True)
+    if create_directory:
+        target_dir.mkdir(parents=True, exist_ok=True)
     return target_dir / f"annotations_{safe_source}--site{int(p)}.json"
 
 
 class SlideRegistry:
     """The set of slides this server has open, keyed by a stable short id."""
 
-    def __init__(self, max_render_mpx: float = 400.0):
+    def __init__(self, max_render_mpx: float = 400.0, *, window_session=None):
         self.slides: dict[str, ViewerState] = {}  # insertion-ordered
         self.max_render_mpx = max_render_mpx
         self._lock = threading.Lock()
+        self.window_session = window_session
+        self.annotation_workspace = None
+        if window_session is not None:
+            from .annotation_workspace import AnnotationWorkspace
+            self.annotation_workspace = AnnotationWorkspace(window_session)
+
+    @property
+    def agent_window(self) -> bool:
+        return self.window_session is not None and self.window_session.role == "agent"
+
+    def annotation_path(self, path: Path, attrs: dict, *, site: int | None = None) -> Path:
+        if self.annotation_workspace is None:
+            return (annotations_sidecar(path, attrs) if site is None
+                    else plate_annotations_sidecar(path, attrs, site))
+        from .annotation_workspace import annotation_lock
+        legacy: list[Path] = []
+        canonical = (annotations_sidecar(path, attrs, migrate=False, legacy_paths=legacy)
+                     if site is None else plate_annotations_sidecar(path, attrs, site, create_directory=False))
+        if self.agent_window:
+            return self.annotation_workspace.snapshot(canonical, source=legacy[0] if legacy else None)
+        # Legacy migration is a write too; new user-window servers serialize it.
+        with annotation_lock(canonical):
+            return (annotations_sidecar(path, attrs) if site is None
+                    else plate_annotations_sidecar(path, attrs, site))
 
     @staticmethod
     def sid_for(store_path: Path) -> str:
@@ -1002,6 +1037,8 @@ class SlideRegistry:
             try:
                 return self.add_direct(slide_path)
             except NotImplementedError:
+                if self.agent_window:
+                    raise PermissionError("Agent windows cannot build a shared cache; open an existing cache instead")
                 from .convert import convert as _convert
                 from .convert import default_store_path as _dsp
 
@@ -1052,7 +1089,7 @@ class SlideRegistry:
                     root,
                     attrs,
                     max_render_mpx=self.max_render_mpx,
-                    annotations_path=annotations_sidecar(store_path, attrs),
+                    annotations_path=self.annotation_path(store_path, attrs),
                     generation=gen,
                     trash_path=Path(trash_path) if trash_path is not None else None,
                     source_path=registered_source,
@@ -1140,7 +1177,7 @@ class SlideRegistry:
                     f"{reason}; showing the stored overview at half resolution"
                 ]
             try:
-                annotations = None if degraded else annotations_sidecar(store_path, attrs)
+                annotations = None if degraded else self.annotation_path(store_path, attrs)
             except BaseException:
                 close = getattr(root, "close", None)
                 if close is not None:
@@ -1220,7 +1257,7 @@ class SlideRegistry:
                 root,
                 attrs,
                 max_render_mpx=self.max_render_mpx,
-                annotations_path=annotations_sidecar(slide_path, attrs),
+                annotations_path=self.annotation_path(slide_path, attrs),
                 generation=gen,
                 source_path=slide_path,
                 manifest={"source": fingerprint},
@@ -1265,10 +1302,9 @@ class SlideRegistry:
             # registry fingerprint and that internally consistent open.
             source = None
             for _ in range(2):
-                candidate = (
+                candidate = (PlateSource(slide_path, store=False) if self.agent_window else
                     PlateSource(slide_path, cache_path=cache_path)
-                    if cache_path is not None else PlateSource(slide_path)
-                )
+                    if cache_path is not None else PlateSource(slide_path))
                 try:
                     current = quick_fingerprint(slide_path)
                 except BaseException:
@@ -1292,7 +1328,7 @@ class SlideRegistry:
                 root = _Root(
                     source.root_for(0, 0, source.z_home), closer=source.close
                 )
-                annotations = plate_annotations_sidecar(slide_path, source.attrs, 0)
+                annotations = self.annotation_path(slide_path, source.attrs, site=0)
             except BaseException:
                 source.close()
                 raise
@@ -1338,7 +1374,12 @@ class SlideRegistry:
                 if is_plate_file(path):
                     # camera fields over time: no pyramid to build, ever
                     return self.add_plate(path)
-            store = ensure_cache(path, on_progress=on_progress)
+            if self.agent_window:
+                store = existing_cache_store(path)
+                if store is None:
+                    raise PermissionError("Agent windows cannot build or repair a shared cache; open an existing cache instead")
+            else:
+                store = ensure_cache(path, on_progress=on_progress)
         elif path.is_dir():  # a user-supplied *.ome.zarr store
             return self.add_store(path)
         else:
@@ -1349,6 +1390,13 @@ class SlideRegistry:
 
     def remove(self, sid: str) -> bool:
         with self._lock:
+            st = self.slides.get(sid)
+            if st is not None and self.window_session is not None:
+                # Atomically bar export admission; a separate active check
+                # would race an already-resolved HTTP export request.
+                if not st.busy.close(timeout=0):
+                    st.busy.reopen()
+                    raise ValueError("An export from this slide is still running; close it after the export finishes")
             st = self.slides.pop(sid, None)
         _close_state(st)
         return st is not None
@@ -1414,6 +1462,8 @@ class SlideRegistry:
         hundreds of thousands of small files, so the caller gets a fraction
         as the files go.
         """
+        if self.window_session is not None:
+            raise PermissionError("Shared cache removal is unavailable in multiwindow mode; another window may still be reading it")
         import os
 
         from .cache import (
@@ -1982,6 +2032,8 @@ def make_handler(
             return self._json({"sid": sid, "slides": registry.listing()})
 
         def _trash(self):
+            if registry.window_session is not None:
+                return self._error(403, "Shared cache removal is unavailable in multiwindow mode; another window may still be reading it")
             try:
                 data = self._body_json(limit=10_000)
             except (ValueError, json.JSONDecodeError) as e:
@@ -2015,8 +2067,11 @@ def make_handler(
             except (ValueError, json.JSONDecodeError) as e:
                 return self._error(400, str(e))
             sid = data.get("sid") if isinstance(data, dict) else None
-            if not sid or not registry.remove(sid):
-                return self._error(404, f"no open slide {sid}")
+            try:
+                if not sid or not registry.remove(sid):
+                    return self._error(404, f"no open slide {sid}")
+            except ValueError as e:
+                return self._error(409, str(e))
             return self._json({"ok": True, "slides": registry.listing()})
 
         # ---- per-slide endpoints -----------------------------------------
@@ -2025,6 +2080,7 @@ def make_handler(
             lv0 = meta["levels"][0]
             return {
                 "name": meta["source"],
+                **({"window": registry.window_session.as_dict()} if registry.window_session is not None else {}),
                 "width": lv0["width"],
                 "height": lv0["height"],
                 "tileSize": meta["tile"],
@@ -2046,7 +2102,7 @@ def make_handler(
                 "maxRenderMpx": st.max_render_mpx,
                 "nd2Export": _limnd2_available(),
                 "direct": bool(meta.get("direct")),
-                "trashable": st.trash_path is not None,
+                "trashable": st.trash_path is not None and registry.window_session is None,
                 "generation": st.generation,
                 "storage": _storage_mode(meta),
                 "kind": "plate" if meta.get("plate") else "slide",
@@ -2182,7 +2238,7 @@ def make_handler(
                 raise ValueError(f"p={p} out of range (0..{st.plate.P - 1})")
             if st.source_path is None:
                 return None, p
-            return plate_annotations_sidecar(st.source_path, st.attrs, p), p
+            return registry.annotation_path(st.source_path, st.attrs, site=p), p
 
         def _annotations_get(self, st: ViewerState, q: dict | None = None):
             try:
@@ -2191,6 +2247,13 @@ def make_handler(
                 return self._error(400, str(e))
             if p is None:
                 return self._json({"items": [], "path": None})
+            if registry.annotation_workspace is not None:
+                try:
+                    document, rev = registry.annotation_workspace.read(p)
+                    return self._json({"items": document.get("items", []), "path": str(p),
+                                       "revision": rev, "window": registry.window_session.as_dict()})
+                except (ValueError, UnicodeError, OSError, TimeoutError) as e:
+                    return self._error(500, f"could not read {p.name}: {e}")
             if p.exists():
                 try:
                     data = json.loads(p.read_text(encoding="utf-8"))
@@ -2244,6 +2307,18 @@ def make_handler(
                 payload["selection"] = {"p": site}
                 sites = (meta.get("plate") or {}).get("sites") or []
                 payload["site"] = sites[site]["name"] if site < len(sites) else None
+            if registry.annotation_workspace is not None:
+                from .annotation_workspace import AnnotationConflict
+                try:
+                    rev = registry.annotation_workspace.write(p, payload, data.get("expected_revision"), source_path=st.source_path)
+                except AnnotationConflict as e:
+                    return self._json({"ok": False, "error": str(e), "conflict": True,
+                                       "current_revision": e.current_revision,
+                                       "draft_path": str(e.draft_path) if e.draft_path else None,
+                                       "draft_error": e.draft_error}, code=409)
+                except (ValueError, UnicodeError, OSError, TimeoutError) as e:
+                    return self._error(500, f"could not save {p.name}: {e}")
+                return self._json({"ok": True, "path": str(p), "count": len(data["items"]), "revision": rev})
             # unique temp + per-slide lock: two tabs saving at once cannot
             # interleave through one shared temp name
             with st.lock:
@@ -2384,6 +2459,8 @@ def make_handler(
                 root = st.plate.root_for(*frame)
                 stem += "_t{}_p{}_z{}".format(*frame)
             fname = f"{stem}_L{level}_x{x}_y{y}_{w}x{h}"
+            if registry.agent_window:
+                fname = f"agent-{registry.window_session.id[:12]}_{fname}"
 
             if fmt in ("nd2", "tif", "tiff"):
                 # write through an on-disk temp file so RAM stays bounded for
@@ -2472,6 +2549,7 @@ def create_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     max_render_mpx: float = 400.0,
+    window_session=None,
 ) -> ThreadingHTTPServer:
     """Build the viewer HTTP server without running it (port 0 = ephemeral).
 
@@ -2495,7 +2573,7 @@ def create_server(
 
     if isinstance(store_paths, (str, Path)):
         store_paths = [store_paths]
-    registry = SlideRegistry(max_render_mpx=max_render_mpx)
+    registry = SlideRegistry(max_render_mpx=max_render_mpx, window_session=window_session)
     for p in store_paths:
         registry.add_store(p)
     token = secrets.token_urlsafe(16)

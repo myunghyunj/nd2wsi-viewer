@@ -27,6 +27,8 @@ const state = {
   plate: null, // {t, z, focus, playing, fps, k, ...} for a time series of sites
   annDirty: false, // an edit is waiting for the debounced save
   annRevision: 0,
+  annServerRevision: null, // opaque file revision, separate from local edit counter
+  annServerRevisions: new Map(), // URL -> revision from our GET/committed save only
   annContext: 0, // changes when a plate switches to another site's sidecar
   annSaveTail: Promise.resolve(),
   annFailedSaves: new Map(), // URL -> latest captured payload that still needs retry
@@ -1674,9 +1676,13 @@ function annotationsUrl(site) {
 function annotationSaveEntry(site) {
   const url = annotationsUrl(site);
   if (!url) return null;
+  const payload = { items: state.annotations };
+  if (typeof state.annServerRevision === "string") {
+    payload.expected_revision = state.annServerRevision;
+  }
   return {
     url,
-    body: JSON.stringify({ items: state.annotations }),
+    body: JSON.stringify(payload),
     revision: state.annRevision,
     context: state.annContext,
   };
@@ -1688,13 +1694,34 @@ function queueAnnotationSave(entry) {
   }
   const run = state.annSaveTail.then(async () => {
     try {
+      // A newer local snapshot may have queued behind our own successful
+      // save. Advance only from this window's committed revision, never a
+      // revision reported by a conflicting writer.
+      const payload = JSON.parse(entry.body);
+      const revisions = state.annServerRevisions || (state.annServerRevisions = new Map());
+      if (typeof payload.expected_revision === "string" && revisions.has(entry.url)) {
+        payload.expected_revision = revisions.get(entry.url);
+      }
+      entry.body = JSON.stringify(payload);
       const response = await fetch(entry.url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: entry.body,
       });
+      if (response.status === 409) {
+        let conflict = {};
+        try { conflict = await response.json(); } catch (_) { /* keep local draft */ }
+        entry.conflict = true;
+        entry.draftPath = conflict.draft_path || null;
+        throw new Error("Conflict: another window changed this sidecar. Your edits remain unsaved; no overwrite or merge." +
+          (entry.draftPath ? " Recovery draft: " + entry.draftPath : " Keep this window open and export your annotations."));
+      }
       if (!response.ok) throw new Error("HTTP " + response.status);
       const data = await response.json();
+      if (typeof data.revision === "string") {
+        revisions.set(entry.url, data.revision);
+        if (state.annContext === entry.context) state.annServerRevision = data.revision;
+      }
       const failed = state.annFailedSaves.get(entry.url);
       if (!failed || failed.revision <= entry.revision) {
         state.annFailedSaves.delete(entry.url);
@@ -1712,6 +1739,7 @@ function queueAnnotationSave(entry) {
         state.annFailedSaves.set(entry.url, entry);
       }
       if (state.annContext === entry.context) {
+        state.annDirty = true;
         setAnnStatus("Save failed: " + error.message);
       }
       return { ok: false, error: error.message };
@@ -1806,6 +1834,7 @@ function loadAnnotations(site) {
   state.annSite = Number.isInteger(targetSite) ? targetSite : null;
   state.annReady = false;
   state.annPath = null;
+  state.annServerRevision = null;
   state.annotations = [];
   state.editingId = null;
   $("ann-editor").hidden = true;
@@ -1834,7 +1863,7 @@ function loadAnnotations(site) {
       // or update preparation will retry this exact recovered snapshot.
       const captured = JSON.parse(failed.body);
       if (captured && Array.isArray(captured.items)) {
-        return { data: captured, recovered: true };
+        return { data: captured, recovered: true, conflict: !!failed.conflict, draftPath: failed.draftPath };
       }
     }
     return fetch(url).then((r) => r.ok
@@ -1843,18 +1872,24 @@ function loadAnnotations(site) {
   })
     .then((result) => {
       if (result === null || !stillCurrent() || revision !== state.annRevision) return;
-      const { data: d, recovered } = result;
+      const { data: d, recovered, conflict, draftPath } = result;
       state.annotations = Array.isArray(d.items) ? d.items : [];
       state.annPath = recovered ? null : d.path;
       state.annReady = true;
       state.annDirty = recovered;
+      const rev = recovered ? d.expected_revision : d.revision;
+      state.annServerRevision = typeof rev === "string" ? rev : null;
+      const revisions = state.annServerRevisions || (state.annServerRevisions = new Map());
+      if (!recovered && typeof rev === "string") revisions.set(url, rev);
       // a skipped legacy-sidecar import must not be silent: the server
       // leaves a note explaining why old annotations are not shown here
       const skipped = ((state.info && state.info.notes) || []).find((n) =>
         n.includes("annotation sidecar")
       );
       setAnnStatus(
-        recovered
+        conflict
+          ? "Conflict: unsaved annotations recovered; no overwrite or merge." + (draftPath ? " Recovery draft: " + draftPath : " Export these annotations before closing.")
+          : recovered
           ? "Recovered unsaved annotations · save will retry"
           : skipped
           ? skipped
@@ -2249,6 +2284,8 @@ function wireAnnotationPanel() {
 }
 
 function downloadJsonFile(data, filename, mime) {
+  const context = state.info?.window;
+  if (context?.role === "agent") filename = `agent-${context.id.slice(0, 12)}_${filename}`;
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: mime });
   const a = document.createElement("a");
   const url = URL.createObjectURL(blob);

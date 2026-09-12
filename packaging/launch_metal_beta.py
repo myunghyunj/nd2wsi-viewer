@@ -12,11 +12,14 @@ multiprocessing.freeze_support()
 if sys.platform != "darwin":
     raise SystemExit("This experimental package is macOS-only")
 os.environ.setdefault("ND2WSI_GPU_PYRAMID", "1")
+os.environ["ND2WSI_APP_NAME"] = "nd2wsi-viewer Metal Beta"
+if not getattr(sys, "frozen", False):
+    os.environ["ND2WSI_WINDOW_LAUNCHER"] = os.path.abspath(__file__)
 
 from nd2wsi.metal import device_info, diagnostics, reduce2x  # noqa: E402
 
 if "--metal-info" in sys.argv:
-    print(json.dumps({"beta": "2.1.0b1", "device": device_info(), "diagnostics": diagnostics()}))
+    print(json.dumps({"beta": "2.1.0b2", "device": device_info(), "diagnostics": diagnostics()}))
     raise SystemExit(0)
 if "--metal-self-test" in sys.argv:
     import numpy as np
