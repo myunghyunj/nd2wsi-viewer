@@ -149,6 +149,17 @@ def _write_level1_from_source(
     # emits blocks on the target grid, so the writer never has to reshuffle
     # half-tile output blocks into full store chunks.
     data = data.rechunk((1, out_tile * 2, out_tile * 2))
+    from .metal import enabled, reduce2x_or_cpu
+
+    if enabled() and src.dtype in (np.dtype("uint8"), np.dtype("uint16")):
+        mean = da.map_blocks(
+            reduce2x_or_cpu, data, dtype=src.dtype,
+            chunks=(data.chunks[0], tuple(n // 2 for n in data.chunks[1]),
+                    tuple(n // 2 for n in data.chunks[2])),
+            meta=np.empty((0, 0, 0), dtype=src.dtype),
+        )
+        _store_direct(mean, arr, storage, allow_rechunk=False)
+        return
     mean = da.coarsen(np.mean, data.astype(np.float32), {0: 1, 1: 2, 2: 2})
     if np.issubdtype(src.dtype, np.integer):
         mean = da.rint(mean)
@@ -230,8 +241,12 @@ def _downsample_into(
         if rx < sx1:
             src[:, rx - sx0 :] = src[:, rx - sx0 - 1 : rx - sx0]
         h2, w2 = y1 - y0, x1 - x0
-        mean = src.reshape(h2, 2, w2, 2).mean(axis=(1, 3), dtype=np.float32)
-        row = np.rint(mean).astype(dtype) if integer else mean.astype(dtype)
+        from .metal import reduce2x
+
+        row = reduce2x(src)
+        if row is None:
+            mean = src.reshape(h2, 2, w2, 2).mean(axis=(1, 3), dtype=np.float32)
+            row = np.rint(mean).astype(dtype) if integer else mean.astype(dtype)
         for tx in range(x0 // nt, -(-x1 // nt)):
             cx0, cx1 = tx * nt - x0, min((tx + 1) * nt, nw) - x0
             if not row[:, cx0:cx1].any():  # all-zero chunk stays unwritten
@@ -971,9 +986,13 @@ def ensure_cache(
 
 
 def existing_cache_store(
-    slide: str | Path, selection: PlaneSelection | None = None
+    slide: str | Path, selection: PlaneSelection | None = None, *, read_only: bool = False
 ) -> Path | None:
-    """A valid, already-built store for this slide, or None. Never builds."""
+    """A valid, already-built store, or None. Never builds.
+
+    Selection/Agent callers must use ``read_only=True``: historical broken
+    directory stores are skipped without quarantine, repair or migration.
+    """
     from .cache import (
         cache_container,
         cache_matches,
@@ -993,7 +1012,7 @@ def existing_cache_store(
         if cache_matches(container, slide, selection) and store.exists():
             return store
     if selection == PlaneSelection():
-        legacy = _legacy_store(slide)
+        legacy = _legacy_store(slide, read_only=read_only)
         if legacy is not None:
             return legacy
     return None
@@ -1029,7 +1048,7 @@ def _legacy_store_matches_source(
     return len(siblings) == 1
 
 
-def _legacy_store(slide: Path) -> Path | None:
+def _legacy_store(slide: Path, *, read_only: bool = False) -> Path | None:
     """A complete portable store found beside this source.
 
     The current suffix-aware name is checked first, followed by historical
@@ -1049,8 +1068,13 @@ def _legacy_store(slide: Path) -> Path | None:
         if not cand.exists():
             continue
         try:
-            _, attrs = open_store(cand)
+            root, attrs = open_store(cand)
+            close = getattr(root, "close", None)
+            if close is not None:
+                close()
         except (ValueError, FileNotFoundError):
+            if read_only:
+                continue
             # 0.8 converts atomically, so a store that exists but does not
             # open is a wedge from an older version, never work in progress
             try:

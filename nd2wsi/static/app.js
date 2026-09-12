@@ -27,6 +27,8 @@ const state = {
   plate: null, // {t, z, focus, playing, fps, k, ...} for a time series of sites
   annDirty: false, // an edit is waiting for the debounced save
   annRevision: 0,
+  annServerRevision: null, // opaque file revision, separate from local edit counter
+  annServerRevisions: new Map(), // URL -> revision from our GET/committed save only
   annContext: 0, // changes when a plate switches to another site's sidecar
   annSaveTail: Promise.resolve(),
   annFailedSaves: new Map(), // URL -> latest captured payload that still needs retry
@@ -77,6 +79,8 @@ const state = {
   },
 };
 
+window.nd2CaptureViewState = () => window.Nd2ViewState.capture(state);
+
 init().catch((e) => {
   $("boot").textContent = "failed to load: " + e.message;
 });
@@ -89,6 +93,16 @@ async function init() {
   state.channels = info.channels.map((_, i) => i);
   state.luts = info.channels.map(() => null);
   state.lutWidgets = [];
+  // The native bridge binds this state to the registered source and role.
+  // Apply display settings before panels/tile URLs, and camera after OSD opens.
+  const handoffApi = window.parent !== window ? window.parent.pywebview?.api : null;
+  if (handoffApi?.initial_view_state) {
+    const display = await handoffApi.initial_view_state(currentSlideSid());
+    if (display) {
+      window.Nd2ViewState.applyDisplay(state, display);
+      state.initialViewHandoff = display;
+    }
+  }
   const LatestRequestGate = window.Nd2LatestRequest && window.Nd2LatestRequest.LatestRequestGate;
   if (!LatestRequestGate) throw new Error("latest-request helper did not load");
   state.pixel.requests = new LatestRequestGate();
@@ -135,7 +149,6 @@ async function init() {
   buildWindows();
   wireSlideInspector();
   wireTheme();
-  wireTrash();
   wireDragForward();
   buildChannelPanel();
   buildLevelLamps();
@@ -236,7 +249,7 @@ function renderParams(q) {
   // the channel set, the LUT windows and the cache generation, shared by
   // tiles, plate frames and rendered exports
   if (state.channels.length !== state.info.channels.length)
-    q.set("c", state.channels.join(","));
+    q.set("c", state.channels.length ? state.channels.join(",") : "none");
   const win = lutParam();
   if (win) q.set("win", win);
   // the cache generation makes tile URLs immutable: the browser may keep
@@ -403,6 +416,11 @@ function buildViewer() {
   });
   viewer.addHandler("open", () => {
     applyDesiredDisplayTransform(false);
+    if (state.initialViewHandoff) {
+      window.Nd2ViewState.applyCamera(viewer, state.initialViewHandoff);
+      state.initialViewHandoff = null;
+      window.nd2HandoffApplied = true;
+    }
     $("boot").style.display = "none";
     updateReadout();
     restoreRoiOverlay();
@@ -564,7 +582,7 @@ function buildChannelPanel() {
       ev.preventDefault();
       state.lutWidgets[i].reset();
     });
-    const toggle = macSwitch(true, (next) => {
+    const toggle = macSwitch(state.channels.includes(i), (next) => {
       const on = new Set(state.channels);
       next ? on.add(i) : on.delete(i);
       if (!on.size) return false; // keep at least one channel lit
@@ -667,7 +685,7 @@ function buildLutRow(i, ch, winLabel) {
   }
 
   const def = { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
-  const cur = { ...def };
+  const cur = { ...(state.luts[i] || def) };
   let vmin = Math.min(Number(ch.window.min) || 0, def.lo);
   let vmax = Math.max(
     def.hi,
@@ -1674,9 +1692,13 @@ function annotationsUrl(site) {
 function annotationSaveEntry(site) {
   const url = annotationsUrl(site);
   if (!url) return null;
+  const payload = { items: state.annotations };
+  if (typeof state.annServerRevision === "string") {
+    payload.expected_revision = state.annServerRevision;
+  }
   return {
     url,
-    body: JSON.stringify({ items: state.annotations }),
+    body: JSON.stringify(payload),
     revision: state.annRevision,
     context: state.annContext,
   };
@@ -1688,13 +1710,34 @@ function queueAnnotationSave(entry) {
   }
   const run = state.annSaveTail.then(async () => {
     try {
+      // A newer local snapshot may have queued behind our own successful
+      // save. Advance only from this window's committed revision, never a
+      // revision reported by a conflicting writer.
+      const payload = JSON.parse(entry.body);
+      const revisions = state.annServerRevisions || (state.annServerRevisions = new Map());
+      if (typeof payload.expected_revision === "string" && revisions.has(entry.url)) {
+        payload.expected_revision = revisions.get(entry.url);
+      }
+      entry.body = JSON.stringify(payload);
       const response = await fetch(entry.url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: entry.body,
       });
+      if (response.status === 409) {
+        let conflict = {};
+        try { conflict = await response.json(); } catch (_) { /* keep local draft */ }
+        entry.conflict = true;
+        entry.draftPath = conflict.draft_path || null;
+        throw new Error("Conflict: another window changed this sidecar. Your edits remain unsaved; no overwrite or merge." +
+          (entry.draftPath ? " Recovery draft: " + entry.draftPath : " Keep this window open and export your annotations."));
+      }
       if (!response.ok) throw new Error("HTTP " + response.status);
       const data = await response.json();
+      if (typeof data.revision === "string") {
+        revisions.set(entry.url, data.revision);
+        if (state.annContext === entry.context) state.annServerRevision = data.revision;
+      }
       const failed = state.annFailedSaves.get(entry.url);
       if (!failed || failed.revision <= entry.revision) {
         state.annFailedSaves.delete(entry.url);
@@ -1712,6 +1755,7 @@ function queueAnnotationSave(entry) {
         state.annFailedSaves.set(entry.url, entry);
       }
       if (state.annContext === entry.context) {
+        state.annDirty = true;
         setAnnStatus("Save failed: " + error.message);
       }
       return { ok: false, error: error.message };
@@ -1806,6 +1850,7 @@ function loadAnnotations(site) {
   state.annSite = Number.isInteger(targetSite) ? targetSite : null;
   state.annReady = false;
   state.annPath = null;
+  state.annServerRevision = null;
   state.annotations = [];
   state.editingId = null;
   $("ann-editor").hidden = true;
@@ -1834,7 +1879,7 @@ function loadAnnotations(site) {
       // or update preparation will retry this exact recovered snapshot.
       const captured = JSON.parse(failed.body);
       if (captured && Array.isArray(captured.items)) {
-        return { data: captured, recovered: true };
+        return { data: captured, recovered: true, conflict: !!failed.conflict, draftPath: failed.draftPath };
       }
     }
     return fetch(url).then((r) => r.ok
@@ -1843,18 +1888,24 @@ function loadAnnotations(site) {
   })
     .then((result) => {
       if (result === null || !stillCurrent() || revision !== state.annRevision) return;
-      const { data: d, recovered } = result;
+      const { data: d, recovered, conflict, draftPath } = result;
       state.annotations = Array.isArray(d.items) ? d.items : [];
       state.annPath = recovered ? null : d.path;
       state.annReady = true;
       state.annDirty = recovered;
+      const rev = recovered ? d.expected_revision : d.revision;
+      state.annServerRevision = typeof rev === "string" ? rev : null;
+      const revisions = state.annServerRevisions || (state.annServerRevisions = new Map());
+      if (!recovered && typeof rev === "string") revisions.set(url, rev);
       // a skipped legacy-sidecar import must not be silent: the server
       // leaves a note explaining why old annotations are not shown here
       const skipped = ((state.info && state.info.notes) || []).find((n) =>
         n.includes("annotation sidecar")
       );
       setAnnStatus(
-        recovered
+        conflict
+          ? "Conflict: unsaved annotations recovered; no overwrite or merge." + (draftPath ? " Recovery draft: " + draftPath : " Export these annotations before closing.")
+          : recovered
           ? "Recovered unsaved annotations · save will retry"
           : skipped
           ? skipped
@@ -2249,6 +2300,8 @@ function wireAnnotationPanel() {
 }
 
 function downloadJsonFile(data, filename, mime) {
+  const context = state.info?.window;
+  if (context?.role === "agent") filename = `agent-${context.id.slice(0, 12)}_${filename}`;
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: mime });
   const a = document.createElement("a");
   const url = URL.createObjectURL(blob);
@@ -3673,74 +3726,6 @@ function inkColor(a) {
     : "rgba(255,255,255," + a + ")";
 }
 
-/* ---- cache trashcan --------------------------------------------------------
-   Deletes this slide's pyramid store on disk (annotations stay). The tab
-   closes because the tiles are gone; the slide re-converts on next open. */
-
-function wireTrash() {
-  const btn = $("tb-trash");
-  const pop = $("trash-confirm");
-  if (state.info && !state.info.trashable) {
-    btn.hidden = true; // direct source or user-owned portable store
-    return;
-  }
-  const hide = () => { pop.hidden = true; };
-  btn.onclick = () => {
-    if (pop.hidden) setPlateViewMenuOpen(false);
-    pop.hidden = !pop.hidden;
-  };
-  $("trash-cancel").onclick = hide;
-  document.addEventListener("pointerdown", (ev) => {
-    if (!pop.hidden && !pop.contains(ev.target) && ev.target !== btn && !btn.contains(ev.target)) hide();
-  });
-  window.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") hide();
-  });
-  $("trash-go").onclick = () => {
-    const m = location.pathname.match(/\/s\/([0-9a-f]{8})\//);
-    if (!m) { hide(); showToast("cannot resolve slide id"); return; }
-    const go = $("trash-go");
-    const label = go.textContent;
-    go.disabled = true;
-    // a store is hundreds of thousands of small files, and on a USB disk
-    // that takes minutes, so the button carries the count while it runs
-    const job = Math.random().toString(36).slice(2, 10);
-    const timer = setInterval(() => {
-      fetch("api/roi/progress?job=" + job, { cache: "no-store" })
-        .then((r) => r.json())
-        .then((d) => {
-          if (d.state === "deleting") go.textContent = "Deleting… " + (d.pct || 0) + " %";
-        })
-        .catch(() => {});
-    }, 400);
-    const stop = () => { clearInterval(timer); go.textContent = label; };
-    fetch("../../api/trash", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sid: m[1], job }),
-    })
-      .then((r) => r.json())
-      .then((d) => {
-        stop();
-        if (d.error) throw new Error(d.error);
-        showToast("cache deleted — freed " + fmtBytes(d.freed || 0));
-        setTimeout(() => {
-          if (window.parent !== window) {
-            window.parent.postMessage({ nd2wsi: "slide-trashed" }, location.origin);
-          } else {
-            location.href = "../../";
-          }
-        }, 900);
-      })
-      .catch((e) => {
-        stop();
-        go.disabled = false;
-        hide();
-        showToast("could not delete cache: " + e.message);
-      });
-  };
-}
-
 /* ---- floating mac windows --------------------------------------------------
    Each panel is a small macOS-style window over the slide: draggable by its
    title bar, resizable from every edge and corner, with working traffic
@@ -4282,8 +4267,6 @@ function setPlateViewMenuOpen(open) {
   btn.classList.toggle("active", shown);
   btn.setAttribute("aria-expanded", String(shown));
   if (shown) {
-    const trash = $("trash-confirm");
-    if (trash) trash.hidden = true;
     positionPlateViewMenu();
     const items = [...menu.querySelectorAll("[data-plate-view]")];
     items.forEach((item, i) => { item.tabIndex = i === 0 ? 0 : -1; });
@@ -5025,7 +5008,7 @@ function renderTimeLine() {
   renderPlateAuto();
 }
 
-const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #ann-editor, #trash-confirm, #z-slider, #plate-transpose, #zoom-cluster";
+const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #ann-editor, #z-slider, #plate-transpose, #zoom-cluster";
 
 function wireNativeGestureScope() {
   let pending = false;

@@ -12,6 +12,15 @@
   <div id="chrome-pad" class="pywebview-drag-region"></div>
   <button id="newtab" type="button" title="Open another slide" aria-label="Open another slide">+</button>
   <div id="tabbar-space" class="pywebview-drag-region"></div>
+  <details id="window-menu" hidden>
+    <summary id="window-identity" aria-label="Window identity and new window actions"></summary>
+    <div class="window-actions" role="group" aria-label="New native window">
+      <button id="new-user-window" type="button">New Window <kbd>⌘N</kbd></button>
+      <button id="new-agent-window" type="button">New Agent Window <kbd>⇧⌘N</kbd></button>
+      <button id="open-metal-window" type="button" hidden title="Open the active slide in a separate window of the same role. Standard tools remain here.">Open in Metal</button>
+      <span id="window-action-status" role="status" aria-live="polite"></span>
+    </div>
+  </details>
   <button id="update-check" class="shell-icon-button" type="button"
           title="Check for Updates…" aria-label="Check for Updates" disabled>
     <svg class="update-icon" viewBox="0 0 18 18" aria-hidden="true">
@@ -139,5 +148,6 @@
 <script src="static/shortcut-router-v1.js"></script>
 <script src="static/native-scope-v1.js"></script>
 <script src="static/shell-v1.js"></script>
+<script src="static/window-controls-v1.js"></script>
 </body>
 </html>

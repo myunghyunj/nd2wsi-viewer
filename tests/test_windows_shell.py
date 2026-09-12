@@ -84,14 +84,14 @@ def test_windows_preserves_native_window_controls_and_rejects_mshtml(fake_webvie
 
 
 def test_windows_updates_open_release_downloads_without_sparkle(fake_webview, monkeypatch):
-    browser = Mock(return_value=True)
-    monkeypatch.setattr("webbrowser.open", browser)
+    check = Mock(return_value={"ok": True, "mode": "manual-download"})
+    monkeypatch.setattr("nd2wsi.release_selection.check_for_updates", check)
     api = app.Api(None)
     assert api.update_status()["available"] is True
     assert api.update_status()["mode"] == "download"
     assert api.check_for_updates()["ok"] is True
-    browser.assert_called_once_with(app.RELEASES_URL)
-    browser.return_value = False
+    check.assert_called_once_with(channel="stable")
+    check.return_value = {"ok": False}
     assert api.check_for_updates()["ok"] is False
 
 

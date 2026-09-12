@@ -474,6 +474,124 @@ def _event_belongs_to_window(event: Any, native_window: Any) -> tuple[bool, str]
     return active, "nil-key" if active else "nil-inactive"
 
 
+def _replay_input_targets_window(event: Any, native_window: Any, key_window: Any = None) -> bool:
+    """Strict diagnostic scope: never substitute a main but non-key window."""
+    try:
+        destination = event.window()
+    except Exception:
+        destination = None
+    if destination is not None:
+        if destination is native_window:
+            return True
+        number = int(_call_number(destination, "windowNumber"))
+        return number > 0 and number == int(_call_number(native_window, "windowNumber"))
+    number = int(_call_number(event, "windowNumber"))
+    if number > 0:
+        return number == int(_call_number(native_window, "windowNumber"))
+    if key_window is None:
+        return False
+    if key_window is native_window:
+        return True
+    number = int(_call_number(key_window, "windowNumber"))
+    return number > 0 and number == int(_call_number(native_window, "windowNumber"))
+
+
+def _replay_input_monitor(native_window, locked, key_window):
+    """Consume native input to this diagnostic window, not JS replay calls.
+
+    Direct viewer methods/evaluate_js do not create NSEvents. We intentionally
+    do not distinguish physical hardware from externally synthesized native
+    events: either can contaminate a replay and neither belongs to its driver.
+    Returning None consumes the event; it never clicks through to another app.
+    """
+    def monitor(event):
+        if not locked():
+            return event
+        try:
+            if _replay_input_targets_window(event, native_window, key_window()):
+                return None
+        except Exception:
+            pass
+        return event
+    return monitor
+
+
+def install_replay_input_guard(window: Any) -> Callable[[], None]:
+    """Temporarily isolate physical input to an authorized Agent replay only.
+
+    Called by the explicit replay helper once its own Cocoa host is ready.
+    Installation/removal happen on AppKit's main queue. The returned cleanup is
+    idempotent; closing this window also removes its local monitor. There is no
+    global event tap, application activation, or mouse-event passthrough.
+    """
+    if sys.platform != "darwin" or getattr(window, "_nd2_benchmark_input_authorized", False) is not True:
+        raise ValueError("Input isolation requires an authorized macOS Agent replay window")
+    if getattr(window, "_nd2_benchmark_input_locked", False):
+        raise RuntimeError("Replay input guard is already installed")
+    import AppKit
+    from Foundation import NSOperationQueue, NSThread
+    from webview.platforms.cocoa import BrowserView
+
+    finished = threading.Event()
+    cancelled = threading.Event()
+    state = {"token": None, "monitor": None, "error": None}
+
+    def remove_native():
+        token, state["token"] = state["token"], None
+        if token is not None:
+            AppKit.NSEvent.removeMonitor_(token)
+        state["monitor"] = None
+
+    def restore(*_args):
+        cancelled.set()
+        window._nd2_benchmark_input_locked = False
+        if NSThread.isMainThread():
+            remove_native()
+        else:
+            NSOperationQueue.mainQueue().addOperationWithBlock_(remove_native)
+
+    def install():
+        try:
+            if cancelled.is_set():
+                return
+            browser = BrowserView.instances.get(window.uid)
+            if browser is None or browser.window is None:
+                raise RuntimeError("Replay Cocoa window is not ready")
+            window._nd2_benchmark_input_locked = True
+            state["monitor"] = _replay_input_monitor(
+                browser.window, lambda: bool(window._nd2_benchmark_input_locked),
+                lambda: AppKit.NSApplication.sharedApplication().keyWindow())
+            mask = 0
+            for name in ("ScrollWheel", "Swipe", "Magnify", "Rotate", "Gesture", "BeginGesture", "EndGesture",
+                         "LeftMouseDown", "LeftMouseUp", "LeftMouseDragged", "RightMouseDown", "RightMouseUp",
+                         "RightMouseDragged", "OtherMouseDown", "OtherMouseUp", "OtherMouseDragged", "MouseMoved",
+                         "KeyDown", "KeyUp", "FlagsChanged", "Pressure"):
+                mask |= int(getattr(AppKit, "NSEventMask" + name, 0))
+            state["token"] = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(mask, state["monitor"])
+            if state["token"] is None:
+                raise RuntimeError("Could not install replay input guard")
+            if cancelled.is_set():
+                restore()
+        except Exception as exc:
+            state["error"] = exc
+            window._nd2_benchmark_input_locked = False
+            remove_native()
+        finally:
+            finished.set()
+
+    if NSThread.isMainThread():
+        install()
+    else:
+        NSOperationQueue.mainQueue().addOperationWithBlock_(install)
+    if not finished.wait(5):
+        restore()
+        raise TimeoutError("Replay input guard installation timed out")
+    if state["error"] is not None:
+        raise RuntimeError("Replay input guard installation failed") from state["error"]
+    window.events.closed += restore
+    return restore
+
+
 def _dispatch_native_trackpad(
     native_webview: Any,
     payload: dict[str, Any],
@@ -506,6 +624,7 @@ def _make_native_trackpad_monitor(
     logger: Callable[[str], None],
     clock_ms: Callable[[], float] = lambda: time.monotonic() * 1000.0,
     dispatch: Callable[[dict[str, Any], bool], None] | None = None,
+    input_locked: Callable[[], bool] = lambda: False,
 ) -> Callable[[Any], Any]:
     """Build the local monitor with injectable native boundaries for tests."""
 
@@ -522,6 +641,17 @@ def _make_native_trackpad_monitor(
             sample = _native_event_sample(event, appkit)
             belongs, window_match = _event_belongs_to_window(event, native_window)
             if not belongs:
+                return event
+            if input_locked():
+                try:
+                    key_window = appkit.NSApplication.sharedApplication().keyWindow()
+                except Exception:
+                    key_window = None
+                if _replay_input_targets_window(event, native_window, key_window):
+                    sequence.reset()
+                    return None
+                # Do not let the normal, broader nil-main-window heuristic
+                # forward another destination's input into this replay.
                 return event
             try:
                 event_window = event.window()
@@ -666,6 +796,7 @@ def wire_native_trackpad_bridge(
                 scope_cache=scopes,
                 sequence=sequence,
                 logger=logger,
+                input_locked=lambda: bool(getattr(window, "_nd2_benchmark_input_locked", False)),
             )
 
             token = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(

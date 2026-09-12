@@ -166,6 +166,14 @@ def _delegate_class(protocol: Any):
         def updaterWillRelaunchApplication_(self, updater):
             self.logger("Sparkle will relaunch application")
 
+        def allowedChannelsForUpdater_(self, updater):
+            # RC feeds must not be offered to existing stable installations.
+            # Sparkle always considers its default stable channel as well, so
+            # an RC installation can advance to the subsequent final release.
+            from .release_selection import channel_for_version, installed_version
+
+            return {"rc"} if channel_for_version(installed_version()) == "rc" else set()
+
         def updater_didAbortWithError_(self, updater, error):
             with self._install_lock:
                 self._pending_install_token = None

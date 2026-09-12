@@ -9,6 +9,8 @@
 __pycache__/
 build/
 dist/
+nd2wsi/metal/*.dylib
+nd2wsi/metal_viewport/*.dylib
 docs/*.nd2
 docs/*.tmp
 testdata/

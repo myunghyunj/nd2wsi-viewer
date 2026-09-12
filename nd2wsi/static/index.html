@@ -44,22 +44,8 @@
       <button class="tb-btn tb-theme" id="tb-theme" title="Appearance" aria-label="Appearance">
         <span class="tb-ico theme-glyph" aria-hidden="true"></span>
       </button>
-      <button class="tb-btn tb-danger" id="tb-trash" title="Delete this slide's viewing cache" aria-label="Delete viewing cache">
-        <span class="tb-ico icon-trash" aria-hidden="true"></span>
-      </button>
     </div>
   </header>
-
-  <div id="trash-confirm" hidden>
-    <div class="tc-text">
-      Delete this slide's viewing cache?<br>
-      <span class="tc-sub">The tab will close. The source and annotations will remain.</span>
-    </div>
-    <div class="tc-actions">
-      <button class="btn" id="trash-cancel">Cancel</button>
-      <button class="btn destructive" id="trash-go">Delete Cache</button>
-    </div>
-  </div>
 
   <div id="plate-view-menu" role="menu" aria-label="Plate view options" hidden>
     <button type="button" role="menuitemcheckbox" aria-checked="false" tabindex="0" data-plate-view="siteLabels">
@@ -275,6 +261,7 @@
 <script src="../../static/axis-latch-v1.js"></script>
 <script src="../../static/request-latest-v1.js"></script>
 <script src="../../static/spatial-pane-v1.js"></script>
+<script src="../../static/view-state-v1.js"></script>
 <script src="../../static/app.js"></script>
 </body>
 </html>
