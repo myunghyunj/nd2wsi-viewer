@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nd2wsi-viewer"
-version = "2.1.0b2"
+version = "2.1.0rc1"
 description = "Local whole-slide viewing for stitched Nikon ND2 and Aperio SVS, with native-value ROI export"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,7 +42,7 @@ nd2wsi-viewer = "nd2wsi.app:main"
 include = ["nd2wsi*"]
 
 [tool.setuptools.package-data]
-nd2wsi = ["static/**/*", "metal/*.dylib", "metal/*.m", "metal/*.sh"]
+nd2wsi = ["static/**/*", "metal/*.dylib", "metal/*.m", "metal/*.sh", "metal_viewport/*.dylib", "metal_viewport/*.m", "metal_viewport/*.sh"]
 
 [tool.uv]
 extra-index-url = ["https://pypi.laboratory-imaging.com/simple"]

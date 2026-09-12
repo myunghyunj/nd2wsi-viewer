@@ -961,8 +961,8 @@ class Api:
             current = "development"
         manual = sys.platform == "win32"
         if self._updates_disabled:
-            return {"available": False, "version": current, "mode": "disabled-multiwindow",
-                    "message": "Automatic updates are disabled in this multiwindow beta. Close every window before replacing the app manually."}
+            return {"available": True, "version": current, "mode": "manual-download",
+                    "message": "Check for a compatible macOS download. Close all viewer windows before replacing the app."}
         return {
             "available": manual or self._updater is not None,
             "version": current,
@@ -972,20 +972,13 @@ class Api:
     def check_for_updates(self) -> dict:
         """Open Windows release downloads or the macOS Sparkle update window."""
         if self._updates_disabled:
-            return {"ok": False, "message": self.update_status()["message"]}
-        if sys.platform == "win32":
-            import webbrowser
+            from .release_selection import check_for_updates
 
-            try:
-                opened = webbrowser.open(RELEASES_URL)
-                return {
-                    "ok": bool(opened),
-                    "message": "Download the latest Windows build from the releases page."
-                    if opened else "Could not open the releases page in your browser.",
-                }
-            except Exception as exc:
-                _dlog(f"release downloads failed: {exc!r}")
-                return {"ok": False, "message": "Could not open the releases page."}
+            return check_for_updates()
+        if sys.platform == "win32":
+            from .release_selection import check_for_updates
+
+            return check_for_updates(channel="stable")
         handle = self._updater
         if handle is None:
             return {

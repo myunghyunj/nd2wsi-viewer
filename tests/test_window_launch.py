@@ -94,8 +94,11 @@ def test_api_default_agent_and_scoped_context(monkeypatch, tmp_path):
     assert context["role"] == "agent" and context["id"] == session.id
     assert context["exports_root"] == str(session.exports_root)
     assert "NEW Agent window" in context["agent_directive"]
-    assert api.update_status()["mode"] == "disabled-multiwindow"
+    assert api.update_status()["mode"] == "manual-download"
+    check = Mock(return_value={"ok": True, "message": "Close every window before installing."})
+    monkeypatch.setattr("nd2wsi.release_selection.check_for_updates", check)
     assert "every window" in api.check_for_updates()["message"]
+    check.assert_called_once_with()
 
 
 def test_api_server_is_bound_to_its_session(monkeypatch, tmp_path):

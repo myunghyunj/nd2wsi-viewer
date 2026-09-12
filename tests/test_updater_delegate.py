@@ -77,6 +77,13 @@ def driver(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("version,channels", [("2.1.0rc1", {"rc"}), ("2.0.0", set()),
+                                               ("2.1.0", set()), ("2.1.0b3", set())])
+def test_delegate_respects_stable_and_rc_channels(driver, monkeypatch, version, channels):
+    monkeypatch.setattr("nd2wsi.release_selection.installed_version", lambda: version)
+    assert driver.delegate.allowedChannelsForUpdater_(None) == channels
+
+
 def test_duplicate_request_keeps_original_block_and_completes_once(driver):
     installed = []
 
