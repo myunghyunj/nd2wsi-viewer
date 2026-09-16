@@ -80,6 +80,8 @@ const state = {
   },
 };
 
+let frameRequests = null;
+
 window.nd2CaptureViewState = () => window.Nd2ViewState.capture(state);
 
 init().catch((e) => {
@@ -108,6 +110,7 @@ async function init() {
   if (!LatestRequestGate) throw new Error("latest-request helper did not load");
   state.pixel.requests = new LatestRequestGate();
   state.histogram.requests = new LatestRequestGate();
+  frameRequests = createFrameRequests();
 
   if (info.kind === "plate" && info.plate) {
     state.plate = {
@@ -171,6 +174,31 @@ async function init() {
     }
     setAnnStatus("Annotation locked: source file missing");
   }
+}
+
+function createFrameRequests() {
+  const shared = {
+    readContext: activeFrameContext, matchesResponse: responseMatchesFrameContext,
+    appendFrameParams, isAbortError: window.Nd2LatestRequest.isAbortError,
+    fetch: (...args) => fetch(...args),
+  };
+  return {
+    histograms: window.Nd2FrameData.createHistogramController({
+      ...shared, state: state.histogram, onClear: clearHistograms,
+      onHistograms(channels) {
+        channels.forEach((histogram, i) => state.lutWidgets[i]?.setHistogram(histogram));
+        setHistogramReady(true);
+      },
+    }),
+    pixels: window.Nd2FrameData.createPixelProbeController({
+      ...shared, state: state.pixel, onRender: renderPixelInspector,
+      onClearCursor() {
+        $("pos-um").textContent = "–";
+        $("pos-px").textContent = "–";
+        $("pos-px").title = "";
+      },
+    }),
+  };
 }
 
 function kindMark(info) {
@@ -623,36 +651,8 @@ function buildChannelPanel() {
 
 // Coalesce all channels from one input event, then keep showing the newest
 // contrast during a continuous drag instead of waiting for it to stop.
-const applyLuts = liveUpdate(() => refreshTiles(), 100);
+const applyLuts = window.Nd2LutControls.liveUpdate(() => refreshTiles(), 100);
 window.addEventListener("pagehide", () => applyLuts.cancel(), { once: true });
-
-function liveUpdate(fn, ms) {
-  let timer = null;
-  let pending = false;
-  let last = -Infinity;
-  const apply = () => {
-    timer = null;
-    if (!pending) return;
-    pending = false;
-    last = performance.now();
-    fn();
-  };
-  const request = () => {
-    pending = true;
-    if (timer === null)
-      timer = setTimeout(apply, Math.max(0, ms - (performance.now() - last)));
-  };
-  request.flush = () => {
-    clearTimeout(timer);
-    apply();
-  };
-  request.cancel = () => {
-    clearTimeout(timer);
-    timer = null;
-    pending = false;
-  };
-  return request;
-}
 
 /* Swap the tiles of the open image in place. The tile source builds every
    URL through tileQuery() at request time, so dropping the loaded tiles is
@@ -701,369 +701,25 @@ function resetTiledImage(item) {
 }
 
 function buildLutRow(i, ch, winLabel) {
-  const wrap = document.createElement("div");
-  wrap.className = "lut";
-  const canvas = document.createElement("canvas");
-  canvas.className = "lut-canvas";
-  canvas.title = "Scroll to zoom at the pointer; scroll sideways or drag empty space to pan. Double-click for full range. Drag triangles or the round handle to adjust contrast.";
-  const ctx = canvas.getContext("2d");
-  wrap.append(canvas);
-
-  // size follows the Channels window; relayout() re-derives everything
-  let W = 208;
-  let H = 84;
-  let PLOT = { x0: 4, x1: W - 4, y0: 14, y1: H - 18 };
-
-  function relayout(cssW) {
-    W = Math.max(180, Math.round(cssW));
-    H = Math.round(Math.max(74, Math.min(150, W * 0.4)));
-    PLOT = { x0: 4, x1: W - 4, y0: 14, y1: H - 18 };
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    canvas.style.width = W + "px";
-    canvas.style.height = H + "px";
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    draw();
-  }
-
-  const def = { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
-  const cur = { ...(state.luts[i] || def) };
-  let rangeMin = Number.isFinite(Number(ch.window.min)) ? Number(ch.window.min) : 0;
-  let rangeMax = Math.max(Number(ch.window.max) || def.hi, rangeMin + 1);
-  let vmin = rangeMin;
-  let vmax = rangeMax;
-  let bins = null;
-  let autoHistogram = null;
-  let fullHistogram = null;
-  let autoRange = !!state.lutAutoRange;
-  let manualAxis = false;
-
-  function projectBins() {
-    const histogram = autoRange && autoHistogram ? autoHistogram : fullHistogram;
-    if (!histogram) { bins = null; return; }
-    if (!manualAxis) { bins = histogram.bins; return; }
-    const n = Math.max(64, Math.min(512, Math.round(W - 8)));
-    bins = Array(n).fill(0);
-    const detail = fullHistogram?.detail;
-    const add = (value, count) => {
-      if (value < vmin || value > vmax) return;
-      const bin = Math.min(n - 1, Math.floor((value - vmin) / (vmax - vmin) * n));
-      bins[bin] += count;
-    };
-    if (detail) {
-      detail.values.forEach((value, index) => add(value, detail.counts[index]));
-    } else {
-      const step = (histogram.vmax - histogram.vmin) / histogram.bins.length;
-      histogram.bins.forEach((count, index) => add(histogram.vmin + (index + 0.5) * step, count));
-    }
-  }
-
-  function updateAxis() {
-    const histogram = autoRange && autoHistogram ? autoHistogram : fullHistogram;
-    if (!manualAxis) {
-      vmin = histogram ? histogram.vmin : rangeMin;
-      vmax = histogram ? histogram.vmax : rangeMax;
-    }
-    projectBins();
-    draw();
-  }
-
-  function manualView(lo, hi) {
-    // Freeze every channel's current axis when leaving automatic fitting.
-    // Merely navigating a graph must never change image contrast.
-    if (state.lutAutoRange) {
+  const widget = window.Nd2LutControls.createWidget({
+    channel: ch, initialLut: state.luts[i], autoRange: state.lutAutoRange,
+    label: winLabel, width: state.windows.channels.bodyWidth(), document, window,
+    protocolVersion: VIEWPORT_PROTOCOL_VERSION, inkColor, currentTheme, fmtInt,
+    onChange(lut) {
+      state.luts[i] = lut;
+      applyLuts(); // shared cadence: one tile reload even for shift-drags
+    },
+    onFlush: () => applyLuts.flush(),
+    onManualAxis() {
+      if (!state.lutAutoRange) return;
       state.lutAutoRange = false;
       $("lut-auto-range").checked = false;
-      state.lutWidgets.forEach((widget) => widget.freezeAxis());
-    }
-    autoRange = false;
-    manualAxis = true;
-    const span = clamp(hi - lo, Math.max(1, (rangeMax - rangeMin) / 65536), rangeMax - rangeMin);
-    vmin = clamp(lo, rangeMin, rangeMax - span);
-    vmax = vmin + span;
-    projectBins();
-    draw();
-  }
-
-  const vx = (v) => PLOT.x0 +
-    clamp((v - vmin) / Math.max(vmax - vmin, 1e-9), 0, 1) * (PLOT.x1 - PLOT.x0);
-  const xv = (x) =>
-    vmin + clamp((x - PLOT.x0) / (PLOT.x1 - PLOT.x0), 0, 1) * (vmax - vmin);
-  const curveY = (t) =>
-    PLOT.y1 - Math.pow(Math.max(0, Math.min(1, t)), 1 / cur.gamma) * (PLOT.y1 - PLOT.y0);
-  const knobPos = () => ({
-    x: vx(cur.lo + (Math.max(cur.hi, cur.lo + 1) - cur.lo) * 0.5),
-    y: curveY(0.5),
+      state.lutWidgets.forEach((other) => other.freezeAxis());
+    },
+    onShiftChange: (lut) => state.lutWidgets.forEach((other) => other.setLut(lut)),
   });
-
-  function draw() {
-    const w = PLOT.x1 - PLOT.x0;
-    const h = PLOT.y1 - PLOT.y0;
-    ctx.clearRect(0, 0, W, H);
-    // frame
-    ctx.strokeStyle = inkColor(0.12);
-    ctx.lineWidth = 1;
-    ctx.strokeRect(PLOT.x0 - 0.5, PLOT.y0 - 0.5, w + 1, h + 1);
-    // histogram (sqrt-scaled so tissue signal shows over background counts)
-    if (bins) {
-      const peak = Math.sqrt(Math.max(...bins, 1));
-      ctx.beginPath();
-      ctx.moveTo(PLOT.x0, PLOT.y1);
-      for (let b = 0; b < bins.length; b++) {
-        const x = PLOT.x0 + (w * (b + 0.5)) / bins.length;
-        ctx.lineTo(x, PLOT.y1 - (Math.sqrt(bins[b]) / peak) * (h - 2));
-      }
-      ctx.lineTo(PLOT.x1, PLOT.y1);
-      ctx.closePath();
-      ctx.fillStyle = "#" + ch.color + "55";
-      ctx.fill();
-      ctx.strokeStyle = "#" + ch.color + "cc";
-      ctx.stroke();
-    }
-    // window guides
-    ctx.strokeStyle = inkColor(0.30);
-    ctx.setLineDash([2, 3]);
-    for (const v of [cur.lo, cur.hi].filter((value) => value >= vmin && value <= vmax)) {
-      ctx.beginPath();
-      ctx.moveTo(vx(v) + 0.5, PLOT.y0);
-      ctx.lineTo(vx(v) + 0.5, PLOT.y1);
-      ctx.stroke();
-    }
-    ctx.setLineDash([]);
-    // mapping curve: flat-left, gamma ramp, flat-right
-    ctx.strokeStyle = inkColor(0.85);
-    ctx.beginPath();
-    const steps = 40;
-    for (let s = 0; s <= steps; s++) {
-      const value = vmin + (vmax - vmin) * s / steps;
-      const t = (value - cur.lo) / Math.max(cur.hi - cur.lo, 1e-9);
-      const x = PLOT.x0 + w * s / steps;
-      if (s === 0) ctx.moveTo(x, curveY(t));
-      else ctx.lineTo(x, curveY(t));
-    }
-    ctx.stroke();
-    // gamma knob
-    const k = knobPos();
-    if ((cur.lo + cur.hi) / 2 >= vmin && (cur.lo + cur.hi) / 2 <= vmax) {
-      ctx.beginPath();
-      ctx.arc(k.x, k.y, 4.5, 0, Math.PI * 2);
-      ctx.fillStyle = currentTheme() === "light" ? "#f6f6f8" : "#1e1e20";
-      ctx.fill();
-      ctx.strokeStyle = inkColor(0.85);
-      ctx.stroke();
-    }
-    // lo/hi triangles along the top edge
-    if (cur.lo >= vmin && cur.lo <= vmax)
-      triangle(vx(cur.lo), currentTheme() === "light" ? "#3a3a3c" : "#111214", inkColor(0.55));
-    if (cur.hi >= vmin && cur.hi <= vmax)
-      triangle(vx(cur.hi), currentTheme() === "light" ? "#ffffff" : "rgba(255,255,255,0.92)", "rgba(0,0,0,0.6)");
-    // labels — SF Mono ramp
-    ctx.font = "9px ui-monospace, 'SF Mono', Menlo, monospace";
-    ctx.fillStyle = inkColor(0.55);
-    ctx.textAlign = "left";
-    ctx.fillText(fmtInt(cur.lo), PLOT.x0, 9);
-    ctx.textAlign = "right";
-    ctx.fillText(fmtInt(cur.hi), PLOT.x1, 9);
-    ctx.textAlign = "center";
-    ctx.fillText("G: " + cur.gamma.toFixed(2), (PLOT.x0 + PLOT.x1) / 2, 9);
-    ctx.fillStyle = inkColor(0.28);
-    ctx.textAlign = "left";
-    ctx.fillText(fmtInt(vmin), PLOT.x0, H - 3);
-    ctx.textAlign = "right";
-    ctx.fillText(fmtInt(vmax), PLOT.x1, H - 3);
-    winLabel.textContent = fmtInt(cur.lo) + "–" + fmtInt(cur.hi);
-    canvas.setAttribute("aria-label", ch.label + " histogram range " + fmtInt(vmin) + " to " + fmtInt(vmax));
-    canvas.setAttribute("data-axis-min", String(vmin));
-    canvas.setAttribute("data-axis-max", String(vmax));
-  }
-
-  function triangle(x, fill, stroke) {
-    ctx.beginPath();
-    ctx.moveTo(x - 5, PLOT.y0 - 10);
-    ctx.lineTo(x + 5, PLOT.y0 - 10);
-    ctx.lineTo(x, PLOT.y0 - 1);
-    ctx.closePath();
-    ctx.fillStyle = fill;
-    ctx.fill();
-    ctx.strokeStyle = stroke;
-    ctx.stroke();
-  }
-
-  function isDefault(l) {
-    return (
-      Math.abs(l.lo - def.lo) < 0.5 &&
-      Math.abs(l.hi - def.hi) < 0.5 &&
-      Math.abs(l.gamma - 1) < 0.005
-    );
-  }
-  function setLut(l) {
-    cur.lo = l.lo;
-    cur.hi = Math.max(l.hi, l.lo + 1);
-    cur.gamma = Math.max(0.25, Math.min(4, l.gamma));
-    draw();
-    state.luts[i] = isDefault(cur) ? null : { ...cur };
-    applyLuts(); // shared cadence: one tile reload even for shift-drags
-  }
-
-  // dragging: lo/hi triangles (horizontal), gamma knob (vertical)
-  let mode = null;
-  let panFrom = null;
-  const pt = (ev) => {
-    const r = canvas.getBoundingClientRect();
-    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
-  };
-  canvas.addEventListener("pointerdown", (ev) => {
-    if (ev.button !== undefined && ev.button !== 0 && ev.button !== 1) return;
-    const p = pt(ev);
-    const k = knobPos();
-    const loDistance = cur.lo >= vmin && cur.lo <= vmax ? Math.abs(p.x - vx(cur.lo)) : Infinity;
-    const hiDistance = cur.hi >= vmin && cur.hi <= vmax ? Math.abs(p.x - vx(cur.hi)) : Infinity;
-    const mid = (cur.lo + cur.hi) / 2;
-    if (ev.button !== 1 && mid >= vmin && mid <= vmax && Math.hypot(p.x - k.x, p.y - k.y) < 9) mode = "gamma";
-    else if (ev.button !== 1 && p.y <= PLOT.y0 + 7 && Math.min(loDistance, hiDistance) < 10)
-      mode = hiDistance < loDistance ? "hi" : "lo";
-    else mode = "pan";
-    panFrom = { x: p.x, lo: vmin, hi: vmax };
-    canvas.setPointerCapture(ev.pointerId);
-    if (mode !== "pan") drag(ev);
-    ev.preventDefault();
-  });
-  canvas.addEventListener("pointermove", (ev) => {
-    if (mode) drag(ev);
-  });
-  const endDrag = () => {
-    if (mode && mode !== "pan") applyLuts.flush();
-    mode = null;
-    panFrom = null;
-    canvas.style.cursor = "grab";
-  };
-  canvas.addEventListener("pointerup", endDrag);
-  canvas.addEventListener("pointercancel", endDrag);
-  canvas.addEventListener("lostpointercapture", endDrag);
-
-  const navigateWheel = (dx, dy, x) => {
-    if (Math.abs(dx) > Math.abs(dy)) {
-      const offset = dx / (PLOT.x1 - PLOT.x0) * (vmax - vmin);
-      manualView(vmin + offset, vmax + offset);
-    } else if (dy) {
-      const fraction = clamp((x - PLOT.x0) / (PLOT.x1 - PLOT.x0), 0, 1);
-      const anchor = vmin + fraction * (vmax - vmin);
-      const span = clamp((vmax - vmin) * Math.exp(clamp(dy * 0.008, -1, 1)),
-        Math.max(1, (rangeMax - rangeMin) / 65536), rangeMax - rangeMin);
-      manualView(anchor - fraction * span, anchor + (1 - fraction) * span);
-    }
-  };
-  canvas.addEventListener("wheel", (ev) => {
-    const factor = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? W : 1;
-    navigateWheel(ev.deltaX * factor, ev.deltaY * factor, pt(ev).x);
-    ev.preventDefault();
-    ev.stopPropagation();
-  }, { passive: false });
-  canvas.addEventListener("dblclick", (ev) => {
-    manualView(rangeMin, rangeMax);
-    ev.preventDefault();
-    ev.stopPropagation();
-  });
-  const onNativeLutScroll = (ev) => {
-    if (ev.origin !== location.origin || ev.source !== window.parent) return;
-    const data = ev.data;
-    if (data?.nd2wsi !== "native-trackpad" || data.version !== VIEWPORT_PROTOCOL_VERSION) return;
-    if (document.elementFromPoint(data.clientX, data.clientY) !== canvas) return;
-    // AppKit scrollingDeltaX has the opposite sign from DOM WheelEvent.
-    navigateWheel(-Number(data.deltaX || 0), 0, data.clientX - canvas.getBoundingClientRect().left);
-  };
-  window.addEventListener("message", onNativeLutScroll);
-  window.addEventListener("pagehide", () => window.removeEventListener("message", onNativeLutScroll), { once: true });
-
-  function drag(ev) {
-    const p = pt(ev);
-    if (mode === "pan") {
-      const offset = (panFrom.x - p.x) / (PLOT.x1 - PLOT.x0) * (panFrom.hi - panFrom.lo);
-      canvas.style.cursor = "grabbing";
-      manualView(panFrom.lo + offset, panFrom.hi + offset);
-      return;
-    }
-    const next = { ...cur };
-    if (mode === "gamma") {
-      const frac = (PLOT.y1 - Math.max(PLOT.y0, Math.min(PLOT.y1, p.y))) /
-        (PLOT.y1 - PLOT.y0);
-      // knob height = 0.5^(1/gamma)  =>  gamma = ln(0.5)/ln(frac)
-      const f = Math.max(0.02, Math.min(0.98, frac));
-      next.gamma = Math.max(0.25, Math.min(4, Math.log(0.5) / Math.log(f)));
-    } else {
-      const v = xv(p.x);
-      if (mode === "lo") next.lo = Math.min(v, cur.hi - 1);
-      else next.hi = Math.max(v, cur.lo + 1);
-    }
-    if (ev.shiftKey) {
-      state.lutWidgets.forEach((wd) => wd.setLut(next));
-    } else {
-      setLut(next);
-    }
-  }
-
-  const widget = {
-    setLut,
-    relayout,
-    freezeAxis() { autoRange = false; manualAxis = true; },
-    setAutoRange(enabled) {
-      autoRange = !!enabled;
-      manualAxis = false;
-      updateAxis();
-    },
-    setHistogram(hg) {
-      fullHistogram = hg;
-      autoHistogram = hg.autoHistogram || hg;
-      rangeMin = hg.vmin;
-      rangeMax = hg.vmax;
-      updateAxis();
-    },
-    clearHistogram() {
-      fullHistogram = null;
-      autoHistogram = null;
-      updateAxis();
-    },
-    reset() {
-      setLut({ ...def });
-    },
-    auto() {
-      const histogram = autoHistogram;
-      const window = histogram && autoWindowFromHistogram(histogram.bins, histogram.vmin, histogram.vmax);
-      if (window) setLut({ ...window, gamma: cur.gamma });
-    },
-  };
   state.lutWidgets[i] = widget;
-  relayout(state.windows.channels.bodyWidth());
-  return wrap;
-}
-
-function autoWindowFromHistogram(bins, vmin, vmax, rightPeakFraction = 0.70) {
-  if (!Array.isArray(bins) || !bins.length || !(vmax > vmin)) return null;
-  const total = bins.reduce((sum, count) => sum + Number(count || 0), 0);
-  if (!(total > 0)) return null;
-  const bw = (vmax - vmin) / bins.length;
-  let acc = 0;
-  let fallbackBin = -1;
-  let highBin = bins.length - 1;
-  let modeBin = 0;
-  for (let b = 0; b < bins.length; b++) {
-    if (Number(bins[b] || 0) > Number(bins[modeBin] || 0)) modeBin = b;
-    acc += Number(bins[b] || 0);
-    if (acc >= total * 0.001 && fallbackBin < 0) fallbackBin = b;
-  }
-  acc = 0;
-  for (let b = 0; b < bins.length; b++) {
-    acc += Number(bins[b] || 0);
-    if (acc >= total * 0.999) { highBin = b; break; }
-  }
-  const fallback = vmin + Math.max(0, fallbackBin) * bw;
-  const high = Math.max(vmin + (highBin + 1) * bw, fallback + 1);
-  const mode = vmin + modeBin * bw;
-  const low = mode >= fallback + rightPeakFraction * (high - fallback)
-    ? fallback
-    : mode;
-  return { lo: low, hi: Math.max(high, low + 1) };
+  return widget.element;
 }
 
 function relayoutLuts() {
@@ -1089,48 +745,8 @@ function clearHistograms(unavailable = false) {
   setHistogramReady(false, unavailable);
 }
 
-function requestHistograms(context) {
-  if (!context || activeFrameContext()?.key !== context.key) return;
-  const q = appendFrameParams(new URLSearchParams(), context.frame).toString();
-  const ticket = state.histogram.requests.begin(context.key);
-  fetch("api/histogram" + (q ? "?" + q : ""), {
-    cache: "no-store",
-    signal: ticket.signal,
-  })
-    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
-    .then((data) => {
-      if (
-        !state.histogram.requests.isCurrent(ticket, context.key) ||
-        !responseMatchesFrameContext(data, context)
-      ) return;
-      data.channels.forEach((hg, i) => {
-        if (state.lutWidgets[i]) state.lutWidgets[i].setHistogram(hg);
-      });
-      setHistogramReady(true);
-    })
-    .catch((error) => {
-      if (
-        !state.histogram.requests.isCurrent(ticket, context.key) ||
-        window.Nd2LatestRequest.isAbortError(error)
-      ) return;
-      clearHistograms(false); // manual LUT controls remain usable
-    })
-    .finally(() => state.histogram.requests.finish(ticket));
-}
-
 function scheduleHistograms(delay) {
-  clearTimeout(state.histogram.timer);
-  state.histogram.timer = null;
-  state.histogram.requests.invalidate();
-  const context = activeFrameContext();
-  clearHistograms(!context);
-  if (!context) return;
-  const run = () => {
-    state.histogram.timer = null;
-    requestHistograms(context);
-  };
-  if (delay > 0) state.histogram.timer = setTimeout(run, delay);
-  else run();
+  frameRequests.histograms.schedule(delay);
 }
 
 function loadHistograms() {
@@ -1350,92 +966,11 @@ function positionPixelHud(point) {
 }
 
 function queuePixelProbe(x, y) {
-  const context = activeFrameContext();
-  if (!context) {
-    invalidatePixelProbe(false);
-    return;
-  }
-  state.pixel.queued = { x, y, context };
-  pumpPixelProbe();
+  frameRequests.pixels.queue(x, y);
 }
 
 function invalidatePixelProbe(requeue = true) {
-  clearTimeout(state.pixel.timer);
-  state.pixel.timer = null;
-  state.pixel.requests.invalidate();
-  state.pixel.inFlight = null;
-  state.pixel.queued = null;
-  state.pixel.result = null;
-  state.pixel.resultKey = null;
-  state.pixel.failed = false;
-  state.pixel.retryAfter = 0;
-  const context = activeFrameContext();
-  if (!context) {
-    state.pixel.cursor = null;
-    $("pos-um").textContent = "–";
-    $("pos-px").textContent = "–";
-    $("pos-px").title = "";
-  }
-  renderPixelInspector();
-  if (requeue && context && state.pixel.cursor) {
-    queuePixelProbe(state.pixel.cursor.x, state.pixel.cursor.y);
-  }
-}
-
-function pumpPixelProbe() {
-  if (state.pixel.inFlight || state.pixel.timer || !state.pixel.queued) return;
-  const now = Date.now();
-  const wait = Math.max(
-    0,
-    100 - (now - state.pixel.lastStarted),
-    state.pixel.retryAfter - now
-  );
-  state.pixel.timer = setTimeout(() => {
-    state.pixel.timer = null;
-    if (!state.pixel.queued) return;
-    const requested = state.pixel.queued;
-    state.pixel.queued = null;
-    const current = activeFrameContext();
-    if (!current || current.key !== requested.context.key) return;
-    const ticket = state.pixel.requests.begin(requested.context.key);
-    state.pixel.inFlight = ticket;
-    state.pixel.lastStarted = Date.now();
-    const query = appendFrameParams(
-      new URLSearchParams({ x: requested.x, y: requested.y }),
-      requested.context.frame
-    );
-    fetch("api/pixel?" + query.toString(), { cache: "no-store", signal: ticket.signal })
-      .then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
-      .then((data) => {
-        const cursor = state.pixel.cursor;
-        if (
-          !state.pixel.requests.isCurrent(ticket, requested.context.key) ||
-          !responseMatchesFrameContext(data, requested.context) ||
-          !cursor || cursor.x !== requested.x || cursor.y !== requested.y
-        ) return;
-        state.pixel.result = data;
-        state.pixel.resultKey = requested.context.key;
-        state.pixel.failed = false;
-        state.pixel.retryAfter = 0;
-        renderPixelInspector();
-      })
-      .catch((error) => {
-        const cursor = state.pixel.cursor;
-        if (
-          !state.pixel.requests.isCurrent(ticket, requested.context.key) ||
-          window.Nd2LatestRequest.isAbortError(error) ||
-          !cursor || cursor.x !== requested.x || cursor.y !== requested.y
-        ) return;
-        state.pixel.failed = true;
-        state.pixel.retryAfter = Date.now() + 2500;
-        renderPixelInspector();
-      })
-      .finally(() => {
-        state.pixel.requests.finish(ticket);
-        if (state.pixel.inFlight === ticket) state.pixel.inFlight = null;
-        if (state.pixel.queued) pumpPixelProbe();
-      });
-  }, wait);
+  frameRequests.pixels.invalidate(requeue);
 }
 
 function togglePixelInspector() {
@@ -3952,10 +3487,17 @@ function inkColor(a) {
    title bar, resizable from every edge and corner, with working traffic
    lights (close / minimize-to-titlebar / zoom) and remembered geometry. */
 
-let winZ = 30;
+let floatingWindows = null;
 
 function buildWindows() {
   const stage = $("stage-wrap");
+  floatingWindows = window.Nd2FloatingWindows.createManager({
+    stage, document,
+    storage: {
+      getItem: (key) => localStorage.getItem(key),
+      setItem: (key, value) => localStorage.setItem(key, value),
+    },
+  });
   state.windows = {
     channels: makeMacWindow($("win-channels"), {
       key: "channels",
@@ -4020,196 +3562,7 @@ function buildWindows() {
 }
 
 function makeMacWindow(el, opts) {
-  const stage = $("stage-wrap");
-  const body = el.querySelector(".win-body");
-  const titlebar = el.querySelector(".win-titlebar");
-  const store = "nd2wsi.win." + opts.key;
-
-  let st = {
-    rect: opts.def(),
-    collapsed: false,
-    hidden: !!opts.startClosed,
-    zoomRestore: null,
-  };
-  try {
-    // geometry and collapse persist; "closed" is session-only, so panels
-    // come back in their opening state on the next launch
-    const saved = JSON.parse(localStorage.getItem(store) || "null");
-    if (saved && saved.rect) {
-      st.rect = saved.rect;
-      st.collapsed = !!saved.collapsed;
-    }
-  } catch (_) { /* private mode etc. */ }
-
-  function persist() {
-    try {
-      localStorage.setItem(
-        store,
-        JSON.stringify({ rect: st.rect, collapsed: st.collapsed })
-      );
-    } catch (_) { /* ignore */ }
-  }
-
-  function apply() {
-    el.style.left = st.rect.x + "px";
-    el.style.top = st.rect.y + "px";
-    el.style.width = st.rect.w + "px";
-    if (st.collapsed || st.rect.h == null) {
-      el.style.height = "";
-      el.style.maxHeight = Math.max(120, stage.clientHeight - st.rect.y - 12) + "px";
-    } else {
-      el.style.height = st.rect.h + "px";
-      el.style.maxHeight = "";
-    }
-    el.classList.toggle("collapsed", st.collapsed);
-    el.classList.toggle("hidden", st.hidden);
-    if (opts.toolbarBtn) opts.toolbarBtn.classList.toggle("active", !st.hidden);
-  }
-
-  function clampToStage() {
-    const sw = stage.clientWidth;
-    const sh = stage.clientHeight;
-    st.rect.w = Math.min(Math.max(st.rect.w, opts.minW), opts.maxW, sw - 20);
-    st.rect.x = clamp(st.rect.x, 6 - st.rect.w + 60, sw - 60);
-    st.rect.y = clamp(st.rect.y, 6, Math.max(6, sh - 34));
-    apply();
-  }
-
-  function focus() {
-    document.querySelectorAll(".mac-window").forEach((w) => w.classList.remove("focused"));
-    el.classList.add("focused");
-    el.style.zIndex = ++winZ;
-  }
-
-  el.addEventListener("pointerdown", focus);
-
-  // -- dragging by the title bar
-  let dragFrom = null;
-  titlebar.addEventListener("pointerdown", (ev) => {
-    if (ev.target.closest(".tl")) return;
-    dragFrom = { px: ev.clientX, py: ev.clientY, x: st.rect.x, y: st.rect.y };
-    el.classList.add("dragging");
-    titlebar.setPointerCapture(ev.pointerId);
-    ev.preventDefault();
-  });
-  titlebar.addEventListener("pointermove", (ev) => {
-    if (!dragFrom) return;
-    st.rect.x = dragFrom.x + (ev.clientX - dragFrom.px);
-    st.rect.y = dragFrom.y + (ev.clientY - dragFrom.py);
-    clampToStage();
-  });
-  titlebar.addEventListener("pointerup", () => {
-    dragFrom = null;
-    el.classList.remove("dragging");
-    persist();
-  });
-  titlebar.addEventListener("dblclick", (ev) => {
-    if (ev.target.closest(".tl")) return;
-    setCollapsed(!st.collapsed);
-  });
-
-  // -- resizing from edges and corners
-  for (const dir of ["n", "s", "e", "w", "ne", "nw", "se", "sw"]) {
-    const h = document.createElement("div");
-    h.className = "rz rz-" + dir;
-    el.append(h);
-    let from = null;
-    h.addEventListener("pointerdown", (ev) => {
-      from = {
-        px: ev.clientX,
-        py: ev.clientY,
-        x: st.rect.x,
-        y: st.rect.y,
-        w: st.rect.w,
-        h: st.rect.h != null ? st.rect.h : el.offsetHeight,
-      };
-      el.classList.add("resizing");
-      focus();
-      h.setPointerCapture(ev.pointerId);
-      ev.preventDefault();
-      ev.stopPropagation();
-    });
-    h.addEventListener("pointermove", (ev) => {
-      if (!from) return;
-      const dx = ev.clientX - from.px;
-      const dy = ev.clientY - from.py;
-      const r = { ...st.rect, h: from.h };
-      if (dir.includes("e")) r.w = from.w + dx;
-      if (dir.includes("s")) r.h = from.h + dy;
-      if (dir.includes("w")) { r.w = from.w - dx; r.x = from.x + dx; }
-      if (dir.includes("n")) { r.h = from.h - dy; r.y = from.y + dy; }
-      if (r.w < opts.minW) { if (dir.includes("w")) r.x -= opts.minW - r.w; r.w = opts.minW; }
-      if (r.w > opts.maxW) { if (dir.includes("w")) r.x += r.w - opts.maxW; r.w = opts.maxW; }
-      if (r.h < opts.minH) { if (dir.includes("n")) r.y -= opts.minH - r.h; r.h = opts.minH; }
-      st.rect = r;
-      apply();
-      if (opts.onResize) opts.onResize();
-    });
-    h.addEventListener("pointerup", () => {
-      from = null;
-      el.classList.remove("resizing");
-      persist();
-    });
-  }
-
-  // -- traffic lights
-  function setCollapsed(on) {
-    st.collapsed = on;
-    apply();
-    persist();
-  }
-  function close(silent) {
-    st.hidden = true;
-    apply();
-    if (!silent) persist();
-  }
-  function open() {
-    st.hidden = false;
-    st.collapsed = false;
-    apply();
-    clampToStage();
-    focus();
-    persist();
-    if (opts.onResize) opts.onResize();
-    if (opts.onOpen) opts.onOpen();
-  }
-  el.querySelector(".tl-close").addEventListener("click", () => close(false));
-  el.querySelector(".tl-min").addEventListener("click", () => setCollapsed(!st.collapsed));
-  el.querySelector(".tl-zoom").addEventListener("click", () => {
-    if (st.zoomRestore) {
-      st.rect = st.zoomRestore;
-      st.zoomRestore = null;
-    } else {
-      st.zoomRestore = { ...st.rect };
-      st.rect = { ...st.rect, w: opts.zoomW, h: null };
-    }
-    st.collapsed = false;
-    clampToStage();
-    persist();
-    if (opts.onResize) opts.onResize();
-  });
-
-  if (opts.toolbarBtn) {
-    opts.toolbarBtn.addEventListener("click", () => (st.hidden ? open() : close(false)));
-  }
-
-  const api = {
-    el,
-    open,
-    close,
-    clampToStage,
-    fitContent() {
-      st.rect.h = null;
-      st.collapsed = false;
-      apply();
-      persist();
-    },
-    isHidden: () => st.hidden,
-    bodyWidth: () => Math.max(180, (body.clientWidth || st.rect.w - 2) - 24),
-  };
-  apply();
-  clampToStage();
-  return api;
+  return floatingWindows.createWindow(el, opts);
 }
 
 /* ---- plate mode ------------------------------------------------------------

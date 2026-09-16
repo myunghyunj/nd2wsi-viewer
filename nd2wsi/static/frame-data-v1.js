@@ -1,0 +1,153 @@
+/* Frame-owned histogram and pixel requests; no DOM or viewer dependencies. */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  else root.Nd2FrameData = api;
+})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+  "use strict";
+
+  function createHistogramController({
+    state, readContext, matchesResponse, appendFrameParams, isAbortError,
+    fetch, onHistograms, onClear, setTimer = setTimeout, clearTimer = clearTimeout,
+  }) {
+    function requestHistograms(context) {
+      if (!context || readContext()?.key !== context.key) return;
+      const q = appendFrameParams(new URLSearchParams(), context.frame).toString();
+      const ticket = state.requests.begin(context.key);
+      return fetch("api/histogram" + (q ? "?" + q : ""), {
+        cache: "no-store",
+        signal: ticket.signal,
+      })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
+        .then((data) => {
+          if (
+            !state.requests.isCurrent(ticket, context.key) ||
+            !matchesResponse(data, context)
+          ) return;
+          onHistograms(data.channels);
+        })
+        .catch((error) => {
+          if (
+            !state.requests.isCurrent(ticket, context.key) ||
+            isAbortError(error)
+          ) return;
+          onClear(false); // manual LUT controls remain usable
+        })
+        .finally(() => state.requests.finish(ticket));
+    }
+
+    function scheduleHistograms(delay) {
+      clearTimer(state.timer);
+      state.timer = null;
+      state.requests.invalidate();
+      const context = readContext();
+      onClear(!context);
+      if (!context) return;
+      const run = () => {
+        state.timer = null;
+        requestHistograms(context);
+      };
+      if (delay > 0) state.timer = setTimer(run, delay);
+      else run();
+    }
+
+    return { schedule: scheduleHistograms };
+  }
+
+  function createPixelProbeController({
+    state, readContext, matchesResponse, appendFrameParams, isAbortError,
+    fetch, onRender, onClearCursor, now = () => Date.now(),
+    setTimer = setTimeout, clearTimer = clearTimeout,
+  }) {
+    function queuePixelProbe(x, y) {
+      const context = readContext();
+      if (!context) {
+        invalidatePixelProbe(false);
+        return;
+      }
+      state.queued = { x, y, context };
+      pumpPixelProbe();
+    }
+
+    function invalidatePixelProbe(requeue = true) {
+      clearTimer(state.timer);
+      state.timer = null;
+      state.requests.invalidate();
+      state.inFlight = null;
+      state.queued = null;
+      state.result = null;
+      state.resultKey = null;
+      state.failed = false;
+      state.retryAfter = 0;
+      const context = readContext();
+      if (!context) {
+        state.cursor = null;
+        onClearCursor();
+      }
+      onRender();
+      if (requeue && context && state.cursor) {
+        queuePixelProbe(state.cursor.x, state.cursor.y);
+      }
+    }
+
+    function pumpPixelProbe() {
+      if (state.inFlight || state.timer || !state.queued) return;
+      const time = now();
+      const wait = Math.max(
+        0,
+        100 - (time - state.lastStarted),
+        state.retryAfter - time
+      );
+      state.timer = setTimer(() => {
+        state.timer = null;
+        if (!state.queued) return;
+        const requested = state.queued;
+        state.queued = null;
+        const current = readContext();
+        if (!current || current.key !== requested.context.key) return;
+        const ticket = state.requests.begin(requested.context.key);
+        state.inFlight = ticket;
+        state.lastStarted = now();
+        const query = appendFrameParams(
+          new URLSearchParams({ x: requested.x, y: requested.y }),
+          requested.context.frame
+        );
+        fetch("api/pixel?" + query.toString(), { cache: "no-store", signal: ticket.signal })
+          .then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
+          .then((data) => {
+            const cursor = state.cursor;
+            if (
+              !state.requests.isCurrent(ticket, requested.context.key) ||
+              !matchesResponse(data, requested.context) ||
+              !cursor || cursor.x !== requested.x || cursor.y !== requested.y
+            ) return;
+            state.result = data;
+            state.resultKey = requested.context.key;
+            state.failed = false;
+            state.retryAfter = 0;
+            onRender();
+          })
+          .catch((error) => {
+            const cursor = state.cursor;
+            if (
+              !state.requests.isCurrent(ticket, requested.context.key) ||
+              isAbortError(error) ||
+              !cursor || cursor.x !== requested.x || cursor.y !== requested.y
+            ) return;
+            state.failed = true;
+            state.retryAfter = now() + 2500;
+            onRender();
+          })
+          .finally(() => {
+            state.requests.finish(ticket);
+            if (state.inFlight === ticket) state.inFlight = null;
+            if (state.queued) pumpPixelProbe();
+          });
+      }, wait);
+    }
+
+    return { queue: queuePixelProbe, invalidate: invalidatePixelProbe };
+  }
+
+  return { createHistogramController, createPixelProbeController };
+});

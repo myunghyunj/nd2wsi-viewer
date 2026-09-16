@@ -1,7 +1,8 @@
 nd2wsi-viewer for Windows
 
-This is a locally delivered Windows package. It has not been uploaded to
-GitHub Releases. Keep the matching .sha256 file supplied beside the ZIP.
+Download published Windows packages and their matching .sha256 files from:
+https://github.com/myunghyunj/nd2wsi-viewer/releases
+Keep the matching checksum supplied beside this ZIP.
 
 1. Extract the entire ZIP to a folder on your computer.
 2. Open nd2wsi-viewer.exe inside that folder.
@@ -21,10 +22,9 @@ with Windows 11. If your organization removed it, install the runtime from:
 https://developer.microsoft.com/microsoft-edge/webview2/
 Select the runtime for your operating system (ARM64 on an ARM64 PC).
 
-Updates: obtain a newer locally supplied Windows ZIP and extract it into a
+Updates: obtain a newer Windows ZIP from GitHub Releases and extract it into a
 new folder after closing the current app. Windows updates are installed
-manually. The update button opens the upstream releases page; it does not
-provide this unpublished Windows package.
+manually. The update button opens the releases page for downloads.
 
 This portable build does not register file associations or need administrator
 access. Windows may display an unknown-publisher SmartScreen prompt because

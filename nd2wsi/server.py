@@ -28,25 +28,36 @@ GET/POST /s/<sid>/api/annotations   sidecar annotations
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import math
 import os
 import re
 import stat
-import tempfile
 import threading
 import time
 import urllib.parse
-import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from . import render
+from .annotation_sidecars import (
+    SLIDE_SUFFIXES,
+    _manifest_source_path,
+    annotations_sidecar,
+    plate_annotations_sidecar,
+)
+from .cache_removal import (
+    _delete_verified_cache_file,
+    _delete_verified_cache_tree,
+    _same_file_identity,
+    _validate_file_cache_for_trash,
+    rescue_annotations,
+)
 from .direct import _Lifecycle
+from .region_export import JOB_RE, ExportRequestError, prepare_export
 
 STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
@@ -55,7 +66,6 @@ ASSOCIATED_RE = re.compile(
     r"^/api/associated/(thumbnail|label|macro)\.jpg$"
 )
 SLIDE_RE = re.compile(r"^/s/([0-9a-f]{8})(/.*)?$")
-JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 # region-export progress, polled by the viewer's status bar
 EXPORT_JOBS: dict[str, dict] = {}
@@ -80,7 +90,6 @@ def _job_get(job: str) -> dict:
     d.pop("t", None)
     return d or {"state": "unknown", "pct": 0}
 
-SLIDE_SUFFIXES = {".nd2", ".svs"}
 
 
 _LIMND2_OK: bool | None = None
@@ -257,20 +266,6 @@ def _inspection_storage_details(
         details.update(manifested)
     details["mode"] = _storage_mode(meta)
     return details
-
-
-def _manifest_source_path(container: Path, manifest: dict[str, Any]) -> Path | None:
-    from .cache import source_base
-
-    src = manifest.get("source") or {}
-    rel = src.get("relative_path") if isinstance(src, dict) else None
-    if not isinstance(rel, str) or not rel:
-        return None
-    candidate = (source_base(container) / rel).resolve()
-    recorded_name = src.get("name")
-    if recorded_name and candidate.name != Path(str(recorded_name)).name:
-        return None
-    return candidate
 
 
 def _associated_source_path(st: ViewerState) -> Path | None:
@@ -452,503 +447,6 @@ def store_generation(store_path: str | Path) -> str:
         return format(probe.stat().st_mtime_ns, "x")
     except OSError:
         return ""
-
-
-def _validate_file_cache_for_trash(path: Path, manifest: dict[str, Any]) -> None:
-    """Fail closed on embedded user work, unfamiliar formats, or active journals."""
-    from .cache import MANIFEST_NAME, SINGLE_FILE_FORMAT, STORE_NAME
-    from .storage.single_file import SQLiteStore
-
-    for suffix in ("-journal", "-wal", "-shm"):
-        companion = path.with_name(path.name + suffix)
-        if companion.exists() or companion.is_symlink():
-            raise ValueError("cache has a SQLite journal; close its writer before deleting")
-    with SQLiteStore(path, read_only=True) as store:
-        current = json.loads(store.read_bytes(MANIFEST_NAME))
-        if not isinstance(current, dict) or not current.get("complete"):
-            raise ValueError("refusing to delete an incomplete cache")
-        kind = current.get("kind")
-        expected_format = "nd2wsi-plate/2" if kind == "plate" else SINGLE_FILE_FORMAT
-        if kind not in ("full", "overview", "plate") or current.get("format") != expected_format:
-            raise ValueError("refusing to delete an unfamiliar cache format")
-        if not manifest.get("generation") or current.get("generation") != manifest.get("generation"):
-            raise ValueError("cache generation changed; reopen before deleting")
-        prefix = "thumbs.zarr" if kind == "plate" else STORE_NAME
-        arrays = {"thumbs", "done", "digest", "focus"} if kind == "plate" else None
-        for key in store.list_keys():
-            if key == MANIFEST_NAME:
-                continue
-            parts = key.split("/")
-            owned = len(parts) == 2 and parts[0] == prefix and parts[1] in (
-                ".zattrs", ".zgroup", ".zmetadata",
-            )
-            if len(parts) == 3 and parts[0] == prefix:
-                array = parts[1] in arrays if arrays is not None else parts[1].isdigit()
-                owned = array and (
-                    parts[2] in (".zarray", ".zattrs")
-                    or re.fullmatch(r"\d+(?:\.\d+)*", parts[2]) is not None
-                )
-            if not owned:
-                raise ValueError(f"unknown or user-owned embedded entry; cache preserved: {key}")
-
-
-def _delete_verified_cache_file(path: Path, expected: os.stat_result, root_fd: int,
-                                on_progress=None) -> int:
-    """Unlink only the renamed, still-guarded regular file; never follow links."""
-    try:
-        current = path.stat(follow_symlinks=False)
-        if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
-                or not _same_file_identity(current, expected)
-                or not _same_file_identity(os.fstat(root_fd), current)):
-            raise OSError(f"cache changed before deletion; retained safely at {path}")
-        size = current.st_size
-        if os.name == "nt":
-            from .windows_fs import _delete_handle, open_guard
-
-            fd = open_guard(path, delete=True)
-            try:
-                if not _same_file_identity(os.fstat(fd), expected):
-                    raise OSError(f"cache changed before deletion: {path}")
-                _delete_handle(fd)
-            finally:
-                os.close(fd)
-        else:
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            parent_fd = os.open(path.parent, flags)
-            try:
-                current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-                if not stat.S_ISREG(current.st_mode) or not _same_file_identity(current, expected):
-                    raise OSError(f"cache changed before deletion: {path}")
-                os.unlink(path.name, dir_fd=parent_fd)
-            finally:
-                os.close(parent_fd)
-        if on_progress:
-            on_progress(1.0)
-        return size
-    finally:
-        os.close(root_fd)
-
-
-def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
-    """Copy annotation sidecars out of ``folder`` before it is deleted.
-
-    Annotations belong beside the slide, but a store built by an older
-    version may hold them, and they are work rather than cache. Returns the
-    new safe copies. Any copy failure is fatal to cache deletion: the caller
-    must never destroy the only copy of user work.
-    """
-    folder, home = Path(folder), Path(home)
-    try:
-        folder_stat = folder.stat(follow_symlinks=False)
-    except OSError as exc:
-        raise OSError(f"could not inspect annotation source: {folder}") from exc
-    if not stat.S_ISDIR(folder_stat.st_mode):
-        raise ValueError(f"annotation source is not a real directory: {folder}")
-    home.mkdir(parents=True, exist_ok=True)
-    folder_resolved = folder.resolve()
-    home_resolved = home.resolve()
-    if home_resolved == folder_resolved or folder_resolved in home_resolved.parents:
-        raise ValueError("annotation rescue destination is inside the doomed cache")
-    saved = []
-    for path in folder.rglob("annotations_*.json"):
-        try:
-            source = path.read_bytes()
-        except OSError as exc:
-            raise OSError(f"could not read annotation before cache deletion: {path}") from exc
-        target = home / path.name
-        while True:
-            fd = None
-            owned_target = False
-            try:
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                owned_target = True
-            except FileExistsError:
-                try:
-                    target_stat = target.lstat()
-                    # Never count a symlink as a safe rescue. It may merely
-                    # point back into the cache that is about to disappear.
-                    target_resolved = target.resolve(strict=True)
-                    outside_doomed = not (
-                        target_resolved == folder_resolved
-                        or folder_resolved in target_resolved.parents
-                    )
-                    if (
-                        stat.S_ISREG(target_stat.st_mode)
-                        and outside_doomed
-                        and target.read_bytes() == source
-                    ):
-                        break  # an identical safe copy already exists
-                except OSError:
-                    pass
-                # A same-named but distinct annotation is still user work.
-                # UUID allocation plus O_EXCL makes concurrent rescues safe.
-                target = home / (
-                    f"{path.stem}.rescued-{time.strftime('%Y%m%dT%H%M%S')}-"
-                    f"{uuid.uuid4().hex[:8]}{path.suffix}"
-                )
-                continue
-            try:
-                with os.fdopen(fd, "wb") as out:
-                    fd = None  # the file object owns it now
-                    out.write(source)
-                    out.flush()
-                    os.fsync(out.fileno())
-                if target.read_bytes() != source:
-                    raise OSError(f"annotation verification failed: {target}")
-                # File fsync does not necessarily persist its new directory
-                # entry. Flush the destination directory when the filesystem
-                # supports it before the embedded original can be deleted.
-                dir_fd = None
-                try:
-                    # CRT directory fsync is unavailable on Windows. The file
-                    # itself was flushed with FlushFileBuffers via os.fsync.
-                    if os.name != "nt":
-                        dir_fd = os.open(
-                            home,
-                            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                        )
-                        os.fsync(dir_fd)
-                except OSError as exc:
-                    if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF):
-                        raise
-                finally:
-                    if dir_fd is not None:
-                        os.close(dir_fd)
-            except BaseException:
-                if fd is not None:
-                    os.close(fd)
-                if owned_target:
-                    try:
-                        target.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                raise
-            saved.append(target)
-            break
-    return saved
-
-
-def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
-    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
-
-
-def _open_child_directory(
-    parent_fd: int,
-    name: str,
-    expected: os.stat_result,
-) -> int:
-    """Open exactly one already-inspected child without following a symlink."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(name, flags, dir_fd=parent_fd)
-    try:
-        opened = os.fstat(fd)
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(opened.st_mode)
-            or not _same_file_identity(opened, expected)
-            or not _same_file_identity(opened, current)
-        ):
-            raise OSError(errno.EPERM, "cache directory changed during deletion", name)
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
-def _tree_totals_fd(directory_fd: int) -> tuple[int, int]:
-    files = 0
-    logical_bytes = 0
-    for name in os.listdir(directory_fd):
-        try:
-            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISDIR(entry.st_mode):
-            child_fd = _open_child_directory(directory_fd, name, entry)
-            try:
-                child_files, child_bytes = _tree_totals_fd(child_fd)
-            finally:
-                os.close(child_fd)
-            files += child_files
-            logical_bytes += child_bytes
-        else:
-            files += 1
-            logical_bytes += int(entry.st_size)
-    return files, logical_bytes
-
-
-def _delete_tree_contents_fd(
-    directory_fd: int,
-    *,
-    total: int,
-    progress: list[int],
-    on_progress: Any,
-) -> int:
-    """Delete one opened tree without ever following a pathname symlink."""
-    freed = 0
-    for name in os.listdir(directory_fd):
-        try:
-            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISDIR(entry.st_mode):
-            child_fd = _open_child_directory(directory_fd, name, entry)
-            try:
-                freed += _delete_tree_contents_fd(
-                    child_fd,
-                    total=total,
-                    progress=progress,
-                    on_progress=on_progress,
-                )
-            finally:
-                os.close(child_fd)
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if not _same_file_identity(current, entry):
-                raise OSError(
-                    errno.EPERM,
-                    "cache directory changed during deletion",
-                    name,
-                )
-            os.rmdir(name, dir_fd=directory_fd)
-            continue
-
-        try:
-            os.unlink(name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            continue
-        freed += int(entry.st_size)
-        progress[0] += 1
-        if on_progress:
-            on_progress(min(progress[0] / max(1, total), 0.99))
-    return freed
-
-
-def _delete_verified_cache_tree(
-    path: Path,
-    expected: os.stat_result,
-    on_progress: Any = None,
-    root_fd: int | None = None,
-) -> int:
-    """Remove the captured cache inode with fd-relative, no-follow traversal."""
-    if os.name == "nt":
-        from .windows_fs import delete_verified_tree
-
-        if root_fd is not None:
-            os.close(root_fd)
-        return delete_verified_tree(path, expected, on_progress)
-    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    parent_fd = None
-    try:
-        # The caller may transfer an already-open cache root. Opening the
-        # parent can itself fail, so enter the cleanup scope before that first
-        # operation or the transferred descriptor would leak.
-        parent_fd = os.open(path.parent, parent_flags)
-        if root_fd is None:
-            root_fd = _open_child_directory(parent_fd, path.name, expected)
-        else:
-            opened = os.fstat(root_fd)
-            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or not _same_file_identity(opened, expected)
-                or not _same_file_identity(opened, current)
-            ):
-                raise OSError(
-                    errno.EPERM,
-                    "cache root changed during deletion",
-                    str(path),
-                )
-        try:
-            total, _ = _tree_totals_fd(root_fd)
-            freed = _delete_tree_contents_fd(
-                root_fd,
-                total=total,
-                progress=[0],
-                on_progress=on_progress,
-            )
-        finally:
-            os.close(root_fd)
-            root_fd = None
-        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if not _same_file_identity(current, expected):
-            raise OSError(
-                errno.EPERM,
-                "cache root changed during deletion",
-                str(path),
-            )
-        os.rmdir(path.name, dir_fd=parent_fd)
-    except Exception as exc:
-        raise OSError(
-            f"cache deletion incomplete; remaining data was kept at {path}: {exc}"
-        ) from exc
-    finally:
-        if root_fd is not None:
-            os.close(root_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
-    if on_progress:
-        on_progress(1.0)
-    return freed
-
-
-def _annotation_source_name(path: Path) -> str | None:
-    """Return a legacy sidecar's declared source name, when present."""
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    source = payload.get("source")
-    if isinstance(source, dict):
-        name = source.get("name")
-        return Path(str(name)).name if name else None
-    if isinstance(source, str):
-        return Path(source).name
-    return None
-
-
-def _legacy_sidecar_matches(path: Path, source_name: str, home: Path) -> bool:
-    """Whether an unscoped sidecar can be migrated without guessing."""
-    declared = _annotation_source_name(path)
-    if declared is not None:
-        return declared == source_name
-    stem = Path(source_name).stem
-    try:
-        siblings = [
-            item
-            for item in home.iterdir()
-            if item.is_file()
-            and item.stem == stem
-            and item.suffix.lower() in SLIDE_SUFFIXES
-        ]
-    except OSError:
-        siblings = []
-    return len(siblings) <= 1
-
-
-def annotations_sidecar(
-    store_path: str | Path, attrs: dict[str, Any], *,
-    migrate: bool = True, legacy_paths: list[Path] | None = None,
-) -> Path:
-    """Return a sidecar path scoped to the source file and selected plane.
-
-    An annotation belongs to one level-0 coordinate space. T, P, and Z are
-    therefore part of its identity, just as they are part of cache identity.
-    An older unscoped sidecar is claimed by the default plane and copied
-    for any other, so every selection keeps seeing its 0.9 work.
-    """
-    from .cache import (
-        ANNOTATIONS_DIR,
-        MANAGED_DIR,
-        manifest_container,
-        read_manifest,
-        selection_tag,
-    )
-    from .convert import CACHE_DIR_NAME
-
-    store_path = Path(store_path).resolve()
-    meta = attrs["nd2wsi"]
-    source_name = Path(meta["source"]).name
-    stem = Path(source_name).stem
-
-    container = manifest_container(store_path)
-    home = container.parent if container is not None else store_path.parent
-    if home.name in (CACHE_DIR_NAME, "caches"):
-        home = home.parent
-    if home.name == MANAGED_DIR:
-        home = home.parent
-
-    manifest = read_manifest(container) if container is not None else None
-    if manifest and container is not None:
-        source = _manifest_source_path(container, manifest)
-        if source is not None and source.is_file() and source.name == source_name:
-            home = source.parent
-    raw_selection = (manifest or {}).get("selection") or meta.get("selection") or {}
-    selection = {
-        key: raw_selection[key]
-        for key in ("t", "p")
-        if key in raw_selection
-    }
-    if "z_resolved" in raw_selection:
-        selection["z"] = raw_selection["z_resolved"]
-    elif "z" in raw_selection:
-        selection["z"] = raw_selection["z"]
-
-    safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", source_name)
-    filename = f"annotations_{safe_source}"
-    if selection:
-        filename += f"--{selection_tag(selection)}"
-    filename += ".json"
-
-    target_dir = home / MANAGED_DIR / ANNOTATIONS_DIR
-    if migrate:
-        target_dir.mkdir(parents=True, exist_ok=True)
-    new = target_dir / filename
-
-    if not new.exists():
-        import shutil
-
-        old_paths = (
-            target_dir / f"annotations_{stem}.json",
-            home / f"annotations_{stem}.json",
-            home / CACHE_DIR_NAME / f"annotations_{stem}.json",
-            home / f"{stem}.annotations.json",
-            store_path.parent / f"annotations_{stem}.json",
-        )
-        for old in old_paths:
-            if old == new or not old.exists():
-                continue
-            if not _legacy_sidecar_matches(old, source_name, home):
-                note = (
-                    f"legacy annotation sidecar {old.name} was not imported "
-                    "because its source is ambiguous"
-                )
-                if note not in meta.setdefault("notes", []):
-                    meta["notes"].append(note)
-                continue
-            if not migrate:
-                if legacy_paths is not None:
-                    legacy_paths.append(old)
-                break
-            # the default plane inherits the unscoped file outright; any
-            # other selection takes a copy, because one unscoped sidecar
-            # used to serve every plane and the rest must keep finding it
-            claim = not selection or (
-                int(raw_selection.get("t", 0) or 0) == 0
-                and int(raw_selection.get("p", 0) or 0) == 0
-                and str(raw_selection.get("z", "mid")) in ("mid", "0")
-            )
-            try:
-                if claim:
-                    old.rename(new)
-                else:
-                    shutil.copy2(old, new)
-                break
-            except OSError:
-                continue
-    return new
-
-
-def plate_annotations_sidecar(
-    path: str | Path, attrs: dict[str, Any], p: int, *, create_directory: bool = True,
-) -> Path:
-    """The sidecar for one site of a plate file, beside the slide.
-
-    Annotations on a plate are per site and shared across time and z, so
-    the site index is the only scope in the name.
-    """
-    from .cache import ANNOTATIONS_DIR, MANAGED_DIR
-
-    path = Path(path).resolve()
-    source_name = Path(attrs["nd2wsi"]["source"]).name or path.name
-    safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", source_name)
-    target_dir = path.parent / MANAGED_DIR / ANNOTATIONS_DIR
-    if create_directory:
-        target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"annotations_{safe_source}--site{int(p)}.json"
 
 
 class SlideRegistry:
@@ -2421,134 +1919,31 @@ def make_handler(
                 raise
 
         def _roi_impl(self, st: ViewerState, q: dict):
-            def qi(name: str, default: int | None = None) -> int:
-                v = q.get(name)
-                if not v:
-                    if default is None:
-                        raise ValueError(f"missing parameter {name}")
-                    return default
-                return int(float(v[0]))
-
-            meta = st.attrs["nd2wsi"]
-            level = qi("level", 0)
+            prefix = (
+                f"agent-{registry.window_session.id[:12]}_"
+                if registry.agent_window else ""
+            )
             try:
-                lv = render.level_entry(meta["levels"], level)
-            except KeyError:
-                return self._error(400, f"level {level} out of range")
-            lw, lh = lv["width"], lv["height"]
-            try:
-                x, y, w, h = qi("x"), qi("y"), qi("w"), qi("h")
-            except ValueError as e:
-                return self._error(400, str(e))
-            x, y = max(0, min(x, lw - 1)), max(0, min(y, lh - 1))
-            w, h = max(1, min(w, lw - x)), max(1, min(h, lh - y))
-            fmt = (q.get("format") or ["nd2"])[0].lower()
-            scale_bar = fmt == "svg" or (q.get("scalebar") or ["0"])[0] == "1"
-            if scale_bar and fmt not in ("svg", "jpg", "jpeg"):
-                return self._error(400, "Scale bar export supports SVG and JPEG")
-            n = len(st.attrs["omero"]["channels"])
-            channels = render.parse_channels((q.get("c") or [None])[0], n)
-            win = (q.get("win") or [None])[0]
-            job = (q.get("job") or [None])[0]
-            if job and not JOB_RE.match(job):
-                job = None
-            stem = Path(meta["source"]).stem
-            try:
-                frame = _frame_args(st, q, require_p=True)
-            except ValueError as e:
-                return self._error(400, str(e))
-            root = st.root
-            if frame is not None:
-                root = st.plate.root_for(*frame)
-                stem += "_t{}_p{}_z{}".format(*frame)
-            fname = f"{stem}_L{level}_x{x}_y{y}_{w}x{h}"
-            if registry.agent_window:
-                fname = f"agent-{registry.window_session.id[:12]}_{fname}"
-
-            if fmt in ("nd2", "tif", "tiff"):
-                # write through an on-disk temp file so RAM stays bounded for
-                # arbitrarily large regions, then stream it to the client
-                is_nd2 = fmt == "nd2"
-                ext = ".nd2" if is_nd2 else ".tif"
-                ctype = "application/octet-stream" if is_nd2 else "image/tiff"
-                tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-                _job_update(job, state="writing", pct=0)
-
-                def on_progress(frac: float) -> None:
-                    _job_update(job, state="writing", pct=int(min(1.0, frac) * 100))
-
-                try:
-                    tmp.close()
-                    if is_nd2:
-                        from .export_nd2 import export_roi_nd2
-
-                        try:
-                            export_roi_nd2(
-                                root, st.attrs, tmp.name,
-                                level, x, y, w, h, channels,
-                                on_progress=on_progress,
-                            )
-                        except (RuntimeError, ValueError) as e:
-                            _job_update(job, state="error", error=str(e))
-                            return self._error(400, str(e))
-                    else:
-                        render.export_roi_tiff(
-                            root, st.attrs, tmp.name,
-                            level, x, y, w, h, channels,
-                            on_progress=on_progress,
+                export = prepare_export(st, q, resolve_frame=_frame_args, filename_prefix=prefix)
+                if export.streams_file:
+                    with export.file(_job_update) as artifact:
+                        size = artifact.size
+                        self.send_response(200)
+                        self.send_header("Content-Type", artifact.content_type)
+                        self.send_header("Content-Length", str(size))
+                        self.send_header(
+                            "Content-Disposition", content_disposition(artifact.filename)
                         )
-                    _job_update(job, state="streaming", pct=100)
-                    size = Path(tmp.name).stat().st_size
-                    self.send_response(200)
-                    self.send_header("Content-Type", ctype)
-                    self.send_header("Content-Length", str(size))
-                    self.send_header(
-                        "Content-Disposition", content_disposition(f"{fname}{ext}")
-                    )
-                    self.end_headers()
-                    with open(tmp.name, "rb") as fh:
-                        while True:
-                            buf = fh.read(1024 * 1024)
-                            if not buf:
-                                break
-                            self.wfile.write(buf)
-                    _job_update(job, state="done", pct=100)
-                except BrokenPipeError:
-                    _job_update(job, state="error", error="client disconnected")
-                    raise
-                except Exception as e:
-                    _job_update(job, state="error", error=f"{type(e).__name__}: {e}")
-                    raise
-                finally:
-                    Path(tmp.name).unlink(missing_ok=True)
-                return
-
-            if fmt in ("png", "jpg", "jpeg", "svg"):
-                if w * h / 1e6 > st.max_render_mpx:
-                    return self._error(
-                        400,
-                        f"rendered export capped at {st.max_render_mpx:.0f} MPx; "
-                        f"requested {w * h / 1e6:.0f} MPx -- use format=tiff "
-                        "(streams any size) or a higher level",
-                    )
-                try:
-                    body = render.export_roi_rendered(
-                        root, st.attrs, level, x, y, w, h, channels, fmt, win,
-                        scale_bar=scale_bar,
-                    )
-                except ValueError as e:
-                    return self._error(400, str(e))
-                ext = "jpg" if fmt == "jpeg" else fmt
-                ctype = {"png": "image/png", "jpg": "image/jpeg", "svg": "image/svg+xml"}[ext]
-                if scale_bar:
-                    fname += "_scalebar"
-                return self._send(
-                    200,
-                    body,
-                    ctype,
-                    {"Content-Disposition": content_disposition(f"{fname}.{ext}")},
-                )
-            return self._error(400, f"unknown format {fmt}")
+                        self.end_headers()
+                        artifact.copy_to(self.wfile)
+                    return
+                artifact = export.rendered()
+            except ExportRequestError as e:
+                return self._error(400, str(e))
+            return self._send(
+                200, artifact.body, artifact.content_type,
+                {"Content-Disposition": content_disposition(artifact.filename)},
+            )
 
     return Handler
 

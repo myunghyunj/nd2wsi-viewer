@@ -21,14 +21,31 @@ handles, displayed limits, gamma, Auto/Reset, full-range and optional Auto-fit
 axes, graph zoom/pan and live contrast remain available. Calibrated SVG/JPEG
 scale-bar exports from 2.1.3 are also retained.
 
-This release provides the macOS Apple-silicon DMG (macOS 12 or later).
-The app is ad-hoc signed, not Developer ID notarized. Its Sparkle update is
-signed with the existing update identity. Windows continues to build and run
-in CI; the published Windows download remains
-[v2.0.0](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.0.0).
+This release provides the macOS Apple-silicon DMG (macOS 12 or later) and
+Windows x64 portable ZIP. Windows 11 ARM64 runs the same x64 executable through
+emulation. Windows 10 Education and local Parallels were not directly tested.
+The macOS app is ad-hoc signed, not Developer ID notarized; its Sparkle update
+uses the existing signing identity. Windows updates are manual and the EXE is
+not Authenticode-signed. See [Windows distribution](windows.md) for downloads,
+checksums, prerequisites and exact verification evidence.
 
-The release follows local interactive approval. Main CI and tag real-data
-checks run after publication; their current results are reported on the
-GitHub release page. Local checks include physical comparison behavior,
-LUT interactions, package source/signature verification, ND2 and SVS scientific
-export smoke tests, and the installed native WKWebView renderer.
+## Completed validation
+
+The original macOS release source is
+`596f6bffafe48188d08ba7752366c6bd2829af2d`. Follow-up commit
+`dab37448f583b7d91cd987fae6ca3354e1ad64f0` only fixes UTF-8 decoding in a Windows
+test and is the source of the Windows archive. Application/build files match
+the original tag. Subsequent refactoring on main is not part of these binaries.
+
+- [Main CI passed](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/35117273867).
+- [Real ND2 checks passed](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/35117314024).
+- [Windows build and verification passed](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/35117273821),
+  including 1,237 unit/integration tests, 5 real-data tests, packaged scientific
+  smoke, and native WebView2 on x64 and Windows 11 ARM64 via x64 emulation.
+- Local macOS checks included 1,342 passing tests, physical comparison behavior,
+  LUT interactions, package source/signature verification, ND2/SVS scientific
+  export smoke, the installed WKWebView renderer and signed Sparkle feed.
+
+The Windows archive's original READ-ME describes local/unpublished delivery;
+these release notes supersede those statements. The tested ZIP is published
+unchanged, with its matching checksum. No v2.1.4 Setup installer is published.

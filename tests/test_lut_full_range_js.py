@@ -11,7 +11,8 @@ NODE = shutil.which('node')
 pytestmark = pytest.mark.skipif(NODE is None, reason='node is not installed')
 
 SCRIPT = r'''
-const fs = require('fs'), vm = require('vm');
+const fs = require('fs'), vm = require('vm'), path = require('path');
+const lut = require(path.join(path.dirname(process.argv[1]), 'lut-controls-v1.js'));
 const source = fs.readFileSync(process.argv[1], 'utf8');
 let labels = []; let refreshes = 0;
 const ctx = new Proxy({}, {get:(o,k)=>k==='fillText' ? ((text)=>labels.push(text)) : (o[k] || (()=>{}))});
@@ -21,9 +22,9 @@ function node(tag) { const n={tag,children:[],handlers:{},attrs:{},style:{},valu
  addEventListener(k,fn){this.handlers[k]=fn},getContext(){return ctx},
  setPointerCapture(){},getBoundingClientRect(){return {left:0,top:0}}};nodes.push(n);return n; }
 const state={luts:[null],lutWidgets:[],windows:{channels:{bodyWidth:()=>240}}};
-const context={document:{createElement:node},window:{devicePixelRatio:2,addEventListener(){},removeEventListener(){}},state,
+const context={document:{createElement:node},window:{Nd2LutControls:lut,devicePixelRatio:2,addEventListener(){},removeEventListener(){}},state,
  clamp:(v,l,h)=>Math.max(l,Math.min(h,v)),inkColor:()=>'',currentTheme:()=> 'dark',
- fmtInt:v=>String(Math.round(v)),applyLuts:Object.assign(()=>{refreshes++},{flush(){}})};
+ VIEWPORT_PROTOCOL_VERSION:1,fmtInt:v=>String(Math.round(v)),applyLuts:Object.assign(()=>{refreshes++},{flush(){}})};
 vm.createContext(context);
 vm.runInContext(source.slice(source.indexOf('function buildLutRow('),source.indexOf('function relayoutLuts(')),context);
 const winLabel={};context.buildLutRow(0,{label:'CY5',color:'FF0000',window:{min:0,max:65535,start:102,end:192}},winLabel);
@@ -110,15 +111,14 @@ def test_zoom_pan_bounds_and_pointer_cancel_do_not_change_contrast():
 
 
 LIVE_SCRIPT = r"""
-const fs=require('fs'), vm=require('vm'), source=fs.readFileSync(process.argv[1],'utf8');
+const path=require('path');
+const {liveUpdate}=require(path.join(path.dirname(process.argv[1]),'lut-controls-v1.js'));
 let now=0, next=1, state=[0,0], calls=[];
 const timers=new Map();
-const context={performance:{now:()=>now},window:{addEventListener(){}},
- setTimeout:(fn,delay)=>{const id=next++;timers.set(id,{at:now+delay,fn});return id;},
- clearTimeout:id=>timers.delete(id),refreshTiles:()=>calls.push({at:now,values:[...state]})};
-vm.createContext(context);
-vm.runInContext(source.slice(source.indexOf('const applyLuts ='),source.indexOf('/* Swap the tiles')),context);
-const update=vm.runInContext('applyLuts',context);
+const clock={now:()=>now,
+ setTimer:(fn,delay)=>{const id=next++;timers.set(id,{at:now+delay,fn});return id;},
+ clearTimer:id=>timers.delete(id)};
+const update=liveUpdate(()=>calls.push({at:now,values:[...state]}),100,clock);
 function tick(to){
  while(true){const due=[...timers].filter(([id,t])=>t.at<=to).sort((a,b)=>a[1].at-b[1].at)[0];
  if(!due)break;now=due[1].at;timers.delete(due[0]);due[1].fn();}

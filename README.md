@@ -1,4 +1,4 @@
-> **macOS v2.1.4.** Compare offers **Link scale** for matching physical
+> **macOS and Windows v2.1.4.** Compare offers **Link scale** for matching physical
 > magnification with independent movement, or **Link scale + frame** for linked
 > movement too. The LUT panel uses graph handles without Min/Max entry boxes.
 > **Scale bar + SVG** and **Scale bar + JPEG** remain available for region exports.
@@ -7,13 +7,13 @@
 > slides, with safe recovery to the standard viewer. Multiple independent windows
 > are supported. Metal is opt-in pending a comparable performance measurement;
 > annotations, measurements and export remain in the standard viewer.
-> [Scope and limitations](docs/macos-metal-viewport.md). Windows remains on v2.0.0.
+> [Scope and limitations](docs/macos-metal-viewport.md).
 > This is not disk-to-display zero-copy.
 
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.0.0 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.0.0/nd2wsi-viewer-2.0.0-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.1.4 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -67,16 +67,16 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.0.0-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.0.0/nd2wsi-viewer-2.0.0-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.0.0/nd2wsi-viewer-2.0.0-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.1.4-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides the tested portable ZIP, not a v2.0
+or GPU is required. This release provides the tested portable ZIP, not a v2.1.4
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
-silicon, it uses Windows x64 emulation. The exact v2.0 portable archive passed
+silicon, it uses Windows x64 emulation. The exact v2.1.4 portable archive passed
 scientific and GUI checks on GitHub x64 and Windows 11 ARM64-emulation runners.
 Windows 10 Education and local Parallels were not tested for this release.
 .NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
@@ -135,7 +135,7 @@ The window has no title bar of its own, so the tab strip and the toolbar take it
 
 The mark at the left of the toolbar names the kind of file in two words. 2D or 3D says whether the file holds a z stack, and SLIDE or PLATE says whether it holds one scan position or several. A stitched scan reads 2D SLIDE and the phage assay reads 3D PLATE.
 
-In macOS 2.1.3, the bottom of **Region** offers **Scale bar + SVG** and
+In 2.1.4 on macOS and Windows, the bottom of **Region** offers **Scale bar + SVG** and
 **Scale bar + JPEG**. Both use the image calibration and selected export scale.
 SVG embeds the rendered PNG without changing its pixels and keeps the white bar
 and label editable. JPEG includes the bar at high quality with 4:4:4 colour sampling.
@@ -339,6 +339,9 @@ An eligible ND2, meaning a modern uncompressed file with one stored T/P/Z plane,
 Rebuilding a working set of 39 scans totalling 190 GB measured the trade. Full pyramids took 152 GB, compact caches 36 GB, and a cold 512 px native window from the largest scan read in 170 ms.
 
 ### Development
+
+See [application boundaries and regression coverage](docs/architecture.md) for
+the desktop lifecycle, HTTP/export services and viewer controllers.
 
 ```bash
 uv sync --all-extras

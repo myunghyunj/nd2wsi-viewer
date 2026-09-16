@@ -34,6 +34,7 @@ def _run(script):
 def test_production_loads_helper_and_separates_backing_from_user_frames():
     app = APP.read_text(encoding="utf-8")
     index = INDEX.read_text(encoding="utf-8")
+    frame_data = MODULE.with_name("frame-data-v1.js").read_text(encoding="utf-8")
 
     assert index.index("request-latest-v1.js") < index.index("app.js")
     assert "function activeFrameParams()" in app
@@ -41,8 +42,11 @@ def test_production_loads_helper_and_separates_backing_from_user_frames():
     assert "appendFrameParams(renderParams(new URLSearchParams()), backingFrameParams())" in app
     assert "plateFrameParams" not in app
     assert "withPlateParams" not in app
-    assert 'fetch("api/pixel?"' in app and "requested.context.frame" in app
-    assert 'fetch("api/histogram"' in app and "responseMatchesFrameContext(data, context)" in app
+    assert index.index("frame-data-v1.js") < index.index("app.js")
+    assert "createFrameRequests()" in app
+    assert "matchesResponse: responseMatchesFrameContext" in app
+    assert 'fetch("api/pixel?"' in frame_data and "requested.context.frame" in frame_data
+    assert 'fetch("api/histogram"' in frame_data and "matchesResponse(data, context)" in frame_data
     assert "function normalizeAnnotationSite(site)" in app
     assert "normalizeAnnotationSite(site === undefined ? state.annSite : site)" in app
     assert "appendFrameParams(q, context.frame); // explicit active frame" in app

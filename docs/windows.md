@@ -1,24 +1,38 @@
 # Windows distribution
 
-## Published v2.0.0 download
+## Published v2.1.4 download
 
-Use the [v2.0.0 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.0.0),
-SHA-256 `fd31a16ba74c0df8b445ed46b5dc65d070d6c04b526cbff05fba045f7176a5ea`.
-The exact archive built from `836b05d98d3d18a309e1e6fd0ab936a95589e29c`
-passed scientific and native GUI verification on x64 and Windows 11 ARM64-emulation
-[CI runners](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/34181559081).
+Use the [v2.1.4 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip.sha256).
+
+- ZIP SHA-256: `fc412b86e792d081254712942e4d0b10342490a15b489d47ca12d301ec528c4b`.
+- Built from clean source `dab37448f583b7d91cd987fae6ca3354e1ad64f0`.
+  Application and build code match the original `v2.1.4` tag; the follow-up
+  commit only fixes UTF-8 decoding in a Windows test.
+- The exact same archive passed scientific and native WebView2 GUI checks on
+  x64 Windows and Windows 11 ARM64 through x64 emulation, including Korean and
+  space-containing installation and source paths, in
+  [Windows CI](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/35117273821).
+  The build passed 1,237 unit/integration tests and 5 real-ND2 tests.
+
+This update includes physical scale linking, simplified interactive LUT controls,
+and calibrated SVG/JPEG scale-bar exports. Subsequent source refactoring on main
+is separate from this immutable 2.1.4 archive.
+
 Extract the complete ZIP; retain `_internal` beside the executable. Install
 WebView2 separately if absent. The archive's historical READ-ME local/unpublished
-delivery statements are superseded by the release notes; the archive was not repacked.
+delivery statements are superseded by these release notes; the verified archive
+was not repacked.
 
-No v2.0 Setup installer is published or verified. The installer information below
-describes available build tooling and historical v1.2.8 evidence, not the v2.0
-download. Windows 10 Education and local Parallels remain untested for v2.0.
+No v2.1.4 Setup installer is published or verified. The installer information
+below describes build tooling and historical v1.2.8 evidence. Windows 10
+Education and local Parallels remain untested for v2.1.4. ARM64 execution is x64
+emulation, not an ARM64-native binary.
 
 ## Installer build tooling
 
-The current source targets viewer 2.0.0, with a native Windows frame
-and Microsoft Edge WebView2. `nd2wsi-viewer-2.0.0-Setup.exe` is the expected installer
+The current source targets viewer 2.1.4, with a native Windows frame
+and Microsoft Edge WebView2. `nd2wsi-viewer-2.1.4-Setup.exe` is the expected installer
 name for that version. Setup installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
@@ -31,10 +45,10 @@ whole extracted folder together; the EXE depends on its `_internal` directory.
 Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
-v1.2.8 results below do not establish v2.0.0 Windows hardware verification.
-The current public v2.0 download is the verified portable ZIP described above.
+v1.2.8 results below do not establish v2.1.4 Windows hardware verification.
+The current public v2.1.4 download is the verified portable ZIP described above.
 
-Target execution modes (exact v2.0.0 build verification is still required):
+Target execution modes (the verified CI environments are listed above):
 
 | Computer | Execution |
 | --- | --- |
@@ -64,7 +78,7 @@ and GUI smoke checks, directory-junction refusal, and five locked-file or
 interrupted-removal recovery cases. Scientific-data and app-data sentinels
 survived removal; the temporary test installations were cleaned up.
 Windows 10 Education and separate native x64 hardware were not tested in that run.
-This record applies only to that v1.2.8 artifact, not to the v2.0.0 source,
+This record applies only to that v1.2.8 artifact, not to the v2.1.4 source,
 single-file cache changes, or a newly built installer.
 
 The Windows source was added after the original macOS v1.2.8 tag. The release
@@ -95,7 +109,7 @@ bootstrapper if the runtime is missing. That prerequisite step needs Internet
 access; existing WebView2 installations are reused and are not uninstalled with
 the viewer. App removal preserves added images, annotations, caches, and other
 user files. Reinstalling the same version into its registered directory is
-supported. To change from v1.x to v2.0.0, close the app, uninstall the previous
+supported. To change between different installed versions, close the app, uninstall the previous
 version, then install the new version. Setup will not silently replace a different
 registered version. If retained user files leave the old install folder nonempty,
 choose a new empty installation folder; do not delete research data to make room.
@@ -127,14 +141,14 @@ uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --
 ```
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.0.0-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.1.4-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.0.0-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.1.4-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks
@@ -156,7 +170,7 @@ tags, pull requests, and manual runs pinned to a full commit SHA. It builds on
 x64 Windows and tests the same final archive on x64 Windows and Windows 11 ARM
 runners, saving the archive and smoke evidence as workflow artifacts. A local
 build does not itself require publication. The workflow file alone does not
-establish a successful run for v2.0.0; report the exact tested commit and artifact
+establish a successful run for a particular release; report the exact tested commit and artifact
 hashes from completed jobs.
 
 ## Local behavior
@@ -175,10 +189,9 @@ rollback.
 Close all viewers and migration writers before moving or deleting a cache,
 especially on Windows where open handles can prevent those operations. A write
 can temporarily create a SQLite journal beside the container; do not remove
-journal/companion files to force a one-file appearance. The v2 Windows acceptance
-run must cover read-only reopen, legacy import, Unicode and long paths, and
-cache-handle closure before rename/removal. The historical installer result above
-does not establish that these new Windows checks have passed.
+journal/companion files to force a one-file appearance. The Windows regression suite covers read-only reopen, legacy import, Unicode and long paths, and
+cache-handle closure before rename/removal. The current portable archive and historical installer have separate verification
+evidence; installer results do not validate a newer portable build.
 
 Windows locks use kernel byte-range locking and safe process-liveness checks.
 Cache removal captures file identities and deletes through Windows handles;

@@ -21,5 +21,6 @@ verify `role == "agent"` and a fresh session `id` before continuing.
 - Do not remove/rebuild shared research caches from an Agent window to benchmark.
   Use explicitly isolated test data/output locations.
 - Keep these automation directions in code and this internal file, **not README.md**.
-- This experimental branch is macOS-only. Do not publish a Windows update or
-  replace an active installed app as part of local validation.
+- Publish platform updates only within the user's requested scope and after
+  verifying the exact delivered artifact on its documented execution targets.
+  Do not replace an active installed app as part of local validation.
