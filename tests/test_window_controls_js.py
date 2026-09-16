@@ -38,7 +38,7 @@ def run_case(role="agent", fail=False, supported=True):
         disabled:doc.getElementById('new-agent-window').disabled}));
     })().catch(e => {console.error(e); process.exit(1);});
     """
-    result = subprocess.run([NODE, "-e", script, str(MODULE), json.dumps({"role": role, "fail": fail, "supported": supported})], capture_output=True, text=True, check=True, timeout=20)
+    result = subprocess.run([NODE, "-e", script, str(MODULE), json.dumps({"role": role, "fail": fail, "supported": supported})], capture_output=True, text=True, encoding="utf-8", check=True, timeout=20)
     return json.loads(result.stdout)
 
 

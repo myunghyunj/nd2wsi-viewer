@@ -212,7 +212,8 @@ def test_fetch_is_bounded_https_metadata_only(monkeypatch, index):
 
 @pytest.mark.parametrize("data,url", [(b"x" * (updates.MAX_METADATA_BYTES + 1), updates.RELEASES_API),
                                       (b"{}", updates.RELEASES_API),
-                                      (b"[]", "https://evil.invalid/releases")])
+                                      (b"[]", "https://evil.invalid/releases")],
+                         ids=["oversized", "invalid-json-shape", "redirected"])
 def test_fetch_rejects_large_invalid_or_redirected_index(monkeypatch, data, url):
     monkeypatch.setattr(updates.urllib.request, "urlopen", lambda *a, **kw: Response(data, url))
     with pytest.raises(ValueError):
