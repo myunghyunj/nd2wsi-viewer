@@ -42,3 +42,18 @@ each image's calibration, pyramid level and display transform; missing
 calibration must not silently fall back to a claimed physical match.
 
 The 2.1.4 controls are not part of the 2.1.3 changes.
+
+## Published macOS artifact
+
+Version 2.1.3 is published at:
+https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.3
+
+- Source candidate: `601dc09c12857fc34f0033705dee25e79fe6cc60`.
+- DMG SHA-256: `55bba26e142fbb55907acb6abf81a74c4a446c15a2afe0f53a28ba5498007ce4`.
+- Public download checksum, packaged source equality and deep/strict signature
+  verification passed. Its executable matches the locally installed 2.1.3 app.
+- Sparkle enclosure signature verified with the existing signing identity;
+  all nine older feed entries are preserved.
+- Exact-source real-data checks passed. The remaining macOS matrix and Windows
+  checks were still running at publication; their live results are linked from
+  the release notes. Windows v2.0.0 remains the public Windows package.
