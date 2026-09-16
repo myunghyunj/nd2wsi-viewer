@@ -31,7 +31,6 @@
   <img src="https://img.shields.io/badge/license-MIT-8E8E93?style=flat-square" alt="MIT">
 </p>
 
-![A stitched Nikon scan open in nd2wsi-viewer](docs/overview-slide.png)
 
 ## Why this exists
 
