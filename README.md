@@ -1,5 +1,6 @@
-> **macOS v2.1.2.** LUTs show the full intensity range by default, with optional
-> Auto-fit, X-axis zoom and pan, and live contrast updates while dragging.
+> **macOS v2.1.3.** Region exports now offer **Scale bar + SVG** and
+> **Scale bar + JPEG**. SVG keeps the image as a lossless PNG with an editable,
+> calibrated vector bar and label. LUT range, zoom/pan and live contrast controls remain available.
 > The standard viewer remains the default. On Apple silicon,
 > **Open in Metal** offers direct GPU display for compatible cached fluorescence
 > slides, with safe recovery to the standard viewer. Multiple independent windows
@@ -132,6 +133,12 @@ Press `⌘I` for Slide Info. It lists the pixel size and where it came from, the
 The window has no title bar of its own, so the tab strip and the toolbar take its place. Double-click either one to zoom the window, as you would a title bar, and double-click again to bring it back. The gesture follows the title bar setting in System Settings under Desktop & Dock.
 
 The mark at the left of the toolbar names the kind of file in two words. 2D or 3D says whether the file holds a z stack, and SLIDE or PLATE says whether it holds one scan position or several. A stitched scan reads 2D SLIDE and the phage assay reads 3D PLATE.
+
+In macOS 2.1.3, the bottom of **Region** offers **Scale bar + SVG** and
+**Scale bar + JPEG**. Both use the image calibration and selected export scale.
+SVG embeds the rendered PNG without changing its pixels and keeps the white bar
+and label editable. JPEG includes the bar at high quality with 4:4:4 colour sampling.
+Images without valid calibration cannot export a physical scale bar.
 
 ### Time series of a plate
 

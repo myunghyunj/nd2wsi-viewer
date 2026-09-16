@@ -25,8 +25,12 @@ the selected raster resolution; saving SVG does not create additional image deta
   scale both retain a 100 µm bar, with widths 151.5210 and 75.7605 pixels.
 - Each SVG embeds exactly the ordinary PNG export bytes. At native scale,
   decoded image pixels also match the approved example without modification.
-- This is local implementation/preview validation, not an installed-app update
-  or a published release. The native viewer's existing User session is untouched.
+- Packaged and installed application source equality: 39 Python modules and
+  18 static assets. Deep, strict code-signature verification passed.
+- Installed version 2.1.3 passed the native WKWebView image/bridge smoke and
+  ND2/SVS read, calibrated ND2 round-trip and pixel-exact TIFF export checks.
+- Public release requires the exact-source CI and real-data gates, verified
+  release download and signed Sparkle feed. Windows binaries remain on v2.0.0.
 
 ## Reserved for 2.1.4
 
