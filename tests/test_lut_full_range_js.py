@@ -73,7 +73,7 @@ process.stdout.write(JSON.stringify({navigation,initial,auto,reset,exact,cropped
 
 def test_full_axis_survives_auto_reset_clear_resize_and_lut_updates():
     result = subprocess.run([NODE, '-e', SCRIPT, str(APP)], check=True,
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, encoding='utf-8', timeout=20)
     out = json.loads(result.stdout)
     axis = 'CY5 histogram range 0 to 65535'
     assert out['initial'] == {'axis': axis, 'label': '102–192'}
@@ -93,7 +93,7 @@ def test_full_axis_survives_auto_reset_clear_resize_and_lut_updates():
 
 def test_zoom_pan_bounds_and_pointer_cancel_do_not_change_contrast():
     result = subprocess.run([NODE, '-e', SCRIPT, str(APP)], check=True,
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, encoding='utf-8', timeout=20)
     nav = json.loads(result.stdout)['navigation']
     span = nav['zoom'][1] - nav['zoom'][0]
     assert 0 < span < 65535
@@ -138,7 +138,7 @@ process.stdout.write(JSON.stringify({first,during,beforeRelease,release,afterWai
 
 def test_continuous_drag_renders_before_release_and_flushes_latest_values():
     result = subprocess.run([NODE, '-e', LIVE_SCRIPT, str(APP)], check=True,
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, encoding='utf-8', timeout=20)
     out = json.loads(result.stdout)
     assert out['first'] == [{'at': 0, 'values': [1, 1]}]
     assert len(out['during']) >= 8  # A trailing debounce would never run during this drag.
