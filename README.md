@@ -1,6 +1,7 @@
-> **macOS v2.1.3.** Region exports now offer **Scale bar + SVG** and
-> **Scale bar + JPEG**. SVG keeps the image as a lossless PNG with an editable,
-> calibrated vector bar and label. LUT range, zoom/pan and live contrast controls remain available.
+> **macOS v2.1.4.** Compare offers **Link scale** for matching physical
+> magnification with independent movement, or **Link scale + frame** for linked
+> movement too. The LUT panel uses graph handles without Min/Max entry boxes.
+> **Scale bar + SVG** and **Scale bar + JPEG** remain available for region exports.
 > The standard viewer remains the default. On Apple silicon,
 > **Open in Metal** offers direct GPU display for compatible cached fluorescence
 > slides, with safe recovery to the standard viewer. Multiple independent windows
@@ -120,7 +121,7 @@ Drop either one onto the app.
 
 ![Per-channel colors, brightness range, gamma, and histogram](docs/channels-panel.png)
 
-Every fluorescence channel has its own row in the Channels panel. Pick a color, turn the channel on or off, and drag the two triangles under the histogram to set the darkest and brightest values shown. By default, the histogram axis shows the full integer data range, such as 0 to 65,535 for uint16. Check **Auto-fit LUT range** to crop each channel's axis to its signal distribution; uncheck it to restore the full range. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Min and Max fields let you enter exact display endpoints in either mode. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. Its lower end sits on the background peak of the histogram, so the background goes black and the signal stands out. Hold Shift while dragging to move every channel together.
+Every fluorescence channel has its own row in the Channels panel. Pick a color, turn the channel on or off, and drag the two triangles under the histogram to set the darkest and brightest values shown. By default, the histogram axis shows the full integer data range, such as 0 to 65,535 for uint16. Check **Auto-fit LUT range** to crop each channel's axis to its signal distribution; uncheck it to restore the full range. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. Its lower end sits on the background peak of the histogram, so the background goes black and the signal stands out. Hold Shift while dragging to move every channel together.
 
 A color brightfield slide such as an H&E opens with a light window, and a fluorescence scan opens with a dark one. You can switch either way with the appearance button.
 
@@ -192,15 +193,15 @@ The `Full` button selects the entire slide. A very large picture export is made 
 
 From left: H&E, Masson's trichrome, and CD31 immunofluorescence of the same case, linked. Moving any one pane moves the other two.
 
-Open two or more slides of the same case, press `⌘\`, and choose which slide to link with the one in front. Press `+` in the capsule to link more, up to four in all, so a reference section can sit beside CD31, CD68, and an H&E at the same time. Two slides share the screen, three take a column each, and four fill a grid. When you move one, the others follow in micrometers.
+Open two or more slides, press `⌘\`, and choose which slide to compare with the one in front. Then choose **Off**, **Link scale**, or **Link scale + frame**. Link scale matches micrometres per displayed pixel while letting you move each image independently; Link scale + frame also links movement using the alignment. Press `+` in the capsule to add more slides, up to four. Two slides share the screen, three take a column each, and four fill a grid. Physical linking requires valid pixel calibration in every image; incompatible pixel shapes or orientations show a reason instead of claiming equal scale. Zoom percentages may differ between scans because their pixel sizes differ. Here, frame means viewport position, not acquisition T/P/Z indices.
 
 Scans taken through opposite sides of the glass may need a reflection, not just a rotation. In Compare, choose the image in **Active linked slide**, then use **Flip ↔** (`⌘F`), **Flip ↕**, **↶ 90°**, **↷ 90°** (`⌘R`), or **Transpose** (swap the displayed horizontal and vertical axes). These are image-orientation controls, distinct from transposing the well grid. The reference stays fixed; only the selected linked image changes, around the current view center. **Reset Orientation** restores its original orientation without resetting that center. The viewer does not guess the orientation from `.svs` or `.nd2` filenames. Pair orientations are remembered while the app remains open.
 
-The comparison toolbox's **×** only hides the tools: the linked panes and their alignment stay active. Use the **Show comparison tools** sliders button beside the tab-bar link button to reopen them. The tab-bar **link** button (or `⌘\`) ends the comparison; the link button inside the toolbox pauses/resumes linked movement without closing the panes. Hiding tools also preserves an in-progress landmark edit, which can be resumed by reopening the toolbox.
+The comparison toolbox's **×** only hides the tools: the linked panes and their alignment stay active. Use the **Show comparison tools** sliders button beside the tab-bar link button to reopen them. The tab-bar **link** button (or `⌘\`) ends the comparison; the link button inside the toolbox opens the three linking choices without closing the panes. Hiding tools also preserves an in-progress landmark edit, which can be resumed by reopening the toolbox.
 
 To refine the alignment, press **Align** and click the same four structures on every image, in the same order. The viewer fits rotation, uniform scale and shift, preserving the current mirror state unless **Infer mirror** is selected. This is similarity alignment, not perspective or deformable registration. Landmark residuals are shown in micrometers when calibrated (relative units otherwise). **Done** commits a valid draft; **Cancel** preserves the previous alignment. **Clear Points** clears only the draft. A fitted image's orientation buttons and shortcuts remain protected until **Remove Fit** removes the committed fit. These are display transforms: source pixels, annotation coordinates, and raw exports remain unchanged.
 
-Even a good alignment drifts by a few cells at high magnification. While linked, the arrow keys move the linked slide by one screen pixel, Shift with an arrow by ten, and an Option-drag moves one pane alone. Each nudge becomes part of the alignment.
+Even a good alignment drifts by a few cells at high magnification. With **Link scale + frame**, the arrow keys move the linked slide by one screen pixel, Shift with an arrow by ten, and an Option-drag moves one pane alone. Each nudge becomes part of the alignment. Scale-only movement does not alter the saved alignment.
 
 This is a navigation and manual similarity-alignment aid, not automatic or deformable image registration. Matching orientation alone does not establish pixel correspondence. For serial sections it never claims that cells in sections separated in depth are the same cells.
 
@@ -270,7 +271,7 @@ Shortcuts act on the image workspace. They are ignored while typing in a text fi
 | `⌘R` | rotate the image 90° clockwise on screen |
 | `⌘F` | flip the image horizontally on screen |
 | `⌘\` | link slides |
-| `L` | pause or resume the link |
+| `L` | choose Off, Link scale, or Link scale + frame |
 | `←` `→` `↑` `↓` | nudge the linked slide by a pixel, ten with Shift |
 | `⌥` drag | move one linked pane alone |
 

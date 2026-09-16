@@ -28,9 +28,8 @@ vm.createContext(context);
 vm.runInContext(source.slice(source.indexOf('function buildLutRow('),source.indexOf('function relayoutLuts(')),context);
 const winLabel={};context.buildLutRow(0,{label:'CY5',color:'FF0000',window:{min:0,max:65535,start:102,end:192}},winLabel);
 const widget=state.lutWidgets[0],canvas=nodes.find(n=>n.tag==='canvas');
-const inputs=nodes.filter(n=>n.tag==='input');
 const axis=()=>canvas.attrs['aria-label'];
-const initial={axis:axis(),lo:inputs[0].value,hi:inputs[1].value};
+const initial={axis:axis(),label:winLabel.textContent};
 const bounds=()=>[Number(canvas.attrs['data-axis-min']),Number(canvas.attrs['data-axis-max'])];
 const wheel=(dx,dy,x=120,deltaMode=0)=>canvas.handlers.wheel({deltaX:dx,deltaY:dy,deltaMode,
  clientX:x,clientY:40,preventDefault(){},stopPropagation(){}});
@@ -50,12 +49,12 @@ const fine=Array(256).fill(0);fine[12]=10000;fine[172]=500;
 widget.setHistogram({bins:Array(256).fill(1),vmin:0,vmax:65535,
  autoHistogram:{bins:fine,vmin:96,vmax:239}});
 widget.auto();const auto={axis:axis(),lut:state.luts[0]};
-widget.reset();const reset={axis:axis(),lo:inputs[0].value,hi:inputs[1].value};
-inputs[1].value='50000';inputs[1].handlers.change();
+widget.reset();const reset={axis:axis(),label:winLabel.textContent};
+widget.setLut({lo:102,hi:50000,gamma:1});
 const exact={axis:axis(),lut:state.luts[0]};
 widget.setAutoRange(true);
-const cropped={axis:axis(),lut:state.luts[0],max:inputs[1].max};
-inputs[1].value='40000';inputs[1].handlers.change();
+const cropped={axis:axis(),lut:state.luts[0]};
+widget.setLut({lo:102,hi:40000,gamma:1});
 const croppedEdit=state.luts[0];
 widget.clearHistogram();
 widget.setHistogram({bins:Array(256).fill(1),vmin:0,vmax:65535,
@@ -63,23 +62,21 @@ widget.setHistogram({bins:Array(256).fill(1),vmin:0,vmax:65535,
 const newFrame={axis:axis(),lut:state.luts[0]};
 widget.setAutoRange(false);
 const expanded={axis:axis(),lut:state.luts[0]};
-inputs[1].value='100000';inputs[1].handlers.change();
-const capped=state.luts[0];
-inputs[0].value='';inputs[0].handlers.change();const blank=inputs[0].value;
 widget.clearHistogram();const cleared=axis();
 widget.relayout(500);const resized=axis();
-canvas.handlers.pointerdown({clientX:496,clientY:20,pointerId:1,preventDefault(){}});
+canvas.handlers.pointerdown({clientX:4+40000/65535*492,clientY:5,pointerId:1,preventDefault(){}});
+canvas.handlers.pointermove({clientX:496,clientY:5});
 canvas.handlers.pointerup();const rightEdge=state.luts[0].hi;
-process.stdout.write(JSON.stringify({navigation,initial,auto,reset,exact,cropped,croppedEdit,newFrame,expanded,capped,blank,cleared,resized,rightEdge}));
+process.stdout.write(JSON.stringify({navigation,initial,auto,reset,exact,cropped,croppedEdit,newFrame,expanded,cleared,resized,rightEdge}));
 '''
 
 
-def test_full_axis_survives_auto_reset_clear_resize_and_exact_edits():
+def test_full_axis_survives_auto_reset_clear_resize_and_lut_updates():
     result = subprocess.run([NODE, '-e', SCRIPT, str(APP)], check=True,
                             capture_output=True, text=True, timeout=20)
     out = json.loads(result.stdout)
     axis = 'CY5 histogram range 0 to 65535'
-    assert out['initial'] == {'axis': axis, 'lo': '102', 'hi': '192'}
+    assert out['initial'] == {'axis': axis, 'label': '102–192'}
     assert out['reset'] == out['initial']
     assert out['auto']['axis'] == out['exact']['axis'] == out['cleared'] == out['resized'] == axis
     assert 100 < out['auto']['lut']['lo'] < 110
@@ -87,13 +84,11 @@ def test_full_axis_survives_auto_reset_clear_resize_and_exact_edits():
     assert out['exact']['lut']['hi'] == 50000
     assert out['cropped']['axis'] == 'CY5 histogram range 96 to 239'
     assert out['cropped']['lut'] == out['exact']['lut']
-    assert out['cropped']['max'] == '65535'
     assert out['croppedEdit']['hi'] == 40000
     assert out['newFrame']['axis'] == 'CY5 histogram range 100 to 500'
     assert out['expanded']['axis'] == axis
     assert out['expanded']['lut'] == out['croppedEdit'] == out['newFrame']['lut']
-    assert out['capped']['hi'] == out['rightEdge'] == 65535
-    assert out['blank'] == '102'
+    assert out['rightEdge'] == 65535
 
 
 def test_zoom_pan_bounds_and_pointer_cancel_do_not_change_contrast():

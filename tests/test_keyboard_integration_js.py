@@ -206,7 +206,8 @@ def test_owned_letters_run_before_osd_canvas_defaults(letter, button, tool):
     ({}, []), ({"plate": True}, [True]),
     ({"plate": True, "zCount": 1}, []),
     ({"plate": True, "disabled": ["t-auto"]}, []),
-    ({"plate": True, "compare": {"enabled": True, "linked": True}}, []),
+    ({"plate": True, "compare": {"enabled": True, "linked": True, "frameLinked": True}}, []),
+    ({"plate": True, "compare": {"enabled": True, "linked": True, "frameLinked": False}}, [True]),
     ({"plate": True, "landmark": True}, []),
 ])
 def test_plain_f_only_autofocuses_an_eligible_plate_and_never_flips(config, autofocus):

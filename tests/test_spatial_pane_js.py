@@ -348,3 +348,18 @@ def test_late_linked_viewport_cannot_interrupt_active_option_drag():
       const before=outputs.length;applyLinkedViewport(packet);
       outputs.length===before;
     """) is True
+
+
+def test_scale_only_command_keeps_live_center_even_if_snapshot_and_constraints_are_stale():
+    result = run_app(PAN_VIEW + """
+      loadProduction('finiteViewportPoint');loadProduction('applyLinkedViewport');
+      let zoom=0;
+      state.viewer.viewport.zoomTo=z=>{zoom=z;center={x:-1,y:-1};};
+      state.viewer.viewport.imageToViewportZoom=z=>z;
+      state.viewer.viewport.applyConstraints=()=>{center={x:-2,y:-2};};
+      const packet=command(1,{commandId:'scale-only',scaleOnly:true,
+        centerPx:{x:9999,y:8888},spanPx:{x:400,y:300}});
+      gate.receive(packet);applyLinkedViewport(packet);
+      ({center,zoom,echo:outputs.at(-1).echoOf});
+    """)
+    assert result == {"center": {"x": 100, "y": 200}, "zoom": 2, "echo": "scale-only"}

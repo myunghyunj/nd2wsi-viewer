@@ -117,6 +117,7 @@ for (const [sid, pixel, center] of [
     spatialContext:{key:`context-${sid}`,kind:'slide',sourceGeneration:'gen-'+sid},
     centerPx: center, imagePx: {x:1000, y:800}, pixelSizeUm: {x:pixel, y:pixel},
     spanPx: {x:400, y:300}, containerPx: {x:800, y:600},
+    physicalScale: {x:pixel/2, y:pixel/2, cosine:0},
   });
   context.frames.set(sid,{dataset:{sid},style:{},contentWindow:{}});
 }

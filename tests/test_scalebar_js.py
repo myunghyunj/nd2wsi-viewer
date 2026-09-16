@@ -23,7 +23,8 @@ const c = Math.sin(angle)*config.zoom, d = Math.cos(angle)*config.zoom;
 const det = a*d-b*c;
 const context = {
   window:{devicePixelRatio:config.dpr},
-  state:{viewer:{viewport:{getContainerSize:()=>({x:config.width,y:config.height})}},
+  state:{viewer:{viewport:{getContainerSize:()=>({x:config.width,y:config.height}),
+    getZoom:()=>config.zoom,getMinZoom:()=>.1,getMaxZoom:()=>4,viewportToImageZoom:x=>x}},
     plate:config.grid ? {focus:null} : null},
   pixelSize:()=>config.pixelSize, $:id=>nodes[id],
   viewerElementToImagePoint:p=>({x:(d*p.x-b*p.y)/det+57,y:(-c*p.x+a*p.y)/det+92}),
@@ -33,8 +34,11 @@ const start = source.indexOf('function screenHorizontalUmPerCssPixel(');
 const end = source.indexOf('/* ---- tools: ROI select', start);
 vm.runInContext(source.slice(start,end),context);
 const scale = context.screenHorizontalUmPerCssPixel();
+const physicalStart = source.indexOf('function physicalViewportScale(');
+vm.runInContext(source.slice(physicalStart,source.indexOf('\n}',physicalStart)+2),context);
+const physical = context.physicalViewportScale();
 context.updateScalebar(config.zoom);
-const output = {scale, width:nodes.scalebar.style.width, display:nodes.scalebar.style.display,
+const output = {scale, physical, width:nodes.scalebar.style.width, display:nodes.scalebar.style.display,
   label:nodes['scalebar-label'].textContent};
 // Returning to calibrated data must restore a bar hidden on uncalibrated data.
 const old = config.pixelSize; config.pixelSize = null; context.updateScalebar(config.zoom);
@@ -65,6 +69,11 @@ def test_scalebar_measures_physical_screen_horizontal_distance(
     expected = math.hypot(math.cos(angle) * pixel_size[1],
                           math.sin(angle) * pixel_size[0]) / zoom
     assert out["scale"] == pytest.approx(expected)
+    assert out["physical"]["x"] == pytest.approx(expected)
+    assert out["physical"]["y"] == pytest.approx(
+        math.hypot(math.sin(angle) * pixel_size[1], math.cos(angle) * pixel_size[0]) / zoom)
+    assert out["physical"]["min"] == pytest.approx(expected * zoom / 4)
+    assert out["physical"]["max"] == pytest.approx(expected * zoom / .1)
     length, unit = out["label"].split()
     physical = float(length) * (1000 if unit == "mm" else 1)
     assert float(out["width"].removesuffix("px")) * expected == pytest.approx(physical)
@@ -93,6 +102,7 @@ def test_unknown_invalid_calibration_and_zero_size_hide_bar():
     for changes in ({}, {"pixelSize": [0, 1]}, {"pixelSize": [0.5, 0.25], "width": 0}):
         out = _run({**config, **changes})
         assert out["scale"] is None
+        assert out["physical"] is None
         assert out["display"] == "none"
         assert out["label"] == ""
 

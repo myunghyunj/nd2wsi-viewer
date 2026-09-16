@@ -61,6 +61,7 @@ const compare = {
   toolsVisible: false, // toolbox visibility is independent of group/link state
   toolbarHeight: 0,
   linked: true,
+  linkMode: "scale-frame",
   split: 50,
   mru: [],
   states: new Map(),
@@ -816,6 +817,7 @@ function normalizeViewportState(data, sid) {
     requestId: data.requestId == null ? null : String(data.requestId),
     echoOf: data.echoOf == null ? null : String(data.echoOf),
     centerPx, spanPx, imagePx, pixelSizeUm,
+    physicalScale: data.physicalScale ? {...data.physicalScale} : null,
     containerPx: finitePoint(data.containerPx, true) || {x: 1, y: 1},
     plateGrid: data.plateGrid === true, imageReady: data.imageReady === true,
     paneInstanceId: data.paneInstanceId, contextEpoch: data.contextEpoch,
@@ -887,6 +889,38 @@ function spatialPauseReason() {
       compare.states.get(sid)?.spatialContext)) return "Waiting for current views";
   if (!spatialGroupReady()) return "Paused · anisotropic mapping unsupported; choose Relative explicitly";
   return "";
+}
+
+function physicalScaleFor(st) {
+  if (!finitePoint(st?.pixelSizeUm, true)) return null;
+  const value = st.physicalScale;
+  if (!value || ![value.x, value.y].every((v) => Number.isFinite(v) && v > 0) ||
+      !Number.isFinite(value.cosine) || Math.abs(value.cosine) > 1.000001) return null;
+  return value;
+}
+
+function scaleLinkIssue(mode = compare.linkMode) {
+  if (!spatialGroupReady("edit")) return "Focus a ready image in every view";
+  const scales = groupSids().map((sid) => physicalScaleFor(compare.states.get(sid)));
+  if (scales.some((s) => !s)) return "Pixel calibration is needed in every view";
+  const first = scales[0];
+  if (scales.some((s) => Math.abs(s.y / s.x - first.y / first.x) > 0.001 ||
+      Math.abs(s.cosine - first.cosine) > 0.001)) {
+    return "Pixel shape or orientation differs; equal physical scale is unavailable";
+  }
+  if (mode === "scale-frame" && !spatialGroupReady()) return spatialPauseReason();
+  const low = Math.max(...scales.map((s) => Number.isFinite(s.min) && s.min > 0 ? s.min : 0));
+  const high = Math.min(...scales.map((s) => Number.isFinite(s.max) && s.max > 0 ? s.max : Infinity));
+  return low > high ? "These views have no shared zoom range" : "";
+}
+
+function linkedScale(source) {
+  const value = physicalScaleFor(source);
+  if (!value || scaleLinkIssue()) return null;
+  const scales = groupSids().map((sid) => physicalScaleFor(compare.states.get(sid)));
+  const low = Math.max(...scales.map((s) => Number.isFinite(s.min) && s.min > 0 ? s.min : 0));
+  const high = Math.min(...scales.map((s) => Number.isFinite(s.max) && s.max > 0 ? s.max : Infinity));
+  return Math.max(low, Math.min(high, value.x));
 }
 
 function invalidateSpatialWork() {
@@ -1041,6 +1075,7 @@ function applyDisplayTransform(sid) {
 }
 
 function applyDisplayTransforms() {
+  if (compare.linkMode === "scale") return;
   for (const sid of groupSids()) applyDisplayTransform(sid);
 }
 
@@ -1184,17 +1219,26 @@ function targetViewFromAnchor(targetSid, anchorView) {
 
 function forwardViewport(sourceSid, source) {
   if (!compare.linked || compare.pendingRequest || compare.landmark.active ||
-      !inGroup(sourceSid) || !spatialGroupReady() ||
+      !inGroup(sourceSid) || scaleLinkIssue() ||
       !sameIdentity(localIdentity(source), localIdentity(compare.states.get(sourceSid)))) return;
-  const anchorView = anchorViewFromSource(sourceSid, source);
-  if (!anchorView) return;
+  const scaleOnly = compare.linkMode === "scale";
+  const umPerCss = linkedScale(source);
+  const anchorView = scaleOnly ? null : anchorViewFromSource(sourceSid, source);
+  if (!umPerCss || (!scaleOnly && !anchorView)) return;
   for (const targetSid of groupSids()) {
-    if (targetSid === sourceSid) continue;
     if (compare.pendingNudge?.sid === targetSid) continue;
-    const view = targetViewFromAnchor(targetSid, anchorView);
+    const target = compare.states.get(targetSid), scale = physicalScaleFor(target);
+    const changingScale = Math.abs(scale.x / umPerCss - 1) > 1e-6;
+    if (targetSid === sourceSid && !changingScale) continue;
+    if (scaleOnly && !changingScale) continue;
+    const view = scaleOnly || targetSid === sourceSid
+      ? {centerPx: target.centerPx, state: target}
+      : targetViewFromAnchor(targetSid, anchorView);
+    if (view) view.spanX = target.spanPx.x * umPerCss / scale.x;
     if (!view || !Number.isFinite(view.spanX) || view.spanX <= 0) continue;
     sendSpatial(targetSid, {
       nd2wsi: "viewport-apply", sourceSid, sourceSeq: source.seq,
+      scaleOnly: scaleOnly || targetSid === sourceSid,
       centerPx: view.centerPx,
       spanPx: {x: view.spanX, y: view.spanX * view.state.containerPx.y / view.state.containerPx.x},
       animate: false,
@@ -1203,7 +1247,7 @@ function forwardViewport(sourceSid, source) {
 }
 
 function scheduleViewportRoute(sourceSid, state) {
-  if (!spatialGroupReady()) return;
+  if (scaleLinkIssue()) return;
   compare.routeLatest.set(sourceSid, state);
   if (compare.routeTimers.has(sourceSid)) return;
   const epoch = compare.groupEpoch, session = compare.groupSessionId;
@@ -1244,7 +1288,8 @@ function requestGroup(kind, details = {}) {
     if (kind === "sync") requestGroupSoon("sync");
     return false;
   }
-  if (!spatialGroupReady(kind) || (compare.landmark.active && kind !== "sync")) return false;
+  if (!spatialGroupReady(kind === "scale-link" || (kind === "sync" && compare.linkMode === "scale")
+      ? "edit" : kind) || (compare.landmark.active && kind !== "sync")) return false;
   if (compare.pendingRequest) {
     if (kind === "sync") requestGroupSoon("sync");
     return false;
@@ -1280,7 +1325,8 @@ function transactionCurrent(pending) {
     pending.expectedTargets.length === groupSids().length &&
     pending.expectedTargets.every((sid) => inGroup(sid) &&
       sameIdentity(pending.contexts.get(sid), localIdentity(compare.states.get(sid)))) &&
-    spatialGroupReady(pending.kind);
+    spatialGroupReady(pending.kind === "scale-link" ||
+      (pending.kind === "sync" && compare.linkMode === "scale") ? "edit" : pending.kind);
 }
 
 function requestGroupSoon(kind) {
@@ -1302,6 +1348,8 @@ function finishGroupRequest(pending) {
   let changed = false;
   if (pending.kind === "capture") {
     changed = recaptureAll(captured);
+    compare.linked = true;
+  } else if (pending.kind === "scale-link") {
     compare.linked = true;
   } else if (["orientation", "remove-fit", "relative"].includes(pending.kind)) {
     const sid = pending.targetSid, previous = compare.pairs.get(sid);
@@ -1340,8 +1388,8 @@ function finishGroupRequest(pending) {
   }
   broadcastCompareState();
   if (["orientation", "remove-fit", "relative"].includes(pending.kind)) applyDisplayTransform(pending.targetSid);
-  else applyDisplayTransforms();
-  if (pending.kind === "sync" || pending.kind === "capture") syncFromAnchor();
+  else if (pending.kind !== "scale-link") applyDisplayTransforms();
+  if (["sync", "capture", "scale-link"].includes(pending.kind)) syncFromAnchor();
   updateCompareControls();
   return true;
 }
@@ -1384,8 +1432,11 @@ function receiveViewportState(data, sid) {
     }
     return true;
   }
+  if (inGroup(sid) && ["transform", "apply"].includes(state.reason)) updateCompareControls();
   if (!compare.linked || compare.pendingRequest || compare.landmark.active ||
-      !inGroup(sid) || !spatialGroupReady() || state.reason !== "user" || state.echoOf) return;
+      !inGroup(sid) || scaleLinkIssue() || state.echoOf) return;
+  if (state.reason === "transform") { syncFromAnchor(); return; }
+  if (state.reason !== "user") return;
   scheduleViewportRoute(sid, state);
 }
 
@@ -1406,7 +1457,8 @@ function sendLandmarkMode(sid, active, extra = {}) {
 function snapshotAlignment() {
   return {
     anchorSet: cloneValue(compare.anchorSet), anchorLandmarks: clonePoints(compare.anchorLandmarks),
-    linked: compare.linked, pairs: new Map([...compare.pairs].map(([sid, pair]) => [sid, cloneValue(pair)])),
+    linked: compare.linked, linkMode: compare.linkMode,
+    pairs: new Map([...compare.pairs].map(([sid, pair]) => [sid, cloneValue(pair)])),
   };
 }
 
@@ -1414,6 +1466,7 @@ function restoreSnapshot(snapshot) {
   compare.anchorSet = cloneValue(snapshot.anchorSet);
   compare.anchorLandmarks = clonePoints(snapshot.anchorLandmarks);
   compare.linked = snapshot.linked;
+  compare.linkMode = snapshot.linkMode || "scale-frame";
   compare.pairs = new Map([...snapshot.pairs].map(([sid, pair]) => [sid, cloneValue(pair)]));
 }
 
@@ -1624,7 +1677,7 @@ function movingSids() {
 }
 
 function broadcastCompareState() {
-  const ready = spatialGroupReady(), pending = Boolean(compare.pendingRequest);
+  const ready = spatialGroupReady("edit") && !scaleLinkIssue(), pending = Boolean(compare.pendingRequest);
   for (const sid of frames.keys()) {
     const envelope = spatialEnvelope(sid);
     if (!envelope) continue;
@@ -1635,6 +1688,9 @@ function broadcastCompareState() {
       committedRevision: compare.committedRevision, nudgeBusy: Boolean(compare.pendingNudge),
       spatialEnabled: member && spatialGroupReady("edit"),
       linked: member && ready && compare.linked && !pending && !compare.landmark.active,
+      linkMode: compare.linkMode,
+      frameLinked: member && ready && compare.linked && compare.linkMode === "scale-frame" &&
+        !pending && !compare.landmark.active,
       moving: member && sid !== compare.anchorSid,
       role: member && sid === compare.anchorSid ? "anchor" : "member",
     });
@@ -1642,6 +1698,7 @@ function broadcastCompareState() {
 }
 
 function nudgeAlignment(dxPx, dyPx, fromSid) {
+  if (compare.linkMode !== "scale-frame") return;
   if (compare.pendingRequest?.kind === "sync") clearPendingRequest(true);
   if (!compare.linked || compare.pendingRequest || compare.landmark.active || !spatialGroupReady()) return;
   const dx = Number(dxPx), dy = Number(dyPx);
@@ -1744,6 +1801,7 @@ function receiveNudgeReply(data, snapshot, sid) {
 }
 
 function receiveDragNudge(data, snapshot, sid) {
+  if (compare.linkMode !== "scale-frame") return false;
   if (data.nudgeSource !== "drag" || typeof data.dragId !== "string" ||
       !currentEnvelope(data, sid) || !inGroup(sid) || !snapshot.imageReady ||
       snapshot.seq <= (compare.states.get(sid)?.seq ?? -1)) return false;
@@ -1905,13 +1963,14 @@ function updateCompareControls() {
   const landmarking = compare.landmark.active;
   const link = $("compare-link");
   link.classList.toggle("linked", compare.linked && !pending);
+  link.classList.toggle("scale-only", compare.linked && compare.linkMode === "scale");
   link.classList.toggle("pending", pending);
-  link.disabled = pending || landmarking || !spatialGroupReady();
+  link.disabled = landmarking;
   link.setAttribute("aria-pressed", String(compare.linked && !pending));
-  link.setAttribute("aria-label", compare.linked ? "Unlink views" : "Relink and capture alignment");
-  link.title = ShortcutRouter.formatShortcutText(compare.linked
-    ? "Unlink, move any slide, then relink (L). While linked, arrow keys and Option-drag nudge the alignment."
-    : "Relink and keep the current positions as the alignment (L)");
+  link.setAttribute("aria-label", "Choose linking: " +
+    (!compare.linked ? "Off" : compare.linkMode === "scale" ? "Link scale" : "Link scale + frame"));
+  link.title = "Choose Off, Link scale, or Link scale + frame (L)";
+  updateLinkModeMenu();
 
   const members = compare.members.map((sid) => compare.pairs.get(sid)).filter(Boolean);
   updateOrientationControls();
@@ -1929,17 +1988,16 @@ function updateCompareControls() {
   align.classList.toggle("active", landmarking);
   align.setAttribute("aria-pressed", String(landmarking));
 
-  const modes = new Set(members.map((pair) => pair.mode).filter(Boolean));
   let status;
-  if (spatialPauseReason()) status = spatialPauseReason();
-  else if (compare.pendingNudge) status = "Adjusting alignment…";
+  if (compare.pendingNudge) status = "Adjusting alignment…";
   else if (pending) status = "Reading every view…";
   else if (!compare.linked) status = "Unlinked · move any view";
-  else if (!members.length || !members.every((pair) => pair.transform)) status = "Waiting for views";
-  else status = modes.has("normalized") ? "Linked · relative" : "Linked · µm";
+  else if (scaleLinkIssue()) status = "Paused · " + scaleLinkIssue();
+  else if (!members.length) status = "Waiting for views";
+  else status = compare.linkMode === "scale" ? "Scale linked · µm" : "Scale + frame linked · µm";
   $("compare-status").textContent = status;
 
-  const delta = compare.linked && !pending ? alignmentDeltaLabel() : "";
+  const delta = compare.linked && compare.linkMode === "scale-frame" && !pending ? alignmentDeltaLabel() : "";
   const deltaEl = $("compare-delta");
   deltaEl.textContent = delta;
   deltaEl.hidden = !delta;
@@ -2117,13 +2175,14 @@ function startGroup(anchorSid, memberSid) {
   compare.members = []; compare.pairs = new Map(); compare.anchorLandmarks = [];
   compare.anchorSet = {id: uniqueId(), revision: 0, points: []};
   compare.landmark = {active: false, edit: null};
-  compare.linked = true; active = anchorSid;
+  compare.linked = false; compare.linkMode = "scale"; active = anchorSid;
   rememberSlide(anchorSid); ensureFrame(anchorSid); attachMember(memberSid);
   applyFrameLayout();
   broadcastCompareState();
   applyDisplayTransforms();
   compare.committedGroup = snapshotAlignment();
   updateCompareControls(); render(); requestGroupSoon("sync");
+  setLinkMenuVisible(true);
 }
 
 function addMember(sid) {
@@ -2165,6 +2224,7 @@ function replaceMember(oldSid, newSid) {
 
 function stopCompare() {
   closePairPicker(false);
+  setLinkMenuVisible(false, false);
   if (!compare.enabled) return;
   const sids = groupSids();
   rememberAlignment(); // committed only; never finishLandmarks(true) in teardown
@@ -2184,12 +2244,52 @@ function toggleCompare() {
 }
 
 function toggleViewLink() {
-  if (compare.pendingRequest || compare.landmark.active || !spatialGroupReady()) return;
-  if (compare.linked) {
-    compare.linked = false;
-    invalidateSpatialWork();
-    updateCompareControls();
-  } else requestGroup("capture");
+  if (!compare.enabled || compare.landmark.active) return;
+  setLinkMenuVisible($("compare-link-menu").hidden);
+}
+
+function updateLinkModeMenu() {
+  const current = compare.linked ? compare.linkMode : "off";
+  for (const mode of ["off", "scale", "scale-frame"]) {
+    const button = $("compare-link-" + mode);
+    const issue = mode === "off" ? "" : scaleLinkIssue(mode);
+    button.disabled = Boolean(compare.landmark.active || (mode !== "off" &&
+      (issue || compare.pendingRequest || compare.pendingNudge)));
+    button.setAttribute("aria-checked", String(mode === current));
+    button.title = issue;
+  }
+  $("compare-link-hint").textContent = scaleLinkIssue("scale") ||
+    "Match physical magnification using each image’s pixel calibration.";
+}
+
+function setLinkMenuVisible(visible, focus = true) {
+  const menu = $("compare-link-menu");
+  menu.hidden = !visible || !compare.enabled;
+  $("compare-link").setAttribute("aria-expanded", String(!menu.hidden));
+  if (!menu.hidden) updateLinkModeMenu();
+  syncCompareToolbarSpace();
+  if (focus) (menu.hidden ? $("compare-link") : $("compare-link-off")).focus();
+}
+
+function setLinkMode(mode) {
+  if (!compare.enabled || !["off", "scale", "scale-frame"].includes(mode) || compare.landmark.active) return;
+  if (mode !== "off") {
+    const issue = scaleLinkIssue(mode);
+    if (issue || compare.pendingRequest || compare.pendingNudge) {
+      if (issue) showError(issue);
+      return;
+    }
+  }
+  compare.linked = false;
+  invalidateSpatialWork();
+  // Closing this panel resizes the panes. Keep its deferred fresh-layout
+  // snapshot instead of cancelling it with the previous mode's commands.
+  setLinkMenuVisible(false);
+  if (mode !== "off") {
+    compare.linkMode = mode;
+    requestGroup(mode === "scale" ? "scale-link" : "capture");
+  }
+  updateCompareControls();
 }
 
 function changeOrientation(action) {
@@ -2250,6 +2350,22 @@ $("compare-tools-toggle").onclick = () => setCompareToolsVisible(!compare.toolsV
 $("compare-picker-close").onclick = () => closePairPicker();
 $("compare-add").onclick = () => openPicker("add");
 $("compare-link").onclick = toggleViewLink;
+for (const mode of ["off", "scale", "scale-frame"]) {
+  $("compare-link-" + mode).onclick = () => setLinkMode(mode);
+}
+$("compare-link-menu").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault(); event.stopPropagation(); setLinkMenuVisible(false); return;
+  }
+  if (event.key === "Tab") { setLinkMenuVisible(false, false); return; }
+  const options = ["off", "scale", "scale-frame"].map((mode) => $("compare-link-" + mode))
+    .filter((button) => !button.disabled);
+  const index = options.indexOf(document.activeElement);
+  const step = event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0;
+  if (step && options.length) {
+    event.preventDefault(); options[(index + step + options.length) % options.length].focus();
+  }
+});
 $("compare-swap").onclick = swapComparedSlides;
 for (const [id, action] of Object.entries(ORIENTATION_ACTIONS)) {
   $(id).onclick = () => changeOrientation(action);

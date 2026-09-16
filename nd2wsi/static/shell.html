@@ -81,7 +81,8 @@
               aria-haspopup="menu" aria-expanded="false" aria-controls="compare-picker-list">+</button>
       <span id="compare-delta" hidden></span>
       <button id="compare-link" class="compare-control linked" type="button"
-              aria-label="Unlink views" aria-pressed="true">
+              aria-label="Choose linking" aria-pressed="false" aria-haspopup="menu"
+              aria-expanded="false" aria-controls="compare-link-menu">
         <svg class="hotspot-icon" viewBox="0 0 28 18" aria-hidden="true">
           <path d="M11.2 4.2H8.5a4.8 4.8 0 0 0 0 9.6h2.7" />
           <path d="M16.8 4.2h2.7a4.8 4.8 0 0 1 0 9.6h-2.7" />
@@ -96,6 +97,18 @@
       <button id="compare-close" class="compare-control" type="button"
               title="Hide comparison tools — slides stay linked"
               aria-label="Hide comparison tools">×</button>
+    </div>
+    <div id="compare-link-menu" role="menu" aria-label="Linking mode" hidden>
+      <button id="compare-link-off" type="button" role="menuitemradio" aria-checked="true">
+        <strong>Off</strong><span>Zoom and move independently</span>
+      </button>
+      <button id="compare-link-scale" type="button" role="menuitemradio" aria-checked="false">
+        <strong>Link scale</strong><span>Zoom together, move independently</span>
+      </button>
+      <button id="compare-link-scale-frame" type="button" role="menuitemradio" aria-checked="false">
+        <strong>Link scale + frame</strong><span>Zoom and move together</span>
+      </button>
+      <p id="compare-link-hint"></p>
     </div>
     <div id="compare-orientation" class="compare-row orientation-panel" role="group" aria-label="Slide orientation">
       <label for="compare-orientation-target">Active linked slide</label>

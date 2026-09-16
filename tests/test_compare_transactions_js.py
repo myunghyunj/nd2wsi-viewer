@@ -442,6 +442,7 @@ def test_nudge_after_click_zoom_uses_delta_not_stale_anchor_center_or_span():
       compare.states.get('a').centerPx={x:99999,y:88888};
       compare.states.get('a').spanPx={x:400,y:300};
       member.spanPx={x:160,y:120};
+      member.physicalScale={x:160/800*.66,y:160/800*.66,cosine:0};
       nudgeAlignment(1,0,'b');messages.length=0;
       replyNudge({x:-.5,y:0},{centerPx:{x:500,y:400}});
       const views=messages.filter(m=>m.nd2wsi==='viewport-apply');
@@ -452,7 +453,8 @@ def test_nudge_after_click_zoom_uses_delta_not_stale_anchor_center_or_span():
     assert result["current"] == pytest.approx(.33)
     assert result["fit"] < 1e-9
     assert result["targets"] == ["a"]
-    assert result["anchorSpan"] == pytest.approx(160)
+    # Fitted registration must not override the image's physical calibration.
+    assert result["anchorSpan"] == pytest.approx(160 * .66 / .25)
 
 
 def test_rapid_nudge_keys_serialize_and_use_fresh_committed_revisions():

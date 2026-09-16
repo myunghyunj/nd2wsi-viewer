@@ -786,33 +786,6 @@ function buildLutRow(i, ch, winLabel) {
     draw();
   }
 
-  // Full-range handles can sit less than one screen pixel apart. Keep exact
-  // display endpoints editable without cropping or magnifying the axis.
-  const fields = document.createElement("div");
-  fields.className = "lut-values";
-  const inputs = {};
-  for (const [key, text] of [["lo", "Min"], ["hi", "Max"]]) {
-    const label = document.createElement("label");
-    label.textContent = text;
-    const input = document.createElement("input");
-    input.type = "number";
-    input.step = "any";
-    input.setAttribute("aria-label", ch.label + " display " + text.toLowerCase());
-    input.addEventListener("change", () => {
-      const value = input.value === "" ? NaN : Number(input.value);
-      if (Number.isFinite(value)) {
-        const next = { ...cur };
-        next[key] = key === "lo" ? clamp(value, rangeMin, cur.hi - 1)
-          : clamp(value, cur.lo + 1, rangeMax);
-        setLut(next);
-      } else draw();
-    });
-    inputs[key] = input;
-    label.append(input);
-    fields.append(label);
-  }
-  wrap.append(fields);
-
   const vx = (v) => PLOT.x0 +
     clamp((v - vmin) / Math.max(vmax - vmin, 1e-9), 0, 1) * (PLOT.x1 - PLOT.x0);
   const xv = (x) =>
@@ -900,12 +873,6 @@ function buildLutRow(i, ch, winLabel) {
     ctx.textAlign = "right";
     ctx.fillText(fmtInt(vmax), PLOT.x1, H - 3);
     winLabel.textContent = fmtInt(cur.lo) + "–" + fmtInt(cur.hi);
-    inputs.lo.value = String(cur.lo);
-    inputs.hi.value = String(cur.hi);
-    for (const input of Object.values(inputs)) {
-      input.min = String(rangeMin);
-      input.max = String(rangeMax);
-    }
     canvas.setAttribute("aria-label", ch.label + " histogram range " + fmtInt(vmin) + " to " + fmtInt(vmax));
     canvas.setAttribute("data-axis-min", String(vmin));
     canvas.setAttribute("data-axis-max", String(vmax));
@@ -3501,6 +3468,8 @@ function receiveCompareLifecycle(message) {
   }
   relay.compare = {
     enabled: Boolean(message.enabled), linked: Boolean(message.linked),
+    frameLinked: message.frameLinked === undefined ? Boolean(message.linked) : Boolean(message.frameLinked),
+    linkMode: message.linkMode || "scale-frame",
     moving: Boolean(message.moving), role: message.role === "anchor" ? "anchor" : "member",
     committedRevision: message.committedRevision,
     nudgeBusy: Boolean(message.nudgeBusy),
@@ -3585,11 +3554,37 @@ function currentSlideSid() {
   return match ? match[1] : null;
 }
 
+function physicalViewportScale() {
+  const viewport = state.viewer?.viewport, ps = pixelSize();
+  if (!viewport || !ps || ps.length !== 2 ||
+      !ps.every((v) => Number.isFinite(v) && v > 0)) return null;
+  const size = viewport.getContainerSize();
+  if (!(size.x > 0 && size.y > 0)) return null;
+  const origin = {x: size.x / 2, y: size.y / 2};
+  const a = viewerElementToImagePoint(origin);
+  const b = viewerElementToImagePoint({x: origin.x + 100, y: origin.y});
+  const c = viewerElementToImagePoint({x: origin.x, y: origin.y + 100});
+  const u = {x: (b.x - a.x) * ps[1] / 100, y: (b.y - a.y) * ps[0] / 100};
+  const v = {x: (c.x - a.x) * ps[1] / 100, y: (c.y - a.y) * ps[0] / 100};
+  const x = Math.hypot(u.x, u.y), y = Math.hypot(v.x, v.y);
+  if (![x, y].every((n) => Number.isFinite(n) && n > 0)) return null;
+  const result = {x, y, cosine: (u.x * v.x + u.y * v.y) / (x * y)};
+  // OSD zoom and screen coordinates use CSS pixels, regardless of Retina DPR.
+  const zoom = viewport.viewportToImageZoom(viewport.getZoom(true));
+  const minZoom = viewport.viewportToImageZoom(viewport.getMinZoom());
+  const maxZoom = viewport.viewportToImageZoom(viewport.getMaxZoom());
+  if ([zoom, minZoom, maxZoom].every((n) => Number.isFinite(n) && n > 0)) {
+    result.min = x * zoom / maxZoom;
+    result.max = x * zoom / minZoom;
+  }
+  return result;
+}
+
 function viewportSnapshot() {
   const viewer = state.viewer;
   const pixelSize = state.info?.pixelSizeUm;
   const calibrated = Array.isArray(pixelSize) && pixelSize.length >= 2 &&
-    Number(pixelSize[0]) > 0 && Number(pixelSize[1]) > 0;
+    pixelSize.every((v) => Number.isFinite(v) && v > 0);
   const identity = {
     ...spatialIdentity(), imageReady: spatialImageReady(),
     imagePx: { x: state.info?.width, y: state.info?.height },
@@ -3625,6 +3620,7 @@ function viewportSnapshot() {
       const size = viewer.viewport.getContainerSize();
       return { x: Math.max(1, size.x), y: Math.max(1, size.y) };
     })(),
+    physicalScale: physicalViewportScale(),
     pixelSizeUm: calibrated
       ? { x: Number(pixelSize[1]), y: Number(pixelSize[0]) }
       : null,
@@ -3693,7 +3689,7 @@ function beginAlignmentDrag(event) {
   const relay = state.viewportRelay;
   relay.suppressAlignmentDragEnd = false;
   if (event.button !== 0 || !event.altKey || !spatialPaneReady() ||
-      !relay.compare?.linked || relay.compare.nudgeBusy || state.tool || state.landmark.active) return;
+      !relay.compare?.frameLinked || relay.compare.nudgeBusy || state.tool || state.landmark.active) return;
   clearTimeout(relay.timer);
   relay.timer = null;
   relay.suppressAlignmentDragEnd = true;
@@ -3753,13 +3749,14 @@ function applyLinkedViewport(message) {
     // under any display rotation, so set the zoom for the field width and
     // the center directly. Both are independent of rotation and mirror.
     const viewport = state.viewer.viewport;
+    const independentCenter = message.scaleOnly ? viewport.getCenter(true) : null;
     const screenPerImage = viewport.getContainerSize().x / span.x;
     viewport.zoomTo(viewport.imageToViewportZoom(screenPerImage), null, true);
-    viewport.panTo(
-      viewport.imageToViewportCoordinates(new OpenSeadragon.Point(center.x, center.y)),
-      true
-    );
+    if (!independentCenter) viewport.panTo(
+      viewport.imageToViewportCoordinates(new OpenSeadragon.Point(center.x, center.y)), true);
     viewport.applyConstraints(true);
+    // Keep the live centre, not a possibly stale centre from the shell's snapshot.
+    if (independentCenter) viewport.panTo(independentCenter, true);
     postViewportState("apply", { echoOf: commandId });
   }
 }
@@ -3829,7 +3826,7 @@ function wireCompareRelay() {
   // phase so OpenSeadragon's own arrow-key panning never sees the event.
   window.addEventListener("keydown", (ev) => {
     const compare = state.viewportRelay.compare;
-    if (window.parent === window || !compare?.enabled || !compare.linked) return;
+    if (window.parent === window || !compare?.enabled || !compare.frameLinked) return;
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
     if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
@@ -5390,7 +5387,7 @@ function wirePlateKeys() {
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     if (state.landmark.active) return;
     const compare = state.viewportRelay.compare;
-    if (compare && compare.enabled && compare.linked) return;
+    if (compare && compare.enabled && compare.frameLinked) return;
     const info = state.info.plate;
     let handled = true;
     if (ev.key === "ArrowUp" && info.Z > 1) stepPlateZ(1);
