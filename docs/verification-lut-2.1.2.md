@@ -1,4 +1,4 @@
-# macOS 2.1.2 LUT controls: local verification
+# macOS 2.1.2 LUT controls: verification
 
 The LUT panel starts at the complete integer data range (0–65,535 for uint16).
 Auto-fit LUT range is an optional checkbox that crops the histogram axes without
@@ -26,7 +26,8 @@ their routing.
 - Native graph checks: full/automatic ranges, zoom, pan, drag, double-click reset,
   and contrast preservation passed in isolated Agent windows.
 
-This is a local macOS update. No public release or Windows update was published.
+This release updates macOS Apple silicon. The published Windows package remains v2.0.0.
 Programmatic input checks do not replace physical trackpad testing on other Macs.
-Detailed local logs, preservation inventories, and a recoverable previous app
-are retained under validation/full-lut, outside the Git commit.
+Detailed local logs and preservation inventories are retained outside Git.
+Release publication additionally requires exact-commit CI and real-data checks,
+a verified release download, and the existing Sparkle signing identity.

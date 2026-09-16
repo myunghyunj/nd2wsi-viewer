@@ -1,4 +1,5 @@
-> **macOS v2.1.1.** The unused cache-delete toolbar button has been removed.
+> **macOS v2.1.2.** LUTs show the full intensity range by default, with optional
+> Auto-fit, X-axis zoom and pan, and live contrast updates while dragging.
 > The standard viewer remains the default. On Apple silicon,
 > **Open in Metal** offers direct GPU display for compatible cached fluorescence
 > slides, with safe recovery to the standard viewer. Multiple independent windows
