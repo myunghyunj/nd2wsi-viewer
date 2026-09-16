@@ -345,6 +345,13 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 .tool-row { display: flex; gap: 6px; }
 .tool-row .btn { flex: 1; padding: 4px 4px; font-size: 12px; white-space: nowrap; }
 .tool-row .btn.grow2 { flex: 2; }
+.roi-scalebar-actions { margin-top: 9px; }
+.roi-scalebar-actions .btn,
+:root.light .roi-scalebar-actions .btn {
+  min-width: 0; padding: 6px 3px; font-size: 10px;
+  color: #ffebae; background: linear-gradient(#635020, #493b19);
+}
+.roi-scalebar-actions .btn:disabled { cursor: not-allowed; }
 .tool-row.footer { margin-top: 9px; }
 .tool-row.footer.geojson-footer { margin-top: 6px; }
 #ann-list { margin-top: 9px; }

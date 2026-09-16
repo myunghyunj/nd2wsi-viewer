@@ -22,7 +22,7 @@ GET  /s/<sid>/api/tile/<L>/<x>/<y>.jpg?c=0,1&win=…
 GET  /s/<sid>/api/plate/frame/<t>/<p>/<z>.jpg?k=8&c=&win=   reduced frame of one site
 GET  /s/<sid>/api/plate/status  how much of the thumbnail store is filled
 GET  /s/<sid>/api/plate/focus   the sharpest plane per time point and site
-GET  /s/<sid>/api/roi?level=&x=&y=&w=&h=&format=nd2|tiff|png|jpg&c=&win=
+GET  /s/<sid>/api/roi?level=&x=&y=&w=&h=&format=nd2|tiff|png|jpg|svg&c=&win=&scalebar=1
 GET/POST /s/<sid>/api/annotations   sidecar annotations
 """
 
@@ -2443,6 +2443,9 @@ def make_handler(
             x, y = max(0, min(x, lw - 1)), max(0, min(y, lh - 1))
             w, h = max(1, min(w, lw - x)), max(1, min(h, lh - y))
             fmt = (q.get("format") or ["nd2"])[0].lower()
+            scale_bar = fmt == "svg" or (q.get("scalebar") or ["0"])[0] == "1"
+            if scale_bar and fmt not in ("svg", "jpg", "jpeg"):
+                return self._error(400, "Scale bar export supports SVG and JPEG")
             n = len(st.attrs["omero"]["channels"])
             channels = render.parse_channels((q.get("c") or [None])[0], n)
             win = (q.get("win") or [None])[0]
@@ -2520,7 +2523,7 @@ def make_handler(
                     Path(tmp.name).unlink(missing_ok=True)
                 return
 
-            if fmt in ("png", "jpg", "jpeg"):
+            if fmt in ("png", "jpg", "jpeg", "svg"):
                 if w * h / 1e6 > st.max_render_mpx:
                     return self._error(
                         400,
@@ -2528,11 +2531,17 @@ def make_handler(
                         f"requested {w * h / 1e6:.0f} MPx -- use format=tiff "
                         "(streams any size) or a higher level",
                     )
-                body = render.export_roi_rendered(
-                    root, st.attrs, level, x, y, w, h, channels, fmt, win
-                )
-                ext = "png" if fmt == "png" else "jpg"
-                ctype = "image/png" if fmt == "png" else "image/jpeg"
+                try:
+                    body = render.export_roi_rendered(
+                        root, st.attrs, level, x, y, w, h, channels, fmt, win,
+                        scale_bar=scale_bar,
+                    )
+                except ValueError as e:
+                    return self._error(400, str(e))
+                ext = "jpg" if fmt == "jpeg" else fmt
+                ctype = {"png": "image/png", "jpg": "image/jpeg", "svg": "image/svg+xml"}[ext]
+                if scale_bar:
+                    fname += "_scalebar"
                 return self._send(
                     200,
                     body,

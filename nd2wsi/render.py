@@ -405,8 +405,10 @@ def export_roi_rendered(
     channels: list[int],
     fmt: str,
     win: str | None = None,
+    *,
+    scale_bar: bool = False,
 ) -> bytes:
-    """Render a region to PNG or JPEG, strip by strip.
+    """Render a region to PNG/JPEG or a PNG-backed SVG, strip by strip.
 
     Compositing goes through float32, which at hundreds of megapixels used
     to mean several times the output size in transients. Each strip is
@@ -420,12 +422,20 @@ def export_roi_rendered(
     windows, colors = display_params(attrs)
     windows, gammas = parse_windows(win, windows)
 
+    bar = None
+    if scale_bar or fmt == "svg":
+        from .scalebar import layout
+
+        bar = layout(w, h, meta.get("pixel_size_um"), lv["downsample"])
+
     canvas_bytes = h * w * 3
     budget = _available_memory() // 2
-    if canvas_bytes > budget:
+    # SVG additionally holds the lossless PNG and its base64/XML representation.
+    required_bytes = canvas_bytes * (4 if fmt == "svg" else 1)
+    if required_bytes > budget:
         raise ValueError(
-            f"a {w} x {h} render needs {canvas_bytes / 1e9:.1f} GB for its "
-            f"canvas but only {budget / 1e9:.1f} GB is safely available — "
+            f"a {w} x {h} render needs {required_bytes / 1e9:.1f} GB for its "
+            f"output buffers but only {budget / 1e9:.1f} GB is safely available — "
             "export a coarser level, or use TIFF, which streams"
         )
 
@@ -436,6 +446,17 @@ def export_roi_rendered(
         canvas[y0 : y0 + th] = composite(
             region, channels, windows, colors, meta["rgb"], gammas
         )
+    if bar is not None:
+        from PIL import Image
+
+        from . import scalebar
+
+        if fmt == "svg":
+            return scalebar.svg(encode_image(canvas, "png"), w, h, bar,
+                                roi={"level": level, "x": x, "y": y, "width": w, "height": h})
+        if fmt in ("jpg", "jpeg"):
+            return scalebar.jpeg(Image.fromarray(canvas), bar)
+        raise ValueError("Scale bar export supports SVG and JPEG")
     return encode_image(canvas, fmt, quality=92)
 
 

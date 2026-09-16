@@ -1592,6 +1592,7 @@ function syncFrameScopedControls() {
   for (const id of ["roi-dl-tiff", "roi-dl-png", "roi-dl-jpg", "roi-clear"]) {
     scopedButton(id, !hasRoi, hasFrame ? "Mark a region first" : chooseSite);
   }
+  syncScaleBarExportControls();
   scopedButton("roi-move", !hasRoi, hasFrame ? "Mark a region first" : chooseSite);
   const nd2Unavailable = state.info && state.info.nd2Export === false;
   scopedButton(
@@ -1824,6 +1825,8 @@ function wireTools() {
   $("roi-dl-tiff").onclick = () => downloadRoi("tiff");
   $("roi-dl-png").onclick = () => downloadRoi("png");
   $("roi-dl-jpg").onclick = () => downloadRoi("jpg");
+  $("roi-dl-svg-scale").onclick = () => downloadRoi("svg", true);
+  $("roi-dl-jpg-scale").onclick = () => downloadRoi("jpg", true);
   if (state.info.nd2Export === false) {
     const b = $("roi-dl-nd2");
     b.disabled = true;
@@ -2893,6 +2896,7 @@ function roiScale() {
 
 let scaleSeq = 0;
 function updateScaleStrip() {
+  syncScaleBarExportControls();
   const strip = $("roi-scales");
   const dims = $("roi-scale-dims");
   const context = activeFrameContext();
@@ -3028,19 +3032,44 @@ function wireRoiDims() {
   }
 }
 
-function downloadRoi(fmt) {
+function scaleBarExportIssue() {
+  const ps = pixelSize();
+  if (!ps || ps.length !== 2 || !ps.every((v) => Number.isFinite(v) && v > 0)) {
+    return "Scale bar needs valid pixel calibration";
+  }
+  const sel = roiScale();
+  if (!sel || sel.w < 96 || sel.h < 64) {
+    return "Choose a larger export size for the scale bar (at least 96 × 64 px)";
+  }
+  return "";
+}
+
+function syncScaleBarExportControls() {
+  const context = activeFrameContext();
+  const issue = !frameOwnsRoi(context)
+    ? context ? "Mark a region first" : "Choose a site first"
+    : scaleBarExportIssue();
+  for (const id of ["roi-dl-svg-scale", "roi-dl-jpg-scale"]) scopedButton(id, !!issue, issue);
+}
+
+function downloadRoi(fmt, scaleBar = false) {
   const context = activeFrameContext();
   const r = state.roi ? { ...state.roi } : null;
   if (!r || !frameOwnsRoi(context)) {
     showToast("Choose a site and mark a region before exporting");
     return;
   }
+  scaleBar = scaleBar || fmt === "svg";
+  if (scaleBar) {
+    const issue = scaleBarExportIssue();
+    if (issue) { showToast(issue); return; }
+  }
   // ND2 and TIFF stream raw pixels at native resolution; a rendered PNG or
   // JPEG too big for one image drops to the pyramid level that fits, which
   // is how the whole slide leaves as one picture
   let level = 0;
   let d = 1;
-  if (fmt === "png" || fmt === "jpg") {
+  if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
     const sel = roiScale();
     if (!sel) {
       showToast(
@@ -3050,7 +3079,7 @@ function downloadRoi(fmt) {
       return;
     }
     d = sel.d;
-    level = state.info.levels.findIndex((l) => l.downsample === d);
+    level = Number(levelPathFor(d));
   }
   const q = new URLSearchParams({
     level,
@@ -3062,10 +3091,11 @@ function downloadRoi(fmt) {
   });
   const all = state.channels.length === state.info.channels.length;
   if (!all) q.set("c", state.channels.join(","));
-  if (fmt === "png" || fmt === "jpg") {
+  if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
     const win = lutParam();
     if (win) q.set("win", win); // rendered exports match the screen LUTs
   }
+  if (scaleBar) q.set("scalebar", "1");
   appendFrameParams(q, context.frame); // explicit active frame; never hidden P0
   let job = null;
   if (fmt === "nd2" || fmt === "tiff") {
