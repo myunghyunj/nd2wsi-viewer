@@ -49,7 +49,8 @@ jobs:
           uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --default-index https://pypi.org/simple -r packaging/windows-build-requirements.txt
           if ($LASTEXITCODE -ne 0) { throw 'Locked build tooling installation failed' }
       - name: Windows unit and integration tests
-        run: .venv/Scripts/python.exe -m pytest tests -q -m 'not realdata'
+        timeout-minutes: 10
+        run: .venv/Scripts/python.exe -m pytest tests -vv --tb=short -m 'not realdata'
       - name: Fetch checksum-verified real ND2 acquisitions
         run: .venv/Scripts/python.exe scripts/fetch_testdata.py
       - name: Windows real-data tests
