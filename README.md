@@ -31,6 +31,7 @@
   <img src="https://img.shields.io/badge/license-MIT-8E8E93?style=flat-square" alt="MIT">
 </p>
 
+![Fluorescence slide with interactive channel histograms and LUT controls in nd2wsi-viewer](docs/overview-slide.png)
 
 ## Why this exists
 
