@@ -54,7 +54,7 @@ class _Array:
         return self.data[key]
 
 
-def test_histogram_reports_its_value_origin():
+def test_uint16_histogram_covers_full_dtype_despite_narrow_signal():
     data = np.arange(10_000, 20_000, dtype=np.uint16).reshape(1, 100, 100)
     root = {"0": _Array(data)}
     attrs = {
@@ -64,8 +64,8 @@ def test_histogram_reports_its_value_origin():
 
     histogram = compute_histograms(root, attrs, min_pixels=1)[0]
 
-    assert histogram["vmin"] == 10_000
-    assert histogram["vmax"] >= 19_000
+    assert histogram["vmin"] == 0
+    assert histogram["vmax"] == 65_535
     assert sum(histogram["bins"]) == data.size
 
 
@@ -83,3 +83,43 @@ def test_float_windows_ignore_nan_and_infinity():
     assert window["min"] == 10.0
     assert window["max"] == 20.0
     assert window["end"] > window["start"]
+
+
+@pytest.mark.parametrize("dtype, expected", [
+    (np.uint8, (0, 255)), (np.uint16, (0, 65535)),
+    (np.int16, (-32768, 32767)), (np.bool_, (0, 1)),
+])
+def test_histogram_axis_is_independent_of_signal_and_display_window(dtype, expected):
+    data = np.full((1, 10, 10), 1, dtype=dtype)
+    attrs = {"nd2wsi": {"levels": [{"path": "0", "width": 10, "height": 10}]},
+             "omero": {"channels": [{"window": {"start": 0, "end": 2}}]}}
+    histogram = compute_histograms({"0": _Array(data)}, attrs, min_pixels=1)[0]
+    assert (histogram["vmin"], histogram["vmax"]) == expected
+    assert sum(histogram["bins"]) == 100
+
+
+def test_full_histogram_keeps_sparse_bright_values_in_their_actual_bins():
+    data = np.full((1, 100, 100), 100, dtype=np.uint16)
+    data[0, 0, :3] = [10000, 50000, 65535]
+    attrs = {"nd2wsi": {"levels": [{"path": "0", "width": 100, "height": 100}]},
+             "omero": {"channels": [{"window": {"start": 100, "end": 200}}]}}
+    histogram = compute_histograms({"0": _Array(data)}, attrs, min_pixels=1)[0]
+    assert sum(histogram["bins"]) == data.size
+    assert histogram["detail"] == {"values": [100, 10000, 50000, 65535],
+                                   "counts": [9997, 1, 1, 1]}
+    assert histogram["bins"][39] == 1
+    assert histogram["bins"][195] == 1
+    assert histogram["bins"][-1] == 1
+    assert histogram["autoHistogram"]["vmax"] < 10000
+    assert sum(histogram["autoHistogram"]["bins"]) == data.size
+
+
+def test_float_histogram_includes_extremes_and_stored_range_without_percentile_crop():
+    data = np.array([[[np.nan, -np.inf, 5, 10, 11, 99999, np.inf]]], dtype=np.float32)
+    attrs = {"nd2wsi": {"levels": [{"path": "0", "width": 7, "height": 1}]},
+             "omero": {"channels": [{"window": {"min": -20, "max": 100000,
+                                                   "start": 5, "end": 11}}]}}
+    histogram = compute_histograms({"0": _Array(data)}, attrs, min_pixels=1)[0]
+    assert (histogram["vmin"], histogram["vmax"]) == (-20, 100000)
+    assert sum(histogram["bins"]) == 4
+    assert histogram["bins"][-1] == 1

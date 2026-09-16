@@ -118,7 +118,12 @@
         </div>
         <span class="win-title">Channels &amp; LUTs</span>
       </div>
-      <div class="win-body"><div id="channel-list"></div></div>
+      <div class="win-body">
+        <label class="lut-range-option" title="Fit each histogram axis to its signal distribution without changing image contrast">
+          <input type="checkbox" id="lut-auto-range"> Auto-fit LUT range
+        </label>
+        <div id="channel-list"></div>
+      </div>
     </section>
 
     <section class="mac-window" id="win-region">
@@ -262,6 +267,7 @@
 <script src="../../static/request-latest-v1.js"></script>
 <script src="../../static/spatial-pane-v1.js"></script>
 <script src="../../static/view-state-v1.js"></script>
+<script src="../../static/native-scope-v1.js"></script>
 <script src="../../static/app.js"></script>
 </body>
 </html>

@@ -175,9 +175,11 @@ def compute_histograms(
     """Per-channel intensity histograms for the LUT panel.
 
     Computed from the smallest pyramid level with at least ``min_pixels``
-    (a few-MPx read at most).  The axis max is robust to lone hot pixels:
-    the 99.9th percentile with 30% headroom, clamped to the data max, and
-    never below the stored display window.  Overflow lands in the last bin.
+    (a few-MPx read at most). Integer axes always cover the complete source
+    dtype, regardless of the sampled signal or selected display window.
+    Floating-point axes use the stored acquisition range, including any finite
+    sampled extremes. The explicit Auto action has its own fine histogram;
+    its contrast estimate never changes the displayed axis.
     """
     meta = attrs["nd2wsi"]
     levels = meta["levels"]
@@ -190,23 +192,54 @@ def compute_histograms(
     out = []
     for ci in range(data.shape[0]):
         ch = data[ci].ravel()
+        if np.issubdtype(ch.dtype, np.bool_):
+            ch = ch.astype(np.uint8)
         if np.issubdtype(ch.dtype, np.floating):
             ch = ch[np.isfinite(ch)]
         dmin = float(ch.min()) if ch.size else 0.0
         dmax = float(ch.max()) if ch.size else 1.0
         win = attrs["omero"]["channels"][ci].get("window", {})
-        vmin = min(dmin, float(win.get("start", dmin)))
+        # Retain the fine histogram only for the explicit Auto button. A
+        # full uint16 axis with 256 display bins cannot resolve dim signals.
+        auto_min = min(dmin, float(win.get("start", dmin)))
         robust_high = float(np.percentile(ch, 99.9)) if ch.size else dmax
-        vmax = min(vmin + (robust_high - vmin) * 1.3, dmax)
-        window_high = float(win.get("end", vmax))
-        vmax = max(vmax, vmin + (window_high - vmin) * 1.1, vmin + 1.0)
-        counts, _ = np.histogram(np.clip(ch, vmin, vmax), bins=bins, range=(vmin, vmax))
+        auto_max = min(auto_min + (robust_high - auto_min) * 1.3, dmax)
+        window_high = float(win.get("end", auto_max))
+        auto_max = max(auto_max, auto_min + (window_high - auto_min) * 1.1, auto_min + 1.0)
+        auto_counts, _ = np.histogram(np.clip(ch, auto_min, auto_max), bins=bins,
+                                      range=(auto_min, auto_max))
+        dtype = np.dtype(meta.get("dtype", data.dtype))
+        if np.issubdtype(dtype, np.integer):
+            limits = np.iinfo(dtype)
+            vmin, vmax = float(limits.min), float(limits.max)
+        elif np.issubdtype(dtype, np.bool_):
+            vmin, vmax = 0.0, 1.0
+        else:
+            bounds = [dmin, dmax]
+            bounds.extend(float(win[key]) for key in ("min", "max", "start", "end")
+                          if key in win and np.isfinite(float(win[key])))
+            vmin, vmax = min(bounds), max(bounds)
+            if vmax <= vmin:
+                vmax = vmin + max(1.0, abs(vmin) * 1e-6)
+        counts, _ = np.histogram(ch, bins=bins, range=(vmin, vmax))
+        # Preserve native integer peaks for client-side zooming. Sparse arrays
+        # avoid sending 65,536 mostly empty bins for dim uint16 acquisitions.
+        if np.issubdtype(ch.dtype, np.integer) and ch.dtype.itemsize <= 2:
+            values, detail_counts = np.unique(ch, return_counts=True)
+        else:
+            detail_counts, edges = np.histogram(ch, bins=65536, range=(vmin, vmax))
+            occupied = detail_counts > 0
+            values = ((edges[:-1] + edges[1:]) / 2)[occupied]
+            detail_counts = detail_counts[occupied]
         out.append(
             {
                 "bins": [int(c) for c in counts],
                 "vmin": vmin,
                 "vmax": vmax,
                 "level": pick["path"],
+                "detail": {"values": values.tolist(), "counts": detail_counts.tolist()},
+                "autoHistogram": {"bins": [int(c) for c in auto_counts],
+                                  "vmin": auto_min, "vmax": auto_max},
             }
         )
     return out

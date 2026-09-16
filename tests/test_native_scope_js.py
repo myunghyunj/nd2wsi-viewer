@@ -21,7 +21,8 @@ SCRIPT = r"""
 const Scope = require(process.argv[1]);
 const spec = JSON.parse(process.argv[2]);
 let value;
-if (spec.fn === "map") value = Scope.mapRect(spec.local, spec.frame, spec.viewport);
+if (spec.fn === "subtract") value = Scope.subtractRects(spec.base, spec.holes);
+else if (spec.fn === "map") value = Scope.mapRect(spec.local, spec.frame, spec.viewport);
 else if (spec.fn === "build") value = Scope.buildScopes(spec.entries, spec.viewport);
 else if (spec.fn === "roundtrip") {
   const point = Scope.pointFromInput(spec.input, spec.viewport);
@@ -136,3 +137,16 @@ def test_shell_blocker_rect_normalizes_and_clips_to_the_webview():
     )
 
     assert normalized == {"left": 0, "top": 0.2, "right": 0.12, "bottom": 0.5}
+
+
+def test_lut_holes_route_only_visible_plots_and_preserve_neighbor_scrolling():
+    base = {"left": 0, "top": 0, "right": 500, "bottom": 800}
+    holes = [{"left": 20, "top": y, "right": 220, "bottom": y + 90}
+             for y in (50, 200)]
+    excluded = _run({"fn": "subtract", "base": base, "holes": holes})
+    def inside(r, x, y):
+        return r['left'] <= x < r['right'] and r['top'] <= y < r['bottom']
+    for x in range(0, 500, 5):
+        for y in range(0, 800, 5):
+            assert any(inside(r, x, y) for r in excluded) != any(inside(r, x, y) for r in holes)
+    assert len(excluded) < 64

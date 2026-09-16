@@ -10,6 +10,7 @@ const state = {
   channels: [], // enabled channel indices
   luts: [], // per channel {lo, hi, gamma}; null while at store defaults
   lutWidgets: [], // canvas LUT widgets, aligned with luts
+  lutAutoRange: false, // opt-in histogram crop; never changes image contrast
   roi: null, // {x, y, w, h} in level-0 pixels
   roiSite: null, // plate site that owns the ROI; null for WSI or no ROI
   roiOverlayEl: null, // projected SVG polygon in raw image coordinates
@@ -552,6 +553,12 @@ function buildChannelPanel() {
     return;
   }
   const list = $("channel-list");
+  const rangeToggle = $("lut-auto-range");
+  rangeToggle.checked = state.lutAutoRange;
+  rangeToggle.addEventListener("change", () => {
+    state.lutAutoRange = rangeToggle.checked;
+    state.lutWidgets.forEach((widget) => widget.setAutoRange(state.lutAutoRange));
+  });
   info.channels.forEach((ch, i) => {
     const row = document.createElement("div");
     row.className = "channel-row";
@@ -601,6 +608,10 @@ function buildChannelPanel() {
     list.append(hint);
   }
   loadHistograms();
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.textContent = "Scroll to zoom · Drag to pan · Double-click for full range";
+  list.append(hint);
 }
 
 /* ---- per-channel LUT (NIS-style histogram + window/gamma curve) ------------
@@ -610,7 +621,38 @@ function buildChannelPanel() {
    -- the layout NIS-Elements' LUTs panel uses.  Shift-drag applies to all
    channels. */
 
-const applyLuts = debounce(() => refreshTiles(), 250);
+// Coalesce all channels from one input event, then keep showing the newest
+// contrast during a continuous drag instead of waiting for it to stop.
+const applyLuts = liveUpdate(() => refreshTiles(), 100);
+window.addEventListener("pagehide", () => applyLuts.cancel(), { once: true });
+
+function liveUpdate(fn, ms) {
+  let timer = null;
+  let pending = false;
+  let last = -Infinity;
+  const apply = () => {
+    timer = null;
+    if (!pending) return;
+    pending = false;
+    last = performance.now();
+    fn();
+  };
+  const request = () => {
+    pending = true;
+    if (timer === null)
+      timer = setTimeout(apply, Math.max(0, ms - (performance.now() - last)));
+  };
+  request.flush = () => {
+    clearTimeout(timer);
+    apply();
+  };
+  request.cancel = () => {
+    clearTimeout(timer);
+    timer = null;
+    pending = false;
+  };
+  return request;
+}
 
 /* Swap the tiles of the open image in place. The tile source builds every
    URL through tileQuery() at request time, so dropping the loaded tiles is
@@ -663,6 +705,7 @@ function buildLutRow(i, ch, winLabel) {
   wrap.className = "lut";
   const canvas = document.createElement("canvas");
   canvas.className = "lut-canvas";
+  canvas.title = "Scroll to zoom at the pointer; scroll sideways or drag empty space to pan. Double-click for full range. Drag triangles or the round handle to adjust contrast.";
   const ctx = canvas.getContext("2d");
   wrap.append(canvas);
 
@@ -686,12 +729,89 @@ function buildLutRow(i, ch, winLabel) {
 
   const def = { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
   const cur = { ...(state.luts[i] || def) };
-  let vmin = Math.min(Number(ch.window.min) || 0, def.lo);
-  let vmax = Math.max(
-    def.hi,
-    vmin + 2 * Math.max(def.hi - vmin, 1)
-  ); // provisional until the histogram loads
+  let rangeMin = Number.isFinite(Number(ch.window.min)) ? Number(ch.window.min) : 0;
+  let rangeMax = Math.max(Number(ch.window.max) || def.hi, rangeMin + 1);
+  let vmin = rangeMin;
+  let vmax = rangeMax;
   let bins = null;
+  let autoHistogram = null;
+  let fullHistogram = null;
+  let autoRange = !!state.lutAutoRange;
+  let manualAxis = false;
+
+  function projectBins() {
+    const histogram = autoRange && autoHistogram ? autoHistogram : fullHistogram;
+    if (!histogram) { bins = null; return; }
+    if (!manualAxis) { bins = histogram.bins; return; }
+    const n = Math.max(64, Math.min(512, Math.round(W - 8)));
+    bins = Array(n).fill(0);
+    const detail = fullHistogram?.detail;
+    const add = (value, count) => {
+      if (value < vmin || value > vmax) return;
+      const bin = Math.min(n - 1, Math.floor((value - vmin) / (vmax - vmin) * n));
+      bins[bin] += count;
+    };
+    if (detail) {
+      detail.values.forEach((value, index) => add(value, detail.counts[index]));
+    } else {
+      const step = (histogram.vmax - histogram.vmin) / histogram.bins.length;
+      histogram.bins.forEach((count, index) => add(histogram.vmin + (index + 0.5) * step, count));
+    }
+  }
+
+  function updateAxis() {
+    const histogram = autoRange && autoHistogram ? autoHistogram : fullHistogram;
+    if (!manualAxis) {
+      vmin = histogram ? histogram.vmin : rangeMin;
+      vmax = histogram ? histogram.vmax : rangeMax;
+    }
+    projectBins();
+    draw();
+  }
+
+  function manualView(lo, hi) {
+    // Freeze every channel's current axis when leaving automatic fitting.
+    // Merely navigating a graph must never change image contrast.
+    if (state.lutAutoRange) {
+      state.lutAutoRange = false;
+      $("lut-auto-range").checked = false;
+      state.lutWidgets.forEach((widget) => widget.freezeAxis());
+    }
+    autoRange = false;
+    manualAxis = true;
+    const span = clamp(hi - lo, Math.max(1, (rangeMax - rangeMin) / 65536), rangeMax - rangeMin);
+    vmin = clamp(lo, rangeMin, rangeMax - span);
+    vmax = vmin + span;
+    projectBins();
+    draw();
+  }
+
+  // Full-range handles can sit less than one screen pixel apart. Keep exact
+  // display endpoints editable without cropping or magnifying the axis.
+  const fields = document.createElement("div");
+  fields.className = "lut-values";
+  const inputs = {};
+  for (const [key, text] of [["lo", "Min"], ["hi", "Max"]]) {
+    const label = document.createElement("label");
+    label.textContent = text;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "any";
+    input.setAttribute("aria-label", ch.label + " display " + text.toLowerCase());
+    input.addEventListener("change", () => {
+      const value = input.value === "" ? NaN : Number(input.value);
+      if (Number.isFinite(value)) {
+        const next = { ...cur };
+        next[key] = key === "lo" ? clamp(value, rangeMin, cur.hi - 1)
+          : clamp(value, cur.lo + 1, rangeMax);
+        setLut(next);
+      } else draw();
+    });
+    inputs[key] = input;
+    label.append(input);
+    fields.append(label);
+  }
+  wrap.append(fields);
 
   const vx = (v) => PLOT.x0 +
     clamp((v - vmin) / Math.max(vmax - vmin, 1e-9), 0, 1) * (PLOT.x1 - PLOT.x0);
@@ -731,7 +851,7 @@ function buildLutRow(i, ch, winLabel) {
     // window guides
     ctx.strokeStyle = inkColor(0.30);
     ctx.setLineDash([2, 3]);
-    for (const v of [cur.lo, cur.hi]) {
+    for (const v of [cur.lo, cur.hi].filter((value) => value >= vmin && value <= vmax)) {
       ctx.beginPath();
       ctx.moveTo(vx(v) + 0.5, PLOT.y0);
       ctx.lineTo(vx(v) + 0.5, PLOT.y1);
@@ -741,26 +861,30 @@ function buildLutRow(i, ch, winLabel) {
     // mapping curve: flat-left, gamma ramp, flat-right
     ctx.strokeStyle = inkColor(0.85);
     ctx.beginPath();
-    ctx.moveTo(PLOT.x0, PLOT.y1);
-    ctx.lineTo(vx(cur.lo), PLOT.y1);
     const steps = 40;
     for (let s = 0; s <= steps; s++) {
-      const t = s / steps;
-      ctx.lineTo(vx(cur.lo + (cur.hi - cur.lo) * t), curveY(t));
+      const value = vmin + (vmax - vmin) * s / steps;
+      const t = (value - cur.lo) / Math.max(cur.hi - cur.lo, 1e-9);
+      const x = PLOT.x0 + w * s / steps;
+      if (s === 0) ctx.moveTo(x, curveY(t));
+      else ctx.lineTo(x, curveY(t));
     }
-    ctx.lineTo(PLOT.x1, PLOT.y0);
     ctx.stroke();
     // gamma knob
     const k = knobPos();
-    ctx.beginPath();
-    ctx.arc(k.x, k.y, 4.5, 0, Math.PI * 2);
-    ctx.fillStyle = currentTheme() === "light" ? "#f6f6f8" : "#1e1e20";
-    ctx.fill();
-    ctx.strokeStyle = inkColor(0.85);
-    ctx.stroke();
+    if ((cur.lo + cur.hi) / 2 >= vmin && (cur.lo + cur.hi) / 2 <= vmax) {
+      ctx.beginPath();
+      ctx.arc(k.x, k.y, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = currentTheme() === "light" ? "#f6f6f8" : "#1e1e20";
+      ctx.fill();
+      ctx.strokeStyle = inkColor(0.85);
+      ctx.stroke();
+    }
     // lo/hi triangles along the top edge
-    triangle(vx(cur.lo), currentTheme() === "light" ? "#3a3a3c" : "#111214", inkColor(0.55));
-    triangle(vx(cur.hi), currentTheme() === "light" ? "#ffffff" : "rgba(255,255,255,0.92)", "rgba(0,0,0,0.6)");
+    if (cur.lo >= vmin && cur.lo <= vmax)
+      triangle(vx(cur.lo), currentTheme() === "light" ? "#3a3a3c" : "#111214", inkColor(0.55));
+    if (cur.hi >= vmin && cur.hi <= vmax)
+      triangle(vx(cur.hi), currentTheme() === "light" ? "#ffffff" : "rgba(255,255,255,0.92)", "rgba(0,0,0,0.6)");
     // labels — SF Mono ramp
     ctx.font = "9px ui-monospace, 'SF Mono', Menlo, monospace";
     ctx.fillStyle = inkColor(0.55);
@@ -776,6 +900,15 @@ function buildLutRow(i, ch, winLabel) {
     ctx.textAlign = "right";
     ctx.fillText(fmtInt(vmax), PLOT.x1, H - 3);
     winLabel.textContent = fmtInt(cur.lo) + "–" + fmtInt(cur.hi);
+    inputs.lo.value = String(cur.lo);
+    inputs.hi.value = String(cur.hi);
+    for (const input of Object.values(inputs)) {
+      input.min = String(rangeMin);
+      input.max = String(rangeMax);
+    }
+    canvas.setAttribute("aria-label", ch.label + " histogram range " + fmtInt(vmin) + " to " + fmtInt(vmax));
+    canvas.setAttribute("data-axis-min", String(vmin));
+    canvas.setAttribute("data-axis-max", String(vmax));
   }
 
   function triangle(x, fill, stroke) {
@@ -803,32 +936,87 @@ function buildLutRow(i, ch, winLabel) {
     cur.gamma = Math.max(0.25, Math.min(4, l.gamma));
     draw();
     state.luts[i] = isDefault(cur) ? null : { ...cur };
-    applyLuts(); // shared debounce: one tile reload even for shift-drags
+    applyLuts(); // shared cadence: one tile reload even for shift-drags
   }
 
   // dragging: lo/hi triangles (horizontal), gamma knob (vertical)
   let mode = null;
+  let panFrom = null;
   const pt = (ev) => {
     const r = canvas.getBoundingClientRect();
     return { x: ev.clientX - r.left, y: ev.clientY - r.top };
   };
   canvas.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== undefined && ev.button !== 0 && ev.button !== 1) return;
     const p = pt(ev);
     const k = knobPos();
-    if (Math.hypot(p.x - k.x, p.y - k.y) < 9) mode = "gamma";
-    else if (Math.abs(p.x - vx(cur.hi)) < Math.abs(p.x - vx(cur.lo))) mode = "hi";
-    else mode = "lo";
+    const loDistance = cur.lo >= vmin && cur.lo <= vmax ? Math.abs(p.x - vx(cur.lo)) : Infinity;
+    const hiDistance = cur.hi >= vmin && cur.hi <= vmax ? Math.abs(p.x - vx(cur.hi)) : Infinity;
+    const mid = (cur.lo + cur.hi) / 2;
+    if (ev.button !== 1 && mid >= vmin && mid <= vmax && Math.hypot(p.x - k.x, p.y - k.y) < 9) mode = "gamma";
+    else if (ev.button !== 1 && p.y <= PLOT.y0 + 7 && Math.min(loDistance, hiDistance) < 10)
+      mode = hiDistance < loDistance ? "hi" : "lo";
+    else mode = "pan";
+    panFrom = { x: p.x, lo: vmin, hi: vmax };
     canvas.setPointerCapture(ev.pointerId);
-    drag(ev);
+    if (mode !== "pan") drag(ev);
     ev.preventDefault();
   });
   canvas.addEventListener("pointermove", (ev) => {
     if (mode) drag(ev);
   });
-  canvas.addEventListener("pointerup", () => (mode = null));
+  const endDrag = () => {
+    if (mode && mode !== "pan") applyLuts.flush();
+    mode = null;
+    panFrom = null;
+    canvas.style.cursor = "grab";
+  };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("lostpointercapture", endDrag);
+
+  const navigateWheel = (dx, dy, x) => {
+    if (Math.abs(dx) > Math.abs(dy)) {
+      const offset = dx / (PLOT.x1 - PLOT.x0) * (vmax - vmin);
+      manualView(vmin + offset, vmax + offset);
+    } else if (dy) {
+      const fraction = clamp((x - PLOT.x0) / (PLOT.x1 - PLOT.x0), 0, 1);
+      const anchor = vmin + fraction * (vmax - vmin);
+      const span = clamp((vmax - vmin) * Math.exp(clamp(dy * 0.008, -1, 1)),
+        Math.max(1, (rangeMax - rangeMin) / 65536), rangeMax - rangeMin);
+      manualView(anchor - fraction * span, anchor + (1 - fraction) * span);
+    }
+  };
+  canvas.addEventListener("wheel", (ev) => {
+    const factor = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? W : 1;
+    navigateWheel(ev.deltaX * factor, ev.deltaY * factor, pt(ev).x);
+    ev.preventDefault();
+    ev.stopPropagation();
+  }, { passive: false });
+  canvas.addEventListener("dblclick", (ev) => {
+    manualView(rangeMin, rangeMax);
+    ev.preventDefault();
+    ev.stopPropagation();
+  });
+  const onNativeLutScroll = (ev) => {
+    if (ev.origin !== location.origin || ev.source !== window.parent) return;
+    const data = ev.data;
+    if (data?.nd2wsi !== "native-trackpad" || data.version !== VIEWPORT_PROTOCOL_VERSION) return;
+    if (document.elementFromPoint(data.clientX, data.clientY) !== canvas) return;
+    // AppKit scrollingDeltaX has the opposite sign from DOM WheelEvent.
+    navigateWheel(-Number(data.deltaX || 0), 0, data.clientX - canvas.getBoundingClientRect().left);
+  };
+  window.addEventListener("message", onNativeLutScroll);
+  window.addEventListener("pagehide", () => window.removeEventListener("message", onNativeLutScroll), { once: true });
 
   function drag(ev) {
     const p = pt(ev);
+    if (mode === "pan") {
+      const offset = (panFrom.x - p.x) / (PLOT.x1 - PLOT.x0) * (panFrom.hi - panFrom.lo);
+      canvas.style.cursor = "grabbing";
+      manualView(panFrom.lo + offset, panFrom.hi + offset);
+      return;
+    }
     const next = { ...cur };
     if (mode === "gamma") {
       const frac = (PLOT.y1 - Math.max(PLOT.y0, Math.min(PLOT.y1, p.y))) /
@@ -851,24 +1039,30 @@ function buildLutRow(i, ch, winLabel) {
   const widget = {
     setLut,
     relayout,
+    freezeAxis() { autoRange = false; manualAxis = true; },
+    setAutoRange(enabled) {
+      autoRange = !!enabled;
+      manualAxis = false;
+      updateAxis();
+    },
     setHistogram(hg) {
-      bins = hg.bins;
-      vmin = Number.isFinite(Number(hg.vmin)) ? Number(hg.vmin) : 0;
-      const reportedMax = Number(hg.vmax);
-      vmax = Math.max(Number.isFinite(reportedMax) ? reportedMax : vmin + 1, vmin + 1);
-      draw();
+      fullHistogram = hg;
+      autoHistogram = hg.autoHistogram || hg;
+      rangeMin = hg.vmin;
+      rangeMax = hg.vmax;
+      updateAxis();
     },
     clearHistogram() {
-      bins = null;
-      vmin = Math.min(Number(ch.window.min) || 0, def.lo);
-      vmax = Math.max(def.hi, vmin + 2 * Math.max(def.hi - vmin, 1));
-      draw();
+      fullHistogram = null;
+      autoHistogram = null;
+      updateAxis();
     },
     reset() {
       setLut({ ...def });
     },
     auto() {
-      const window = autoWindowFromHistogram(bins, vmin, vmax);
+      const histogram = autoHistogram;
+      const window = histogram && autoWindowFromHistogram(histogram.bins, histogram.vmin, histogram.vmax);
       if (window) setLut({ ...window, gamma: cur.gamma });
     },
   };
@@ -5028,10 +5222,25 @@ function wireNativeGestureScope() {
       pending = false;
       if (closed) return;
       const selectors = NATIVE_GESTURE_EXCLUSIONS + (state.plate?.focus !== null ? ", #plate-block" : "");
+      const stageRect = rect($("stage-wrap"));
+      const channelBody = rect(document.querySelector("#win-channels .win-body"));
+      const lutRects = channelBody ? [...document.querySelectorAll(".lut-canvas")].map(rect)
+        .filter(Boolean).map((r) => window.Nd2NativeScope.rect({
+          left: Math.max(r.left, channelBody.left), top: Math.max(r.top, channelBody.top),
+          right: Math.min(r.right, channelBody.right), bottom: Math.min(r.bottom, channelBody.bottom),
+        })).filter(Boolean) : [];
+      const plateEnabled = !!state.plate && Number(state.info?.plate?.T) > 1;
+      let exclusions = plateEnabled ? [] : window.Nd2NativeScope.subtractRects(stageRect, lutRects);
+      for (const element of document.querySelectorAll(selectors)) {
+        const bounds = rect(element);
+        if (!bounds) continue;
+        exclusions.push(...(element.id === "win-channels"
+          ? window.Nd2NativeScope.subtractRects(bounds, lutRects) : [bounds]));
+      }
       const payload = {
         nd2wsi: "native-gesture-scope", version: VIEWPORT_PROTOCOL_VERSION,
-        enabled: !!state.plate && Number(state.info?.plate?.T) > 1, include: rect($("stage-wrap")),
-        exclude: [...document.querySelectorAll(selectors)].map(rect).filter(Boolean),
+        enabled: plateEnabled || lutRects.length > 0, include: stageRect,
+        exclude: exclusions,
       };
       const key = JSON.stringify(payload);
       if (key !== previous) { previous = key; window.parent.postMessage(payload, location.origin); }

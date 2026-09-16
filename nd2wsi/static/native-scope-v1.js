@@ -24,6 +24,29 @@
 
   const clampUnit = (value) => Math.max(0, Math.min(1, value));
 
+  // Represent holes using ordinary exclusion rectangles, so native routing
+  // retains one authenticated scope per pane and its existing size bounds.
+  function subtractRects(base, holes) {
+    let pieces = rect(base) ? [rect(base)] : [];
+    for (const value of holes) {
+      const hole = rect(value);
+      if (!hole) continue;
+      pieces = pieces.flatMap((piece) => {
+        const overlap = rect({ left: Math.max(piece.left, hole.left),
+          top: Math.max(piece.top, hole.top), right: Math.min(piece.right, hole.right),
+          bottom: Math.min(piece.bottom, hole.bottom) });
+        if (!overlap) return [piece];
+        return [
+          { ...piece, bottom: overlap.top },
+          { ...piece, top: overlap.bottom },
+          { left: piece.left, right: overlap.left, top: overlap.top, bottom: overlap.bottom },
+          { left: overlap.right, right: piece.right, top: overlap.top, bottom: overlap.bottom },
+        ].map(rect).filter(Boolean);
+      });
+    }
+    return pieces;
+  }
+
   function normalizeRect(value, viewportValue) {
     const source = rect(value);
     const viewportWidth = finite(viewportValue?.width);
@@ -99,5 +122,5 @@
     };
   }
 
-  return { rect, normalizeRect, mapRect, buildScopes, pointFromInput, pointInFrame };
+  return { rect, subtractRects, normalizeRect, mapRect, buildScopes, pointFromInput, pointInFrame };
 });
