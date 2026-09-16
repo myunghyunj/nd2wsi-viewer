@@ -29,5 +29,26 @@ their routing.
 This release updates macOS Apple silicon. The published Windows package remains v2.0.0.
 Programmatic input checks do not replace physical trackpad testing on other Macs.
 Detailed local logs and preservation inventories are retained outside Git.
-Release publication additionally requires exact-commit CI and real-data checks,
-a verified release download, and the existing Sparkle signing identity.
+
+## Public release verification
+
+- [v2.1.2](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.2) is tagged from
+  `main` commit `8d4fee12cfdf15fcdb8f280e3a75d87d98875215`.
+- [CI](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/35099446383): lint,
+  cold package installation, and Python 3.11/3.12/3.13 suites passed.
+- [Real ND2](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/35099567205):
+  the exact release commit passed the real-data workflow before tagging.
+- [Windows compatibility](https://github.com/myunghyunj/nd2wsi-viewer/actions/runs/35099446401):
+  1,183 tests passed, 124 skipped and 5 deselected; 5 real-data tests passed and
+  1 skipped. Packaged headless/GUI checks passed on hosted x64 Windows and
+  Windows 11 ARM64 using x64 emulation, including Korean and space-containing paths.
+  No Windows 2.1.2 package is published by this macOS release.
+- The public DMG was downloaded again and its checksum, existing Sparkle
+  Ed25519 signature, strict application signature and ND2/SVS export smoke passed.
+- All 2,058 file/symlink entries in the downloaded application match the installed
+  `/Applications/nd2wsi-viewer.app`; version 2.1.2 is installed.
+- The app is ad-hoc signed, not Developer ID notarized.
+
+Artifact: `nd2wsi-viewer-2.1.2-macos-arm64.dmg` (69,269,884 bytes).
+
+SHA-256: `9d4612609c172636ec0705b47bf82f70444e31cdcee12367eb41e04285405849`.

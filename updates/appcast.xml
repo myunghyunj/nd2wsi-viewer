@@ -3,6 +3,23 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.1.2</title>
+            <pubDate>Wed, 16 Sep 2026 21:48:27 +0900</pubDate>
+            <sparkle:version>2.1.2</sparkle:version>
+            <sparkle:shortVersionString>2.1.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>LUT range and live contrast</h2>
+<ul>
+<li>Full intensity range by default, with optional Auto-fit.</li>
+<li>Scroll to zoom, drag or scroll sideways to pan, and double-click for the full range.</li>
+<li>Live contrast updates while dragging, plus exact Min/Max entry.</li>
+</ul>
+<p>macOS Apple silicon. Existing slides, annotations and viewing caches are preserved.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.2/nd2wsi-viewer-2.1.2-macos-arm64.dmg" length="69269884" type="application/octet-stream" sparkle:edSignature="ijqf0AEMyUnngALlq7BPjmZnVsofg6hFbZ2waAPE5ogUqP9uT5IjGK/1yuPghiF1mBMUXmxVDMo3BbMO1F5JDA=="/>
+        </item>
+        <item>
             <title>2.0.0</title>
             <pubDate>Tue, 08 Sep 2026 11:54:09 +0900</pubDate>
             <sparkle:version>2.0.0</sparkle:version>
