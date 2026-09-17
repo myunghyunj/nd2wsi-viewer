@@ -149,7 +149,7 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
     const button = ev.currentTarget;
     button.disabled = true;
     pywebview.api.check_for_updates()
-      .then(result => { if (!result.ok) setStatus(result.message || 'Could not check for updates.'); })
+      .then(result => { if (result.message || !result.ok) setStatus(result.message || 'Could not check for updates.'); })
       .catch(error => setStatus('Could not check for updates: ' + error))
       .finally(() => { button.disabled = false; });
   });
@@ -417,7 +417,7 @@ class Api:
         self._open_attempt_id = None
         self._fallback_consumed = False
         self._updates_disabled = sys.platform == "darwin" and (
-            window_session is not None or os.environ.get("ND2WSI_WINDOW_CHILD") == "1"
+            window_session is not None and window_session.role == "agent"
         )
         self._server_lock = threading.Lock()
         if native_gesture_scopes is None:

@@ -13,7 +13,7 @@
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.1.4 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.1.4 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.5/nd2wsi-viewer-2.1.5-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -67,17 +67,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.1.4-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.1.5-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.5/nd2wsi-viewer-2.1.5-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.5/nd2wsi-viewer-2.1.5-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides the tested portable ZIP, not a v2.1.4
+or GPU is required. This release provides the tested portable ZIP, not a v2.1.5
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
-silicon, it uses Windows x64 emulation. The exact v2.1.4 portable archive passed
-scientific and GUI checks on GitHub x64 and Windows 11 ARM64-emulation runners.
+silicon, it uses Windows x64 emulation. The release notes record scientific and
+GUI verification of the exact archive on GitHub x64 and Windows 11 ARM64-emulation runners.
 Windows 10 Education and local Parallels were not tested for this release.
 .NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
 install WebView2 separately if it is missing.
@@ -102,7 +102,10 @@ Version 1.2.1 is the first release that contains the updater, so it must be
 installed from the DMG once. After that, use the circular-arrow button in the
 tab bar or **nd2wsi-viewer → Check for Updates…**. The app checks quietly once
 a day and shows Sparkle's standard update window only when a newer signed
-release exists; it never installs an update without asking.
+release exists; it never installs an update without asking. Close the other
+viewer windows before installing; each window checks its unsaved work first.
+Versions 2.1.1–2.1.4 did not start automatic checks, so download 2.1.5 manually
+once if you are upgrading from one of those versions.
 
 The first time you open an ND2 scan the viewer builds its reduced copies. A 3 GB scan takes well under a minute on a laptop, and the next open is instant. An SVS opens right away.
 

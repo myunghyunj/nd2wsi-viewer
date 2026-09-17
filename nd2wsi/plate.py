@@ -130,23 +130,23 @@ def is_plate_file(path: str | Path) -> bool:
         return False
 
 
-def _cluster_1d(values: list[float]) -> list[int]:
+def _cluster_1d(values: list[float], *, gap_limit: float | None = None) -> list[int]:
     """Cluster index per value, ascending, split where the step between
     neighbours stands out.
 
-    The threshold is half the widest step, not a fraction of the whole
-    extent. Measured against the extent, five or more evenly spaced rows
-    had no step wide enough to count as a gap and the plate collapsed
-    into one track; half the widest step splits them and still holds a
-    column together when its sites are spread over a few millimetres.
-    The floor keeps the stage's own wobble, tens of micrometres, from
-    splitting one row in two.
+    Half the widest step allows a column to spread over a few millimetres.
+    Missing tracks can make that estimate too large; site_layout supplies
+    a smaller limit when the resulting cells contain separate stage sites.
+    The floor keeps revisits within a millimetre in the same track.
     """
     n = len(values)
     order = sorted(range(n), key=lambda i: values[i])
     steps = [d for d in (values[b] - values[a] for a, b in zip(order, order[1:])) if d > 0]
     widest = max(steps) if steps else 0.0
-    gap = max(1000.0, 0.5 * widest)
+    gap = 0.5 * widest
+    if gap_limit is not None:
+        gap = min(gap, gap_limit)
+    gap = max(1000.0, gap)
     labels = [0] * n
     c = 0
     for prev, cur in zip(order, order[1:]):
@@ -156,9 +156,57 @@ def _cluster_1d(values: list[float]) -> list[int]:
     return labels
 
 
-def site_layout(points: list[tuple[float, float] | None]) -> list[tuple[int, int]]:
+def _named_site_layout(
+    xs: list[float], ys: list[float], names: list[str] | None,
+) -> list[tuple[int, int]] | None:
+    """Use unambiguous well identities, with orientation taken from the stage."""
+    if names is None or len(names) != len(xs):
+        return None
+    wells = []
+    for name in names:
+        match = re.fullmatch(r"([A-Za-z]+)0*([1-9]\d*)", str(name).strip())
+        if match is None:
+            return None
+        row = 0
+        for letter in match[1].upper():
+            row = row * 26 + ord(letter) - ord("A") + 1
+        try:
+            wells.append((row, int(match[2])))
+        except ValueError:
+            return None
+    # Repeated well names may represent several fields of one well. Their
+    # geometry must remain authoritative instead of merging by identity.
+    if len(set(wells)) != len(wells):
+        return None
+
+    def axis(values: list[float], part: int) -> tuple[list[int], float]:
+        groups: dict[int, list[float]] = {}
+        for well, value in zip(wells, values):
+            groups.setdefault(well[part], []).append(value)
+        centers = {key: sum(v) / len(v) for key, v in groups.items()}
+        order = sorted(groups, key=lambda key: (centers[key], key))
+        ranks = {key: rank for rank, key in enumerate(order)}
+        error = sum(
+            (value - centers[well[part]]) ** 2 for well, value in zip(wells, values)
+        )
+        return [ranks[well[part]] for well in wells], error
+
+    candidates = []
+    for row_part, col_part in ((0, 1), (1, 0)):
+        rows, row_error = axis(ys, row_part)
+        cols, col_error = axis(xs, col_part)
+        candidates.append((row_error + col_error, list(zip(rows, cols))))
+    # Compare normal and transposed grouping; sorting each track by its
+    # stage center also preserves reversed axes and serpentine acquisitions.
+    return min(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def site_layout(
+    points: list[tuple[float, float] | None], *, names: list[str] | None = None,
+) -> list[tuple[int, int]]:
     """(row, col) per stage point. Rows follow ascending Y, columns ascending X.
 
+    Unique well names disambiguate sparse grids without assuming a plate size.
     Without usable coordinates every site lands in row 0 at its own index.
     """
     n = len(points)
@@ -175,8 +223,41 @@ def site_layout(points: list[tuple[float, float] | None]) -> list[tuple[int, int
             return [(0, i) for i in range(n)]
         xs.append(x)
         ys.append(y)
+    named = _named_site_layout(xs, ys, names)
+    if named is not None:
+        return named
     rows = _cluster_1d(ys)
     cols = _cluster_1d(xs)
+    # Refine only occupied cells that combine widely separated positions.
+    # Independent smallest-gap clustering would split a real column whose
+    # sites drift by 3.2 mm between rows. Resolve the strongest separation
+    # first, then reconsider collisions with the other axis still intact.
+    limits = [math.inf, math.inf]
+    while True:
+        cells: dict[tuple[int, int], list[int]] = {}
+        for i, cell in enumerate(zip(rows, cols)):
+            cells.setdefault(cell, []).append(i)
+        candidates = []
+        for axis, values in enumerate((ys, xs)):
+            steps = []
+            for members in cells.values():
+                positions = sorted(values[i] for i in members)
+                steps.extend(
+                    b - a for a, b in zip(positions, positions[1:]) if b - a > 1000.0
+                )
+            if steps:
+                limit = min(limits[axis], 0.5 * min(steps))
+                labels = _cluster_1d(values, gap_limit=limit)
+                if labels != (rows if axis == 0 else cols):
+                    candidates.append((max(steps), axis, limit, labels))
+        if not candidates:
+            break
+        _, axis, limit, labels = max(candidates, key=lambda candidate: candidate[0])
+        limits[axis] = limit
+        if axis == 0:
+            rows = labels
+        else:
+            cols = labels
     return list(zip(rows, cols))
 
 
@@ -412,7 +493,7 @@ class PlateStore:
         fingerprint = quick_fingerprint(source.path)
         c, h, w = source.frame_shape
         shape = (source.T, source.P, source.Z, c, h // THUMB_K, w // THUMB_K)
-        manifest = cls._read(container)
+        manifest = cls._read(container, recover=True)
         if explicit and (manifest is None or not cls._matches(manifest, fingerprint, shape, source)):
             raise ValueError('explicit plate cache is missing or does not match its source')
         if container.is_dir():
@@ -436,7 +517,7 @@ class PlateStore:
         root = None
         try:
             build_lock.acquire(timeout=30.0)
-            manifest = cls._read(container)
+            manifest = cls._read(container, recover=True)
             if manifest is not None and not cls._matches(
                 manifest, fingerprint, shape, source
             ):
@@ -602,13 +683,13 @@ class PlateStore:
             raise ValueError("invalid plate digest array")
 
     @staticmethod
-    def _read(container: Path) -> dict | None:
+    def _read(container: Path, *, recover: bool = False) -> dict | None:
         if is_file_container(container):
             from .storage.single_file import newer_file_format
             newer = newer_file_format(container)
             if newer is not None:
                 raise RuntimeError(f'thumbnail cache uses newer storage format {newer}; update nd2wsi-viewer')
-        m = read_manifest(container)
+        m = read_manifest(container, recover=recover)
         if not isinstance(m, dict):
             return None
         fmt = str(m.get("format") or "")
@@ -1408,7 +1489,8 @@ class PlateSource:
                     stage = None
             self.sites.append({"i": p, "name": name, "row": 0, "col": p, "stageUm": stage})
             points.append((stage[0], stage[1]) if stage else None)
-        for site, (row, col) in zip(self.sites, site_layout(points)):
+        layout = site_layout(points, names=[site["name"] for site in self.sites])
+        for site, (row, col) in zip(self.sites, layout):
             site["row"], site["col"] = int(row), int(col)
         self.rows = 1 + max((s["row"] for s in self.sites), default=0)
         self.cols = 1 + max((s["col"] for s in self.sites), default=0)

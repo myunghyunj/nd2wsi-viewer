@@ -119,7 +119,9 @@ for (const [sid, pixel, center] of [
     spanPx: {x:400, y:300}, containerPx: {x:800, y:600},
     physicalScale: {x:pixel/2, y:pixel/2, cosine:0},
   });
-  context.frames.set(sid,{dataset:{sid},style:{},contentWindow:{}});
+  const frame={dataset:{sid},style:{},contentWindow:{focus(){}},
+    focus(){context.document.activeElement=frame;}};
+  context.frames.set(sid,frame);
 }
 for (const sid of compare.members) {
   compare.pairs.set(sid, context.newPair('a.svs', sid + '.nd2'));

@@ -141,7 +141,7 @@ async function refreshUpdaterButton() {
   try {
     const status = await api.update_status();
     button.disabled = !status.available;
-    const label = status.mode === "download" ? "Download Updates…" : "Check for Updates…";
+    const label = ["download", "manual-download"].includes(status.mode) ? "Download Updates…" : "Check for Updates…";
     button.setAttribute("aria-label", label);
     button.title = status.available
       ? `${label} · version ${status.version}`
@@ -160,7 +160,7 @@ $("update-check").addEventListener("click", async () => {
   button.setAttribute("aria-busy", "true");
   try {
     const result = await api.check_for_updates();
-    if (!result.ok) showError(result.message || "Could not open the update window");
+    if (result.message || !result.ok) showError(result.message || "Could not open the update window");
   } catch (error) {
     showError(`Could not check for updates: ${error}`);
   } finally {
@@ -351,8 +351,27 @@ function broadcastTabShortcutState() {
   for (const sid of frames.keys()) sendTabShortcutState(sid);
 }
 
+function focusActivePane(deferred = false) {
+  const frame = frames.get(active);
+  if (!frame || !readyFrames.has(active) || pairPicker.open || quitPreparation) return false;
+  const focused = document.activeElement;
+  // Already inside the selected pane: leave its annotation editor/controls alone.
+  if (focused === frame) return true;
+  if (ShortcutRouter.isTypingEvent({target: focused})) return false;
+  const otherPane = [...frames.values()].find((item) => item === focused);
+  if (otherPane && compare.enabled && inGroup(otherPane.dataset.sid)) return false;
+  // A late ready message must not take focus from a control the user selected
+  // while the image loaded. A hidden old iframe can safely yield focus.
+  if (deferred && focused && focused !== document.body &&
+      focused !== document.documentElement && !otherPane) return false;
+  frame.focus({preventScroll: true});
+  frame.contentWindow?.focus();
+  return true;
+}
+
 function paneCameUp(sid) {
   sendTabShortcutState(sid);
+  if (sid === active) focusActivePane(true);
   scheduleNativeGestureScopes();
   if (!inGroup(sid)) return;
   broadcastCompareState();
@@ -457,6 +476,7 @@ function activate(sid) {
     selected.contentWindow.postMessage({ nd2wsi: "theme-request" }, location.origin);
   }
   render();
+  focusActivePane();
 }
 
 function refresh(selectSid) {
@@ -2235,6 +2255,7 @@ function stopCompare() {
   compare.anchorSet = {id: null, revision: 0, points: []};
   compare.linked = true;
   applyFrameLayout(); updateCompareControls(); render();
+  focusActivePane();
 }
 
 function toggleCompare() {

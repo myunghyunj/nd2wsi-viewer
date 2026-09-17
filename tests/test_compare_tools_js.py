@@ -75,6 +75,7 @@ const originalPair = {mode: 'physical', transform: {a:1,b:0,c:0,d:1,tx:10,ty:20}
 const frames = new Map([['a', $('frame-a')], ['b', $('frame-b')]]);
 const context = vm.createContext({
   $, document, calls, styleValues, frames, active: 'a', MAX_GROUP: 4,
+  pairPicker:{open:false},quitPreparation:null,
   Align, ShortcutRouter, VIEWPORT_PROTOCOL_VERSION: 2, VIEWPORT_THROTTLE_MS: 48, LANDMARKS_NEEDED: 4,
   structuredClone, crypto: {randomUUID: () => `token-${++tokenSeq}`},
   readyFrames: new Set(['a','b','c']),

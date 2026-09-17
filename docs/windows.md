@@ -1,6 +1,21 @@
 # Windows distribution
 
-## Published v2.1.4 download
+## Current v2.1.5 download
+
+Use the [v2.1.5 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.5/nd2wsi-viewer-2.1.5-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.5/nd2wsi-viewer-2.1.5-windows-x64.zip.sha256).
+The [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.5)
+records the source commit, artifact checksum, and Windows x64 / Windows 11 ARM64
+emulation validation. Extract the whole ZIP and retain `_internal` beside the
+EXE. WebView2 is required. No 2.1.5 Setup installer is included.
+
+This version fixes initial shortcut focus, sparse plate layout and interrupted
+cache recovery. Shared application improvements also include conflict-draft
+handling; macOS automatic-update integration is not used on Windows.
+Windows 10 Education and local Parallels remain untested for this release.
+Windows 11 ARM64 uses the x64 executable through emulation, not a native ARM build.
+
+## Historical v2.1.4 download
 
 Use the [v2.1.4 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip)
 and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.4/nd2wsi-viewer-2.1.4-windows-x64.zip.sha256).
@@ -31,8 +46,8 @@ emulation, not an ARM64-native binary.
 
 ## Installer build tooling
 
-The current source targets viewer 2.1.4, with a native Windows frame
-and Microsoft Edge WebView2. `nd2wsi-viewer-2.1.4-Setup.exe` is the expected installer
+The current source targets viewer 2.1.5, with a native Windows frame
+and Microsoft Edge WebView2. `nd2wsi-viewer-2.1.5-Setup.exe` is the expected installer
 name for that version. Setup installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
@@ -45,8 +60,8 @@ whole extracted folder together; the EXE depends on its `_internal` directory.
 Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
-v1.2.8 results below do not establish v2.1.4 Windows hardware verification.
-The current public v2.1.4 download is the verified portable ZIP described above.
+v1.2.8 results below do not establish v2.1.5 Windows hardware verification.
+The current release provides the portable ZIP described above.
 
 Target execution modes (the verified CI environments are listed above):
 

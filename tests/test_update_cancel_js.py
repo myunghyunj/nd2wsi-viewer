@@ -40,7 +40,7 @@ function runTimers(delay) {
   }
 }
 async function pump() {
-  for (let turn = 0; turn < 30; turn++) {
+  for (let turn = 0; turn < 80; turn++) {
     for (const deliver of pendingMessages.splice(0)) deliver();
     await Promise.resolve();
   }
@@ -118,12 +118,15 @@ for (const sid of ['a', 'b']) {
     }),
   });
   for (const name of ['debounce', 'annotationsChanged', 'normalizeAnnotationSite',
-    'annotationsUrl', 'annotationSaveEntry', 'queueAnnotationSave', 'saveAnnotations',
+    'annotationsUrl', 'annotationSaveEntry', 'annotationRecoveryDrafts', 'annotationDraftAccepted',
+    'acceptAnnotationRecoveryDrafts', 'updateAnnotationRecoveryNotice', 'queueAnnotationSave', 'saveAnnotations',
     'flushAnnotationsForUpdate', 'acknowledgeUpdatePreparation', 'cancelUpdatePreparation',
     'closeEditor', 'wireCompareRelay']) {
     vm.runInContext(production(appSource, name), context);
   }
   vm.runInContext('const scheduleAnnSave = debounce(saveAnnotations, 800); wireCompareRelay();', context);
+  pane.api = context;
+  pane.acceptDrafts = () => context.acceptAnnotationRecoveryDrafts();
   pane.edit = text => {
     state.editingId = 'pin';
     element('ann-editor').hidden = false;

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from test_plate import H, P, T, W, Z, value
 from test_plate import plate_nd2 as _plate_nd2_fixture
+from test_single_file_recovery import _crash_write
 
 from nd2wsi.cache import quick_fingerprint, read_manifest
 from nd2wsi.plate import THUMB_K, PlateSource, PlateStore, plate_container
@@ -60,6 +61,26 @@ def test_explicit_plate_cache_mismatch_is_not_rebuilt(plate_nd2):
         PlateSource(plate_nd2, cache_path=path)
     assert path.read_bytes() == before
     assert not list(path.parent.glob(path.name + '.corrupt-*'))
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_plate_reopens_interrupted_cache_without_rebuilding(plate_nd2, explicit):
+    source = PlateSource(plate_nd2)
+    source.reduced(0, 0, 0, THUMB_K)
+    source.close()
+    path = plate_container(plate_nd2)
+    committed_manifest = read_manifest(path)
+    journal = _crash_write(path)
+    assert read_manifest(path) is None
+    reopened = PlateSource(plate_nd2, **({"cache_path": path} if explicit else {}))
+    try:
+        assert reopened.store is not None
+        assert reopened.store.manifest == committed_manifest
+        assert np.all(reopened.store.get(0, 0, 0) == value(0, 0, 0))
+        assert not journal.exists()
+        assert not list(path.parent.glob(path.name + ".corrupt-*"))
+    finally:
+        reopened.close()
 
 
 def test_explicit_plate_cache_relocates_without_default_cache(tmp_path, plate_nd2):

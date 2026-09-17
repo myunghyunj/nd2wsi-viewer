@@ -204,6 +204,42 @@ def test_prepare_returns_without_blocking_main_and_relaunches_on_main(driver):
     assert driver.coordinator._running is True
 
 
+def test_install_waits_for_other_windows_and_releases_admission_on_cancel(driver, tmp_path):
+    from nd2wsi.window_sessions import create_window_session
+
+    owner = create_window_session("user", tmp_path)
+    peer = create_window_session("agent", tmp_path)
+    driver.api._window_session = owner
+    assert driver.prepare()
+    driver.main.until(lambda: len(driver.window.flushes) == 1)
+    driver.window.reply(0, {"ok": True, "panes": 1})
+    driver.main.until(lambda: "notice" in driver.trace)
+    assert not driver.api.closed.is_set()
+    assert driver.completions == []
+    peer.mark_closed()
+    driver.main.until(lambda: bool(driver.completions))
+    guard = driver.coordinator._install_guard
+    assert guard.gate.acquired
+    driver.coordinator.cancel_preparation()
+    driver.wait_workers()
+    assert not guard.gate.acquired
+    assert create_window_session("user", tmp_path).id != owner.id
+
+
+def test_install_teardown_failure_releases_admission(driver, tmp_path):
+    from nd2wsi.window_sessions import create_window_session
+
+    driver.api._window_session = create_window_session("user", tmp_path)
+    driver.api.close_error = RuntimeError("test resource teardown failure")
+    assert driver.prepare()
+    driver.main.until(lambda: len(driver.window.flushes) == 1)
+    driver.window.reply(0, {"ok": True, "panes": 1})
+    driver.main.until(lambda: not driver.coordinator._running)
+    assert not driver.completions
+    assert driver.coordinator._install_guard is None
+    assert create_window_session("agent", tmp_path).role == "agent"
+
+
 def test_active_exports_or_conversion_are_drained_before_server_close(driver):
     # Use the real API's conversion/export gating and shutdown order, replacing
     # only its HTTP server boundary so this regression opens no sockets.

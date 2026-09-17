@@ -246,6 +246,11 @@
       <button class="zc-btn" id="zoom-fit" title="Fit slide (0)" aria-label="Fit slide">⌾</button>
     </div>
 
+    <aside id="ann-recovery" hidden aria-label="Annotation recovery">
+      <p id="ann-recovery-message" role="status" aria-live="polite"></p>
+      <details><summary>Recovery draft locations</summary><pre id="ann-recovery-paths"></pre></details>
+      <button type="button" class="btn" id="ann-recovery-keep">Keep recovery drafts for closing</button>
+    </aside>
     <div id="toast" role="status" aria-live="polite"></div>
     <div id="boot">Loading slide…</div>
   </div>

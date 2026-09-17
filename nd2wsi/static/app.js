@@ -1362,8 +1362,10 @@ function annotationsChanged() {
   if (state.quitPreparing) return;
   state.annRevision += 1;
   state.annDirty = true;
+  state.annAcceptedDrafts?.clear();
   renderAnnotations();
   rebuildAnnList();
+  updateAnnotationRecoveryNotice();
   scheduleAnnSave();
 }
 
@@ -1403,6 +1405,57 @@ function annotationSaveEntry(site) {
   };
 }
 
+function annotationRecoveryDrafts() {
+  const entries = [...state.annFailedSaves.values()];
+  if (!entries.length || entries.some((entry) => !entry.conflict || !entry.draftPath ||
+      entry.draftBody !== entry.body)) return null;
+  if (state.annDirty) {
+    const current = annotationSaveEntry();
+    if (!current || !entries.some((entry) => entry.url === current.url &&
+        entry.draftBody === current.body)) return null;
+  }
+  return entries;
+}
+
+function annotationDraftAccepted(entry) {
+  return !!(entry?.conflict && entry.draftPath && entry.draftBody === entry.body &&
+    state.annAcceptedDrafts?.get(entry.url) === entry.draftBody);
+}
+
+function acceptAnnotationRecoveryDrafts() {
+  if (state.quitPreparing) return false;
+  if (!$('ann-editor').hidden) closeEditor(true);
+  const entries = annotationRecoveryDrafts();
+  if (!entries) {
+    updateAnnotationRecoveryNotice();
+    return false;
+  }
+  state.annAcceptedDrafts = new Map(entries.map((entry) => [entry.url, entry.draftBody]));
+  updateAnnotationRecoveryNotice();
+  return true;
+}
+
+function updateAnnotationRecoveryNotice() {
+  const notice = $('ann-recovery');
+  if (!notice) return;
+  const failed = [...state.annFailedSaves.values()];
+  notice.hidden = !failed.some((entry) => entry.conflict);
+  if (notice.hidden) return;
+  const entries = annotationRecoveryDrafts();
+  const accepted = !!entries && entries.every(annotationDraftAccepted);
+  $('ann-recovery-message').textContent = accepted
+    ? 'Recovery drafts will be kept when you close. These edits have not been applied to the source. Close the tab or window again when ready.'
+    : entries
+    ? 'Another window changed the annotations. Your edits are preserved in recovery drafts and have not been applied to the source.'
+    : 'Another window changed the annotations. Some edits are not yet preserved in a recovery draft. Keep this window open and retry saving or export your annotations.';
+  const paths = failed.filter((entry) => entry.draftPath).map((entry) => entry.draftPath);
+  $('ann-recovery-paths').textContent = paths.join('\n');
+  const button = $('ann-recovery-keep');
+  button.disabled = !entries || accepted || state.quitPreparing;
+  button.textContent = accepted ? 'Recovery drafts kept for closing' : 'Keep recovery drafts for closing';
+  button.onclick = acceptAnnotationRecoveryDrafts;
+}
+
 function queueAnnotationSave(entry) {
   if (!entry || !entry.url) {
     return Promise.resolve({ ok: false, error: "choose a plate site first" });
@@ -1418,6 +1471,10 @@ function queueAnnotationSave(entry) {
         payload.expected_revision = revisions.get(entry.url);
       }
       entry.body = JSON.stringify(payload);
+      // A previous draft cannot authorize a later failed or changed request.
+      entry.conflict = false;
+      entry.draftPath = null;
+      entry.draftBody = null;
       const response = await fetch(entry.url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1427,7 +1484,9 @@ function queueAnnotationSave(entry) {
         let conflict = {};
         try { conflict = await response.json(); } catch (_) { /* keep local draft */ }
         entry.conflict = true;
-        entry.draftPath = conflict.draft_path || null;
+        entry.draftPath = typeof conflict.draft_path === "string" && !conflict.draft_error
+          ? conflict.draft_path : null;
+        entry.draftBody = entry.draftPath ? entry.body : null;
         throw new Error("Conflict: another window changed this sidecar. Your edits remain unsaved; no overwrite or merge." +
           (entry.draftPath ? " Recovery draft: " + entry.draftPath : " Keep this window open and export your annotations."));
       }
@@ -1447,6 +1506,7 @@ function queueAnnotationSave(entry) {
       if (state.annContext === entry.context) {
         setAnnStatus("Saved · " + basename(data.path));
       }
+      updateAnnotationRecoveryNotice();
       return { ok: true };
     } catch (error) {
       const failed = state.annFailedSaves.get(entry.url);
@@ -1457,6 +1517,7 @@ function queueAnnotationSave(entry) {
         state.annDirty = true;
         setAnnStatus("Save failed: " + error.message);
       }
+      updateAnnotationRecoveryNotice();
       return { ok: false, error: error.message };
     }
   });
@@ -1483,23 +1544,32 @@ async function flushAnnotationsForUpdate() {
   if (!$('ann-editor').hidden) closeEditor(true);
   state.quitPreparing = true;
   scheduleAnnSave.cancel();
+  await state.annSaveTail;
 
   if (state.annDirty) {
-    const saved = await saveAnnotations();
-    if (!saved.ok) throw new Error(saved.error || "annotation save failed");
+    const current = annotationSaveEntry();
+    const failed = current && state.annFailedSaves.get(current.url);
+    if (!failed || failed.body !== current.body || !annotationDraftAccepted(failed)) {
+      await saveAnnotations();
+    }
   }
   await state.annSaveTail;
 
-  // A plate may have changed sites after queueing a save. Retry the exact
-  // URL and payload captured for every older site rather than writing the
-  // current site's marks into it.
+  // Capture every older plate site's failed snapshot too. Do not short-circuit
+  // at the first conflict, leaving another site's unsaved marks unchecked.
   for (const entry of [...state.annFailedSaves.values()]) {
-    const retried = await queueAnnotationSave(entry);
-    if (!retried.ok) throw new Error(retried.error || "annotation retry failed");
+    if (!annotationDraftAccepted(entry) && (!entry.conflict || !entry.draftPath ||
+        entry.draftBody !== entry.body)) await queueAnnotationSave(entry);
   }
   await state.annSaveTail;
   if (state.annDirty || state.annFailedSaves.size) {
-    throw new Error("annotations are still waiting to be saved");
+    const drafts = annotationRecoveryDrafts();
+    if (!drafts || !drafts.every(annotationDraftAccepted)) {
+      updateAnnotationRecoveryNotice();
+      throw new Error(drafts
+        ? "Annotations conflict. Review the recovery notice and choose Keep recovery drafts for closing, then close again."
+        : "Some annotations are not safely preserved. Keep this window open and retry saving or export your annotations.");
+    }
   }
 }
 
@@ -1529,9 +1599,10 @@ function cancelUpdatePreparation(requestId) {
   if (!requestId || state.quitRequestId !== requestId) return false;
   state.quitRequestId = null;
   state.quitPreparing = false;
+  updateAnnotationRecoveryNotice();
   // Keep in-flight saves and failed snapshots intact. If saving failed while
   // preparation had cancelled the debounce, ordinary editing can retry it.
-  if (state.annDirty) scheduleAnnSave();
+  if (state.annDirty && !annotationRecoveryDrafts()?.every(annotationDraftAccepted)) scheduleAnnSave();
   return true;
 }
 
@@ -1612,6 +1683,7 @@ function loadAnnotations(site) {
           ? "Loaded " + state.annotations.length + " from " + basename(d.path)
           : "Sidecar: " + basename(d.path)
       );
+      updateAnnotationRecoveryNotice();
       renderAnnotations();
       rebuildAnnList();
       syncFrameScopedControls();
@@ -4582,7 +4654,7 @@ function renderTimeLine() {
   renderPlateAuto();
 }
 
-const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #ann-editor, #z-slider, #plate-transpose, #zoom-cluster";
+const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #ann-editor, #ann-recovery, #z-slider, #plate-transpose, #zoom-cluster";
 
 function wireNativeGestureScope() {
   let pending = false;

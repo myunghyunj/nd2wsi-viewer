@@ -42,7 +42,7 @@ bundle_version = match[1] + (f'fc{match[2]}' if match[2] else '')
 info.update(CFBundleShortVersionString=match[1], CFBundleVersion=bundle_version,
             ND2WSIPackageVersion=release, LSMinimumSystemVersion='12.0',
             CFBundleDisplayName='nd2wsi-viewer', NSHighResolutionCapable=True,
-            SUEnableAutomaticChecks=False)
+            SUEnableAutomaticChecks=True)
 types = [('nd2', 'com.nikon.nis-elements.nd2', 'Nikon ND2 slide scan'),
          ('svs', 'com.aperio.svs', 'Aperio SVS slide'),
          ('nd2svs', 'com.nd2wsi.nd2svs', 'nd2svs single-file viewing cache')]

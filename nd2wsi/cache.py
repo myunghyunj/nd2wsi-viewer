@@ -189,11 +189,11 @@ def source_base(container: str | Path) -> Path:
     return container.parent if is_file_container(container) else container
 
 
-def _manifest_data(container: Path) -> Any:
+def _manifest_data(container: Path, *, recover: bool = False) -> Any:
     if is_file_container(container):
         from .storage.single_file import read_entry
 
-        return json.loads(read_entry(container, MANIFEST_NAME))
+        return json.loads(read_entry(container, MANIFEST_NAME, recover=recover))
     return json.loads((container / MANIFEST_NAME).read_text(encoding="utf-8"))
 
 
@@ -276,9 +276,10 @@ def write_manifest(
     tmp.replace(container / MANIFEST_NAME)
 
 
-def read_manifest(container: str | Path) -> dict[str, Any] | None:
+def read_manifest(container: str | Path, *, recover: bool = False) -> dict[str, Any] | None:
+    """Read metadata; only authorized cache-open paths opt into crash recovery."""
     try:
-        m = _manifest_data(Path(container))
+        m = _manifest_data(Path(container), recover=recover)
     except (OSError, UnicodeError, ValueError):
         return None
     return m if isinstance(m, dict) and m.get("complete") else None

@@ -16,6 +16,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .session_lock import SessionFileLock
+
 AGENT_DIRECTIVE = (
     "Automated agents must open a NEW Agent window using new_window('agent') "
     "or --agent-window before opening slides or changing viewer state. Confirm "
@@ -49,6 +51,7 @@ class WindowSession:
     root: Path
     endpoint: str | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _lifetime_lock: SessionFileLock | None = field(default=None, repr=False)
 
     @property
     def annotation_root(self) -> Path:
@@ -88,7 +91,11 @@ class WindowSession:
 
     def mark_closed(self) -> None:
         # Keep snapshots/drafts/results for recovery; closing never deletes data.
-        self._record(state="closed", closed_at=dt.datetime.now(dt.UTC).isoformat())
+        try:
+            self._record(state="closed", closed_at=dt.datetime.now(dt.UTC).isoformat())
+        finally:
+            if self._lifetime_lock is not None:
+                self._lifetime_lock.release()
 
 
 def create_window_session(role: str, base_path: str | Path | None = None) -> WindowSession:
@@ -101,18 +108,32 @@ def create_window_session(role: str, base_path: str | Path | None = None) -> Win
         )
     base = Path(base_path).expanduser().resolve()
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    from .update_guard import window_admission
+
+    with window_admission(base):
+        return _create_session(role, base)
+
+
+def _create_session(role: str, base: Path) -> WindowSession:
+    from .update_guard import session_lifetime
+
     session_id = uuid.uuid4().hex
     root = base / session_id
     root.mkdir(mode=0o700, exist_ok=False)
     session = WindowSession(role=role, id=session_id, root=root)
-    for directory in (session.annotation_root, session.exports_root, session.drafts_root):
-        directory.mkdir(mode=0o700)
-    _atomic_json(root / "session.json", {
-        "format": "nd2wsi-window-session/1",
-        **session.as_dict(),
-        "pid": os.getpid(),
-        "created_at": dt.datetime.now(dt.UTC).isoformat(),
-        "state": "starting",
-        "endpoint": None,
-    })
+    session._lifetime_lock = session_lifetime(base, session_id)
+    try:
+        for directory in (session.annotation_root, session.exports_root, session.drafts_root):
+            directory.mkdir(mode=0o700)
+        _atomic_json(root / "session.json", {
+            "format": "nd2wsi-window-session/1",
+            **session.as_dict(),
+            "pid": os.getpid(),
+            "created_at": dt.datetime.now(dt.UTC).isoformat(),
+            "state": "starting",
+            "endpoint": None,
+        })
+    except BaseException:
+        session._lifetime_lock.release()
+        raise
     return session

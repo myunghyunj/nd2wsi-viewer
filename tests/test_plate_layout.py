@@ -1,5 +1,7 @@
 """Site arrangement from stage positions, and the plate detection boundary."""
 
+import pytest
+
 from nd2wsi.plate import PLATE_MAX_FRAME_PX, is_plate_file, site_layout
 
 # the demo acquisition, XYPosLoop points in file order (x, y in um)
@@ -103,6 +105,7 @@ def test_a_ninety_six_well_scan_keeps_its_eight_by_twelve_grid():
     layout, rows, cols = _grid(points)
     assert (rows, cols) == (8, 12)
     assert len(set(layout)) == 96
+    assert site_layout([(x, y) for _, x, y in points], names=[n for n, _, _ in points]) == layout
 
 
 def test_sixteen_by_sixteen_serpentine_scan_keeps_well_coordinates():
@@ -128,3 +131,103 @@ def test_sixteen_by_sixteen_serpentine_scan_keeps_well_coordinates():
     assert by_name["A01"] == (0, 15)
     assert by_name["P16"] == (15, 0)
     assert by_name["P01"] == (15, 15)
+    assert site_layout([(x, y) for _, x, y in points], names=[n for n, _, _ in points]) == layout
+
+
+@pytest.mark.parametrize("positions", [
+    [0, 9000, 18000, 45000],  # A01 A02 A03 A06
+    [0, 9000, 27000],  # A01 A02 A04: the previous strict gap test also merged these
+])
+@pytest.mark.parametrize("vertical", [False, True])
+def test_missing_tracks_do_not_merge_unnamed_stage_sites(positions, vertical):
+    points = [(0, x) if vertical else (x, 0) for x in positions]
+    expected = [(i, 0) if vertical else (0, i) for i in range(len(points))]
+    assert site_layout(points) == expected
+    assert site_layout(list(reversed(points))) == list(reversed(expected))
+
+
+def test_missing_row_refinement_preserves_within_column_spread():
+    # The row gap must not collapse three rows, nor should repairing those
+    # collisions turn the 3.2 mm drift within the right column into new columns.
+    points = [
+        (16000, 0), (24000, 0),
+        (16000, 9000), (27200, 9000),
+        (16000, 18000), (24500, 18000),
+        (16000, 45000), (25000, 45000),
+    ]
+    assert site_layout(points) == [(r, c) for r in range(4) for c in range(2)]
+
+
+def test_ambiguous_unnamed_tracks_stop_at_the_existing_jitter_tolerance():
+    # Intermediate positions in another row can bridge a wide gap between
+    # two sites. Without well identities it is ambiguous, but must terminate.
+    points = [(0, 0), (9000, 0)] + [(x, 9000) for x in range(900, 9000, 900)]
+    assert site_layout(points) == [(0, 0), (0, 0)] + [(1, 0)] * 9
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("reverse_x", [False, True])
+@pytest.mark.parametrize("reverse_y", [False, True])
+def test_named_missing_wells_preserve_stage_orientation(transpose, reverse_x, reverse_y):
+    wells = [("A", 1), ("A", 2), ("A", 4), ("C", 1), ("C", 2), ("C", 4)]
+    names = [f"{row}{col:02}" for row, col in wells]
+    points, expected = [], []
+    for row, col in wells:
+        r, c = {"A": 0, "C": 1}[row], {1: 0, 2: 1, 4: 2}[col]
+        x, y = (col - 1) * 9000, (ord(row) - ord("A")) * 9000
+        if transpose:
+            x, y = y, x
+            r, c = c, r
+        if reverse_x:
+            x = -x
+            c = (1 if transpose else 2) - c
+        if reverse_y:
+            y = -y
+            r = (2 if transpose else 1) - r
+        points.append((x, y))
+        expected.append((r, c))
+    assert site_layout(points, names=names) == expected
+
+
+def test_well_identity_resolves_small_spacing_and_large_stage_jitter():
+    # The geometric jitter tolerance is deliberately not a minimum well pitch.
+    points = [(0, 0), (500, 120), (1500, -80), (0, 500), (650, 600), (1400, 450)]
+    names = ["A01", "A02", "A04", "B01", "B02", "B04"]
+    assert site_layout(points, names=names) == [(r, c) for r in range(2) for c in range(3)]
+
+
+def test_invalid_or_repeated_well_names_leave_stage_layout_authoritative():
+    points = [(0, 0), (400, 0), (9000, 0)]
+    expected = [(0, 0), (0, 0), (0, 1)]
+    for names in (["A01", "A001", "A02"], ["A01", "Treatment B", "A02"], ["A01"]):
+        assert site_layout(points, names=names) == expected
+
+
+def test_plate_source_uses_well_names_for_ambiguous_stage_geometry(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from nd2wsi import plate
+
+    positions = [("A01", 0), ("A02", 400), ("A04", 1200)]
+    points = [SimpleNamespace(name=name, stagePositionUm=SimpleNamespace(x=x, y=0, z=0))
+              for name, x in positions]
+    f = SimpleNamespace(
+        sizes={"P": 3, "Y": 8, "X": 8},
+        read_frame=lambda _: np.zeros((8, 8), dtype=np.uint16),
+        experiment=[SimpleNamespace(type="XYPosLoop", parameters=SimpleNamespace(points=points))],
+    )
+    monkeypatch.setattr(plate, "_channel_infos", lambda *_: [])
+    monkeypatch.setattr(plate, "_nd2_pixel_size", lambda _: (None, None))
+    monkeypatch.setattr(plate, "objective_magnification", lambda _: None)
+    source = plate.PlateSource.__new__(plate.PlateSource)
+    source.tile = 256
+    source._build_attrs = lambda _: {}
+    path = tmp_path / "metadata-fixture.nd2"
+    path.write_bytes(b"metadata test")
+    with path.open("rb") as stream:
+        source._fd = stream.fileno()
+        source._init_from_file(f)
+    assert [(s["row"], s["col"]) for s in source.sites] == [(0, 0), (0, 1), (0, 2)]
+    assert (source.rows, source.cols) == (1, 3)

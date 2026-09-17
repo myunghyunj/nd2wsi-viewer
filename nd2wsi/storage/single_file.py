@@ -13,6 +13,7 @@ import errno
 import ntpath
 import os
 import sqlite3
+import stat
 import threading
 from collections.abc import AsyncIterator, Iterable, Iterator
 from contextlib import contextmanager
@@ -34,6 +35,7 @@ _LEGACY_SCHEMA = "CREATE TABLE entries (key TEXT PRIMARY KEY, value BLOB NOT NUL
 _READABLE_VERSIONS = frozenset({1, FORMAT_VERSION})
 _COMPANION_SUFFIXES = ("-journal", "-wal", "-shm")
 _PAGE_KEYS = 256
+_RECOVERY_TIMEOUT = 1.0
 
 
 def _normalize_key(key: str, *, prefix: bool = False) -> str:
@@ -84,6 +86,8 @@ class SQLiteStore(Store):
     do not call Zarr's asynchronous/synchronous array API inside its context.
     Prototype format 1 is accepted read-only for verification/recovery; new and
     writable containers require format 2 and never upgrade a file in place.
+    ``recover=True`` explicitly permits rollback recovery during a read-only
+    open; ordinary inspection and Agent shared-cache reads must leave it false.
     """
 
     supports_writes = True
@@ -93,7 +97,7 @@ class SQLiteStore(Store):
 
     def __init__(
         self, path: str | os.PathLike, *, read_only: bool = False, prefix: str = "",
-        _exclusive: bool = False,
+        recover: bool = False, _exclusive: bool = False,
     ):
         super().__init__(read_only=read_only)
         self.path = self.root = Path(os.path.abspath(os.fspath(path)))
@@ -103,6 +107,7 @@ class SQLiteStore(Store):
         self._closed = False
         self._in_batch = False
         self._exclusive = _exclusive
+        self._recover = recover
         self._ensure_open_sync()
 
     @classmethod
@@ -151,6 +156,56 @@ class SQLiteStore(Store):
             raise ValueError("unsupported single-file cache schema")
         if version == FORMAT_VERSION and schema[1][3] is not None:
             raise ValueError("unsupported single-file cache schema")
+
+    @staticmethod
+    def _configure(connection: sqlite3.Connection) -> None:
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA cache_size=-8192")
+        connection.execute("PRAGMA mmap_size=0")
+        connection.execute("PRAGMA temp_store=FILE")
+        if hasattr(connection, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):
+            connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+
+    def _recover_hot_journal(self) -> None:
+        """Let SQLite roll back one interrupted format-2 write, never discard it.
+
+        Called only after SQLITE_READONLY_ROLLBACK, not merely because a
+        journal exists: active writers keep their journals and SQLite locks.
+        The immutable inspection performs no recovery or entry reads; it checks
+        the exact owned schema before granting SQLite temporary write access.
+        Unknown/prototype files are preserved, and the caller retries read-only.
+        """
+        native = filesystem_path(self.path)
+        before = os.stat(native, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("journal recovery requires a regular, singly linked cache file")
+        if any(os.path.lexists(native + suffix) for suffix in ("-wal", "-shm")):
+            raise ValueError("unsupported WAL companion; preserve and recover it")
+        inspection = sqlite3.connect(
+            _database_uri(self.path, "ro") + "&immutable=1", uri=True,
+            timeout=_RECOVERY_TIMEOUT, isolation_level=None,
+        )
+        try:
+            self._configure(inspection)
+            self._validate(inspection, read_only=False)
+        finally:
+            inspection.close()
+        current = os.stat(native, follow_symlinks=False)
+        if (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError("cache changed before journal recovery; reopen it")
+        if not os.path.lexists(native + "-journal"):
+            return  # Another reader has already recovered it; retry read-only.
+        recovery = sqlite3.connect(
+            _database_uri(self.path, "rw"), uri=True,
+            timeout=_RECOVERY_TIMEOUT, isolation_level=None,
+        )
+        try:
+            self._configure(recovery)
+            # SQLite obtains its own recovery locks and performs rollback on
+            # the first database read. No DML, migration, or journal deletion.
+            self._validate(recovery, read_only=False)
+        finally:
+            recovery.close()
 
     def _ensure_open_sync(self) -> sqlite3.Connection:
         with self._lock:
@@ -206,17 +261,19 @@ class SQLiteStore(Store):
                 # A normal active -journal remains supported for readers.
                 if any(os.path.lexists(native + suffix) for suffix in ("-wal", "-shm")):
                     raise ValueError("unsupported WAL companion beside single-file cache; preserve and recover it")
+            connection = self._open_validated(created=created)
+            self._connection = connection
+            self._is_open = True
+            return connection
+
+    def _open_validated(self, *, created: bool) -> sqlite3.Connection:
+        for attempt in range(2):
             connection = sqlite3.connect(
                 _database_uri(self.path, "ro" if self.read_only else "rw"),
                 uri=True, timeout=30, isolation_level=None, check_same_thread=False,
             )
             try:
-                connection.execute("PRAGMA trusted_schema=OFF")
-                connection.execute("PRAGMA cache_size=-8192")
-                connection.execute("PRAGMA mmap_size=0")
-                connection.execute("PRAGMA temp_store=FILE")
-                if hasattr(connection, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):
-                    connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+                self._configure(connection)
                 if not created:
                     self._validate(connection, read_only=self.read_only)
                 if not self.read_only:
@@ -237,13 +294,22 @@ class SQLiteStore(Store):
                     self._validate(connection, read_only=self.read_only)
             except sqlite3.Error as exc:
                 connection.close()
+                if (attempt == 0 and self.read_only and self._recover
+                        and getattr(exc, "sqlite_errorcode", None)
+                        == sqlite3.SQLITE_READONLY_ROLLBACK):
+                    try:
+                        self._recover_hot_journal()
+                    except (OSError, ValueError, sqlite3.Error) as recovery_error:
+                        raise ValueError(
+                            f"cache needs rollback-journal recovery; cache and journal preserved: {self.path}"
+                        ) from recovery_error
+                    continue
                 raise ValueError(f"invalid or unreadable single-file cache: {self.path}") from exc
             except BaseException:
                 connection.close()
                 raise
-            self._connection = connection
-            self._is_open = True
             return connection
+        raise AssertionError("unreachable cache open retry")
 
     async def _open(self) -> None:
         await asyncio.to_thread(self._ensure_open_sync)
@@ -471,9 +537,9 @@ class SQLiteStore(Store):
         return await asyncio.to_thread(self._getsize_prefix, prefix)
 
 
-def read_entry(path: str | os.PathLike, key: str) -> bytes:
+def read_entry(path: str | os.PathLike, key: str, *, recover: bool = False) -> bytes:
     try:
-        with SQLiteStore(path, read_only=True) as store:
+        with SQLiteStore(path, read_only=True, recover=recover) as store:
             return store.read_bytes(key)
     except sqlite3.Error as exc:
         raise ValueError(f"invalid or unreadable single-file cache: {path}") from exc

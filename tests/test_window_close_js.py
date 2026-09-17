@@ -39,7 +39,7 @@ vm.runInContext(production(shellSource, 'closeTab'), shell);
 SCRIPT = PREPARATION_SCRIPT.replace(
     "resolve({ok:true, json:async()=>({path:'qa-only-annotations.json'})});",
     "resolve(pane.failSaves ? {ok:false, status:409, "
-    "json:async()=>({error:'conflicting annotations'})} : "
+    "json:async()=>({error:'conflicting annotations', draft_path:pane.draftPath || null, draft_error:pane.draftError || null})} : "
     "{ok:true, json:async()=>({path:'qa-only-annotations.json'})});",
 ).replace("Promise.resolve(vm.runInContext", CLOSE_BINDINGS + "\nPromise.resolve(vm.runInContext", 1)
 
@@ -213,3 +213,125 @@ def test_loading_frame_is_not_removed_without_an_annotation_acknowledgement():
     assert out["requests"] == 0
     assert out["frame"] is True
     assert "loading" in out["notices"][-1]
+
+
+def test_verified_conflict_draft_requires_explicit_choice_before_close():
+    out = run("""
+      const a=panes.get('a');
+      a.failSaves=true; a.draftPath='/session/drafts/recovery.json';
+      a.edit('preserve my exact draft');
+      const first=closeTab('a'); await pump(); const refused=await first; await pump();
+      const notice=a.elements.get('ann-recovery');
+      const before={refused,visible:!notice.hidden,requests:closeRequests.length};
+      const accepted=a.acceptDrafts();
+      const second=closeTab('a'); await pump(); const closed=await second; await pump();
+      return {before,accepted,closed,requests:closeRequests.length,
+        dirty:a.state.annDirty,failed:a.state.annFailedSaves.size,
+        saved:a.writes.every(w=>w.items[0].text==='preserve my exact draft')};
+    """)
+    assert out["before"] == {"refused": False, "visible": True, "requests": 0}
+    assert out["accepted"] and out["closed"] and out["saved"]
+    assert out["requests"] == 1
+    # Kept-for-recovery never means the source sidecar was successfully saved.
+    assert out["dirty"] and out["failed"] == 1
+
+
+@pytest.mark.parametrize("draft_error", ["null", "'disk full'"])
+def test_missing_or_failed_draft_persistence_never_authorizes_close(draft_error):
+    out = run("""
+      const a=panes.get('a'); a.failSaves=true;
+      a.draftPath=DRAFT_ERROR ? '/unconfirmed/path.json' : null; a.draftError=DRAFT_ERROR;
+      a.edit('must remain open');
+      const first=closeTab('a'); await pump(); await first; await pump();
+      const accepted=a.acceptDrafts();
+      const second=closeTab('a'); await pump(); const closed=await second; await pump();
+      return {accepted,closed,requests:closeRequests.length,frame:frames.has('a'),
+        failed:a.state.annFailedSaves.size};
+    """.replace("DRAFT_ERROR", draft_error))
+    assert out == {"accepted": False, "closed": False, "requests": 0, "frame": True, "failed": 1}
+
+
+def test_new_editor_text_after_acceptance_requires_a_new_draft_choice():
+    out = run("""
+      const a=panes.get('a'); a.failSaves=true; a.draftPath='/session/old.json';
+      a.edit('old draft'); const first=closeTab('a'); await pump(); await first; await pump();
+      const accepted=a.acceptDrafts();
+      a.edit('newer text not approved');
+      const second=closeTab('a'); await pump(); const closed=await second; await pump();
+      return {accepted,closed,requests:closeRequests.length,text:a.state.annotations[0].text,
+        latest:a.writes[a.writes.length-1].items[0].text};
+    """)
+    assert out == {"accepted": True, "closed": False, "requests": 0,
+                   "text": "newer text not approved", "latest": "newer text not approved"}
+
+
+def test_live_editor_change_cannot_authorize_an_older_draft_before_flush():
+    out = run("""
+      const a=panes.get('a'); a.failSaves=true; a.draftPath='/session/old.json';
+      a.edit('old draft'); const first=closeTab('a'); await pump(); await first; await pump();
+      a.edit('text still in editor');
+      const accepted=a.acceptDrafts();
+      return {accepted,text:a.state.annotations[0].text,requests:closeRequests.length};
+    """)
+    assert out == {"accepted": False, "text": "text still in editor", "requests": 0}
+
+
+def test_older_plate_site_without_a_durable_draft_blocks_close_of_accepted_current_site():
+    out = run("""
+      const a=panes.get('a'); a.failSaves=true; a.draftPath='/session/current.json';
+      a.edit('current'); const first=closeTab('a'); await pump(); await first; await pump();
+      const accepted=a.acceptDrafts();
+      a.state.annFailedSaves.set('api/annotations?p=0',{
+        url:'api/annotations?p=0',body:JSON.stringify({items:[{id:'old-site'}]}),
+        revision:-1,context:-1,conflict:true,draftPath:null,draftBody:null});
+      a.draftPath=null;
+      const second=closeTab('a'); await pump(); const closed=await second; await pump();
+      return {accepted,closed,requests:closeRequests.length,failed:a.state.annFailedSaves.size,
+        retried:a.writes.some(w=>w.items[0].id==='old-site')};
+    """)
+    assert out == {"accepted": True, "closed": False, "requests": 0, "failed": 2, "retried": True}
+
+
+def test_pending_older_plate_site_is_checked_after_the_current_draft_was_accepted():
+    out = run("""
+      const a=panes.get('a'); a.failSaves=true; a.draftPath='/session/current.json';
+      a.edit('current'); const first=closeTab('a'); await pump(); await first; await pump();
+      const accepted=a.acceptDrafts(); a.holdSaves=true; a.draftPath=null;
+      a.api.queueAnnotationSave({url:'api/annotations?p=0',
+        body:JSON.stringify({items:[{id:'queued-old-site'}]}),revision:-1,context:-1});
+      await pump();
+      const second=closeTab('a'); await pump();
+      const before=closeRequests.length;
+      a.holdSaves=false; for(const save of a.saves.splice(0)) save(); await pump();
+      const closed=await second; await pump();
+      return {accepted,before,closed,requests:closeRequests.length,failed:a.state.annFailedSaves.size};
+    """)
+    assert out == {"accepted": True, "before": 0, "closed": False, "requests": 0, "failed": 2}
+
+
+def test_native_close_preparation_accepts_all_preserved_drafts_without_clearing_them():
+    out = run("""
+      const a=panes.get('a'); a.failSaves=true; a.draftPath='/session/current.json';
+      a.edit('current'); const first=closeTab('a'); await pump(); await first; await pump();
+      const body=JSON.stringify({items:[{id:'old-site'}]});
+      a.state.annFailedSaves.set('api/annotations?p=0',{
+        url:'api/annotations?p=0',body,revision:-1,context:-1,
+        conflict:true,draftPath:'/session/old-site.json',draftBody:body});
+      const accepted=a.acceptDrafts();
+      const preparing=window.nd2wsiPrepareForUpdate('native-close'); await pump();
+      const result=await preparing;
+      return {accepted,result,failed:a.state.annFailedSaves.size,dirty:a.state.annDirty};
+    """)
+    assert out == {"accepted": True, "result": {"ok": True, "panes": 2}, "failed": 2, "dirty": True}
+
+
+def test_any_new_annotation_edit_revokes_the_previous_close_choice():
+    out = run("""
+      const a=panes.get('a'); a.failSaves=true; a.draftPath='/session/preserved.json';
+      a.edit('original'); const first=closeTab('a'); await pump(); await first; await pump();
+      a.acceptDrafts();
+      a.api.annotationsChanged();
+      const second=closeTab('a'); await pump(); const closed=await second; await pump();
+      return {closed,requests:closeRequests.length,approved:a.state.annAcceptedDrafts.size};
+    """)
+    assert out == {"closed": False, "requests": 0, "approved": 0}

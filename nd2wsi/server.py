@@ -549,7 +549,7 @@ class SlideRegistry:
         manifest: dict[str, Any] = {}
         container_path = manifest_container(store_path)
         if container_path is not None:
-            manifest = read_manifest(container_path) or {}
+            manifest = read_manifest(container_path, recover=not self.agent_window) or {}
             if store_path.suffix.lower() == SINGLE_FILE_SUFFIX and not manifest:
                 raise ValueError("single-file cache has no complete manifest")
             if store_path.suffix.lower() == SINGLE_FILE_SUFFIX:

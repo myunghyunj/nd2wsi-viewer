@@ -53,6 +53,7 @@ class UpdateShutdownCoordinator:
         self._cancelled = threading.Event()
         self._wire_request_id = ""
         self._teardown_started = False
+        self._install_guard = None
 
     def prepare_for_update(self, completion, failure) -> bool:
         with self._lock:
@@ -226,12 +227,22 @@ class UpdateShutdownCoordinator:
         finally:
             if cancelled.is_set() or not completed.is_set() or completion_errors:
                 self._recover_browser(request_id)
+            if self._install_guard is not None:
+                self._install_guard.release()
+                self._install_guard = None
             self._finish_request(request_id)
 
     def _drain_and_close(self, request_id, cancelled) -> bool:
+        session = getattr(self.api, "_window_session", None)
+        if session is not None:
+            from .update_guard import UpdateInstallGuard
+
+            self._install_guard = UpdateInstallGuard(session)
         last_reason = None
         while self._is_current(request_id, cancelled):
             reason = self.api.update_block_reason()
+            if reason is None and self._install_guard is not None:
+                reason = self._install_guard.acquire()
             if reason is None:
                 break
             if reason != last_reason:
