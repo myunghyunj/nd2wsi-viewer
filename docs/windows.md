@@ -156,14 +156,14 @@ uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --
 ```
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.1.4-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.1.5-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.1.4-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.1.5-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks

@@ -3,6 +3,24 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.1.5</title>
+            <pubDate>Thu, 17 Sep 2026 02:37:48 +0000</pubDate>
+            <sparkle:version>2.1.5</sparkle:version>
+            <sparkle:shortVersionString>2.1.5</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Reliable opening and recovery</h2>
+<ul>
+<li>Keyboard shortcuts work immediately after a slide opens.</li>
+<li>Automatic updates resume and installation waits for other viewer windows.</li>
+<li>Annotation conflicts can close after explicit recovery-draft preservation.</li>
+<li>Sparse plate wells retain separate cells; interrupted cache writes recover safely.</li>
+</ul>
+<p>Versions 2.1.1–2.1.4 need one manual upgrade to resume automatic checks.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.5/nd2wsi-viewer-2.1.5-macos-arm64.dmg" sparkle:edSignature="wY8WmzQHdyD9vQTO37w/wR4qsEVg/yGeIhg+2oyapfi3NEIzeI/7dMVok9qUkHUyj2C1ZKIxfIO29BvDSkE2Dw==" length="75414865" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.1.4</title>
             <pubDate>Thu, 17 Sep 2026 00:33:13 +0900</pubDate>
             <sparkle:version>2.1.4</sparkle:version>

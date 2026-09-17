@@ -1,4 +1,6 @@
-> **macOS and Windows v2.1.4.** Compare offers **Link scale** for matching physical
+> **macOS and Windows v2.1.5.** Fixes initial keyboard focus, automatic update
+> startup, annotation-conflict recovery, sparse well layouts and interrupted caches.
+> [Release details](docs/release-notes-2.1.5.md). Compare offers **Link scale** for matching physical
 > magnification with independent movement, or **Link scale + frame** for linked
 > movement too. The LUT panel uses graph handles without Min/Max entry boxes.
 > **Scale bar + SVG** and **Scale bar + JPEG** remain available for region exports.
@@ -13,7 +15,7 @@
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.1.4 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.5/nd2wsi-viewer-2.1.5-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.1.5 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.5/nd2wsi-viewer-2.1.5-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
