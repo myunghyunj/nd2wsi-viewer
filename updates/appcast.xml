@@ -3,6 +3,25 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.1.6</title>
+            <pubDate>Thu, 17 Sep 2026 04:43:56 +0000</pubDate>
+            <sparkle:version>2.1.6</sparkle:version>
+            <sparkle:shortVersionString>2.1.6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Precise contrast and dependable controls</h2>
+<ul>
+<li>Fractional LUT windows retain precision through display and rendering.</li>
+<li>Z navigation and offsets follow the recorded stack direction.</li>
+<li>Checkbox and comparison controls respect keyboard focus.</li>
+<li>Histogram failures recover automatically or offer Retry.</li>
+<li>Uncached plate windows show their state and stop idle polling.</li>
+</ul>
+<p>Includes the opening, automatic-update and recovery fixes from 2.1.5.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.6/nd2wsi-viewer-2.1.6-macos-arm64.dmg" sparkle:edSignature="vsB3yKOQ61hkuUSt8LN5w+Pt8Cp6KBPXUEp2dhamVvGPbcCQy1dj1pDhePIzKAPsTJZ7PlY4RIBcVjellBgeAw==" length="73188361" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.1.5</title>
             <pubDate>Thu, 17 Sep 2026 02:37:48 +0000</pubDate>
             <sparkle:version>2.1.5</sparkle:version>
