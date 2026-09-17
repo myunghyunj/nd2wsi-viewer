@@ -31,6 +31,7 @@ function makeTarget(spec) {
   spec = spec || {};
   return {
     tagName: spec.tag || "DIV",
+    type: spec.type,
     isContentEditable: !!spec.contentEditable,
     parentElement: null,
     closest(selector) {
@@ -43,10 +44,13 @@ function makeTarget(spec) {
 
 const out = cases.map((entry) => {
   const event = {...entry.event, target: makeTarget(entry.target)};
+  if (entry.path) event.composedPath = () => entry.path.map(makeTarget);
   // Historical Command-key cases model a Mac, even when Node runs on Windows.
   const platform = entry.platform || 'MacIntel';
   return {
     typing: Router.isTypingEvent(event),
+    focusControl: Router.isFocusControl(event.target),
+    plain: Router.plainLetterForEvent(event),
     letter: Router.letterCode(event),
     panel: Router.panelForEvent(event),
     orientationShortcut: Router.isOrientationShortcut(event, platform),
@@ -110,6 +114,48 @@ def test_text_entry_and_ime_composition_suppress_shortcuts():
     )
     assert all(item["typing"] for item in out)
     assert all(item["panel"] is None and item["tab"] is None for item in out)
+
+
+def test_checkbox_focus_allows_letters_but_keeps_native_space_and_focus_ownership():
+    out = _run([
+        {"target": {"tag": "INPUT", "type": "checkbox"}, "event": event}
+        for event in [
+            {"key": "c", "code": "KeyC"}, {"key": "ㅊ", "code": "KeyC"},
+            {"key": " ", "code": "Space"}, {"key": "Spacebar"}, {"keyCode": 32},
+            {"key": "c", "code": "KeyC", "isComposing": True},
+            {"key": "c", "code": "KeyC", "keyCode": 229},
+        ]
+    ])
+    assert [row["panel"] for row in out] == ["channels", "channels", None, None, None, None, None]
+    assert [row["typing"] for row in out] == [False, False, True, True, True, True, True]
+    assert all(row["focusControl"] for row in out)
+
+
+@pytest.mark.parametrize("input_type", [None, "text", "number", "search", "email", "range", "radio"])
+def test_other_input_controls_keep_their_existing_native_key_ownership(input_type):
+    out = _run([{"target": {"tag": "INPUT", "type": input_type},
+                 "event": {"key": "c", "code": "KeyC"}}])[0]
+    assert out["typing"] and out["focusControl"]
+    assert out["plain"] is None and out["panel"] is None
+
+
+@pytest.mark.parametrize("target", [
+    {"tag": "INPUT", "type": "text"}, {"tag": "SELECT"},
+    {"tag": "TEXTAREA"}, {"contentEditable": True}, {"insideTextbox": True},
+])
+def test_shadow_retargeting_does_not_hide_text_entry_from_shortcut_guards(target):
+    out = _run([{"target": {"tag": "DIV"}, "path": [target, {"tag": "DIV"}],
+                 "event": {"key": "l", "code": "KeyL"}}])[0]
+    assert out["typing"] and out["plain"] is None
+
+
+def test_shadow_checkbox_allows_c_but_retains_space():
+    out = _run([{"target": {"tag": "DIV"},
+                 "path": [{"tag": "INPUT", "type": "checkbox"}, {"tag": "DIV"}],
+                 "event": event}
+                for event in [{"key": "c", "code": "KeyC"}, {"key": " ", "code": "Space"}]])
+    assert [row["panel"] for row in out] == ["channels", None]
+    assert [row["typing"] for row in out] == [False, True]
 
 
 def test_panel_shortcuts_reject_modifiers_repeats_and_prevented_events():
@@ -260,6 +306,8 @@ def test_contenteditable_false_does_not_hide_a_panel_shortcut():
     assert out == [
         {
             "typing": False,
+            "focusControl": False,
+            "plain": "KeyC",
             "letter": "KeyC",
             "panel": "channels",
             "orientationShortcut": False,

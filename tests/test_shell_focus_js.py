@@ -66,7 +66,8 @@ def test_switching_to_ready_tab_focuses_it_once_without_resetting_inner_editor()
 
 
 @pytest.mark.parametrize('target', [
-    "{tagName:'INPUT'}", "{tagName:'TEXTAREA'}", "{tagName:'SELECT'}",
+    "{tagName:'INPUT'}", "{tagName:'INPUT',type:'checkbox'}",
+    "{tagName:'TEXTAREA'}", "{tagName:'SELECT'}",
     "{tagName:'DIV',isContentEditable:true}",
 ])
 def test_activation_and_late_readiness_preserve_text_or_select_focus(target):
@@ -84,6 +85,16 @@ def test_delayed_ready_does_not_take_focus_from_a_newly_selected_button():
       readyFrames.add('a');paneCameUp('a');focused;
     ''')
     assert result == []
+
+
+def test_delayed_ready_keeps_new_checkbox_focus_while_c_remains_available():
+    result = run('''
+      activate('a');document.activeElement={tagName:'INPUT',type:'checkbox'};
+      readyFrames.add('a');paneCameUp('a');
+      ({focused,tag:document.activeElement.tagName,
+        action:ShortcutRouter.panelForEvent({key:'c',code:'KeyC',target:document.activeElement})});
+    ''')
+    assert result == {'focused': [], 'tag': 'INPUT', 'action': 'channels'}
 
 
 def test_inactive_ready_pane_does_not_take_focus_from_selected_slide():

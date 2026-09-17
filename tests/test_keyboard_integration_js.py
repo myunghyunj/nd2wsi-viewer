@@ -132,6 +132,7 @@ const osdKeydown=vm.runInNewContext('('+vendor.slice(dispatchAt+8,dispatchEnd)+'
 function press(spec) {
   const targetSpec=spec.target || {};
   const target={tagName:targetSpec.tag || 'DIV',
+    type:targetSpec.type,
     isContentEditable:!!targetSpec.editable,
     closest(selector){
       if(targetSpec.insideEditable && selector.includes('contenteditable')) return {};
@@ -299,6 +300,51 @@ def test_text_editing_keeps_plain_and_command_keys(target):
                 key("F", target=target, outsideCanvas=True, metaKey=True)])
     assert out["events"] == [{"prevented": False, "stopped": False}] * 2
     assert out["clicks"] == out["orientationCalls"] == out["applied"] == []
+
+
+@pytest.mark.parametrize("plate", [False, True])
+def test_checkbox_channels_shortcut_runs_and_space_remains_native(plate):
+    target = {"tag": "INPUT", "type": "checkbox"}
+    out = pane([key("C", target=target, outsideCanvas=True),
+                {"key": " ", "code": "Space", "keyCode": 32, "target": target, "outsideCanvas": True}],
+               plate=plate)
+    assert out["clicks"] == ["tb-channels"]
+    assert out["events"] == [{"prevented": True, "stopped": True},
+                             {"prevented": False, "stopped": False}]
+    assert out["osdKeydowns"] == 0
+
+
+@pytest.mark.parametrize("overrides", [
+    "{target:{tagName:'SELECT',closest:()=>null}}",
+    "{target:{tagName:'INPUT',type:'text',closest:()=>null}}",
+    "{target:{tagName:'TEXTAREA',closest:()=>null}}",
+    "{target:{tagName:'DIV',isContentEditable:true,closest:()=>null}}",
+    "{target:{tagName:'SPAN',closest:selector=>selector.includes('contenteditable')?{}:null}}",
+    "{isComposing:true}", "{keyCode:229}", "{defaultPrevented:true}",
+    "{shiftKey:true}", "{altKey:true}", "{metaKey:true}", "{ctrlKey:true}", "{repeat:true}",
+    "{composedPath:()=>[{tagName:'SELECT'}, {tagName:'DIV'}]}",
+])
+def test_shell_l_preserves_typing_composition_and_prevented_events(overrides):
+    out = run_shell(f"""
+      $('compare-link-menu').hidden=true;
+      const consumed=pressKey('l',{{code:'KeyL',...{overrides}}});
+      ({{consumed,menuHidden:$('compare-link-menu').hidden}});
+    """)
+    assert out["menuHidden"] is True
+    assert out["consumed"] == {"prevented": "defaultPrevented:true" in overrides, "stopped": False}
+
+
+@pytest.mark.parametrize("key_value,target", [
+    ("l", "{tagName:'DIV'}"), ("ㅣ", "{tagName:'DIV'}"),
+    ("l", "{tagName:'INPUT',type:'checkbox'}"),
+])
+def test_shell_plain_l_opens_compare_link_menu_from_non_typing_controls(key_value, target):
+    out = run_shell(f"""
+      $('compare-link-menu').hidden=true;
+      const consumed=pressKey({json.dumps(key_value)},{{code:'KeyL',target:{target}}});
+      ({{consumed,menuHidden:$('compare-link-menu').hidden}});
+    """)
+    assert out == {"consumed": {"prevented": True, "stopped": False}, "menuHidden": False}
 
 
 def test_ime_composition_remains_unhandled_and_latin_shortcuts_work_afterward():

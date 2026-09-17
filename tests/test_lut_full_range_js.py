@@ -21,7 +21,7 @@ function node(tag) { const n={tag,children:[],handlers:{},attrs:{},style:{},valu
  append(...xs){this.children.push(...xs)},setAttribute(k,v){this.attrs[k]=v},
  addEventListener(k,fn){this.handlers[k]=fn},getContext(){return ctx},
  setPointerCapture(){},getBoundingClientRect(){return {left:0,top:0}}};nodes.push(n);return n; }
-const state={luts:[null],lutWidgets:[],windows:{channels:{bodyWidth:()=>240}}};
+const state={info:{dtype:'uint16'},luts:[null],lutWidgets:[],windows:{channels:{bodyWidth:()=>240}}};
 const context={document:{createElement:node},window:{Nd2LutControls:lut,devicePixelRatio:2,addEventListener(){},removeEventListener(){}},state,
  clamp:(v,l,h)=>Math.max(l,Math.min(h,v)),inkColor:()=>'',currentTheme:()=> 'dark',
  VIEWPORT_PROTOCOL_VERSION:1,fmtInt:v=>String(Math.round(v)),applyLuts:Object.assign(()=>{refreshes++},{flush(){}})};

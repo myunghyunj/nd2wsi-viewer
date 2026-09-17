@@ -357,7 +357,7 @@ function focusActivePane(deferred = false) {
   const focused = document.activeElement;
   // Already inside the selected pane: leave its annotation editor/controls alone.
   if (focused === frame) return true;
-  if (ShortcutRouter.isTypingEvent({target: focused})) return false;
+  if (ShortcutRouter.isFocusControl(focused)) return false;
   const otherPane = [...frames.values()].find((item) => item === focused);
   if (otherPane && compare.enabled && inGroup(otherPane.dataset.sid)) return false;
   // A late ready message must not take focus from a control the user selected
@@ -2439,8 +2439,7 @@ window.addEventListener("keydown", (event) => {
   } else if ((event.metaKey || event.ctrlKey) && event.code === "Backslash") {
     event.preventDefault();
     toggleCompare();
-  } else if (compare.enabled && !event.metaKey && !event.ctrlKey && !event.altKey &&
-             event.key.toLowerCase() === "l") {
+  } else if (compare.enabled && ShortcutRouter?.plainLetterForEvent(event) === "KeyL") {
     event.preventDefault();
     toggleViewLink();
   }

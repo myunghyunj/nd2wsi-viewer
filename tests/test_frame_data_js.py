@@ -16,7 +16,7 @@ const F=require(process.argv[1]);
 const R=require(path.join(path.dirname(process.argv[1]),'request-latest-v1.js'));
 const flush=async()=>{for(let i=0;i<12;i++)await Promise.resolve();};
 function fixture(){
-  let time=0,next=1;const timers=new Map(),requests=[],applied=[],cleared=[],rendered=[];
+  let time=0,next=1;const timers=new Map(),requests=[],applied=[],cleared=[],rendered=[],statuses=[];
   const clock={now:()=>time,setTimer:(fn,delay)=>{const id=next++;timers.set(id,{at:time+delay,fn});return id},clearTimer:id=>timers.delete(id)};
   function tick(to){while(true){const due=[...timers].filter(([id,t])=>t.at<=to).sort((a,b)=>a[1].at-b[1].at)[0];if(!due)break;time=due[1].at;timers.delete(due[0]);due[1].fn()}time=to;}
   function frame(p){const frame={t:2,p,z:3};return {frame,generation:'g1',sourceId:'slide',key:R.identityKey('slide','g1',frame)}}
@@ -26,9 +26,9 @@ function fixture(){
     fetch:(url,options)=>new Promise((resolve,reject)=>requests.push({url,options,reject,resolve:data=>resolve({ok:true,json:()=>Promise.resolve(data)})}))};
   const histState={requests:new R.LatestRequestGate(),timer:null};
   const pixelState={requests:new R.LatestRequestGate(),timer:null,cursor:null,queued:null,inFlight:null,result:null,resultKey:null,lastStarted:0,retryAfter:0,failed:false};
-  const hist=F.createHistogramController({...shared,state:histState,onClear:unavailable=>cleared.push(unavailable),onHistograms:channels=>applied.push(channels)});
+  const hist=F.createHistogramController({...shared,state:histState,onStatus:s=>statuses.push(s),onClear:unavailable=>cleared.push(unavailable),onHistograms:channels=>applied.push(channels)});
   const pixel=F.createPixelProbeController({...shared,state:pixelState,onRender:()=>rendered.push({result:pixelState.result,failed:pixelState.failed}),onClearCursor:()=>cleared.push('cursor')});
-  return {tick,requests,applied,cleared,rendered,hist,histState,pixel,pixelState,frame,
+  return {tick,requests,applied,cleared,rendered,statuses,timers,hist,histState,pixel,pixelState,frame,
     setContext:value=>{context=value},payload:(extra={})=>({generation:context.generation,frame:context.frame,...extra})};
 }
 (async()=>{
@@ -61,7 +61,7 @@ process.stdout.write(JSON.stringify({during,mismatch,applied:f.applied,urls:f.re
         "api/histogram?t=2&p=0&z=3", "api/histogram?t=2&p=4&z=3",
         "api/histogram?t=2&p=4&z=3",
     ]
-    assert out["cleared"] == [False, False, False, True]
+    assert out["cleared"] == [False, False, False, False, True]
 
 
 def test_stale_histogram_failure_cannot_clear_new_request_or_its_result():
@@ -74,6 +74,55 @@ f.requests[1].resolve(f.payload({channels:['new']}));await flush();
 process.stdout.write(JSON.stringify({currentSurvives,cleared:f.cleared,applied:f.applied}));
 """)
     assert out == {"currentSurvives": True, "cleared": [False, False], "applied": [["new"]]}
+
+
+def test_histogram_retries_transient_failure_and_recovers_same_frame():
+    out = run(r"""
+const f=fixture();f.hist.schedule(0);f.requests[0].reject(new Error('HTTP503'));await flush();
+f.tick(499);const before=f.requests.length;f.tick(500);
+f.requests[1].resolve(f.payload({channels:['recovered']}));await flush();f.tick(60000);
+process.stdout.write(JSON.stringify({before,requests:f.requests.length,applied:f.applied,statuses:f.statuses,timers:f.timers.size}));
+""")
+    assert out == {"before": 1, "requests": 2, "applied": [["recovered"]],
+                   "statuses": ["loading", "retrying", "ready"], "timers": 0}
+
+
+def test_histogram_retries_are_bounded_and_explicit_retry_can_recover():
+    out = run(r"""
+const f=fixture();f.hist.schedule(0);
+for(const [index,nextTime] of [[0,500],[1,2000],[2,6000],[3,60000]]){
+  f.requests[index].reject(new Error('offline'));await flush();f.tick(nextTime);
+}
+const failed={requests:f.requests.length,status:f.statuses.at(-1),timers:f.timers.size};
+f.hist.schedule(0);f.requests[4].resolve(f.payload({channels:['manual-retry']}));await flush();
+process.stdout.write(JSON.stringify({failed,status:f.statuses.at(-1),applied:f.applied}));
+""")
+    assert out == {"failed": {"requests": 4, "status": "failed", "timers": 0},
+                   "status": "ready", "applied": [["manual-retry"]]}
+
+
+def test_new_frame_cancels_pending_histogram_retry_and_dispose_aborts():
+    out = run(r"""
+const f=fixture();f.hist.schedule(0);f.requests[0].reject(new Error('old'));await flush();
+f.setContext(f.frame(2));f.hist.schedule(300);f.tick(300);
+f.requests[1].resolve(f.payload({channels:['new-frame']}));await flush();f.tick(10000);
+const recovered={requests:f.requests.length,applied:[...f.applied]};
+f.hist.schedule(0);const pending=f.requests[2];f.hist.dispose();
+pending.reject(new Error('network cancelled'));await flush();f.hist.schedule(0);f.tick(20000);
+process.stdout.write(JSON.stringify({recovered,aborted:pending.options.signal.aborted,requests:f.requests.length,timers:f.timers.size,status:f.statuses.at(-1)}));
+""")
+    assert out == {"recovered": {"requests": 2, "applied": [["new-frame"]]},
+                   "aborted": True, "requests": 3, "timers": 0, "status": "loading"}
+
+
+def test_aborted_and_changed_context_failures_do_not_schedule_retries():
+    out = run(r"""
+const f=fixture();f.hist.schedule(0);
+f.requests[0].reject(Object.assign(new Error('aborted'),{name:'AbortError'}));await flush();
+f.hist.schedule(0);f.setContext(f.frame(3));f.requests[1].reject(new Error('stale'));await flush();
+f.tick(60000);process.stdout.write(JSON.stringify({requests:f.requests.length,timers:f.timers.size,statuses:f.statuses}));
+""")
+    assert out == {"requests": 2, "timers": 0, "statuses": ["loading", "loading"]}
 
 
 def test_pixel_queue_coalesces_cursor_and_preserves_new_frame_ownership():

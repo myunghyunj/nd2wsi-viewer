@@ -39,7 +39,7 @@
   }
 
   function createWidget({
-    channel: ch, initialLut = null, autoRange: initialAutoRange = false,
+    channel: ch, dtype, initialLut = null, autoRange: initialAutoRange = false,
     label: winLabel, width, document, window, protocolVersion,
     inkColor, currentTheme, fmtInt, onChange, onFlush, onManualAxis, onShiftChange,
   }) {
@@ -71,8 +71,17 @@
 
     const def = { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
     const cur = { ...(initialLut || def) };
-    let rangeMin = Number.isFinite(Number(ch.window.min)) ? Number(ch.window.min) : 0;
-    let rangeMax = Math.max(Number(ch.window.max) || def.hi, rangeMin + 1);
+    // The API supplies source dtype separately from channel windows. Integer
+    // looking bounds (notably 0–1) do not identify the pixel representation.
+    const discrete = /^(?:u?int\d+|bool|[<>=|]?[iu]\d+)$/.test(String(dtype || ""));
+    const spacing = (...values) => Math.max(Number.MIN_VALUE,
+      Math.max(...values.map(Math.abs)) * Number.EPSILON);
+    const minWindow = (lo, hi) => discrete ? 1 : spacing(lo, hi);
+    let rangeMin = Number.isFinite(ch.window.min) ? ch.window.min : def.lo;
+    let rangeMax = Number.isFinite(ch.window.max) ? ch.window.max : def.hi;
+    if (!(rangeMax > rangeMin)) rangeMax = Math.max(def.hi, rangeMin + minWindow(rangeMin, def.hi));
+    const minAxisSpan = () => Math.min(rangeMax - rangeMin,
+      Math.max(discrete ? 1 : spacing(rangeMin, rangeMax), (rangeMax - rangeMin) / 65536));
     let vmin = rangeMin;
     let vmax = rangeMax;
     let bins = null;
@@ -117,7 +126,7 @@
       onManualAxis();
       autoRange = false;
       manualAxis = true;
-      const span = clamp(hi - lo, Math.max(1, (rangeMax - rangeMin) / 65536), rangeMax - rangeMin);
+      const span = clamp(hi - lo, minAxisSpan(), rangeMax - rangeMin);
       vmin = clamp(lo, rangeMin, rangeMax - span);
       vmax = vmin + span;
       projectBins();
@@ -125,15 +134,26 @@
     }
 
     const vx = (v) => PLOT.x0 +
-      clamp((v - vmin) / Math.max(vmax - vmin, 1e-9), 0, 1) * (PLOT.x1 - PLOT.x0);
+      clamp((v - vmin) / (vmax - vmin), 0, 1) * (PLOT.x1 - PLOT.x0);
     const xv = (x) =>
       vmin + clamp((x - PLOT.x0) / (PLOT.x1 - PLOT.x0), 0, 1) * (vmax - vmin);
     const curveY = (t) =>
       PLOT.y1 - Math.pow(Math.max(0, Math.min(1, t)), 1 / cur.gamma) * (PLOT.y1 - PLOT.y0);
     const knobPos = () => ({
-      x: vx(cur.lo + (Math.max(cur.hi, cur.lo + 1) - cur.lo) * 0.5),
+      x: vx(cur.lo + (cur.hi - cur.lo) * 0.5),
       y: curveY(0.5),
     });
+
+    function formatValue(value) {
+      if (discrete) return fmtInt(value);
+      // Keep both tiny signals and small changes at a large offset readable.
+      const span = Math.min(vmax - vmin, cur.hi - cur.lo);
+      const magnitude = Math.max(Math.abs(vmin), Math.abs(vmax), Math.abs(cur.lo), Math.abs(cur.hi));
+      const digits = span > 0 && magnitude > 0
+        ? clamp(Math.ceil(Math.log10(magnitude)) - Math.floor(Math.log10(span)) + 3, 6, 17)
+        : 6;
+      return Number(value.toPrecision(digits)).toString();
+    }
 
     function draw() {
       const w = PLOT.x1 - PLOT.x0;
@@ -175,7 +195,7 @@
       const steps = 40;
       for (let s = 0; s <= steps; s++) {
         const value = vmin + (vmax - vmin) * s / steps;
-        const t = (value - cur.lo) / Math.max(cur.hi - cur.lo, 1e-9);
+        const t = (value - cur.lo) / (cur.hi - cur.lo);
         const x = PLOT.x0 + w * s / steps;
         if (s === 0) ctx.moveTo(x, curveY(t));
         else ctx.lineTo(x, curveY(t));
@@ -200,18 +220,18 @@
       ctx.font = "9px ui-monospace, 'SF Mono', Menlo, monospace";
       ctx.fillStyle = inkColor(0.55);
       ctx.textAlign = "left";
-      ctx.fillText(fmtInt(cur.lo), PLOT.x0, 9);
+      ctx.fillText(formatValue(cur.lo), PLOT.x0, 9);
       ctx.textAlign = "right";
-      ctx.fillText(fmtInt(cur.hi), PLOT.x1, 9);
+      ctx.fillText(formatValue(cur.hi), PLOT.x1, 9);
       ctx.textAlign = "center";
       ctx.fillText("G: " + cur.gamma.toFixed(2), (PLOT.x0 + PLOT.x1) / 2, 9);
       ctx.fillStyle = inkColor(0.28);
       ctx.textAlign = "left";
-      ctx.fillText(fmtInt(vmin), PLOT.x0, H - 3);
+      ctx.fillText(formatValue(vmin), PLOT.x0, H - 3);
       ctx.textAlign = "right";
-      ctx.fillText(fmtInt(vmax), PLOT.x1, H - 3);
-      winLabel.textContent = fmtInt(cur.lo) + "–" + fmtInt(cur.hi);
-      canvas.setAttribute("aria-label", ch.label + " histogram range " + fmtInt(vmin) + " to " + fmtInt(vmax));
+      ctx.fillText(formatValue(vmax), PLOT.x1, H - 3);
+      winLabel.textContent = formatValue(cur.lo) + "–" + formatValue(cur.hi);
+      canvas.setAttribute("aria-label", ch.label + " histogram range " + formatValue(vmin) + " to " + formatValue(vmax));
       canvas.setAttribute("data-axis-min", String(vmin));
       canvas.setAttribute("data-axis-max", String(vmax));
     }
@@ -230,17 +250,20 @@
 
     function isDefault(l) {
       return (
-        Math.abs(l.lo - def.lo) < 0.5 &&
-        Math.abs(l.hi - def.hi) < 0.5 &&
-        Math.abs(l.gamma - 1) < 0.005
+        l.lo === def.lo && l.hi === def.hi && l.gamma === 1
       );
     }
     function setLut(l) {
+      if (!l || ![l.lo, l.hi, l.gamma].every(Number.isFinite)) return false;
+      const hi = l.hi > l.lo && (!discrete || isDefault(l)) ? l.hi
+        : Math.max(l.hi, l.lo + minWindow(l.lo, l.hi));
+      if (!Number.isFinite(hi) || !(hi > l.lo)) return false;
       cur.lo = l.lo;
-      cur.hi = Math.max(l.hi, l.lo + 1);
+      cur.hi = hi;
       cur.gamma = Math.max(0.25, Math.min(4, l.gamma));
       draw();
       onChange(isDefault(cur) ? null : { ...cur });
+      return true;
     }
 
     // dragging: lo/hi triangles (horizontal), gamma knob (vertical)
@@ -287,7 +310,7 @@
         const fraction = clamp((x - PLOT.x0) / (PLOT.x1 - PLOT.x0), 0, 1);
         const anchor = vmin + fraction * (vmax - vmin);
         const span = clamp((vmax - vmin) * Math.exp(clamp(dy * 0.008, -1, 1)),
-          Math.max(1, (rangeMax - rangeMin) / 65536), rangeMax - rangeMin);
+          minAxisSpan(), rangeMax - rangeMin);
         manualView(anchor - fraction * span, anchor + (1 - fraction) * span);
       }
     };
@@ -330,8 +353,8 @@
         next.gamma = Math.max(0.25, Math.min(4, Math.log(0.5) / Math.log(f)));
       } else {
         const v = xv(p.x);
-        if (mode === "lo") next.lo = Math.min(v, cur.hi - 1);
-        else next.hi = Math.max(v, cur.lo + 1);
+        if (mode === "lo") next.lo = Math.min(v, cur.hi - minWindow(v, cur.hi));
+        else next.hi = Math.max(v, cur.lo + minWindow(v, cur.lo));
       }
       if (ev.shiftKey) {
         onShiftChange(next);
@@ -351,8 +374,11 @@
         updateAxis();
       },
       setHistogram(hg) {
+        const valid = (value) => value && Array.isArray(value.bins) && value.bins.length &&
+          Number.isFinite(value.vmin) && Number.isFinite(value.vmax) && value.vmax > value.vmin;
+        if (!valid(hg)) return false;
         fullHistogram = hg;
-        autoHistogram = hg.autoHistogram || hg;
+        autoHistogram = valid(hg.autoHistogram) ? hg.autoHistogram : hg;
         rangeMin = hg.vmin;
         rangeMax = hg.vmax;
         updateAxis();
@@ -367,7 +393,7 @@
       },
       auto() {
         const histogram = autoHistogram;
-        const window = histogram && autoWindowFromHistogram(histogram.bins, histogram.vmin, histogram.vmax);
+        const window = histogram && autoWindowFromHistogram(histogram.bins, histogram.vmin, histogram.vmax, 0.70, discrete ? 1 : 0);
         if (window) setLut({ ...window, gamma: cur.gamma });
       },
     };
@@ -375,8 +401,9 @@
     return widget;
   }
 
-  function autoWindowFromHistogram(bins, vmin, vmax, rightPeakFraction = 0.70) {
-    if (!Array.isArray(bins) || !bins.length || !(vmax > vmin)) return null;
+  function autoWindowFromHistogram(bins, vmin, vmax, rightPeakFraction = 0.70, minimumWidth = 0) {
+    if (!Array.isArray(bins) || !bins.length || !Number.isFinite(vmin) ||
+        !Number.isFinite(vmax) || !(vmax > vmin)) return null;
     const total = bins.reduce((sum, count) => sum + Number(count || 0), 0);
     if (!(total > 0)) return null;
     const bw = (vmax - vmin) / bins.length;
@@ -395,12 +422,12 @@
       if (acc >= total * 0.999) { highBin = b; break; }
     }
     const fallback = vmin + Math.max(0, fallbackBin) * bw;
-    const high = Math.max(vmin + (highBin + 1) * bw, fallback + 1);
+    const high = Math.max(vmin + (highBin + 1) * bw, fallback + minimumWidth);
     const mode = vmin + modeBin * bw;
     const low = mode >= fallback + rightPeakFraction * (high - fallback)
       ? fallback
       : mode;
-    return { lo: low, hi: Math.max(high, low + 1) };
+    return { lo: low, hi: Math.max(high, low + minimumWidth) };
   }
 
   return { createWidget, autoWindowFromHistogram, liveUpdate };

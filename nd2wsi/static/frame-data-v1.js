@@ -8,10 +8,16 @@
 
   function createHistogramController({
     state, readContext, matchesResponse, appendFrameParams, isAbortError,
-    fetch, onHistograms, onClear, setTimer = setTimeout, clearTimer = clearTimeout,
+    fetch, onHistograms, onClear, onStatus = () => {},
+    setTimer = setTimeout, clearTimer = clearTimeout,
   }) {
-    function requestHistograms(context) {
-      if (!context || readContext()?.key !== context.key) return;
+    const retryDelays = [500, 1500, 4000];
+    let revision = 0, disposed = false;
+    const ownsContext = (context, requestRevision) => !disposed &&
+      revision === requestRevision && readContext()?.key === context.key;
+
+    function requestHistograms(context, attempt, requestRevision) {
+      if (!ownsContext(context, requestRevision)) return;
       const q = appendFrameParams(new URLSearchParams(), context.frame).toString();
       const ticket = state.requests.begin(context.key);
       return fetch("api/histogram" + (q ? "?" + q : ""), {
@@ -22,36 +28,61 @@
         .then((data) => {
           if (
             !state.requests.isCurrent(ticket, context.key) ||
-            !matchesResponse(data, context)
+            !ownsContext(context, requestRevision)
           ) return;
+          if (!matchesResponse(data, context) || !Array.isArray(data.channels)) {
+            throw new Error("Histogram response did not match the current frame");
+          }
           onHistograms(data.channels);
+          onStatus("ready");
         })
         .catch((error) => {
           if (
             !state.requests.isCurrent(ticket, context.key) ||
+            !ownsContext(context, requestRevision) ||
             isAbortError(error)
           ) return;
           onClear(false); // manual LUT controls remain usable
+          if (attempt < retryDelays.length) {
+            onStatus("retrying");
+            state.timer = setTimer(() => {
+              state.timer = null;
+              requestHistograms(context, attempt + 1, requestRevision);
+            }, retryDelays[attempt]);
+          } else {
+            onStatus("failed"); // the UI offers an explicit retry after backoff
+          }
         })
         .finally(() => state.requests.finish(ticket));
     }
 
     function scheduleHistograms(delay) {
+      if (disposed) return;
+      const requestRevision = ++revision;
       clearTimer(state.timer);
       state.timer = null;
       state.requests.invalidate();
       const context = readContext();
       onClear(!context);
       if (!context) return;
+      onStatus("loading");
       const run = () => {
         state.timer = null;
-        requestHistograms(context);
+        requestHistograms(context, 0, requestRevision);
       };
       if (delay > 0) state.timer = setTimer(run, delay);
       else run();
     }
 
-    return { schedule: scheduleHistograms };
+    function dispose() {
+      disposed = true;
+      revision += 1;
+      clearTimer(state.timer);
+      state.timer = null;
+      state.requests.invalidate();
+    }
+
+    return { schedule: scheduleHistograms, dispose };
   }
 
   function createPixelProbeController({

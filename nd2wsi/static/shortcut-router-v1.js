@@ -16,12 +16,12 @@
     KeyF: "flip-horizontal",
   });
   const EDITABLE_SELECTOR = [
-    "input",
     "select",
     "textarea",
     '[contenteditable]:not([contenteditable="false"])',
     '[role="textbox"]',
   ].join(",");
+  const FOCUS_CONTROL_SELECTOR = "input," + EDITABLE_SELECTOR;
 
   function isMac(platform) {
     if (platform === undefined) {
@@ -57,13 +57,33 @@
 
   function isTypingEvent(event) {
     if (!event || event.isComposing || event.keyCode === 229) return true;
-    const target = event.target;
+    // Shadow-root events can be retargeted to a non-editable host. Keep the
+    // original input's typing/native key ownership even across that boundary.
+    const targets = typeof event.composedPath === "function" ? event.composedPath() : [];
+    return [event.target, ...targets].some((target) => {
+      if (!target) return false;
+      const tag = String(target.tagName || "").toUpperCase();
+      const element = targetElement(target);
+      const input = tag === "INPUT" ? target : element?.closest("input");
+      if (input) {
+        // Checkbox focus does not own letters such as C. Space still belongs
+        // to its native toggle, including on a plate where Space means play.
+        if (String(input.type || "text").toLowerCase() !== "checkbox") return true;
+        if (event.key === " " || event.key === "Spacebar" ||
+            event.code === "Space" || event.keyCode === 32) return true;
+      }
+      return tag === "SELECT" || tag === "TEXTAREA" || target.isContentEditable === true ||
+        Boolean(element && element.closest(EDITABLE_SELECTOR));
+    });
+  }
+
+  function isFocusControl(target) {
     if (!target) return false;
     const tag = String(target.tagName || "").toUpperCase();
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return true;
     if (target.isContentEditable === true) return true;
     const element = targetElement(target);
-    return Boolean(element && element.closest(EDITABLE_SELECTOR));
+    return Boolean(element && element.closest(FOCUS_CONTROL_SELECTOR));
   }
 
   function isBlocked(event) {
@@ -78,12 +98,16 @@
     return /^Key[A-Z]$/.test(code) ? code : "";
   }
 
-  function panelForEvent(event) {
+  function plainLetterForEvent(event) {
     if (
       isBlocked(event) || event.repeat || event.metaKey || event.ctrlKey ||
       event.altKey || event.shiftKey
     ) return null;
-    return PANEL_BY_CODE[letterCode(event)] || null;
+    return letterCode(event) || null;
+  }
+
+  function panelForEvent(event) {
+    return PANEL_BY_CODE[plainLetterForEvent(event)] || null;
   }
 
   function isOrientationShortcut(event, platform) {
@@ -109,7 +133,7 @@
   }
 
   return {
-    isTypingEvent, letterCode, panelForEvent, isOrientationShortcut,
+    isTypingEvent, isFocusControl, letterCode, plainLetterForEvent, panelForEvent, isOrientationShortcut,
     orientationForEvent, tabIndexForEvent, isMac, commandPressed,
     formatShortcutText, localizeLabels,
   };

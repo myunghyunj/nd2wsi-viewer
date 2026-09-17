@@ -123,3 +123,70 @@ def test_float_histogram_includes_extremes_and_stored_range_without_percentile_c
     assert (histogram["vmin"], histogram["vmax"]) == (-20, 100000)
     assert sum(histogram["bins"]) == 4
     assert histogram["bins"][-1] == 1
+
+
+@pytest.mark.parametrize('low,high', [(0.0, 0.001), (-0.002, -0.001), (0.0, 1e-12)])
+def test_float_auto_histogram_retains_subunit_signal_resolution(low, high):
+    data = np.linspace(low, high, 1000, dtype=np.float64).reshape(1, 10, 100)
+    attrs = {'nd2wsi': {'dtype': 'float64', 'levels': [{'path': '0', 'width': 100, 'height': 10}]},
+             'omero': {'channels': [{'window': {'min': low, 'max': high, 'start': low, 'end': high}}]}}
+    histogram = compute_histograms({'0': _Array(data)}, attrs, min_pixels=1)[0]
+    auto = histogram['autoHistogram']
+    assert auto['vmin'] == low
+    assert 0 < auto['vmax'] - auto['vmin'] <= (high - low) * 1.101
+    assert np.count_nonzero(auto['bins']) > 200
+    assert sum(auto['bins']) == data.size
+    assert (histogram['vmin'], histogram['vmax']) == (low, high)
+
+
+@pytest.mark.parametrize('value', [0.0, -0.125, 1e12])
+def test_constant_float_histogram_uses_a_finite_nonzero_span(value):
+    data = np.full((1, 10, 10), value, dtype=np.float64)
+    attrs = {'nd2wsi': {'dtype': 'float64', 'levels': [{'path': '0', 'width': 10, 'height': 10}]},
+             'omero': {'channels': [{'window': {'min': value, 'max': value, 'start': value, 'end': value}}]}}
+    histogram = compute_histograms({'0': _Array(data)}, attrs, min_pixels=1)[0]
+    for row in [histogram, histogram['autoHistogram']]:
+        assert np.isfinite(row['vmax']) and row['vmax'] > row['vmin']
+        assert sum(row['bins']) == data.size
+
+
+@pytest.mark.parametrize('dtype', [np.float32, np.float64])
+@pytest.mark.parametrize('rgb', [False, True])
+def test_float_render_applies_submicro_contrast_window(dtype, rgb):
+    from nd2wsi.render import composite
+    high = float(dtype(1e-9))
+    data = np.array([[[0.0, high / 2, high]]], dtype=dtype)
+    if rgb:
+        data = np.repeat(data, 3, axis=0)
+    image = composite(data, list(range(len(data))), [(0.0, high)] * len(data),
+                      [(255, 255, 255)] * len(data), rgb=rgb)
+    assert image.tolist() == [[[0, 0, 0], [127, 127, 127], [255, 255, 255]]]
+
+
+def test_float64_render_preserves_narrow_differences_at_large_negative_offset():
+    from nd2wsi.render import composite
+    low = -(2.0 ** 30)
+    width = 2.0 ** -10
+    data = np.array([[[low, low + width / 2, low + width]]], dtype=np.float64)
+    image = composite(data, [0], [(low, low + width)], [(255, 255, 255)], rgb=False)
+    assert image.tolist() == [[[0, 0, 0], [127, 127, 127], [255, 255, 255]]]
+
+
+def test_integer_render_keeps_full_range_and_gamma_behavior():
+    from nd2wsi.render import composite
+    data = np.array([[[0, 16384, 65535]]], dtype=np.uint16)
+    linear = composite(data, [0], [(0, 65535)], [(255, 0, 0)], rgb=False)
+    gamma = composite(data, [0], [(0, 65535)], [(255, 0, 0)], rgb=False, gammas=[2])
+    assert linear.tolist() == [[[0, 0, 0], [63, 0, 0], [255, 0, 0]]]
+    assert gamma.tolist() == [[[0, 0, 0], [127, 0, 0], [255, 0, 0]]]
+
+
+def test_float_histogram_counts_narrow_differences_at_large_offset():
+    low, high = 2.0 ** 30, 2.0 ** 30 + 2.0 ** -10
+    data = np.array([[[low, (low + high) / 2, high]]], dtype=np.float64)
+    attrs = {'nd2wsi': {'dtype': 'float64', 'levels': [{'path': '0', 'width': 3, 'height': 1}]},
+             'omero': {'channels': [{'window': {'min': low, 'max': high, 'start': low, 'end': high}}]}}
+    histogram = compute_histograms({'0': _Array(data)}, attrs, min_pixels=1)[0]
+    assert sum(histogram['bins']) == sum(histogram['detail']['counts']) == 3
+    assert np.count_nonzero(histogram['bins']) == 3
+    assert all(low <= value <= high for value in histogram['detail']['values'])

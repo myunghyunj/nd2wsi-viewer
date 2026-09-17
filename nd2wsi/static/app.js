@@ -185,9 +185,9 @@ function createFrameRequests() {
   return {
     histograms: window.Nd2FrameData.createHistogramController({
       ...shared, state: state.histogram, onClear: clearHistograms,
+      onStatus(status) { setHistogramReady(status === "ready", false, status); },
       onHistograms(channels) {
         channels.forEach((histogram, i) => state.lutWidgets[i]?.setHistogram(histogram));
-        setHistogramReady(true);
       },
     }),
     pixels: window.Nd2FrameData.createPixelProbeController({
@@ -264,12 +264,14 @@ function lutParam() {
   // one lo:hi[:gamma] slot per channel; empty slot = store default
   const luts = state.luts;
   if (!luts.some((l) => l)) return "";
+  const discrete = /^(?:u?int\d+|bool|[<>=|]?[iu]\d+)$/.test(String(state.info.dtype || ""));
+  const limit = (value) => String(discrete ? Math.round(value) : value);
   return state.info.channels
     .map((ch, i) => {
       const l = luts[i];
       if (!l) return "";
-      const g = Math.abs(l.gamma - 1) > 0.005 ? ":" + l.gamma.toFixed(2) : "";
-      return Math.round(l.lo) + ":" + Math.round(l.hi) + g;
+      const g = l.gamma === 1 ? "" : ":" + String(l.gamma);
+      return limit(l.lo) + ":" + limit(l.hi) + g;
     })
     .join(",");
 }
@@ -606,6 +608,7 @@ function buildChannelPanel() {
     auto.textContent = "Auto";
     auto.addEventListener("click", (ev) => {
       ev.preventDefault();
+      if (state.histogram.failed) { loadHistograms(); return; }
       state.lutWidgets[i].auto();
     });
     const reset = document.createElement("button");
@@ -652,7 +655,10 @@ function buildChannelPanel() {
 // Coalesce all channels from one input event, then keep showing the newest
 // contrast during a continuous drag instead of waiting for it to stop.
 const applyLuts = window.Nd2LutControls.liveUpdate(() => refreshTiles(), 100);
-window.addEventListener("pagehide", () => applyLuts.cancel(), { once: true });
+window.addEventListener("pagehide", () => {
+  applyLuts.cancel();
+  frameRequests?.histograms.dispose();
+}, { once: true });
 
 /* Swap the tiles of the open image in place. The tile source builds every
    URL through tileQuery() at request time, so dropping the loaded tiles is
@@ -702,7 +708,8 @@ function resetTiledImage(item) {
 
 function buildLutRow(i, ch, winLabel) {
   const widget = window.Nd2LutControls.createWidget({
-    channel: ch, initialLut: state.luts[i], autoRange: state.lutAutoRange,
+    channel: ch, dtype: state.info?.dtype,
+    initialLut: state.luts[i], autoRange: state.lutAutoRange,
     label: winLabel, width: state.windows.channels.bodyWidth(), document, window,
     protocolVersion: VIEWPORT_PROTOCOL_VERSION, inkColor, currentTheme, fmtInt,
     onChange(lut) {
@@ -727,16 +734,22 @@ function relayoutLuts() {
   state.lutWidgets.forEach((wd) => wd && wd.relayout(w));
 }
 
-function setHistogramReady(ready, unavailable = false) {
+function setHistogramReady(ready, unavailable = false, status = "loading") {
   state.histogram.ready = !!ready;
+  state.histogram.failed = status === "failed";
   document.querySelectorAll(".lut-auto").forEach((button) => {
     if (!button.dataset.readyTitle) button.dataset.readyTitle = button.title;
-    button.disabled = !ready;
+    button.disabled = !ready && !state.histogram.failed;
+    button.textContent = state.histogram.failed ? "Retry" : "Auto";
     button.title = ready
       ? button.dataset.readyTitle
       : unavailable
         ? "Choose a site to calculate its histogram"
-        : "Histogram is loading for the current frame";
+        : state.histogram.failed
+          ? "Histogram could not be loaded. Click to retry. Manual contrast remains available."
+          : status === "retrying"
+            ? "Histogram request failed; retrying automatically"
+            : "Histogram is loading for the current frame";
   });
 }
 
@@ -4239,7 +4252,7 @@ function stepPlateZ(delta) {
   // moves from there rather than from the plane the user last set by hand
   const pl = state.plate;
   const from = pl.auto && pl.focus !== null ? plateZFor(pl.focus) : pl.z;
-  setPlateZ(from + delta);
+  setPlateZ(from + window.Nd2PlateUI.zIndexStep(state.info.plate, delta));
 }
 
 function setPlateAuto(on) {
@@ -4339,8 +4352,7 @@ function setPlatePlaying(on) {
    plane marked, a value capsule beside the knob */
 
 function zSliderPct(z) {
-  const Z = state.info.plate.Z;
-  return Z > 1 ? (1 - z / (Z - 1)) * 100 : 50;
+  return window.Nd2PlateUI.zSliderPercent(state.info.plate, z);
 }
 
 function buildZSlider() {
@@ -4362,7 +4374,7 @@ function buildZSlider() {
     const r = track.getBoundingClientRect();
     if (!r.height) return;
     const f = clamp((y - r.top) / r.height, 0, 1);
-    setPlateZ(Math.round((1 - f) * (info.Z - 1)));
+    setPlateZ(window.Nd2PlateUI.zIndexAtSlider(info, f));
   };
   let drag = false;
   knob.addEventListener("pointerdown", (ev) => {
@@ -4380,7 +4392,7 @@ function buildZSlider() {
     if (ev.key === "ArrowUp") { stepPlateZ(1); ev.preventDefault(); ev.stopPropagation(); }
     else if (ev.key === "ArrowDown") { stepPlateZ(-1); ev.preventDefault(); ev.stopPropagation(); }
     else if (ev.key === "Home" || ev.key === "End") {
-      setPlateZ(ev.key === "Home" ? 0 : info.Z - 1);
+      setPlateZ(window.Nd2PlateUI.zIndexAtSlider(info, ev.key === "Home" ? 1 : 0));
       ev.preventDefault(); ev.stopPropagation();
     }
   });
@@ -4395,6 +4407,8 @@ function renderZSlider() {
   // with autofocus on, the slider reports the plane of the site in view
   const shownZ = pl.auto && pl.focus !== null ? plateZFor(pl.focus) : pl.z;
   const pct = zSliderPct(shownZ);
+  const offset = pl.auto && pl.focus === null ? null : window.Nd2PlateUI.zOffsetUm(info, shownZ);
+  const offsetText = offset === null ? "" : " · " + (offset < 0 ? "−" : "+") + rawValueLabel(Math.abs(offset)) + " µm";
   // the track is inset 10 px inside the slider, so the knob and the label
   // follow the track's own extent
   const slider = $("z-slider");
@@ -4409,7 +4423,7 @@ function renderZSlider() {
   const knob = $("z-knob");
   knob.style.top = top + "px";
   knob.setAttribute("aria-valuenow", String(shownZ + 1));
-  knob.setAttribute("aria-valuetext", plateZText() + (pl.auto && pl.focus === null ? ". Adjust to set a shared manual plane." : ""));
+  knob.setAttribute("aria-valuetext", plateZText() + offsetText + (pl.auto && pl.focus === null ? ". Adjust to set a shared manual plane." : ""));
   $("z-slider").classList.toggle("auto", !!pl.auto);
   $("z-fill").style.height = ((1 - pct / 100) * (tr.height || 0)) + "px";
   const label = $("z-label");
@@ -4418,11 +4432,7 @@ function renderZSlider() {
   label.append(pl.auto && pl.focus === null ? plateZText() : (shownZ + 1) + " of " + info.Z);
   const dim = document.createElement("span");
   dim.className = "dim";
-  let text = "";
-  if (Number(info.zStepUm) > 0 && !(pl.auto && pl.focus === null)) {
-    const d = (shownZ - info.zHome) * Number(info.zStepUm);
-    text += " · " + (d < 0 ? "−" : "+") + rawValueLabel(Math.abs(d)) + " µm";
-  }
+  let text = offsetText;
   if (pl.auto && pl.focus !== null) text += window.Nd2PlateUI.focusReady(pl.focusMap, pl.t, pl.focus) ? " · auto" : " · manual, AF pending";
   else if (!pl.auto && shownZ === info.zHome) text += " · home";
   dim.textContent = text;
@@ -4564,7 +4574,7 @@ function loadPlateFocus() {
   fetch("api/plate/focus", { cache: "no-store", signal: controller.signal })
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
     .then((map) => {
-      if (state.plate !== pl || state.info.generation !== generation || pl.focusRequest !== controller
+      if (controller.signal.aborted || state.plate !== pl || state.info.generation !== generation || pl.focusRequest !== controller
           || !map || !Array.isArray(map.best) || !Array.isArray(map.complete)) return;
       // the map keeps growing while the planes are measured, so a repaint
       // only happens when the planes on screen actually move; reloading the
@@ -4590,37 +4600,56 @@ function pollPlateStatus() {
   // scrubber shows which time points are in, and the status bar counts,
   // so the series can be scrubbed without touching the ND2 once it is done
   const pl = state.plate;
-  if (!pl || pl.statusTimer) return;
+  if (!pl || pl.statusTimer || pl.statusRequest) return;
+  const generation = state.info.generation;
+  let closed = false;
   const cell = $("plate-cache-cell");
+  const stop = () => {
+    closed = true;
+    clearInterval(pl.statusTimer);
+    pl.statusTimer = null;
+    pl.statusRequest?.abort();
+  };
   const ask = () => {
-    fetch("api/plate/status", { cache: "no-store" })
+    if (closed || state.plate !== pl || state.info.generation !== generation) { stop(); return; }
+    if (pl.statusRequest) return;
+    const controller = new AbortController();
+    pl.statusRequest = controller;
+    fetch("api/plate/status", { cache: "no-store", signal: controller.signal })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status))))
       .then((d) => {
+        if (closed || state.plate !== pl || state.info.generation !== generation) { stop(); return; }
         pl.storePerT = Array.isArray(d.perT) ? d.perT : null;
         pl.storeDone = Number(d.done) || 0;
         pl.storeTotal = Number(d.total) || 0;
         renderTimeLine();
         const done = pl.storeTotal && pl.storeDone >= pl.storeTotal;
+        // Agent windows may read directly without a store. Nothing is being
+        // built in that case; reporting 0% would promise progress that cannot occur.
+        const noStore = d.path === null && !d.building && !d.writer;
         if (cell) {
-          cell.hidden = done || !pl.storeTotal;
-          $("plate-cache-val").textContent = pl.storeTotal
-            ? Math.floor((pl.storeDone / pl.storeTotal) * 100) + " % · " + fmtInt(pl.storeDone) + " of " + fmtInt(pl.storeTotal)
-            : "";
+          cell.hidden = !noStore && (done || !pl.storeTotal);
+          cell.title = noStore ? "This image is open without a viewing cache." : "";
+          $("plate-cache-val").textContent = noStore ? "No viewing cache"
+            : pl.storeTotal
+              ? Math.floor((pl.storeDone / pl.storeTotal) * 100) + " % · " + fmtInt(pl.storeDone) + " of " + fmtInt(pl.storeTotal)
+              : "";
         }
+        if (noStore) { stop(); return; }
         const map = pl.focusMap;
         const focusNeeded = state.info.plate.Z > 1;
         const measured = map && map.completeCount >= map.total;
         if (focusNeeded && !measured) loadPlateFocus();
         if (done && (!focusNeeded || measured)) {
-          clearInterval(pl.statusTimer);
-          pl.statusTimer = null;
+          stop();
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => { if (pl.statusRequest === controller) pl.statusRequest = null; });
   };
-  ask();
   pl.statusTimer = setInterval(ask, 2000);
-  window.addEventListener("pagehide", () => { clearInterval(pl.statusTimer); pl.statusTimer = null; }, { once: true });
+  ask();
+  window.addEventListener("pagehide", stop, { once: true });
 }
 
 function renderTimeLine() {

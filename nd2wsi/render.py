@@ -108,11 +108,16 @@ def composite(
     if h == 0 or w == 0:
         return np.zeros((h, w, 3), dtype=np.uint8)
     gammas = gammas or [1.0] * len(windows)
+    floating = np.issubdtype(region.dtype, np.floating)
+    # Preserve both sub-micro windows and small float64 differences at large
+    # offsets. Integer sources keep the existing float32 compositing path.
+    working_dtype = np.float64 if floating else np.float32
 
     if rgb and len(channels) == 3 and channels == [0, 1, 2]:
         lo, hi = windows[0]
-        img = region.astype(np.float32)
-        img = (img - lo) / max(hi - lo, 1e-6)
+        img = region.astype(working_dtype)
+        span = (hi - lo if hi > lo else 1.0) if floating else max(hi - lo, 1e-6)
+        img = (img - lo) / span
         np.clip(img, 0, 1, out=img)
         if gammas[0] != 1.0:
             img **= 1.0 / gammas[0]
@@ -121,7 +126,8 @@ def composite(
     out = np.zeros((h, w, 3), dtype=np.float32)
     for ci in channels:
         lo, hi = windows[ci]
-        v = (region[ci].astype(np.float32) - lo) / max(hi - lo, 1e-6)
+        span = (hi - lo if hi > lo else 1.0) if floating else max(hi - lo, 1e-6)
+        v = (region[ci].astype(working_dtype) - lo) / span
         np.clip(v, 0, 1, out=v)
         if gammas[ci] != 1.0:
             v **= 1.0 / gammas[ci]
@@ -189,6 +195,17 @@ def compute_histograms(
             pick = lv
             break
     data = np.asarray(root[pick["path"]][:])  # (C, h, w)
+
+    def histogram(values, count, low, high):
+        if np.issubdtype(values.dtype, np.floating):
+            # NumPy cannot construct thousands of distinct edges when a float
+            # window is only a few representable steps wide at a large offset.
+            # Count in normalized coordinates, then map the edges back.
+            scaled = (values.astype(np.float64) - low) / (high - low)
+            counts, edges = np.histogram(scaled, bins=count, range=(0.0, 1.0))
+            return counts, low + edges * (high - low)
+        return np.histogram(values, bins=count, range=(low, high))
+
     out = []
     for ci in range(data.shape[0]):
         ch = data[ci].ravel()
@@ -205,10 +222,15 @@ def compute_histograms(
         robust_high = float(np.percentile(ch, 99.9)) if ch.size else dmax
         auto_max = min(auto_min + (robust_high - auto_min) * 1.3, dmax)
         window_high = float(win.get("end", auto_max))
-        auto_max = max(auto_max, auto_min + (window_high - auto_min) * 1.1, auto_min + 1.0)
-        auto_counts, _ = np.histogram(np.clip(ch, auto_min, auto_max), bins=bins,
-                                      range=(auto_min, auto_max))
         dtype = np.dtype(meta.get("dtype", data.dtype))
+        auto_max = max(auto_max, auto_min + (window_high - auto_min) * 1.1)
+        if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
+            auto_max = max(auto_max, auto_min + 1.0)
+        elif auto_max <= auto_min:
+            # Only a constant channel needs expansion. Do not impose an
+            # intensity-unit floor on a valid, possibly very narrow float span.
+            auto_max = auto_min + max(1.0, abs(auto_min)) * np.finfo(float).eps * bins
+        auto_counts, _ = histogram(np.clip(ch, auto_min, auto_max), bins, auto_min, auto_max)
         if np.issubdtype(dtype, np.integer):
             limits = np.iinfo(dtype)
             vmin, vmax = float(limits.min), float(limits.max)
@@ -220,16 +242,16 @@ def compute_histograms(
                           if key in win and np.isfinite(float(win[key])))
             vmin, vmax = min(bounds), max(bounds)
             if vmax <= vmin:
-                vmax = vmin + max(1.0, abs(vmin) * 1e-6)
-        counts, _ = np.histogram(ch, bins=bins, range=(vmin, vmax))
+                vmax = vmin + max(1.0, abs(vmin)) * np.finfo(float).eps * bins
+        counts, _ = histogram(ch, bins, vmin, vmax)
         # Preserve native integer peaks for client-side zooming. Sparse arrays
         # avoid sending 65,536 mostly empty bins for dim uint16 acquisitions.
         if np.issubdtype(ch.dtype, np.integer) and ch.dtype.itemsize <= 2:
             values, detail_counts = np.unique(ch, return_counts=True)
         else:
-            detail_counts, edges = np.histogram(ch, bins=65536, range=(vmin, vmax))
+            detail_counts, edges = histogram(ch, 65536, vmin, vmax)
             occupied = detail_counts > 0
-            values = ((edges[:-1] + edges[1:]) / 2)[occupied]
+            values = (edges[:-1] + (edges[1:] - edges[:-1]) / 2)[occupied]
             detail_counts = detail_counts[occupied]
         out.append(
             {

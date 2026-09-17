@@ -87,6 +87,33 @@
     };
   }
 
+  function zIndexStep(info, upwardSteps) {
+    // Indices remain in acquisition order; only navigation follows stack height.
+    return upwardSteps * (info.bottomToTop === false ? -1 : 1);
+  }
+
+  function zSliderPercent(info, z) {
+    if (!(info.Z > 1)) return 50;
+    const fraction = Math.max(0, Math.min(1, z / (info.Z - 1)));
+    return (info.bottomToTop === false ? fraction : 1 - fraction) * 100;
+  }
+
+  function zIndexAtSlider(info, fractionFromTop) {
+    const fraction = Math.max(0, Math.min(1, fractionFromTop));
+    const position = info.bottomToTop === false ? fraction : 1 - fraction;
+    return Math.round(position * Math.max(0, info.Z - 1));
+  }
+
+  function zOffsetUm(info, z) {
+    // homeIndex is already an acquisition index, including asymmetric reverse
+    // stacks. Reversing the home index again would move the zero plane.
+    const step = Number(info.zStepUm), home = info.zHome;
+    if (typeof info.bottomToTop !== "boolean" || !Number.isFinite(step) || step <= 0 ||
+        !Number.isInteger(home) || home < 0 || home >= info.Z ||
+        !Number.isInteger(z) || z < 0 || z >= info.Z) return null;
+    return zIndexStep(info, z - home) * step;
+  }
+
   function nextGridSite(placed, current, key) {
     const site = placed.find((s) => s.i === current) || placed[0];
     if (!site) return null;
@@ -102,5 +129,6 @@
     return candidates[0]?.i ?? site.i;
   }
 
-  return { parseWellName, wellHeaders, focusReady, displayedZ, focusSummary, nextGridSite };
+  return { parseWellName, wellHeaders, focusReady, displayedZ, focusSummary, nextGridSite,
+    zIndexStep, zSliderPercent, zIndexAtSlider, zOffsetUm };
 });

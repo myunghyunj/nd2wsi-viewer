@@ -1499,14 +1499,15 @@ class PlateSource:
         zl = _loop(f, "ZStackLoop")
         self.z_home = self.Z // 2
         self.z_step_um: float | None = None
-        self.bottom_to_top = True
+        self.bottom_to_top = None
         if zl is not None:
             params = getattr(zl, "parameters", None)
             home = getattr(params, "homeIndex", None)
             if isinstance(home, int) and 0 <= home < self.Z:
                 self.z_home = home
             self.z_step_um = _finite_positive(getattr(params, "stepUm", None))
-            self.bottom_to_top = bool(getattr(params, "bottomToTop", True))
+            direction = getattr(params, "bottomToTop", None)
+            self.bottom_to_top = direction if isinstance(direction, bool) else None
         if self.z_step_um is None:
             try:
                 self.z_step_um = _finite_positive(f.voxel_size().z)
