@@ -45,7 +45,7 @@ def run(body, *, dtype='float64', lo=0, hi=1, start=None, end=None):
     spec = {'dtype': dtype, 'window': {'min': lo, 'max': hi,
             'start': lo if start is None else start, 'end': hi if end is None else end}}
     result = subprocess.run([NODE, '-e', SCRIPT, str(MODULE), json.dumps(spec), body],
-                            capture_output=True, text=True, check=True, timeout=20)
+                            capture_output=True, encoding='utf-8', check=True, timeout=20)
     return json.loads(result.stdout)
 
 
