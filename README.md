@@ -141,12 +141,6 @@ The window has no title bar of its own, so the tab strip and the toolbar take it
 
 The mark at the left of the toolbar names the kind of file in two words. 2D or 3D says whether the file holds a z stack, and SLIDE or PLATE says whether it holds one scan position or several. A stitched scan reads 2D SLIDE and the phage assay reads 3D PLATE.
 
-In 2.1.4 on macOS and Windows, the bottom of **Region** offers **Scale bar + SVG** and
-**Scale bar + JPEG**. Both use the image calibration and selected export scale.
-SVG embeds the rendered PNG without changing its pixels and keeps the white bar
-and label editable. JPEG includes the bar at high quality with 4:4:4 colour sampling.
-Images without valid calibration cannot export a physical scale bar.
-
 ### Time series of a plate
 
 ![Six sites of a phage assay in plate mode](docs/plate-mode.png)
@@ -177,7 +171,7 @@ Marks are saved automatically in a small `.json` file beside the slide, so they 
 
 ## Cutting out a region
 
-![A region selected for export at high magnification](docs/region-closeup.png)
+![A selected fluorescence region with channel controls and the Scale bar + SVG and Scale bar + JPEG buttons](docs/region-closeup.png)
 
 Press `R` to open the Region panel, choose **Select Region**, and drag a box, or type a size in pixels or micrometers. Then choose a format.
 
@@ -186,8 +180,22 @@ Press `R` to open the Region panel, choose **Select Region**, and drag a box, or
 | ND2 | the original numbers of the selected channels, as a new ND2 file |
 | TIFF | the original numbers, as a tiled TIFF |
 | PNG or JPEG | a picture of the region exactly as it looks on screen |
+| Scale bar + SVG | a lossless PNG image embedded in an SVG, with an editable vector scale bar and label |
+| Scale bar + JPEG | a high-quality JPEG with the calibrated scale bar and label baked in |
 
 ND2 and TIFF keep the raw values, so what you export is what the scanner recorded. PNG and JPEG apply your colors and brightness settings, which makes them right for figures and wrong for measurement.
+
+### Editable scale bars in Adobe Illustrator
+
+Choose **Scale bar + SVG** to export a single SVG file combining the rendered PNG with a white vector bar and text label. The label uses **Arial by default**. Open it in Adobe Illustrator to edit the label's font or move the bar. The embedded microscopy image keeps the selected export resolution; SVG does not turn it into vector artwork or add image detail.
+
+The horizontal bar is calibrated from the file's recorded micrometers per pixel, adjusted for the selected export scale: **bar width (px) = bar length (µm) ÷ (source µm/px × downsample factor)**. For example, a half-resolution export uses twice the source µm/px. Scale-bar export is unavailable without valid calibration. In Illustrator, resize the image and bar together to preserve their physical relationship; do not stretch the bar independently.
+
+![The exported PNG-plus-SVG figure open in Adobe Illustrator, with an editable 100 µm scale bar and the Character panel](docs/region-scalebar-illustrator.png)
+
+*The microscopy image is raster PNG; the scale bar and its label are separate, editable SVG elements.*
+
+### Exporting the whole slide
 
 ![The whole slide selected for a reduced-size export](docs/region-wholeslide.png)
 
