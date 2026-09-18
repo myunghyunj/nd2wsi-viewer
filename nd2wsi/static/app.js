@@ -575,13 +575,8 @@ function macSwitch(on, onToggle) {
 
 function buildChannelPanel() {
   const info = state.info;
-  if (info.rgb) {
-    // RGB slides render as-is: no channel window at all
-    state.windows.channels.close(true);
-    $("tb-channels").disabled = true;
-    $("tb-channels").style.opacity = 0.4;
-    return;
-  }
+  // RGB ND2/SVS expose their Red/Green/Blue components through the same LUT
+  // controls. Their default windows preserve the original brightfield colours.
   const list = $("channel-list");
   const rangeToggle = $("lut-auto-range");
   rangeToggle.checked = state.lutAutoRange;

@@ -113,15 +113,21 @@ def composite(
     # offsets. Integer sources keep the existing float32 compositing path.
     working_dtype = np.float64 if floating else np.float32
 
-    if rgb and len(channels) == 3 and channels == [0, 1, 2]:
-        lo, hi = windows[0]
-        img = region.astype(working_dtype)
-        span = (hi - lo if hi > lo else 1.0) if floating else max(hi - lo, 1e-6)
-        img = (img - lo) / span
-        np.clip(img, 0, 1, out=img)
-        if gammas[0] != 1.0:
-            img **= 1.0 / gammas[0]
-        return (np.moveaxis(img, 0, -1) * 255).astype(np.uint8)
+    if rgb:
+        # RGB components keep their physical R/G/B slots, not fluorescence
+        # pseudocolours. Each component has its own display window and gamma;
+        # hiding one leaves the other two unchanged. Defaults remain identity
+        # for an 8-bit colour acquisition.
+        out = np.zeros((h, w, 3), dtype=np.uint8)
+        for ci in channels:
+            lo, hi = windows[ci]
+            span = (hi - lo if hi > lo else 1.0) if floating else max(hi - lo, 1e-6)
+            v = (region[ci].astype(working_dtype) - lo) / span
+            np.clip(v, 0, 1, out=v)
+            if gammas[ci] != 1.0:
+                v **= 1.0 / gammas[ci]
+            out[..., ci] = (v * 255).astype(np.uint8)
+        return out
 
     out = np.zeros((h, w, 3), dtype=np.float32)
     for ci in channels:
