@@ -1,6 +1,7 @@
-> **macOS and Windows v2.1.6.** Fixes fractional LUT precision, Z-stack direction,
-> checkbox and comparison shortcuts, histogram retry, and cache-free plate status.
-> [Release details](docs/release-notes-2.1.6.md). Compare offers **Link scale** for matching physical
+> **macOS and Windows v2.1.7.** RGB brightfield ND2 and SVS images now expose
+> independent Red, Green and Blue ranges, gamma and visibility in **Channels & LUTs**,
+> while keeping the light theme and original default colours.
+> [Release details](docs/release-notes-2.1.7.md). Compare offers **Link scale** for matching physical
 > magnification with independent movement, or **Link scale + frame** for linked
 > movement too. The LUT panel uses graph handles without Min/Max entry boxes.
 > **Scale bar + SVG** and **Scale bar + JPEG** remain available for region exports.
@@ -15,7 +16,7 @@
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.1.6 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.6/nd2wsi-viewer-2.1.6-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.1.7 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.7/nd2wsi-viewer-2.1.7-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -69,11 +70,11 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.1.6-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.6/nd2wsi-viewer-2.1.6-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.6/nd2wsi-viewer-2.1.6-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.1.7-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.7/nd2wsi-viewer-2.1.7-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.7/nd2wsi-viewer-2.1.7-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides the tested portable ZIP, not a v2.1.6
+or GPU is required. This release provides the tested portable ZIP, not a v2.1.7
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
