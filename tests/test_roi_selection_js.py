@@ -69,7 +69,7 @@ vm.runInContext(
   between('function finishSelection(', 'function applyRoi(') +
   between('function roiOverlayPoints(', 'function ensureRoiOverlayLayer(') +
   between('function downloadRoi(', 'let exportTimer') +
-  between('function elementPoint(', 'function rectFrom(') +
+  between('function elementPoint(', 'const clamp =') +
   '\nconst SVG_NS = "http://www.w3.org/2000/svg"; wireTools();', context);
 const stage = context.$('stage');
 function event(p) {

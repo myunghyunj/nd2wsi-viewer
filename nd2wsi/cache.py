@@ -493,17 +493,6 @@ class CacheLock:
         except PermissionError:
             return False
 
-    def _stale(self) -> bool:
-        try:
-            fd = os.open(self.path, os.O_RDONLY | BINARY)
-        except OSError:
-            return False
-        try:
-            info, st = self._read_fd(fd)
-            return self._stale_info(info, st.st_mtime)
-        finally:
-            os.close(fd)
-
     def acquire(self, timeout: float = 3600.0, poll: float = 0.5) -> None:
         timeout = max(0.0, float(timeout))
         poll = max(0.001, float(poll))

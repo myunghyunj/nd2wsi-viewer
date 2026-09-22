@@ -5018,14 +5018,6 @@ function elementPoint(ev, el) {
   const r = el.getBoundingClientRect();
   return { x: ev.clientX - r.left, y: ev.clientY - r.top };
 }
-function rectFrom(a, b) {
-  return {
-    x: Math.min(a.x, b.x),
-    y: Math.min(a.y, b.y),
-    w: Math.abs(a.x - b.x),
-    h: Math.abs(a.y - b.y),
-  };
-}
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const fmtInt = (v) => Math.round(v).toLocaleString("en-US");
 function fmtUm(um) {

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import __version__
 from .renderer_policy import FailureLedger, open_attempt_id, should_try_metal, source_fingerprint
+from .window_launch import child_environment
 
 
 def metal_available():
@@ -39,11 +40,7 @@ def command_prefix():
 
 def spawn_browser(arguments):
     """Never reuse an AppKit event loop or adopt an existing User window."""
-    environment = os.environ.copy()
-    environment.update(PYINSTALLER_RESET_ENVIRONMENT="1", ND2WSI_WINDOW_CHILD="1")
-    for key in ("ND2WSI_VIEWPORT_REPLAY", "ND2WSI_VIEWPORT_AUTOQUIT",
-                "ND2WSI_VIEWPORT_CAPTURE_AFTER_REPLAY", "MTL_CAPTURE_ENABLED"):
-        environment.pop(key, None)
+    environment = child_environment()
     return subprocess.Popen(command_prefix() + arguments, env=environment,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True)
@@ -65,7 +62,7 @@ def main(argv=None):
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     # Existing scientific/package smoke paths and all non-macOS behavior remain
-    # exactly in the established application. This RC ships no Windows update.
+    # exactly in the established application.
     if sys.platform != "darwin" or any(x in arguments for x in ("--smoke", "--gui-smoke")):
         return app.main(arguments)
     parser = argparse.ArgumentParser(prog="nd2wsi-viewer")
