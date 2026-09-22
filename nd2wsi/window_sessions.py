@@ -108,20 +108,20 @@ def create_window_session(role: str, base_path: str | Path | None = None) -> Win
         )
     base = Path(base_path).expanduser().resolve()
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
-    from .update_guard import window_admission
-
-    with window_admission(base):
-        return _create_session(role, base)
+    return _create_session(role, base)
 
 
 def _create_session(role: str, base: Path) -> WindowSession:
-    from .update_guard import session_lifetime
+    from .update_guard import session_lifetime, window_admission
 
     session_id = uuid.uuid4().hex
     root = base / session_id
-    root.mkdir(mode=0o700, exist_ok=False)
-    session = WindowSession(role=role, id=session_id, root=root)
-    session._lifetime_lock = session_lifetime(base, session_id)
+    with window_admission(base):
+        root.mkdir(mode=0o700, exist_ok=False)
+        session = WindowSession(role=role, id=session_id, root=root)
+        session._lifetime_lock = session_lifetime(base, session_id)
+    # The lifetime lock now blocks installation. Slow durable session writes
+    # must not hold launch admission and make other normal windows time out.
     try:
         for directory in (session.annotation_root, session.exports_root, session.drafts_root):
             directory.mkdir(mode=0o700)

@@ -122,17 +122,32 @@ def test_release_keeps_coordination_path_and_allows_reacquire(tmp_path: Path):
 def test_metadata_write_failure_does_not_drop_kernel_lock(tmp_path: Path, monkeypatch):
     path = tmp_path / "plate.writer-session"
 
-    def fail_fsync(_fd: int) -> None:
+    def fail_write(_fd: int, _data) -> None:
         raise OSError("diagnostic metadata unavailable")
 
-    monkeypatch.setattr(os, "fsync", fail_fsync)
     first = SessionFileLock(path)
-    first.acquire()
+    with monkeypatch.context() as metadata_failure:
+        metadata_failure.setattr(os, "write", fail_write)
+        first.acquire()
     try:
         assert first.acquired
         assert _spawn_attempt(path) == ("blocked", None)
     finally:
         first.release()
+
+
+def test_diagnostic_metadata_does_not_require_a_durable_flush(tmp_path, monkeypatch):
+    def unexpected_flush(_fd):
+        pytest.fail("kernel lock diagnostics must not wait for durable storage")
+
+    monkeypatch.setattr(os, "fsync", unexpected_flush)
+    lock = SessionFileLock(tmp_path / "session.lock")
+    try:
+        lock.acquire()
+        assert lock.acquired
+        assert json.loads(lock.path.read_text())["pid"] == os.getpid()
+    finally:
+        lock.release()
 
 
 def test_symlink_lock_path_cannot_modify_its_target(tmp_path: Path, symlink_support):

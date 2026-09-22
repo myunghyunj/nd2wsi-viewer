@@ -7,6 +7,7 @@ A maintenance release for macOS and Windows, built from the same source revision
 - Reuse the shared child-process environment setup when opening the standard viewer, preserving independent windows and stripping inherited replay/capture settings.
 - Remove an unused cache-lock wrapper; active lock acquisition and stale-lock safety checks are unchanged.
 - Remove an unused rectangle helper from the viewer; region selection, rotation, mirroring and export coordinates retain their existing behavior.
+- Fix simultaneous window launches being mistaken for an update in progress on slower storage. Durable session writes no longer hold the launch gate; lifetime locks still prevent installation while a window is starting or open. Kernel-lock diagnostic metadata no longer requests an unnecessary disk flush.
 
 ## Platform alignment
 

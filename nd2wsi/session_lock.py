@@ -163,7 +163,9 @@ class SessionFileLock:
                 if written <= 0:
                     raise OSError("short write while recording lock metadata")
                 view = view[written:]
-            os.fsync(fd)
+            # Metadata is diagnostic, not recovery state. Kernel ownership
+            # ends with the descriptor/process, so a durable flush adds no
+            # safety and can serialize simultaneous launches on slow disks.
         except OSError:
             # The open descriptor and kernel lock are the authority. Diagnostics
             # must never turn a successfully held kernel lock into a failure.

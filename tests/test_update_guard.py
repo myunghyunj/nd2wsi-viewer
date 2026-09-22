@@ -3,6 +3,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -130,6 +132,43 @@ def test_failed_session_initialization_releases_liveness(tmp_path, monkeypatch):
         assert guard.acquire() is None
     finally:
         guard.release()
+
+
+def test_slow_session_write_allows_other_launches_but_blocks_install(tmp_path, monkeypatch):
+    from nd2wsi import window_sessions
+
+    owner = create_window_session('user', tmp_path)
+    writing = threading.Event()
+    finish_write = threading.Event()
+    real_write = window_sessions._atomic_json
+
+    def delayed_write(path, payload):
+        if payload.get('role') == 'agent':
+            writing.set()
+            assert finish_write.wait(10), 'test did not release the pending write'
+        real_write(path, payload)
+
+    monkeypatch.setattr(window_sessions, '_atomic_json', delayed_write)
+    guard = UpdateInstallGuard(owner, bundle_peers=lambda: [])
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(create_window_session, 'agent', tmp_path)
+        try:
+            assert writing.wait(5)
+            # A real lifetime lock protects the starting peer even before its
+            # JSON exists; neither a long sleep nor a larger timeout is needed.
+            assert 'other viewer windows' in guard.acquire()
+            peer = create_window_session('user', tmp_path)
+            peer.mark_closed()
+            assert 'other viewer windows' in guard.acquire()
+        finally:
+            finish_write.set()
+            guard.release()
+        pending.result(timeout=5).mark_closed()
+    try:
+        assert guard.acquire() is None
+    finally:
+        guard.release()
+        owner.mark_closed()
 
 
 @pytest.mark.parametrize('child', [False, True])
