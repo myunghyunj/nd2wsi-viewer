@@ -55,8 +55,10 @@ def inline_traffic_lights(window, *, logger: Callable[[str], None], resolve_nati
     make room (the ``native-chrome`` class). pywebview installs the
     WKWebView as the content view only after the first navigation, which
     can rebuild the frame, so the tweak re-runs on every ``loaded`` event
-    as well as on ``shown``. Purely cosmetic — on any failure the stock
-    title bar simply stays.
+    as well as on ``shown``. Full-screen gets ordinary content geometry
+    without the spacer toolbar: WebKit otherwise clips the top of the page
+    to the windowed title-bar inset even after AppKit hides its title bar.
+    Restore the inline chrome when the native transition finishes.
     """
 
     def apply(trigger):
@@ -71,27 +73,24 @@ def inline_traffic_lights(window, *, logger: Callable[[str], None], resolve_nati
                 ns = resolve_native_window(window)
                 if ns is None:
                     return
-                # the style-mask change rebuilds the title bar, wiping any
-                # appearance set before it — so the mask goes first
-                ns.setStyleMask_(
-                    ns.styleMask() | AppKit.NSWindowStyleMaskFullSizeContentView
-                )
+                mask = ns.styleMask()
+                fullscreen = bool(mask & AppKit.NSWindowStyleMaskFullScreen)
+                full_size = AppKit.NSWindowStyleMaskFullSizeContentView
+                target_mask = mask & ~full_size if fullscreen else mask | full_size
+                # A mask change rebuilds the title bar. Do it before styling,
+                # and only after the native full-screen transition completes.
+                if target_mask != mask:
+                    frame = ns.frame()
+                    ns.setStyleMask_(target_mask)
+                    # AppKit may resize the outer frame when this content
+                    # style changes. Do not shrink it on each enter/exit cycle.
+                    ns.setFrame_display_(frame, True)
                 ns.setTitlebarAppearsTransparent_(True)
                 ns.setTitleVisibility_(AppKit.NSWindowTitleHidden)
                 if hasattr(ns, "setTitlebarSeparatorStyle_"):
                     ns.setTitlebarSeparatorStyle_(
                         getattr(AppKit, "NSTitlebarSeparatorStyleNone", 1)
                     )
-
-                frame_view = ns.contentView().superview()
-                # the content view must truly span the frame: when the web
-                # view was installed before the mask changed, its frame
-                # still excludes the old title bar
-                content = ns.contentView()
-                content.setFrame_(frame_view.bounds())
-                content.setAutoresizingMask_(
-                    AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable
-                )
 
                 # an empty toolbar is how Chrome and Notion get their
                 # traffic lights vertically centered: it makes the title
@@ -102,10 +101,22 @@ def inline_traffic_lights(window, *, logger: Callable[[str], None], resolve_nati
                     )
                     bar.setShowsBaselineSeparator_(False)
                     ns.setToolbar_(bar)
+                ns.toolbar().setVisible_(not fullscreen)
                 if hasattr(ns, "setToolbarStyle_"):
                     ns.setToolbarStyle_(
                         getattr(AppKit, "NSWindowToolbarStyleUnifiedCompact", 4)
                     )
+
+                # Apply geometry after the toolbar, which also changes the
+                # content inset. Never carry the windowed inset into full-screen.
+                content = ns.contentView()
+                frame_view = content.superview()
+                content.setFrame_(ns.contentLayoutRect() if fullscreen else frame_view.bounds())
+                content.setAutoresizingMask_(
+                    AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable
+                )
+                if fullscreen:
+                    return
 
                 # pywebview's frameless mode hides the standard buttons;
                 # this app wants them, floating over the tab strip
@@ -147,6 +158,10 @@ def inline_traffic_lights(window, *, logger: Callable[[str], None], resolve_nati
 
     window.events.shown += lambda: apply("shown")
     window.events.loaded += lambda: apply("loaded")
+    # Cocoa's pywebview delegate emits these after native full-screen entry
+    # and exit. Read the actual mask: restored also fires after deminiaturizing.
+    window.events.maximized += lambda: apply("maximized")
+    window.events.restored += lambda: apply("restored")
 
 
 def wire_file_drop(window, *, logger: Callable[[str], None]):
