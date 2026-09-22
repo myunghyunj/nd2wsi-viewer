@@ -1,9 +1,9 @@
-> **macOS and Windows v2.1.8.** A maintenance refactor removes unused helpers and
-> shares viewer-launch setup without changing storage formats or viewing behavior.
-> Shared session startup also avoids false “update in progress” errors during simultaneous window starts on slow storage.
+> **macOS and Windows v2.1.9.** Slide tabs remain visible and usable in macOS
+> full-screen (the green window button), with the original window size restored
+> on exit. Windows retains its existing native window behavior.
 > RGB brightfield ND2 and SVS retain independent Red, Green and Blue ranges, gamma
 > and visibility in **Channels & LUTs**, with the light theme and original default colours.
-> [Release details](docs/release-notes-2.1.8.md). Compare offers **Link scale** for matching physical
+> [Release details](docs/release-notes-2.1.9.md). Compare offers **Link scale** for matching physical
 > magnification with independent movement, or **Link scale + frame** for linked
 > movement too. The LUT panel uses graph handles without Min/Max entry boxes.
 > **Scale bar + SVG** and **Scale bar + JPEG** remain available for region exports.
@@ -18,7 +18,7 @@
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.1.8 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.8/nd2wsi-viewer-2.1.8-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.1.9 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.9/nd2wsi-viewer-2.1.9-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -72,17 +72,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.1.8-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.8/nd2wsi-viewer-2.1.8-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.8/nd2wsi-viewer-2.1.8-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.1.9-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.9/nd2wsi-viewer-2.1.9-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.9/nd2wsi-viewer-2.1.9-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.1.8
+or GPU is required. This release provides a portable ZIP, not a v2.1.9
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.8) for the
+[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.9) for the
 exact source commit, archive checksums, and completed scientific and GUI
 verification on GitHub x64 and Windows 11 ARM64-emulation runners.
 Windows 10 Education and local Parallels were not tested for this release.
