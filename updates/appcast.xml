@@ -3,6 +3,19 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.1.10</title>
+            <pubDate>Wed, 30 Sep 2026 14:20:11 +0000</pubDate>
+            <sparkle:version>2.1.10</sparkle:version>
+            <sparkle:shortVersionString>2.1.10</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Readable light-mode action buttons</h2>
+<p>The annotation editor's Done button now has a blue background with white text in light appearance, including SVS viewing. The same correction applies to the ND2 export button.</p>
+<p>Dark appearance, annotation saving, image rendering and scientific exports are unchanged. Apple silicon, macOS 12 or later.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.10/nd2wsi-viewer-2.1.10-macos-arm64.dmg" sparkle:edSignature="CU3ebtbissK++Bdeg6BY8Ly9vjoNZtdpO6dEPJMhycnb4oOWRtPEI0a6Dn4EWjziNVL22mr0tm8ksfL8dB4dBg==" length="71338031" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.1.9</title>
             <pubDate>Tue, 22 Sep 2026 08:08:49 +0000</pubDate>
             <sparkle:version>2.1.9</sparkle:version>
