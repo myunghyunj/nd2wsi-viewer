@@ -206,8 +206,8 @@ button { font: inherit; color: inherit; }
 .rz { position: absolute; z-index: 5; touch-action: none; }
 .rz-n  { top: -8px; left: 18px; right: 18px; height: 14px; cursor: ns-resize; }
 .rz-s  { bottom: -8px; left: 18px; right: 18px; height: 14px; cursor: ns-resize; }
-.rz-e  { right: -8px; top: 18px; bottom: 18px; width: 14px; cursor: ew-resize; }
-.rz-w  { left: -8px; top: 18px; bottom: 18px; width: 14px; cursor: ew-resize; }
+.rz-e  { right: -8px; top: 8px; bottom: 8px; width: 14px; cursor: ew-resize; }
+.rz-w  { left: -8px; top: 8px; bottom: 8px; width: 14px; cursor: ew-resize; }
 .rz-ne { top: -8px; right: -8px; width: 26px; height: 26px; cursor: nesw-resize; }
 .rz-nw { top: -8px; left: -8px; width: 26px; height: 26px; cursor: nwse-resize; }
 .rz-se { bottom: -8px; right: -8px; width: 26px; height: 26px; cursor: nwse-resize; }
