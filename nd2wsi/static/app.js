@@ -3,6 +3,8 @@
 window.Nd2ShortcutRouter?.localizeLabels(document);
 
 const $ = (id) => document.getElementById(id);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const fmtInt = (v) => Math.round(v).toLocaleString("en-US");
 
 const state = {
   info: null,
@@ -4629,8 +4631,6 @@ function elementPoint(ev, el) {
   const r = el.getBoundingClientRect();
   return { x: ev.clientX - r.left, y: ev.clientY - r.top };
 }
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-const fmtInt = (v) => Math.round(v).toLocaleString("en-US");
 function fmtUm(um) {
   if (um >= 10000) return (um / 1000).toFixed(2) + " mm";
   if (um >= 100) return Math.round(um) + " µm";
