@@ -6,23 +6,29 @@ from pathlib import Path
 
 import pytest
 
-APP = Path(__file__).resolve().parents[1] / 'nd2wsi/static/app.js'
+CONTROLLER = Path(__file__).resolve().parents[1] / 'nd2wsi/static/plate-controller-v1.js'
 NODE = shutil.which('node')
 pytestmark = pytest.mark.skipif(NODE is None, reason='node is not installed')
 
 HARNESS = r"""
-const fs=require('fs'),vm=require('vm'),source=fs.readFileSync(process.argv[1],'utf8');
-const requests=[],timers=new Map(),events={};let next=1,focusLoads=0,renders=0;
-const pl={focusMap:null},state={plate:pl,info:{generation:'g1',plate:{Z:3}}};
-const nodes={'plate-cache-cell':{hidden:true,title:''},'plate-cache-val':{textContent:''}};
-const context={state,AbortController,$:id=>nodes[id],fmtInt:String,
-  renderTimeLine:()=>renders++,loadPlateFocus:()=>focusLoads++,
-  window:{addEventListener:(type,handler)=>events[type]=handler},
+const {createController}=require(process.argv[1]);
+const requests=[],focusRequests=[],timers=new Map(),events={};let next=1,focusLoads=0,renders=0;
+const pl={focusMap:null,t:0,z:0,auto:false,loaded:new Map()},state={plate:pl,info:{generation:'g1',plate:{Z:3,T:2,P:1}}};
+const nodes={};
+const $=id=>nodes[id]||(nodes[id]={hidden:true,title:'',textContent:'',style:{},
+  classList:{toggle(){}},setAttribute(){},querySelector(){return $('auto-label')}});
+Object.defineProperty($('t-read-frame'),'textContent',{set:()=>renders++});
+$('plate-cache-cell');$('plate-cache-val');
+const host={AbortController,addEventListener:(type,handler)=>events[type]=handler,
   setInterval:(fn,delay)=>{const id=next++;timers.set(id,fn);return id},clearInterval:id=>timers.delete(id),
-  fetch:(url,opts)=>new Promise((resolve,reject)=>requests.push({url,opts,reject,
-    resolve:data=>resolve({ok:true,json:()=>Promise.resolve(data)})}))};
-vm.createContext(context);
-vm.runInContext(source.slice(source.indexOf('function pollPlateStatus('),source.indexOf('function renderTimeLine(')),context);
+  fetch:(url,opts)=>new Promise((resolve,reject)=>{
+    const queue=url.endsWith('/focus')?focusRequests:requests;
+    if(queue===focusRequests)focusLoads++;
+    queue.push({url,opts,reject,resolve:data=>resolve({ok:true,json:()=>Promise.resolve(data)})});
+  })};
+const context=createController({state,$,fmtInt:String,fmtHm:String,fmtPeriodWords:String,
+  platePeriodMs:()=>null,currentFocusSummary:()=>({ready:0,total:1}),plateZFor:()=>pl.z,
+  platePlaneNote:()=>'',paintPlate:()=>renders++,plateFrameChanged:()=>renders++},host);
 const flush=async()=>{for(let i=0;i<12;i++)await Promise.resolve()};
 const tick=()=>[...timers.values()].forEach(fn=>fn());
 const status=(extra={})=>({path:null,format:null,total:6,done:0,perT:[0,0],building:false,writer:false,...extra});
@@ -32,7 +38,7 @@ const status=(extra={})=>({path:null,format:null,total:6,done:0,perT:[0,0],build
 
 def run(script):
     result = subprocess.run([NODE, '-e', HARNESS + script +
-                             "\n})().catch(e=>{console.error(e);process.exit(1)});", str(APP)],
+                             "\n})().catch(e=>{console.error(e);process.exit(1)});", str(CONTROLLER)],
                             check=True, capture_output=True, encoding='utf-8', timeout=20)
     return json.loads(result.stdout)
 
@@ -95,10 +101,8 @@ process.stdout.write(JSON.stringify({failed,requests:requests.length,timers:time
 def test_cancelled_focus_response_cannot_repaint_or_replace_the_focus_map():
     out = run(r"""
 state.info.plate.sites=[];
-context.renderPlateAuto=()=>renders++;context.renderZSlider=()=>renders++;
-vm.runInContext(source.slice(source.indexOf('function loadPlateFocus('),source.indexOf('function pollPlateStatus(')),context);
 context.loadPlateFocus();pl.focusRequest.abort();
-requests[0].resolve({best:[[2]],complete:[[true]],completeCount:1,total:1});await flush();
+focusRequests[0].resolve({best:[[2]],complete:[[true]],completeCount:1,total:1});await flush();
 process.stdout.write(JSON.stringify({renders,map:pl.focusMap,pending:!!pl.focusRequest}));
 """)
     assert out == {'renders': 0, 'map': None, 'pending': False}

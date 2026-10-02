@@ -160,7 +160,7 @@ def test_production_routes_share_one_guarded_slot_and_one_open_listener():
     assert "receiveCompareLifecycle(event.data);" in relay
     assert "...landmarkEnvelope()" in relay
     assert "if (!spatialPaneReady()) return; // grid" in relay
-    focus = app[app.index("function setPlateFocus(") : app.index("function setPlatePlaying(")]
+    focus = app[app.index("function setPlateFocus(") : app.index("const NATIVE_GESTURE_EXCLUSIONS")]
     assert focus.index("refreshSpatialContext();") < focus.index("loadAnnotations(next)")
     assert "postSpatialReadiness();" in focus
     shortcut = app[app.index('if (plain && letterCode === "KeyL"') :]

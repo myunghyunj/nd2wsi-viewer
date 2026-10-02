@@ -84,6 +84,7 @@ class Element {
  append(x){this.children.push(x);} replaceChildren(){this.children=[];}
  addEventListener(name,fn){this.events[name]=fn;} setAttribute(k,v){this.attrs[k]=v;}
  getBoundingClientRect(){return this.rect;}
+ querySelector(){return $("auto-label");}
 }
 const elements=new Map(), $=id=>{if(!elements.has(id))elements.set(id,new Element());return elements.get(id);};
 const document={createElement:()=>new Element()}, window={Nd2PlateUI:ui};
@@ -94,11 +95,12 @@ const state={info:{plate:{Z:6,zHome:2,zStepUm:2,bottomToTop:false,T:2,P:2,sites:
 function currentFocusSummary(){const p=state.plate,sites=p.focus===null?[0,1]:[p.focus];
  return ui.focusSummary(p.focusMap,p.t,sites,p.z,state.info.plate.Z,p.auto);}
 function plateZFor(p){return ui.displayedZ(state.plate.focusMap,state.plate.t,p,state.plate.z,state.info.plate.Z,state.plate.auto);}
-function renderPlateAuto(){} function paintPlate(){}
+function paintPlate(){}
 function plateFrameChanged(){selected.push({t:state.plate.t,p:state.plate.focus,z:state.plate.z});renderZSlider();}
 eval(part('plateZText','platePlaneNote'));
-eval(part('setPlateZ','setPlateAuto'));
-eval(part('zSliderPct','timeSpanMs'));
+const {buildZSlider,renderZSlider,setPlateZ,stepPlateZ} = require(process.argv[1]+'/plate-controller-v1.js').createController({
+ state,$,clamp,rawValueLabel,plateZFor,plateZText,currentFocusSummary,paintPlate,plateFrameChanged
+}, {document,localStorage,Nd2PlateUI:ui});
 $('z-track').rect={top:10,height:100}; buildZSlider();renderZSlider();
 function snapshot(){return {index:state.plate.z,top:$('z-knob').style.top,
  aria:$('z-knob').attrs['aria-valuenow'],accessible:$('z-knob').attrs['aria-valuetext'],

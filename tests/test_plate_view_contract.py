@@ -17,7 +17,7 @@ def test_well_headers_and_view_menu_are_loaded_and_wired():
     app = APP.read_text(encoding="utf-8")
     index = INDEX.read_text(encoding="utf-8")
 
-    assert index.index("plate-ui-v1.js") < index.index("app.js")
+    assert index.index("plate-ui-v1.js") < index.index("plate-controller-v1.js") < index.index("app.js")
     assert 'id="tb-plate-view"' in index
     assert 'id="plate-view-menu" role="menu"' in index
     assert 'role="menuitemcheckbox"' in index
@@ -46,9 +46,10 @@ def test_singleton_axes_default_hidden_and_cannot_start_useless_work():
 
     assert "timeline: Number(info.plate.T) > 1" in app
     assert "zAxis: Number(info.plate.Z) > 1" in app
-    assert 'pl.playing = state.info.plate.T > 1 && !!on' in app
-    assert '$("t-play").disabled = info.T <= 1' in app
-    assert "(!pl.auto && summary.ready === 0)" in app
+    controller = (APP.parent / "plate-controller-v1.js").read_text(encoding="utf-8")
+    assert "(!pl.auto && summary.ready === 0)" in controller
+    # Single-frame playback and disabled transport are exercised directly in
+    # test_plate_controller_js.py, independent of function placement.
     assert "if (info.Z > 1) loadPlateFocus();" in app
 
 
