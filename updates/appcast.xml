@@ -3,6 +3,17 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.1.11</title>
+            <pubDate>Fri, 02 Oct 2026 18:48:30 +0000</pubDate>
+            <sparkle:version>2.1.11</sparkle:version>
+            <sparkle:shortVersionString>2.1.11</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Automatic ND2 contrast</h2><ul><li>ND2 opens with automatic contrast and a fitted LUT graph, with reduced sensitivity to rare bright pixels.</li><li>Manual edits take priority; full-range histograms and native pixel values remain available. RGB Auto uses a shared window.</li><li>Plate time, Z, playback, autofocus and cache-status controls have a dedicated, directly tested controller.</li><li>Floating panels have reachable resize edges and a visible corner grip, with recovery after interrupted drags.</li></ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-macos-arm64.dmg" sparkle:edSignature="R23Wc6b5X/5iEUZMCrnvWZwYqmzOFqY4SbRzFqMJBG8rIGd/wTwzrmI8s74v4BrU6pSaD6hu6UBZeOIRSKtNBw==" length="73902429" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.1.10</title>
             <pubDate>Wed, 30 Sep 2026 14:20:11 +0000</pubDate>
             <sparkle:version>2.1.10</sparkle:version>

@@ -1,9 +1,11 @@
-> **macOS and Windows v2.1.10.** Light-mode primary buttons now have a readable
-> blue background with white text, including annotation **Done** and **ND2** export.
-> Dark appearance, annotation saving and scientific image/export behavior are unchanged.
-> RGB brightfield ND2 and SVS retain independent Red, Green and Blue ranges, gamma
-> and visibility in **Channels & LUTs**, with the light theme and original default colours.
-> [Release details](docs/release-notes-2.1.10.md). Compare offers **Link scale** for matching physical
+> **macOS and Windows v2.1.11.** ND2 opens with automatic contrast and a fitted LUT graph.
+> A robust bright limit reduces the influence of rare bright pixels; manual edits
+> and display handoffs take priority. Full-range inspection and raw pixel values remain available.
+> RGB Auto uses one shared window, with independent manual channel controls retained.
+> Floating panels have easier-to-grab resize edges and a visible corner grip.
+> Plate time and Z navigation, playback, autofocus and cache-status requests now
+> use a dedicated controller with direct regression tests.
+> [Release details](docs/release-notes-2.1.11.md). Compare offers **Link scale** for matching physical
 > magnification with independent movement, or **Link scale + frame** for linked
 > movement too. The LUT panel uses graph handles without Min/Max entry boxes.
 > **Scale bar + SVG** and **Scale bar + JPEG** remain available for region exports.
@@ -18,7 +20,7 @@
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.1.10 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.10/nd2wsi-viewer-2.1.10-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.1.11 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -72,17 +74,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.1.10-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.10/nd2wsi-viewer-2.1.10-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.10/nd2wsi-viewer-2.1.10-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.1.11-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.1.10
+or GPU is required. This release provides a portable ZIP, not a v2.1.11
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.10) for the
+[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.11) for the
 exact source commit, archive checksums, and completed scientific and GUI
 verification on GitHub x64 and Windows 11 ARM64-emulation runners.
 Windows 10 Education and local Parallels were not tested for this release.
@@ -132,7 +134,7 @@ Drop either one onto the app.
 
 ![Per-channel colors, brightness range, gamma, and histogram](docs/channels-panel.png)
 
-Every fluorescence channel has its own row in the Channels panel. Pick a color, turn the channel on or off, and drag the two triangles under the histogram to set the darkest and brightest values shown. By default, the histogram axis shows the full integer data range, such as 0 to 65,535 for uint16. Check **Auto-fit LUT range** to crop each channel's axis to its signal distribution; uncheck it to restore the full range. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. Its lower end sits on the background peak of the histogram, so the background goes black and the signal stands out. Hold Shift while dragging to move every channel together.
+Every fluorescence channel has its own row in the Channels panel. Pick a color, turn the channel on or off, and drag the two triangles under the histogram to set the darkest and brightest values shown. ND2 opens with automatic contrast and **Auto-fit LUT range** enabled, fitting each channel's axis to its signal distribution. Uncheck it to show the full integer data range, such as 0 to 65,535 for uint16. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. For typical fluorescence histograms, its lower end follows the background peak, while rare bright pixels have less influence on its upper end. This display adjustment preserves native pixel values. Hold Shift while dragging to move every channel together.
 
 A color brightfield slide such as an H&E opens with a light window, and a fluorescence scan opens with a dark one. You can switch either way with the appearance button.
 

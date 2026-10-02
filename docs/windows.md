@@ -1,23 +1,26 @@
 # Windows distribution
 
-## Current v2.1.10 download
+## Current v2.1.11 download
 
-Use the [v2.1.10 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.10/nd2wsi-viewer-2.1.10-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.10/nd2wsi-viewer-2.1.10-windows-x64.zip.sha256).
-See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.10)
+Use the [v2.1.11 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-windows-x64.zip.sha256).
+See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.11)
 for the exact source commit, artifact checksum, and completed Windows x64 /
 Windows 11 ARM64-emulation validation. Extract the whole ZIP and retain
-`_internal` beside the EXE. WebView2 is required. No 2.1.10 Setup installer is included.
+`_internal` beside the EXE. WebView2 is required. No 2.1.11 Setup installer is included.
 
-This release fixes light-mode primary button visibility on both platforms:
-annotation Done and ND2 export now have blue backgrounds with white labels.
-Dark appearance, annotation saving and scientific image/export behavior are unchanged.
+ND2 now opens with automatic contrast and a fitted LUT graph. The robust bright limit
+reduces sensitivity to rare bright pixels, while manual edits, full-range inspection
+and raw pixel values remain available. Floating panels have reachable resize edges
+and a visible corner grip. Plate controls also use a dedicated controller
+with direct tests for navigation, playback and stale-request cancellation.
 The macOS full-screen tab fix remains included; Windows retains its native title bar.
 The 2.1.8 maintenance
 refactor remains included, with no storage-format change or research-data migration.
 It retains the 2.1.7
 RGB brightfield ND2 and SVS controls: independent Red, Green and Blue ranges,
-gamma and visibility, with a light theme and unchanged default colours.
+gamma and visibility, with a light theme. RGB ND2 Auto uses a shared window across
+components; SVS retains its original default colours.
 Calibrated SVG/JPEG scale-bar exports and Arial-default SVG labels remain available.
 Shared session startup also avoids false “update in progress” errors during simultaneous window starts on slow storage.
 It also retains fractional LUT precision, Z-stack direction, checkbox and
@@ -58,8 +61,8 @@ emulation, not an ARM64-native binary.
 
 ## Installer build tooling
 
-The current source targets viewer 2.1.10, with a native Windows frame
-and Microsoft Edge WebView2. `nd2wsi-viewer-2.1.10-Setup.exe` is the expected installer
+The current source targets viewer 2.1.11, with a native Windows frame
+and Microsoft Edge WebView2. `nd2wsi-viewer-2.1.11-Setup.exe` is the expected installer
 name for that version. Setup installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
@@ -72,7 +75,7 @@ whole extracted folder together; the EXE depends on its `_internal` directory.
 Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
-v1.2.8 results below do not establish v2.1.10 Windows hardware verification.
+v1.2.8 results below do not establish v2.1.11 Windows hardware verification.
 The current release provides the portable ZIP described above.
 
 Target execution modes (the verified CI environments are listed above):
@@ -168,14 +171,14 @@ uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --
 ```
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.1.10-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.1.11-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.1.10-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.1.11-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks
