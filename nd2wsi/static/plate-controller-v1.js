@@ -16,7 +16,10 @@
       platePeriodMs, rawValueLabel, fmtTickLabel, fmtHm,
       fmtPeriodWords, fmtInt, paintPlate, plateFrameChanged,
     } = dependencies;
-    const { document, localStorage, AbortController, Nd2PlateUI: ui } = host;
+    const { document, AbortController, Nd2PlateUI: ui } = host;
+    // Storage access itself may throw in restricted browser contexts. Keep it
+    // inside the existing guarded writes instead of reading it during startup.
+    const localStorage = { setItem: (...args) => host.localStorage.setItem(...args) };
     const fetch = (...args) => host.fetch(...args);
     const setInterval = (...args) => host.setInterval(...args);
     const clearInterval = (...args) => host.clearInterval(...args);

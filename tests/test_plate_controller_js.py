@@ -55,3 +55,15 @@ control.setPlatePlaying(true);key('End');
 console.log(JSON.stringify({disabled:$('t-play').disabled,playing:state.plate.playing,timers:timers.size,t:state.plate.t}));
 """)
     assert out == {"disabled": True, "playing": False, "timers": 0, "t": 0}
+
+
+def test_unavailable_storage_does_not_prevent_startup_or_manual_z_handoff():
+    out = run(r"""
+Object.defineProperty(host,'localStorage',{get(){throw new Error('Storage denied')}});
+$('t-auto').querySelector=()=>$('auto-label');
+const guarded=createController({state,$,clamp:(v,a,b)=>Math.max(a,Math.min(b,v)),
+ currentFocusSummary:()=>({ready:1,total:1}),paintPlate(){},plateFrameChanged(){changes.push(state.plate.z)}},host);
+guarded.setPlateZ(2);
+console.log(JSON.stringify({z:state.plate.z,auto:state.plate.auto,changes}));
+""")
+    assert out == {"z": 2, "auto": False, "changes": [2]}
