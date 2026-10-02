@@ -86,6 +86,7 @@
     let vmax = rangeMax;
     let bins = null;
     let autoHistogram = null;
+    let autoWindow = null;
     let fullHistogram = null;
     let autoRange = !!initialAutoRange;
     let manualAxis = false;
@@ -379,13 +380,18 @@
         if (!valid(hg)) return false;
         fullHistogram = hg;
         autoHistogram = valid(hg.autoHistogram) ? hg.autoHistogram : hg;
+        const candidate = hg.autoWindow;
+        autoWindow = candidate && Number.isFinite(candidate.lo) && Number.isFinite(candidate.hi) &&
+          candidate.hi > candidate.lo ? { lo: candidate.lo, hi: candidate.hi } : null;
         rangeMin = hg.vmin;
         rangeMax = hg.vmax;
         updateAxis();
+        return true;
       },
       clearHistogram() {
         fullHistogram = null;
         autoHistogram = null;
+        autoWindow = null;
         updateAxis();
       },
       reset() {
@@ -393,7 +399,7 @@
       },
       auto() {
         const histogram = autoHistogram;
-        const window = histogram && autoWindowFromHistogram(histogram.bins, histogram.vmin, histogram.vmax, 0.70, discrete ? 1 : 0);
+        const window = autoWindow || (histogram && autoWindowFromHistogram(histogram.bins, histogram.vmin, histogram.vmax, 0.70, discrete ? 1 : 0));
         if (window) setLut({ ...window, gamma: cur.gamma });
       },
     };

@@ -45,6 +45,7 @@ from .cache import (
     source_base,
     source_tag,
 )
+from .contrast import auto_window
 from .direct import _Lifecycle, _parse_cyx_index, _Root, _TileCache
 from .plate_integrity import (
     DIGEST_ALGORITHM,
@@ -1631,15 +1632,7 @@ class PlateSource:
             if self.rgb:
                 start, end = 0.0, 255.0
             else:
-                ch = small[ci]
-                values = ch[np.isfinite(ch)] if np.issubdtype(ch.dtype, np.floating) else ch
-                if values.size:
-                    start = float(np.percentile(values, 0.5))
-                    end = float(np.percentile(values, 99.8))
-                    if end <= start:
-                        end = start + 1.0
-                else:
-                    start, end = 0.0, 1.0
+                start, end = auto_window(small[ci], dtype=self.dtype, background_mode=False)
             windows.append({"start": start, "end": end, "min": lo_all, "max": hi_all})
         return windows
 

@@ -25,6 +25,7 @@ from typing import Any
 
 import numpy as np
 
+from .contrast import auto_window
 from .platform_io import (
     filesystem_path,
     windows_allocation_block_bytes,
@@ -317,23 +318,10 @@ def _percentile_windows(
         lo_all, hi_all = 0.0, 1.0
     windows = []
     for ci in range(small.shape[0]):
-        ch = small[ci]
         if src.rgb:
             start, end = 0.0, 255.0
         else:
-            values = (
-                ch[np.isfinite(ch)]
-                if np.issubdtype(ch.dtype, np.floating)
-                else ch.ravel()
-            )
-            if values.size:
-                fallback = float(np.percentile(values, 1.0))
-                end = float(np.percentile(values, 99.8))
-                start = _background_mode_start(values, end, fallback)
-                if end <= start:
-                    end = start + 1.0
-            else:
-                start, end = 0.0, 1.0
+            start, end = auto_window(small[ci], dtype=src.dtype)
         windows.append({"start": start, "end": end, "min": lo_all, "max": hi_all})
     return windows
 

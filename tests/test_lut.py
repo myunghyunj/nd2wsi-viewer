@@ -111,7 +111,7 @@ def test_full_histogram_keeps_sparse_bright_values_in_their_actual_bins():
     assert histogram["bins"][195] == 1
     assert histogram["bins"][-1] == 1
     assert histogram["autoHistogram"]["vmax"] < 10000
-    assert sum(histogram["autoHistogram"]["bins"]) == data.size
+    assert sum(histogram["autoHistogram"]["bins"]) == data.size - 3
 
 
 def test_float_histogram_includes_extremes_and_stored_range_without_percentile_crop():

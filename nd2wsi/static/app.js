@@ -12,7 +12,8 @@ const state = {
   channels: [], // enabled channel indices
   luts: [], // per channel {lo, hi, gamma}; null while at store defaults
   lutWidgets: [], // canvas LUT widgets, aligned with luts
-  lutAutoRange: false, // opt-in histogram crop; never changes image contrast
+  lutAutoRange: false, // ND2 opens fitted; axis navigation never changes contrast
+  lutAutoPending: [], // one initial adjustment; manual edits always take priority
   roi: null, // {x, y, w, h} in level-0 pixels
   roiSite: null, // plate site that owns the ROI; null for WSI or no ROI
   roiOverlayEl: null, // projected SVG polygon in raw image coordinates
@@ -119,6 +120,7 @@ async function init() {
       state.initialViewHandoff = display;
     }
   }
+  initializeLutAuto();
   const LatestRequestGate = window.Nd2LatestRequest && window.Nd2LatestRequest.LatestRequestGate;
   if (!LatestRequestGate) throw new Error("latest-request helper did not load");
   state.pixel.requests = new LatestRequestGate();
@@ -189,6 +191,24 @@ async function init() {
   }
 }
 
+function initializeLutAuto() {
+  const nd2 = /\.nd2$/i.test(String(state.info.name || ""));
+  state.lutAutoRange = nd2;
+  state.lutAutoPending = state.info.channels.map((_, i) =>
+    nd2 && !state.initialViewHandoff && !state.luts[i]);
+}
+
+function acceptLutHistograms(channels) {
+  channels.forEach((histogram, i) => {
+    const widget = state.lutWidgets[i];
+    if (!widget || !widget.setHistogram(histogram)) return;
+    if (state.lutAutoPending[i]) {
+      state.lutAutoPending[i] = false;
+      widget.auto();
+    }
+  });
+}
+
 function createFrameRequests() {
   const shared = {
     readContext: activeFrameContext, matchesResponse: responseMatchesFrameContext,
@@ -200,7 +220,7 @@ function createFrameRequests() {
       ...shared, state: state.histogram, onClear: clearHistograms,
       onStatus(status) { setHistogramReady(status === "ready", false, status); },
       onHistograms(channels) {
-        channels.forEach((histogram, i) => state.lutWidgets[i]?.setHistogram(histogram));
+        acceptLutHistograms(channels);
       },
     }),
     pixels: window.Nd2FrameData.createPixelProbeController({
@@ -612,7 +632,7 @@ function buildChannelPanel() {
     const auto = document.createElement("button");
     auto.className = "lut-auto";
     auto.type = "button";
-    auto.title = "Auto-adjust window (background peak–99.9 percentile; bright-background fallback)";
+    auto.title = "Auto-adjust contrast with a robust bright limit; keep bright backgrounds and ignore zero padding";
     auto.textContent = "Auto";
     auto.addEventListener("click", (ev) => {
       ev.preventDefault();
@@ -721,6 +741,7 @@ function buildLutRow(i, ch, winLabel) {
     label: winLabel, width: state.windows.channels.bodyWidth(), document, window,
     protocolVersion: VIEWPORT_PROTOCOL_VERSION, inkColor, currentTheme, fmtInt,
     onChange(lut) {
+      if (state.lutAutoPending) state.lutAutoPending[i] = false;
       state.luts[i] = lut;
       applyLuts(); // shared cadence: one tile reload even for shift-drags
     },
