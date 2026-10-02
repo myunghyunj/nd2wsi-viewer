@@ -90,3 +90,21 @@ const p=isolated.createWindow(el,{key:'private',def:()=>({x:14,y:14,w:256,h:null
 p.open();p.fitContent();p.close();process.stdout.write(JSON.stringify({hidden:p.isHidden(),width:el.style.width,height:el.style.height}));
 """)
     assert out == {"hidden": True, "width": "256px", "height": ""}
+
+
+@pytest.mark.parametrize("end_event", ["pointercancel", "lostpointercapture"])
+def test_interrupted_resize_finishes_and_can_start_again(end_event):
+    out = run(r"""
+const p=panel({def:()=>({x:14,y:14,w:300,h:400})});
+const corner=p.el.children.find(n=>n.className==='rz rz-se');
+corner.handlers.pointerdown(event());corner.handlers.pointermove(event({clientX:50,clientY:60}));
+corner.handlers.END_EVENT();
+const ended={resizing:p.el.classList.contains('resizing'),rect:JSON.parse(values.get('nd2wsi.win.channels')).rect};
+corner.handlers.pointermove(event({clientX:200,clientY:200}));
+const frozen={w:p.el.style.width,h:p.el.style.height};
+corner.handlers.pointerdown(event());corner.handlers.pointermove(event({clientX:10,clientY:20}));corner.handlers.pointerup();
+process.stdout.write(JSON.stringify({ended,frozen,next:JSON.parse(values.get('nd2wsi.win.channels')).rect}));
+""".replace("END_EVENT", end_event))
+    assert out["ended"] == {"resizing": False, "rect": {"x": 14, "y": 14, "w": 350, "h": 460}}
+    assert out["frozen"] == {"w": "350px", "h": "460px"}
+    assert out["next"] == {"x": 14, "y": 14, "w": 360, "h": 480}

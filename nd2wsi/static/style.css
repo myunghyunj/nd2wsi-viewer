@@ -157,7 +157,7 @@ button { font: inherit; color: inherit; }
   -webkit-backdrop-filter: blur(28px) saturate(180%);
   backdrop-filter: blur(28px) saturate(180%);
   box-shadow: var(--window-shadow);
-  display: flex; flex-direction: column; overflow: hidden;
+  display: flex; flex-direction: column; overflow: visible;
   user-select: none; -webkit-user-select: none;
 }
 .mac-window.dragging, .mac-window.resizing { transition: none; }
@@ -196,18 +196,28 @@ button { font: inherit; color: inherit; }
 .tl-zoom::after  { content: "\002b"; }
 .traffic:hover .tl::after { opacity: 1; }
 
-.win-body { padding: 10px 12px 12px; overflow-y: auto; flex: 1; min-height: 0; }
+.win-body {
+  padding: 10px 12px 12px; overflow-y: auto; flex: 1; min-height: 0;
+  border-bottom-left-radius: inherit; border-bottom-right-radius: inherit;
+}
 
-/* resize handles (injected by JS) */
-.rz { position: absolute; z-index: 5; }
-.rz-n  { top: -3px; left: 8px; right: 8px; height: 7px; cursor: ns-resize; }
-.rz-s  { bottom: -3px; left: 8px; right: 8px; height: 7px; cursor: ns-resize; }
-.rz-e  { right: -3px; top: 8px; bottom: 8px; width: 7px; cursor: ew-resize; }
-.rz-w  { left: -3px; top: 8px; bottom: 8px; width: 7px; cursor: ew-resize; }
-.rz-ne { top: -3px; right: -3px; width: 12px; height: 12px; cursor: nesw-resize; }
-.rz-nw { top: -3px; left: -3px; width: 12px; height: 12px; cursor: nwse-resize; }
-.rz-se { bottom: -3px; right: -3px; width: 12px; height: 12px; cursor: nwse-resize; }
-.rz-sw { bottom: -3px; left: -3px; width: 12px; height: 12px; cursor: nesw-resize; }
+/* Keep hit areas outside the rounded material instead of clipping them to
+   a 4px strip. Content still clips and scrolls inside .win-body. */
+.rz { position: absolute; z-index: 5; touch-action: none; }
+.rz-n  { top: -8px; left: 18px; right: 18px; height: 14px; cursor: ns-resize; }
+.rz-s  { bottom: -8px; left: 18px; right: 18px; height: 14px; cursor: ns-resize; }
+.rz-e  { right: -8px; top: 18px; bottom: 18px; width: 14px; cursor: ew-resize; }
+.rz-w  { left: -8px; top: 18px; bottom: 18px; width: 14px; cursor: ew-resize; }
+.rz-ne { top: -8px; right: -8px; width: 26px; height: 26px; cursor: nesw-resize; }
+.rz-nw { top: -8px; left: -8px; width: 26px; height: 26px; cursor: nwse-resize; }
+.rz-se { bottom: -8px; right: -8px; width: 26px; height: 26px; cursor: nwse-resize; }
+.rz-sw { bottom: -8px; left: -8px; width: 26px; height: 26px; cursor: nesw-resize; }
+.rz-se::after {
+  content: ""; position: absolute; right: 11px; bottom: 11px;
+  width: 9px; height: 9px; pointer-events: none; opacity: 0.75;
+  background: repeating-linear-gradient(135deg, transparent 0 3px, var(--label-3) 3px 4px);
+  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+}
 .mac-window.collapsed .rz-n, .mac-window.collapsed .rz-s,
 .mac-window.collapsed .rz-ne, .mac-window.collapsed .rz-nw,
 .mac-window.collapsed .rz-se, .mac-window.collapsed .rz-sw { display: none; }

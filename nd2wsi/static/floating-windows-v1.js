@@ -136,11 +136,15 @@
           apply();
           if (opts.onResize) opts.onResize();
         });
-        h.addEventListener("pointerup", () => {
+        const finishResize = () => {
+          if (!from) return;
           from = null;
           el.classList.remove("resizing");
           persist();
-        });
+        };
+        h.addEventListener("pointerup", finishResize);
+        h.addEventListener("pointercancel", finishResize);
+        h.addEventListener("lostpointercapture", finishResize);
       }
 
       // -- traffic lights

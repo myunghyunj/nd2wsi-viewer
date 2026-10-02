@@ -4,6 +4,8 @@ ND2 images now open with automatic brightness/contrast and a fitted LUT graph. T
 
 Manual contrast edits and display handoffs take priority. Changing time or Z does not repeatedly reset contrast. Full-range histograms, native pixel values, raw exports and annotations remain available unchanged. Auto is a display aid, not artifact detection or a quantitative correction; bright detail above the automatic limit is clipped in the display and can be inspected by widening the window.
 
+Floating panels now have reachable resize edges and a visible corner grip. Resizing remains responsive after an interrupted drag.
+
 Plate time and Z navigation, playback, autofocus and cache-status requests now share a dedicated controller with direct regression tests. The refactor does not claim a performance improvement.
 
 The macOS download targets Apple silicon and uses an ad-hoc code signature plus signed Sparkle updates. It is not Developer ID notarized. The Windows download is an x64 portable build; Windows 11 ARM64 runs it through x64 emulation.
