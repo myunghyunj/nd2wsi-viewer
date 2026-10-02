@@ -411,12 +411,14 @@ def test_socket_worker_admission_does_not_spawn_unbounded_threads(tmp_path):
                 client = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
                 client.sendall(b"GET / HTTP/1.1\r\n")
                 clients.append(client)
-            connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
-            connection.request("GET", parsed.path + "metadata")
-            response = connection.getresponse()
-            assert response.status == 503
-            response.read()
-            connection.close()
+            # Admission rejects before reading a request. Read that rejection
+            # directly: sending headers into the already-closing socket can
+            # abort the connection on Windows before HTTPResponse sees 503.
+            with socket.create_connection((parsed.hostname, parsed.port), timeout=3) as overflow:
+                response = http.client.HTTPResponse(overflow)
+                response.begin()
+                assert response.status == 503
+                response.read()
             assert server.source.metrics()["rejected_requests"] >= 1
         finally:
             for client in clients:
