@@ -315,3 +315,121 @@ def test_app_close_guard_keeps_late_bound_diagnostics(monkeypatch):
     guard._notice("Save failed; window remains open")
     assert len(logs) == 1
     assert "closed renderer" in logs[0]
+
+
+@pytest.fixture
+def titlebar_drag(monkeypatch):
+    pending, logs = [], []
+    state = SimpleNamespace(buttons=1, now=100.0)
+    native = Mock(isVisible=lambda: True, attachedSheet=lambda: None, styleMask=lambda: 0)
+    other = Mock()
+    token = object()
+    events = SimpleNamespace(
+        pressedMouseButtons=lambda: state.buttons,
+        addLocalMonitorForEventsMatchingMask_handler_=Mock(return_value=token),
+        removeMonitor_=Mock(),
+    )
+    monkeypatch.setitem(sys.modules, "AppKit", SimpleNamespace(
+        NSEvent=events, NSEventTypeLeftMouseDown=1,
+        NSEventMaskLeftMouseDown=2, NSEventMaskLeftMouseUp=4,
+        NSWindowStyleMaskFullScreen=0x4000,
+    ))
+    monkeypatch.setitem(sys.modules, "Foundation", SimpleNamespace(
+        NSOperationQueue=SimpleNamespace(
+            mainQueue=lambda: SimpleNamespace(addOperationWithBlock_=pending.append)),
+    ))
+    window = SimpleNamespace(uid="agent", events=SimpleNamespace(**{
+        name: Event() for name in ("shown", "closed", "before_load")
+    }))
+    monkeypatch.setitem(sys.modules, "webview.platforms.cocoa", SimpleNamespace(
+        BrowserView=SimpleNamespace(instances={"agent": SimpleNamespace(window=native),
+                                              "user": SimpleNamespace(window=other)}),
+    ))
+    monkeypatch.setattr(window_chrome.time, "monotonic", lambda: state.now)
+    drag = window_chrome.NativeTitlebarDrag(window, logger=logs.append)
+
+    def emit(name):
+        handler, = getattr(window.events, name).handlers
+        handler()
+        pending.pop(0)()
+
+    emit("shown")
+    emit("shown")
+    events.addLocalMonitorForEventsMatchingMask_handler_.assert_called_once()
+    mask, monitor = events.addLocalMonitorForEventsMatchingMask_handler_.call_args.args
+    assert mask == 6
+    press = Mock(type=lambda: 1, window=lambda: native, clickCount=lambda: 1)
+    assert monitor(press) is press
+    return SimpleNamespace(**locals())
+
+
+def test_titlebar_drag_uses_original_owned_event_not_display_coordinates(titlebar_drag):
+    q = titlebar_drag
+    api = app.Api(None)
+    api._titlebar_drag = q.drag
+    assert api.start_window_drag() is True
+    q.native.performWindowDragWithEvent_.assert_not_called()
+    q.pending.pop(0)()
+    q.native.performWindowDragWithEvent_.assert_called_once_with(q.press)
+    q.native.setFrameOrigin_.assert_not_called()
+    q.native.setFrameTopLeftPoint_.assert_not_called()
+    q.other.assert_not_called()
+    assert q.other.mock_calls == []
+    # AppKit may consume mouse-up. A repeated bridge message cannot reuse it.
+    q.drag.request()
+    q.pending.pop(0)()
+    q.native.performWindowDragWithEvent_.assert_called_once()
+    assert q.logs == []
+
+
+@pytest.mark.parametrize("reason", ["released", "other-window", "late", "fullscreen",
+                                    "sheet", "hidden", "navigation", "closed"])
+def test_titlebar_drag_rejects_stale_or_ineligible_presses(titlebar_drag, reason):
+    q = titlebar_drag
+    q.drag.request()
+    if reason == "released":
+        q.state.buttons = 0
+    elif reason == "other-window":
+        q.monitor(Mock(type=lambda: 1, window=lambda: q.other))
+    elif reason == "late":
+        q.state.now += 1.1
+    elif reason == "fullscreen":
+        q.native.styleMask = lambda: 0x4000
+    elif reason == "sheet":
+        q.native.attachedSheet = lambda: object()
+    elif reason == "hidden":
+        q.native.isVisible = lambda: False
+    elif reason == "navigation":
+        q.drag._clear()
+    elif reason == "closed":
+        q.drag._remove()
+        q.events.removeMonitor_.assert_called_once_with(q.token)
+    q.pending.pop(0)()
+    q.native.performWindowDragWithEvent_.assert_not_called()
+    q.native.zoom_.assert_not_called()
+    assert q.logs == []
+
+
+def test_titlebar_mouse_up_cancels_queued_handoff(titlebar_drag):
+    q = titlebar_drag
+    q.drag.request()
+    release = Mock(type=lambda: 2, window=lambda: q.native)
+    assert q.monitor(release) is release
+    q.pending.pop(0)()
+    q.native.performWindowDragWithEvent_.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["zoom", "minimize", "none"])
+def test_titlebar_native_double_click_honors_system_setting(titlebar_drag, monkeypatch, action):
+    q = titlebar_drag
+    q.press.clickCount = lambda: 2
+    monkeypatch.setattr(window_chrome, "title_bar_double_click_action", lambda: action)
+    q.drag.request()
+    q.pending.pop(0)()
+    assert q.native.zoom_.call_count == (action == "zoom")
+    assert q.native.miniaturize_.call_count == (action == "minimize")
+    q.native.performWindowDragWithEvent_.assert_not_called()
+
+
+def test_titlebar_bridge_is_unavailable_without_owning_native_adapter():
+    assert app.Api(None).start_window_drag() is False

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from collections.abc import Callable
 
 
@@ -45,6 +46,108 @@ def title_bar_double_click_action() -> str:
     if value == "None":
         return "none"
     return "zoom"
+
+
+class NativeTitlebarDrag:
+    """Hand a shell title-bar press to AppKit, without screen-coordinate moves.
+
+    pywebview's DOM drag handler sends global WebKit screen coordinates to a
+    Cocoa move method which offsets them by the *initial* display's frame.
+    That mixes coordinate spaces on secondary/disconnected displays. Retain
+    the original, window-owned mouse-down instead and let Window Server track
+    the drag, including display boundaries and a release outside WebKit.
+    """
+
+    def __init__(self, window, *, logger: Callable[[str], None]):
+        self.window = window
+        self.logger = logger
+        self.native = None
+        self._token = None
+        self._monitor = None
+        self._press = None
+        self._pressed_at = 0.0
+        window.events.shown += lambda: self._schedule(self._install)
+        window.events.closed += lambda: self._schedule(self._remove)
+        window.events.before_load += lambda: self._schedule(self._clear)
+
+    def _schedule(self, operation):
+        try:
+            from Foundation import NSOperationQueue
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(operation)
+        except Exception as exc:
+            self.logger(f"native title-bar drag unavailable: {exc!r}")
+
+    def _clear(self):
+        self._press = None
+
+    def _install(self):
+        if self._token is not None:
+            return
+        try:
+            import AppKit
+            from webview.platforms.cocoa import BrowserView
+
+            # Never fall back to the first visible window: it may be a User
+            # window while this adapter belongs to a separate Agent window.
+            browser = BrowserView.instances.get(self.window.uid)
+            if browser is None:
+                return
+            self.native = browser.window
+
+            def monitor(event):
+                self._clear()
+                if (event.type() == AppKit.NSEventTypeLeftMouseDown
+                        and event.window() == self.native):
+                    self._press = event
+                    self._pressed_at = time.monotonic()
+                return event
+
+            self._monitor = monitor
+            self._token = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                AppKit.NSEventMaskLeftMouseDown | AppKit.NSEventMaskLeftMouseUp,
+                monitor,
+            )
+        except Exception as exc:
+            self.logger(f"native title-bar drag install failed: {exc!r}")
+
+    def _remove(self):
+        self._clear()
+        if self._token is not None:
+            import AppKit
+
+            AppKit.NSEvent.removeMonitor_(self._token)
+        self._token = self._monitor = self.native = None
+
+    def request(self) -> bool:
+        """Called only for a real left press on the shell's empty drag region."""
+        self._schedule(self._begin)
+        return True
+
+    def _begin(self):
+        try:
+            import AppKit
+
+            event, ns = self._press, self.native
+            self._clear()  # At most one handoff for the original mouse-down.
+            if (event is None or ns is None or event.window() != ns
+                    or time.monotonic() - self._pressed_at > 1.0
+                    or not (AppKit.NSEvent.pressedMouseButtons() & 1)
+                    or not ns.isVisible() or ns.attachedSheet() is not None
+                    or ns.styleMask() & AppKit.NSWindowStyleMaskFullScreen):
+                return
+            if event.clickCount() == 2:
+                # A native drag may consume mouse-up, so DOM dblclick is not
+                # reliable. Preserve the system title-bar double-click setting.
+                action = title_bar_double_click_action()
+                if action == "minimize":
+                    ns.miniaturize_(None)
+                elif action == "zoom":
+                    ns.zoom_(None)
+            elif event.clickCount() == 1:
+                ns.performWindowDragWithEvent_(event)
+        except Exception as exc:
+            self.logger(f"native title-bar drag failed: {exc!r}")
 
 
 def inline_traffic_lights(window, *, logger: Callable[[str], None], resolve_native_window=native_window):

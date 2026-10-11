@@ -74,6 +74,7 @@ def test_windows_preserves_native_window_controls_and_rejects_mshtml(fake_webvie
     assert result is window
     assert webview.create_window.call_args.kwargs["frameless"] is False
     assert webview.settings["ALLOW_DOWNLOADS"] is True
+    assert "DRAG_REGION_SELECTOR" not in webview.settings
     assert app._wire_file_drop.call_count == 1
     assert window.events.shown.handlers == []
     guard, = window.events.initialized.handlers

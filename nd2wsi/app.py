@@ -648,6 +648,11 @@ class Api:
         )
         return [str(p) for p in picked] if picked else None
 
+    def start_window_drag(self) -> bool:
+        """Hand the owning shell's mouse-down to native macOS window dragging."""
+        drag = getattr(self, "_titlebar_drag", None)
+        return drag.request() if drag is not None else False
+
     def title_bar_double_click(self) -> str:
         """The tab strip stands in for the title bar: double-clicking it zooms.
 
@@ -995,6 +1000,11 @@ def create_app_window(initial: Path | None, window_session=None):
         from .window_sessions import create_window_session
 
         window_session = create_window_session("user")
+    if sys.platform == "darwin":
+        # Cocoa's legacy DOM move handler mixes global mouse coordinates with
+        # the startup display's origin. Only the native handoff may move a Mac
+        # window; Windows keeps pywebview and its ordinary native title bar.
+        webview.settings["DRAG_REGION_SELECTOR"] = ":not(*)"
     api = Api(initial, window_session=window_session)
     title = APP_NAME
     if window_session is not None:
@@ -1029,6 +1039,7 @@ def create_app_window(initial: Path | None, window_session=None):
     _wire_file_drop(window)
     if sys.platform == "darwin":
         _inline_traffic_lights(window)
+        api._titlebar_drag = _window_chrome.NativeTitlebarDrag(window, logger=_dlog)
         _install_open_files_handler()
         window.events.shown += lambda: _install_window_menu(api, window)
         api._close_coordinator = WindowCloseCoordinator(api, window)

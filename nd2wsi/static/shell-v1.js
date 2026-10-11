@@ -227,11 +227,23 @@ function requestWindowZoom() {
 // closing a tab rebuilds the strip under the pointer, so the second click
 // of a double-click on a close button would otherwise count as bare.
 const bareStrip = (target) => target instanceof Element && target.classList.contains("pywebview-drag-region");
+const nativeWindowDrag = () => window.pywebview?.platform === "cocoa"
+  && typeof window.pywebview?.api?.start_window_drag === "function";
 let stripPresses = [];
 $("tabbar").addEventListener("pointerdown", (event) => {
   stripPresses = [...stripPresses.slice(-1), { at: event.timeStamp, bare: bareStrip(event.target) }];
 });
+$("tabbar").addEventListener("mousedown", (event) => {
+  if (!nativeWindowDrag() || !event.isTrusted || event.button !== 0 || !bareStrip(event.target)) return;
+  const recent = stripPresses.filter((press) => event.timeStamp - press.at < 1000);
+  // A close button can disappear under the pointer between the two presses.
+  // Do not reinterpret that second click as a title-bar double-click.
+  if (event.detail === 2 && recent.length === 2 && !recent.every((press) => press.bare)) return;
+  event.preventDefault();
+  Promise.resolve(window.pywebview.api.start_window_drag()).catch(() => {});
+});
 $("tabbar").addEventListener("dblclick", (event) => {
+  if (nativeWindowDrag()) return; // AppKit uses the original native click count.
   if (!bareStrip(event.target)) return;
   const recent = stripPresses.filter((press) => event.timeStamp - press.at < 1000);
   if (recent.length === 2 && !recent.every((press) => press.bare)) return;
