@@ -287,14 +287,17 @@ def test_gui_smoke_timeout_preserves_last_pending_phase(fake_webview, monkeypatc
     window.destroy.assert_called_once()
 
 
-def test_windows_lut_clipboard_api_uses_owning_window_not_first(fake_webview, monkeypatch):
+def test_windows_lut_clipboard_api_uses_real_pywebview_owner_not_first(monkeypatch):
     from nd2wsi import lut_clipboard
 
-    webview, owner = fake_webview
+    webview = pytest.importorskip("webview")
     api = app.Api(None)
-    owner.js_api = api
-    other = SimpleNamespace(js_api=app.Api(None))
-    webview.windows = [other, owner]
+    # Constructor only: no native GUI, renderer, server, or clipboard is opened.
+    owner = webview.Window("lut-owner", "LUT owner", None, js_api=api)
+    other = webview.Window("lut-other", "Other window", None, js_api=app.Api(None))
+    assert owner.native is None and owner.gui is None
+    monkeypatch.setattr(webview, "windows", [other, owner])
+    monkeypatch.setattr(app.sys, "platform", "win32")
     read = Mock(return_value={"ok": True, "text": "portable LUT"})
     write = Mock(return_value={"ok": True})
     monkeypatch.setattr(lut_clipboard, "read_lut_clipboard", read)
@@ -306,12 +309,15 @@ def test_windows_lut_clipboard_api_uses_owning_window_not_first(fake_webview, mo
 
 
 @pytest.mark.parametrize("count", [0, 2])
-def test_windows_lut_clipboard_api_rejects_missing_or_ambiguous_owner(fake_webview, monkeypatch, count):
+def test_windows_lut_clipboard_api_rejects_missing_or_ambiguous_real_owner(monkeypatch, count):
     from nd2wsi import lut_clipboard
 
-    webview, _ = fake_webview
+    webview = pytest.importorskip("webview")
     api = app.Api(None)
-    webview.windows = [SimpleNamespace(js_api=app.Api(None))] + [SimpleNamespace(js_api=api) for _ in range(count)]
+    other = webview.Window("lut-other", "Other window", None, js_api=app.Api(None))
+    owners = [webview.Window(f"lut-owner-{index}", "LUT owner", None, js_api=api) for index in range(count)]
+    monkeypatch.setattr(webview, "windows", [other, *owners])
+    monkeypatch.setattr(app.sys, "platform", "win32")
     read, write = Mock(), Mock()
     monkeypatch.setattr(lut_clipboard, "read_lut_clipboard", read)
     monkeypatch.setattr(lut_clipboard, "write_lut_clipboard", write)

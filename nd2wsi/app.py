@@ -679,7 +679,9 @@ class Api:
         """Resolve this bridge's one window, never another window's UI thread."""
         import webview
 
-        owners = [window for window in webview.windows if getattr(window, "js_api", None) is self]
+        # pywebview Window stores the constructor's js_api in _js_api.
+        # A real Window-construction regression test covers this dependency.
+        owners = [window for window in webview.windows if getattr(window, "_js_api", None) is self]
         if len(owners) != 1:
             raise RuntimeError("LUT clipboard requires exactly one window owned by this bridge")
         return owners[0]
