@@ -793,13 +793,105 @@ def _startup_error(message: str, *, show_dialog: bool = True) -> None:
             pass
 
 
+def _smoke_loopback_origin(url: str) -> str | None:
+    """Accept only the explicit IPv4 loopback origin used by our local server."""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port is None):
+            return None
+        return f"http://127.0.0.1:{parsed.port}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _smoke_windows_ui(window, callback, *, timeout: float = 5):
+    """Bounded dispatch to the exact pywebview WinForms window's UI thread."""
+    from System import Action
+
+    done, cancelled = threading.Event(), threading.Event()
+    outcome = {}
+
+    def invoke():
+        if cancelled.is_set():
+            return
+        try:
+            outcome["value"] = callback()
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    window.native.BeginInvoke(Action(invoke))
+    if not done.wait(timeout):
+        cancelled.set()  # Do not run a queued install after the smoke has failed.
+        raise TimeoutError("Windows GUI smoke UI dispatch timed out")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
+def _install_smoke_clipboard_permission(window, app_url: str):
+    """Grant only this disposable Windows smoke's origin a nonpersistent read."""
+    if sys.platform != "win32" or os.environ.get("ND2WSI_SMOKE_LUT_CLIPBOARD") != "1":
+        raise RuntimeError("Clipboard permission setup requires the explicit Windows smoke opt-in")
+    from Microsoft.Web.WebView2.Core import CoreWebView2PermissionKind, CoreWebView2PermissionState
+
+    origin = _smoke_loopback_origin(app_url)
+    if origin is None:
+        raise ValueError("Clipboard smoke requires the current app's explicit loopback origin")
+    evidence = {
+        "mode": "webview2-origin-scoped", "origin": origin, "permission": "ClipboardRead",
+        "persistent": False, "allowed_requests": 0, "ignored_requests": 0,
+        "attached": False, "removed": False,
+    }
+
+    def requested(_sender, args):
+        if (args.PermissionKind != CoreWebView2PermissionKind.ClipboardRead
+                or _smoke_loopback_origin(str(args.Uri)) != origin):
+            evidence["ignored_requests"] += 1
+            return  # Leave unrelated origins and permission kinds at their default.
+        try:
+            args.SavesInProfile = False
+            args.State = CoreWebView2PermissionState.Allow
+            evidence["allowed_requests"] += 1
+        except Exception as exc:
+            evidence["error"] = str(exc)
+
+    def attach():
+        core = window.native.browser.webview.CoreWebView2
+        if core is None:
+            return None  # WebView2 initialization has not completed yet.
+        core.PermissionRequested += requested
+        evidence["attached"] = True
+        return core
+
+    core = _smoke_windows_ui(window, attach)
+    if core is None:
+        return None
+
+    def remove():
+        def detach():
+            core.PermissionRequested -= requested
+            evidence["removed"] = True
+
+        _smoke_windows_ui(window, detach)
+
+    return evidence, remove
+
+
 def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 90) -> dict:
     """Exercise the real renderer, bridge and slide DOM, then close the app."""
     started = time.monotonic()
-    report = {"ok": False, "platform": sys.platform, "renderer": None}
+    report = {"ok": False, "platform": sys.platform, "renderer": None, "phase": "app-loading"}
     # The opt-in round trip replaces clipboard text. Enable only on disposable
     # Windows CI desktops, never during local macOS packaged verification.
     clipboard_check = sys.platform == "win32" and os.environ.get("ND2WSI_SMOKE_LUT_CLIPBOARD") == "1"
+    permission_cleanup = None
+    report["clipboard_permission"] = {"mode": "pending" if clipboard_check and expect_slide else "not-requested"}
     expected = getattr(api, "_requested_handoff", None)
     try:
         import webview
@@ -816,18 +908,29 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
         while time.monotonic() - started < timeout:
             if api._status.startswith("could not open"):
                 raise RuntimeError(api._status)
+            if clipboard_check and expect_slide and permission_cleanup is None:
+                report["phase"] = "clipboard-permission"
+                if api._httpd is not None:
+                    installed = _install_smoke_clipboard_permission(window, _server_url(api._httpd))
+                    if installed is not None:
+                        report["clipboard_permission"], permission_cleanup = installed
+                if permission_cleanup is None:
+                    time.sleep(0.05)
+                    continue
             result = None
             try:
                 result = window.evaluate_js("""(() => {
                   const api = window.pywebview && window.pywebview.api;
-                  if (!api || !api.update_status || document.readyState !== 'complete') return null;
+                  if (!api || !api.update_status || document.readyState !== 'complete')
+                    return {phase: 'app-bridge', document_ready: document.readyState};
                   if (!window.__nd2wsiSmokeBridge) {
                     window.__nd2wsiSmokeBridge = 'pending';
                     api.update_status().then(status => { window.__nd2wsiSmokeBridge = status; })
                       .catch(() => { window.__nd2wsiSmokeBridge = 'failed'; });
                   }
                   const bridge = window.__nd2wsiSmokeBridge;
-                  if (!bridge || typeof bridge !== 'object' || !bridge.version) return null;
+                  if (!bridge || typeof bridge !== 'object' || !bridge.version)
+                    return {phase: 'app-bridge', bridge_status: bridge || 'unavailable'};
                   const frame = document.querySelector('#frames iframe.active');
                   const page = frame && frame.contentDocument;
                   const canvas = page && page.querySelector('#stage canvas');
@@ -838,9 +941,17 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                     (plate && plate.complete && plate.naturalWidth > 0)));
                   if (slide && !frame.__nd2wsiSmokeLut) {
                     const view = frame.contentWindow;
-                    // Auto-LUT loading must settle before a same-values round trip.
-                    if (__CLIPBOARD_CHECK__ && view.eval('state.lutAutoPending.some(Boolean)')) return null;
-                    frame.__nd2wsiSmokeLut = {pending: true};
+                    const progress = frame.__nd2wsiSmokeLut = {pending: true, phase: 'lut-toolbar'};
+                    const step = async (phase, run, timeoutMs = 10000) => {
+                      progress.phase = phase;
+                      progress.step_timeout_ms = timeoutMs;
+                      let timer;
+                      try {
+                        return await Promise.race([Promise.resolve().then(run), new Promise((_, reject) => {
+                          timer = setTimeout(() => reject(new Error('LUT smoke ' + phase + ' timed out after ' + timeoutMs + ' ms')), timeoutMs);
+                        })]);
+                      } finally { clearTimeout(timer); }
+                    };
                     frame.__nd2wsiSmokeLutTask = (async () => {
                       const transfer = view.Nd2LutTransfer;
                       if (!transfer || ['encode', 'planPaste', 'fitsChannel'].some(name => typeof transfer[name] !== 'function'))
@@ -849,16 +960,24 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                       if (buttons.some(button => !button || typeof button.onclick !== 'function') ||
                           !page.getElementById('lut-dialog') || !page.getElementById('lut-copy-tooltip'))
                         throw new Error('Packaged LUT toolbar is not wired');
+                      // Auto-LUT loading must settle before a same-values round trip.
+                      if (__CLIPBOARD_CHECK__) await step('autolut', async () => {
+                        const deadline = Date.now() + 15000;
+                        while (view.eval('state.lutAutoPending.some(Boolean)')) {
+                          if (Date.now() >= deadline) throw new Error('LUT smoke autolut timed out after 15000 ms');
+                          await new Promise(resolve => setTimeout(resolve, 50));
+                        }
+                      }, 15000);
                       const assets = ['fluent-copy-20-regular.svg', 'fluent-clipboard-paste-20-regular.svg',
                         'fluent-checkmark-20-regular.svg'];
-                      await Promise.all(assets.map(async name => {
+                      await step('icons', () => Promise.all(assets.map(async name => {
                         const response = await view.fetch(new URL('../../static/icons/' + name, page.baseURI));
                         if (!response.ok) throw new Error('LUT icon ' + name + ': HTTP ' + response.status);
                         const svg = new view.DOMParser().parseFromString(await response.text(), 'image/svg+xml');
                         if (svg.documentElement.tagName !== 'svg' || svg.documentElement.getAttribute('viewBox') !== '0 0 20 20' ||
                             !svg.querySelector('path')) throw new Error('Invalid packaged LUT icon: ' + name);
-                      }));
-                      const outcome = {ok: true, module: true, handlers: true, icons: assets,
+                      })));
+                      const outcome = {ok: true, phase: 'complete', module: true, handlers: true, icons: assets,
                         clipboard_api: {write: typeof view.navigator.clipboard?.writeText === 'function',
                           read: typeof view.navigator.clipboard?.readText === 'function'}};
                       if (__CLIPBOARD_CHECK__) {
@@ -868,10 +987,10 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         if (!expected) throw new Error('LUT clipboard fixture has no uniquely named compatible channels');
                         const [, copy, paste] = buttons;
                         const toast = () => page.getElementById('toast')?.textContent || 'No result reported';
-                        await copy.onclick();
+                        await step('copy', () => copy.onclick());
                         if (copy.disabled || !copy.classList.contains('is-copied') || toast() !== 'Channel LUTs copied')
                           throw new Error('LUT clipboard copy failed: ' + toast());
-                        await paste.onclick();
+                        await step('paste', () => paste.onclick());
                         if (paste.disabled || !toast().startsWith('Pasted ' + expected + ' channel LUT'))
                           throw new Error('LUT clipboard paste failed: ' + toast());
                         if (current() !== before) throw new Error('LUT clipboard round trip changed effective channel values');
@@ -879,16 +998,21 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                       }
                       return outcome;
                     })().then(value => { frame.__nd2wsiSmokeLut = value; })
-                      .catch(error => { frame.__nd2wsiSmokeLut = {ok: false, error: error.message || String(error)}; });
+                      .catch(error => { frame.__nd2wsiSmokeLut = {ok: false, phase: progress.phase,
+                        error: error.message || String(error)}; });
                   }
                   const handoff = __HANDOFF_CHECK__ && frame?.contentWindow.nd2HandoffApplied === true;
                   return {bridge: true, version: bridge.version,
+                    phase: slide ? frame.__nd2wsiSmokeLut?.phase || 'lut-toolbar' : frame ? 'slide-render' : 'slide-load',
                     ...(__HANDOFF_CHECK__ ? {handoff_applied:handoff,
                       observed_display:handoff ? frame.contentWindow.nd2CaptureViewState() : null} : {}),
                     boot: !!document.getElementById('drop'),
                     slide, lut_toolbar: frame?.__nd2wsiSmokeLut || null};
                 })()""".replace("__HANDOFF_CHECK__", "true" if expected is not None else "false")
                     .replace("__CLIPBOARD_CHECK__", "true" if clipboard_check else "false"))
+                if result:
+                    report["last_result"] = result
+                    report["phase"] = result.get("phase", (result.get("lut_toolbar") or {}).get("phase", report["phase"]))
                 if result and result.get("bridge") and result.get("slide" if expect_slide else "boot"):
                     if expect_slide and (result.get("lut_toolbar") or {}).get("ok") is not True:
                         if (result.get("lut_toolbar") or {}).get("ok") is False:
@@ -906,16 +1030,21 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         report.update(result)
                         if not matches_view_state(expected, result.get("observed_display")):
                             raise ValueError("Actual browser display state differs from the requested handoff")
-                    report.update(result, ok=True)
+                    report.update(result, ok=True, phase="complete")
                     break
             except Exception as exc:
                 report["last_error"] = str(exc)
             time.sleep(0.25)
         else:
-            raise TimeoutError("GUI did not finish loading the app bridge, slide and LUT toolbar within 90 seconds")
+            raise TimeoutError(f"GUI did not finish within {timeout:g} seconds (last phase: {report['phase']})")
     except Exception as exc:
         report["error"] = str(exc)
     finally:
+        if permission_cleanup is not None:
+            try:
+                permission_cleanup()
+            except Exception as exc:
+                report.update(ok=False, error=f"Clipboard smoke permission cleanup failed: {exc}")
         report["elapsed_seconds"] = round(time.monotonic() - started, 2)
         # Set the result before destroy; the GUI's main loop can return at once.
         api._gui_smoke_report = report
