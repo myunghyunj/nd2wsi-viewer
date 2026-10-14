@@ -58,6 +58,10 @@ def test_main_thread_runs_without_queue_or_wait(native):
     _text([{"name": "x" * (128 * 1024)}]),
     _text([{"name": "한" * (64 * 1024)}]),
     "\ud800",
+], ids=[
+    "none", "empty", "plain-text", "empty-object", "array", "null",
+    "wrong-format", "wrong-channels", "too-many-channels", "too-large-ascii",
+    "too-large-multibyte", "invalid-surrogate",
 ])
 def test_invalid_write_never_touches_clipboard(native, text):
     assert lut_clipboard.write_lut_clipboard(text)["ok"] is False

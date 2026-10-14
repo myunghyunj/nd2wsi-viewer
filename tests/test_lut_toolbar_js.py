@@ -99,7 +99,7 @@ def run(body):
     result = subprocess.run(
         [NODE, "-e", HARNESS + "(async()=>{" + body +
          "})().then(result=>process.stdout.write(JSON.stringify(result))).catch(error=>{console.error(error);process.exitCode=1});", str(STATIC)],
-        check=True, capture_output=True, text=True, timeout=20,
+        check=True, capture_output=True, encoding="utf-8", timeout=20,
     )
     return json.loads(result.stdout)
 
