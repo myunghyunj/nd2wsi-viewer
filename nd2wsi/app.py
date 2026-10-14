@@ -653,6 +653,18 @@ class Api:
         drag = getattr(self, "_titlebar_drag", None)
         return drag.request() if drag is not None else False
 
+    def read_lut_clipboard(self) -> dict:
+        """Read compatible LUT settings from the system clipboard."""
+        from .lut_clipboard import read_lut_clipboard
+
+        return read_lut_clipboard()
+
+    def write_lut_clipboard(self, text: str) -> dict:
+        """Copy portable LUT settings for another independent viewer window."""
+        from .lut_clipboard import write_lut_clipboard
+
+        return write_lut_clipboard(text)
+
     def title_bar_double_click(self) -> str:
         """The tab strip stands in for the title bar: double-clicking it zooms.
 
@@ -785,6 +797,9 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
     """Exercise the real renderer, bridge and slide DOM, then close the app."""
     started = time.monotonic()
     report = {"ok": False, "platform": sys.platform, "renderer": None}
+    # The opt-in round trip replaces clipboard text. Enable only on disposable
+    # Windows CI desktops, never during local macOS packaged verification.
+    clipboard_check = sys.platform == "win32" and os.environ.get("ND2WSI_SMOKE_LUT_CLIPBOARD") == "1"
     expected = getattr(api, "_requested_handoff", None)
     try:
         import webview
@@ -801,6 +816,7 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
         while time.monotonic() - started < timeout:
             if api._status.startswith("could not open"):
                 raise RuntimeError(api._status)
+            result = None
             try:
                 result = window.evaluate_js("""(() => {
                   const api = window.pywebview && window.pywebview.api;
@@ -816,17 +832,71 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                   const page = frame && frame.contentDocument;
                   const canvas = page && page.querySelector('#stage canvas');
                   const plate = page && page.querySelector('#plate img');
+                  const slide = !!(frame && typeof readyFrames !== 'undefined' &&
+                    readyFrames.has(frame.dataset.sid) &&
+                    ((canvas && canvas.width > 0 && canvas.height > 0) ||
+                    (plate && plate.complete && plate.naturalWidth > 0)));
+                  if (slide && !frame.__nd2wsiSmokeLut) {
+                    const view = frame.contentWindow;
+                    // Auto-LUT loading must settle before a same-values round trip.
+                    if (__CLIPBOARD_CHECK__ && view.eval('state.lutAutoPending.some(Boolean)')) return null;
+                    frame.__nd2wsiSmokeLut = {pending: true};
+                    frame.__nd2wsiSmokeLutTask = (async () => {
+                      const transfer = view.Nd2LutTransfer;
+                      if (!transfer || ['encode', 'planPaste', 'fitsChannel'].some(name => typeof transfer[name] !== 'function'))
+                        throw new Error('Packaged LUT transfer module is unavailable');
+                      const buttons = ['lut-type', 'lut-copy', 'lut-paste'].map(id => page.getElementById(id));
+                      if (buttons.some(button => !button || typeof button.onclick !== 'function') ||
+                          !page.getElementById('lut-dialog') || !page.getElementById('lut-copy-tooltip'))
+                        throw new Error('Packaged LUT toolbar is not wired');
+                      const assets = ['fluent-copy-20-regular.svg', 'fluent-clipboard-paste-20-regular.svg',
+                        'fluent-checkmark-20-regular.svg'];
+                      await Promise.all(assets.map(async name => {
+                        const response = await view.fetch(new URL('../../static/icons/' + name, page.baseURI));
+                        if (!response.ok) throw new Error('LUT icon ' + name + ': HTTP ' + response.status);
+                        const svg = new view.DOMParser().parseFromString(await response.text(), 'image/svg+xml');
+                        if (svg.documentElement.tagName !== 'svg' || svg.documentElement.getAttribute('viewBox') !== '0 0 20 20' ||
+                            !svg.querySelector('path')) throw new Error('Invalid packaged LUT icon: ' + name);
+                      }));
+                      const outcome = {ok: true, module: true, handlers: true, icons: assets,
+                        clipboard_api: {write: typeof view.navigator.clipboard?.writeText === 'function',
+                          read: typeof view.navigator.clipboard?.readText === 'function'}};
+                      if (__CLIPBOARD_CHECK__) {
+                        const current = () => view.eval('window.Nd2LutTransfer.encode(state.info.channels, state.luts, state.info.dtype)');
+                        const before = current();
+                        const expected = view.eval('window.Nd2LutTransfer.planPaste(window.Nd2LutTransfer.encode(state.info.channels, state.luts, state.info.dtype), state.info.channels, state.info.dtype).updates.length');
+                        if (!expected) throw new Error('LUT clipboard fixture has no uniquely named compatible channels');
+                        const [, copy, paste] = buttons;
+                        const toast = () => page.getElementById('toast')?.textContent || 'No result reported';
+                        await copy.onclick();
+                        if (copy.disabled || !copy.classList.contains('is-copied') || toast() !== 'Channel LUTs copied')
+                          throw new Error('LUT clipboard copy failed: ' + toast());
+                        await paste.onclick();
+                        if (paste.disabled || !toast().startsWith('Pasted ' + expected + ' channel LUT'))
+                          throw new Error('LUT clipboard paste failed: ' + toast());
+                        if (current() !== before) throw new Error('LUT clipboard round trip changed effective channel values');
+                        outcome.clipboard_roundtrip = {ok: true, channels: expected, effective_values_unchanged: true};
+                      }
+                      return outcome;
+                    })().then(value => { frame.__nd2wsiSmokeLut = value; })
+                      .catch(error => { frame.__nd2wsiSmokeLut = {ok: false, error: error.message || String(error)}; });
+                  }
                   const handoff = __HANDOFF_CHECK__ && frame?.contentWindow.nd2HandoffApplied === true;
                   return {bridge: true, version: bridge.version,
                     ...(__HANDOFF_CHECK__ ? {handoff_applied:handoff,
                       observed_display:handoff ? frame.contentWindow.nd2CaptureViewState() : null} : {}),
                     boot: !!document.getElementById('drop'),
-                    slide: !!(frame && typeof readyFrames !== 'undefined' &&
-                      readyFrames.has(frame.dataset.sid) &&
-                      ((canvas && canvas.width > 0 && canvas.height > 0) ||
-                      (plate && plate.complete && plate.naturalWidth > 0)))};
-                })()""".replace("__HANDOFF_CHECK__", "true" if expected is not None else "false"))
+                    slide, lut_toolbar: frame?.__nd2wsiSmokeLut || null};
+                })()""".replace("__HANDOFF_CHECK__", "true" if expected is not None else "false")
+                    .replace("__CLIPBOARD_CHECK__", "true" if clipboard_check else "false"))
                 if result and result.get("bridge") and result.get("slide" if expect_slide else "boot"):
+                    if expect_slide and (result.get("lut_toolbar") or {}).get("ok") is not True:
+                        if (result.get("lut_toolbar") or {}).get("ok") is False:
+                            report.update(result)
+                            report["error"] = result["lut_toolbar"]["error"]
+                            break
+                        time.sleep(0.05)
+                        continue
                     if expected is not None:
                         from .view_state import matches_view_state
 
@@ -842,7 +912,7 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                 report["last_error"] = str(exc)
             time.sleep(0.25)
         else:
-            raise TimeoutError("GUI did not finish loading the app bridge and slide within 90 seconds")
+            raise TimeoutError("GUI did not finish loading the app bridge, slide and LUT toolbar within 90 seconds")
     except Exception as exc:
         report["error"] = str(exc)
     finally:

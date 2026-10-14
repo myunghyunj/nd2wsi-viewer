@@ -617,6 +617,7 @@ function buildChannelPanel() {
     state.lutAutoRange = rangeToggle.checked;
     state.lutWidgets.forEach((widget) => widget.setAutoRange(state.lutAutoRange));
   });
+  wireLutToolbar();
   info.channels.forEach((ch, i) => {
     const row = document.createElement("div");
     row.className = "channel-row";
@@ -671,6 +672,166 @@ function buildChannelPanel() {
   hint.className = "hint";
   hint.textContent = "Scroll to zoom · Drag to pan · Double-click for full range";
   list.append(hint);
+}
+
+function wireLutToolbar() {
+  const transfer = window.Nd2LutTransfer;
+  const dialog = $("lut-dialog");
+  const fields = $("lut-fields");
+  const error = $("lut-error");
+  let inputs = [];
+  $("lut-type").onclick = () => {
+    fields.replaceChildren();
+    error.textContent = "";
+    inputs = state.info.channels.map((channel, i) => {
+      const row = document.createElement("fieldset");
+      row.className = "lut-input-row";
+      const legend = document.createElement("legend");
+      legend.textContent = channel.label || "Channel " + i;
+      const values = document.createElement("div");
+      values.className = "lut-input-values";
+      const lut = transfer.currentLut(channel, state.luts[i]);
+      const entry = {};
+      for (const [key, caption] of [["lo", "Minimum"], ["hi", "Maximum"], ["gamma", "Gamma"]]) {
+        const label = document.createElement("label");
+        label.textContent = caption;
+        const input = document.createElement("input");
+        input.type = "number";
+        input.step = "any";
+        input.required = true;
+        input.value = String(lut[key]);
+        input.setAttribute("aria-label", `${legend.textContent} ${caption}`);
+        if (key === "gamma") { input.min = "0.25"; input.max = "4"; }
+        label.append(input);
+        values.append(label);
+        entry[key] = input;
+      }
+      row.append(legend, values);
+      fields.append(row);
+      return entry;
+    });
+    dialog.showModal();
+    inputs[0]?.lo.focus();
+  };
+  $("lut-cancel").onclick = () => dialog.close();
+  // Keyboard shortcuts belong to the editor until it closes.
+  dialog.addEventListener("keydown", (event) => event.stopPropagation());
+  $("lut-form").onsubmit = (event) => {
+    event.preventDefault();
+    const luts = inputs.map((entry) => Object.fromEntries(
+      Object.entries(entry).map(([key, input]) => [key, input.valueAsNumber])));
+    const invalid = luts.findIndex((lut, i) => !transfer.fitsChannel(state.info.channels[i], lut, state.info.dtype));
+    if (invalid !== -1) {
+      error.textContent = `${state.info.channels[invalid].label || "Channel " + invalid}: enter a finite minimum below maximum and gamma from 0.25 to 4. Integer ranges must span at least 1.`;
+      return;
+    }
+    luts.forEach((lut, i) => state.lutWidgets[i].setLut(lut));
+    applyLuts.flush();
+    dialog.close();
+    showToast("LUT values applied");
+  };
+  wireLutCopyFeedback();
+  $("lut-copy").onclick = () => runLutClipboard("copy");
+  $("lut-paste").onclick = () => runLutClipboard("paste");
+}
+
+function wireLutCopyFeedback() {
+  const button = $("lut-copy");
+  if (button.lutCopyFeedback) return;
+  const tooltip = $("lut-copy-tooltip");
+  let hovered = false, focused = false, copied = false, dismissed = false, disposed = false;
+  let timer = null;
+  const render = () => {
+    tooltip.textContent = copied ? "Copied!" : "Copy LUT to clipboard";
+    button.classList.toggle("is-copied", copied);
+    tooltip.hidden = disposed || dismissed || !(hovered || focused || copied);
+    if (tooltip.hidden) return;
+    const anchor = button.getBoundingClientRect();
+    const tip = tooltip.getBoundingClientRect();
+    const left = Math.max(8, Math.min(anchor.left + (anchor.width - tip.width) / 2,
+      window.innerWidth - tip.width - 8));
+    const top = anchor.top - tip.height - 8;
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${Math.max(8, Math.min(top >= 8 ? top : anchor.bottom + 8,
+      window.innerHeight - tip.height - 8))}px`;
+  };
+  const reset = () => {
+    clearTimeout(timer);
+    timer = null;
+    copied = false;
+    render();
+  };
+  button.lutCopyFeedback = {
+    reset,
+    succeed() {
+      if (disposed) return;
+      clearTimeout(timer);
+      copied = true;
+      dismissed = false;
+      render();
+      timer = setTimeout(reset, 1800);
+    },
+  };
+  button.addEventListener("pointerenter", () => { hovered = true; dismissed = false; render(); });
+  button.addEventListener("pointerleave", () => { hovered = false; render(); });
+  button.addEventListener("focus", () => { focused = true; dismissed = false; render(); });
+  button.addEventListener("blur", () => { focused = false; render(); });
+  const dismiss = (event) => {
+    if (event.key === "Escape") { dismissed = true; render(); }
+  };
+  document.addEventListener("keydown", dismiss, true);
+  window.addEventListener("resize", render);
+  window.addEventListener("scroll", render, true);
+  window.addEventListener("pagehide", () => {
+    disposed = true;
+    reset();
+    document.removeEventListener("keydown", dismiss, true);
+    window.removeEventListener("resize", render);
+    window.removeEventListener("scroll", render, true);
+  }, { once: true });
+}
+
+async function runLutClipboard(action) {
+  const button = $(action === "copy" ? "lut-copy" : "lut-paste");
+  const transfer = window.Nd2LutTransfer;
+  const info = state.info;
+  const native = window.parent?.pywebview?.platform === "cocoa" ? window.parent.pywebview.api : null;
+  button.disabled = true;
+  if (action === "copy") button.lutCopyFeedback.reset();
+  try {
+    if (action === "copy") {
+      const text = transfer.encode(info.channels, state.luts, info.dtype);
+      if (native?.write_lut_clipboard) {
+        const result = await native.write_lut_clipboard(text);
+        if (!result?.ok) throw new Error(result?.message || "Could not copy LUT");
+      } else {
+        await copyPlainText(text);
+      }
+      button.lutCopyFeedback.succeed();
+      showToast("Channel LUTs copied");
+    } else {
+      let text;
+      if (native?.read_lut_clipboard) {
+        const result = await native.read_lut_clipboard();
+        if (!result?.ok) throw new Error(result?.message || "Could not paste LUT");
+        text = result.text;
+      } else {
+        if (!navigator.clipboard?.readText) throw new Error("Clipboard reading is unavailable in this browser");
+        text = await navigator.clipboard.readText();
+      }
+      if (state.info !== info) return; // Do not apply a late read to a replaced slide.
+      const plan = transfer.planPaste(text, info.channels, info.dtype);
+      plan.updates.forEach(({ index, lut }) => state.lutWidgets[index].setLut(lut));
+      if (plan.updates.length) applyLuts.flush();
+      showToast(plan.updates.length
+        ? `Pasted ${plan.updates.length} channel LUT${plan.updates.length === 1 ? "" : "s"}${plan.skipped ? ` · ${plan.skipped} skipped` : ""}`
+        : "No compatible, uniquely named channels to paste");
+    }
+  } catch (error) {
+    showToast(error.message || "LUT clipboard unavailable");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 /* ---- per-channel LUT (NIS-style histogram + window/gamma curve) ------------

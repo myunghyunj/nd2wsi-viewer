@@ -19,6 +19,8 @@ jobs:
   build:
     runs-on: windows-2025
     timeout-minutes: 45
+    env:
+      ND2WSI_SMOKE_LUT_CLIPBOARD: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,6 +85,8 @@ jobs:
 
   verify:
     needs: build
+    env:
+      ND2WSI_SMOKE_LUT_CLIPBOARD: '1'
     strategy:
       fail-fast: false
       matrix:

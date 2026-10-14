@@ -1,0 +1,17 @@
+{
+  "source": "Microsoft Fluent UI System Icons",
+  "repository": "https://github.com/microsoft/fluentui-system-icons",
+  "retrieved": "2026-10-14",
+  "license": "MIT",
+  "license_file": "LICENSE-Fluent-Icons.txt",
+  "license_url": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/LICENSE",
+  "copyright": "Copyright (c) 2020 Microsoft Corporation",
+  "size_px": 20,
+  "style": "Regular",
+  "rendering": "Unmodified upstream SVGs used as monochrome CSS currentColor masks on both macOS and Windows",
+  "assets": {
+    "fluent-copy-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Copy/SVG/ic_fluent_copy_20_regular.svg",
+    "fluent-clipboard-paste-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Clipboard%20Paste/SVG/ic_fluent_clipboard_paste_20_regular.svg",
+    "fluent-checkmark-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Checkmark/SVG/ic_fluent_checkmark_20_regular.svg"
+  }
+}

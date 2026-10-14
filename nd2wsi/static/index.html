@@ -119,9 +119,14 @@
         <span class="win-title">Channels &amp; LUTs</span>
       </div>
       <div class="win-body">
-        <label class="lut-range-option" title="Fit each histogram axis to its signal distribution without changing image contrast">
-          <input type="checkbox" id="lut-auto-range"> Auto-fit LUT range
-        </label>
+        <div class="lut-toolbar">
+          <label class="lut-range-option" title="Fit each histogram axis to its signal distribution without changing image contrast">
+            <input type="checkbox" id="lut-auto-range"> Auto-fit
+          </label>
+          <button type="button" id="lut-type" class="btn lut-type" title="Enter channel minimum, maximum and gamma">Type LUT</button>
+          <button type="button" id="lut-copy" class="lut-icon lut-copy" aria-label="Copy LUT" aria-describedby="lut-copy-tooltip"><span class="lut-symbol lut-copy-symbol" data-symbol="copy" aria-hidden="true"></span></button>
+          <button type="button" id="lut-paste" class="lut-icon" aria-label="Paste LUT" title="Paste LUT values for matching channel names"><span class="lut-symbol lut-paste-symbol" data-symbol="clipboard-paste" aria-hidden="true"></span></button>
+        </div>
         <div id="channel-list"></div>
       </div>
     </section>
@@ -277,7 +282,21 @@
 <script src="../../static/spatial-pane-v1.js"></script>
 <script src="../../static/view-state-v1.js"></script>
 <script src="../../static/native-scope-v1.js"></script>
+<div id="lut-copy-tooltip" role="tooltip" hidden>Copy LUT to clipboard</div>
+<dialog id="lut-dialog" aria-labelledby="lut-dialog-title" aria-describedby="lut-dialog-help">
+  <form id="lut-form">
+    <h2 id="lut-dialog-title">Type LUT</h2>
+    <p id="lut-dialog-help">Set each channel’s display range and gamma. Image data is unchanged.</p>
+    <div id="lut-fields"></div>
+    <p id="lut-error" role="alert"></p>
+    <div class="lut-dialog-actions">
+      <button type="button" id="lut-cancel" class="btn">Cancel</button>
+      <button type="submit" class="btn primary">Apply</button>
+    </div>
+  </form>
+</dialog>
 <script src="../../static/lut-controls-v1.js"></script>
+<script src="../../static/lut-transfer-v1.js"></script>
 <script src="../../static/frame-data-v1.js"></script>
 <script src="../../static/floating-windows-v1.js"></script>
 <script src="../../static/plate-controller-v1.js"></script>

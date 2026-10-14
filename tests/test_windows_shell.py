@@ -3,6 +3,8 @@
 import io
 import json
 import runpy
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,8 @@ from unittest.mock import Mock
 import pytest
 
 from nd2wsi import app
+
+NODE = shutil.which("node")
 
 
 def test_windows_launcher_uses_utf8_with_inherited_legacy_streams(tmp_path, monkeypatch):
@@ -108,14 +112,129 @@ def test_gui_smoke_requires_slide_readiness_and_always_closes(fake_webview):
     api = app.Api(None)
     window.evaluate_js.side_effect = [
         {"bridge": True, "version": "test", "boot": True, "slide": False},
-        {"bridge": True, "version": "test", "boot": False, "slide": True},
+        {"bridge": True, "version": "test", "boot": False, "slide": True, "lut_toolbar": {"pending": True}},
+        {"bridge": True, "version": "test", "boot": False, "slide": True, "lut_toolbar": {"ok": True}},
     ]
     report = app.gui_smoke(api, window, expect_slide=True)
     assert report["ok"] is True and report["slide"] is True
     assert report["renderer"] == "edgechromium"
-    assert window.evaluate_js.call_count == 2
+    assert window.evaluate_js.call_count == 3
     window.destroy.assert_called_once()
     assert api._gui_smoke_report is report
+
+
+def test_gui_smoke_fails_promptly_on_lut_asset_or_clipboard_error(fake_webview):
+    _, window = fake_webview
+    window.evaluate_js.return_value = {
+        "bridge": True, "version": "test", "slide": True,
+        "lut_toolbar": {"ok": False, "error": "LUT clipboard paste failed: Read permission denied"},
+    }
+    report = app.gui_smoke(app.Api(None), window, expect_slide=True)
+    assert report["ok"] is False
+    assert report["error"] == "LUT clipboard paste failed: Read permission denied"
+    assert window.evaluate_js.call_count == 1
+    window.destroy.assert_called_once()
+
+
+@pytest.mark.parametrize("platform, opt_in, enabled", [
+    ("win32", "1", True), ("win32", "true", False), ("win32", "0", False), ("darwin", "1", False),
+])
+def test_clipboard_smoke_is_strictly_opt_in_and_never_runs_on_mac(fake_webview, monkeypatch, platform, opt_in, enabled):
+    _, window = fake_webview
+    monkeypatch.setattr(app.sys, "platform", platform)
+    monkeypatch.setenv("ND2WSI_SMOKE_LUT_CLIPBOARD", opt_in)
+    window.evaluate_js.return_value = {"bridge": True, "version": "test", "boot": True}
+    assert app.gui_smoke(app.Api(None), window)["ok"] is True
+    script = window.evaluate_js.call_args.args[0]
+    assert f"if ({str(enabled).lower()} && view.eval('state.lutAutoPending.some(Boolean)'))" in script
+    assert "__CLIPBOARD_CHECK__" not in script
+
+
+GUI_LUT_SCRIPT = r"""
+const fs=require('fs'),vm=require('vm');
+const {script,mode}=JSON.parse(fs.readFileSync(0,'utf8'));
+const fetches=[],calls={copy:0,paste:0};let toast='',copied=false,encoded='exact effective LUTs';
+const buttons={
+  'lut-type':{onclick(){}},
+  'lut-copy':{disabled:false,classList:{contains:()=>copied},async onclick(){
+    calls.copy++;copied=mode!=='copy-failure';toast=copied?'Channel LUTs copied':'Write permission denied';
+  }},
+  'lut-paste':{disabled:false,async onclick(){
+    calls.paste++;toast=mode==='paste-failure'?'Read permission denied':'Pasted 2 channel LUTs';
+    if(mode==='changed-values')encoded='changed LUTs';
+  }},
+  'lut-dialog':{},'lut-copy-tooltip':{},'toast':{get textContent(){return toast}},
+};
+if(mode==='missing-handler')delete buttons['lut-paste'].onclick;
+const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){},fitsChannel(){}},
+  navigator:{clipboard:{writeText(){},readText(){}}},
+  fetch:async url=>{fetches.push(String(url));return {ok:mode!=='missing-icon',status:404,text:async()=>mode==='invalid-icon'?'bad':'svg'}},
+  DOMParser:class{parseFromString(text){return {documentElement:{tagName:text==='svg'?'svg':'parsererror',getAttribute:()=> '0 0 20 20'},querySelector:()=>({})}}},
+  eval(expression){
+    if(expression==='state.lutAutoPending.some(Boolean)')return false;
+    if(expression.includes('planPaste'))return 2;
+    return encoded;
+  },
+};
+const page={baseURI:'http://viewer.test/private-token/s/test/',
+  querySelector:selector=>selector==='#stage canvas'?{width:100,height:100}:null,
+  getElementById:id=>buttons[id]};
+const frame={dataset:{sid:'test'},contentDocument:page,contentWindow:view};
+const context={window:{pywebview:{api:{update_status(){}}},__nd2wsiSmokeBridge:{version:'test'}},
+  document:{readyState:'complete',querySelector:()=>frame,getElementById:()=>null},readyFrames:new Set(['test']),URL};
+vm.createContext(context);
+(async()=>{
+  const first=vm.runInContext(script,context);
+  await frame.__nd2wsiSmokeLutTask;
+  const result=vm.runInContext(script,context);
+  process.stdout.write(JSON.stringify({first,result,fetches,calls}));
+})().catch(error=>{console.error(error);process.exitCode=1});
+"""
+
+
+@pytest.mark.parametrize("mode, clipboard, error", [
+    ("ready", False, None), ("ready", True, None),
+    ("missing-module", False, "transfer module is unavailable"),
+    ("missing-handler", False, "toolbar is not wired"),
+    ("missing-icon", False, "HTTP 404"), ("invalid-icon", False, "Invalid packaged LUT icon"),
+    ("copy-failure", True, "copy failed: Write permission denied"),
+    ("paste-failure", True, "paste failed: Read permission denied"),
+    ("changed-values", True, "changed effective channel values"),
+])
+def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(fake_webview, monkeypatch, mode, clipboard, error):
+    if NODE is None:
+        pytest.skip("node is not installed")
+    _, window = fake_webview
+    monkeypatch.setenv("ND2WSI_SMOKE_LUT_CLIPBOARD", "1" if clipboard else "0")
+    window.evaluate_js.return_value = {
+        "bridge": True, "version": "test", "slide": True, "lut_toolbar": {"ok": True},
+    }
+    assert app.gui_smoke(app.Api(None), window, expect_slide=True)["ok"] is True
+    script = window.evaluate_js.call_args.args[0]
+    result = subprocess.run(
+        [NODE, "-e", GUI_LUT_SCRIPT], input=json.dumps({"script": script, "mode": mode}),
+        check=True, capture_output=True, text=True, timeout=20,
+    )
+    out = json.loads(result.stdout)
+    assert out["first"]["lut_toolbar"] == {"pending": True}
+    result = out["result"]["lut_toolbar"]
+    if error:
+        assert result["ok"] is False and error in result["error"]
+    else:
+        assert result["ok"] is result["module"] is result["handlers"] is True
+        assert result["clipboard_api"] == {"write": True, "read": True}
+        assert out["fetches"] == [
+            "http://viewer.test/private-token/static/icons/" + name
+            for name in ["fluent-copy-20-regular.svg", "fluent-clipboard-paste-20-regular.svg",
+                         "fluent-checkmark-20-regular.svg"]
+        ]
+        if clipboard:
+            assert result["clipboard_roundtrip"] == {"ok": True, "channels": 2, "effective_values_unchanged": True}
+            assert out["calls"] == {"copy": 1, "paste": 1}
+        else:
+            assert "clipboard_roundtrip" not in result
+    if not clipboard:
+        assert out["calls"] == {"copy": 0, "paste": 0}
 
 
 def test_gui_smoke_timeout_is_a_failure_and_closes_the_window(fake_webview):
