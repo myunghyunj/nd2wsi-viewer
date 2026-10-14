@@ -1,13 +1,15 @@
-> **macOS and Windows v2.1.11.** ND2 opens with automatic contrast and a fitted LUT graph.
-> A robust bright limit reduces the influence of rare bright pixels; manual edits
-> and display handoffs take priority. Full-range inspection and raw pixel values remain available.
-> RGB Auto uses one shared window, with independent manual channel controls retained.
-> Floating panels have easier-to-grab resize edges and a visible corner grip.
-> Plate time and Z navigation, playback, autofocus and cache-status requests now
-> use a dedicated controller with direct regression tests.
-> [Release details](docs/release-notes-2.1.11.md). Compare offers **Link scale** for matching physical
+> **macOS and Windows v2.1.13.** Use the gold **Type LUT** button to enter each channel's
+> minimum, maximum and gamma. The histogram-axis checkbox is now **Auto-fit**.
+> Copy and paste LUTs between windows by unique channel name, regardless of channel order;
+> unmatched, duplicate, invalid or incompatible entries are skipped. Raw pixels, annotations,
+> channel colors and visibility stay unchanged.
+> Both platforms use borderless 16 px Fluent icons. Successful copying briefly shows a
+> green check and **Copied!**; the tooltip also supports keyboard focus.
+> macOS title-bar dragging uses the native Cocoa operation, including after display changes.
+> Windows keeps its native title bar.
+> [Release details](docs/release-notes-2.1.13.md). Compare offers **Link scale** for matching physical
 > magnification with independent movement, or **Link scale + frame** for linked
-> movement too. The LUT panel uses graph handles without Min/Max entry boxes.
+> movement too. Histogram handles remain available alongside numeric LUT entry.
 > **Scale bar + SVG** and **Scale bar + JPEG** remain available for region exports.
 > The standard viewer remains the default. On Apple silicon,
 > **Open in Metal** offers direct GPU display for compatible cached fluorescence
@@ -20,7 +22,7 @@
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.1.11 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.1.13 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.13/nd2wsi-viewer-2.1.13-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -74,17 +76,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.1.11-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.11/nd2wsi-viewer-2.1.11-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.1.13-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.13/nd2wsi-viewer-2.1.13-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.13/nd2wsi-viewer-2.1.13-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.1.11
+or GPU is required. This release provides a portable ZIP, not a v2.1.13
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.11) for the
+[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.13) for the
 exact source commit, archive checksums, and completed scientific and GUI
 verification on GitHub x64 and Windows 11 ARM64-emulation runners.
 Windows 10 Education and local Parallels were not tested for this release.
@@ -97,7 +99,7 @@ Windows uses its standard title bar and window buttons. Updates are installed
 manually from [Releases](https://github.com/myunghyunj/nd2wsi-viewer/releases);
 Windows does not use the macOS Sparkle updater.
 
-The app and Setup are not Authenticode-signed, so Windows may display an
+The Windows executable is not Authenticode-signed, so Windows may display an
 unknown-publisher warning. See [Windows distribution and verification](docs/windows.md)
 for requirements, tested behavior, and build instructions.
 
@@ -106,6 +108,9 @@ for requirements, tested behavior, and build instructions.
 1. Download the `macos-arm64.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. It runs on Apple silicon Macs.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
 3. Drop an `.nd2` or `.svs` file onto the window, or press `+` to browse.
+
+The macOS bundle is ad-hoc signed and uses signed Sparkle updates. This is not
+Developer ID signing or notarization.
 
 Version 1.2.1 is the first release that contains the updater, so it must be
 installed from the DMG once. After that, use the circular-arrow button in the
@@ -134,7 +139,9 @@ Drop either one onto the app.
 
 ![Per-channel colors, brightness range, gamma, and histogram](docs/channels-panel.png)
 
-Every fluorescence channel has its own row in the Channels panel. Pick a color, turn the channel on or off, and drag the two triangles under the histogram to set the darkest and brightest values shown. ND2 opens with automatic contrast and **Auto-fit LUT range** enabled, fitting each channel's axis to its signal distribution. Uncheck it to show the full integer data range, such as 0 to 65,535 for uint16. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. For typical fluorescence histograms, its lower end follows the background peak, while rare bright pixels have less influence on its upper end. This display adjustment preserves native pixel values. Hold Shift while dragging to move every channel together.
+Every fluorescence channel has its own row in the Channels panel. Pick a color, turn the channel on or off, and drag the two triangles under the histogram to set the darkest and brightest values shown. ND2 opens with automatic contrast and **Auto-fit** enabled, fitting each channel's axis to its signal distribution. Uncheck it to show the full integer data range, such as 0 to 65,535 for uint16. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. For typical fluorescence histograms, its lower end follows the background peak, while rare bright pixels have less influence on its upper end. This display adjustment preserves native pixel values. Hold Shift while dragging to move every channel together.
+
+For exact settings, choose **Type LUT** and enter each channel's minimum, maximum and gamma. Apply updates the channels together; invalid entries leave every channel unchanged, and Cancel discards the edits. Use **Copy LUT** and **Paste LUT** to reuse those settings in another window. Paste matches unique channel names regardless of order and skips unmatched, duplicate, invalid or incompatible entries. It does not copy colors or visibility and does not change raw pixels or annotations. The borderless 16 px copy icon briefly becomes a green check with **Copied!** after a successful copy.
 
 A color brightfield slide such as an H&E opens with a light window, and a fluorescence scan opens with a dark one. You can switch either way with the appearance button.
 
@@ -144,7 +151,7 @@ Move the cursor over the slide and the status bar shows the raw value of every c
 
 Press `⌘I` for Slide Info. It lists the pixel size and where it came from, the objective, the size of the scan, and the space the reduced copies take on disk. For an SVS it also shows the label and the macro photo stored inside the file.
 
-The window has no title bar of its own, so the tab strip and the toolbar take its place. Double-click either one to zoom the window, as you would a title bar, and double-click again to bring it back. The gesture follows the title bar setting in System Settings under Desktop & Dock.
+On macOS, the tab strip and toolbar take the place of a separate title bar. Drag their empty space to move the window using native Cocoa window dragging, including after a display configuration changes. Double-click either one to zoom the window, as you would a title bar, and double-click again to bring it back. The gesture follows the title bar setting in System Settings under Desktop & Dock. Windows retains its standard title bar and window buttons.
 
 The mark at the left of the toolbar names the kind of file in two words. 2D or 3D says whether the file holds a z stack, and SLIDE or PLATE says whether it holds one scan position or several. A stitched scan reads 2D SLIDE and the phage assay reads 3D PLATE.
 
