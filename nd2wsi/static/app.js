@@ -795,13 +795,16 @@ async function runLutClipboard(action) {
   const button = $(action === "copy" ? "lut-copy" : "lut-paste");
   const transfer = window.Nd2LutTransfer;
   const info = state.info;
-  const native = window.parent?.pywebview?.platform === "cocoa" ? window.parent.pywebview.api : null;
+  const host = window.parent?.pywebview;
+  const nativePlatform = ["cocoa", "edgechromium"].includes(host?.platform);
+  const native = nativePlatform ? host.api : null;
   button.disabled = true;
   if (action === "copy") button.lutCopyFeedback.reset();
   try {
     if (action === "copy") {
       const text = transfer.encode(info.channels, state.luts, info.dtype);
-      if (native?.write_lut_clipboard) {
+      if (nativePlatform) {
+        if (typeof native?.write_lut_clipboard !== "function") throw new Error("Native LUT clipboard writing is unavailable");
         const result = await native.write_lut_clipboard(text);
         if (!result?.ok) throw new Error(result?.message || "Could not copy LUT");
       } else {
@@ -811,7 +814,8 @@ async function runLutClipboard(action) {
       showToast("Channel LUTs copied");
     } else {
       let text;
-      if (native?.read_lut_clipboard) {
+      if (nativePlatform) {
+        if (typeof native?.read_lut_clipboard !== "function") throw new Error("Native LUT clipboard reading is unavailable");
         const result = await native.read_lut_clipboard();
         if (!result?.ok) throw new Error(result?.message || "Could not paste LUT");
         text = result.text;

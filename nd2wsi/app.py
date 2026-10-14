@@ -657,13 +657,32 @@ class Api:
         """Read compatible LUT settings from the system clipboard."""
         from .lut_clipboard import read_lut_clipboard
 
+        if sys.platform == "win32":
+            try:
+                return read_lut_clipboard(window=self._lut_clipboard_owner())
+            except RuntimeError as exc:
+                return {"ok": False, "message": str(exc)}
         return read_lut_clipboard()
 
     def write_lut_clipboard(self, text: str) -> dict:
         """Copy portable LUT settings for another independent viewer window."""
         from .lut_clipboard import write_lut_clipboard
 
+        if sys.platform == "win32":
+            try:
+                return write_lut_clipboard(text, window=self._lut_clipboard_owner())
+            except RuntimeError as exc:
+                return {"ok": False, "message": str(exc)}
         return write_lut_clipboard(text)
+
+    def _lut_clipboard_owner(self):
+        """Resolve this bridge's one window, never another window's UI thread."""
+        import webview
+
+        owners = [window for window in webview.windows if getattr(window, "js_api", None) is self]
+        if len(owners) != 1:
+            raise RuntimeError("LUT clipboard requires exactly one window owned by this bridge")
+        return owners[0]
 
     def title_bar_double_click(self) -> str:
         """The tab strip stands in for the title bar: double-clicking it zooms.
@@ -793,96 +812,6 @@ def _startup_error(message: str, *, show_dialog: bool = True) -> None:
             pass
 
 
-def _smoke_loopback_origin(url: str) -> str | None:
-    """Accept only the explicit IPv4 loopback origin used by our local server."""
-    from urllib.parse import urlsplit
-
-    try:
-        parsed = urlsplit(url)
-        if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
-                or parsed.username is not None or parsed.password is not None
-                or parsed.port is None):
-            return None
-        return f"http://127.0.0.1:{parsed.port}"
-    except (TypeError, ValueError):
-        return None
-
-
-def _smoke_windows_ui(window, callback, *, timeout: float = 5):
-    """Bounded dispatch to the exact pywebview WinForms window's UI thread."""
-    from System import Action
-
-    done, cancelled = threading.Event(), threading.Event()
-    outcome = {}
-
-    def invoke():
-        if cancelled.is_set():
-            return
-        try:
-            outcome["value"] = callback()
-        except Exception as exc:
-            outcome["error"] = exc
-        finally:
-            done.set()
-
-    window.native.BeginInvoke(Action(invoke))
-    if not done.wait(timeout):
-        cancelled.set()  # Do not run a queued install after the smoke has failed.
-        raise TimeoutError("Windows GUI smoke UI dispatch timed out")
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome.get("value")
-
-
-def _install_smoke_clipboard_permission(window, app_url: str):
-    """Grant only this disposable Windows smoke's origin a nonpersistent read."""
-    if sys.platform != "win32" or os.environ.get("ND2WSI_SMOKE_LUT_CLIPBOARD") != "1":
-        raise RuntimeError("Clipboard permission setup requires the explicit Windows smoke opt-in")
-    from Microsoft.Web.WebView2.Core import CoreWebView2PermissionKind, CoreWebView2PermissionState
-
-    origin = _smoke_loopback_origin(app_url)
-    if origin is None:
-        raise ValueError("Clipboard smoke requires the current app's explicit loopback origin")
-    evidence = {
-        "mode": "webview2-origin-scoped", "origin": origin, "permission": "ClipboardRead",
-        "persistent": False, "allowed_requests": 0, "ignored_requests": 0,
-        "attached": False, "removed": False,
-    }
-
-    def requested(_sender, args):
-        if (args.PermissionKind != CoreWebView2PermissionKind.ClipboardRead
-                or _smoke_loopback_origin(str(args.Uri)) != origin):
-            evidence["ignored_requests"] += 1
-            return  # Leave unrelated origins and permission kinds at their default.
-        try:
-            args.SavesInProfile = False
-            args.State = CoreWebView2PermissionState.Allow
-            evidence["allowed_requests"] += 1
-        except Exception as exc:
-            evidence["error"] = str(exc)
-
-    def attach():
-        core = window.native.browser.webview.CoreWebView2
-        if core is None:
-            return None  # WebView2 initialization has not completed yet.
-        core.PermissionRequested += requested
-        evidence["attached"] = True
-        return core
-
-    core = _smoke_windows_ui(window, attach)
-    if core is None:
-        return None
-
-    def remove():
-        def detach():
-            core.PermissionRequested -= requested
-            evidence["removed"] = True
-
-        _smoke_windows_ui(window, detach)
-
-    return evidence, remove
-
-
 def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 90) -> dict:
     """Exercise the real renderer, bridge and slide DOM, then close the app."""
     started = time.monotonic()
@@ -890,8 +819,6 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
     # The opt-in round trip replaces clipboard text. Enable only on disposable
     # Windows CI desktops, never during local macOS packaged verification.
     clipboard_check = sys.platform == "win32" and os.environ.get("ND2WSI_SMOKE_LUT_CLIPBOARD") == "1"
-    permission_cleanup = None
-    report["clipboard_permission"] = {"mode": "pending" if clipboard_check and expect_slide else "not-requested"}
     expected = getattr(api, "_requested_handoff", None)
     try:
         import webview
@@ -908,15 +835,6 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
         while time.monotonic() - started < timeout:
             if api._status.startswith("could not open"):
                 raise RuntimeError(api._status)
-            if clipboard_check and expect_slide and permission_cleanup is None:
-                report["phase"] = "clipboard-permission"
-                if api._httpd is not None:
-                    installed = _install_smoke_clipboard_permission(window, _server_url(api._httpd))
-                    if installed is not None:
-                        report["clipboard_permission"], permission_cleanup = installed
-                if permission_cleanup is None:
-                    time.sleep(0.05)
-                    continue
             result = None
             try:
                 result = window.evaluate_js("""(() => {
@@ -960,6 +878,15 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                       if (buttons.some(button => !button || typeof button.onclick !== 'function') ||
                           !page.getElementById('lut-dialog') || !page.getElementById('lut-copy-tooltip'))
                         throw new Error('Packaged LUT toolbar is not wired');
+                      if (__CLIPBOARD_CHECK__) {
+                        progress.phase = 'clipboard-transport';
+                        const native = view.parent?.pywebview;
+                        if (native?.platform !== 'edgechromium' ||
+                            typeof native.api?.write_lut_clipboard !== 'function' ||
+                            typeof native.api?.read_lut_clipboard !== 'function')
+                          throw new Error('Native Windows LUT clipboard bridge is unavailable');
+                        progress.clipboard_transport = 'native-winforms';
+                      }
                       // Auto-LUT loading must settle before a same-values round trip.
                       if (__CLIPBOARD_CHECK__) await step('autolut', async () => {
                         const deadline = Date.now() + 15000;
@@ -994,11 +921,12 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         if (paste.disabled || !toast().startsWith('Pasted ' + expected + ' channel LUT'))
                           throw new Error('LUT clipboard paste failed: ' + toast());
                         if (current() !== before) throw new Error('LUT clipboard round trip changed effective channel values');
-                        outcome.clipboard_roundtrip = {ok: true, channels: expected, effective_values_unchanged: true};
+                        outcome.clipboard_roundtrip = {ok: true, channels: expected, effective_values_unchanged: true,
+                          transport: progress.clipboard_transport};
                       }
                       return outcome;
                     })().then(value => { frame.__nd2wsiSmokeLut = value; })
-                      .catch(error => { frame.__nd2wsiSmokeLut = {ok: false, phase: progress.phase,
+                      .catch(error => { frame.__nd2wsiSmokeLut = {...progress, pending: false, ok: false,
                         error: error.message || String(error)}; });
                   }
                   const handoff = __HANDOFF_CHECK__ && frame?.contentWindow.nd2HandoffApplied === true;
@@ -1040,11 +968,6 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
     except Exception as exc:
         report["error"] = str(exc)
     finally:
-        if permission_cleanup is not None:
-            try:
-                permission_cleanup()
-            except Exception as exc:
-                report.update(ok=False, error=f"Clipboard smoke permission cleanup failed: {exc}")
         report["elapsed_seconds"] = round(time.monotonic() - started, 2)
         # Set the result before destroy; the GUI's main loop can return at once.
         api._gui_smoke_report = report

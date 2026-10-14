@@ -86,7 +86,7 @@ const snapshot=()=>JSON.stringify({info:state.info,luts:state.luts,enabled:state
 const submit=()=>nodes['lut-form'].onsubmit({preventDefault(){}});
 const payload=channels=>JSON.stringify({format:'nd2wsi-lut/1',dtype:'uint16',channels});
 const entry=(label,lo,hi,gamma=1)=>({label,lo,hi,gamma});
-const installNative=()=>window.parent.pywebview={platform:'cocoa',api:{
+const installNative=(platform='cocoa')=>window.parent.pywebview={platform,api:{
   write_lut_clipboard:async text=>{writes.push({transport:'native',text});return {ok:true}},
   read_lut_clipboard:async()=>{nativeReads++;return {ok:true,text:clipboardText}}
 }};
@@ -169,15 +169,16 @@ return {updates,flushes,open:nodes['lut-dialog'].open,toasts,
     assert out["enabled"] == [True, False, True]
 
 
-def test_native_copy_and_reordered_partial_paste_use_cocoa_bridge_and_preserve_unmatched():
+@pytest.mark.parametrize("platform", ["cocoa", "edgechromium"])
+def test_native_copy_and_reordered_partial_paste_use_native_bridge_and_preserve_unmatched(platform):
     out = run("""
-installNative();await nodes['lut-copy'].onclick();
+installNative(PLATFORM);await nodes['lut-copy'].onclick();
 clipboardText=payload([entry('DAPI',10,100,0.5),entry('OTHER',3,30),entry('CY5',20,200,2)]);
 await nodes['lut-paste'].onclick();
 return {writes:writes.map(write=>({...write,payload:JSON.parse(write.text),text:undefined})),
   nativeReads,browserReads,updates,flushes,luts:state.luts,enabled:state.enabled,auto:state.lutAutoRange,
   toasts,buttons:[nodes['lut-copy'].disabled,nodes['lut-paste'].disabled]};
-""")
+""".replace("PLATFORM", json.dumps(platform)))
     assert out["writes"] == [{"transport": "native", "payload": {
         "format": "nd2wsi-lut/1", "dtype": "uint16", "channels": [
             {"label": "CY5", "lo": 127.25, "hi": 4363.75, "gamma": 0.37},
@@ -196,7 +197,7 @@ return {writes:writes.map(write=>({...write,payload:JSON.parse(write.text),text:
     assert out["toasts"] == ["Channel LUTs copied", "Pasted 2 channel LUTs · 1 skipped"]
 
 
-def test_browser_clipboard_fallback_succeeds_without_cocoa_bridge():
+def test_browser_clipboard_fallback_succeeds_outside_supported_native_platforms():
     out = run("""
 installNative();window.parent.pywebview.platform='qt';
 await nodes['lut-copy'].onclick();
@@ -216,6 +217,7 @@ return {transports:writes.map(write=>write.transport),nativeReads,browserReads,u
     ("clipboardText=payload([entry('UNKNOWN',1,100)]);", "No compatible"),
     ("navigator.clipboard.readText=async()=>{throw new Error('Permission denied')};", "Permission denied"),
     ("installNative();window.parent.pywebview.api.read_lut_clipboard=async()=>({ok:false,message:'Native read failed'});", "Native read failed"),
+    ("installNative('edgechromium');window.parent.pywebview.api.read_lut_clipboard=async()=>({ok:false,message:'Native read failed'});", "Native read failed"),
 ])
 def test_unusable_clipboard_has_no_update_and_reenables_paste(setup, message):
     out = run(setup + """
@@ -227,13 +229,29 @@ return {unchanged:before===snapshot(),updates,flushes,disabled:nodes['lut-paste'
     assert len(out["toasts"]) == 1 and message in out["toasts"][0]
 
 
-def test_failed_native_copy_reports_failure_and_reenables_copy_without_browser_retry():
+@pytest.mark.parametrize("platform", ["cocoa", "edgechromium"])
+def test_failed_native_copy_reports_failure_and_reenables_copy_without_browser_retry(platform):
     out = run("""
-installNative();window.parent.pywebview.api.write_lut_clipboard=async()=>({ok:false,message:'Native write failed'});
+installNative(PLATFORM);window.parent.pywebview.api.write_lut_clipboard=async()=>({ok:false,message:'Native write failed'});
 await nodes['lut-copy'].onclick();
 return {writes,disabled:nodes['lut-copy'].disabled,toasts,updates,flushes};
-""")
+""".replace("PLATFORM", json.dumps(platform)))
     assert out == {"writes": [], "disabled": False, "toasts": ["Native write failed"], "updates": [], "flushes": 0}
+
+
+@pytest.mark.parametrize("action, method, message", [
+    ("copy", "write_lut_clipboard", "Native LUT clipboard writing is unavailable"),
+    ("paste", "read_lut_clipboard", "Native LUT clipboard reading is unavailable"),
+])
+def test_windows_missing_native_method_does_not_fall_back_to_browser(action, method, message):
+    out = run("""
+installNative('edgechromium');delete window.parent.pywebview.api[METHOD];
+const before=snapshot();await nodes['lut-'+ACTION].onclick();
+return {writes,nativeReads,browserReads,unchanged:before===snapshot(),updates,flushes,toasts,
+  disabled:nodes['lut-'+ACTION].disabled};
+""".replace("METHOD", json.dumps(method)).replace("ACTION", json.dumps(action)))
+    assert out == {"writes": [], "nativeReads": 0, "browserReads": 0, "unchanged": True,
+                   "updates": [], "flushes": 0, "toasts": [message], "disabled": False}
 
 
 def test_pending_paste_disables_button_and_ignores_read_after_slide_replacement():

@@ -1,8 +1,8 @@
 """Small, opt-in native clipboard bridge for portable channel LUT settings.
 
 Only a compatible LUT envelope is returned to the web view. Other clipboard
-content never leaves this module. AppKit is imported lazily so browser viewers
-and non-macOS builds can keep using their browser clipboard implementation.
+content never leaves this module. Native frameworks are imported lazily:
+AppKit on macOS, or the owning WinForms window's STA thread on Windows.
 """
 
 from __future__ import annotations
@@ -64,35 +64,91 @@ def _on_main_queue(operation: Callable[[], dict]) -> dict:
     return result["value"]
 
 
-def read_lut_clipboard() -> dict:
+def _on_windows_ui(operation: Callable[[], dict], window) -> dict:
+    """Dispatch only to the supplied viewer's live WinForms STA UI thread."""
+    native = getattr(window, "native", None)
+
+    def ready():
+        return (native is not None and getattr(native, "IsHandleCreated", False)
+                and not getattr(native, "IsDisposed", False)
+                and not getattr(native, "Disposing", False))
+
+    unavailable = {"ok": False, "message": "The viewer window is not ready for clipboard access."}
+    if not ready():
+        return unavailable
+
+    from System import Action
+
+    # InvokeRequired can be false before a handle exists as well as on its UI
+    # thread. The ready check above excludes the former; never create a handle
+    # or touch the clipboard from an arbitrary bridge worker thread.
+    if not native.InvokeRequired:
+        return operation()
+
+    finished = threading.Event()
+    cancelled = threading.Event()
+    result = {}
+
+    def run():
+        try:
+            if not cancelled.is_set():
+                result["value"] = operation() if ready() else unavailable
+        except Exception:
+            result["value"] = {
+                "ok": False, "message": "Could not access the system clipboard."
+            }
+        finally:
+            finished.set()
+
+    native.BeginInvoke(Action(run))
+    if not finished.wait(MAIN_QUEUE_TIMEOUT):
+        cancelled.set()
+        return {"ok": False, "message": "The system clipboard did not respond in time."}
+    return result["value"]
+
+
+def read_lut_clipboard(*, window=None) -> dict:
     """Read LUT text only; do not expose unrelated clipboard contents."""
-    if sys.platform != "darwin":
+    windows = sys.platform == "win32"
+    if sys.platform != "darwin" and not windows:
         return {"ok": False, "message": "Native LUT clipboard is unsupported on this platform."}
 
     def read():
-        import AppKit
+        if windows:
+            from System.Windows.Forms import Clipboard, TextDataFormat
 
-        text = AppKit.NSPasteboard.generalPasteboard().stringForType_(
-            AppKit.NSPasteboardTypeString
-        )
+            text = Clipboard.GetText(TextDataFormat.UnicodeText)
+        else:
+            import AppKit
+
+            text = AppKit.NSPasteboard.generalPasteboard().stringForType_(
+                AppKit.NSPasteboardTypeString
+            )
         if not _compatible_text(text):
             return {"ok": False, "message": "Clipboard does not contain compatible LUT settings."}
         return {"ok": True, "text": text}
 
     try:
-        return _on_main_queue(read)
+        return _on_windows_ui(read, window) if windows else _on_main_queue(read)
     except Exception:
         return {"ok": False, "message": "Could not access the system clipboard."}
 
 
-def write_lut_clipboard(text: str) -> dict:
+def write_lut_clipboard(text: str, *, window=None) -> dict:
     """Replace clipboard text only after validating the LUT format envelope."""
     if not _compatible_text(text):
         return {"ok": False, "message": "Copy needs compatible LUT settings."}
-    if sys.platform != "darwin":
+    windows = sys.platform == "win32"
+    if sys.platform != "darwin" and not windows:
         return {"ok": False, "message": "Native LUT clipboard is unsupported on this platform."}
 
     def write():
+        if windows:
+            from System.Windows.Forms import Clipboard, TextDataFormat
+
+            Clipboard.SetText(text, TextDataFormat.UnicodeText)
+            return {"ok": True}
+
         import AppKit
 
         clipboard = AppKit.NSPasteboard.generalPasteboard()
@@ -102,6 +158,6 @@ def write_lut_clipboard(text: str) -> dict:
         return {"ok": True}
 
     try:
-        return _on_main_queue(write)
+        return _on_windows_ui(write, window) if windows else _on_main_queue(write)
     except Exception:
         return {"ok": False, "message": "Could not access the system clipboard."}

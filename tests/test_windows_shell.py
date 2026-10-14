@@ -51,11 +51,6 @@ class Event:
         self.handlers.append(callback)
         return self
 
-    def __isub__(self, callback):
-        self.handlers.remove(callback)
-        return self
-
-
 @pytest.fixture()
 def fake_webview(monkeypatch):
     window = SimpleNamespace(
@@ -72,20 +67,6 @@ def fake_webview(monkeypatch):
     monkeypatch.delenv("ND2WSI_SMOKE_LUT_CLIPBOARD", raising=False)
     monkeypatch.setattr(app, "_wire_file_drop", Mock())
     return webview, window
-
-
-@pytest.fixture()
-def fake_smoke_permission(fake_webview, monkeypatch):
-    evidence = {"mode": "webview2-origin-scoped", "removed": False}
-
-    def cleanup():
-        evidence["removed"] = True
-
-    remove = Mock(side_effect=cleanup)
-    install = Mock(return_value=(evidence, remove))
-    monkeypatch.setattr(app, "_install_smoke_clipboard_permission", install)
-    monkeypatch.setattr(app, "_server_url", lambda _server: "http://127.0.0.1:50000/private-token/")
-    return install, remove, evidence
 
 
 def test_windows_preserves_native_window_controls_and_rejects_mshtml(fake_webview, monkeypatch):
@@ -188,6 +169,9 @@ const buttons={
 };
 if(mode==='missing-handler')delete buttons['lut-paste'].onclick;
 const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){},fitsChannel(){}},
+  parent:{pywebview:{platform:mode==='wrong-platform'?'cocoa':'edgechromium',api:{
+    write_lut_clipboard:mode==='missing-native-write'?null:()=>{},
+    read_lut_clipboard:mode==='missing-native-read'?null:()=>{}}}},
   navigator:{clipboard:{writeText(){},readText(){}}},
   fetch:async url=>{fetches.push(String(url));if(mode==='icons-timeout')return new Promise(()=>{});
     return {ok:mode!=='missing-icon',status:404,text:async()=>mode==='invalid-icon'?'bad':'svg'}},
@@ -225,13 +209,16 @@ vm.createContext(context);
     ("copy-failure", True, "copy failed: Write permission denied"),
     ("paste-failure", True, "paste failed: Read permission denied"),
     ("changed-values", True, "changed effective channel values"),
+    ("wrong-platform", True, "Native Windows LUT clipboard bridge is unavailable"),
+    ("missing-native-write", True, "Native Windows LUT clipboard bridge is unavailable"),
+    ("missing-native-read", True, "Native Windows LUT clipboard bridge is unavailable"),
     ("autolut-timeout", True, "autolut timed out"),
     ("icons-timeout", False, "icons timed out"),
     ("copy-timeout", True, "copy timed out"),
     ("paste-timeout", True, "paste timed out"),
 ])
 def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
-        fake_webview, fake_smoke_permission, monkeypatch, mode, clipboard, error):
+        fake_webview, monkeypatch, mode, clipboard, error):
     if NODE is None:
         pytest.skip("node is not installed")
     _, window = fake_webview
@@ -240,10 +227,7 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
         "bridge": True, "version": "test", "slide": True, "lut_toolbar": {"ok": True},
     }
     api = app.Api(None)
-    api._httpd = object()
     assert app.gui_smoke(api, window, expect_slide=True)["ok"] is True
-    install, remove, _ = fake_smoke_permission
-    assert install.call_count == remove.call_count == int(clipboard)
     script = window.evaluate_js.call_args.args[0]
     result = subprocess.run(
         [NODE, "-e", GUI_LUT_SCRIPT], input=json.dumps({"script": script, "mode": mode}),
@@ -257,6 +241,9 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
         assert result["ok"] is False and error in result["error"]
         if mode.endswith("-timeout"):
             assert result["phase"] == mode.removesuffix("-timeout")
+        if mode in {"wrong-platform", "missing-native-write", "missing-native-read"}:
+            assert result["phase"] == "clipboard-transport"
+            assert out["calls"] == {"copy": 0, "paste": 0}
     else:
         assert result["ok"] is result["module"] is result["handlers"] is True
         assert result["phase"] == "complete"
@@ -267,7 +254,9 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
                          "fluent-checkmark-20-regular.svg"]
         ]
         if clipboard:
-            assert result["clipboard_roundtrip"] == {"ok": True, "channels": 2, "effective_values_unchanged": True}
+            assert result["clipboard_roundtrip"] == {
+                "ok": True, "channels": 2, "effective_values_unchanged": True, "transport": "native-winforms",
+            }
             assert out["calls"] == {"copy": 1, "paste": 1}
         else:
             assert "clipboard_roundtrip" not in result
@@ -298,87 +287,52 @@ def test_gui_smoke_timeout_preserves_last_pending_phase(fake_webview, monkeypatc
     window.destroy.assert_called_once()
 
 
-@pytest.mark.parametrize("success", [True, False])
-def test_gui_smoke_cleans_up_clipboard_permission_on_success_or_failure(
-        fake_webview, fake_smoke_permission, monkeypatch, success):
-    _, window = fake_webview
-    monkeypatch.setenv("ND2WSI_SMOKE_LUT_CLIPBOARD", "1")
+def test_windows_lut_clipboard_api_uses_owning_window_not_first(fake_webview, monkeypatch):
+    from nd2wsi import lut_clipboard
+
+    webview, owner = fake_webview
     api = app.Api(None)
-    api._httpd = object()
-    window.evaluate_js.return_value = {
-        "bridge": True, "slide": True, "phase": "paste",
-        "lut_toolbar": {"ok": success, "error": "test clipboard failure"},
-    }
-    report = app.gui_smoke(api, window, expect_slide=True)
-    install, remove, evidence = fake_smoke_permission
-    assert report["ok"] is success
-    install.assert_called_once_with(window, "http://127.0.0.1:50000/private-token/")
-    remove.assert_called_once()
-    assert report["clipboard_permission"] is evidence and evidence["removed"] is True
-    window.destroy.assert_called_once()
+    owner.js_api = api
+    other = SimpleNamespace(js_api=app.Api(None))
+    webview.windows = [other, owner]
+    read = Mock(return_value={"ok": True, "text": "portable LUT"})
+    write = Mock(return_value={"ok": True})
+    monkeypatch.setattr(lut_clipboard, "read_lut_clipboard", read)
+    monkeypatch.setattr(lut_clipboard, "write_lut_clipboard", write)
+    assert api.read_lut_clipboard() == read.return_value
+    assert api.write_lut_clipboard("portable LUT") == write.return_value
+    read.assert_called_once_with(window=owner)
+    write.assert_called_once_with("portable LUT", window=owner)
 
 
-@pytest.mark.parametrize("url, expected", [
-    ("http://127.0.0.1:50000/private-token/", "http://127.0.0.1:50000"),
-    ("http://127.0.0.1:50001/", "http://127.0.0.1:50001"),
-    ("https://127.0.0.1:50000/", None), ("http://localhost:50000/", None),
-    ("http://127.0.0.1.evil.test:50000/", None), ("http://127.0.0.1/", None),
-    ("http://user@127.0.0.1:50000/", None), ("http://127.0.0.1:99999/", None),
-])
-def test_smoke_permission_origin_is_explicit_loopback_only(url, expected):
-    assert app._smoke_loopback_origin(url) == expected
+@pytest.mark.parametrize("count", [0, 2])
+def test_windows_lut_clipboard_api_rejects_missing_or_ambiguous_owner(fake_webview, monkeypatch, count):
+    from nd2wsi import lut_clipboard
+
+    webview, _ = fake_webview
+    api = app.Api(None)
+    webview.windows = [SimpleNamespace(js_api=app.Api(None))] + [SimpleNamespace(js_api=api) for _ in range(count)]
+    read, write = Mock(), Mock()
+    monkeypatch.setattr(lut_clipboard, "read_lut_clipboard", read)
+    monkeypatch.setattr(lut_clipboard, "write_lut_clipboard", write)
+    for result in [api.read_lut_clipboard(), api.write_lut_clipboard("portable LUT")]:
+        assert result["ok"] is False and "exactly one window" in result["message"]
+    read.assert_not_called()
+    write.assert_not_called()
 
 
-def test_smoke_native_permission_filters_origin_and_kind_and_removes_handler(fake_webview, monkeypatch):
-    _, window = fake_webview
-    monkeypatch.setenv("ND2WSI_SMOKE_LUT_CLIPBOARD", "1")
-    core = SimpleNamespace(PermissionRequested=Event())
-    window.native = SimpleNamespace(
-        browser=SimpleNamespace(webview=SimpleNamespace(CoreWebView2=core)),
-        BeginInvoke=Mock(side_effect=lambda callback: callback()),
-    )
-    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda callback: callback))
-    monkeypatch.setitem(sys.modules, "Microsoft.Web.WebView2.Core", SimpleNamespace(
-        CoreWebView2PermissionKind=SimpleNamespace(ClipboardRead="read"),
-        CoreWebView2PermissionState=SimpleNamespace(Allow="allow"),
-    ))
-    evidence, cleanup = app._install_smoke_clipboard_permission(window, "http://127.0.0.1:50000/token/")
-    handler, = core.PermissionRequested.handlers
-    for uri, kind, allowed in [
-        ("http://127.0.0.1:50000/token/s/test/", "read", True),
-        ("http://127.0.0.1:50001/token/", "read", False),
-        ("http://localhost:50000/token/", "read", False),
-        ("https://127.0.0.1:50000/token/", "read", False),
-        ("http://127.0.0.1:50000/token/", "camera", False),
-        ("http://127.0.0.1.evil.test:50000/", "read", False),
-    ]:
-        args = SimpleNamespace(Uri=uri, PermissionKind=kind, SavesInProfile=True, State="default")
-        handler(core, args)
-        assert args.State == ("allow" if allowed else "default")
-        assert args.SavesInProfile is (not allowed)
-    assert evidence["allowed_requests"] == 1 and evidence["ignored_requests"] == 5
-    assert evidence["persistent"] is False and evidence["attached"] is True
-    cleanup()
-    assert core.PermissionRequested.handlers == [] and evidence["removed"] is True
-    assert window.native.BeginInvoke.call_count == 2
+def test_macos_lut_clipboard_api_keeps_original_call_contract(fake_webview, monkeypatch):
+    from nd2wsi import lut_clipboard
 
-
-def test_smoke_ui_dispatch_is_bounded_and_cancels_queued_callback(monkeypatch):
-    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda callback: callback))
-    native = SimpleNamespace(BeginInvoke=Mock())
-    callback = Mock()
-    with pytest.raises(TimeoutError, match="UI dispatch timed out"):
-        app._smoke_windows_ui(SimpleNamespace(native=native), callback, timeout=0)
-    native.BeginInvoke.call_args.args[0]()
-    callback.assert_not_called()
-
-
-@pytest.mark.parametrize("platform, opt_in", [("darwin", "1"), ("win32", "0")])
-def test_native_smoke_permission_setup_requires_windows_explicit_opt_in(monkeypatch, platform, opt_in):
-    monkeypatch.setattr(app.sys, "platform", platform)
-    monkeypatch.setenv("ND2WSI_SMOKE_LUT_CLIPBOARD", opt_in)
-    with pytest.raises(RuntimeError, match="explicit Windows smoke opt-in"):
-        app._install_smoke_clipboard_permission(object(), "http://127.0.0.1:50000/")
+    monkeypatch.setattr(app.sys, "platform", "darwin")
+    read, write = Mock(return_value={"ok": True, "text": "LUT"}), Mock(return_value={"ok": True})
+    monkeypatch.setattr(lut_clipboard, "read_lut_clipboard", read)
+    monkeypatch.setattr(lut_clipboard, "write_lut_clipboard", write)
+    api = app.Api(None)
+    assert api.read_lut_clipboard() == read.return_value
+    assert api.write_lut_clipboard("LUT") == write.return_value
+    read.assert_called_once_with()
+    write.assert_called_once_with("LUT")
 
 
 def test_main_passes_edge_renderer_and_writes_gui_report(fake_webview, monkeypatch, tmp_path):
