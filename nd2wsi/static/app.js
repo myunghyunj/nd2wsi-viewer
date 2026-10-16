@@ -11,6 +11,7 @@ const state = {
   viewer: null,
   channels: [], // enabled channel indices
   luts: [], // per channel {lo, hi, gamma}; null while at store defaults
+  lutPersistence: null, // durable, source-bound display preferences
   lutWidgets: [], // canvas LUT widgets, aligned with luts
   lutAutoRange: false, // ND2 opens fitted; axis navigation never changes contrast
   lutAutoPending: [], // one initial adjustment; manual edits always take priority
@@ -110,17 +111,7 @@ async function init() {
   state.channels = info.channels.map((_, i) => i);
   state.luts = info.channels.map(() => null);
   state.lutWidgets = [];
-  // The native bridge binds this state to the registered source and role.
-  // Apply display settings before panels/tile URLs, and camera after OSD opens.
-  const handoffApi = window.parent !== window ? window.parent.pywebview?.api : null;
-  if (handoffApi?.initial_view_state) {
-    const display = await handoffApi.initial_view_state(currentSlideSid());
-    if (display) {
-      window.Nd2ViewState.applyDisplay(state, display);
-      state.initialViewHandoff = display;
-    }
-  }
-  initializeLutAuto();
+  await initializeDisplayLuts();
   const LatestRequestGate = window.Nd2LatestRequest && window.Nd2LatestRequest.LatestRequestGate;
   if (!LatestRequestGate) throw new Error("latest-request helper did not load");
   state.pixel.requests = new LatestRequestGate();
@@ -189,6 +180,35 @@ async function init() {
     }
     setAnnStatus("Annotation locked: source file missing");
   }
+}
+
+async function initializeDisplayLuts() {
+  state.lutPersistence = window.Nd2LutPersistence.createController({
+    info: state.info,
+    readLuts: () => state.luts,
+    fetch: (...args) => fetch(...args),
+    reportError: (message) => showToast(String(message)),
+  });
+  const saved = await state.lutPersistence.load();
+  if (saved) state.luts = saved;
+  // An explicit renderer handoff represents the view the user just left.
+  // It overrides persisted values; both take precedence over initial Auto.
+  const handoffApi = window.parent !== window ? window.parent.pywebview?.api : null;
+  if (handoffApi?.initial_view_state) {
+    const display = await handoffApi.initial_view_state(currentSlideSid());
+    if (display) {
+      window.Nd2ViewState.applyDisplay(state, display);
+      state.initialViewHandoff = display;
+      state.lutHandoffOutsideSavedRange = !state.luts.every((lut, i) =>
+        window.Nd2LutTransfer.fitsChannel(state.info.channels[i], lut, state.info.dtype));
+      if (state.lutHandoffOutsideSavedRange) {
+        showToast("This Metal LUT remains visible but is outside the standard viewer's saved range. Adjust the LUTs here to remember them.");
+      } else state.lutPersistence.changed();
+    }
+  }
+  initializeLutAuto();
+  // Tab close, native quit and updates await flush before the page is removed.
+  window.addEventListener("pagehide", () => state.lutPersistence.dispose(), { once: true });
 }
 
 function initializeLutAuto() {
@@ -959,6 +979,12 @@ function buildLutRow(i, ch, winLabel) {
     onChange(lut) {
       if (state.lutAutoPending) state.lutAutoPending[i] = false;
       state.luts[i] = lut;
+      if (state.lutHandoffOutsideSavedRange) {
+        state.lutHandoffOutsideSavedRange = !state.luts.every((value, index) =>
+          window.Nd2LutTransfer.fitsChannel(state.info.channels[index],
+            window.Nd2LutTransfer.currentLut(state.info.channels[index], value), state.info.dtype));
+      }
+      if (!state.lutHandoffOutsideSavedRange) state.lutPersistence?.changed();
       applyLuts(); // shared cadence: one tile reload even for shift-drags
     },
     onFlush: () => applyLuts.flush(),
@@ -1836,6 +1862,7 @@ async function acknowledgeUpdatePreparation(requestId) {
   let reply;
   try {
     await flushAnnotationsForUpdate();
+    await state.lutPersistence?.flush();
     reply = { ok: true };
   } catch (error) {
     reply = { ok: false, error: String(error.message || error).slice(0, 240) };

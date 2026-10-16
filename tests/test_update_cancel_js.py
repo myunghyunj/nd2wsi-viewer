@@ -200,6 +200,37 @@ def test_abort_after_successful_flush_still_unlocks_and_reports_closed_images():
     ]
 
 
+def test_normal_close_waits_for_pending_lut_save_before_acknowledging():
+    out = run("""
+      const a=panes.get('a'); let finish;
+      a.state.lutPersistence={flush:()=>new Promise(resolve=>{finish=resolve;})};
+      const pending=window.nd2wsiPrepareForUpdate('lut-close');
+      await pump();
+      const before=messages.filter(m=>m.from==='a' && m.nd2wsi==='quit-ready');
+      finish(); await pump();
+      return {before,result:await pending};
+    """)
+    assert out == {"before": [], "result": {"ok": True, "panes": 2}}
+
+
+def test_lut_save_failure_blocks_close_and_can_be_retried():
+    out = run("""
+      const a=panes.get('a'); let attempts=0;
+      a.state.lutPersistence={flush:async()=>{
+        if(++attempts===1)throw Error('LUT settings disk is unavailable');
+      }};
+      const first=window.nd2wsiPrepareForUpdate('lut-failed'); await pump();
+      const failure=await first;
+      window.nd2wsiCancelUpdate('lut-failed'); await pump();
+      const retry=window.nd2wsiPrepareForUpdate('lut-retry'); await pump();
+      return {failure,retry:await retry,attempts};
+    """)
+    assert out["failure"]["ok"] is False
+    assert "LUT settings disk is unavailable" in out["failure"]["error"]
+    assert out["retry"] == {"ok": True, "panes": 2}
+    assert out["attempts"] == 2
+
+
 def test_busy_retry_cancellation_unlocks_panes_prepared_by_the_earlier_attempt():
     out = run("""
       const first=window.nd2wsiPrepareForUpdate('older-attempt'); await pump(); await first;

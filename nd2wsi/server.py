@@ -161,6 +161,7 @@ class ViewerState:
         self._inspect_lock = threading.Lock()
         self._cache_usage_ready = False
         self._cache_usage: dict[str, int] | None = None
+        self._lut_settings_store = None
 
     @property
     def source_path(self) -> Path | None:
@@ -484,6 +485,14 @@ class SlideRegistry:
     @staticmethod
     def sid_for(store_path: Path) -> str:
         return hashlib.sha1(str(store_path.resolve()).encode()).hexdigest()[:8]
+
+    def lut_settings_for(self, st: ViewerState):
+        from .lut_settings import LutSettingsStore
+
+        with st.lock:
+            if st._lut_settings_store is None:
+                st._lut_settings_store = LutSettingsStore(st.source_path, st.attrs, self.window_session)
+            return st._lut_settings_store
 
     def add_store(
         self,
@@ -1410,6 +1419,8 @@ def make_handler(
                     return self._error(404, f"no slide for {path}")
                 if sub == "/api/info":
                     return self._info(st)
+                if sub == "/api/lut-settings":
+                    return self._json(registry.lut_settings_for(st).read())
                 if sub == "/api/inspect":
                     return self._inspect(st)
                 if sub == "/api/pixel":
@@ -1463,6 +1474,8 @@ def make_handler(
                 if path == "/api/trash":
                     return self._trash()
                 st, sub = self._resolve(path)
+                if st is not None and sub == "/api/lut-settings":
+                    return self._lut_settings_post(st)
                 if st is not None and sub == "/api/annotations":
                     return self._annotations_post(st, q)
                 if st is not None and sub == "/api/reveal":
@@ -1573,6 +1586,19 @@ def make_handler(
             return self._json({"ok": True, "slides": registry.listing()})
 
         # ---- per-slide endpoints -----------------------------------------
+        def _lut_settings_post(self, st: ViewerState):
+            from .lut_settings import MAX_BYTES, LutSettingsUnavailable
+
+            try:
+                payload = self._body_json(limit=MAX_BYTES)
+                return self._json(registry.lut_settings_for(st).write(payload))
+            except LutSettingsUnavailable as exc:
+                return self._error(409, str(exc))
+            except (ValueError, TypeError, RecursionError) as exc:
+                return self._error(400, str(exc))
+            except OSError as exc:
+                return self._error(500, f"Could not save LUT settings: {exc}")
+
         def _info_payload(self, st: ViewerState) -> dict[str, Any]:
             meta = st.attrs["nd2wsi"]
             lv0 = meta["levels"][0]
