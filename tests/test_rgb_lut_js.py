@@ -17,11 +17,12 @@ const source=fs.readFileSync(path.join(process.argv[1],'app.js'),'utf8');
 const L=require(path.join(process.argv[1],'lut-controls-v1.js'));
 const transfer=require(path.join(process.argv[1],'lut-transfer-v1.js'));
 const nodes=[],ctx=new Proxy({}, {get:(o,k)=>o[k]||(()=>{})});
-function node(tag){const n={tag,children:[],handlers:{},attrs:{},style:{},disabled:false,
+function node(tag){const n={tag,children:[],handlers:{},attrs:{},style:{},disabled:false,textContent:'',hidden:false,
  append(...xs){this.children.push(...xs)},setAttribute(k,v){this.attrs[k]=v},
  replaceChildren(...xs){this.children=[...xs]},focus(){this.focused=true},
  showModal(){this.open=true},close(){this.open=false},
- addEventListener(k,f){this.handlers[k]=f},getContext:()=>ctx,setPointerCapture(){},
+ addEventListener(k,f){this.handlers[k]=f},
+ removeEventListener(k,f){if(this.handlers[k]===f)delete this.handlers[k]},getContext:()=>ctx,setPointerCapture(){},
  getBoundingClientRect:()=>({left:0,top:0})};
  n.classList={contains:c=>(n.className||'').split(' ').includes(c),
  toggle(c,on){const s=new Set((n.className||'').split(' '));on?s.add(c):s.delete(c);n.className=[...s].join(' ');}};
@@ -29,7 +30,12 @@ function node(tag){const n={tag,children:[],handlers:{},attrs:{},style:{},disabl
 const controls={'channel-list':node('div'),'lut-auto-range':node('input'),'tb-channels':node('button')};
 for(const id of ['lut-type','lut-copy','lut-paste','lut-cancel'])controls[id]=node('button');
 controls['lut-dialog']=node('dialog');controls['lut-form']=node('form');
-controls['lut-fields']=node('div');controls['lut-error']=node('p');controls['lut-copy-tooltip']=node('div');
+controls['lut-fields']=node('div');controls['lut-error']=node('p');
+for(const [action,text] of Object.entries({type:'Enter channel minimum, maximum and gamma',
+ copy:'Copy LUT to clipboard',paste:'Paste LUT values for matching channel names'})){
+ const tip=controls['lut-'+action+'-tooltip']=node('div');
+ tip.hidden=true;tip.textContent=text;
+}
 let closed=false,histograms=0,refreshes=0;
 const rgb=process.argv[2]==='true';
 const channels=['Red','Green','Blue'].map((label,i)=>({label,color:['FF0000','00FF00','0000FF'][i],
