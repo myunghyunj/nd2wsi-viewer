@@ -1,25 +1,31 @@
 # Windows distribution
 
-## Current v2.1.13 download
+## Current v2.1.14 download
 
-Use the [v2.1.13 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.13/nd2wsi-viewer-2.1.13-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.13/nd2wsi-viewer-2.1.13-windows-x64.zip.sha256).
-See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.13)
-for the exact source commit, artifact checksum, and completed Windows x64 /
-Windows 11 ARM64-emulation validation. Extract the whole ZIP and retain
-`_internal` beside the EXE. WebView2 is required. No 2.1.13 Setup installer is included.
+Use the [v2.1.14 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.14/nd2wsi-viewer-2.1.14-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.14/nd2wsi-viewer-2.1.14-windows-x64.zip.sha256).
+See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.14)
+for the exact source commit, artifact checksum, and platform verification results.
+Extract the whole ZIP and retain
+`_internal` beside the EXE. WebView2 is required. No 2.1.14 Setup installer is included.
 
-The gold **Type LUT** button now accepts each channel's minimum, maximum and gamma;
-invalid entries leave every channel unchanged. **Auto-fit** is the shorter label
+The standard viewer remembers each file's last-used channel minimum, maximum and
+gamma, including across app restarts. Preferences are stored locally and separately
+from the source image; saved values take precedence over initial Auto.
+
+The **Type LUT** action now uses a compact pencil icon matching the adjacent copy
+and paste actions. Its numeric dialog still accepts each channel's minimum,
+maximum and gamma; invalid entries leave every channel unchanged. **Auto-fit** is the shorter label
 for the histogram-axis checkbox. Copy and paste LUTs between windows by unique
 channel name, regardless of channel order. Unmatched, duplicate, invalid or
 incompatible entries are skipped; raw pixels, annotations, channel colors and
 visibility stay unchanged. macOS and Windows share the same borderless 16 px
-Fluent icons. A successful copy briefly shows a green check and **Copied!**, with
-a tooltip available on hover or keyboard focus. See the
-[2.1.13 release notes](release-notes-2.1.13.md).
+Fluent icons. Hover over edit, copy or paste for about one second to see a short
+explanation, also available with keyboard focus. A successful copy immediately
+shows a brief green check and **Copied!**. See the
+[2.1.14 release notes](release-notes-2.1.14.md).
 
-ND2 continues to open with automatic contrast and a fitted LUT graph. The robust bright limit
+ND2 without saved LUTs opens with automatic contrast and a fitted LUT graph. The robust bright limit
 reduces sensitivity to rare bright pixels, while manual edits, full-range inspection
 and raw pixel values remain available. Floating panels have reachable resize edges
 and a visible corner grip. Plate controls also use a dedicated controller
@@ -72,9 +78,9 @@ emulation, not an ARM64-native binary.
 
 ## Installer build tooling
 
-The current source targets viewer 2.1.13, with a native Windows frame
+The current source targets viewer 2.1.14, with a native Windows frame
 and Microsoft Edge WebView2. Installer tooling can produce
-`nd2wsi-viewer-2.1.13-Setup.exe`, but no Setup is published or verified for this
+`nd2wsi-viewer-2.1.14-Setup.exe`, but no Setup is published or verified for this
 release. The tooling installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
@@ -87,7 +93,7 @@ whole extracted folder together; the EXE depends on its `_internal` directory.
 Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
-v1.2.8 results below do not establish v2.1.13 Windows hardware verification.
+v1.2.8 results below do not establish v2.1.14 Windows hardware verification.
 The current release provides the portable ZIP described above.
 
 Target execution modes (the verified CI environments are listed above):
@@ -170,7 +176,7 @@ packaging. The packaging script requires the frozen executable to pass:
 - ND2 ROI export with exact source pixels, calibration, and channel names.
 - JPEG and lossless JPEG 2000 SVS pyramid reads, tile serving, and exact TIFF ROI export.
 - A native window using WebView2, a JavaScript/Python bridge roundtrip, and a loaded viewer canvas.
-- A wired LUT toolbar, its transfer module, and the three packaged Fluent SVG icons.
+- A wired LUT toolbar, its transfer module, and the four packaged Fluent SVG icons.
 
 To reproduce in Windows with x64 Python 3.13.14, uv 0.12.10, Node.js 22, and
 Microsoft Edge WebView2 Runtime:
@@ -184,14 +190,14 @@ uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --
 ```
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.1.13-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.1.14-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.1.13-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.1.14-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks
