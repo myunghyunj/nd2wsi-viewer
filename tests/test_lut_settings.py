@@ -206,6 +206,16 @@ def test_windows_unsupported_filesystem_keeps_persistence_and_detects_restored_m
     real_stat, real_fstat = Path.stat, os.fstat
     guards = set()
 
+    class WindowsStat:
+        def __init__(self, *, by_handle=False):
+            self.st_birthtime_ns = captured.st_ctime_ns
+            self.st_ctime_ns = captured.st_ctime_ns + (100 if by_handle else 0)
+
+        def __getattr__(self, name):
+            return getattr(captured, name)
+
+    path_stat, handle_stat = WindowsStat(), WindowsStat(by_handle=True)
+
     def open_guard(path):
         assert path == source
         fd = os.open(path, os.O_RDONLY)
@@ -213,10 +223,11 @@ def test_windows_unsupported_filesystem_keeps_persistence_and_detects_restored_m
         return fd
 
     def fstat(fd):
-        return captured if fd in guards else real_fstat(fd)
+        return handle_stat if fd in guards else real_fstat(fd)
 
-    # Shadow Windows creation time and the restored modification time while
-    # real sampled bytes still change. Only source descriptors are shadowed.
+    # Windows path ctime can be creation time while handle ctime is ChangeTime.
+    # Keep their birthtime/restored mtime equal while sampled bytes change.
+    # Only source descriptors are shadowed.
     real_close = os.close
 
     def close(fd):
@@ -224,12 +235,13 @@ def test_windows_unsupported_filesystem_keeps_persistence_and_detects_restored_m
         return real_close(fd)
 
     monkeypatch.setattr(lut_settings.sys, "platform", "win32")
-    monkeypatch.setattr(Path, "stat", lambda path, *a, **kw: captured if path == source else real_stat(path, *a, **kw))
+    monkeypatch.setattr(Path, "stat", lambda path, *a, **kw: path_stat if path == source else real_stat(path, *a, **kw))
     monkeypatch.setattr(windows_fs, "file_change_time", lambda *args: None)
     monkeypatch.setattr(windows_fs, "open_guard", open_guard)
     monkeypatch.setattr(os, "fstat", fstat)
     monkeypatch.setattr(os, "close", close)
     _, _, store = registered_store(source)
+    assert store.identity is not None, store._warning
     store.write(settings(20))
     assert store.read()["settings"] == settings(20)
     _, _, reopened = registered_store(source)

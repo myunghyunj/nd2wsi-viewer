@@ -88,6 +88,15 @@ class _FileBasicInfo(ctypes.Structure):
     ]
 
 
+def source_stat_identity(info: os.stat_result) -> tuple:
+    """Compare path/handle identity without mixing Windows timestamp meanings."""
+    # CPython 3.12+ path stat keeps ctime as creation time, but fstat can
+    # report ChangeTime there. Birthtime is unambiguous on both; older Python
+    # versions expose creation time consistently as ctime instead.
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            getattr(info, "st_birthtime_ns", info.st_ctime_ns))
+
+
 def file_change_time(path: Path, expected: os.stat_result) -> int | None:
     """Read the native change stamp from the same file as a captured stat.
 
@@ -102,9 +111,7 @@ def file_change_time(path: Path, expected: os.stat_result) -> int | None:
     from ctypes import wintypes
 
     def matches(info):
-        return (_same(info, expected) and info.st_size == expected.st_size
-                and info.st_mtime_ns == expected.st_mtime_ns
-                and info.st_ctime_ns == expected.st_ctime_ns)
+        return source_stat_identity(info) == source_stat_identity(expected)
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     query = kernel.GetFileInformationByHandleEx
@@ -125,7 +132,8 @@ def file_change_time(path: Path, expected: os.stat_result) -> int | None:
                             filesystem, len(filesystem))
         if not identified or filesystem.value.upper() not in {"NTFS", "REFS"}:
             after = os.fstat(fd)
-            if not matches(after) or _is_reparse(after):
+            if (not matches(after) or _is_reparse(after)
+                    or after.st_ctime_ns != opened.st_ctime_ns):
                 raise OSError("source identity changed while identifying Windows filesystem")
             return None
         info = _FileBasicInfo()
@@ -134,7 +142,8 @@ def file_change_time(path: Path, expected: os.stat_result) -> int | None:
             raise ctypes.WinError(ctypes.get_last_error())
         if info.ChangeTime <= 0 or info.FileAttributes & 0x400:
             raise OSError("Windows source change time is unavailable")
-        if not matches(os.fstat(fd)):
+        after = os.fstat(fd)
+        if not matches(after) or after.st_ctime_ns != opened.st_ctime_ns:
             raise OSError("source identity changed while reading Windows change time")
         return int(info.ChangeTime)
     finally:

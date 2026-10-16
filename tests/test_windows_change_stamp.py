@@ -16,7 +16,7 @@ from nd2wsi import windows_fs
 def native(monkeypatch):
     value = SimpleNamespace(
         st_dev=7, st_ino=13, st_size=24, st_mtime_ns=123, st_ctime_ns=456,
-        st_mode=stat.S_IFREG | 0o600, st_file_attributes=0,
+        st_birthtime_ns=456, st_mode=stat.S_IFREG | 0o600, st_file_attributes=0,
     )
     state = SimpleNamespace(
         expected=value, opened=value, after=value, stamp=133000000000000001,
@@ -81,7 +81,7 @@ def test_basic_info_layout_and_query_preserve_exact_change_time(native, filesyst
 
 @pytest.mark.parametrize("field,value", [
     ("st_dev", 8), ("st_ino", 14), ("st_size", 25),
-    ("st_mtime_ns", 124), ("st_ctime_ns", 457),
+    ("st_mtime_ns", 124), ("st_birthtime_ns", 457),
     ("st_mode", stat.S_IFDIR | 0o700), ("st_file_attributes", 0x400),
 ])
 def test_changed_or_reparse_file_is_rejected_before_query(native, field, value):
@@ -91,11 +91,33 @@ def test_changed_or_reparse_file_is_rejected_before_query(native, field, value):
     assert native.queries == [] and native.closed == [41]
 
 
-def test_file_changed_during_query_is_rejected_and_handle_closed(native):
-    native.after = SimpleNamespace(**{**vars(native.expected), "st_mtime_ns": 124})
+@pytest.mark.parametrize("field", ["st_mtime_ns", "st_ctime_ns", "st_birthtime_ns"])
+def test_file_changed_during_query_is_rejected_and_handle_closed(native, field):
+    native.after = SimpleNamespace(**{**vars(native.expected), field: getattr(native.expected, field) + 1})
     with pytest.raises(OSError, match="while reading"):
         windows_fs.file_change_time(Path("source.nd2"), native.expected)
     assert native.queries == [(141, 0, 40)] and native.closed == [41]
+
+
+@pytest.mark.parametrize("filesystem", ["NTFS", "exFAT"])
+def test_path_creation_ctime_and_handle_change_ctime_are_not_compared(native, filesystem):
+    # CPython 3.13.14 uses birthtime for path.stat().ctime but ChangeTime for
+    # os.fstat().ctime. Creation and the initial write can have different times.
+    native.filesystem = filesystem
+    native.opened = native.after = SimpleNamespace(**{**vars(native.expected), "st_ctime_ns": 556})
+    assert native.opened.st_birthtime_ns == native.expected.st_birthtime_ns
+    expected_stamp = native.stamp if filesystem == "NTFS" else None
+    assert windows_fs.file_change_time(Path("source.nd2"), native.expected) == expected_stamp
+    assert native.closed == [41]
+
+
+def test_legacy_python_without_birthtime_retains_creation_time_identity(native):
+    del native.expected.st_birthtime_ns
+    assert windows_fs.file_change_time(Path("source.nd2"), native.expected) == native.stamp
+    native.fstats = 0
+    native.opened = SimpleNamespace(**{**vars(native.expected), "st_ctime_ns": 457})
+    with pytest.raises(OSError, match="identity changed"):
+        windows_fs.file_change_time(Path("source.nd2"), native.expected)
 
 
 @pytest.mark.parametrize("stamp,attributes", [(0, 0), (-1, 0), (123, 0x400)])

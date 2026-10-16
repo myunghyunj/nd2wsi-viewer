@@ -93,10 +93,11 @@ def _stat_signature(path: Path) -> tuple:
         raise ValueError("LUT settings require an original source file")
     signature = info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
     if sys.platform == "win32":
-        from .windows_fs import file_change_time, open_guard
+        from .windows_fs import file_change_time, open_guard, source_stat_identity
 
-        # Windows ctime is creation time. Keep the cheap native change stamp
+        # Windows path ctime is creation time. Keep the cheap native change stamp
         # instead of rehashing the source on every contrast adjustment.
+        signature = source_stat_identity(info)
         stamp = file_change_time(path, info)
         if stamp is not None:
             signature += ("change-time", stamp)
@@ -109,13 +110,14 @@ def _stat_signature(path: Path) -> tuple:
                 def matches(opened):
                     return (stat.S_ISREG(opened.st_mode)
                             and not getattr(opened, "st_file_attributes", 0) & 0x400
-                            and (opened.st_dev, opened.st_ino, opened.st_size,
-                                 opened.st_mtime_ns, opened.st_ctime_ns) == signature)
+                            and source_stat_identity(opened) == signature)
 
-                if not matches(os.fstat(fd)):
+                opened = os.fstat(fd)
+                if not matches(opened):
                     raise OSError("source identity changed before sampled fingerprint")
                 fingerprint = quick_fingerprint(path)
-                if not matches(os.fstat(fd)):
+                after = os.fstat(fd)
+                if not matches(after) or after.st_ctime_ns != opened.st_ctime_ns:
                     raise OSError("source identity changed during sampled fingerprint")
                 signature += ("sampled-content", fingerprint["quick_sha256"])
             finally:
