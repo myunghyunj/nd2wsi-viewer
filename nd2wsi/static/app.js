@@ -681,6 +681,7 @@ function wireLutToolbar() {
   const error = $("lut-error");
   let inputs = [];
   $("lut-type").onclick = () => {
+    $("lut-type").lutTooltip.dismiss();
     fields.replaceChildren();
     error.textContent = "";
     inputs = state.info.channels.map((channel, i) => {
@@ -730,61 +731,111 @@ function wireLutToolbar() {
     dialog.close();
     showToast("LUT values applied");
   };
-  wireLutCopyFeedback();
+  wireLutToolbarTooltips();
   $("lut-copy").onclick = () => runLutClipboard("copy");
-  $("lut-paste").onclick = () => runLutClipboard("paste");
+  $("lut-paste").onclick = () => {
+    $("lut-paste").lutTooltip.dismiss();
+    return runLutClipboard("paste");
+  };
 }
 
-function wireLutCopyFeedback() {
-  const button = $("lut-copy");
-  if (button.lutCopyFeedback) return;
-  const tooltip = $("lut-copy-tooltip");
-  let hovered = false, focused = false, copied = false, dismissed = false, disposed = false;
-  let timer = null;
-  const render = () => {
-    tooltip.textContent = copied ? "Copied!" : "Copy LUT to clipboard";
-    button.classList.toggle("is-copied", copied);
-    tooltip.hidden = disposed || dismissed || !(hovered || focused || copied);
-    if (tooltip.hidden) return;
-    const anchor = button.getBoundingClientRect();
-    const tip = tooltip.getBoundingClientRect();
-    const left = Math.max(8, Math.min(anchor.left + (anchor.width - tip.width) / 2,
-      window.innerWidth - tip.width - 8));
-    const top = anchor.top - tip.height - 8;
-    tooltip.style.left = `${left}px`;
-    tooltip.style.top = `${Math.max(8, Math.min(top >= 8 ? top : anchor.bottom + 8,
-      window.innerHeight - tip.height - 8))}px`;
-  };
-  const reset = () => {
-    clearTimeout(timer);
-    timer = null;
-    copied = false;
-    render();
-  };
-  button.lutCopyFeedback = {
-    reset,
-    succeed() {
-      if (disposed) return;
-      clearTimeout(timer);
-      copied = true;
-      dismissed = false;
+function wireLutToolbarTooltips() {
+  if ($("lut-copy").lutCopyFeedback) return;
+  const controllers = ["type", "copy", "paste"].map((action) => {
+    const button = $("lut-" + action);
+    const tooltip = $("lut-" + action + "-tooltip");
+    const description = tooltip.textContent;
+    let hovered = false, hoverReady = false, focused = false;
+    let copied = false, dismissed = false, disposed = false;
+    let hoverTimer = null, successTimer = null;
+    const cancelHover = () => {
+      clearTimeout(hoverTimer);
+      hoverTimer = null;
+    };
+    const render = () => {
+      tooltip.textContent = copied ? "Copied!" : description;
+      button.classList.toggle("is-copied", copied);
+      tooltip.hidden = disposed || dismissed || !(hoverReady || focused || copied);
+      if (tooltip.hidden) return;
+      const anchor = button.getBoundingClientRect();
+      const tip = tooltip.getBoundingClientRect();
+      const left = Math.max(8, Math.min(anchor.left + (anchor.width - tip.width) / 2,
+        window.innerWidth - tip.width - 8));
+      const top = anchor.top - tip.height - 8;
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${Math.max(8, Math.min(top >= 8 ? top : anchor.bottom + 8,
+        window.innerHeight - tip.height - 8))}px`;
+    };
+    const reset = () => {
+      clearTimeout(successTimer);
+      successTimer = null;
+      copied = false;
       render();
-      timer = setTimeout(reset, 1800);
-    },
-  };
-  button.addEventListener("pointerenter", () => { hovered = true; dismissed = false; render(); });
-  button.addEventListener("pointerleave", () => { hovered = false; render(); });
-  button.addEventListener("focus", () => { focused = true; dismissed = false; render(); });
-  button.addEventListener("blur", () => { focused = false; render(); });
+    };
+    const dismiss = () => {
+      cancelHover();
+      hoverReady = false;
+      dismissed = true;
+      render();
+    };
+    const handlers = {
+      pointerenter() {
+        if (disposed) return;
+        cancelHover();
+        hovered = true;
+        hoverReady = focused || copied;
+        dismissed = false;
+        if (!focused && !copied) hoverTimer = setTimeout(() => {
+          hoverTimer = null;
+          hoverReady = hovered;
+          render();
+        }, 1000);
+        render();
+      },
+      pointerleave() { cancelHover(); hovered = hoverReady = false; render(); },
+      focus() {
+        if (disposed) return;
+        cancelHover();
+        focused = true;
+        hoverReady = hovered;
+        dismissed = false;
+        render();
+      },
+      blur() { focused = false; render(); },
+    };
+    for (const [event, handler] of Object.entries(handlers)) button.addEventListener(event, handler);
+    const controller = {
+      render, dismiss, reset,
+      succeed() {
+        if (disposed) return;
+        cancelHover();
+        clearTimeout(successTimer);
+        copied = true;
+        hoverReady = hovered;
+        dismissed = false;
+        render();
+        successTimer = setTimeout(reset, 1800);
+      },
+      dispose() {
+        disposed = true;
+        cancelHover();
+        reset();
+        for (const [event, handler] of Object.entries(handlers)) button.removeEventListener(event, handler);
+      },
+    };
+    button.lutTooltip = controller;
+    if (action === "copy") button.lutCopyFeedback = controller;
+    return controller;
+  });
+  const render = () => controllers.forEach((controller) => controller.render());
   const dismiss = (event) => {
-    if (event.key === "Escape") { dismissed = true; render(); }
+    if (event.key === "Escape") controllers.forEach((controller) => controller.dismiss());
   };
   document.addEventListener("keydown", dismiss, true);
   window.addEventListener("resize", render);
   window.addEventListener("scroll", render, true);
   window.addEventListener("pagehide", () => {
-    disposed = true;
-    reset();
+    controllers.forEach((controller) => controller.dispose());
     document.removeEventListener("keydown", dismiss, true);
     window.removeEventListener("resize", render);
     window.removeEventListener("scroll", render, true);

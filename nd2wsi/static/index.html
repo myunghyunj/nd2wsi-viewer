@@ -123,9 +123,9 @@
           <label class="lut-range-option" title="Fit each histogram axis to its signal distribution without changing image contrast">
             <input type="checkbox" id="lut-auto-range"> Auto-fit
           </label>
-          <button type="button" id="lut-type" class="btn lut-type" title="Enter channel minimum, maximum and gamma">Type LUT</button>
+          <button type="button" id="lut-type" class="lut-icon lut-type" aria-label="Type LUT" aria-describedby="lut-type-tooltip"><span class="lut-symbol lut-type-symbol" data-symbol="edit" aria-hidden="true"></span></button>
           <button type="button" id="lut-copy" class="lut-icon lut-copy" aria-label="Copy LUT" aria-describedby="lut-copy-tooltip"><span class="lut-symbol lut-copy-symbol" data-symbol="copy" aria-hidden="true"></span></button>
-          <button type="button" id="lut-paste" class="lut-icon" aria-label="Paste LUT" title="Paste LUT values for matching channel names"><span class="lut-symbol lut-paste-symbol" data-symbol="clipboard-paste" aria-hidden="true"></span></button>
+          <button type="button" id="lut-paste" class="lut-icon" aria-label="Paste LUT" aria-describedby="lut-paste-tooltip"><span class="lut-symbol lut-paste-symbol" data-symbol="clipboard-paste" aria-hidden="true"></span></button>
         </div>
         <div id="channel-list"></div>
       </div>
@@ -282,7 +282,9 @@
 <script src="../../static/spatial-pane-v1.js"></script>
 <script src="../../static/view-state-v1.js"></script>
 <script src="../../static/native-scope-v1.js"></script>
-<div id="lut-copy-tooltip" role="tooltip" hidden>Copy LUT to clipboard</div>
+<div id="lut-type-tooltip" class="lut-tooltip" role="tooltip" hidden>Enter channel minimum, maximum and gamma</div>
+<div id="lut-copy-tooltip" class="lut-tooltip" role="tooltip" hidden>Copy LUT to clipboard</div>
+<div id="lut-paste-tooltip" class="lut-tooltip" role="tooltip" hidden>Paste LUT values for matching channel names</div>
 <dialog id="lut-dialog" aria-labelledby="lut-dialog-title" aria-describedby="lut-dialog-help">
   <form id="lut-form">
     <h2 id="lut-dialog-title">Type LUT</h2>

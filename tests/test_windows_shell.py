@@ -250,7 +250,7 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
         assert result["clipboard_api"] == {"write": True, "read": True}
         assert out["fetches"] == [
             "http://viewer.test/private-token/static/icons/" + name
-            for name in ["fluent-copy-20-regular.svg", "fluent-clipboard-paste-20-regular.svg",
+            for name in ["fluent-edit-20-regular.svg", "fluent-copy-20-regular.svg", "fluent-clipboard-paste-20-regular.svg",
                          "fluent-checkmark-20-regular.svg"]
         ]
         if clipboard:

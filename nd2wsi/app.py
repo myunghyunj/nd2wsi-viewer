@@ -897,7 +897,7 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                           await new Promise(resolve => setTimeout(resolve, 50));
                         }
                       }, 15000);
-                      const assets = ['fluent-copy-20-regular.svg', 'fluent-clipboard-paste-20-regular.svg',
+                      const assets = ['fluent-edit-20-regular.svg', 'fluent-copy-20-regular.svg', 'fluent-clipboard-paste-20-regular.svg',
                         'fluent-checkmark-20-regular.svg'];
                       await step('icons', () => Promise.all(assets.map(async name => {
                         const response = await view.fetch(new URL('../../static/icons/' + name, page.baseURI));

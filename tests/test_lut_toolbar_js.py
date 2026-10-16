@@ -53,10 +53,13 @@ function node(tag){
   Object.defineProperty(result,'valueAsNumber',{get(){return this.value.trim()==='' ? NaN : Number(this.value)}});
   created.push(result);return result;
 }
-for(const id of ['lut-type','lut-copy','lut-paste','lut-copy-tooltip','lut-dialog','lut-fields','lut-error','lut-form','lut-cancel'])nodes[id]=node(id);
-nodes['lut-copy-tooltip'].hidden=true;
-nodes['lut-copy-tooltip'].textContent='Copy LUT to clipboard';
-nodes['lut-copy-tooltip'].rect={left:0,top:0,right:180,bottom:28,width:180,height:28};
+for(const id of ['lut-type','lut-copy','lut-paste','lut-dialog','lut-fields','lut-error','lut-form','lut-cancel'])nodes[id]=node(id);
+for(const [action,text] of Object.entries({type:'Enter channel minimum, maximum and gamma',
+  copy:'Copy LUT to clipboard',paste:'Paste LUT values for matching channel names'})){
+  const tip=nodes['lut-'+action+'-tooltip']=node('tooltip');
+  tip.hidden=true;tip.textContent=text;
+  tip.rect={left:0,top:0,right:180,bottom:28,width:180,height:28};
+}
 const channel=(label,start=0,end=65535)=>({label,window:{start,end}});
 const state={info:{dtype:'uint16',channels:[channel('CY5',129,672),channel('DAPI',0,0.75),channel('FITC',15,200)]},
   luts:[{lo:127.25,hi:4363.75,gamma:0.37},null,{lo:20,hi:190,gamma:1.5}],
@@ -272,7 +275,7 @@ let resolveCopy;const clipboardPending=new Promise(resolve=>resolveCopy=resolve)
 if(TRANSPORT==='native'){
   installNative();window.parent.pywebview.api.write_lut_clipboard=()=>clipboardPending;
 }else context.copyPlainText=()=>clipboardPending;
-nodes['lut-copy'].handlers.pointerenter();const before=copyFeedback();
+nodes['lut-copy'].handlers.pointerenter();advance(1000);const before=copyFeedback();
 const pending=nodes['lut-copy'].onclick();const waiting=copyFeedback();
 resolveCopy({ok:true});await pending;const succeeded=copyFeedback();
 advance(1799);const almostExpired=copyFeedback();advance(1);const expired=copyFeedback();
@@ -329,32 +332,95 @@ return {repeated,originalDeadline,almostExpired,expired:copyFeedback()};
     }
 
 
-def test_tooltip_hover_focus_escape_and_positioning_stay_independent_of_panel_clipping():
+@pytest.mark.parametrize("action, description", [
+    ("type", "Enter channel minimum, maximum and gamma"),
+    ("copy", "Copy LUT to clipboard"),
+    ("paste", "Paste LUT values for matching channel names"),
+])
+def test_each_tooltip_waits_one_second_for_hover_and_cancels_early_leave(action, description):
     out = run("""
-const button=nodes['lut-copy'],tip=nodes['lut-copy-tooltip'];const visible=[];
+const button=nodes['lut-'+ACTION],tip=nodes['lut-'+ACTION+'-tooltip'];
+button.handlers.pointerenter();advance(999);const before={hidden:tip.hidden,timers:timers.size};
+advance(1);const shown={hidden:tip.hidden,text:tip.textContent,timers:timers.size};
+button.handlers.pointerleave();const left=tip.hidden;
+button.handlers.pointerenter();advance(999);button.handlers.pointerleave();advance(1000);
+const cancelled={hidden:tip.hidden,timers:timers.size};
+button.handlers.pointerenter();advance(999);const reentered=tip.hidden;advance(1);
+return {before,shown,left,cancelled,reentered,reshown:!tip.hidden};
+""".replace("ACTION", json.dumps(action)))
+    assert out == {
+        "before": {"hidden": True, "timers": 1},
+        "shown": {"hidden": False, "text": description, "timers": 0},
+        "left": True, "cancelled": {"hidden": True, "timers": 0},
+        "reentered": True, "reshown": True,
+    }
+
+
+@pytest.mark.parametrize("action", ["type", "copy", "paste"])
+def test_each_tooltip_focus_escape_and_positioning_stay_independent_of_panel_clipping(action):
+    out = run("""
+const button=nodes['lut-'+ACTION],tip=nodes['lut-'+ACTION+'-tooltip'];const visible=[];
 const record=()=>visible.push(!tip.hidden);
-button.handlers.pointerenter();record();button.handlers.pointerleave();record();
+button.handlers.pointerenter();advance(1000);record();button.handlers.pointerleave();record();
 button.handlers.focus();record();button.handlers.blur();record();
 button.handlers.pointerenter();button.handlers.focus();button.handlers.pointerleave();record();
 document.handlers.keydown({key:'Escape'});record();window.handlers.resize();record();
-button.handlers.blur();button.handlers.focus();record();button.handlers.blur();
-await button.onclick();button.handlers.pointerleave();record();
-document.handlers.keydown({key:'Escape'});record();
-button.handlers.pointerenter();record();
-const afterEscape=copyFeedback();
+button.handlers.blur();button.handlers.focus();record();
 window.innerWidth=320;window.innerHeight=240;
 button.rect={left:300,top:220,right:320,bottom:240,width:20,height:20};
 window.handlers.resize();const corner={...tip.style};
 button.rect={left:0,top:0,right:20,bottom:20,width:20,height:20};
 window.handlers.scroll();const topCorner={...tip.style};
-document.handlers.keydown({key:'Escape'});await button.onclick();
-return {visible,afterEscape,corner,topCorner,newSuccess:copyFeedback()};
-""")
-    assert out["visible"] == [True, False, True, False, True, False, False, True, True, False, True]
-    assert out["afterEscape"]["copied"] is True and out["afterEscape"]["text"] == "Copied!"
+button.handlers.blur();button.handlers.pointerenter();advance(999);
+document.handlers.keydown({key:'Escape'});advance(1000);
+return {visible,corner,topCorner,pendingDismissed:{hidden:tip.hidden,timers:timers.size}};
+""".replace("ACTION", json.dumps(action)))
+    assert out["visible"] == [True, False, True, False, True, False, False, True]
     assert out["corner"] == {"left": "132px", "top": "184px"}
     assert out["topCorner"] == {"left": "8px", "top": "28px"}
-    assert out["newSuccess"]["hidden"] is False and out["newSuccess"]["copied"] is True
+    assert out["pendingDismissed"] == {"hidden": True, "timers": 0}
+
+
+def test_copy_success_is_immediate_during_pending_hover_and_escape_does_not_clear_checkmark():
+    out = run("""
+const button=nodes['lut-copy'];button.handlers.pointerenter();advance(100);
+await button.onclick();const immediate=copyFeedback();
+document.handlers.keydown({key:'Escape'});const dismissed=copyFeedback();
+button.handlers.pointerleave();button.handlers.pointerenter();const reentered=copyFeedback();
+document.handlers.keydown({key:'Escape'});await button.onclick();const newSuccess=copyFeedback();
+advance(1799);const almostExpired=copyFeedback();advance(1);const expired=copyFeedback();
+return {immediate,dismissed,reentered,newSuccess,almostExpired,expired};
+""")
+    success = {"copied": True, "hidden": False, "text": "Copied!", "disabled": False, "timers": 1}
+    assert out["immediate"] == out["reentered"] == out["newSuccess"] == out["almostExpired"] == success
+    assert out["dismissed"] == {**success, "hidden": True}
+    assert out["expired"] == {
+        "copied": False, "hidden": False, "text": "Copy LUT to clipboard", "disabled": False, "timers": 0,
+    }
+
+
+@pytest.mark.parametrize("action", ["type", "paste"])
+@pytest.mark.parametrize("hover_ms", [500, 1000])
+def test_edit_and_paste_clicks_dismiss_help_and_cancel_pending_hover(action, hover_ms):
+    out = run("""
+const button=nodes['lut-'+ACTION],tip=nodes['lut-'+ACTION+'-tooltip'];
+button.handlers.pointerenter();advance(HOVER_MS);await button.onclick();advance(2000);
+return {hidden:tip.hidden,timers:timers.size};
+""".replace("ACTION", json.dumps(action)).replace("HOVER_MS", str(hover_ms)))
+    assert out == {"hidden": True, "timers": 0}
+
+
+def test_pagehide_cancels_pending_hover_and_removes_all_tooltip_listeners():
+    out = run("""
+for(const action of ['type','copy','paste'])nodes['lut-'+action].handlers.pointerenter();
+advance(999);const pending=timers.size;window.handlers.pagehide();advance(1000);
+return {pending,timers:timers.size,controls:['type','copy','paste'].map(action=>({
+  hidden:nodes['lut-'+action+'-tooltip'].hidden,handlers:Object.keys(nodes['lut-'+action].handlers)})),
+  listeners:{keydown:!!document.handlers.keydown,resize:!!window.handlers.resize,scroll:!!window.handlers.scroll}};
+""")
+    assert out["pending"] == 3 and out["timers"] == 0
+    assert out["controls"] == [{"hidden": True, "handlers": []}] * 3
+    assert out["listeners"] == {"keydown": False, "resize": False, "scroll": False}
 
 
 @pytest.mark.parametrize("pending_copy", [False, True])
@@ -383,25 +449,30 @@ def test_toolbar_html_has_short_auto_fit_label_and_named_controls_in_order():
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     assert re.search(r'id="lut-auto-range"\s*>\s*Auto-fit\s*</label>', html)
     assert "Auto-fit LUT range" not in html
-    assert re.search(r'<button\b[^>]*id="lut-type"[^>]*>Type LUT</button>', html)
-    for name, symbol in [("Copy", "copy"), ("Paste", "clipboard-paste")]:
+    for name, symbol in [("Type", "edit"), ("Copy", "copy"), ("Paste", "clipboard-paste")]:
         button = re.search(rf'<button\b[^>]*id="lut-{name.lower()}"[^>]*>(.*?)</button>', html)
         assert button is not None
         assert f'aria-label="{name} LUT"' in button.group(0)
         classes = re.search(r'class="([^"]+)"', button.group(0)).group(1).split()
         assert "lut-icon" in classes and "btn" not in classes  # no inherited capsule styling
+        assert f'aria-describedby="lut-{name.lower()}-tooltip"' in button.group(0)
+        assert " title=" not in button.group(0)  # only the delayed custom tooltip
         if name == "Copy":
-            assert "lut-copy" in classes and 'aria-describedby="lut-copy-tooltip"' in button.group(0)
-            assert " title=" not in button.group(0)  # custom tooltip owns success feedback
+            assert "lut-copy" in classes
         assert re.fullmatch(
             rf'<span class="lut-symbol lut-{name.lower()}-symbol" data-symbol="{symbol}" aria-hidden="true"></span>',
             button.group(1),
         )
+    for action, description in [("type", "Enter channel minimum, maximum and gamma"),
+                                ("copy", "Copy LUT to clipboard"),
+                                ("paste", "Paste LUT values for matching channel names")]:
+        assert f'<div id="lut-{action}-tooltip" class="lut-tooltip" role="tooltip" hidden>{description}</div>' in html
     assert html.index('id="lut-type"') < html.index('id="lut-copy"') < html.index('id="lut-paste"')
     assert html.index("lut-transfer-v1.js") < html.index("app.js")
     for element in ["lut-dialog", "lut-fields", "lut-error", "lut-form", "lut-cancel"]:
         assert f'id="{element}"' in html
     css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert not re.search(r'\.lut-toolbar \.lut-type\s*[,\{]', css)  # no yellow pill override
     icon_rule = re.search(r'\.lut-toolbar \.lut-icon\s*\{([^}]+)\}', css).group(1)
     for declaration in ["width: 28px", "height: 28px", "padding: 6px", "appearance: none",
                         "border: 0", "background: transparent", "box-shadow: none", "color: var(--label-2)"]:
@@ -409,6 +480,9 @@ def test_toolbar_html_has_short_auto_fit_label_and_named_controls_in_order():
     hover_rule = re.search(r'\.lut-toolbar \.lut-icon:hover\s*\{([^}]+)\}', css).group(1)
     assert "color: var(--label)" in hover_rule and "background" not in hover_rule
     assert ".lut-icon:focus-visible" in css
+    tooltip_rule = re.search(r'\.lut-tooltip\s*\{([^}]+)\}', css).group(1)
+    assert "position: fixed" in tooltip_rule and "max-width: calc(100vw - 16px)" in tooltip_rule
+    assert ".lut-tooltip[hidden] { display: none; }" in css
     symbol_rule = re.search(r'\.lut-icon \.lut-symbol\s*\{([^}]+)\}', css).group(1)
     assert "width: 16px" in symbol_rule and "height: 16px" in symbol_rule
     assert "background: currentColor" in symbol_rule
@@ -416,6 +490,7 @@ def test_toolbar_html_has_short_auto_fit_label_and_named_controls_in_order():
     assert provenance["source"] == "Microsoft Fluent UI System Icons" and provenance["license"] == "MIT"
     upstream = "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/"
     expected_assets = {
+        "fluent-edit-20-regular.svg": upstream + "Edit/SVG/ic_fluent_edit_20_regular.svg",
         "fluent-copy-20-regular.svg": upstream + "Copy/SVG/ic_fluent_copy_20_regular.svg",
         "fluent-clipboard-paste-20-regular.svg": upstream + "Clipboard%20Paste/SVG/ic_fluent_clipboard_paste_20_regular.svg",
         "fluent-checkmark-20-regular.svg": upstream + "Checkmark/SVG/ic_fluent_checkmark_20_regular.svg",
