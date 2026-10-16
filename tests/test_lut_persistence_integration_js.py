@@ -46,5 +46,5 @@ context.initializeDisplayLuts().then(()=>{
 
 
 def test_persistence_dependency_is_loaded_before_the_viewer():
-    html = (STATIC / "index.html").read_text()
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
     assert html.index('lut-transfer-v1.js') < html.index('lut-persistence-v1.js') < html.index('static/app.js')

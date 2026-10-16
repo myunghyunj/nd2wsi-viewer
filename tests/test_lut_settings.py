@@ -137,6 +137,112 @@ def test_replaced_source_rejects_live_save_and_fresh_open_ignores_old_preference
     assert original.path.read_bytes() == saved
 
 
+def test_windows_change_time_rejects_rewrite_with_identical_python_stat_without_rehash(source, monkeypatch):
+    from nd2wsi import windows_fs
+
+    original_stat = source.stat()
+    real_stat = Path.stat
+    real_fingerprint = lut_settings.quick_fingerprint
+    fingerprints = []
+    change_time = 133000000000000001
+
+    def shadow_stat(path, *args, **kwargs):
+        # Windows creation time, size and restored mtime can all remain equal.
+        return original_stat if path == source else real_stat(path, *args, **kwargs)
+
+    def read_change_time(path, expected):
+        assert path == source and expected == original_stat
+        return change_time
+
+    def fingerprint(path):
+        fingerprints.append(path)
+        return real_fingerprint(path)
+
+    monkeypatch.setattr(lut_settings.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "stat", shadow_stat)
+    monkeypatch.setattr(windows_fs, "file_change_time", read_change_time)
+    monkeypatch.setattr(lut_settings, "quick_fingerprint", fingerprint)
+    _, _, store = registered_store(source)
+    store.write(settings(10))
+    store.write(settings(20))
+    assert store.read()["settings"] == settings(20)
+    previous = store.path.read_bytes()
+    source.write_bytes(b"x" * original_stat.st_size)
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    change_time += 1
+    assert source.stat() == original_stat
+    with pytest.raises(LutSettingsUnavailable):
+        store.write(settings(30))
+    assert store.read()["available"] is False
+    assert store.path.read_bytes() == previous
+    assert fingerprints == [source]
+
+
+def test_windows_unavailable_change_stamp_fails_closed_without_overwriting(source, monkeypatch):
+    from nd2wsi import windows_fs
+
+    monkeypatch.setattr(lut_settings.sys, "platform", "win32")
+    monkeypatch.setattr(windows_fs, "file_change_time", lambda *args: 133000000000000001)
+    _, _, store = registered_store(source)
+    store.write(settings())
+    previous = store.path.read_bytes()
+
+    def unavailable(*args):
+        raise OSError("FileBasicInfo is unsupported")
+
+    monkeypatch.setattr(windows_fs, "file_change_time", unavailable)
+    with pytest.raises(LutSettingsUnavailable):
+        store.write(settings(30))
+    assert store.read()["available"] is False
+    assert store.path.read_bytes() == previous
+    _, _, reopened = registered_store(source)
+    assert reopened.read()["available"] is False
+
+
+def test_windows_unsupported_filesystem_keeps_persistence_and_detects_restored_mtime(source, monkeypatch):
+    from nd2wsi import windows_fs
+
+    captured = source.stat()
+    real_stat, real_fstat = Path.stat, os.fstat
+    guards = set()
+
+    def open_guard(path):
+        assert path == source
+        fd = os.open(path, os.O_RDONLY)
+        guards.add(fd)
+        return fd
+
+    def fstat(fd):
+        return captured if fd in guards else real_fstat(fd)
+
+    # Shadow Windows creation time and the restored modification time while
+    # real sampled bytes still change. Only source descriptors are shadowed.
+    real_close = os.close
+
+    def close(fd):
+        guards.discard(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(lut_settings.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "stat", lambda path, *a, **kw: captured if path == source else real_stat(path, *a, **kw))
+    monkeypatch.setattr(windows_fs, "file_change_time", lambda *args: None)
+    monkeypatch.setattr(windows_fs, "open_guard", open_guard)
+    monkeypatch.setattr(os, "fstat", fstat)
+    monkeypatch.setattr(os, "close", close)
+    _, _, store = registered_store(source)
+    store.write(settings(20))
+    assert store.read()["settings"] == settings(20)
+    _, _, reopened = registered_store(source)
+    assert reopened.read()["settings"] == settings(20)
+    saved = store.path.read_bytes()
+    source.write_bytes(b"x" * captured.st_size)
+    os.utime(source, ns=(captured.st_atime_ns, captured.st_mtime_ns))
+    with pytest.raises(LutSettingsUnavailable):
+        store.write(settings(30))
+    assert store.read()["available"] is False and store.path.read_bytes() == saved
+    assert not guards
+
+
 @pytest.mark.parametrize("value", [None, [], {}, True, "12", float("nan"), float("inf"), 10**400])
 def test_invalid_lut_numbers_are_rejected_without_touching_saved_settings(source, value):
     _, _, store = registered_store(source)

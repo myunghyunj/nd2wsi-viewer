@@ -78,6 +78,69 @@ def _same(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+class _FileBasicInfo(ctypes.Structure):
+    """FILE_BASIC_INFO uses four 64-bit FILETIMEs followed by a DWORD."""
+
+    _fields_ = [
+        ("CreationTime", ctypes.c_int64), ("LastAccessTime", ctypes.c_int64),
+        ("LastWriteTime", ctypes.c_int64), ("ChangeTime", ctypes.c_int64),
+        ("FileAttributes", ctypes.c_uint32),
+    ]
+
+
+def file_change_time(path: Path, expected: os.stat_result) -> int | None:
+    """Read the native change stamp from the same file as a captured stat.
+
+    Windows stat ctime is creation time, not a modification guard. FileBasicInfo
+    exposes ChangeTime even if a writer restores LastWriteTime. The read-only
+    guard prevents pathname replacement while the handle is queried; unsupported
+    or unusable stamps fail closed instead of silently trusting creation time.
+    None explicitly means the filesystem needs a content-based fallback: FAT32
+    does not process ChangeTime, and nonzero alone cannot establish support.
+    """
+    import msvcrt
+    from ctypes import wintypes
+
+    def matches(info):
+        return (_same(info, expected) and info.st_size == expected.st_size
+                and info.st_mtime_ns == expected.st_mtime_ns
+                and info.st_ctime_ns == expected.st_ctime_ns)
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel.GetFileInformationByHandleEx
+    query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    query.restype = wintypes.BOOL
+    volume = kernel.GetVolumeInformationByHandleW
+    volume.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+                       wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD,
+                       wintypes.LPWSTR, wintypes.DWORD]
+    volume.restype = wintypes.BOOL
+    fd = open_guard(path)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or _is_reparse(opened) or not matches(opened):
+            raise OSError("source identity changed before reading Windows change time")
+        filesystem = ctypes.create_unicode_buffer(32)
+        identified = volume(msvcrt.get_osfhandle(fd), None, 0, None, None, None,
+                            filesystem, len(filesystem))
+        if not identified or filesystem.value.upper() not in {"NTFS", "REFS"}:
+            after = os.fstat(fd)
+            if not matches(after) or _is_reparse(after):
+                raise OSError("source identity changed while identifying Windows filesystem")
+            return None
+        info = _FileBasicInfo()
+        # FileBasicInfo=0; ChangeTime is an exact 100-ns FILETIME integer.
+        if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if info.ChangeTime <= 0 or info.FileAttributes & 0x400:
+            raise OSError("Windows source change time is unavailable")
+        if not matches(os.fstat(fd)):
+            raise OSError("source identity changed while reading Windows change time")
+        return int(info.ChangeTime)
+    finally:
+        os.close(fd)
+
+
 class _DirectoryInfoHeader(ctypes.Structure):
     """Fixed header of FILE_ID_BOTH_DIR_INFO; names follow as UTF-16 bytes."""
 
