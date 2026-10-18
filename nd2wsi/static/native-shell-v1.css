@@ -80,6 +80,7 @@ button { color:inherit; font:inherit; }
 .shading-progress-stage { margin-top:12px; color:var(--label-2); font-size:11px; }
 #shading-pct { font-variant-numeric:tabular-nums; }
 #shading-progress-bar { display:block; appearance:none; -webkit-appearance:none; width:100%; height:5px; margin:8px 0; border:0; border-radius:3px; overflow:hidden; accent-color:var(--accent); background:rgba(128,128,128,.2); }
+#shading-progress-bar[hidden] { display:none; }
 #shading-progress-bar::-webkit-progress-bar { background:rgba(128,128,128,.2); border-radius:3px; }
 #shading-progress-bar::-webkit-progress-value { background:var(--accent); border-radius:3px; transition:width .2s; }
 #shading-progress-bar::-moz-progress-bar { background:var(--accent); border-radius:3px; }

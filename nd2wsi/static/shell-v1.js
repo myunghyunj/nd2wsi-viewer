@@ -153,8 +153,18 @@ function refreshShadingButton() {
   button.title = view.label;
   $("shading-status").textContent = view.label;
   const progress = window.Nd2ShadingCorrection.progress(status);
-  $("shading-progress").hidden = !progress.visible;
-  if (progress.visible) {
+  const outcome = status?.outcome;
+  $("shading-progress").hidden = !progress.visible && !outcome;
+  $("shading-progress").setAttribute("aria-label", outcome ? "Shading Correction result" : "Shading Correction progress");
+  $("shading-pct").hidden = !!outcome;
+  $("shading-progress-bar").hidden = !!outcome;
+  $("shading-cancel").textContent = outcome ? "Dismiss" : "Cancel";
+  if (outcome) {
+    $("shading-progress-title").textContent = outcome.title;
+    $("shading-stage").textContent = outcome.reason;
+    $("shading-eta").textContent = outcome.note;
+    $("shading-cancel").disabled = !readyFrames.has(active);
+  } else if (progress.visible) {
     $("shading-progress-title").textContent = progress.title;
     $("shading-stage").textContent = progress.stage;
     $("shading-pct").textContent = progress.pct + "%";
@@ -162,6 +172,14 @@ function refreshShadingButton() {
     $("shading-eta").textContent = progress.eta;
     $("shading-cancel").disabled = button.disabled || !progress.canCancel;
   }
+}
+
+function dismissShadingOutcome() {
+  const sid = active, status = shadingStates.get(sid);
+  if (!status?.outcome || !readyFrames.has(sid)) return false;
+  return postToSlide(sid, { nd2wsi: "shading-command", version: VIEWPORT_PROTOCOL_VERSION, action: "dismiss",
+    sid, shellToken: shadingTokens.get(sid), paneInstanceId: status.paneInstanceId,
+    contextKey: status.contextKey, commandSeq: ++shadingCommandSeq });
 }
 
 function requestShadingState(sid, renew = true) {
@@ -253,7 +271,10 @@ function dismissShadingConfirmation(event) {
 }
 
 $("shading-correction").addEventListener("click", activateShadingCorrection);
-$("shading-cancel").addEventListener("click", activateShadingCorrection);
+$("shading-cancel").addEventListener("click", () => {
+  if (shadingStates.get(active)?.outcome) dismissShadingOutcome();
+  else activateShadingCorrection();
+});
 $("shading-confirm-continue").addEventListener("click", continueShadingConfirmation);
 $("shading-confirm-cancel").addEventListener("click", () => closeShadingConfirmation());
 $("shading-confirm").addEventListener("cancel", dismissShadingConfirmation);

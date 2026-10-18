@@ -369,6 +369,42 @@ def test_no_enabled_targets_is_unchanged_not_ready(state, monkeypatch):
     controller.close()
 
 
+def test_model_validation_abstention_is_readable_and_never_replaces_pyramid(state, monkeypatch):
+    from nd2wsi import h_model
+
+    before = copy.deepcopy(state.manifest)
+    original_root = state.root
+    code = "insufficient_repeat_cells_heldout_rows"
+
+    def abstain(*args, **kwargs):
+        kwargs["progress"](0.12)
+        raise h_model.Unsupported(code)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("An unverified correction must not prepare or publish a pyramid")
+
+    monkeypatch.setattr(hc, "_metadata_for_state", metadata)
+    monkeypatch.setattr(h_model, "fit", abstain)
+    monkeypatch.setattr(hp, "prepare_apply", forbidden)
+    state.replace_pyramid = forbidden
+    controller = hc.HCorrectionController(state)
+    controller.start()
+    status = done(controller)
+    assert status["state"] == "unsupported"
+    assert status["supported"] is False
+    assert status["applied"] is False
+    assert status["reason_code"] == code
+    assert "Too few usable repeated fields" in status["reason"]
+    assert "independent validation rows" in status["reason"]
+    assert code not in status["reason"]
+    assert status["pct"] == 42
+    assert status["can_cancel"] is False
+    assert state.manifest == before
+    assert state.root is original_root
+    assert status["generation"] == before["generation"]
+    controller.close()
+
+
 @pytest.mark.parametrize(
     "change,reason",
     [

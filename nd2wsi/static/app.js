@@ -255,6 +255,13 @@ function receiveShadingCommand(message) {
         message.paneInstanceId !== state.viewportRelay.commandGate.paneInstanceId ||
         !Number.isSafeInteger(message.commandSeq) || message.commandSeq <= state.shadingCommandSeq) return;
     const status = state.shading?.snapshot();
+    if (message.action === "dismiss") {
+      if (status?.outcome && status.contextKey === message.contextKey) {
+        state.shadingCommandSeq = message.commandSeq;
+        state.shading.dismissOutcome(message.contextKey);
+      } else postShadingState();
+      return;
+    }
     if (!status || window.Nd2ShadingCorrection.nextAction(status) !== message.action ||
         status.contextKey !== message.contextKey ||
         (message.action !== "cancel" && (message.confirmed !== true ||

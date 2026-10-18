@@ -76,7 +76,7 @@
     const fetcher = options.fetch;
     const schedule = options.setTimer || setTimeout;
     const unschedule = options.clearTimer || clearTimeout;
-    let context = null, status = initial(), initiatedOperation = null;
+    let context = null, status = initial(), initiatedOperation = null, initiatedGeneration = null, outcome = null;
     let sequence = 0, timer = null, abort = null, disposed = false, refreshing = false, refreshNeeded = false, lastError = null;
 
     function initial() {
@@ -92,6 +92,7 @@
     }
     function snapshot() {
       return { ...status, channels: [...status.channels], applied: status.applied === true, refreshing,
+        outcome: outcome ? { ...outcome } : null,
         view_stale: refreshNeeded || (!!status.generation && status.generation !== context?.generation),
         contextKey: context?.key || null, generation: status.generation || context?.generation || "" };
     }
@@ -115,6 +116,7 @@
     }
     function fail(error) {
       initiatedOperation = null;
+      initiatedGeneration = null;
       refreshing = false;
       status = { ...status, state: "failed", pending: null, can_cancel: false, reason: String(error.message || error) };
       emit();
@@ -125,6 +127,7 @@
       if (!payload || typeof payload.generation !== "string" || !payload.generation) throw new Error("Invalid pyramid generation");
       if (!working.has(payload.state) && !terminal.has(payload.state)) throw new Error("Invalid preparation status");
       const initiatedHere = initiatedOperation;
+      const generationHere = initiatedGeneration;
       const channels = Array.isArray(payload.channels) ? payload.channels.filter(value => typeof value === "string") : [];
       status = {
         ...payload, pending: null, channels, supported: payload.supported === true,
@@ -147,14 +150,26 @@
         refreshNeeded = false;
       }
       if (disposed || ticket !== sequence) return false;
-      if (!working.has(status.state)) initiatedOperation = null;
-      emit();
-      if (status.state === "failed") reportError(status.reason || "Pyramid rebuild failed");
-      else lastError = null;
-      if (initiatedHere && ["unchanged", "unsupported"].includes(status.state)) {
-        const outcome = status.state === "unchanged" ? "image unchanged" : "unavailable for this image";
-        options.onNotice?.("Shading Correction: " + outcome + (status.reason ? ". " + status.reason : "."));
+      if (outcome && (status.applied || status.generation !== outcome.generation || working.has(status.state))) outcome = null;
+      if (initiatedHere === "apply" && !status.applied && status.generation === generationHere &&
+          ["unchanged", "unsupported", "failed"].includes(status.state)) {
+        outcome = {
+          title: "Shading Correction was not applied",
+          reason: status.reason || "A usable correction could not be verified for this scan.",
+          note: "The original pyramid is unchanged.",
+          generation: status.generation,
+        };
       }
+      if (!working.has(status.state)) {
+        initiatedOperation = null;
+        initiatedGeneration = null;
+      }
+      emit();
+      if (status.state === "failed") {
+        const reason = status.reason || "Pyramid rebuild failed";
+        if (outcome) lastError = reason;
+        else reportError(reason);
+      } else lastError = null;
       schedulePoll();
       return true;
     }
@@ -177,6 +192,7 @@
           // Another window may have committed since the confirmation opened.
           // Refresh the committed state without replaying or changing the action.
           initiatedOperation = null;
+          initiatedGeneration = null;
           await request("status");
           return false;
         }
@@ -198,6 +214,8 @@
       stopRequest();
       context = options.readContext();
       initiatedOperation = null;
+      initiatedGeneration = null;
+      outcome = null;
       refreshing = false;
       refreshNeeded = false;
       lastError = null;
@@ -218,18 +236,27 @@
       if (action !== nextAction(snapshot())) return Promise.resolve(false);
       if (action === "cancel") {
         initiatedOperation = null;
+        initiatedGeneration = null;
         status = { ...status, pending: "cancel" };
       } else {
         if (!confirmed) return Promise.resolve(false);
         initiatedOperation = action === "revoke" ? "revoke" : "apply";
+        initiatedGeneration = context.generation;
+        outcome = null;
         status = { ...status, state: action === "revoke" ? "rebuilding" : "preparing",
           operation: initiatedOperation, pending: action, pct: 0, reason: "", can_cancel: false };
       }
       emit();
       return request(action);
     }
+    function dismissOutcome(expectedKey) {
+      if (disposed || !current() || expectedKey !== context.key || !outcome) return false;
+      outcome = null;
+      emit();
+      return true;
+    }
     function dispose() { stopRequest(); disposed = true; }
-    return { load, syncContext, activate, snapshot, dispose };
+    return { load, syncContext, activate, dismissOutcome, snapshot, dispose };
   }
 
   return { createController, nextAction, describe, progress, estimateLabel };

@@ -35,6 +35,43 @@ _BLOCK_COLS = 2048
 class UnsupportedCorrection(ValueError):
     """An acquisition or operational limit requires leaving RAW unchanged."""
 
+    def __init__(self, message, *, reason_code=None):
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+def _model_limit_message(code: str) -> str:
+    """Explain a model abstention without changing any acceptance criterion."""
+    groups = {
+        "train": "fitting region",
+        "heldout_columns": "independent validation columns",
+        "heldout_rows": "independent validation rows",
+        "heldout_both": "additional spatial validation regions",
+    }
+    prefix = "insufficient_repeat_cells_"
+    if code.startswith(prefix) and code[len(prefix):] in groups:
+        group = groups[code[len(prefix):]]
+        return f"Too few usable repeated fields in the {group} to verify a correction for this scan."
+    if code.startswith("no_reproducible_BF_periodicity:"):
+        return "The repeating BF illumination pattern could not be verified in independent regions."
+    messages = {
+        "insufficient_BF_support": "Too little usable BF background is available to estimate illumination.",
+        "no_complete_supported_repeat_cells": "No complete, usable repeated fields were found in this scan.",
+        "fit_working_memory_limit": "This scan needs more fitting memory than the current correction limit allows.",
+        "sensor_geometry_unknown": "The camera dimensions needed to estimate the repeating pattern are unavailable.",
+        "BF_absent_no_frozen_fallback": "A BF channel is required to estimate the repeating illumination pattern.",
+        "geometry_at_search_boundary": "The repeating pattern could not be reliably located within the supported camera geometry.",
+        "geometry_optimizer_failure": "The repeating illumination pattern could not be estimated reliably.",
+        "insufficient_frequency_resolution": "This scan contains too little information to resolve the repeating illumination pattern.",
+        "invalid_phase_basis": "A reliable repeating illumination geometry could not be found.",
+        "no_BF_local_phase_cells": "No usable BF fields were found to align the local illumination pattern.",
+        "nonfinite_refined_BF_cells": "The BF reference fields could not be normalized reliably.",
+        "nonpositive_cell_median": "The reference fields contain too little positive signal to estimate illumination.",
+        "insufficient_finite_phase_template": "Too little usable reference signal is available to estimate illumination.",
+        "invalid_fitted_gain": "The estimated correction contains invalid intensity factors.",
+    }
+    return messages.get(code, "A reliable illumination correction could not be verified for this scan.")
+
 
 class _Cancelled(Exception):
     pass
@@ -247,7 +284,8 @@ def _fit_model(raw8, raw32, metadata, output, check, progress):
             progress=progress,
         )
     except Unsupported as exc:
-        raise UnsupportedCorrection(str(exc)) from exc
+        code = str(exc)
+        raise UnsupportedCorrection(_model_limit_message(code), reason_code=code) from exc
 
 
 def _prepare_inputs(state, directory: Path, read_native, check, progress):
@@ -374,6 +412,7 @@ class HCorrectionController:
             self._status.update(state="preparing" if operation == "apply" else "rebuilding",
                                 operation=operation, reason="", pct=0)
             self._status.pop("channel_results", None)
+            self._status.pop("reason_code", None)
             self._thread = threading.Thread(target=self._run, args=(self._cancel, operation),
                                             daemon=True, name="h-correction")
             self._thread.start()
@@ -473,7 +512,8 @@ class HCorrectionController:
                     self._status.update(state="cancelled",
                         reason="Slide closed" if self._closed else "Pyramid replacement cancelled")
         except UnsupportedCorrection as exc:
-            self._update(event, state="unsupported", supported=False, reason=str(exc))
+            self._update(event, state="unsupported", supported=False, reason=str(exc),
+                         reason_code=exc.reason_code)
         except Exception as exc:
             self._update(event, state="failed", reason=f"{type(exc).__name__}: {exc}")
         finally:

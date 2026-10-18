@@ -41,7 +41,7 @@ function shellFixture(){
   const c=vm.createContext({$,window:{Nd2ShadingCorrection:S},shadingStates:new Map(),shadingTokens:new Map([['a','ta'],['b','tb']]),
     active:'a',readyFrames:new Set(['a','b']),quitPreparation:null,shadingCommandSeq:0,shadingConfirmation:null,VIEWPORT_PROTOCOL_VERSION:2,
     postToSlide:(sid,data)=>{messages.push({sid,data});return true}});
-  for(const name of ['refreshShadingButton','receiveShadingState','activateShadingCorrection','shadingConfirmationMatches','closeShadingConfirmation','continueShadingConfirmation','dismissShadingConfirmation'])vm.runInContext(production(source,name),c);
+  for(const name of ['refreshShadingButton','receiveShadingState','activateShadingCorrection','dismissShadingOutcome','shadingConfirmationMatches','closeShadingConfirmation','continueShadingConfirmation','dismissShadingConfirmation'])vm.runInContext(production(source,name),c);
   function status(sid,extra={}){return {sid,shellToken:'t'+sid,paneInstanceId:'pane-'+sid,seq:1,
     state:'idle',supported:true,applied:false,can_cancel:false,channels:[],generation:'g1',estimated_seconds:225,contextKey:sid+':g1',...extra};}
   return {c,$,messages,status};
@@ -201,17 +201,109 @@ def test_failed_tile_reopen_retries_even_after_metadata_generation_changed():
     assert out["after"]["view_stale"] is False and out["requests"] == 2
 
 
-@pytest.mark.parametrize("state,outcome", [("unchanged", "image unchanged"), ("unsupported", "unavailable for this image")])
-def test_no_change_outcome_is_reported_only_to_initiating_pane(state, outcome):
+@pytest.mark.parametrize("state", ["unchanged", "unsupported", "failed"])
+def test_no_change_outcome_is_reported_only_to_initiating_pane(state):
     out = run("""
       const initial=fixture(),started=fixture();initial.api.load();started.api.load();
       initial.requests[0].resolve(initial.payload('TERMINAL',{reason:'No usable correction',supported:false}));
       started.requests[0].resolve(started.payload('idle'));await flush();started.api.activate('start','a:g1',true);
       started.requests[1].resolve(started.payload('TERMINAL',{reason:'No usable correction',supported:false}));await flush();
-      return {initial:initial.notices,notices:started.notices,errors:started.errors,applied:started.api.snapshot().applied};
+      return {initial:initial.api.snapshot().outcome,outcome:started.api.snapshot().outcome,
+        errors:started.errors,applied:started.api.snapshot().applied,action:S.nextAction(started.api.snapshot())};
     """.replace("TERMINAL", state))
-    assert out == {"initial": [], "notices": [f"Shading Correction: {outcome}. No usable correction"],
-                   "errors": [], "applied": False}
+    assert out == {"initial": None, "outcome": {"title": "Shading Correction was not applied",
+                   "reason": "No usable correction", "note": "The original pyramid is unchanged.", "generation": "g1"},
+                   "errors": [], "applied": False, "action": None}
+
+
+def test_actual_repeat_cell_limit_shows_persistent_result_without_success_or_progress():
+    out = run("""
+      const f=fixture(),shell=shellFixture(),c=shell.c;
+      const reason='Too few usable repeated fields in the independent validation rows to verify a correction for this scan.';
+      f.api.load();f.requests[0].resolve(f.payload('idle'));await flush();f.api.activate('start','a:g1',true);
+      f.requests[1].resolve(f.payload('fitting',{operation:'apply',pct:42}));await flush();
+      c.receiveShadingState('a',shell.status('a',{...f.api.snapshot(),seq:1}));
+      const before={hidden:shell.$('shading-progress').hidden,pct:shell.$('shading-progress-bar').value};
+      f.tick();f.requests[2].resolve(f.payload('unsupported',{operation:'apply',supported:false,pct:42,
+        reason,reason_code:'insufficient_repeat_cells_heldout_rows'}));await flush();
+      c.receiveShadingState('a',shell.status('a',{...f.api.snapshot(),seq:2}));f.api.syncContext();c.refreshShadingButton();
+      const after={hidden:shell.$('shading-progress').hidden,title:shell.$('shading-progress-title').textContent,
+        reason:shell.$('shading-stage').textContent,note:shell.$('shading-eta').textContent,
+        progressHidden:shell.$('shading-progress-bar').hidden,pctHidden:shell.$('shading-pct').hidden,
+        button:shell.$('shading-cancel').textContent,dismissDisabled:shell.$('shading-cancel').disabled,
+        applied:shell.$('shading-correction').attrs['aria-pressed'],correctionDisabled:shell.$('shading-correction').disabled};
+      c.dismissShadingOutcome();return {before,after,message:shell.messages[0],
+        pct:f.api.snapshot().pct,generation:f.api.snapshot().generation,reloads:f.reloads.length};
+    """)
+    assert out["before"] == {"hidden": False, "pct": 42}
+    assert out["after"] == {"hidden": False, "title": "Shading Correction was not applied",
+                            "reason": "Too few usable repeated fields in the independent validation rows to verify a correction for this scan.",
+                            "note": "The original pyramid is unchanged.", "progressHidden": True, "pctHidden": True,
+                            "button": "Dismiss", "dismissDisabled": False, "applied": "false", "correctionDisabled": True}
+    assert out["message"]["sid"] == "a" and out["message"]["data"]["action"] == "dismiss"
+    assert out["message"]["data"]["contextKey"] == "a:g1"
+    assert out["pct"] == 42 and out["generation"] == "g1" and out["reloads"] == 0
+
+
+def test_outcome_persists_status_polls_and_dismissal_does_not_post_or_reappear():
+    out = run("""
+      const f=fixture();f.api.load();f.requests[0].resolve(f.payload('idle'));await flush();
+      f.api.activate('start','a:g1',true);f.requests[1].resolve(f.payload('failed',{reason:'The rebuild failed'}));await flush();
+      f.tick();f.requests[2].resolve(f.payload('failed',{reason:'The rebuild failed'}));await flush();
+      const persistent=f.api.snapshot().outcome;const wrong=f.api.dismissOutcome('b:g1');
+      const before=f.requests.length,dismissed=f.api.dismissOutcome('a:g1'),after=f.requests.length;
+      f.tick();f.requests[3].resolve(f.payload('failed',{reason:'The rebuild failed'}));await flush();
+      return {persistent:!!persistent,wrong,before,dismissed,after,outcome:f.api.snapshot().outcome,
+        posts:f.requests.filter(request=>request.options.method==='POST').map(request=>request.url)};
+    """)
+    assert out == {"persistent": True, "wrong": False, "before": 3, "dismissed": True, "after": 3,
+                   "outcome": None, "posts": ["api/shading/start"]}
+
+
+@pytest.mark.parametrize("completion", [
+    "f.requests[1].reject(Error('Connection lost'))",
+    "f.requests[1].resolve(f.payload('cancelled'))",
+    "f.requests[1].resolve(f.payload('failed',{generation:'g2'}))",
+    "f.requests[1].resolve(f.payload('failed',{applied:true}))",
+])
+def test_uncertain_cancelled_or_changed_pyramid_cannot_claim_original_unchanged(completion):
+    out = run("""
+      const f=fixture();f.api.load();f.requests[0].resolve(f.payload('idle'));await flush();
+      f.api.activate('start','a:g1',true);COMPLETION;await flush();return f.api.snapshot().outcome;
+    """.replace("COMPLETION", completion))
+    assert out is None
+
+
+def test_initial_unsupported_has_no_result_card_and_new_work_restores_progress():
+    out = run("""
+      const f=shellFixture(),c=f.c;
+      c.receiveShadingState('a',f.status('a',{state:'unsupported',supported:false}));
+      const initialHidden=f.$('shading-progress').hidden;
+      c.receiveShadingState('a',f.status('a',{seq:2,state:'failed',outcome:{title:'Not applied',reason:'Failed',note:'Unchanged'}}));
+      c.receiveShadingState('a',f.status('a',{seq:3,state:'fitting',pct:15,operation:'apply',can_cancel:true}));
+      return {initialHidden,progressHidden:f.$('shading-progress').hidden,barHidden:f.$('shading-progress-bar').hidden,
+        pctHidden:f.$('shading-pct').hidden,button:f.$('shading-cancel').textContent,pct:f.$('shading-progress-bar').value};
+    """)
+    assert out == {"initialHidden": True, "progressHidden": False, "barHidden": False,
+                   "pctHidden": False, "button": "Cancel", "pct": 15}
+
+
+def test_pane_dismissal_requires_current_token_pane_context_and_command_sequence():
+    out = run("""
+      const source=fs.readFileSync(process.argv[1]+'/app.js','utf8'),calls=[];
+      const status={state:'unsupported',applied:false,supported:false,contextKey:'a:g1',outcome:{title:'Not applied'}};
+      const c=vm.createContext({state:{shadingShellToken:'token',shadingCommandSeq:-1,
+        viewportRelay:{commandGate:{paneInstanceId:'pane'}},shading:{snapshot:()=>status,
+          dismissOutcome:key=>calls.push(key),activate:()=>{throw Error('must not mutate')}}},
+        window:{Nd2ShadingCorrection:S},currentSlideSid:()=> 'a',postShadingState:()=>{}});
+      vm.runInContext(production(source,'receiveShadingCommand'),c);
+      const base={nd2wsi:'shading-command',sid:'a',shellToken:'token',paneInstanceId:'pane',commandSeq:1,
+        contextKey:'a:g1',action:'dismiss'};
+      c.receiveShadingCommand({...base,shellToken:'old'});c.receiveShadingCommand({...base,paneInstanceId:'old'});
+      c.receiveShadingCommand({...base,contextKey:'b:g1'});c.receiveShadingCommand(base);c.receiveShadingCommand(base);
+      return calls;
+    """)
+    assert out == ["a:g1"]
 
 
 @pytest.mark.parametrize("applied,action,title,button", [
@@ -410,6 +502,7 @@ def test_selected_icon_confirmation_colors_and_original_pixel_label_are_preserve
     assert '#shading-confirm-cancel { background:#d72c30; }' in css
     assert '#shading-confirm.revoke #shading-confirm-continue { background:#007aff; }' in css
     assert '#shading-confirm.revoke #shading-confirm-cancel' not in css
+    assert '#shading-progress-bar[hidden] { display:none; }' in css
     assert '#shading-correction:hover:not(:disabled) { color:#ff453a; }' in css
     assert 'snapshot().applied) note.textContent += " · Original values before Shading Correction"' in app
     assert 'appendRenderParams' not in app and 'shading-toggle' not in app
