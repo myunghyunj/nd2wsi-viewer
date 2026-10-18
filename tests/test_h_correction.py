@@ -1,15 +1,15 @@
-"""Correction keeps original pixels and global geometry across display levels."""
+"""Persistent correction controller preserves committed state across jobs."""
 
-import tempfile
+import copy
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from nd2wsi import h_correction as hc
+from nd2wsi import h_persistence as hp
 from nd2wsi.cache import quick_fingerprint
 from nd2wsi.direct import _Lifecycle
 
@@ -63,7 +63,7 @@ def state(tmp_path):
         generation="fixture-generation",
         busy=_Lifecycle(),
         plate=None,
-        manifest={"source": quick_fingerprint(source)},
+        manifest={"source": quick_fingerprint(source), "generation": "fixture-generation"},
     )
 
 
@@ -102,19 +102,209 @@ def fake_fitter(raw8, raw32, meta, output, check, progress):
     }
 
 
-def corrected_root(state, tmp_path, coarse=False):
-    temporary = tempfile.TemporaryDirectory(dir=tmp_path, prefix="correction-")
-    model = Model()
-    maps = (
-        hc._prepare_coarse(
-            state, model, [3], Path(temporary.name), reader(state), lambda: None, lambda _: None
-        )
-        if coarse
-        else {}
-    )
-    return hc._CorrectedRoot(
-        state, model, [3], maps, temporary, hc._source_stamp(state.source_path), state.generation
-    )
+def mark_applied(state):
+    state.generation = "committed-corrected-generation"
+    state.manifest.update(generation=state.generation, h_correction={
+        "applied": True, "correction_id": "persisted-revision", "channel_indices": [3],
+    })
+
+
+def fake_persistence(state, monkeypatch):
+    """Exercise transaction ownership without rebuilding image arrays again."""
+    prepared = []
+
+    class Replacement:
+        def __init__(self, operation, event):
+            self.operation, self.event = operation, event
+            self.closed = self.published = False
+            self.manifest = copy.deepcopy(state.manifest)
+            self.manifest["generation"] = operation + "-committed-generation"
+            if operation == "apply":
+                self.manifest["h_correction"] = {
+                    "applied": True, "correction_id": "new-persisted-revision", "channel_indices": [3],
+                }
+            else:
+                self.manifest.pop("h_correction", None)
+
+        def publish(self):
+            assert not self.event.is_set()
+            self.published = True
+            return self.manifest
+
+        def close(self):
+            self.closed = True
+
+    def prepare(operation, event, progress):
+        if event.is_set():
+            raise hp.PreparationCancelled()
+        progress(0.5)
+        result = Replacement(operation, event)
+        prepared.append(result)
+        return result
+
+    def replace(replacement):
+        assert state.busy.active == 0
+        state.manifest = copy.deepcopy(replacement.publish())
+        state.generation = state.manifest["generation"]
+
+    state.replace_pyramid = replace
+    monkeypatch.setattr(hc, "_metadata_for_state", metadata)
+    monkeypatch.setattr(hc, "_fit_model", fake_fitter)
+    monkeypatch.setattr(hp, "prepare_apply", lambda _state, model, result, event, progress: prepare("apply", event, progress))
+    monkeypatch.setattr(hp, "prepare_revoke", lambda _state, event, progress: prepare("revoke", event, progress))
+    return prepared
+
+
+def test_controller_applies_then_rebuilds_raw_with_committed_generations(state, monkeypatch):
+    prepared = fake_persistence(state, monkeypatch)
+    controller = hc.HCorrectionController(state)
+    assert controller.status()["state"] == "idle"
+    assert controller.status()["applied"] is False
+    controller.start()
+    applied = done(controller)
+    assert applied["state"] == "ready"
+    assert applied["applied"] is True
+    assert applied["generation"] == "apply-committed-generation"
+    assert applied["correction_id"] == "new-persisted-revision"
+    assert applied["channels"] == ["FITC"]
+    assert applied["pct"] == 100
+    assert applied["operation"] is None
+    assert applied["can_cancel"] is False
+    assert prepared[0].published and prepared[0].closed
+    with pytest.raises(ValueError, match="Revoke"):
+        controller.start()
+    controller.revoke()
+    reverted = done(controller)
+    assert reverted["state"] == "idle"
+    assert reverted["applied"] is False
+    assert reverted["correction_id"] is None
+    assert reverted["generation"] == "revoke-committed-generation"
+    assert reverted["channels"] == []
+    assert [item.operation for item in prepared] == ["apply", "revoke"]
+    assert all(item.published and item.closed for item in prepared)
+    with pytest.raises(ValueError, match="no applied"):
+        controller.revoke()
+    controller.close()
+
+
+def test_reopened_controller_restores_applied_status_from_manifest(state):
+    mark_applied(state)
+    controller = hc.HCorrectionController(state)
+    status = controller.status()
+    assert status["state"] == "ready"
+    assert status["applied"] is True
+    assert status["correction_id"] == "persisted-revision"
+    assert status["generation"] == "committed-corrected-generation"
+    assert status["channels"] == ["FITC"]
+    assert status["pct"] == 100
+    assert status["can_cancel"] is False
+    assert status["estimated_seconds"] > 0
+    assert controller._thread is None
+
+
+def test_cancel_revoke_keeps_the_committed_corrected_state(state, monkeypatch):
+    mark_applied(state)
+    fake_persistence(state, monkeypatch)
+    before = copy.deepcopy(state.manifest)
+    entered, release = threading.Event(), threading.Event()
+
+    def prepare(_state, event, progress):
+        progress(0.25)
+        entered.set()
+        release.wait(3)
+        assert event.is_set()
+        raise hp.PreparationCancelled()
+
+    monkeypatch.setattr(hp, "prepare_revoke", prepare)
+    controller = hc.HCorrectionController(state)
+    controller.revoke()
+    assert entered.wait(3)
+    running = controller.status()
+    assert running["state"] == "rebuilding"
+    assert running["applied"] is True
+    assert running["operation"] == "revoke"
+    assert running["can_cancel"] is True
+    cancelled = controller.cancel()
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["applied"] is True
+    release.set()
+    status = done(controller)
+    assert status["state"] == "cancelled"
+    assert status["applied"] is True
+    assert status["correction_id"] == "persisted-revision"
+    assert state.manifest == before
+    assert status["generation"] == before["generation"]
+
+
+@pytest.mark.parametrize("operation", ["apply", "revoke"])
+@pytest.mark.parametrize("phase", ["prepare", "publish"])
+def test_failure_preserves_committed_correction_and_generation(state, monkeypatch, operation, phase):
+    if operation == "revoke":
+        mark_applied(state)
+    prepared = fake_persistence(state, monkeypatch)
+    before = copy.deepcopy(state.manifest)
+
+    def fail(*_):
+        raise OSError("injected replacement failure")
+
+    if phase == "prepare":
+        monkeypatch.setattr(hp, "prepare_" + operation, fail)
+    else:
+        state.replace_pyramid = fail
+    controller = hc.HCorrectionController(state)
+    (controller.start if operation == "apply" else controller.revoke)()
+    status = done(controller)
+    assert status["state"] == "failed"
+    assert "injected replacement failure" in status["reason"]
+    assert status["applied"] is (operation == "revoke")
+    assert status["generation"] == before["generation"]
+    assert state.manifest == before
+    assert not any(item.published for item in prepared)
+    assert all(item.closed for item in prepared)
+
+
+def test_publish_disables_cancellation_until_atomic_activation_completes(state, monkeypatch):
+    prepared = fake_persistence(state, monkeypatch)
+    original_replace = state.replace_pyramid
+    entered, release = threading.Event(), threading.Event()
+
+    def replace(replacement):
+        entered.set()
+        release.wait(3)
+        original_replace(replacement)
+
+    state.replace_pyramid = replace
+    controller = hc.HCorrectionController(state)
+    controller.start()
+    assert entered.wait(3)
+    assert controller.status()["state"] == "publishing"
+    assert controller.status()["can_cancel"] is False
+    assert controller.cancel()["state"] == "publishing"
+    assert not controller._cancel.is_set()
+    release.set()
+    status = done(controller)
+    assert status["state"] == "ready" and status["applied"] is True
+    assert prepared[0].published and prepared[0].closed
+
+
+def test_changed_generation_after_preparation_cannot_publish(state, monkeypatch):
+    prepared = fake_persistence(state, monkeypatch)
+    prepare = hp.prepare_apply
+
+    def changed(*args):
+        replacement = prepare(*args)
+        state.generation = "another-window-committed-generation"
+        state.manifest["generation"] = state.generation
+        return replacement
+
+    monkeypatch.setattr(hp, "prepare_apply", changed)
+    controller = hc.HCorrectionController(state)
+    controller.start()
+    status = done(controller)
+    assert not any(item.published for item in prepared)
+    assert all(item.closed for item in prepared)
+    assert status["applied"] is False
+    assert status["generation"] == "another-window-committed-generation"
 
 
 def test_fit_inputs_have_true_partial_edge_means_and_no_rounding(state, tmp_path):
@@ -130,80 +320,6 @@ def test_fit_inputs_have_true_partial_edge_means_and_no_rounding(state, tmp_path
         np.testing.assert_array_equal(state.root["0"], original)
     finally:
         hc._close_maps([raw8, raw32])
-
-
-def test_native_coordinates_and_correction_before_reduction(state, tmp_path):
-    root = corrected_root(state, tmp_path)
-    originals = {key: value.copy() for key, value in state.root.items()}
-    full = root.model.correct(3, state.root["0"][3], 0, 0)
-    try:
-        for level in range(3):
-            factor = 2**level
-            got = root[str(level)][:, 7:21, 9:25]
-            expected = full if factor == 1 else means(full, factor)
-            np.testing.assert_array_equal(got[3], expected[7:21, 9:25])
-            # Includes BF, DAPI, and CY3 whose fitted model was disabled.
-            np.testing.assert_array_equal(got[:3], state.root[str(level)][:3, 7:21, 9:25])
-        np.testing.assert_array_equal(root["0"][3, 19:27, 31:44], full[19:27, 31:44])
-        selected = root["0"][[3, 1], 19:27, 31:44]
-        np.testing.assert_array_equal(selected[0], full[19:27, 31:44])
-        np.testing.assert_array_equal(selected[1], state.root["0"][1, 19:27, 31:44])
-        # A post-downsample approximation would change this concrete result.
-        wrong = root.model.correct(3, state.root["1"][3, 7:21, 9:25], 14, 18)
-        assert np.max(np.abs(root["1"][3, 7:21, 9:25] - wrong)) > 1
-        for key, old in originals.items():
-            np.testing.assert_array_equal(state.root[key], old)
-    finally:
-        root.close()
-
-
-def test_coarse_levels_crop_fit_edges_and_keep_raw_other_channels(state, tmp_path):
-    root = corrected_root(state, tmp_path, coarse=True)
-    temporary = Path(root.temporary.name)
-    full = root.model.correct(3, state.root["0"][3], 0, 0)
-    try:
-        for level in range(3, 6):
-            got = root[str(level)][:]
-            h, w = got.shape[1:]
-            expected = means(full, 2**level)[:h, :w]
-            # Coarser levels average float32 8x means; only normal floating
-            # summation roundoff differs from one direct float64 reduction.
-            np.testing.assert_allclose(got[3], expected, rtol=2e-7, atol=5e-4)
-            np.testing.assert_array_equal(got[:3], state.root[str(level)][:3])
-            assert got.dtype == np.float32
-        assert root["3"].shape == (4, 32, 33)
-    finally:
-        root.close()
-    assert not temporary.exists()
-    with pytest.raises(ValueError, match="closed"):
-        root["0"][:, :1, :1]
-
-
-def test_controller_revision_is_private_and_rejects_stale_ids(state, monkeypatch):
-    monkeypatch.setattr(hc, "_metadata_for_state", metadata)
-    monkeypatch.setattr(hc, "_fit_model", fake_fitter)
-    controller = hc.HCorrectionController(state)
-    raw_root = state.root
-    assert controller.status()["state"] == "idle"
-    assert controller.status()["eta_seconds"] is None
-    assert controller.start()["generation"] == state.generation
-    status = done(controller)
-    assert status["state"] == "ready", status
-    assert status["channels"] == ["FITC"]
-    assert status["pct"] == 100
-    assert status["elapsed_seconds"] >= 0
-    root = controller.root_for(status["correction_id"])
-    assert state.root is raw_root
-    assert controller.start()["correction_id"] == status["correction_id"]
-    assert controller.cancel()["state"] == "ready"  # RAW/H toggle belongs to the pane.
-    with pytest.raises(ValueError, match="unavailable"):
-        controller.root_for("another-slide-or-old-revision")
-    assert not (Path(root.temporary.name) / "raw8.npy").exists()
-    assert state.busy.active == 0
-    state.source_path.unlink()
-    with pytest.raises(ValueError, match="source is unavailable"):
-        controller.root_for(status["correction_id"])
-    controller.close()
 
 
 def test_cancel_fit_is_nonblocking_and_never_publishes(state, monkeypatch):

@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from nd2wsi import render
@@ -198,3 +199,126 @@ def test_adapter_preserves_bad_request_status_and_message(params, message):
     status, error = handler._roi(state(), query(**params))
     assert status == 400
     assert message in error
+
+
+@pytest.fixture
+def persisted_correction(tmp_path):
+    """Expected RAW levels come from the real converter, including rounding."""
+    import zarr
+
+    from nd2wsi.convert import _downsample_into, build_group_attrs
+    from nd2wsi.reader import ChannelInfo, PlaneSource
+
+    raw = np.random.default_rng(19).integers(0, 48, (2, 131, 519), dtype=np.uint16)
+    # Repeated integer rounding differs from a single 4x mean here.
+    raw[:, :4, :4] = [[0, 0, 0, 0], [1, 1, 1, 1],
+                       [0, 0, 1, 1], [1, 1, 2, 2]]
+    raw[:, -1, :] = 65535
+    raw[:, :, -1] = 65535
+    store = zarr.open_group(str(tmp_path / "original.zarr"), mode="w", zarr_format=2)
+    a = store.create_array("0", shape=raw.shape, chunks=(1, 64, 64), dtype=raw.dtype)
+    a[:] = raw
+    expected = {"0": raw}
+    shapes = [raw.shape[1:]]
+    for level in range(1, 9):
+        ph, pw = shapes[-1]
+        shape = (max(1, ph // 2), max(1, pw // 2))
+        target = store.create_array(str(level), shape=(2, *shape),
+                                    chunks=(1, 64, 64), dtype=raw.dtype)
+        _downsample_into(store[str(level - 1)], target, 64, raw.dtype)
+        expected[str(level)] = np.asarray(target[:])
+        shapes.append(shape)
+
+    class Native:
+        shape, dtype = raw.shape, raw.dtype
+
+        def __init__(self):
+            self.read_shapes = []
+
+        def __getitem__(self, index):
+            values = raw[index].copy()
+            self.read_shapes.append(values.shape[-2:])
+            return values
+
+    class Root(dict):
+        pass
+
+    root = Root({k: v.astype(np.float32) + 80 for k, v in expected.items()})
+    root.raw_level0 = Native()
+    src = PlaneSource(data=None, dtype=raw.dtype, shape=raw.shape, rgb=False,
+                      channels=[ChannelInfo("FITC", (255, 255, 255)),
+                                ChannelInfo("CY3", (255, 255, 255))],
+                      pixel_size_um=(0.5, 0.5), source_name="example.nd2",
+                      selection={"t": 0, "p": 0, "z": 0})
+    attrs = build_group_attrs(src, shapes, 64,
+                              [dict(start=0, end=255, min=0, max=255)] * 2)
+    st = ViewerState(root, attrs, manifest={"h_correction": {"applied": True}})
+    try:
+        yield st, expected
+    finally:
+        store.store.close()
+
+
+@pytest.mark.parametrize("fmt", ["png", "jpg", "svg"])
+def test_persisted_rendered_exports_use_saved_display_and_suffix(persisted_correction, fmt):
+    from PIL import Image
+
+    st, expected = persisted_correction
+    w, h = (128, 80) if fmt == "svg" else (25, 19)
+    q = query(x=5, y=7, w=w, h=h, format=fmt)
+    shown = prepare_export(st, q, resolve_frame=_frame_args)
+    # A legacy URL cannot select a private correction revision anymore.
+    legacy = prepare_export(st, q | {"correction": ["old-private-revision"]}, resolve_frame=_frame_args)
+    assert shown.root is st.root and legacy.root is st.root
+    result = shown.rendered()
+    assert "_shading-corrected_" in result.filename
+    if fmt == "png":
+        raw_state = ViewerState(expected, st.attrs)
+        uncorrected = prepare_export(raw_state, q, resolve_frame=_frame_args).rendered()
+        assert np.asarray(Image.open(io.BytesIO(result.body))).mean() > np.asarray(
+            Image.open(io.BytesIO(uncorrected.body))).mean()
+
+
+@pytest.mark.parametrize("fmt", ["tiff", "nd2"])
+@pytest.mark.parametrize("level", [0, 2])
+def test_persisted_native_exports_roundtrip_original_values_at_requested_level(
+        persisted_correction, fmt, level):
+    st, expected = persisted_correction
+    if fmt == "nd2":
+        pytest.importorskip("limnd2")
+        nd2 = pytest.importorskip("nd2")
+    q = query(x=3, y=5, w=19, h=17, format=fmt, level=level, c="1,0")
+    plan = prepare_export(st, q | {"correction": ["ignored-legacy-revision"]}, resolve_frame=_frame_args)
+    with plan.file(lambda *args, **kwargs: None) as result:
+        assert "shading-corrected" not in result.filename
+        if fmt == "nd2":
+            with nd2.ND2File(str(result.path)) as reader:
+                exported = np.asarray(reader.read_frame(0)).copy()
+                assert reader.voxel_size().x == pytest.approx(0.5 * 2**level)
+                assert [ch.channel.name for ch in reader.metadata.channels] == ["CY3", "FITC"]
+        else:
+            import tifffile
+
+            exported = tifffile.imread(result.path)
+        assert exported.dtype == np.uint16
+        np.testing.assert_array_equal(exported, expected[str(level)][[1, 0], 5:22, 3:22])
+
+
+def test_original_reduction_matches_converter_rounding_odd_edges_and_collapsed_axes(persisted_correction):
+    st, expected = persisted_correction
+    for level in (1, 2, 8):
+        plan = prepare_export(st, query(level=level), resolve_frame=_frame_args)
+        actual = plan.root[str(level)][:, :, :]
+        np.testing.assert_array_equal(actual, expected[str(level)])
+    assert expected["2"][0, 0, 0] == 0
+    assert np.rint(expected["0"][0, :4, :4].mean()) == 1
+    assert max(max(shape) for shape in st.root.raw_level0.read_shapes) <= 256
+
+
+@pytest.mark.parametrize("fmt", ["nd2", "tiff"])
+def test_native_export_requires_original_source_when_corrected_cache_is_degraded(persisted_correction, fmt):
+    st, _ = persisted_correction
+    del st.root.raw_level0
+    with pytest.raises(ExportRequestError, match="reopen the original ND2"):
+        prepare_export(st, query(format=fmt, level=2), resolve_frame=_frame_args)
+    assert prepare_export(st, query(format="png"), resolve_frame=_frame_args).root is st.root

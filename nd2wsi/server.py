@@ -164,10 +164,14 @@ class ViewerState:
         self._lut_settings_store = None
         self._shading = None
         self._shading_lock = threading.Lock()
+        self._replacement_lock = threading.RLock()
+        self._closed = False
+        self.correction_write_allowed = True
+        self._cache_identity = self._pyramid_identity()
 
     @property
     def shading(self):
-        """Private, optional correction; the registered RAW root never changes."""
+        """Persistent, source-bound correction of the registered display pyramid."""
         with self._shading_lock:
             if self._shading is None:
                 from .h_correction import HCorrectionController
@@ -179,6 +183,103 @@ class ViewerState:
         with self._shading_lock:
             if self._shading is not None:
                 self._shading.close()
+        with self._replacement_lock:
+            self._closed = True
+
+    def _pyramid_identity(self):
+        path = self.cache_path
+        try:
+            if path is not None and path.suffix.lower() == ".nd2svs":
+                st = path.stat()
+                return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
+    def _close_root(root):
+        close = getattr(root, "close", None)
+        if close is not None:
+            try:
+                close(delay=0)
+            except TypeError:
+                close()
+
+    def _open_pyramid(self, path, manifest):
+        if manifest.get("kind") == "overview":
+            from .direct import open_nd2_backed
+            return open_nd2_backed(self.source_path, path)
+        from .convert import open_store
+        return open_store(path)
+
+    def _adopt_pyramid(self, root, attrs, manifest):
+        self.root, self.attrs, self.manifest = root, attrs, dict(manifest)
+        self.generation = str(manifest["generation"])
+        self.histograms = None
+        self._cache_usage_ready = False
+        self._cache_usage = None
+        self._cache_identity = self._pyramid_identity()
+
+    def replace_pyramid(self, replacement):
+        """Validate, drain readers, atomically publish, then reopen the new pixels."""
+        with self._replacement_lock:
+            if self._closed:
+                raise ValueError("The slide was closed before pyramid publication")
+            probe, _ = self._open_pyramid(replacement.staging, replacement.manifest)
+            self._close_root(probe)
+            if not self.busy.close(timeout=30):
+                self.busy.reopen()
+                raise ValueError("A slide read/export is still running; retry the replacement")
+            admitted = False
+            try:
+                self._close_root(self.root)
+                try:
+                    replacement.publish()
+                except BaseException:
+                    # A denied rename (including another Windows reader) keeps
+                    # the original file intact. Reopen it before admitting reads.
+                    root, attrs = self._open_pyramid(replacement.final, replacement.prior_manifest)
+                    self._adopt_pyramid(root, attrs, replacement.prior_manifest)
+                    admitted = True
+                    raise
+                try:
+                    root, attrs = self._open_pyramid(replacement.final, replacement.manifest)
+                except Exception as exc:
+                    self.manifest = dict(replacement.manifest)
+                    self.generation = str(replacement.manifest["generation"])
+                    self._cache_identity = None  # Status retries activation of the saved cache.
+                    raise RuntimeError("The new pyramid was saved but could not be opened; reopen the slide") from exc
+                self._adopt_pyramid(root, attrs, replacement.manifest)
+                admitted = True
+            finally:
+                # If the OS denies reopening after a successful publish, the
+                # validated cache remains on disk. Keep reads barred until reopen.
+                if admitted:
+                    self.busy.reopen()
+
+    def refresh_pyramid(self):
+        """Observe another window's atomic replacement without resetting sidecars."""
+        identity = self._pyramid_identity()
+        if identity is None or identity == self._cache_identity or self._closed:
+            return
+        from .cache import read_manifest
+        with self._replacement_lock:
+            identity = self._pyramid_identity()
+            if identity is None or identity == self._cache_identity or self._closed:
+                return
+            manifest = read_manifest(self.cache_path, recover=False)
+            if not manifest or not manifest.get("generation"):
+                raise ValueError("The replaced pyramid has no complete manifest")
+            root, attrs = self._open_pyramid(self.cache_path, manifest)
+            if not self.busy.close(timeout=30):
+                self._close_root(root)
+                self.busy.reopen()
+                raise ValueError("Waiting for slide reads before opening the replaced pyramid")
+            try:
+                self._close_root(self.root)
+                self._adopt_pyramid(root, attrs, manifest)
+            finally:
+                self.busy.reopen()
 
     @property
     def source_path(self) -> Path | None:
@@ -374,6 +475,8 @@ def _pixel_payload(
     yi = max(0, min(int(y), height - 1))
     if root is None:
         root = st.root
+    if str(level["path"]) == "0" and hasattr(root, "raw_level0"):
+        root = {"0": root.raw_level0}
     region = render._read_region(root, str(level["path"]), xi, yi, 1, 1)
     if region.shape[1:] != (1, 1):
         raise ValueError("pixel is outside the displayed image")
@@ -580,10 +683,11 @@ class SlideRegistry:
             if store_path.suffix.lower() == SINGLE_FILE_SUFFIX and not manifest:
                 raise ValueError("single-file cache has no complete manifest")
             if store_path.suffix.lower() == SINGLE_FILE_SUFFIX:
-                expected_format = (
-                    "nd2wsi-plate/2" if manifest.get("kind") == "plate" else "nd2wsi-cache/4"
+                expected_formats = (
+                    {"nd2wsi-plate/2"} if manifest.get("kind") == "plate"
+                    else {"nd2wsi-cache/4", "nd2wsi-cache/5"}
                 )
-                if (manifest.get("format") != expected_format
+                if (manifest.get("format") not in expected_formats
                         or manifest.get("kind") not in ("full", "overview", "plate")):
                     raise ValueError("unsupported single-file cache format; update the viewer")
             registered_source = registered_source or _manifest_source_path(
@@ -630,6 +734,9 @@ class SlideRegistry:
                     except TypeError:
                         close()
                 raise
+            if self.agent_window:
+                private = getattr(self.window_session, "exports_root", None)
+                st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
         _close_state(stale)
         return sid
@@ -727,6 +834,9 @@ class SlideRegistry:
                 container_path=container,
                 manifest=manifest,
             )
+            if self.agent_window:
+                private = getattr(self.window_session, "exports_root", None)
+                st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
         _close_state(stale)
         return sid
@@ -787,6 +897,9 @@ class SlideRegistry:
                 source_path=slide_path,
                 manifest={"source": fingerprint},
             )
+            if self.agent_window:
+                private = getattr(self.window_session, "exports_root", None)
+                st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
         _close_state(stale)
         return sid
@@ -872,6 +985,9 @@ class SlideRegistry:
                           else {"source": fingerprint}),
                 plate=source,
             )
+            if self.agent_window:
+                private = getattr(self.window_session, "exports_root", None)
+                st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
         _close_state(stale)
         return sid
@@ -1446,10 +1562,12 @@ def make_handler(
                     return self._json(registry.lut_settings_for(st).read())
                 if sub == "/api/inspect":
                     return self._inspect(st)
-                if sub == "/api/pixel":
-                    return self._pixel(st, q)
-                if sub == "/api/histogram":
-                    return self._histogram(st, q)
+                if sub in ("/api/pixel", "/api/histogram"):
+                    try:
+                        with st.busy:
+                            return self._pixel(st, q) if sub.endswith("pixel") else self._histogram(st, q)
+                    except ValueError as e:
+                        return self._error(409, str(e))
                 if sub == "/api/shading/status":
                     return self._json(st.shading.status())
                 if sub == "/api/annotations":
@@ -1499,15 +1617,23 @@ def make_handler(
                 if path == "/api/trash":
                     return self._trash()
                 st, sub = self._resolve(path)
-                if st is not None and sub in ("/api/shading/start", "/api/shading/cancel"):
+                if st is not None and sub in ("/api/shading/start", "/api/shading/revoke", "/api/shading/cancel"):
                     try:
                         data = self._body_json(limit=1000)
-                        if not isinstance(data, dict) or data:
-                            raise ValueError("expected an empty JSON object")
+                        if not isinstance(data, dict) or set(data) != {"generation"} or not isinstance(data["generation"], str):
+                            raise ValueError("expected the current slide generation")
                     except (ValueError, json.JSONDecodeError) as e:
                         return self._error(400, str(e))
-                    action = st.shading.start if sub.endswith("/start") else st.shading.cancel
                     try:
+                        controller = st.shading
+                        current = controller.status()
+                        if data["generation"] != current["generation"]:
+                            return self._error(409, "The pyramid changed; refresh before continuing")
+                        if not st.correction_write_allowed:
+                            return self._error(403, "Agent windows can replace pyramids only in their private exports folder")
+                        action = {"/api/shading/start": controller.start,
+                                  "/api/shading/revoke": controller.revoke,
+                                  "/api/shading/cancel": controller.cancel}[sub]
                         return self._json(action())
                     except ValueError as e:
                         return self._error(409, str(e))
@@ -1920,6 +2046,18 @@ def make_handler(
             )
 
         def _tile(self, st: ViewerState, m: re.Match, q: dict):
+            try:
+                with st.busy:
+                    generation = (q.get("g") or [None])[0]
+                    if generation and generation != st.generation:
+                        return self._error(409, "The pyramid changed; refresh the slide")
+                    if q.get("correction"):
+                        return self._error(409, "Shading Correction now replaces the pyramid; refresh the slide")
+                    return self._tile_impl(st, m, q)
+            except ValueError as e:
+                return self._error(409, str(e))
+
+        def _tile_impl(self, st: ViewerState, m: re.Match, q: dict):
             level, tx, ty = int(m.group(1)), int(m.group(2)), int(m.group(3))
             fmt = m.group(4)
             n = len(st.attrs["omero"]["channels"])
@@ -1930,14 +2068,6 @@ def make_handler(
             except ValueError as e:
                 return self._error(400, str(e))
             root = st.plate.root_for(*frame) if frame is not None else st.root
-            correction = (q.get("correction") or [None])[0]
-            if correction:
-                try:
-                    if frame is not None:
-                        raise ValueError("Shading correction is unavailable for plate frames")
-                    root = st.shading.root_for(correction)
-                except ValueError as e:
-                    return self._error(409, str(e))
             try:
                 body = render.render_tile(
                     root, st.attrs, level, tx, ty, channels, fmt, win

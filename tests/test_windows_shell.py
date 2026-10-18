@@ -179,8 +179,10 @@ const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){
     return {ok:mode!=='missing-icon',status:404,text:async()=>mode==='invalid-icon'?'bad':'svg'}},
   DOMParser:class{parseFromString(text){return {documentElement:{tagName:text==='svg'?'svg':'parsererror',getAttribute:()=> '0 0 20 20'},querySelector:()=>({})}}},
   eval(expression){
-    if(expression==='state.shading && state.shading.snapshot().state !== "checking"')return true;
-    if(expression==='state.shading.snapshot()')return {state:'idle',enabled:false};
+    if(expression.startsWith('state.shading && '))return true;
+    if(expression==='state.shading.snapshot()')return mode==='legacy-shading-status'?{state:'idle',enabled:false}:
+      {state:mode==='applied'?'ready':'idle',applied:mode==='applied',operation:null,can_cancel:false,generation:'pyramid-test'};
+    if(expression==='state.info.generation')return 'pyramid-test';
     if(expression==='state.lutAutoPending.some(Boolean)')return mode==='autolut-timeout';
     if(expression.includes('planPaste'))return 2;
     return encoded;
@@ -191,8 +193,12 @@ const page={baseURI:'http://viewer.test/private-token/s/test/',
   getElementById:id=>buttons[id]};
 const frame={dataset:{sid:'test'},contentDocument:page,contentWindow:view};
 const shellControls={
-  'shading-correction':mode==='missing-shading-control'?null:{title:'Apply Shading Correction'},
+  'shading-correction':mode==='missing-shading-control'?null:{title:mode==='applied'?'Shading Correction applied · Revoke…':'Apply Shading Correction'},
   'shading-progress-bar':{},
+  'shading-progress-title':{},'shading-cancel':{},
+  'shading-confirm':mode==='missing-shading-confirmation'?null:{showModal(){}},
+  'shading-confirm-title':{},'shading-confirm-message':{},'shading-confirm-estimate':{},
+  'shading-confirm-continue':{},'shading-confirm-cancel':{},
 };
 const context={window:{pywebview:{api:{update_status(){}}},__nd2wsiSmokeBridge:{version:'test'},Nd2ShadingCorrection:Shading},
   document:{readyState:'complete',querySelector:()=>frame,getElementById:id=>shellControls[id]||null},
@@ -211,11 +217,13 @@ vm.createContext(context);
 
 
 @pytest.mark.parametrize("mode, clipboard, error", [
-    ("ready", False, None), ("ready", True, None),
+    ("ready", False, None), ("ready", True, None), ("applied", False, None),
     ("missing-module", False, "transfer module is unavailable"),
     ("missing-handler", False, "toolbar is not wired"),
     ("missing-shading-control", False, "Shading Correction controls are unavailable"),
     ("missing-shading-module", False, "Shading Correction controls are unavailable"),
+    ("missing-shading-confirmation", False, "Shading Correction controls are unavailable"),
+    ("legacy-shading-status", False, "committed pyramid state"),
     ("missing-icon", False, "HTTP 404"), ("invalid-icon", False, "Invalid packaged LUT icon"),
     ("copy-failure", True, "copy failed: Write permission denied"),
     ("paste-failure", True, "paste failed: Read permission denied"),
@@ -245,7 +253,7 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
             "script": script, "mode": mode,
             "shadingModule": str(Path(__file__).resolve().parents[1] / "nd2wsi/static/shading-correction-v1.js"),
         }),
-        check=True, capture_output=True, text=True, timeout=20,
+        check=True, capture_output=True, text=True, encoding="utf-8", timeout=20,
     )
     out = json.loads(result.stdout)
     assert out["first"]["lut_toolbar"]["pending"] is True
@@ -263,9 +271,13 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
         assert result["phase"] == "complete"
         assert result["clipboard_api"] == {"write": True, "read": True}
         assert result["shading_correction"] == {
-            "state": "idle", "original_view": True, "toolbar": True,
-            "progress": {"visible": True, "stage": "Preparing corrected view", "pct": 63,
-                         "eta": "About 2 min remaining"},
+            "state": "ready" if mode == "applied" else "idle", "applied": mode == "applied",
+            "operation": None, "can_cancel": False, "generation": "pyramid-test", "toolbar": True, "confirmation": True,
+            "actions": {"apply": "start", "revoke": "revoke", "cancel": "cancel", "publishing": None},
+            "progress": {"visible": True, "title": "Shading Correction", "stage": "Building corrected pyramid", "pct": 63,
+                         "canCancel": True, "eta": "About 2 min remaining"},
+            "revoke_progress": {"visible": True, "title": "Revoke Shading Correction", "stage": "Rebuilding original pyramid", "pct": 41,
+                                "canCancel": True, "eta": "About 2 min remaining"},
         }
         assert out["fetches"] == [
             "http://viewer.test/private-token/static/icons/" + name

@@ -27,12 +27,17 @@ from ..platform_io import filesystem_path
 
 APPLICATION_ID = 0x4E443253
 FORMAT_VERSION = 2
+# Corrected caches need a capability barrier even when opened directly. Raw
+# caches keep version 2 so revocation restores the historical readable format.
+CORRECTED_FORMAT_VERSION = 3
+MAX_READABLE_VERSION = CORRECTED_FORMAT_VERSION
 # Keep the search B-tree small: a WITHOUT ROWID table puts the large encoded
 # chunk in its index payload, so even key comparisons can read overflow BLOBs.
 # A rowid table's implicit UNIQUE key index contains only (key, rowid).
 _SCHEMA = "CREATE TABLE entries (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL)"
 _LEGACY_SCHEMA = "CREATE TABLE entries (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID"
-_READABLE_VERSIONS = frozenset({1, FORMAT_VERSION})
+_READABLE_VERSIONS = frozenset({1, FORMAT_VERSION, CORRECTED_FORMAT_VERSION})
+_WRITABLE_VERSIONS = frozenset({FORMAT_VERSION, CORRECTED_FORMAT_VERSION})
 _COMPANION_SUFFIXES = ("-journal", "-wal", "-shm")
 _PAGE_KEYS = 256
 _RECOVERY_TIMEOUT = 1.0
@@ -85,7 +90,8 @@ class SQLiteStore(Store):
     and disables memory mapping. ``batch`` is for synchronous byte writes only;
     do not call Zarr's asynchronous/synchronous array API inside its context.
     Prototype format 1 is accepted read-only for verification/recovery; new and
-    writable containers require format 2 and never upgrade a file in place.
+    writable containers accept formats 2 and 3 without upgrading in place.
+    Creation defaults to format 2; corrected-cache writers opt into format 3.
     ``recover=True`` explicitly permits rollback recovery during a read-only
     open; ordinary inspection and Agent shared-cache reads must leave it false.
     """
@@ -97,7 +103,7 @@ class SQLiteStore(Store):
 
     def __init__(
         self, path: str | os.PathLike, *, read_only: bool = False, prefix: str = "",
-        recover: bool = False, _exclusive: bool = False,
+        recover: bool = False, _exclusive: bool = False, format_version: int = FORMAT_VERSION,
     ):
         super().__init__(read_only=read_only)
         self.path = self.root = Path(os.path.abspath(os.fspath(path)))
@@ -108,12 +114,17 @@ class SQLiteStore(Store):
         self._in_batch = False
         self._exclusive = _exclusive
         self._recover = recover
+        if format_version not in _WRITABLE_VERSIONS:
+            raise ValueError("unsupported single-file creation version")
+        self._format_version = format_version
         self._ensure_open_sync()
 
     @classmethod
-    def create_exclusive(cls, path: str | os.PathLike, *, prefix: str = "") -> SQLiteStore:
+    def create_exclusive(
+        cls, path: str | os.PathLike, *, prefix: str = "", format_version: int = FORMAT_VERSION,
+    ) -> SQLiteStore:
         """Atomically create a new container; never adopt an existing pathname."""
-        return cls(path, prefix=prefix, _exclusive=True)
+        return cls(path, prefix=prefix, _exclusive=True, format_version=format_version)
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, SQLiteStore) and (self.path, self.prefix) == (
@@ -140,21 +151,21 @@ class SQLiteStore(Store):
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if app_id != APPLICATION_ID or version not in _READABLE_VERSIONS:
             raise ValueError("not a supported nd2wsi single-file cache (application ID/version)")
-        if version != FORMAT_VERSION and not read_only:
+        if version not in _WRITABLE_VERSIONS and not read_only:
             raise ValueError("prototype single-file cache is read-only; rebuild it as format 2")
         schema = connection.execute(
             "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name LIMIT 3"
         ).fetchall()
         expected = [("table", "entries", "entries")]
-        if version == FORMAT_VERSION:
+        if version in _WRITABLE_VERSIONS:
             expected.append(("index", "sqlite_autoindex_entries_1", "entries"))
         if [row[:3] for row in schema] != expected:
             raise ValueError("unsupported single-file cache schema")
         normalized = "".join((schema[0][3] or "").split()).lower()
-        table_schema = _SCHEMA if version == FORMAT_VERSION else _LEGACY_SCHEMA
+        table_schema = _SCHEMA if version in _WRITABLE_VERSIONS else _LEGACY_SCHEMA
         if normalized != "".join(table_schema.split()).lower():
             raise ValueError("unsupported single-file cache schema")
-        if version == FORMAT_VERSION and schema[1][3] is not None:
+        if version in _WRITABLE_VERSIONS and schema[1][3] is not None:
             raise ValueError("unsupported single-file cache schema")
 
     @staticmethod
@@ -167,7 +178,7 @@ class SQLiteStore(Store):
             connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
 
     def _recover_hot_journal(self) -> None:
-        """Let SQLite roll back one interrupted format-2 write, never discard it.
+        """Let SQLite roll back one interrupted owned write, never discard it.
 
         Called only after SQLITE_READONLY_ROLLBACK, not merely because a
         journal exists: active writers keep their journals and SQLite locks.
@@ -253,7 +264,7 @@ class SQLiteStore(Store):
                     or int.from_bytes(header[68:72], "big") != APPLICATION_ID
                 ):
                     raise ValueError("not a supported nd2wsi single-file cache (header)")
-                if version != FORMAT_VERSION and not self.read_only:
+                if version not in _WRITABLE_VERSIONS and not self.read_only:
                     raise ValueError("prototype single-file cache is read-only; rebuild it as format 2")
                 # SQLite may create -shm when a stray -wal exists even if the
                 # main header still says rollback mode. This format never uses
@@ -286,7 +297,7 @@ class SQLiteStore(Store):
                     try:
                         connection.execute(_SCHEMA)
                         connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
-                        connection.execute(f"PRAGMA user_version={FORMAT_VERSION}")
+                        connection.execute(f"PRAGMA user_version={self._format_version}")
                         connection.commit()
                     except BaseException:
                         connection.rollback()
@@ -575,7 +586,7 @@ def newer_file_format(path: str | os.PathLike) -> int | None:
     ):
         return None
     version = int.from_bytes(header[60:64], "big")
-    return version if version > FORMAT_VERSION else None
+    return version if version > MAX_READABLE_VERSION else None
 
 
 def open_zarr_group(path: str | os.PathLike, prefix: str = "store.ome.zarr", mode: str = "r"):

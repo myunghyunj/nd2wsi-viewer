@@ -199,8 +199,10 @@ def phase_cells(raw32, basis, boxes, bfi, reference, saturation, fit_indices, ch
 
 class Model:
     def __init__(self, path):
-        self.path = Path(path)
-        self.data = np.load(path)
+        # Persisted models are small, verified NPZ entries inside .nd2svs.
+        # A BytesIO keeps reopen read-only and avoids temporary sidecar files.
+        self.path = None if hasattr(path, "read") else Path(path)
+        self.data = np.load(path, allow_pickle=False)
         self.basis = self.data["basis"]
         self.templates = self.data["templates"]
         self.delta = self.data["delta"]

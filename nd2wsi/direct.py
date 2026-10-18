@@ -283,6 +283,27 @@ class _Nd2Level0:
             return self._view[cs, y0:y1, x0:x1].copy()
 
 
+class _PersistedHLevel0:
+    """Correct native display pixels while retaining a separate RAW adapter."""
+
+    def __init__(self, raw, model, life):
+        self.raw, self.model, self._life = raw, model, life
+        self.shape, self.dtype = raw.shape, np.dtype("float32")
+        self._enabled = {c for c, enabled in zip(model.indices, model.enabled) if enabled}
+
+    def __getitem__(self, idx):
+        cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
+        with self._life:
+            out = np.asarray(self.raw[cs, y0:y1, x0:x1], dtype=np.float32)
+            selected = np.arange(self.shape[0])[cs]
+            scalar = np.ndim(selected) == 0
+            result = out[None, ...] if scalar else out
+            for slot, channel in enumerate(np.atleast_1d(selected)):
+                if int(channel) in self._enabled and y1 > y0 and x1 > x0:
+                    result[slot] = self.model.correct(int(channel), result[slot], y0, x0)
+            return out
+
+
 MAX_EXTRA = 8  # deepest on-the-fly downsample of one embedded level
 
 
@@ -433,7 +454,7 @@ def open_nd2_backed(
     )
 
     f = nd2.ND2File(str(slide))
-    zroot = None
+    zroot = model = None
     try:
         ok, why = is_source_backable(f, selection)
         if not ok:
@@ -454,7 +475,21 @@ def open_nd2_backed(
             )
 
         life = _Lifecycle()
-        levels: dict[str, Any] = {"0": _Nd2Level0(view, life, slide)}
+        raw_level0 = _Nd2Level0(view, life, slide)
+        levels: dict[str, Any] = {"0": raw_level0}
+        if (manifest.get("format") == "nd2wsi-cache/5"
+                or manifest.get("h_correction") is not None or meta.get("h_correction") is not None):
+            from .cache import fingerprints_match, quick_fingerprint
+            from .h_persistence import load_model
+
+            if meta.get("h_correction") != manifest.get("h_correction"):
+                raise ValueError("Stored and native correction provenance disagree")
+            if not fingerprints_match(manifest.get("source", {}), quick_fingerprint(slide)):
+                raise ValueError("The original ND2 no longer matches its corrected cache")
+            model = load_model(store, manifest)
+            levels["0"] = _PersistedHLevel0(raw_level0, model, life)
+            meta["h_correction"] = manifest["h_correction"]
+            meta["display_dtype"] = "float32"
         for lv in meta["levels"]:
             levels[lv["path"]] = zroot[lv["path"]]
 
@@ -478,6 +513,8 @@ def open_nd2_backed(
         try:
             f.close()
         finally:
+            if model is not None:
+                model.data.close()
             close = getattr(zroot, "close", None)
             if close is not None:
                 close()
@@ -495,8 +532,13 @@ def open_nd2_backed(
         except BufferError:  # pragma: no cover - defensive
             pass
         finally:
+            if model is not None:
+                model.data.close()
             close = getattr(zroot, "close", None)
             if close is not None:
                 close()
 
-    return _Root(levels, _teardown), attrs
+    root = _Root(levels, _teardown)
+    # Pixel probes and native ND2 exports use this adapter, never H(display).
+    root.raw_level0 = raw_level0
+    return root, attrs

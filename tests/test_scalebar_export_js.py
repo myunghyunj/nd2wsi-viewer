@@ -18,8 +18,7 @@ const src=fs.readFileSync(process.argv[1], 'utf8'), cfg=JSON.parse(process.argv[
 const downloads=[], toasts=[], controls={};
 const context={URLSearchParams, Number, Math,
   state:{roi:{x:110,y:220,w:800,h:776}, channels:[1],
-    info:{channels:[0,1], levels:[{path:'3',downsample:8}], maxRenderMpx:400},
-    shading:{appendRenderParams:q=>{if(cfg.correction)q.set('correction',cfg.correction);return q}}},
+    info:{channels:[0,1], levels:[{path:'3',downsample:8}], maxRenderMpx:400,generation:cfg.generation}},
   activeFrameContext:()=>cfg.hasFrame===false?null:{frame:{t:2,p:3,z:4}},
   frameOwnsRoi:()=>cfg.hasRoi!==false && cfg.hasFrame!==false,
   pixelSize:()=>cfg.pixelSize===undefined?[.8,.5]:cfg.pixelSize,
@@ -59,16 +58,17 @@ def test_both_buttons_use_actual_level_path_and_selected_frame_lut_channels():
     assert all(not button["disabled"] for button in out["controls"].values())
 
 
-def test_shading_is_in_rendered_exports_and_absent_from_original_nd2_tiff():
-    out = run({"correction": "h-fixed", "formats": ["svg", "jpg", "png", "tiff", "nd2"]})
+def test_rendered_exports_name_committed_pyramid_and_raw_exports_stay_source_bound():
+    out = run({"generation": "corrected-generation", "formats": ["svg", "jpg", "png", "tiff", "nd2"]})
     assert len(out["downloads"]) == 5
     for url in out["downloads"]:
         q = parse_qs(urlparse(url).query)
+        assert "correction" not in q
         if q["format"][0] in {"svg", "jpg", "png"}:
-            assert q["correction"] == ["h-fixed"]
+            assert q["g"] == ["corrected-generation"]
             assert "win" in q
         else:
-            assert "correction" not in q and "win" not in q
+            assert "g" not in q and "win" not in q
 
 
 @pytest.mark.parametrize("config,reason", [({"pixelSize":None},"calibration"),

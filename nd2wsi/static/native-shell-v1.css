@@ -93,6 +93,7 @@ button { color:inherit; font:inherit; }
 .shading-confirm-actions button { min-width:84px; padding:7px 13px; border:0; border-radius:7px; color:#fff; font-size:12px; font-weight:550; }
 #shading-confirm-continue { background:#248a3d; }
 #shading-confirm-cancel { background:#d72c30; }
+#shading-confirm.revoke #shading-confirm-continue { background:#007aff; }
 .shading-confirm-actions button:hover { filter:brightness(1.12); }
 .shading-confirm-actions button:focus-visible { outline:2px solid var(--label); outline-offset:3px; }
 #shading-correction.preparing .shading-icon { animation:shading-pulse 1s ease-in-out infinite alternate; }

@@ -18,7 +18,9 @@ from zarr.core.buffer import default_buffer_prototype
 from nd2wsi.platform_io import filesystem_path
 from nd2wsi.storage.single_file import (
     APPLICATION_ID,
+    CORRECTED_FORMAT_VERSION,
     FORMAT_VERSION,
+    MAX_READABLE_VERSION,
     SQLiteStore,
     _database_uri,
     is_single_file,
@@ -61,6 +63,21 @@ def test_container_header_schema_and_bounded_connection_settings(tmp_path):
     assert path.read_bytes().startswith(b"SQLite format 3\0")
     assert list(tmp_path.iterdir()) == [path]
     assert is_single_file(path)
+
+
+def test_corrected_format_is_opt_in_and_raw_format_stays_writable(tmp_path):
+    raw, corrected = tmp_path / "raw.nd2svs", tmp_path / "corrected.nd2svs"
+    with SQLiteStore.create_exclusive(raw) as store:
+        store.write_bytes("marker", b"raw")
+    with SQLiteStore.create_exclusive(corrected, format_version=CORRECTED_FORMAT_VERSION) as store:
+        store.write_bytes("marker", b"corrected")
+    for path, expected in ((raw, FORMAT_VERSION), (corrected, CORRECTED_FORMAT_VERSION)):
+        with SQLiteStore(path) as store:
+            assert store._connection.execute("PRAGMA user_version").fetchone()[0] == expected
+            store.write_bytes("additional", b"same format")
+        with SQLiteStore(path, read_only=True) as store:
+            assert store.read_bytes("additional") == b"same format"
+            assert store._connection.execute("PRAGMA user_version").fetchone()[0] == expected
 
 
 def test_large_blob_key_lookups_and_listing_use_compact_covering_index(tmp_path):
@@ -177,7 +194,8 @@ def test_schema_version_and_actual_table_structure_must_match(tmp_path, prototyp
 @pytest.mark.parametrize(("version", "application", "expected"), [
     (1, APPLICATION_ID, None),
     (FORMAT_VERSION, APPLICATION_ID, None),
-    (FORMAT_VERSION + 1, APPLICATION_ID, FORMAT_VERSION + 1),
+    (CORRECTED_FORMAT_VERSION, APPLICATION_ID, None),
+    (MAX_READABLE_VERSION + 1, APPLICATION_ID, MAX_READABLE_VERSION + 1),
     (999, APPLICATION_ID, 999),
     (999, 123, None),
 ])

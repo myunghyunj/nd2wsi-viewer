@@ -63,6 +63,7 @@ def pack_directory(
     *,
     source: str | Path | None = None,
     on_progress: Callable[[float], None] | None = None,
+    storage_version: int = 2,
 ) -> dict[str, Any]:
     """Create and byte-verify a new file; never overwrite or remove anything.
 
@@ -71,7 +72,10 @@ def pack_directory(
     calibration, channels and selections remain byte-for-byte unchanged.
     """
     from . import __version__
-    from .storage.single_file import FORMAT_VERSION, SQLiteStore
+    from .storage.single_file import CORRECTED_FORMAT_VERSION, FORMAT_VERSION, SQLiteStore
+
+    if storage_version not in (FORMAT_VERSION, CORRECTED_FORMAT_VERSION):
+        raise ValueError("unsupported single-file packing version")
 
     container, target = Path(container), Path(target)
     if target.exists() or target.is_symlink():
@@ -106,7 +110,7 @@ def pack_directory(
     manifest["source"]["relative_path"] = Path(
         os.path.relpath(source, target.parent)
     ).as_posix()
-    manifest.setdefault("storage", {})["container"] = f"nd2svs-sqlite/{FORMAT_VERSION}"
+    manifest.setdefault("storage", {})["container"] = f"nd2svs-sqlite/{storage_version}"
     manifest["migration"] = {
         "from_format": old_format, "nd2wsi_version": __version__,
         "method": "compressed-entry-copy-sha256-verified",
@@ -118,7 +122,7 @@ def pack_directory(
     expected: dict[str, tuple[int, str]] = {}
     original_stats = {}
     target.parent.mkdir(parents=True, exist_ok=True)
-    store = SQLiteStore.create_exclusive(target)
+    store = SQLiteStore.create_exclusive(target, format_version=storage_version)
     try:
         # One transaction avoids a journal sync per tiny metadata/chunk entry.
         with store.batch():

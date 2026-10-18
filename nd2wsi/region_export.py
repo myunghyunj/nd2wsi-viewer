@@ -14,13 +14,74 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+import numpy as np
+
 from . import render
+from .direct import _parse_cyx_index
 
 JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
 class ExportRequestError(ValueError):
     """An expected export rejection that the HTTP adapter reports as 400."""
+
+
+class _OriginalReducedLevel:
+    """Recreate one RAW pyramid level without reading corrected cache pixels.
+
+    Match convert's box-mean-floor-v1: round each 2x reduction to the original
+    dtype, drop odd edges, and repeat axes already collapsed to one pixel.
+    Recursive reads stay bounded even when exporting a deeply reduced level.
+    """
+
+    def __init__(self, previous):
+        self.previous = previous
+        c, h, w = previous.shape
+        self.shape = (c, max(1, h // 2), max(1, w // 2))
+        self.dtype = np.dtype(previous.dtype)
+
+    def __getitem__(self, index):
+        cs, y0, y1, x0, x1 = _parse_cyx_index(index, self.shape)
+        selected = np.arange(self.shape[0])[cs]
+        scalar = np.ndim(selected) == 0
+        selected = np.atleast_1d(selected)
+        out = np.empty((len(selected), y1 - y0, x1 - x0), dtype=self.dtype)
+        _, ph, pw = self.previous.shape
+        integer = np.issubdtype(self.dtype, np.integer)
+        for slot, ci in enumerate(selected):
+            for y in range(y0, y1, 128):
+                ey = min(y + 128, y1)
+                for x in range(x0, x1, 128):
+                    ex = min(x + 128, x1)
+                    block = np.asarray(self.previous[int(ci), y * 2:min(ey * 2, ph),
+                                                     x * 2:min(ex * 2, pw)])
+                    if ph == 1:
+                        block = np.repeat(block, 2, axis=0)
+                    if pw == 1:
+                        block = np.repeat(block, 2, axis=1)
+                    mean = block.reshape(ey - y, 2, ex - x, 2).mean(
+                        axis=(1, 3), dtype=np.float32)
+                    values = np.rint(mean) if integer else mean
+                    out[slot, y - y0:ey - y0, x - x0:ex - x0] = values.astype(self.dtype)
+        return out[0] if scalar else out
+
+
+def _original_export_root(root, entry: dict, dtype: str):
+    native = getattr(root, "raw_level0", None)
+    if native is None:
+        raise ExportRequestError(
+            "Original ND2 pixels are unavailable; reopen the original ND2 to export native ND2/TIFF values"
+        )
+    level = int(entry["path"])
+    _, h, w = native.shape
+    if (level < 0 or entry.get("downsample") != 2**level
+            or (entry["height"], entry["width"]) != (max(1, h // 2**level), max(1, w // 2**level))
+            or np.dtype(native.dtype) != np.dtype(dtype)):
+        raise ExportRequestError("The original ND2 geometry does not match this export level; reopen the slide")
+    levels = {"0": native}
+    for k in range(1, level + 1):
+        levels[str(k)] = _OriginalReducedLevel(levels[str(k - 1)])
+    return levels
 
 
 @dataclass(frozen=True)
@@ -192,19 +253,12 @@ def prepare_export(
     if frame is not None:
         root = state.plate.root_for(*frame)
         stem += "_t{}_p{}_z{}".format(*frame)
-    correction = (query.get("correction") or [None])[0]
-    if correction:
-        if fmt not in ("png", "jpg", "jpeg", "svg"):
-            raise ExportRequestError(
-                "Shading correction applies to rendered exports; native ND2/TIFF exports use original values"
-            )
-        if frame is not None:
-            raise ExportRequestError("Shading correction is unavailable for plate frames")
-        try:
-            root = state.shading.root_for(correction)
-        except ValueError as exc:
-            raise ExportRequestError(str(exc)) from exc
-        stem += "_shading-corrected"
+    applied = frame is None and (state.manifest.get("h_correction") or {}).get("applied") is True
+    if applied:
+        if fmt in ("nd2", "tif", "tiff"):
+            root = _original_export_root(root, entry, meta["dtype"])
+        elif fmt in ("png", "jpg", "jpeg", "svg"):
+            stem += "_shading-corrected"
     filename = f"{filename_prefix}{stem}_L{level}_x{x}_y{y}_{w}x{h}"
     return RegionExport(
         root, state.attrs, level, x, y, w, h, channels, fmt, window, scale_bar,

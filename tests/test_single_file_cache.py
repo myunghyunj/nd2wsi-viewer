@@ -17,7 +17,7 @@ from nd2wsi.cache import (
     sweep_stale_builds,
 )
 from nd2wsi.convert import ensure_cache
-from nd2wsi.storage.single_file import FORMAT_VERSION, SQLiteStore, read_entry
+from nd2wsi.storage.single_file import MAX_READABLE_VERSION, SQLiteStore, read_entry
 
 
 def _write_cache(path, value=b"retained bytes"):
@@ -69,7 +69,7 @@ def test_ensure_cache_refuses_future_storage_header_without_opening_sqlite_or_ch
     container = cache_container(source)
     _write_cache(container)
     with sqlite3.connect(container) as connection:
-        connection.execute(f"PRAGMA user_version={FORMAT_VERSION + 1}")
+        connection.execute(f"PRAGMA user_version={MAX_READABLE_VERSION + 1}")
     before = _snapshot(tmp_path)
 
     def must_not_connect(*args, **kwargs):
@@ -89,10 +89,10 @@ def test_future_single_file_suffix_recognition_is_case_insensitive(tmp_path, suf
     path = tmp_path / ("source" + suffix)
     _write_cache(path)
     with sqlite3.connect(path) as connection:
-        connection.execute(f"PRAGMA user_version={FORMAT_VERSION + 1}")
+        connection.execute(f"PRAGMA user_version={MAX_READABLE_VERSION + 1}")
     before = path.read_bytes()
     assert is_file_container(path)
-    assert newer_cache_format(path) == f"nd2svs-sqlite/{FORMAT_VERSION + 1}"
+    assert newer_cache_format(path) == f"nd2svs-sqlite/{MAX_READABLE_VERSION + 1}"
     assert path.read_bytes() == before
 
 
@@ -127,7 +127,7 @@ def test_dead_recognized_uuid_file_is_swept_but_unknown_artifacts_are_preserved(
     future = tmp_path / ("future.nd2svs.building-" + "c" * 32)
     _write_cache(future)
     with sqlite3.connect(future) as connection:
-        connection.execute(f"PRAGMA user_version={FORMAT_VERSION + 1}")
+        connection.execute(f"PRAGMA user_version={MAX_READABLE_VERSION + 1}")
     expected = _snapshot(tmp_path)
     expected.pop(dead.name)
     assert sweep_stale_builds(tmp_path) == 1
@@ -173,20 +173,17 @@ def test_stale_sweep_does_not_detach_a_cache_from_its_companion(tmp_path, suffix
     assert _snapshot(tmp_path) == before
 
 
-def test_publication_restores_previous_file_if_final_rename_fails(tmp_path, monkeypatch):
+def test_publication_preserves_previous_file_if_atomic_replace_fails(tmp_path, monkeypatch):
     staging = tmp_path / ("source.nd2svs.building-" + "f" * 32)
     final = tmp_path / "source.nd2svs"
     _write_cache(staging, b"new cache")
     _write_cache(final, b"old cache")
     before = _snapshot(tmp_path)
-    real_rename = Path.rename
+    def fail_publish(source, destination):
+        assert source == staging and destination == final
+        raise OSError("injected publication failure")
 
-    def fail_publish(self, destination):
-        if self == staging:
-            raise OSError("injected publication failure")
-        return real_rename(self, destination)
-
-    monkeypatch.setattr(Path, "rename", fail_publish)
+    monkeypatch.setattr(os, "replace", fail_publish)
     with pytest.raises(OSError, match="injected publication"):
         commit_container(staging, final)
     assert _snapshot(tmp_path) == before

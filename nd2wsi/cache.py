@@ -52,7 +52,8 @@ MANIFEST_FORMAT = "nd2wsi-cache/2"
 # carry a format that old readers reject (and quarantine) instead
 OVERVIEW_FORMAT = "nd2wsi-cache/3"
 SINGLE_FILE_FORMAT = "nd2wsi-cache/4"
-KNOWN_FORMATS = (MANIFEST_FORMAT, OVERVIEW_FORMAT, SINGLE_FILE_FORMAT)
+CORRECTED_SINGLE_FILE_FORMAT = "nd2wsi-cache/5"
+KNOWN_FORMATS = (MANIFEST_FORMAT, OVERVIEW_FORMAT, SINGLE_FILE_FORMAT, CORRECTED_SINGLE_FILE_FORMAT)
 ALGORITHM = "box-mean-floor-v1"
 
 # A lock names the machine and boot that took it. A drive carried to
@@ -658,12 +659,19 @@ class CacheLock:
 def commit_container(staging: Path, final: Path) -> None:
     """Expose a finished staging container at the final path atomically.
 
-    Same-directory renames only. If a previous container exists it is set
-    aside first and removed after the new one is in place; a failure puts
-    it back.
+    Files use one atomic replacement. A previous directory is set aside
+    first and removed after the new one is in place; a failure puts it back.
     """
     _refuse_database_companions(staging)
     _refuse_database_companions(final)
+    if staging.is_file() and (not final.exists() or final.is_file()):
+        if staging.is_symlink() or final.is_symlink():
+            raise ValueError("cache publication refuses symbolic links")
+        # A single replacement keeps the pathname continuously valid. Existing
+        # POSIX readers retain their old inode; Windows refuses if a reader has
+        # not released its handle. Either outcome preserves a complete cache.
+        os.replace(staging, final)
+        return
     backup = None
     if final.exists():
         backup = final.with_name(final.name + f".replaced-{uuid.uuid4().hex[:8]}")

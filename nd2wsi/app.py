@@ -892,24 +892,49 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                       const shadingButton = document.getElementById('shading-correction');
                       if (!shadingButton || document.getElementById('update-check') ||
                           !document.getElementById('shading-progress-bar') ||
-                          !window.Nd2ShadingCorrection || !view.Nd2ShadingCorrection)
+                          !document.getElementById('shading-progress-title') ||
+                          !document.getElementById('shading-cancel') ||
+                          !['shading-confirm-title', 'shading-confirm-message', 'shading-confirm-estimate',
+                            'shading-confirm-continue', 'shading-confirm-cancel'].every(id => document.getElementById(id)) ||
+                          typeof document.getElementById('shading-confirm')?.showModal !== 'function' ||
+                          !window.Nd2ShadingCorrection || !view.Nd2ShadingCorrection ||
+                          typeof window.Nd2ShadingCorrection.nextAction !== 'function' ||
+                          typeof view.Nd2ShadingCorrection.nextAction !== 'function')
                         throw new Error('Packaged Shading Correction controls are unavailable');
                       await step('shading-status', async () => {
                         const deadline = Date.now() + 10000;
-                        while (!view.eval('state.shading && state.shading.snapshot().state !== "checking"') ||
+                        while (!view.eval('state.shading && !state.shading.snapshot().refreshing && !state.shading.snapshot().view_stale && state.shading.snapshot().state !== "checking"') ||
                             !shadingStates.has(frame.dataset.sid)) {
                           if (Date.now() >= deadline) throw new Error('Shading Correction status did not arrive');
                           await new Promise(resolve => setTimeout(resolve, 50));
                         }
                       });
                       const shadingStatus = view.eval('state.shading.snapshot()');
-                      if (shadingStatus.enabled || shadingStatus.state === 'failed' ||
+                      if (typeof shadingStatus.applied !== 'boolean' || typeof shadingStatus.can_cancel !== 'boolean' ||
+                          !(shadingStatus.operation === null || ['apply', 'revoke'].includes(shadingStatus.operation)) ||
+                          shadingStatus.generation !== view.eval('state.info.generation') || shadingStatus.state === 'failed' ||
                           !shadingButton.title.includes('Shading Correction'))
-                        throw new Error('Shading Correction did not initialize in the original view');
+                        throw new Error('Shading Correction did not initialize its committed pyramid state');
+                      const shading = window.Nd2ShadingCorrection;
+                      const persistentActions = {
+                        apply: shading.nextAction({state: 'idle', supported: true, applied: false}),
+                        revoke: shading.nextAction({state: 'ready', supported: true, applied: true}),
+                        cancel: shading.nextAction({state: 'rebuilding', operation: 'revoke', applied: true, can_cancel: true}),
+                        publishing: shading.nextAction({state: 'publishing', operation: 'revoke', applied: true, can_cancel: false}),
+                      };
+                      if (persistentActions.apply !== 'start' || persistentActions.revoke !== 'revoke' ||
+                          persistentActions.cancel !== 'cancel' || persistentActions.publishing !== null)
+                        throw new Error('Persistent Shading Correction actions are unavailable');
                       const progressCheck = window.Nd2ShadingCorrection.progress({
-                        state: 'preparing_display', pct: 63, eta_seconds: 75});
+                        state: 'preparing_display', operation: 'apply', can_cancel: true, pct: 63, eta_seconds: 75});
+                      const revokeProgress = window.Nd2ShadingCorrection.progress({
+                        state: 'rebuilding', operation: 'revoke', applied: true, can_cancel: true, pct: 41, eta_seconds: 64});
                       if (!progressCheck.visible || progressCheck.pct !== 63 ||
-                          !progressCheck.eta.includes('remaining'))
+                          progressCheck.stage !== 'Building corrected pyramid' || !progressCheck.canCancel ||
+                          !progressCheck.eta.includes('remaining') || !revokeProgress.visible ||
+                          revokeProgress.title !== 'Revoke Shading Correction' ||
+                          revokeProgress.stage !== 'Rebuilding original pyramid' || !revokeProgress.canCancel ||
+                          !revokeProgress.eta.includes('remaining'))
                         throw new Error('Shading Correction progress display is unavailable');
                       if (__CLIPBOARD_CHECK__) {
                         progress.phase = 'clipboard-transport';
@@ -938,8 +963,10 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                             !svg.querySelector('path')) throw new Error('Invalid packaged LUT icon: ' + name);
                       })));
                       const outcome = {ok: true, phase: 'complete', module: true, handlers: true, icons: assets,
-                        shading_correction: {state: shadingStatus.state, original_view: !shadingStatus.enabled,
-                          progress: progressCheck, toolbar: true},
+                        shading_correction: {state: shadingStatus.state, applied: shadingStatus.applied,
+                          operation: shadingStatus.operation, can_cancel: shadingStatus.can_cancel,
+                          generation: shadingStatus.generation, actions: persistentActions,
+                          progress: progressCheck, revoke_progress: revokeProgress, toolbar: true, confirmation: true},
                         clipboard_api: {write: typeof view.navigator.clipboard?.writeText === 'function',
                           read: typeof view.navigator.clipboard?.readText === 'function'}};
                       if (__CLIPBOARD_CHECK__) {

@@ -145,9 +145,9 @@ function refreshShadingButton() {
   const status = shadingStates.get(active);
   const view = window.Nd2ShadingCorrection.describe(status);
   button.disabled = view.disabled || !readyFrames.has(active) || Boolean(quitPreparation) || Boolean(status?.blocked);
-  button.classList.toggle("active", Boolean(status?.enabled));
+  button.classList.toggle("active", Boolean(status?.applied));
   button.classList.toggle("preparing", view.busy);
-  button.setAttribute("aria-pressed", String(Boolean(status?.enabled)));
+  button.setAttribute("aria-pressed", String(Boolean(status?.applied)));
   button.setAttribute("aria-busy", String(view.busy));
   button.setAttribute("aria-label", view.label);
   button.title = view.label;
@@ -155,11 +155,12 @@ function refreshShadingButton() {
   const progress = window.Nd2ShadingCorrection.progress(status);
   $("shading-progress").hidden = !progress.visible;
   if (progress.visible) {
+    $("shading-progress-title").textContent = progress.title;
     $("shading-stage").textContent = progress.stage;
     $("shading-pct").textContent = progress.pct + "%";
     $("shading-progress-bar").value = progress.pct;
     $("shading-eta").textContent = progress.eta;
-    $("shading-cancel").disabled = button.disabled;
+    $("shading-cancel").disabled = button.disabled || !progress.canCancel;
   }
 }
 
@@ -187,18 +188,27 @@ function activateShadingCorrection() {
   const sid = active, status = shadingStates.get(sid);
   if (!status || !readyFrames.has(sid) || quitPreparation || status.blocked ||
       window.Nd2ShadingCorrection.describe(status).disabled) return false;
-  if (["idle", "failed", "cancelled"].includes(status.state)) {
+  const action = window.Nd2ShadingCorrection.nextAction(status);
+  if (!action) return false;
+  if (action !== "cancel") {
     if (shadingConfirmation && shadingConfirmationMatches()) return true;
     closeShadingConfirmation(false);
     shadingConfirmation = { sid, shellToken: shadingTokens.get(sid),
       paneInstanceId: status.paneInstanceId, contextKey: status.contextKey,
-      generation: status.generation, state: status.state };
+      generation: status.generation, state: status.state, action };
+    const revoke = action === "revoke";
+    $("shading-confirm").classList.toggle("revoke", revoke);
+    $("shading-confirm-title").textContent = revoke ? "Revoke Shading Correction?" : "Shading Correction";
+    $("shading-confirm-message").textContent = revoke
+      ? "Rebuild the original pyramid from the source ND2."
+      : "Shadow correction best works in large scans.";
+    $("shading-confirm-continue").textContent = revoke ? "Revoke" : "Continue";
     $("shading-confirm-estimate").textContent = window.Nd2ShadingCorrection.estimateLabel(status.estimated_seconds);
     $("shading-confirm").showModal();
     $("shading-confirm-cancel").focus({ preventScroll: true });
     return true;
   }
-  return postToSlide(sid, { nd2wsi: "shading-toggle", version: VIEWPORT_PROTOCOL_VERSION,
+  return postToSlide(sid, { nd2wsi: "shading-command", version: VIEWPORT_PROTOCOL_VERSION, action,
     sid, shellToken: shadingTokens.get(sid), paneInstanceId: status.paneInstanceId,
     contextKey: status.contextKey, commandSeq: ++shadingCommandSeq });
 }
@@ -208,6 +218,7 @@ function shadingConfirmationMatches() {
   if (!pending || pending.sid !== active || !readyFrames.has(active) || quitPreparation) return false;
   const status = shadingStates.get(active);
   return !!status && !status.blocked && status.state === pending.state &&
+    window.Nd2ShadingCorrection.nextAction(status) === pending.action &&
     status.paneInstanceId === pending.paneInstanceId && status.contextKey === pending.contextKey &&
     status.generation === pending.generation && shadingTokens.get(active) === pending.shellToken &&
     !window.Nd2ShadingCorrection.describe(status).disabled;
@@ -225,8 +236,8 @@ function continueShadingConfirmation() {
   if (!shadingConfirmationMatches()) { closeShadingConfirmation(false); return false; }
   const pending = shadingConfirmation;
   closeShadingConfirmation();
-  return postToSlide(pending.sid, { nd2wsi: "shading-toggle", version: VIEWPORT_PROTOCOL_VERSION,
-    ...pending, confirmedStart: true, commandSeq: ++shadingCommandSeq });
+  return postToSlide(pending.sid, { nd2wsi: "shading-command", version: VIEWPORT_PROTOCOL_VERSION,
+    ...pending, confirmed: true, commandSeq: ++shadingCommandSeq });
 }
 
 function dismissShadingConfirmation(event) {

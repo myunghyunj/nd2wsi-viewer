@@ -13,7 +13,7 @@ const state = {
   luts: [], // per channel {lo, hi, gamma}; null while at store defaults
   lutPersistence: null, // durable, source-bound display preferences
   lutWidgets: [], // canvas LUT widgets, aligned with luts
-  shading: null, // per-pane RAW/corrected display; never changes source pixels
+  shading: null, // committed, source-bound pyramid correction state
   shadingShellToken: null,
   shadingSeq: 0,
   shadingCommandSeq: -1,
@@ -192,17 +192,45 @@ function initializeShadingCorrection() {
     readContext: activeFrameContext,
     fetch: (...args) => fetch(...args),
     isBlocked: () => state.quitPreparing || !spatialImageReady(),
-    onState: postShadingState,
+    onState: () => { postShadingState(); renderPixelInspector(); },
     onError: showToast,
     onNotice: showToast,
-    onChange: () => {
-      refreshTiles();
-      updateScaleStrip();
-      renderPixelInspector();
-    },
+    onGeneration: refreshShadingPyramid,
   });
   state.shading.load();
   window.addEventListener("pagehide", () => state.shading.dispose(), { once: true });
+}
+
+async function refreshShadingPyramid(generation, captured) {
+  const info = state.info;
+  if (activeFrameContext()?.key !== captured.key) return;
+  const response = await fetch("api/info", { cache: "no-store" });
+  if (!response.ok) throw new Error("Could not load the rebuilt pyramid (HTTP " + response.status + ")");
+  const next = await response.json();
+  if (state.info !== info || activeFrameContext()?.key !== captured.key) return;
+  if (next.generation !== generation) throw new Error("The pyramid changed again while loading; retrying");
+  if (next.width !== info.width || next.height !== info.height || next.kind !== info.kind ||
+      !Array.isArray(next.channels) || next.channels.length !== info.channels.length ||
+      next.channels.some((channel, index) => channel.name !== info.channels[index].name)) {
+    throw new Error("The rebuilt pyramid does not match this slide's geometry or channels");
+  }
+  // Preserve effective LUT values even if a channel still uses its defaults.
+  // Keep this metadata object: the source-bound persistence controller owns it.
+  info.channels.forEach((channel, index) => {
+    if (!state.luts[index]) state.luts[index] = window.Nd2LutTransfer.currentLut(channel, null);
+  });
+  Object.assign(info, next);
+  state.lutAutoPending.fill(false);
+  frameRequests?.pixels.invalidate(true);
+  frameRequests?.histograms.schedule(0);
+  state.inspect = null;
+  $("level-lamps").replaceChildren();
+  buildLevelLamps();
+  updateScaleStrip();
+  // The coordinate system is unchanged. Keep camera, orientation, ROI and
+  // current annotation objects; only invalidate the old pyramid's requests.
+  const opened = await reopenPreservingView(true);
+  if (!opened) throw new Error("The rebuilt pyramid could not be displayed");
 }
 
 function postShadingState() {
@@ -222,20 +250,20 @@ function receiveShadingCommand(message) {
     if (typeof message.shellToken !== "string" || !message.shellToken) return;
     state.shadingShellToken = message.shellToken;
     postShadingState();
-  } else if (message.nd2wsi === "shading-toggle") {
+  } else if (message.nd2wsi === "shading-command") {
     if (message.shellToken !== state.shadingShellToken ||
         message.paneInstanceId !== state.viewportRelay.commandGate.paneInstanceId ||
         !Number.isSafeInteger(message.commandSeq) || message.commandSeq <= state.shadingCommandSeq) return;
-    if (message.confirmedStart === true) {
-      const status = state.shading?.snapshot();
-      if (!status || status.generation !== message.generation || status.contextKey !== message.contextKey ||
-          status.state !== message.state || !["idle", "failed", "cancelled"].includes(status.state)) {
-        postShadingState();
-        return;
-      }
+    const status = state.shading?.snapshot();
+    if (!status || window.Nd2ShadingCorrection.nextAction(status) !== message.action ||
+        status.contextKey !== message.contextKey ||
+        (message.action !== "cancel" && (message.confirmed !== true ||
+          status.generation !== message.generation || status.state !== message.state))) {
+      postShadingState();
+      return;
     }
     state.shadingCommandSeq = message.commandSeq;
-    state.shading?.activate(message.contextKey, message.confirmedStart === true);
+    state.shading?.activate(message.action, message.contextKey, message.confirmed === true);
   }
 }
 
@@ -396,7 +424,6 @@ function renderParams(q) {
   // the cache generation makes tile URLs immutable: the browser may keep
   // them, and a rebuilt cache changes the URLs instead of serving stale
   if (state.info.generation) q.set("g", state.info.generation);
-  state.shading?.appendRenderParams(q);
   return q;
 }
 
@@ -625,10 +652,12 @@ function buildViewer() {
   $("zoom-fit").onclick = () => viewer.viewport.goHome();
 }
 
-function reopenPreservingView() {
+function reopenPreservingView(preservePose = false) {
   const viewer = state.viewer;
   const bounds = viewer.viewport.getBounds();
-  refreshSpatialContext();
+  refreshSpatialContext(preservePose);
+  let finish;
+  const completed = new Promise(resolve => { finish = resolve; });
   const gate = state.viewportRelay.commandGate;
   const capturedIdentity = JSON.stringify(gate.envelope());
   const capturedCommandSeq = gate.latestCommandSeq;
@@ -650,16 +679,19 @@ function reopenPreservingView() {
     state.viewportRelay.reopening = false;
     state.viewportRelay.suppressUntil = Date.now() + 180;
     postViewportState("restore");
+    finish(true);
   };
   const failed = () => {
     cleanup();
     state.viewportRelay.reopening = false;
     state.viewportRelay.suppressUntil = 0;
     postSpatialReadiness();
+    finish(false);
   };
   viewer.addHandler("open", restored);
   viewer.addHandler("open-failed", failed);
   viewer.open(makeTileSource());
+  return completed;
 }
 
 /* ---- channels ------------------------------------------------------------- */
@@ -1284,7 +1316,7 @@ function renderPixelInspector() {
     note.textContent = result.sample_kind === "overview-mean"
       ? "Overview mean" + level
       : "Native pixel" + level;
-    if (state.shading?.snapshot().enabled) note.textContent += " · Original values before Shading Correction";
+    if (state.shading?.snapshot().applied) note.textContent += " · Original values before Shading Correction";
   } else {
     note.textContent = state.pixel.failed ? "Probe endpoint unavailable; cursor coordinates still work" : "";
   }
@@ -2833,7 +2865,7 @@ function updateScaleStrip() {
   if (state.channels.length !== state.info.channels.length) {
     extra.set("c", state.channels.join(","));
   }
-  state.shading?.appendRenderParams(extra);
+  if (state.info.generation) extra.set("g", state.info.generation);
   appendFrameParams(extra, context.frame);
   const winQ = extra.toString() ? "&" + extra.toString() : "";
   // one shared field, sized to the coarsest scale so every patch is honest
@@ -3013,7 +3045,7 @@ function downloadRoi(fmt, scaleBar = false) {
   if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
     const win = lutParam();
     if (win) q.set("win", win); // rendered exports match the screen LUTs
-    state.shading?.appendRenderParams(q);
+    if (state.info.generation) q.set("g", state.info.generation);
   }
   if (scaleBar) q.set("scalebar", "1");
   appendFrameParams(q, context.frame); // explicit active frame; never hidden P0
@@ -3382,12 +3414,12 @@ function clearPaneSpatialWork(resetPose = true) {
   }
 }
 
-function refreshSpatialContext() {
+function refreshSpatialContext(preservePose = false) {
   if (!state.info) return false;
   const context = window.Nd2SpatialPane.spatialContext(activeFrameContext(), Boolean(state.plate));
   const changed = state.viewportRelay.commandGate.setContext(context);
   if (changed) {
-    clearPaneSpatialWork();
+    clearPaneSpatialWork(!preservePose);
     postSpatialReadiness();
   }
   return changed;
@@ -3722,7 +3754,7 @@ function wireCompareRelay() {
       event.origin !== location.origin || !event.data ||
       event.data.version !== VIEWPORT_PROTOCOL_VERSION
     ) return;
-    if (["shading-status-request", "shading-toggle"].includes(event.data.nd2wsi)) {
+    if (["shading-status-request", "shading-command"].includes(event.data.nd2wsi)) {
       receiveShadingCommand(event.data);
     } else if (event.data.nd2wsi === "prepare-quit") {
       const requestId = String(event.data.requestId || "");
