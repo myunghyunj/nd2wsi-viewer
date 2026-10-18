@@ -3,6 +3,10 @@
 const $ = (id) => document.getElementById(id);
 const frames = new Map();
 const readyFrames = new Set();
+const shadingStates = new Map();
+const shadingTokens = new Map();
+let shadingCommandSeq = 0;
+let shadingConfirmation = null;
 let slides = [];
 let active = null;
 let busyTab = null;
@@ -134,41 +138,116 @@ window.nd2wsiNativeTrackpad = (input) => {
   return frame.dataset.sid || true;
 };
 
-async function refreshUpdaterButton() {
-  const button = $("update-check");
-  const api = window.pywebview?.api;
-  if (!api?.update_status) return;
-  try {
-    const status = await api.update_status();
-    button.disabled = !status.available;
-    const label = ["download", "manual-download"].includes(status.mode) ? "Download Updates…" : "Check for Updates…";
-    button.setAttribute("aria-label", label);
-    button.title = status.available
-      ? `${label} · version ${status.version}`
-      : "Updates are unavailable in this build";
-  } catch (_) {
-    button.disabled = true;
+function refreshShadingButton() {
+  if (shadingConfirmation && !shadingConfirmationMatches()) closeShadingConfirmation(false);
+  const button = $("shading-correction");
+  if (!button) return;
+  const status = shadingStates.get(active);
+  const view = window.Nd2ShadingCorrection.describe(status);
+  button.disabled = view.disabled || !readyFrames.has(active) || Boolean(quitPreparation) || Boolean(status?.blocked);
+  button.classList.toggle("active", Boolean(status?.enabled));
+  button.classList.toggle("preparing", view.busy);
+  button.setAttribute("aria-pressed", String(Boolean(status?.enabled)));
+  button.setAttribute("aria-busy", String(view.busy));
+  button.setAttribute("aria-label", view.label);
+  button.title = view.label;
+  $("shading-status").textContent = view.label;
+  const progress = window.Nd2ShadingCorrection.progress(status);
+  $("shading-progress").hidden = !progress.visible;
+  if (progress.visible) {
+    $("shading-stage").textContent = progress.stage;
+    $("shading-pct").textContent = progress.pct + "%";
+    $("shading-progress-bar").value = progress.pct;
+    $("shading-eta").textContent = progress.eta;
+    $("shading-cancel").disabled = button.disabled;
   }
 }
 
-$("update-check").addEventListener("click", async () => {
-  const button = $("update-check");
-  const api = window.pywebview?.api;
-  if (!api?.check_for_updates) return;
-  button.disabled = true;
-  button.classList.add("checking");
-  button.setAttribute("aria-busy", "true");
-  try {
-    const result = await api.check_for_updates();
-    if (result.message || !result.ok) showError(result.message || "Could not open the update window");
-  } catch (error) {
-    showError(`Could not check for updates: ${error}`);
-  } finally {
-    button.classList.remove("checking");
-    button.removeAttribute("aria-busy");
-    setTimeout(refreshUpdaterButton, 400);
+function requestShadingState(sid, renew = true) {
+  const token = (!renew && shadingTokens.get(sid)) || crypto.randomUUID();
+  shadingTokens.set(sid, token);
+  if (renew) shadingStates.delete(sid);
+  postToSlide(sid, { nd2wsi: "shading-status-request", version: VIEWPORT_PROTOCOL_VERSION,
+    sid, shellToken: token });
+  refreshShadingButton();
+}
+
+function receiveShadingState(sid, data) {
+  if (data.sid !== sid || typeof data.shellToken !== "string" || !data.shellToken ||
+      data.shellToken !== shadingTokens.get(sid) || typeof data.paneInstanceId !== "string" ||
+      !data.paneInstanceId || !Number.isSafeInteger(data.seq)) return false;
+  const old = shadingStates.get(sid);
+  if (old && (old.paneInstanceId !== data.paneInstanceId || old.seq >= data.seq)) return false;
+  shadingStates.set(sid, data);
+  if (sid === active) refreshShadingButton();
+  return true;
+}
+
+function activateShadingCorrection() {
+  const sid = active, status = shadingStates.get(sid);
+  if (!status || !readyFrames.has(sid) || quitPreparation || status.blocked ||
+      window.Nd2ShadingCorrection.describe(status).disabled) return false;
+  if (["idle", "failed", "cancelled"].includes(status.state)) {
+    if (shadingConfirmation && shadingConfirmationMatches()) return true;
+    closeShadingConfirmation(false);
+    shadingConfirmation = { sid, shellToken: shadingTokens.get(sid),
+      paneInstanceId: status.paneInstanceId, contextKey: status.contextKey,
+      generation: status.generation, state: status.state };
+    $("shading-confirm-estimate").textContent = window.Nd2ShadingCorrection.estimateLabel(status.estimated_seconds);
+    $("shading-confirm").showModal();
+    $("shading-confirm-cancel").focus({ preventScroll: true });
+    return true;
   }
-});
+  return postToSlide(sid, { nd2wsi: "shading-toggle", version: VIEWPORT_PROTOCOL_VERSION,
+    sid, shellToken: shadingTokens.get(sid), paneInstanceId: status.paneInstanceId,
+    contextKey: status.contextKey, commandSeq: ++shadingCommandSeq });
+}
+
+function shadingConfirmationMatches() {
+  const pending = shadingConfirmation;
+  if (!pending || pending.sid !== active || !readyFrames.has(active) || quitPreparation) return false;
+  const status = shadingStates.get(active);
+  return !!status && !status.blocked && status.state === pending.state &&
+    status.paneInstanceId === pending.paneInstanceId && status.contextKey === pending.contextKey &&
+    status.generation === pending.generation && shadingTokens.get(active) === pending.shellToken &&
+    !window.Nd2ShadingCorrection.describe(status).disabled;
+}
+
+function closeShadingConfirmation(restoreFocus = true) {
+  const pending = shadingConfirmation;
+  shadingConfirmation = null;
+  const dialog = $("shading-confirm");
+  if (dialog.open) dialog.close();
+  if (restoreFocus && pending?.sid === active) $("shading-correction").focus({ preventScroll: true });
+}
+
+function continueShadingConfirmation() {
+  if (!shadingConfirmationMatches()) { closeShadingConfirmation(false); return false; }
+  const pending = shadingConfirmation;
+  closeShadingConfirmation();
+  return postToSlide(pending.sid, { nd2wsi: "shading-toggle", version: VIEWPORT_PROTOCOL_VERSION,
+    ...pending, confirmedStart: true, commandSeq: ++shadingCommandSeq });
+}
+
+function dismissShadingConfirmation(event) {
+  if (event.type === "cancel") {
+    event.preventDefault();
+    closeShadingConfirmation();
+  } else if (event.target === $("shading-confirm")) {
+    const box = event.target.getBoundingClientRect();
+    if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) {
+      closeShadingConfirmation();
+    }
+  }
+}
+
+$("shading-correction").addEventListener("click", activateShadingCorrection);
+$("shading-cancel").addEventListener("click", activateShadingCorrection);
+$("shading-confirm-continue").addEventListener("click", continueShadingConfirmation);
+$("shading-confirm-cancel").addEventListener("click", () => closeShadingConfirmation());
+$("shading-confirm").addEventListener("cancel", dismissShadingConfirmation);
+$("shading-confirm").addEventListener("click", dismissShadingConfirmation);
+$("shading-confirm").addEventListener("close", () => closeShadingConfirmation(false));
 
 function applyShellTheme(theme) {
   document.documentElement.classList.toggle("light", theme === "light");
@@ -185,10 +264,6 @@ function markNativeChrome() {
 if (window.pywebview !== undefined) markNativeChrome();
 window.addEventListener("pywebviewready", () => {
   markNativeChrome();
-  // The shown callback which installs Sparkle and this page load may race by
-  // a few milliseconds, so refresh once immediately and once after startup.
-  refreshUpdaterButton();
-  setTimeout(refreshUpdaterButton, 600);
   const api = window.pywebview?.api;
   if (api?.begin_native_gesture_scope_session) {
     Promise.resolve(api.begin_native_gesture_scope_session())
@@ -264,6 +339,7 @@ function slideName(sid) {
 }
 
 function render() {
+  refreshShadingButton();
   const bar = $("tabbar");
   bar.querySelectorAll(".tab").forEach((tab) => tab.remove());
   const plus = $("newtab");
@@ -343,7 +419,7 @@ function ensureFrame(sid) {
   frame.dataset.sid = sid;
   frame.src = `s/${sid}/`;
   frame.title = slideName(sid);
-  frame.addEventListener("load", () => paneCameUp(sid));
+  frame.addEventListener("load", () => { requestShadingState(sid); paneCameUp(sid); });
   frames.set(sid, frame);
   $("frames").append(frame);
   return frame;
@@ -383,6 +459,7 @@ function focusActivePane(deferred = false) {
 
 function paneCameUp(sid) {
   sendTabShortcutState(sid);
+  refreshShadingButton();
   if (sid === active) focusActivePane(true);
   scheduleNativeGestureScopes();
   if (!inGroup(sid)) return;
@@ -503,6 +580,8 @@ function refresh(selectSid) {
           frames.delete(key);
           nativeGesturePaneScopes.delete(key);
           readyFrames.delete(key);
+          shadingStates.delete(key);
+          shadingTokens.delete(key);
           compare.states.delete(key);
         }
       }
@@ -702,7 +781,7 @@ function publishNativeGestureScopes() {
     height: window.innerHeight,
   };
   let scopes = NativeScope.buildScopes(entries, viewport);
-  const shellBlockers = ["compare-controls", "compare-divider", "compare-picker", "dropzone"]
+  const shellBlockers = ["compare-controls", "compare-divider", "compare-picker", "dropzone", "shading-progress"]
     .map((id) => $(id))
     .filter((element) => {
       if (!element || element.hidden) return false;
@@ -717,7 +796,7 @@ function publishNativeGestureScopes() {
     ...scope,
     exclude: [...scope.exclude, ...shellBlockers],
   }));
-  if (document.documentElement.classList.contains("preparing-update")) scopes = [];
+  if (document.documentElement.classList.contains("preparing-update") || $("shading-confirm")?.open) scopes = [];
   const revision = ++nativeGestureScopeRevision;
   Promise.resolve(api.set_native_gesture_scopes({
     token: nativeGestureScopeToken,
@@ -727,14 +806,14 @@ function publishNativeGestureScopes() {
 }
 
 window.addEventListener("resize", scheduleNativeGestureScopes);
-const nativeGestureShellBlockers = ["compare-controls", "compare-divider", "compare-picker", "dropzone"]
+const nativeGestureShellBlockers = ["compare-controls", "compare-divider", "compare-picker", "dropzone", "shading-progress", "shading-confirm"]
   .map((id) => $(id))
   .filter(Boolean);
 if (typeof MutationObserver === "function") {
   const blockerObserver = new MutationObserver(scheduleNativeGestureScopes);
   nativeGestureShellBlockers.forEach((element) => blockerObserver.observe(
     element,
-    { attributes: true, attributeFilter: ["class", "hidden", "style"] }
+    { attributes: true, attributeFilter: ["class", "hidden", "style", "open"] }
   ));
 }
 if (typeof ResizeObserver === "function") {
@@ -2562,7 +2641,10 @@ window.addEventListener("message", (event) => {
   const senderSid = frameSidForSource(event.source);
   const kind = event.data.nd2wsi;
   const versioned = event.data.version === VIEWPORT_PROTOCOL_VERSION;
-  if (kind === "quit-ready") {
+  if (kind === "shading-state") {
+    if (!senderSid || !versioned) return;
+    receiveShadingState(senderSid, event.data);
+  } else if (kind === "quit-ready") {
     const pending = quitPreparation;
     if (!pending || !senderSid || !versioned || !pending.targets.has(senderSid)) return;
     if (event.data.sid !== senderSid || event.data.requestId !== pending.requestId) return;
@@ -2583,6 +2665,10 @@ window.addEventListener("message", (event) => {
     if (!senderSid || !versioned || (event.data.sid && event.data.sid !== senderSid)) return;
     if (!receiveViewportState(event.data, senderSid)) return;
     readyFrames.add(senderSid);
+    // iframe load can precede the pane's awaited metadata/LUT initialization.
+    // A validated ready message proves its command listener now exists; retry
+    // the possibly lost load-time handshake without resetting a live toggle.
+    if (!shadingStates.has(senderSid)) requestShadingState(senderSid, false);
     paneCameUp(senderSid);
   } else if (kind === "viewport-state") {
     if (!senderSid || (event.data.sid && event.data.sid !== senderSid)) return;

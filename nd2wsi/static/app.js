@@ -13,6 +13,10 @@ const state = {
   luts: [], // per channel {lo, hi, gamma}; null while at store defaults
   lutPersistence: null, // durable, source-bound display preferences
   lutWidgets: [], // canvas LUT widgets, aligned with luts
+  shading: null, // per-pane RAW/corrected display; never changes source pixels
+  shadingShellToken: null,
+  shadingSeq: 0,
+  shadingCommandSeq: -1,
   lutAutoRange: false, // ND2 opens fitted; axis navigation never changes contrast
   lutAutoPending: [], // one initial adjustment; manual edits always take priority
   roi: null, // {x, y, w, h} in level-0 pixels
@@ -166,6 +170,7 @@ async function init() {
   buildPlate();
   if (state.plate) pollPlateStatus();
   wireCompareRelay();
+  initializeShadingCorrection();
   wireTools();
   syncFrameScopedControls();
   wireKeys();
@@ -179,6 +184,58 @@ async function init() {
       }
     }
     setAnnStatus("Annotation locked: source file missing");
+  }
+}
+
+function initializeShadingCorrection() {
+  state.shading = window.Nd2ShadingCorrection.createController({
+    readContext: activeFrameContext,
+    fetch: (...args) => fetch(...args),
+    isBlocked: () => state.quitPreparing || !spatialImageReady(),
+    onState: postShadingState,
+    onError: showToast,
+    onNotice: showToast,
+    onChange: () => {
+      refreshTiles();
+      updateScaleStrip();
+      renderPixelInspector();
+    },
+  });
+  state.shading.load();
+  window.addEventListener("pagehide", () => state.shading.dispose(), { once: true });
+}
+
+function postShadingState() {
+  if (window.parent === window || !state.shading || !state.shadingShellToken) return;
+  window.parent.postMessage({
+    nd2wsi: "shading-state", version: VIEWPORT_PROTOCOL_VERSION,
+    ...state.shading.snapshot(), sid: currentSlideSid(),
+    paneInstanceId: state.viewportRelay.commandGate.paneInstanceId,
+    shellToken: state.shadingShellToken, seq: ++state.shadingSeq,
+    blocked: state.quitPreparing || !spatialImageReady(),
+  }, location.origin);
+}
+
+function receiveShadingCommand(message) {
+  if (message.sid !== currentSlideSid()) return;
+  if (message.nd2wsi === "shading-status-request") {
+    if (typeof message.shellToken !== "string" || !message.shellToken) return;
+    state.shadingShellToken = message.shellToken;
+    postShadingState();
+  } else if (message.nd2wsi === "shading-toggle") {
+    if (message.shellToken !== state.shadingShellToken ||
+        message.paneInstanceId !== state.viewportRelay.commandGate.paneInstanceId ||
+        !Number.isSafeInteger(message.commandSeq) || message.commandSeq <= state.shadingCommandSeq) return;
+    if (message.confirmedStart === true) {
+      const status = state.shading?.snapshot();
+      if (!status || status.generation !== message.generation || status.contextKey !== message.contextKey ||
+          status.state !== message.state || !["idle", "failed", "cancelled"].includes(status.state)) {
+        postShadingState();
+        return;
+      }
+    }
+    state.shadingCommandSeq = message.commandSeq;
+    state.shading?.activate(message.contextKey, message.confirmedStart === true);
   }
 }
 
@@ -339,6 +396,7 @@ function renderParams(q) {
   // the cache generation makes tile URLs immutable: the browser may keep
   // them, and a rebuilt cache changes the URLs instead of serving stale
   if (state.info.generation) q.set("g", state.info.generation);
+  state.shading?.appendRenderParams(q);
   return q;
 }
 
@@ -1226,6 +1284,7 @@ function renderPixelInspector() {
     note.textContent = result.sample_kind === "overview-mean"
       ? "Overview mean" + level
       : "Native pixel" + level;
+    if (state.shading?.snapshot().enabled) note.textContent += " · Original values before Shading Correction";
   } else {
     note.textContent = state.pixel.failed ? "Probe endpoint unavailable; cursor coordinates still work" : "";
   }
@@ -2774,6 +2833,7 @@ function updateScaleStrip() {
   if (state.channels.length !== state.info.channels.length) {
     extra.set("c", state.channels.join(","));
   }
+  state.shading?.appendRenderParams(extra);
   appendFrameParams(extra, context.frame);
   const winQ = extra.toString() ? "&" + extra.toString() : "";
   // one shared field, sized to the coarsest scale so every patch is honest
@@ -2808,7 +2868,7 @@ function updateScaleStrip() {
   note.textContent = "ND2 and TIFF stay native.";
   estimateRenderBytes(sel, winQ, r).then((t) => {
     if (seq === scaleSeq && activeFrameContext()?.key === context.key && t) {
-      note.textContent = t + " · ND2 and TIFF stay native.";
+      note.textContent = t + " · ND2 and TIFF retain original values.";
     }
   });
 }
@@ -2953,6 +3013,7 @@ function downloadRoi(fmt, scaleBar = false) {
   if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
     const win = lutParam();
     if (win) q.set("win", win); // rendered exports match the screen LUTs
+    state.shading?.appendRenderParams(q);
   }
   if (scaleBar) q.set("scalebar", "1");
   appendFrameParams(q, context.frame); // explicit active frame; never hidden P0
@@ -3333,6 +3394,7 @@ function refreshSpatialContext() {
 }
 
 function postSpatialReadiness() {
+  state.shading?.syncContext();
   if (window.parent === window) return;
   window.parent.postMessage({
     nd2wsi: "viewport-ready", version: VIEWPORT_PROTOCOL_VERSION,
@@ -3660,7 +3722,9 @@ function wireCompareRelay() {
       event.origin !== location.origin || !event.data ||
       event.data.version !== VIEWPORT_PROTOCOL_VERSION
     ) return;
-    if (event.data.nd2wsi === "prepare-quit") {
+    if (["shading-status-request", "shading-toggle"].includes(event.data.nd2wsi)) {
+      receiveShadingCommand(event.data);
+    } else if (event.data.nd2wsi === "prepare-quit") {
       const requestId = String(event.data.requestId || "");
       if (requestId) acknowledgeUpdatePreparation(requestId);
     } else if (event.data.nd2wsi === "cancel-quit") {

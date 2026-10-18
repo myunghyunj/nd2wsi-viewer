@@ -152,7 +152,8 @@ def test_clipboard_smoke_is_strictly_opt_in_and_never_runs_on_mac(fake_webview, 
 
 GUI_LUT_SCRIPT = r"""
 const fs=require('fs'),vm=require('vm');
-const {script,mode}=JSON.parse(fs.readFileSync(0,'utf8'));
+const {script,mode,shadingModule}=JSON.parse(fs.readFileSync(0,'utf8'));
+const Shading=require(shadingModule);
 const fetches=[],calls={copy:0,paste:0};let toast='',copied=false,encoded='exact effective LUTs';
 const buttons={
   'lut-type':{onclick(){}},
@@ -169,6 +170,7 @@ const buttons={
 };
 if(mode==='missing-handler')delete buttons['lut-paste'].onclick;
 const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){},fitsChannel(){}},
+  Nd2ShadingCorrection:mode==='missing-shading-module'?null:Shading,
   parent:{pywebview:{platform:mode==='wrong-platform'?'cocoa':'edgechromium',api:{
     write_lut_clipboard:mode==='missing-native-write'?null:()=>{},
     read_lut_clipboard:mode==='missing-native-read'?null:()=>{}}}},
@@ -177,6 +179,8 @@ const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){
     return {ok:mode!=='missing-icon',status:404,text:async()=>mode==='invalid-icon'?'bad':'svg'}},
   DOMParser:class{parseFromString(text){return {documentElement:{tagName:text==='svg'?'svg':'parsererror',getAttribute:()=> '0 0 20 20'},querySelector:()=>({})}}},
   eval(expression){
+    if(expression==='state.shading && state.shading.snapshot().state !== "checking"')return true;
+    if(expression==='state.shading.snapshot()')return {state:'idle',enabled:false};
     if(expression==='state.lutAutoPending.some(Boolean)')return mode==='autolut-timeout';
     if(expression.includes('planPaste'))return 2;
     return encoded;
@@ -186,8 +190,13 @@ const page={baseURI:'http://viewer.test/private-token/s/test/',
   querySelector:selector=>selector==='#stage canvas'?{width:100,height:100}:null,
   getElementById:id=>buttons[id]};
 const frame={dataset:{sid:'test'},contentDocument:page,contentWindow:view};
-const context={window:{pywebview:{api:{update_status(){}}},__nd2wsiSmokeBridge:{version:'test'}},
-  document:{readyState:'complete',querySelector:()=>frame,getElementById:()=>null},readyFrames:new Set(['test']),URL,
+const shellControls={
+  'shading-correction':mode==='missing-shading-control'?null:{title:'Apply Shading Correction'},
+  'shading-progress-bar':{},
+};
+const context={window:{pywebview:{api:{update_status(){}}},__nd2wsiSmokeBridge:{version:'test'},Nd2ShadingCorrection:Shading},
+  document:{readyState:'complete',querySelector:()=>frame,getElementById:id=>shellControls[id]||null},
+  readyFrames:new Set(['test']),shadingStates:new Map([['test',{state:'idle'}]]),URL,
   setTimeout:(callback,delay)=>setTimeout(callback,mode.endsWith('-timeout')?Math.min(delay,10):delay),clearTimeout};
 let fakeNow=0;
 if(mode==='autolut-timeout')context.Date={now:()=>fakeNow+=8000};
@@ -205,6 +214,8 @@ vm.createContext(context);
     ("ready", False, None), ("ready", True, None),
     ("missing-module", False, "transfer module is unavailable"),
     ("missing-handler", False, "toolbar is not wired"),
+    ("missing-shading-control", False, "Shading Correction controls are unavailable"),
+    ("missing-shading-module", False, "Shading Correction controls are unavailable"),
     ("missing-icon", False, "HTTP 404"), ("invalid-icon", False, "Invalid packaged LUT icon"),
     ("copy-failure", True, "copy failed: Write permission denied"),
     ("paste-failure", True, "paste failed: Read permission denied"),
@@ -230,7 +241,10 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
     assert app.gui_smoke(api, window, expect_slide=True)["ok"] is True
     script = window.evaluate_js.call_args.args[0]
     result = subprocess.run(
-        [NODE, "-e", GUI_LUT_SCRIPT], input=json.dumps({"script": script, "mode": mode}),
+        [NODE, "-e", GUI_LUT_SCRIPT], input=json.dumps({
+            "script": script, "mode": mode,
+            "shadingModule": str(Path(__file__).resolve().parents[1] / "nd2wsi/static/shading-correction-v1.js"),
+        }),
         check=True, capture_output=True, text=True, timeout=20,
     )
     out = json.loads(result.stdout)
@@ -248,10 +262,15 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
         assert result["ok"] is result["module"] is result["handlers"] is True
         assert result["phase"] == "complete"
         assert result["clipboard_api"] == {"write": True, "read": True}
+        assert result["shading_correction"] == {
+            "state": "idle", "original_view": True, "toolbar": True,
+            "progress": {"visible": True, "stage": "Preparing corrected view", "pct": 63,
+                         "eta": "About 2 min remaining"},
+        }
         assert out["fetches"] == [
             "http://viewer.test/private-token/static/icons/" + name
             for name in ["fluent-edit-20-regular.svg", "fluent-copy-20-regular.svg", "fluent-clipboard-paste-20-regular.svg",
-                         "fluent-checkmark-20-regular.svg"]
+                         "fluent-checkmark-20-regular.svg", "fluent-circle-highlight-20-regular.svg"]
         ]
         if clipboard:
             assert result["clipboard_roundtrip"] == {

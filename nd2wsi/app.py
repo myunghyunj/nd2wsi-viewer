@@ -257,10 +257,10 @@ def _flush_opens():
 
 
 def _install_open_files_handler():
-    """Accept Finder's open events (double-click, Open With) while running.
+    """Accept Finder's open events before native window creation and while running.
 
     pywebview's cocoa delegate does not implement application:openFiles:,
-    so we add the method to its class before the app starts.
+    so we add the method and bind its shared delegate before the app starts.
     """
     try:
         import objc
@@ -302,6 +302,15 @@ def _install_open_files_handler():
                 ),
             ],
         )
+        # Cocoa may deliver an opening document while the first NSWindow or
+        # WKWebView is being created. pywebview normally binds its delegate
+        # after those constructors; bind the same retained instance now so
+        # the event reaches our queue instead of the default document handler.
+        # A repeated installation must not replace an existing app delegate.
+        if BrowserView.app.delegate() is None:
+            if BrowserView._shared_app_delegate is None:
+                BrowserView._shared_app_delegate = BrowserView.AppDelegate.alloc().init()
+            BrowserView.app.setDelegate_(BrowserView._shared_app_delegate)
         _dlog("openFiles handler installed")
     except Exception as e:
         _dlog(f"openFiles handler install failed: {e}")
@@ -880,6 +889,28 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                       if (buttons.some(button => !button || typeof button.onclick !== 'function') ||
                           !page.getElementById('lut-dialog') || !page.getElementById('lut-copy-tooltip'))
                         throw new Error('Packaged LUT toolbar is not wired');
+                      const shadingButton = document.getElementById('shading-correction');
+                      if (!shadingButton || document.getElementById('update-check') ||
+                          !document.getElementById('shading-progress-bar') ||
+                          !window.Nd2ShadingCorrection || !view.Nd2ShadingCorrection)
+                        throw new Error('Packaged Shading Correction controls are unavailable');
+                      await step('shading-status', async () => {
+                        const deadline = Date.now() + 10000;
+                        while (!view.eval('state.shading && state.shading.snapshot().state !== "checking"') ||
+                            !shadingStates.has(frame.dataset.sid)) {
+                          if (Date.now() >= deadline) throw new Error('Shading Correction status did not arrive');
+                          await new Promise(resolve => setTimeout(resolve, 50));
+                        }
+                      });
+                      const shadingStatus = view.eval('state.shading.snapshot()');
+                      if (shadingStatus.enabled || shadingStatus.state === 'failed' ||
+                          !shadingButton.title.includes('Shading Correction'))
+                        throw new Error('Shading Correction did not initialize in the original view');
+                      const progressCheck = window.Nd2ShadingCorrection.progress({
+                        state: 'preparing_display', pct: 63, eta_seconds: 75});
+                      if (!progressCheck.visible || progressCheck.pct !== 63 ||
+                          !progressCheck.eta.includes('remaining'))
+                        throw new Error('Shading Correction progress display is unavailable');
                       if (__CLIPBOARD_CHECK__) {
                         progress.phase = 'clipboard-transport';
                         const native = view.parent?.pywebview;
@@ -898,7 +929,7 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         }
                       }, 15000);
                       const assets = ['fluent-edit-20-regular.svg', 'fluent-copy-20-regular.svg', 'fluent-clipboard-paste-20-regular.svg',
-                        'fluent-checkmark-20-regular.svg'];
+                        'fluent-checkmark-20-regular.svg', 'fluent-circle-highlight-20-regular.svg'];
                       await step('icons', () => Promise.all(assets.map(async name => {
                         const response = await view.fetch(new URL('../../static/icons/' + name, page.baseURI));
                         if (!response.ok) throw new Error('LUT icon ' + name + ': HTTP ' + response.status);
@@ -907,6 +938,8 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                             !svg.querySelector('path')) throw new Error('Invalid packaged LUT icon: ' + name);
                       })));
                       const outcome = {ok: true, phase: 'complete', module: true, handlers: true, icons: assets,
+                        shading_correction: {state: shadingStatus.state, original_view: !shadingStatus.enabled,
+                          progress: progressCheck, toolbar: true},
                         clipboard_api: {write: typeof view.navigator.clipboard?.writeText === 'function',
                           read: typeof view.navigator.clipboard?.readText === 'function'}};
                       if (__CLIPBOARD_CHECK__) {

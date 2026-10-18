@@ -21,13 +21,21 @@
       <span id="window-action-status" role="status" aria-live="polite"></span>
     </div>
   </details>
-  <button id="update-check" class="shell-icon-button" type="button"
-          title="Check for Updates…" aria-label="Check for Updates" disabled>
-    <svg class="update-icon" viewBox="0 0 18 18" aria-hidden="true">
-      <path d="M14.6 6.1A6.2 6.2 0 1 0 15 10" />
-      <path d="M14.7 2.7v3.8h-3.8" />
-    </svg>
-  </button>
+  <div id="shading-control">
+    <button id="shading-correction" class="shell-icon-button" type="button"
+            title="Open a slide to use Shading Correction" aria-label="Shading Correction"
+            aria-pressed="false" aria-describedby="shading-status" aria-haspopup="dialog" aria-controls="shading-confirm" disabled>
+      <span class="shading-icon" aria-hidden="true"></span>
+    </button>
+    <span id="shading-status" role="status" aria-live="polite"></span>
+    <div id="shading-progress" role="group" aria-label="Shading Correction progress" hidden>
+      <div class="shading-progress-head"><strong>Shading Correction</strong>
+        <button id="shading-cancel" type="button">Cancel</button></div>
+      <div class="shading-progress-stage"><span id="shading-stage"></span><span id="shading-pct"></span></div>
+      <progress id="shading-progress-bar" max="100" value="0" aria-label="Shading Correction progress"></progress>
+      <div id="shading-eta" role="status" aria-live="polite">Estimating time…</div>
+    </div>
+  </div>
   <button id="compare-tools-toggle" class="shell-icon-button" type="button"
           title="Show comparison tools" aria-label="Show comparison tools"
           aria-expanded="false" aria-controls="compare-controls" hidden>
@@ -156,10 +164,20 @@
     </div>
   </div>
 </div>
+<dialog id="shading-confirm" aria-labelledby="shading-confirm-title" aria-describedby="shading-confirm-message shading-confirm-estimate">
+  <h2 id="shading-confirm-title">Shading Correction</h2>
+  <p id="shading-confirm-message">Shadow correction best works in large scans.</p>
+  <p id="shading-confirm-estimate">Est. time: unavailable until preparation starts</p>
+  <div class="shading-confirm-actions">
+    <button id="shading-confirm-cancel" type="button">Cancel</button>
+    <button id="shading-confirm-continue" type="button">Continue</button>
+  </div>
+</dialog>
 <div id="shell-toast" role="alert" aria-live="assertive"></div>
 <script src="static/align-v1.js"></script>
 <script src="static/shortcut-router-v1.js"></script>
 <script src="static/native-scope-v1.js"></script>
+<script src="static/shading-correction-v1.js"></script>
 <script src="static/shell-v1.js"></script>
 <script src="static/window-controls-v1.js"></script>
 </body>

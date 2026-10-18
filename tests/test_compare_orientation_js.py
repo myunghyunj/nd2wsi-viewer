@@ -99,7 +99,7 @@ Object.assign(context, {
   showError:message=>messages.push({error:message}),
   updateCompareControls(){}, updateOrientationControls(){},
   render(){}, applyFrameLayout(){}, renderPairPicker(){},
-  sendTabShortcutState(){}, scheduleNativeGestureScopes(){},
+  sendTabShortcutState(){}, scheduleNativeGestureScopes(){}, refreshShadingButton(){},
   closePairPicker(){}, ensureFrame(){}, activate:sid=>{context.active=sid;},
 });
 const realSyncFromAnchor = context.syncFromAnchor;

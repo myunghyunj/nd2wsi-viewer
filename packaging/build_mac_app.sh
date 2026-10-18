@@ -63,6 +63,7 @@ echo "==> pyinstaller"
   --osx-bundle-identifier "com.nd2wsi.viewer" \
   --collect-all nd2wsi \
   --collect-all nd2 \
+  --collect-all scipy \
   --collect-all zarr \
   --collect-all numcodecs \
   --collect-all dask \

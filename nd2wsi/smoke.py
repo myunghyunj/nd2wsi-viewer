@@ -44,6 +44,19 @@ def run(nd2_path: Path) -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="nd2wsi-smoke-") as temp:
             work = Path(temp)
+            # These compiled SciPy modules and the frozen settings must be in
+            # the delivered bundle, not merely present in a developer venv.
+            from . import h_model
+
+            config = json.loads(Path(h_model.__file__).with_name("h_config.json").read_text())
+            assert config["schema"] == "H_auto_refit/1"
+            phase = np.array([[[0.25, 0.75]], [[0.5, 0.5]]])
+            sampled = h_model.sample_template(np.ones((4, 4)), phase)
+            assert np.array_equal(sampled, np.ones((1, 2)))
+            optimum = h_model.minimize(lambda x: float(np.sum((x - 2) ** 2)),
+                                       [0.0, 0.0], method="Powell")
+            assert optimum.success and np.allclose(optimum.x, [2, 2])
+            print("smoke ok: Shading Correction settings, interpolation and optimizer")
             store = open_or_convert(nd2_path, on_status=print)
             with _served(store) as (_httpd, url):
                 info = json.loads(_fetch(url + "api/info"))

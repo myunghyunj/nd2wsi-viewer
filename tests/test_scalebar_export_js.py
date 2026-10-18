@@ -18,7 +18,8 @@ const src=fs.readFileSync(process.argv[1], 'utf8'), cfg=JSON.parse(process.argv[
 const downloads=[], toasts=[], controls={};
 const context={URLSearchParams, Number, Math,
   state:{roi:{x:110,y:220,w:800,h:776}, channels:[1],
-    info:{channels:[0,1], levels:[{path:'3',downsample:8}], maxRenderMpx:400}},
+    info:{channels:[0,1], levels:[{path:'3',downsample:8}], maxRenderMpx:400},
+    shading:{appendRenderParams:q=>{if(cfg.correction)q.set('correction',cfg.correction);return q}}},
   activeFrameContext:()=>cfg.hasFrame===false?null:{frame:{t:2,p:3,z:4}},
   frameOwnsRoi:()=>cfg.hasRoi!==false && cfg.hasFrame!==false,
   pixelSize:()=>cfg.pixelSize===undefined?[.8,.5]:cfg.pixelSize,
@@ -27,15 +28,14 @@ const context={URLSearchParams, Number, Math,
   lutParam:()=> '158:2144:1,204:2820:1.5',
   appendFrameParams:(q,f)=>{for(const [k,v] of Object.entries(f))q.set(k,v);},
   scopedButton:(id,disabled,title)=>{controls[id]={disabled,title};},
-  showToast:t=>toasts.push(t),
+  showToast:t=>toasts.push(t),trackExport(){},
   document:{body:{append(){}},createElement:()=>({click(){downloads.push(this.href)},remove(){}})},
 };
 vm.createContext(context);
 const start=src.indexOf('function scaleBarExportIssue('),end=src.indexOf('let exportTimer',start);
 vm.runInContext(src.slice(start,end),context);
 context.syncScaleBarExportControls();
-context.downloadRoi('svg',true);
-context.downloadRoi('jpg',true);
+for(const format of cfg.formats||['svg','jpg'])context.downloadRoi(format,['svg','jpg'].includes(format));
 process.stdout.write(JSON.stringify({downloads,toasts,controls}));
 """
 
@@ -57,6 +57,18 @@ def test_both_buttons_use_actual_level_path_and_selected_frame_lut_channels():
         assert {k:q[k][0] for k in ["t","p","z"]} == dict(t="2",p="3",z="4")
         assert q["c"] == ["1"] and q["win"] == ["158:2144:1,204:2820:1.5"]
     assert all(not button["disabled"] for button in out["controls"].values())
+
+
+def test_shading_is_in_rendered_exports_and_absent_from_original_nd2_tiff():
+    out = run({"correction": "h-fixed", "formats": ["svg", "jpg", "png", "tiff", "nd2"]})
+    assert len(out["downloads"]) == 5
+    for url in out["downloads"]:
+        q = parse_qs(urlparse(url).query)
+        if q["format"][0] in {"svg", "jpg", "png"}:
+            assert q["correction"] == ["h-fixed"]
+            assert "win" in q
+        else:
+            assert "correction" not in q and "win" not in q
 
 
 @pytest.mark.parametrize("config,reason", [({"pixelSize":None},"calibration"),

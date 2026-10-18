@@ -24,7 +24,7 @@ Select the runtime for your operating system (ARM64 on an ARM64 PC).
 
 Updates: obtain a newer Windows ZIP from GitHub Releases and extract it into a
 new folder after closing the current app. Windows updates are installed
-manually. The update button opens the releases page for downloads.
+manually.
 
 This portable build does not register file associations or need administrator
 access. Windows may display an unknown-publisher SmartScreen prompt because

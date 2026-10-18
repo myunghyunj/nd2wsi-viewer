@@ -1,0 +1,71 @@
+{
+  "schema": "H_auto_refit/1",
+  "source_model_sha256": "15e1ca080d3a808feff90e7d03e87155a2363e1b646605de57fef012666a28b0",
+  "h_auto": {
+    "sensor_pitch_fraction": [
+      0.7,
+      1.25
+    ],
+    "minimum_repeat_cells_per_fit_group": 4,
+    "split_fractions_y0y1x0x1": {
+      "train": [
+        0.4027972,
+        0.7608392,
+        0.0559441,
+        0.5034965
+      ],
+      "heldout_columns": [
+        0.4027972,
+        0.7608392,
+        0.5594406,
+        0.9230769
+      ],
+      "heldout_rows": [
+        0.7832168,
+        0.9986014,
+        0.0559441,
+        0.5034965
+      ],
+      "heldout_both": [
+        0.7832168,
+        0.9986014,
+        0.5594406,
+        0.9230769
+      ],
+      "tissue_stress": [
+        0.0895105,
+        0.3804196,
+        0.0559441,
+        0.9230769
+      ]
+    },
+    "missing_BF_fallback": "unchanged_unsupported",
+    "geometry_search_boundary_fraction_guard": 0.01,
+    "BF_support_relative_to_train_median": 0.6,
+    "BF_support_minimum_repeat_coverage": 0.97,
+    "BF_support_minimum_phase_coverage": 0.98,
+    "periodicity_evidence": "BF template R2 positive in both heldout_columns and heldout_rows",
+    "channel_evidence": "selected channel template R2 positive in both selection groups",
+    "minimum_valid_gain": 0.25,
+    "gain_clipping": false,
+    "phase_template_shape_yx": [
+      192,
+      256
+    ],
+    "candidate_sigma_phase_bins": [
+      0.5,
+      1.0,
+      2.0
+    ],
+    "candidate_BF_residual_weights": [
+      0.0,
+      0.5,
+      1.0
+    ],
+    "local_phase_candidates": [
+      false,
+      true
+    ],
+    "coarse_own32_comparator": true
+  }
+}

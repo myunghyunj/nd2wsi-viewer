@@ -192,6 +192,19 @@ def prepare_export(
     if frame is not None:
         root = state.plate.root_for(*frame)
         stem += "_t{}_p{}_z{}".format(*frame)
+    correction = (query.get("correction") or [None])[0]
+    if correction:
+        if fmt not in ("png", "jpg", "jpeg", "svg"):
+            raise ExportRequestError(
+                "Shading correction applies to rendered exports; native ND2/TIFF exports use original values"
+            )
+        if frame is not None:
+            raise ExportRequestError("Shading correction is unavailable for plate frames")
+        try:
+            root = state.shading.root_for(correction)
+        except ValueError as exc:
+            raise ExportRequestError(str(exc)) from exc
+        stem += "_shading-corrected"
     filename = f"{filename_prefix}{stem}_L{level}_x{x}_y{y}_{w}x{h}"
     return RegionExport(
         root, state.attrs, level, x, y, w, h, channels, fmt, window, scale_bar,

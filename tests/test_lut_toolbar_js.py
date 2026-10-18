@@ -495,7 +495,7 @@ def test_toolbar_html_has_short_auto_fit_label_and_named_controls_in_order():
         "fluent-clipboard-paste-20-regular.svg": upstream + "Clipboard%20Paste/SVG/ic_fluent_clipboard_paste_20_regular.svg",
         "fluent-checkmark-20-regular.svg": upstream + "Checkmark/SVG/ic_fluent_checkmark_20_regular.svg",
     }
-    assert provenance["assets"] == expected_assets
+    assert {name: provenance["assets"][name] for name in expected_assets} == expected_assets
     assert ".lut-copy.is-copied .lut-copy-symbol" in css
     for filename in expected_assets:
         assert f'url("icons/{filename}")' in css

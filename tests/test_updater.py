@@ -110,7 +110,7 @@ def test_strict_relaunch_close_waits_and_closes_plate_without_timeout():
         def close(self, timeout=300):
             calls.append(timeout)
 
-    state = SimpleNamespace(busy=life, plate=Plate(), root=None)
+    state = SimpleNamespace(busy=life, plate=Plate(), root=None, close_shading=lambda: None)
     registry.slides["slide"] = state
 
     def export():
@@ -146,7 +146,9 @@ def test_updater_ui_and_annotation_flush_are_wired():
     pane_js = (ROOT / "nd2wsi" / "static" / "app.js").read_text(encoding="utf-8")
     app_py = (ROOT / "nd2wsi" / "app.py").read_text(encoding="utf-8")
 
-    assert 'id="update-check"' in shell
+    assert 'id="update-check"' not in shell
+    assert 'id="shading-correction"' in shell
+    assert "refreshUpdaterButton" not in shell_js
     assert "window.nd2wsiPrepareForUpdate" in shell_js
     assert 'kind === "quit-ready"' in shell_js
     assert 'event.data.nd2wsi === "prepare-quit"' in pane_js

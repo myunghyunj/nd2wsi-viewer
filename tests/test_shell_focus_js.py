@@ -27,7 +27,7 @@ const context=vm.createContext({document,frames,readyFrames,ShortcutRouter,focus
   active:null,location:{origin:'http://qa.invalid'},quitPreparation:null,
   pairPicker:{open:false},compare:{enabled:false,members:['b']},
   closePairPicker(){},rememberSlide(){},ensureFrame(){},applyFrameLayout(){},render(){},
-  scheduleNativeGestureScopes(){},inGroup:sid=>['a','b'].includes(sid),
+  scheduleNativeGestureScopes(){},refreshShadingButton(){},inGroup:sid=>['a','b'].includes(sid),
   broadcastCompareState(){},spatialGroupReady:()=>false,
   sendTabShortcutState(){},groupSids:()=>['a','b'],setLinkMenuVisible(){},
   rememberAlignment(){},invalidateSpatialWork(){},clearDisplayTransforms(){},updateCompareControls(){},

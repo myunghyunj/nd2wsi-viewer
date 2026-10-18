@@ -163,7 +163,7 @@ def main() -> int:
         "--specpath", str(build), "--copy-metadata", "nd2wsi-viewer",
     ]
     for package in (
-        "nd2wsi", "nd2", "zarr", "numcodecs", "dask", "tifffile", "imagecodecs",
+        "nd2wsi", "nd2", "scipy", "zarr", "numcodecs", "dask", "tifffile", "imagecodecs",
         "limnd2", "ome_types", "xsdata", "xsdata_pydantic_basemodel", "webview",
         "pythonnet", "clr_loader",
     ):

@@ -162,6 +162,23 @@ class ViewerState:
         self._cache_usage_ready = False
         self._cache_usage: dict[str, int] | None = None
         self._lut_settings_store = None
+        self._shading = None
+        self._shading_lock = threading.Lock()
+
+    @property
+    def shading(self):
+        """Private, optional correction; the registered RAW root never changes."""
+        with self._shading_lock:
+            if self._shading is None:
+                from .h_correction import HCorrectionController
+
+                self._shading = HCorrectionController(self)
+            return self._shading
+
+    def close_shading(self) -> None:
+        with self._shading_lock:
+            if self._shading is not None:
+                self._shading.close()
 
     @property
     def source_path(self) -> Path | None:
@@ -422,6 +439,7 @@ def reveal_in_file_manager(path: Path, *, platform: str | None = None, runner=No
 def _close_state(st: ViewerState | None) -> None:
     if st is None:
         return
+    st.close_shading()
     close = getattr(st.root, "close", None)
     if close:
         close()
@@ -898,10 +916,12 @@ class SlideRegistry:
     def remove(self, sid: str) -> bool:
         with self._lock:
             st = self.slides.get(sid)
+            if st is not None and st._shading is not None:
+                st._shading.cancel()
             if st is not None and self.window_session is not None:
                 # Atomically bar export admission; a separate active check
                 # would race an already-resolved HTTP export request.
-                if not st.busy.close(timeout=0):
+                if not st.busy.close(timeout=1):
                     st.busy.reopen()
                     raise ValueError("An export from this slide is still running; close it after the export finishes")
             st = self.slides.pop(sid, None)
@@ -919,6 +939,7 @@ class SlideRegistry:
             states = list(self.slides.values())
             self.slides.clear()
         for st in states:
+            st.close_shading()
             st.busy.close(timeout=30)
             close = getattr(st.root, "close", None)
             if close is None:
@@ -949,6 +970,7 @@ class SlideRegistry:
             states = list(self.slides.values())
             self.slides.clear()
         for st in states:
+            st.close_shading()
             st.busy.close(timeout=None)
             if st.plate is not None:
                 st.plate.close(timeout=None)
@@ -1118,6 +1140,7 @@ class SlideRegistry:
                     )
 
                 try:
+                    st.close_shading()
                     # A plate's builder writes chunks straight into the container.
                     # Drain all source readers and stop it synchronously without
                     # dropping a local writer lease; trash owns that lease through
@@ -1427,6 +1450,8 @@ def make_handler(
                     return self._pixel(st, q)
                 if sub == "/api/histogram":
                     return self._histogram(st, q)
+                if sub == "/api/shading/status":
+                    return self._json(st.shading.status())
                 if sub == "/api/annotations":
                     return self._annotations_get(st, q)
                 associated = ASSOCIATED_RE.match(sub)
@@ -1474,6 +1499,18 @@ def make_handler(
                 if path == "/api/trash":
                     return self._trash()
                 st, sub = self._resolve(path)
+                if st is not None and sub in ("/api/shading/start", "/api/shading/cancel"):
+                    try:
+                        data = self._body_json(limit=1000)
+                        if not isinstance(data, dict) or data:
+                            raise ValueError("expected an empty JSON object")
+                    except (ValueError, json.JSONDecodeError) as e:
+                        return self._error(400, str(e))
+                    action = st.shading.start if sub.endswith("/start") else st.shading.cancel
+                    try:
+                        return self._json(action())
+                    except ValueError as e:
+                        return self._error(409, str(e))
                 if st is not None and sub == "/api/lut-settings":
                     return self._lut_settings_post(st)
                 if st is not None and sub == "/api/annotations":
@@ -1893,12 +1930,22 @@ def make_handler(
             except ValueError as e:
                 return self._error(400, str(e))
             root = st.plate.root_for(*frame) if frame is not None else st.root
+            correction = (q.get("correction") or [None])[0]
+            if correction:
+                try:
+                    if frame is not None:
+                        raise ValueError("Shading correction is unavailable for plate frames")
+                    root = st.shading.root_for(correction)
+                except ValueError as e:
+                    return self._error(409, str(e))
             try:
                 body = render.render_tile(
                     root, st.attrs, level, tx, ty, channels, fmt, win
                 )
             except KeyError as e:
                 return self._error(404, str(e))
+            except ValueError as e:
+                return self._error(409, str(e))
             ctype = "image/jpeg" if fmt in ("jpg", "jpeg") else "image/png"
             self._send(200, body, ctype, cache=self._immutable_when_current(st, q))
 
