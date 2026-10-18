@@ -2,6 +2,11 @@
   "schema": "H_auto_refit/1",
   "source_model_sha256": "15e1ca080d3a808feff90e7d03e87155a2363e1b646605de57fef012666a28b0",
   "h_auto": {
+    "target_channels": [
+      "FITC",
+      "CY3",
+      "BF"
+    ],
     "sensor_pitch_fraction": [
       0.7,
       1.25
@@ -67,5 +72,37 @@
       true
     ],
     "coarse_own32_comparator": true
+  },
+  "h_adaptive": {
+    "enabled_on_insufficient_repeat_cells": true,
+    "schema": "H_adaptive_hybrid_subcell/1",
+    "target_channels": [
+      "FITC",
+      "CY3",
+      "BF"
+    ],
+    "damping": 0.84,
+    "sigma_nodes": 0.75,
+    "acceptance_criteria": {
+      "reduced_resolution_gates": {
+        "min_supported_cells_per_split_group": 4,
+        "min_template_reproducibility_r2": 0.0,
+        "active_band_cell_definition": {
+          "min_raw_block_c_amplitude": 0.2,
+          "min_raw_block_c_shape_r2": 0.5
+        },
+        "min_active_cells_per_heldout_group": 2,
+        "min_median_block_c_amplitude_reduction_per_heldout_group": 0.25,
+        "max_median_block_c_energy_ratio_per_heldout_group": 0.85,
+        "min_median_block_c_residual_amplitude_per_heldout_group": -0.05,
+        "min_p10_block_c_residual_amplitude_all_heldout": -0.1,
+        "min_worst_cell_block_c_residual_amplitude_all_heldout": -0.15,
+        "max_abs_residual_amplitude_on_weak_cells": 0.15
+      },
+      "gain_and_engineering_invariants": {
+        "minimum_valid_gain": 0.25,
+        "maximum_valid_gain": 1.75
+      }
+    }
   }
 }

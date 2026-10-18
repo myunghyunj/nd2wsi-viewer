@@ -88,34 +88,27 @@ def load_model(container, manifest):
             or not fingerprints_match(provenance.get("source", {}), manifest.get("source", {}))
             or provenance.get("selection") != manifest.get("selection")):
         raise ValueError("Persisted Shading Correction does not identify this source/selection")
-    expected = {name + ".npy" for name in (
-        "basis", "templates", "delta", "local", "old", "oldbasis", "oldtemplates",
-        "channel_indices", "enabled",
-    )}
+    expected_base = {name + ".npy" for name in Model.BASE_FIELDS}
+    expected_adaptive = {name + ".npy" for name in Model.ADAPTIVE_FIELDS}
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         entries = archive.infolist()
-        if (len(entries) != len(expected) or {entry.filename for entry in entries} != expected
+        entry_names = {entry.filename for entry in entries}
+        if (entry_names not in (expected_base, expected_adaptive)
+                or len(entries) != len(entry_names)
                 or sum(entry.file_size for entry in entries) > _MODEL_LIMIT):
             raise ValueError("Unsupported or oversized persisted correction model")
     model = Model(io.BytesIO(payload))
     try:
         count = len(model.indices)
         channels = int(manifest["image"]["shape_cyx"][0])
-        if (not 1 <= count <= 2 or len(set(model.indices)) != count
+        if (not 1 <= count <= 3 or len(set(model.indices)) != count
                 or any(c < 0 or c >= channels for c in model.indices)
                 or len(model.enabled) != count
                 or [c for c, enabled in zip(model.indices, model.enabled) if enabled]
                 != correction.get("channel_indices")):
             raise ValueError("Invalid persisted correction channel mapping")
-        if (model.basis.shape != (2, 2) or model.oldbasis.shape != (2, 2)
-                or model.delta.ndim != 2 or min(model.delta.shape) < 1
-                or model.templates.ndim != 3 or model.templates.shape[0] != count
-                or model.oldtemplates.ndim != 3 or model.oldtemplates.shape[0] != count
-                or model.local.shape != (count,) or model.old.shape != (count,)):
-            raise ValueError("Invalid persisted correction model geometry")
-        for value in (model.basis, model.oldbasis, model.delta, model.templates, model.oldtemplates):
-            if not np.issubdtype(value.dtype, np.number) or not np.isfinite(value).all():
-                raise ValueError("Nonfinite persisted correction model")
+        # Model validates the exact schema/fields, geometry and analytical gain
+        # bounds across every stored template/envelope value before this return.
         return model
     except BaseException:
         model.data.close()
@@ -257,6 +250,8 @@ def prepare_apply(state, model, model_record, event, progress):
     try:
         if replacement.prior_manifest.get("h_correction") is not None:
             raise ValueError("Shading Correction is already applied; revoke before fitting again")
+        # Refuse an invalid model before rebuilding a potentially large pyramid.
+        model.validate()
         native = getattr(state.root, "raw_level0", state.root["0"])
         if np.dtype(native.dtype) not in (np.dtype("uint8"), np.dtype("uint16")):
             raise ValueError("Correction requires original uint8/uint16 ND2 pixels")

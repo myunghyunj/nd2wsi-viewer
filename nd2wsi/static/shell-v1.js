@@ -219,7 +219,7 @@ function activateShadingCorrection() {
     $("shading-confirm-title").textContent = revoke ? "Revoke Shading Correction?" : "Shading Correction";
     $("shading-confirm-message").textContent = revoke
       ? "Rebuild the original pyramid from the source ND2."
-      : "Shadow correction best works in large scans.";
+      : "Estimate shading in FITC, CY3 and BF for large scans. Only channels with sufficient evidence are corrected. DAPI and original measurements stay unchanged.";
     $("shading-confirm-continue").textContent = revoke ? "Revoke" : "Continue";
     $("shading-confirm-estimate").textContent = window.Nd2ShadingCorrection.estimateLabel(status.estimated_seconds);
     $("shading-confirm").showModal();

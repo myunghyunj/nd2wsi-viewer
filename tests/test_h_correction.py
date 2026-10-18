@@ -202,6 +202,25 @@ def test_reopened_controller_restores_applied_status_from_manifest(state):
     assert controller._thread is None
 
 
+def test_reopened_controller_reports_all_three_corrected_channels(state):
+    mark_applied(state)
+    state.manifest["h_correction"]["channel_indices"] = [3, 0, 1]
+    status = hc.HCorrectionController(state).status()
+    assert status["channels"] == ["FITC", "CY3", "BF"]
+    assert status["applied"] is True
+
+
+def test_bf_remains_a_target_without_fluorescence_channels(state):
+    state.attrs["omero"]["channels"][0]["label"] = "CY5"
+    state.attrs["omero"]["channels"][3]["label"] = "GFP"
+    controller = hc.HCorrectionController(state)
+    status = controller.status()
+    assert status["supported"] is True
+    assert status["state"] == "idle"
+    assert hc._mapping(["Bright Field", "DAPI"]) == {"BF": 0, "DAPI": 1}
+    assert controller._thread is None
+
+
 def test_cancel_revoke_keeps_the_committed_corrected_state(state, monkeypatch):
     mark_applied(state)
     fake_persistence(state, monkeypatch)
@@ -571,6 +590,8 @@ def test_preflight_estimate_scales_with_pixel_and_channel_work_without_reads(sta
     assert estimate(22895, 36599 * 2, channels) > reference
     assert estimate(22895, 36599, channels + ["CY5"]) > reference
     assert estimate(22895, 36599, ["BF", "DAPI", "FITC"]) < reference
+    assert estimate(22895, 36599, ["CY5", "BF", "DAPI", "FITC"]) < reference
+    assert estimate(22895, 36599, ["BF"]) > 0
 
 
 def test_preflight_estimate_is_null_for_unsupported_slide(state):

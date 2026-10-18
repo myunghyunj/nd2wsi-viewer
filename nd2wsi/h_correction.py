@@ -25,6 +25,7 @@ _ALIASES = {
     "BRIGHTFIELD": "BF",
     "BRIGHT FIELD": "BF",
 }
+_TARGET_CHANNELS = ("FITC", "CY3", "BF")
 _ACTIVE = {"preparing", "fitting", "preparing_display", "rebuilding", "publishing"}
 _WORKSPACE_LIMIT = 4 * 1024**3
 _FIT_MEMORY_LIMIT = 1024**3
@@ -87,8 +88,6 @@ def _mapping(names: list[str]) -> dict[str, int]:
             result[canonical] = index
     if "BF" not in result:
         raise UnsupportedCorrection("Shading Correction requires a BF channel")
-    if not any(name in result for name in ("FITC", "CY3")):
-        raise UnsupportedCorrection("Shading Correction requires a FITC or CY3 channel")
     return result
 
 
@@ -104,7 +103,7 @@ def _basic_reason(state: Any) -> str:
         if path is None or Path(path).suffix.lower() != ".nd2" or not Path(path).is_file():
             return "Shading Correction needs the original ND2 source"
         if meta.get("rgb"):
-            return "Shading Correction requires scalar fluorescence channels"
+            return "Shading Correction requires scalar channels"
         if meta.get("selection", {}).get("z") == "max":
             return "Shading Correction is unavailable for Z projections"
         levels = meta["levels"]
@@ -156,7 +155,7 @@ def _estimated_seconds(state: Any) -> int:
     """
     channels, height, width = state.root["0"].shape
     mapping = _mapping([ch["label"] for ch in state.attrs["omero"]["channels"]])
-    targets = sum(name in mapping for name in ("FITC", "CY3"))
+    targets = sum(name in mapping for name in _TARGET_CHANNELS)
     pixels = height * width / (36599 * 22895)
     seconds = pixels * (50.8 * channels / 4 + 9.7 + 112.8 * targets / 2)
     return max(30, math.ceil(1.25 * seconds / 15) * 15)
@@ -181,7 +180,7 @@ def _metadata_for_state(state: Any) -> dict:
     with nd2.ND2File(str(path)) as reader:
         sizes = dict(reader.sizes)
         if bool(reader.is_rgb) or sizes.get("S", 1) != 1:
-            raise UnsupportedCorrection("Shading Correction requires scalar fluorescence channels")
+            raise UnsupportedCorrection("Shading Correction requires scalar channels")
         if any(value != 1 for axis, value in sizes.items() if axis not in ("C", "Y", "X", "S")):
             raise UnsupportedCorrection(
                 "Shading Correction currently supports a single stitched frame"
@@ -490,7 +489,7 @@ class HCorrectionController:
                 self._update(event, channel_results=result["selected"])
                 if not any(model.enabled):
                     self._update(event, state="unchanged", pct=100,
-                                 reason="No reproducible, valid FITC/CY3 correction was found")
+                                 reason="No reproducible, valid FITC/CY3/BF correction was found")
                     return
                 self._update(event, state="preparing_display", pct=55)
                 replacement = prepare_apply(self.state, model, result, event,

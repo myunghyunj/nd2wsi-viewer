@@ -320,7 +320,7 @@ def test_confirmation_targets_exact_operation_and_captured_pane_once(applied, ac
       return {before,first,second,open:f.$('shading-confirm').open,messages:f.messages};
     """.replace("APPLIED", str(applied).lower()))
     assert out["before"] == {"open": True, "estimate": "Est. time: about 4 min", "title": title, "button": button,
-                             "message": "Rebuild the original pyramid from the source ND2." if applied else "Shadow correction best works in large scans.",
+                             "message": "Rebuild the original pyramid from the source ND2." if applied else "Estimate shading in FITC, CY3 and BF for large scans. Only channels with sufficient evidence are corrected. DAPI and original measurements stay unchanged.",
                              "messages": 0, "revoke": applied}
     assert out["first"] is True and out["second"] is False and out["open"] is False
     command, = out["messages"]
@@ -496,7 +496,7 @@ def test_selected_icon_confirmation_colors_and_original_pixel_label_are_preserve
     assert pane.index("shading-correction-v1.js") < pane.index("app.js")
     assert 'id="update-check"' not in shell
     assert 'id="shading-progress-bar"' in shell
-    assert 'Shadow correction best works in large scans.' in shell
+    assert 'Estimate shading in FITC, CY3 and BF for large scans.' in shell
     assert 'aria-describedby="shading-confirm-message shading-confirm-estimate"' in shell
     assert '#shading-confirm-continue { background:#248a3d; }' in css
     assert '#shading-confirm-cancel { background:#d72c30; }' in css

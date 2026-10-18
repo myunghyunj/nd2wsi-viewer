@@ -1,12 +1,15 @@
-"""Frozen H fit with the established periodic template family and sampler.
-
-Adapted from validate_transfer.py, fit_best.py and model.py. This module never
-loads slide-7 fitted assets. Geometry and templates are independently estimated.
-
-Source: ExM_Generality_Benchmark/code/h_auto.py, SHA-256
-15e1ca080d3a808feff90e7d03e87155a2363e1b646605de57fef012666a28b0.
-Only cooperative cancellation and an operational memory guard are added here;
-the fit, candidate family, thresholds, and coordinate sampler are unchanged.
+"""Frozen H fit with the established periodic template family and sampler,
+extended with:
+1. Budgeted active sampling in chunks of at most 32 cells. Admission includes
+   concurrently retained coordinates, observations and aligned training cells,
+   as well as coarse, normalization and candidate-scoring temporaries. The
+   estimate concerns fitting-owned workspace, not total application RSS.
+2. Optional fallback to `H_adaptive_hybrid_subcell/1` (`h_adaptive.py`) when
+   fixed-box validation regions have `insufficient_repeat_cells_*` due to
+   tissue-border clipping (e.g., 1-2.nd2).
+3. Support in `Model` for spatially varying cell-centered amplitude envelopes
+   (`amplitude_nodes`, `envelope_cell_origin`) while remaining 100% compatible
+   with legacy 9-entry `H_auto_refit/1` model archives.
 """
 
 import json
@@ -155,6 +158,52 @@ def sample(raw, coords):
     )
 
 
+def _sample_and_norm_active_chunked(
+    raw8,
+    basis,
+    records,
+    active_mask,
+    *,
+    ny=192,
+    nx=256,
+    delta=None,
+    chunk_size=32,
+    check=lambda: None,
+):
+    """Stream `coords_for` -> `sample` -> `norm` in bounded chunks of `chunk_size`
+    cells. Verify finiteness across ALL `records` while storing `coords` and
+    `observed` only for active fit/selection cells (`active_mask`).
+    """
+    n_total = len(records)
+    n_active = int(np.sum(active_mask))
+    n_ch = raw8.shape[0]
+    coords_active = np.empty((n_active, 2, ny, nx), dtype=np.float64) if delta is None else None
+    obs_active = np.empty((n_active, n_ch, ny, nx), dtype=raw8.dtype)
+    finite_by_ch = np.ones(n_ch, dtype=bool)
+
+    write_pos = 0
+    for start in range(0, n_total, chunk_size):
+        check()
+        end = min(n_total, start + chunk_size)
+        rec_chunk = records[start:end]
+        mask_chunk = active_mask[start:end]
+        c_chunk = coords_for(basis, rec_chunk, ny, nx, delta=delta, factor=8)
+        s_chunk = sample(raw8, c_chunk)
+        n_chunk = norm(s_chunk, strict=False)
+        for ch in range(n_ch):
+            if not np.isfinite(n_chunk[:, ch]).all():
+                finite_by_ch[ch] = False
+        k = int(np.sum(mask_chunk))
+        if k > 0:
+            if coords_active is not None:
+                coords_active[write_pos : write_pos + k] = c_chunk[mask_chunk]
+            obs_active[write_pos : write_pos + k] = n_chunk[mask_chunk].astype(
+                raw8.dtype, copy=False
+            )
+            write_pos += k
+    return coords_active, obs_active, finite_by_ch
+
+
 def phase_cells(raw32, basis, boxes, bfi, reference, saturation, fit_indices, check=lambda: None):
     h, w = raw32.shape[1:]
     corners = np.array([[0, 0], [0, w], [h, 0], [h, w]], float).T
@@ -197,21 +246,145 @@ def phase_cells(raw32, basis, boxes, bfi, reference, saturation, fit_indices, ch
     return np.array(cells), records
 
 
+def smooth_node_envelope_at(nodes_yx, origin_rc, phase_yx):
+    """Evaluate a C1 smoothstep 2D half-cell node lattice at continuous phase coordinates."""
+    gy, gx = np.broadcast_arrays(
+        2.0 * (np.asarray(phase_yx[0], dtype=np.float64) - float(origin_rc[0])),
+        2.0 * (np.asarray(phase_yx[1], dtype=np.float64) - float(origin_rc[1])),
+    )
+    max_y = float(nodes_yx.shape[0] - 1)
+    max_x = float(nodes_yx.shape[1] - 1)
+
+    cy = np.clip(gy, 0.0, max_y)
+    cx = np.clip(gx, 0.0, max_x)
+    dist_out = np.hypot(gy - cy, gx - cx)
+    t_out = np.clip(1.0 - dist_out / 1.5, 0.0, 1.0)
+    taper = t_out * t_out * (3.0 - 2.0 * t_out)
+
+    iy = np.clip(np.floor(cy).astype(np.int64), 0, nodes_yx.shape[0] - 2)
+    ix = np.clip(np.floor(cx).astype(np.int64), 0, nodes_yx.shape[1] - 2)
+    ty = np.clip(cy - iy, 0.0, 1.0)
+    tx = np.clip(cx - ix, 0.0, 1.0)
+    sy = ty * ty * (3.0 - 2.0 * ty)
+    sx = tx * tx * (3.0 - 2.0 * tx)
+
+    val = (
+        (1.0 - sy) * ((1.0 - sx) * nodes_yx[iy, ix] + sx * nodes_yx[iy, ix + 1])
+        + sy * ((1.0 - sx) * nodes_yx[iy + 1, ix] + sx * nodes_yx[iy + 1, ix + 1])
+    )
+    return val * taper
+
+
 class Model:
+    LEGACY_SCHEMA = "H_auto_refit/1"
+    ADAPTIVE_SCHEMA = "H_adaptive_hybrid_subcell/1"
+    BASE_FIELDS = frozenset((
+        "basis", "templates", "delta", "local", "old", "oldbasis", "oldtemplates",
+        "channel_indices", "enabled",
+    ))
+    ADAPTIVE_FIELDS = BASE_FIELDS | frozenset((
+        "amplitude_nodes", "envelope_cell_origin", "model_schema",
+    ))
+
     def __init__(self, path):
         # Persisted models are small, verified NPZ entries inside .nd2svs.
         # A BytesIO keeps reopen read-only and avoids temporary sidecar files.
         self.path = None if hasattr(path, "read") else Path(path)
         self.data = np.load(path, allow_pickle=False)
-        self.basis = self.data["basis"]
-        self.templates = self.data["templates"]
-        self.delta = self.data["delta"]
-        self.local = self.data["local"]
-        self.old = self.data["old"]
-        self.oldbasis = self.data["oldbasis"]
-        self.oldtemplates = self.data["oldtemplates"]
-        self.indices = list(map(int, self.data["channel_indices"]))
-        self.enabled = list(map(bool, self.data["enabled"]))
+        try:
+            files = set(self.data.files)
+            if (files not in (self.BASE_FIELDS, self.ADAPTIVE_FIELDS)
+                    or len(self.data.files) != len(files)):
+                raise ValueError("Unsupported correction model fields")
+            self.model_schema = self.LEGACY_SCHEMA
+            if files == self.ADAPTIVE_FIELDS:
+                schema = self.data["model_schema"]
+                if (schema.shape != () or schema.dtype.kind != "U"
+                        or schema.item() != self.ADAPTIVE_SCHEMA):
+                    raise ValueError("Unsupported adaptive correction model schema")
+                self.model_schema = schema.item()
+            self.basis = self.data["basis"]
+            self.templates = self.data["templates"]
+            self.delta = self.data["delta"]
+            self.local = self.data["local"]
+            self.old = self.data["old"]
+            self.oldbasis = self.data["oldbasis"]
+            self.oldtemplates = self.data["oldtemplates"]
+            indices = self.data["channel_indices"]
+            enabled = self.data["enabled"]
+            if (indices.ndim != 1 or indices.dtype.kind not in "iu"
+                    or not 1 <= len(indices) <= 3
+                    or len(np.unique(indices)) != len(indices) or np.any(indices < 0)
+                    or enabled.shape != indices.shape or enabled.dtype.kind != "b"):
+                raise ValueError("Invalid correction channel mapping")
+            self.indices = list(map(int, indices))
+            self.enabled = list(map(bool, enabled))
+            self.has_envelope = files == self.ADAPTIVE_FIELDS
+            self.amplitude_nodes = self.data["amplitude_nodes"] if self.has_envelope else None
+            self.envelope_cell_origin = self.data["envelope_cell_origin"] if self.has_envelope else None
+            self.envelope_origin = self.envelope_cell_origin
+            self.validate()
+        except BaseException:
+            self.data.close()
+            raise
+
+    def validate(self):
+        """Prove gain bounds for every coordinate, not just a sampled tile.
+
+        Linear periodic template interpolation is a convex combination of its
+        stored values. The smoothstep envelope interpolates nonnegative nodes
+        with convex weights, then multiplies by a taper in [0, 1]. Therefore
+        its range lies in [0, max(nodes)] over the entire plane, including the
+        stored lattice boundary and its exterior. These conservative bounds
+        need not assume that template and node extrema coincide in an image.
+
+        Legacy archives retain their original >=0.25 contract. The adaptive
+        schema additionally promises <=1.75; no archive is silently clipped.
+        Disabled channels return identity and have no active gain restriction.
+        """
+        count = len(self.indices)
+        if (self.basis.shape != (2, 2) or self.oldbasis.shape != (2, 2)
+                or self.delta.ndim != 2 or min(self.delta.shape, default=0) < 1
+                or self.templates.ndim != 3 or self.templates.shape[0] != count
+                or min(self.templates.shape[1:], default=0) < 1
+                or self.oldtemplates.ndim != 3 or self.oldtemplates.shape[0] != count
+                or min(self.oldtemplates.shape[1:], default=0) < 1
+                or self.local.shape != (count,) or self.local.dtype.kind != "b"
+                or self.old.shape != (count,) or self.old.dtype.kind != "b"):
+            raise ValueError("Invalid correction model geometry")
+        arrays = [self.basis, self.oldbasis, self.delta, self.templates, self.oldtemplates]
+        if self.has_envelope:
+            if (self.amplitude_nodes.ndim != 3 or self.amplitude_nodes.shape[0] != count
+                    or min(self.amplitude_nodes.shape[1:], default=0) < 2
+                    or self.envelope_cell_origin.shape != (2,)):
+                raise ValueError("Invalid adaptive amplitude envelope geometry")
+            arrays.extend((self.amplitude_nodes, self.envelope_cell_origin))
+        for value in arrays:
+            if value.dtype.kind not in "iuf" or not np.isfinite(value).all():
+                raise ValueError("Nonfinite or non-real correction model")
+        determinants = [np.linalg.det(self.basis), np.linalg.det(self.oldbasis)]
+        if not np.isfinite(determinants).all() or min(determinants) <= 0:
+            raise ValueError("Invalid correction phase basis")
+        if self.has_envelope and np.any(self.old):
+            raise ValueError("Adaptive correction cannot select a legacy template")
+        if self.has_envelope and np.any(self.amplitude_nodes < 0):
+            raise ValueError("Invalid negative adaptive amplitude envelope")
+        bounds = []
+        for ci, enabled in enumerate(self.enabled):
+            if not enabled:
+                bounds.append((1.0, 1.0))
+                continue
+            t = self.oldtemplates[ci] if self.old[ci] else self.templates[ci]
+            low, high = float(np.min(t)), float(np.max(t))
+            if self.has_envelope:
+                amplitude_max = float(np.max(self.amplitude_nodes[ci]))
+                low, high = min(0.0, low * amplitude_max), max(0.0, high * amplitude_max)
+            low, high = 1.0 + low, 1.0 + high
+            if (not np.isfinite([low, high]).all() or low < 0.25
+                    or (self.has_envelope and high > 1.75)):
+                raise ValueError("Invalid correction gain bounds over stored model domain")
+            bounds.append((low, high))
+        self.gain_bounds = bounds
 
     def gain(self, c, shape, origin):
         ci = self.indices.index(int(c))
@@ -221,6 +394,9 @@ class Model:
             return np.ones(shape, np.float32)
         xx = x + np.arange(w)[None, :]
         out = np.empty(shape, np.float32)
+        has_envelope = (
+            self.amplitude_nodes is not None and self.envelope_cell_origin is not None
+        )
         for row in range(0, h, 128):
             yy = y + np.arange(row, min(h, row + 128))[:, None]
             if self.old[ci]:
@@ -229,8 +405,22 @@ class Model:
                 f = field_at(
                     self.templates[ci], self.basis, self.delta, yy, xx, bool(self.local[ci])
                 )
+            if has_envelope:
+                yy32 = (np.asarray(yy, dtype=np.float64) - 15.5) / 32.0
+                xx32 = (np.asarray(xx, dtype=np.float64) - 15.5) / 32.0
+                phase = np.array([
+                    self.basis[0, 0] * yy32 + self.basis[0, 1] * xx32,
+                    self.basis[1, 0] * yy32 + self.basis[1, 1] * xx32,
+                ])
+                if bool(self.local[ci]):
+                    phase[1] = phase[1] + phase_delta(phase, self.delta)
+                amp = smooth_node_envelope_at(
+                    self.amplitude_nodes[ci], self.envelope_cell_origin, phase
+                )
+                f = amp * f
             out[row : row + len(yy)] = 1 + f
-        if not np.isfinite(out).all() or out.min() < 0.25:
+        if (not np.isfinite(out).all() or (out.size and out.min() < 0.25)
+                or (self.has_envelope and out.size and out.max() > 1.75)):
             raise Unsupported("invalid_fitted_gain")
         return out
 
@@ -252,6 +442,102 @@ def fit(
     max_working_bytes=None,
     progress=lambda _fraction: None,
 ):
+    """Release the original fitter's temporaries before adaptive fallback."""
+    fallback_reason = None
+    try:
+        return _fit_impl(raw8, raw32, meta, config, output, check=check,
+                         max_working_bytes=max_working_bytes, progress=progress)
+    except Unsupported as exc:
+        if not str(exc).startswith("insufficient_repeat_cells_"):
+            raise
+        fallback_reason = str(exc)
+    # Dispatch outside the exception handler so its traceback does not retain
+    # the original frame's coarse samples while adaptive allocations are live.
+    h_adapt = config.get("h_adaptive")
+    if h_adapt is None:
+        local_cfg_path = Path(__file__).with_name("h_config.json")
+        h_adapt = (json.loads(local_cfg_path.read_text(encoding="utf-8")).get("h_adaptive", {})
+                   if local_cfg_path.is_file() else {})
+        config = {**config, "h_adaptive": h_adapt}
+    if not h_adapt.get("enabled_on_insufficient_repeat_cells", False):
+        raise Unsupported(fallback_reason)
+    from .h_adaptive import fit_adaptive_from_config
+    return fit_adaptive_from_config(
+        raw8, raw32, meta, config, output, fallback_reason=fallback_reason,
+        check=check, max_working_bytes=max_working_bytes, progress=progress,
+    )
+
+
+def _legacy_fit_workspace_plan(
+    *, n_total, n_active, n_train, n_selection, n_channels, input_itemsize,
+    coarse_itemsize, n_targets, geometry_bytes=0, discovery_bytes=0,
+    lattice_cell_upper_bound=0, max_working_bytes=None,
+):
+    """Reserve the high-water of each allocation phase before fitting.
+
+    Caller-owned input arrays and decoder/allocator/runtime memory are excluded.
+    Floating temporary arrays are budgeted at at least float64 width even when
+    NumPy preserves float32. Sampling accounts for old loop temporaries while
+    the next chunk is assembled; scoring includes the old estimate plus the
+    new per-cell list and stacked estimate. Retained arrays are charged during
+    *both* aligned sampling and candidate evaluation, not just the first pass.
+    """
+    from .h_adaptive import _require_workspace
+    pixels = 192 * 256
+    scratch_itemsize = max(8, int(input_itemsize), int(coarse_itemsize))
+    # Python records, small arrays, lattice grids and numerical-library scratch.
+    reserve = 32 * 1024**2 + n_total * 32 * 1024 + lattice_cell_upper_bound * 4096
+    active = n_active * pixels * (16 + n_channels * input_itemsize)
+    aligned = n_train * pixels * n_channels * input_itemsize
+    retained = active + aligned
+    cell_scratch = 256 * pixels
+    candidate_arrays = (32 + 4 * n_targets) * pixels * scratch_itemsize
+    stages = {
+        "geometry_bytes": int(geometry_bytes),
+        "coarse_discovery_bytes": int(discovery_bytes),
+        # Raw and normalized coarse stacks coexist with indexed template inputs,
+        # nanmedian copies/masks and reduction temporaries until explicitly freed.
+        "coarse_templates_bytes": reserve + 5 * n_total * 48 * 64 * n_channels * scratch_itemsize,
+        "geometry_refinement_bytes": reserve + n_train * 48 * 96 * (32 + 6 * scratch_itemsize),
+        "active_template_and_phase_bytes": reserve + active + 3 * n_train * pixels * scratch_itemsize + cell_scratch,
+        "candidate_build_bytes": reserve + retained + n_train * pixels * (n_channels * input_itemsize + 3 * scratch_itemsize) + candidate_arrays + cell_scratch,
+        "candidate_scoring_bytes": reserve + retained + 3 * n_selection * pixels * scratch_itemsize + candidate_arrays + cell_scratch,
+    }
+    # Smaller sampling chunks help only when retained arrays and scoring fit.
+    _require_workspace(max(stages.values()), max_working_bytes)
+    for chunk in range(min(32, max(1, n_total)), 0, -1):
+        # Up to three coordinate copies and eight sampled/normalization scalar
+        # buffers per channel, including temporaries from the prior iteration.
+        chunk_scratch = min(chunk, n_total) * pixels * (48 + 8 * n_channels * scratch_itemsize)
+        aligned_scratch = min(chunk, n_train) * pixels * (48 + 8 * n_channels * scratch_itemsize)
+        sampling = reserve + active + chunk_scratch
+        alignment = reserve + retained + aligned_scratch
+        peak = max(*stages.values(), sampling, alignment)
+        if max_working_bytes is None or peak <= max_working_bytes:
+            return {
+                "scope": "additional_fitting_workspace_excluding_inputs_decoder_and_process_overhead",
+                "limit_bytes": None if max_working_bytes is None else int(max_working_bytes),
+                "estimated_peak_bytes": int(peak),
+                "chunk_cells": chunk,
+                "retained_active_bytes": active,
+                "retained_aligned_bytes": aligned,
+                "retained_active_and_aligned_bytes": retained,
+                "phase_estimates": {**stages, "active_sampling_bytes": sampling, "aligned_sampling_bytes": alignment},
+            }
+    raise Unsupported("fit_working_memory_limit")
+
+
+def _fit_impl(
+    raw8,
+    raw32,
+    meta,
+    config,
+    output,
+    *,
+    check=lambda: None,
+    max_working_bytes=None,
+    progress=lambda _fraction: None,
+):
     check()
     output = Path(output)
     mapping = meta["channel_mapping"]
@@ -260,6 +546,11 @@ def fit(
         raise Unsupported("BF_absent_no_frozen_fallback")
     h, w = raw32.shape[1:]
     hc = config["h_auto"]
+    configured_targets = hc.get("target_channels", ["FITC", "CY3", "BF"])
+    if (not isinstance(configured_targets, list) or not configured_targets
+            or any(name not in ("FITC", "CY3", "BF") for name in configured_targets)
+            or len(set(configured_targets)) != len(configured_targets)):
+        raise ValueError("H_auto target_channels must contain unique FITC, CY3 or BF names")
     fixed = {
         "geometry_search_boundary_fraction_guard": 0.01,
         "BF_support_relative_to_train_median": 0.6,
@@ -280,12 +571,18 @@ def fit(
         g: [int(f[0] * h), min(h, int(f[1] * h)), int(f[2] * w), min(w, int(f[3] * w))]
         for g, f in hc["split_fractions_y0y1x0x1"].items()
     }
+    # The preliminary fixed-box attempt precedes adaptive dispatch and must
+    # obey the same cap before geometry/coarse-sampling allocations as well.
+    from .h_adaptive import _require_workspace, adaptive_workspace_plan
+    initial_plan = adaptive_workspace_plan(raw8, raw32, boxes["train"])
+    _require_workspace(initial_plan["estimated_peak_bytes"], max_working_bytes)
     y0, y1, x0, x1 = boxes["train"]
     bf = raw32[bfi, y0:y1, x0:x1]
     v = bf[bf > 0]
     if len(v) < 100:
         raise Unsupported("insufficient_BF_support")
     ref = float(np.median(v))
+    del v
     sensor = meta["channel_acquisition_settings"][bfi]["sensor_pixels_xy"]
     if not isinstance(sensor, dict) or min(sensor.get("cx", 0), sensor.get("cy", 0)) <= 0:
         raise Unsupported("sensor_geometry_unknown")
@@ -295,6 +592,8 @@ def fit(
     ]
     progress(0.05)
     oldbasis, gd = geometry(raw32[bfi], boxes["train"], pitch, check)
+    coarse_plan = adaptive_workspace_plan(raw8, raw32, boxes["train"], oldbasis)
+    _require_workspace(coarse_plan["discovery_bytes"], max_working_bytes)
     saturation = (
         float(np.iinfo(np.dtype(meta["dtype"])).max)
         if np.dtype(meta["dtype"]).kind in "ui"
@@ -308,6 +607,17 @@ def fit(
     for g in ["train", "heldout_columns", "heldout_rows"]:
         if int(np.sum(groups == g)) < hc["minimum_repeat_cells_per_fit_group"]:
             raise Unsupported("insufficient_repeat_cells_" + g)
+    active_mask = np.isin(groups, ["train", "heldout_columns", "heldout_rows"])
+    memory_plan = _legacy_fit_workspace_plan(
+        n_total=len(records), n_active=int(np.sum(active_mask)), n_train=int(np.sum(train)),
+        n_selection=max(int(np.sum(groups == group)) for group in ("heldout_columns", "heldout_rows")),
+        n_channels=raw8.shape[0], input_itemsize=raw8.dtype.itemsize,
+        coarse_itemsize=raw32.dtype.itemsize, n_targets=len(configured_targets),
+        geometry_bytes=initial_plan["geometry_bytes"], discovery_bytes=coarse_plan["discovery_bytes"],
+        lattice_cell_upper_bound=coarse_plan["lattice_cell_upper_bound"],
+        max_working_bytes=max_working_bytes,
+    )
+    chunk_cells = memory_plan["chunk_cells"]
     n32 = norm(cells32, strict=False)
     oldtemplates = np.zeros((raw32.shape[0], 48, 64))
     unavailable = {}
@@ -324,6 +634,8 @@ def fit(
     }
     if any(v is None or v <= 0 for v in evidence.values()):
         raise Unsupported("no_reproducible_BF_periodicity:" + json.dumps(evidence))
+    # Neither coarse stack is used after the channel templates/evidence exist.
+    del cells32, n32
     progress(0.22)
     trainrec = [r for r in records if r["group"] == "train"]
 
@@ -346,18 +658,16 @@ def fit(
         options={"maxiter": 12, "xtol": 0.005, "ftol": 1e-5},
     )
     basis = basisof(opt.x) if np.isfinite(opt.fun) and opt.fun < start else oldbasis
-    # Bound the largest simultaneous coordinate/sample/normalization arrays.
-    # This is an operational abstention, not a scientific acceptance rule.
-    work_bytes = len(records) * 192 * 256 * (16 + 12 * raw32.shape[0])
-    if max_working_bytes is not None and work_bytes > max_working_bytes:
-        raise Unsupported("fit_working_memory_limit")
     check()
     progress(0.4)
-    coords = coords_for(basis, records)
-    observed = norm(sample(raw8, coords), strict=False)
-    if not np.isfinite(observed[:, bfi]).all():
+    coords, observed, obs_finite = _sample_and_norm_active_chunked(
+        raw8, basis, records, active_mask, chunk_size=chunk_cells, check=check
+    )
+    active_groups = groups[active_mask]
+    active_train = active_groups == "train"
+    if not obs_finite[bfi]:
         raise Unsupported("nonfinite_refined_BF_cells")
-    basebf = template(observed[train, bfi], 0.7)
+    basebf = template(observed[active_train, bfi], 0.7)
     profile = np.median(basebf, axis=0)
     profile -= profile.mean()
     ny, nx = meta["sizes"]["Y"], meta["sizes"]["X"]
@@ -397,7 +707,15 @@ def fit(
     nearest = ndi.distance_transform_edt(~finite, return_distances=False, return_indices=True)
     delta = ndi.median_filter(grid[tuple(nearest)], size=3, mode="nearest")
     progress(0.65)
-    aligned = norm(sample(raw8, coords_for(basis, trainrec, delta=delta)), strict=False)
+    _, aligned, aligned_finite = _sample_and_norm_active_chunked(
+        raw8,
+        basis,
+        trainrec,
+        np.ones(len(trainrec), dtype=bool),
+        delta=delta,
+        chunk_size=chunk_cells,
+        check=check,
+    )
     selected = []
     all_scores = []
     templates = []
@@ -406,8 +724,8 @@ def fit(
     indices = []
     enabled = []
     oldout = []
-    ids_by_group = {g: np.where(groups == g)[0] for g in ["heldout_columns", "heldout_rows"]}
-    target_names = [name for name in ["FITC", "CY3"] if name in mapping]
+    ids_by_group = {g: np.where(active_groups == g)[0] for g in ["heldout_columns", "heldout_rows"]}
+    target_names = [name for name in configured_targets if name in mapping]
     for target_i, name in enumerate(target_names):
         check()
         if name not in mapping:
@@ -415,8 +733,8 @@ def fit(
         c = mapping[name]
         if (
             c in unavailable
-            or not np.isfinite(observed[:, c]).all()
-            or not np.isfinite(aligned[:, c]).all()
+            or not obs_finite[c]
+            or not aligned_finite[c]
         ):
             selected.append(
                 dict(
@@ -436,7 +754,7 @@ def fit(
             continue
         opts = [("previous_own32", oldtemplates[c], False, True)]
         for local in [False, True]:
-            tr = aligned if local else observed[train]
+            tr = aligned if local else observed[active_train]
             for sigma in [0.5, 1.0, 2.0]:
                 own = template(tr[:, c], sigma)
                 bf = template(tr[:, bfi], sigma)
@@ -542,10 +860,13 @@ def fit(
         bf_local_phase_cells=shifts,
         selected=selected,
         candidates=all_scores,
+        working_memory=memory_plan,
         adaptation="metadata channels, sensor-based pitch prior, normalized original partitions, relative BF support, explicit repeat evidence gates; original H candidate family and global sampler retained",
         diagnostic_sampling_factors=[32, 8],
         fits_7_map_transferred=False,
-        DAPI_BF_modified=False,
+        target_channels=target_names,
+        DAPI_modified=False,
+        BF_modified=any(item["channel"] == "BF" and item["outcome"] == "fitted" for item in selected),
     )
     output.with_suffix(".json").write_text(json.dumps(rec, indent=2, allow_nan=False) + "\n")
     progress(1.0)
