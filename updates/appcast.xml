@@ -3,6 +3,22 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.3.0</title>
+            <pubDate>Mon, 19 Oct 2026 17:26:53 +0000</pubDate>
+            <sparkle:version>2.3.0</sparkle:version>
+            <sparkle:shortVersionString>2.3.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h3>Open SDPC slides and their original embedded photographs</h3>
+<p>Version 2.3.0 adds supported SQ/SDPC HEVC slides alongside Nikon ND2 and Aperio SVS. The decoder is included, and SDPC tiles are read on demand without whole-slide conversion or a pixel-pyramid cache.</p>
+<p>Slide Info now shows the source-embedded photographs and thumbnail. Click an image to enlarge it within the inspector. Images without a verified label/macro identifier use neutral names in their source order.</p>
+<p>The toolbar uses a dashed-square Export button, a pencil for Annotate, and icon-only Info. Channels uses ⌘C, Annotate uses ⌘A, Export uses E, and Info keeps ⌘I. Normal text editing retains copy and select-all behavior.</p>
+<p>Rectangular tiles, image edges and physical calibration are retained. Native TIFF ROI export preserves decoded RGB, not samples lost during the source's lossy compression. Original slides, annotations and saved LUTs retain their existing preservation rules.</p>
+<p>Corresponding decoder sources and third-party licenses accompany the release. Support is limited to the validated HEVC whole-slide variant; JPEG whole-slide SDPC and vendor colour-correction emulation are not included. The macOS app remains ad-hoc signed, not Developer ID notarized.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-macos-arm64.dmg" sparkle:edSignature="QofJGy75CJI/jTJ5UVy6ZGQmPbbnkU8/DscZtjW5LW8Cqq+kg5Pj2dyjc9I4gfRXA6IQs/LXwXqTyBkjadlcAA==" length="99486196" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.2.1</title>
             <pubDate>Mon, 19 Oct 2026 09:31:53 +0000</pubDate>
             <sparkle:version>2.2.1</sparkle:version>
