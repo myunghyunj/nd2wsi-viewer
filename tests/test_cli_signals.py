@@ -1,11 +1,14 @@
 """CLI output pipes must not change the embedded HTTP server's signal handling."""
 
+import errno
+import io
 import os
 import signal
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -69,6 +72,106 @@ def test_cli_routes_preserve_sigpipe_while_running(command, monkeypatch):
 def test_main_preserves_command_return_code(code, monkeypatch):
     monkeypatch.setattr(cli, "_main", lambda argv: code)
     assert cli.main([]) == code
+
+
+@pytest.fixture
+def stdout_descriptors(tmp_path):
+    reader, writer = os.pipe()
+    try:
+        with (tmp_path / "stdout.txt").open("w") as output:
+            yield {"pipe": writer, "file": output.fileno(), "unknown": None}
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
+@pytest.mark.parametrize("operation", ["write", "flush"])
+@pytest.mark.parametrize("target,error_number,closed_pipe", [
+    ("pipe", errno.EINVAL, True),
+    ("pipe", errno.EIO, False),
+    ("file", errno.EINVAL, False),
+    ("unknown", errno.EINVAL, False),
+])
+def test_windows_stdout_only_normalizes_pipe_einval(
+    monkeypatch, stdout_descriptors, operation, target, error_number, closed_pipe
+):
+    stream = Mock()
+    descriptor = stdout_descriptors[target]
+    if descriptor is None:
+        stream.fileno.side_effect = io.UnsupportedOperation("no descriptor")
+    else:
+        stream.fileno.return_value = descriptor
+    failure = OSError(error_number, "output failure")
+    getattr(stream, operation).side_effect = failure
+    duplicate = Mock()
+
+    def command(argv):
+        if operation == "write":
+            print("output")
+        return 0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.sys, "platform", "win32")
+        patch.setattr(cli.sys, "stdout", stream)
+        patch.setattr(cli, "_main", command)
+        patch.setattr(cli.os, "dup2", duplicate)
+        if closed_pipe:
+            assert cli.main([]) == 1
+            assert duplicate.call_args.args[1] == descriptor
+        else:
+            with pytest.raises(OSError) as caught:
+                cli.main([])
+            assert caught.value is failure
+            duplicate.assert_not_called()
+        assert sys.stdout is stream
+
+
+@pytest.mark.parametrize("outcome", ["return", "parser_exit", "command_einval", "command_eio"])
+def test_windows_stdout_restored_and_command_errors_take_priority(monkeypatch, outcome):
+    stream = Mock()
+    duplicate = Mock()
+    error_number = errno.EINVAL if outcome == "command_einval" else errno.EIO
+    failure = OSError(error_number, "command/file failure")
+
+    def command(argv):
+        if outcome == "parser_exit":
+            raise SystemExit(2)
+        if outcome.startswith("command_"):
+            raise failure
+        return 0
+
+    if outcome.startswith("command_"):
+        stream.flush.side_effect = OSError(errno.EINVAL, "flush must not mask command failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.sys, "platform", "win32")
+        patch.setattr(cli.sys, "stdout", stream)
+        patch.setattr(cli, "_main", command)
+        patch.setattr(cli.os, "dup2", duplicate)
+        if outcome == "parser_exit":
+            with pytest.raises(SystemExit) as caught:
+                cli.main([])
+            assert caught.value.code == 2
+        elif outcome.startswith("command_"):
+            with pytest.raises(OSError) as caught:
+                cli.main([])
+            assert caught.value is failure
+            stream.flush.assert_not_called()
+        else:
+            assert cli.main([]) == 0
+        assert sys.stdout is stream
+        duplicate.assert_not_called()
+
+
+def test_windows_stdout_proxy_forwards_standard_attributes(tmp_path):
+    with (tmp_path / "stdout.txt").open("w", encoding="utf-8") as stream:
+        output = cli._WindowsPipeStdout(stream)
+        assert output.fileno() == stream.fileno()
+        assert output.encoding == stream.encoding
+        assert output.buffer is stream.buffer
+        assert output.isatty() == stream.isatty()
+        assert output.write("normal output") == 13
+        output.flush()
+    assert (tmp_path / "stdout.txt").read_text() == "normal output"
 
 
 @pytest.mark.parametrize("mode", ["buffered", "large", "help"])

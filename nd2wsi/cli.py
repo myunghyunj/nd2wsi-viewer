@@ -7,8 +7,11 @@ self-contained OME-Zarr pyramid. ``crop`` reads native ND2 pixels directly.
 from __future__ import annotations
 
 import argparse
+import errno
 import os
+import stat
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from .reader import PlaneSelection, parse_z
@@ -92,22 +95,59 @@ def _selection(args: argparse.Namespace) -> PlaneSelection:
     return PlaneSelection(t=args.t, p=args.position, z=parse_z(args.z))
 
 
+class _WindowsPipeStdout:
+    """Normalize Windows CRT pipe errors only at stdout's write/flush boundary."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    def _call(self, operation, *args):
+        try:
+            return operation(*args)
+        except OSError as exc:
+            # The Windows CRT maps a closed pipe to EINVAL rather than EPIPE.
+            # Regular-file errors and failures from the command are not pipes.
+            if exc.errno == errno.EINVAL:
+                try:
+                    is_pipe = stat.S_ISFIFO(os.fstat(self._stream.fileno()).st_mode)
+                except (AttributeError, OSError, ValueError):
+                    is_pipe = False
+                if is_pipe:
+                    raise BrokenPipeError(errno.EPIPE, "stdout pipe closed") from exc
+            raise
+
+    def write(self, text):
+        return self._call(self._stream.write, text)
+
+    def flush(self):
+        return self._call(self._stream.flush)
+
+
 def main(argv: list[str] | None = None) -> int:
-    try:
+    stdout = _WindowsPipeStdout(sys.stdout) if sys.platform == "win32" else sys.stdout
+    with redirect_stdout(stdout):
         try:
-            return _main(argv)
-        finally:
-            # Catch buffered output failures here, including argparse's exits.
+            try:
+                result = _main(argv)
+            except SystemExit:
+                # argparse exits still need buffered output flushed here.
+                sys.stdout.flush()
+                raise
+            # Do not mask an unrelated command error with a failed final flush.
             sys.stdout.flush()
-    except BrokenPipeError:
-        # Keep Python's SIGPIPE handling: restoring SIG_DFL also kills the
-        # viewer on disconnected HTTP clients. Avoid another flush error at exit.
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        try:
-            os.dup2(devnull, sys.stdout.fileno())
-        finally:
-            os.close(devnull)
-        return 1
+            return result
+        except BrokenPipeError:
+            # Keep Python's SIGPIPE handling: SIG_DFL also kills the viewer on
+            # disconnected HTTP clients. Avoid another flush error at exit.
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, sys.stdout.fileno())
+            finally:
+                os.close(devnull)
+            return 1
 
 
 def _main(argv: list[str] | None = None) -> int:
