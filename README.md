@@ -1,11 +1,11 @@
-> **v2.2.1 · macOS & Windows.** Shading Correction now evaluates FITC, CY3 and BF, with adaptive local strength to reduce residual vertical bands.
-> Existing saved corrections are retained. Use **Revoke → Apply** to refit them with this version.
-> DAPI, source pixels, native ND2/TIFF exports, annotations and saved LUTs remain unchanged. [Release details](docs/release-notes-2.2.1.md).
+> **v2.3.0 · macOS & Windows.** Open supported SQ/SDPC HEVC whole-slide images directly, alongside ND2 and SVS.
+> The decoder is included; there is no whole-slide conversion or pixel-pyramid cache for SDPC.
+> Original slides, annotations and saved LUTs retain their existing preservation rules. [Release details and limits](docs/release-notes-2.3.0.md).
 
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.2.1 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.3.0 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -14,7 +14,7 @@
 <h1 align="center">nd2wsi-viewer</h1>
 
 <p align="center">
-  <strong>A fast slide viewer for Nikon ND2 scans and Aperio SVS slides, on macOS and Windows.</strong><br>
+  <strong>A fast slide viewer for Nikon ND2, Aperio SVS and supported SDPC slides, on macOS and Windows.</strong><br>
   Open a scan, fly from the whole slide to single cells, measure, mark, and cut out what you need.
 </p>
 
@@ -41,7 +41,7 @@ Nothing leaves your computer. There is no upload and no account.
 
 ## What you get
 
-- Opens stitched Nikon `.nd2` scans and Aperio `.svs` slides, several at once in tabs.
+- Opens stitched Nikon `.nd2`, Aperio `.svs` and supported HEVC `.sdpc` slides, several at once in tabs.
 - Keeps each viewing cache in one `.nd2svs` file, easy to copy to an external SSD.
 - Plays a time series of a plate, with every site at any z plane and any time, straight from the ND2.
 - Follows the sharpest plane of each site through a time lapse, so focus drift over a day does not blur the series.
@@ -59,17 +59,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.2.1-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.3.0-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.2.1
+or GPU is required. This release provides a portable ZIP, not a v2.3.0
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.2.1) for the
+[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.3.0) for the
 exact source commit, archive checksums, and platform verification results.
 Windows 10 Education and local Parallels were not tested for this release.
 .NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
@@ -89,7 +89,7 @@ for requirements, tested behavior, and build instructions.
 
 1. Download the `macos-arm64.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. It runs on Apple silicon Macs.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
-3. Drop an `.nd2` or `.svs` file onto the window, or press `+` to browse.
+3. Drop an `.nd2`, `.svs` or supported `.sdpc` file onto the window, or press `+` to browse.
 
 The macOS bundle is ad-hoc signed and uses signed Sparkle updates. This is not
 Developer ID signing or notarization.
@@ -106,6 +106,13 @@ manually once if you are upgrading from one of those versions. Automatic checks
 were restored in 2.1.5.
 
 The first time you open an ND2 scan the viewer builds its reduced copies. A 3 GB scan takes well under a minute on a laptop, and the next open is instant. An SVS opens right away.
+
+Supported SQ/SDPC HEVC slides also open directly from their embedded tiles.
+TIFF ROI export preserves decoded RGB and calibration, not the pre-compression
+microscope samples. Slide Info displays the source-embedded photographs and
+thumbnail, with click-to-enlarge viewing. JPEG whole-slide SDPC and vendor
+colour-correction emulation are not supported. See [SDPC support and limits](docs/sdpc-support.md).
+The bundled decoder's corresponding sources and licenses accompany the release.
 
 ### Try it with the example scans
 

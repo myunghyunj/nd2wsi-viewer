@@ -1,13 +1,22 @@
 # Windows distribution
 
-## Current v2.2.1 download
+## Current v2.3.0 download
 
-Use the [v2.2.1 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip.sha256).
-See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.2.1)
+Use the [v2.3.0 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-windows-x64.zip.sha256).
+See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.3.0)
 for the exact source commit, artifact checksum, and platform verification results.
 Extract the whole ZIP and retain
-`_internal` beside the EXE. WebView2 is required. No 2.2.1 Setup installer is included.
+`_internal` beside the EXE. WebView2 is required. No 2.3.0 Setup installer is included.
+
+Version 2.3.0 adds direct viewing of supported SQ/SDPC HEVC slides, with the
+decoder included. It reads embedded tiles without creating a whole-slide
+pixel cache. TIFF ROI export preserves decoded RGB and physical calibration;
+it cannot recover samples lost during the source's lossy compression.
+Corresponding decoder sources, build configuration and licenses are supplied
+with the release. See the [2.3.0 release notes](release-notes-2.3.0.md) and
+[SDPC format limits](sdpc-support.md); JPEG SDPC and vendor colour correction
+are not supported.
 
 **Shading Correction** evaluates FITC, CY3 and BF, including an adaptive fallback
 for scans with insufficient repeated fields in the original fixed validation
@@ -93,9 +102,9 @@ emulation, not an ARM64-native binary.
 
 ## Installer build tooling
 
-The current source targets viewer 2.2.1, with a native Windows frame
+The current source targets viewer 2.3.0, with a native Windows frame
 and Microsoft Edge WebView2. Installer tooling can produce
-`nd2wsi-viewer-2.2.1-Setup.exe`, but no Setup is published or verified for this
+`nd2wsi-viewer-2.3.0-Setup.exe`, but no Setup is published or verified for this
 release. The tooling installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
@@ -108,7 +117,7 @@ whole extracted folder together; the EXE depends on its `_internal` directory.
 Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
-v1.2.8 results below do not establish v2.2.1 Windows hardware verification.
+v1.2.8 results below do not establish v2.3.0 Windows hardware verification.
 The current release provides the portable ZIP described above.
 
 Target execution modes (the verified CI environments are listed above):
