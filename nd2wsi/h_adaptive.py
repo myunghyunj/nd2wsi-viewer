@@ -13,12 +13,12 @@ fixed validation box for 2D `H_auto_refit/1` (such as `1-2.nd2`), this module:
      (`Strip A`: rows 8..68, `Strip B`: rows 68..128; background mask computed
      strictly on rows 0..132) while holding out `Strip C` (rows 136..176)
      strictly for candidate evaluation and admission.
-  4. Compares the bounded candidate family (`M0_RAW`, `M2_global_supported_x`,
-     `M3_poly2_envelope_x`, `M4_bf_coupled_smooth_x`, `M5_adaptive_hybrid_subcell_x`)
-     on held-out `Strip C` across all spatial validation groups and persists the
-     admitted target channels (`FITC`, `CY3`, `BF`) into the `.nd2svs` model
-     archive. BF uses a leave-cell-out prediction bound to reduce extrapolation
-     overshoot while preserving the fitted fluorescence envelopes.
+  4. Restores locally supported amplitudes with A/B half-strip trough bounds and
+     an empirical template-mismatch allowance. Missing input retains each
+     channel's leave-neighborhood-out prediction bound. The candidate
+     (`M9_local_trough_bound_hybrid_subcell_x`) is admitted on held-out `Strip C`
+     across all spatial groups before the target channels (`FITC`, `CY3`, `BF`)
+     are persisted into the `.nd2svs` model archive.
 """
 
 from __future__ import annotations
@@ -740,6 +740,216 @@ def calibrate_channel_prediction_bound(
     }
 
 
+def finite_node_support(cells, origin_rc, extent_rc, check=lambda: None):
+    """Require finite input across each half-cell node's interpolation footprint.
+
+    Missing samples invalidate every node that could influence them. Only input
+    availability is inspected outside A/B, never C intensity or C observations.
+    No smoothing fills this support mask.
+    """
+    check()
+    rows, columns = extent_rc
+    support = np.ones((2 * rows + 1, 2 * columns + 1), dtype=np.float64)
+    covered = np.zeros_like(support, dtype=bool)
+    for cell in cells:
+        check()
+        r, c = cell["row"] - origin_rc[0], cell["column"] - origin_rc[1]
+        finite = np.isfinite(cell["values_fit"]).all(axis=0)
+        height, width = finite.shape
+        for j, (y0, y1) in enumerate(((0, height // 2), (0, height), (height // 2, height))):
+            check()
+            for k, (x0, x1) in enumerate(((0, width // 2), (0, width), (width // 2, width))):
+                check()
+                iy, ix = 2 * r + j, 2 * c + k
+                support[iy, ix] = min(support[iy, ix], float(finite[y0:y1, x0:x1].all()))
+                covered[iy, ix] = True
+    support[~covered] = 0.0
+    return support
+
+
+def local_trough_amplitude_cap(profile, template, check=lambda: None):
+    """Leave an empirical template-mismatch allowance in the measured trough.
+
+    The trough geometry comes only from the training template. The residual MAD
+    is a local mismatch allowance, not a statistical confidence interval or a
+    guarantee at unseen pixels. Search gains stay in the enforced [0.25, 1.75]
+    domain, including for strong templates.
+    """
+    check()
+    phase = (np.arange(len(template)) + 0.5) / len(template)
+    centre = phase[np.argmin(template)]
+    distance = (phase - centre + 0.5) % 1 - 0.5
+    interior = np.abs(distance) <= 0.08
+    flank = np.abs(distance) >= 0.30
+    alpha = project_amplitude(profile, template)["amplitude"]
+    residual = profile - max(0.0, alpha) * template
+    reserve = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
+
+    def signed_depth(amplitude):
+        corrected = (1 + profile) / (1 + amplitude * template)
+        return float(np.mean(corrected[flank]) - np.mean(corrected[interior]))
+
+    if signed_depth(0) <= reserve:
+        return 0.0
+    limit = 2.2
+    tmin, tmax = float(np.min(template)), float(np.max(template))
+    if tmin < 0:
+        limit = min(limit, 0.75 / -tmin)
+    if tmax > 0:
+        limit = min(limit, 0.75 / tmax)
+    lo, hi = 0.0, max(0.0, min(limit, alpha))
+    if signed_depth(hi) >= reserve:
+        return hi
+    for _ in range(36):
+        check()
+        mid = 0.5 * (lo + hi)
+        if signed_depth(mid) >= reserve:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def build_local_trough_bound_nodes(
+    cells, names, origin_rc, extent_rc, gammas, calibrations, *,
+    templates, mapping, fit_indices, m5_nodes=None, damping=0.84,
+    sigma_nodes=0.75, check=lambda: None,
+):
+    """Restore supported local amplitudes, with local trough and missing-data bounds.
+
+    The global leave-neighborhood bound remains the fallback for extrapolation.
+    A/B half-strips constrain every node influencing their observations; C is
+    still used only by the unchanged admission evaluator.
+    """
+    check()
+    local_damping = 0.95
+    if m5_nodes is None:
+        m5_nodes, _ = build_m5_adaptive_hybrid_nodes(
+            cells, names, origin_rc, extent_rc, gammas,
+            damping=damping, sigma_nodes=sigma_nodes, check=check,
+        )
+    result = np.zeros_like(m5_nodes)
+    finite_support = finite_node_support(cells, origin_rc, extent_rc, check=check)
+    metadata = {
+        "schema": "local_trough_prediction_bound/1",
+        "fit_strips": ["A", "B"],
+        "admission_strip_C_used": False,
+        "outside_fit_strips_input_finiteness_only": True,
+        "finite_support_nodes": int(np.sum(finite_support)),
+        "total_nodes_per_channel": int(finite_support.size),
+        "method": {
+            "local_damping": local_damping,
+            "confidence_r2_interval": [0.35, 0.80],
+            "confidence_valid_fraction_interval": [0.65, 0.90],
+            "confidence_sigma_nodes": 0.65,
+            "cap_row_slices": [[8, 38], [38, 68], [68, 98], [98, 128]],
+            "cap_min_valid_fraction": 0.65,
+            "cap_min_shape_r2": 0.65,
+            "phase_inner_halfwidth": 0.08,
+            "phase_flank_min_abs_distance": 0.30,
+            "mismatch_allowance": "1.4826 * MAD(profile - max(0, LS_amplitude) * template)",
+            "mismatch_allowance_interpretation": "empirical; not a statistical confidence interval",
+            "bisection_iterations": 36,
+            "search_gain_bounds": [0.25, 1.75],
+        },
+        "channels": {},
+    }
+
+    def quality(stats):
+        return (float(np.clip((stats["pos_shape_r2"] - 0.35) / 0.45, 0, 1))
+                * float(np.clip((stats["valid_fraction"] - 0.65) / 0.25, 0, 1)))
+
+    for channel_i, name in enumerate(names):
+        check()
+        calibration = calibrations.get(name, {})
+        scale = calibration.get("scale")
+        if scale is None:
+            metadata["channels"][name] = {"status": "unchanged_no_admitted_prediction_calibration"}
+            continue
+        original = m5_nodes[channel_i]
+        fallback = original * scale
+        support = np.zeros_like(original)
+
+        def own_subcell(cell):
+            out = []
+            for key in ("A", "B"):
+                check()
+                stats = cell["obs"][name][key]
+                amplitude, r2, valid = stats["amplitude"], stats["pos_shape_r2"], stats["valid_fraction"]
+                if amplitude is None or r2 is None or valid < 0.65:
+                    out.extend([None, 0.0])
+                    continue
+                weight = quality(stats)
+                if amplitude < 0.2:
+                    weight = max(weight, 0.8)
+                out.extend([max(0.0, float(amplitude)), max(0.01, weight) * valid])
+            return out[0], out[1], out[2], out[3]
+
+        own = _build_conservative_subcell_field(
+            cells, origin_rc, extent_rc, own_subcell,
+            sigma_nodes=sigma_nodes, damping=local_damping, check=check,
+        )
+        for cell in cells:
+            check()
+            r, c = cell["row"] - origin_rc[0], cell["column"] - origin_rc[1]
+            for key, rows in (("A", (2 * r, 2 * r + 1)), ("B", (2 * r + 1, 2 * r + 2))):
+                check()
+                stats = cell["obs"][name][key]
+                if stats["amplitude"] is None or stats["pos_shape_r2"] is None or stats["valid_fraction"] < 0.65:
+                    continue
+                weight = quality(stats)
+                for y in rows:
+                    check()
+                    support[y, 2 * c:2 * c + 3] = np.maximum(support[y, 2 * c:2 * c + 3], weight)
+        confidence = ndi.gaussian_filter(support, 0.65, mode="constant")
+        direct = np.minimum(original / damping * local_damping, own)
+        local = fallback * (1 - confidence) + direct * confidence
+
+        caps = np.full_like(original, np.inf)
+        cap_observations = 0
+        for cell in cells:
+            check()
+            r, c = cell["row"] - origin_rc[0], cell["column"] - origin_rc[1]
+            values = cell["values_fit"][fit_indices.index(mapping[name])]
+            mask = cell_2d_background_mask(values[:132], cell["valid_est_mask"][:132], mad_mult=2.5)
+            # A median over a whole strip can hide coherent within-strip changes.
+            for start, stop in ((8, 38), (38, 68), (68, 98), (98, 128)):
+                check()
+                if np.mean(cell["valid_est_mask"][start:stop]) < 0.65:
+                    continue
+                profile, _ = robust_strip_profile(
+                    values[start:stop], mask[start:stop],
+                    min_valid_fraction=0.20, min_col_fraction=0.65,
+                )
+                stats = project_amplitude(profile, templates[name])
+                if profile is None or stats["pos_shape_r2"] < 0.65:
+                    continue
+                cap = local_trough_amplitude_cap(profile, templates[name], check=check)
+                cap = min(cap, max(0.0, stats["amplitude"])) * local_damping
+                lo, hi = int(np.floor(2 * start / 192)), int(np.ceil(2 * stop / 192))
+                region = np.s_[2 * r + lo:2 * r + hi + 1, 2 * c:2 * c + 3]
+                caps[region] = np.minimum(caps[region], cap)
+                cap_observations += 1
+        # No smoothing follows caps or support gating: neighbors cannot restore
+        # trust in a missing region or lift a reliable weak local bound.
+        capped = np.minimum(local, caps)
+        result[channel_i] = fallback + (capped - fallback) * finite_support
+        effective_confidence = confidence * finite_support
+        assessed = original > 0.05
+        ratios = result[channel_i][assessed] / original[assessed]
+        metadata["channels"][name] = {
+            "status": "fitted",
+            "fallback_scale": float(scale),
+            "cap_observations": cap_observations,
+            "bounded_nodes": int(np.count_nonzero(np.isfinite(caps))),
+            "cap_reduced_nodes": int(np.count_nonzero(local > caps)),
+            "restored_above_fallback_nodes": int(np.count_nonzero(result[channel_i] > fallback)),
+            "confidence_median": float(np.median(effective_confidence)),
+            "strength_relative_m5_p10_median_p90": np.quantile(ratios, [0.1, 0.5, 0.9]).tolist() if ratios.size else None,
+        }
+    return result, metadata
+
+
 def _summary_stats(vals: list[float]) -> dict[str, Any] | None:
     arr = np.asarray([v for v in vals if v is not None and np.isfinite(v)], dtype=np.float64)
     if len(arr) == 0:
@@ -1111,19 +1321,19 @@ def fit_adaptive_from_config(
                 raise
             candidate_failures[name].append(str(error))
             calibration = {"status": "rejected", "reason": str(error)}
-        else:
-            m5_nodes_all[all_names.index(name)] *= calibration["scale"]
         calibrations[name] = calibration
     bf_calibration = calibrations.get("BF")
-    candidate_id = "M8_spatial_prediction_bound_hybrid_subcell_x"
+    candidate_id = "M9_local_trough_bound_hybrid_subcell_x"
     target_indices = [mapping[n] for n in target_names]
     target_templates = np.asarray(
         [np.broadcast_to(templates_dict[n][None, :], (192, 256)).copy() for n in target_names],
         dtype=np.float64,
     )
-    target_nodes = np.asarray(
-        [m5_nodes_all[all_names.index(n)] for n in target_names],
-        dtype=np.float64,
+    target_nodes, local_calibration = build_local_trough_bound_nodes(
+        cells, target_names, origin_rc, extent_rc, gammas, calibrations,
+        templates=templates_dict, mapping=mapping, fit_indices=fit_indices,
+        m5_nodes=np.asarray([m5_nodes_all[all_names.index(n)] for n in target_names]),
+        damping=damping, sigma_nodes=sigma_nodes, check=check,
     )
 
     check()
@@ -1232,6 +1442,7 @@ def fit_adaptive_from_config(
         "train_channel_coupling_gammas": gammas,
         "bf_prediction_calibration": bf_calibration,
         "channel_prediction_calibration": calibrations,
+        "local_amplitude_calibration": local_calibration,
         "acceptance_criteria": criteria,
         "admission_evaluation": eval_res,
         "working_memory": memory_plan,

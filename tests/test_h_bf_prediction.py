@@ -124,7 +124,9 @@ def test_one_channel_candidate_rejection_keeps_other_channels_eligible(failure, 
             return original_calibration(*args, **kwargs)
         monkeypatch.setattr(adaptive, 'calibrate_channel_prediction_bound', unavailable)
     else:
-        original = adaptive.build_m5_adaptive_hybrid_nodes
+        # Inject after local bounds: an excessive preliminary M5 estimate is
+        # now legitimately constrained before final candidate preflight.
+        original = adaptive.build_local_trough_bound_nodes
         monkeypatch.setattr(adaptive, 'calibrate_channel_prediction_bound',
                             lambda *a, **kw: {'scale': 1.0})
 
@@ -133,7 +135,7 @@ def test_one_channel_candidate_rejection_keeps_other_channels_eligible(failure, 
             if 'CY3' in args[1]:
                 nodes[args[1].index('CY3')] *= 100
             return nodes, record
-        monkeypatch.setattr(adaptive, 'build_m5_adaptive_hybrid_nodes', excessive)
+        monkeypatch.setattr(adaptive, 'build_local_trough_bound_nodes', excessive)
     output = tmp_path / 'fit.npz'
     model, record = adaptive.fit_adaptive_from_config(raw8, raw32, meta, config, output)
     try:
