@@ -1,11 +1,11 @@
-> **v2.1.14 · macOS & Windows.** The standard viewer remembers each file's last-used channel minimum, maximum and gamma—even after restarting the app.
-> A compact pencil opens numeric LUT editing; hover over edit, copy or paste for a short description.
-> Raw pixels and annotations are unchanged. [Release details](docs/release-notes-2.1.14.md).
+> **v2.2.1 · macOS & Windows.** Shading Correction now evaluates FITC, CY3 and BF, with adaptive local strength to reduce residual vertical bands.
+> Existing saved corrections are retained. Use **Revoke → Apply** to refit them with this version.
+> DAPI, source pixels, native ND2/TIFF exports, annotations and saved LUTs remain unchanged. [Release details](docs/release-notes-2.2.1.md).
 
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.1.14 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.14/nd2wsi-viewer-2.1.14-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.2.1 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -59,17 +59,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.1.14-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.14/nd2wsi-viewer-2.1.14-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.14/nd2wsi-viewer-2.1.14-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.2.1-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.1.14
+or GPU is required. This release provides a portable ZIP, not a v2.2.1
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.14) for the
+[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.2.1) for the
 exact source commit, archive checksums, and platform verification results.
 Windows 10 Education and local Parallels were not tested for this release.
 .NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
@@ -95,8 +95,9 @@ The macOS bundle is ad-hoc signed and uses signed Sparkle updates. This is not
 Developer ID signing or notarization.
 
 Version 1.2.1 is the first release that contains the updater, so it must be
-installed from the DMG once. After that, use the circular-arrow button in the
-tab bar or **nd2wsi-viewer → Check for Updates…**. The app checks quietly once
+installed from the DMG once. After that, use
+**nd2wsi-viewer → Check for Updates…**. The tab-strip shaded-circle button
+controls Shading Correction. The app checks quietly once
 a day and shows Sparkle's standard update window only when a newer signed
 release exists; it never installs an update without asking. Close the other
 viewer windows before installing; each window checks its unsaved work first.

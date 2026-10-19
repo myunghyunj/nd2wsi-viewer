@@ -3,6 +3,35 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.2.1</title>
+            <pubDate>Mon, 19 Oct 2026 09:31:53 +0000</pubDate>
+            <sparkle:version>2.2.1</sparkle:version>
+            <sparkle:shortVersionString>2.2.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h3>Stronger local shading correction</h3>
+<p>Shading Correction now evaluates FITC, CY3 and brightfield. An adaptive fallback supports scans where the original method lacks enough repeated fields. Local measurements restore correction strength while trough-depth limits reduce dark-to-bright reversal. Unsupported channels remain unchanged.</p>
+<p>Existing saved corrections remain in place after updating. Use <strong>Revoke</strong>, then <strong>Apply</strong>, to refit them with 2.2.1. Both operations require the original ND2.</p>
+<p>DAPI, original pixel readouts, native ND2/TIFF exports, source files, annotations and saved LUTs remain unchanged. Adaptive and BF-corrected caches require version 2.2.0 or later.</p>
+<p>Improvement varies by location. Validation within one development acquisition does not establish biological preservation or performance on independent acquisitions. Apple silicon, macOS 12 or later; ad-hoc signed and not notarized.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-macos-arm64.dmg" sparkle:edSignature="dP56V5/H4Bau9VJAk6EsmvSGKgIw8ER7O063Y/8WslV1vFoB5BM10OZKeiLAAc+yBiPK10BHY/3lk4ixKz/PBA==" length="92619604" type="application/octet-stream"/>
+        </item>
+        <item>
+            <title>2.1.15</title>
+            <pubDate>Sun, 18 Oct 2026 08:33:10 +0000</pubDate>
+            <sparkle:version>2.1.15</sparkle:version>
+            <sparkle:shortVersionString>2.1.15</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<p>Shading Correction estimates repeating illumination shading in supported stitched ND2 scans and replaces the existing <code>.nd2svs</code> viewing pyramid. The correction remains saved after reopening. Review the estimated time, then Continue to prepare it with progress and cancellation. Revoke rebuilds the original viewing pyramid from the source ND2.</p>
+<p>Correction targets FITC/CY3 using same-scan BF evidence and recorded camera geometry. The original ND2, native ND2/TIFF exports, pixel readouts, annotations and saved LUTs retain their original values or settings. PNG, JPEG and SVG exports use the saved correction. Unsupported or unsuccessful attempts leave a visible explanation that correction was not applied. Inspect the result, especially at tissue boundaries; visible shading can remain when validation fails.</p>
+<p>Cancellation or failure before the final replacement leaves the current cache untouched. If a saved replacement cannot be activated immediately, the valid cache is retained and the viewer asks you to reopen the slide. Corrected caches require version 2.1.15 or later; the format guard in older viewers leaves them untouched and requests an update.</p>
+<p>macOS Finder document-opening handlers are bound before native window creation to accept documents arriving during startup.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.15/nd2wsi-viewer-2.1.15-macos-arm64.dmg" sparkle:edSignature="3I4v1Osos1i/O3ELwxmZqXMjjGRPYdWZ8sBVg5NW1IL80hTXJiGUblr9Bl6BMa3rtibXQSnklw+zf0MQ2Nj/Ag==" length="120848324" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.1.14</title>
             <pubDate>Fri, 16 Oct 2026 03:06:44 +0000</pubDate>
             <sparkle:version>2.1.14</sparkle:version>

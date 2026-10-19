@@ -1,14 +1,29 @@
 # Windows distribution
 
-## Current v2.1.14 download
+## Current v2.2.1 download
 
-Use the [v2.1.14 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.14/nd2wsi-viewer-2.1.14-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.14/nd2wsi-viewer-2.1.14-windows-x64.zip.sha256).
-See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.1.14)
+Use the [v2.2.1 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.2.1/nd2wsi-viewer-2.2.1-windows-x64.zip.sha256).
+See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.2.1)
 for the exact source commit, artifact checksum, and platform verification results.
 Extract the whole ZIP and retain
-`_internal` beside the EXE. WebView2 is required. No 2.1.14 Setup installer is included.
+`_internal` beside the EXE. WebView2 is required. No 2.2.1 Setup installer is included.
 
+**Shading Correction** evaluates FITC, CY3 and BF, including an adaptive fallback
+for scans with insufficient repeated fields in the original fixed validation
+regions. Local measurements restore correction strength while trough-depth bounds
+limit dark-to-bright reversal. Channels without sufficient evidence remain unchanged.
+The corrected viewing pyramid remains saved after reopening. Updating retains
+existing saved corrections; use **Revoke**, then **Apply**, to refit them with 2.2.1.
+Both operations require the original ND2. DAPI, native ND2/TIFF exports, pixel
+readouts, source files, annotations and LUT settings remain unchanged. Adaptive
+and BF-corrected caches require 2.2.0 or later; 2.1.15 corrected caches remain readable.
+See the [2.2.1 release notes](release-notes-2.2.1.md) and
+[method and validation limits](shading-correction-validation.md). Spatial checks
+within one development acquisition do not establish biological preservation or
+performance across independent acquisitions.
+
+The viewing and LUT features introduced in earlier releases remain available.
 The standard viewer remembers each file's last-used channel minimum, maximum and
 gamma, including across app restarts. Preferences are stored locally and separately
 from the source image; saved values take precedence over initial Auto.
@@ -78,9 +93,9 @@ emulation, not an ARM64-native binary.
 
 ## Installer build tooling
 
-The current source targets viewer 2.1.14, with a native Windows frame
+The current source targets viewer 2.2.1, with a native Windows frame
 and Microsoft Edge WebView2. Installer tooling can produce
-`nd2wsi-viewer-2.1.14-Setup.exe`, but no Setup is published or verified for this
+`nd2wsi-viewer-2.2.1-Setup.exe`, but no Setup is published or verified for this
 release. The tooling installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
@@ -93,7 +108,7 @@ whole extracted folder together; the EXE depends on its `_internal` directory.
 Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
-v1.2.8 results below do not establish v2.1.14 Windows hardware verification.
+v1.2.8 results below do not establish v2.2.1 Windows hardware verification.
 The current release provides the portable ZIP described above.
 
 Target execution modes (the verified CI environments are listed above):
@@ -176,7 +191,7 @@ packaging. The packaging script requires the frozen executable to pass:
 - ND2 ROI export with exact source pixels, calibration, and channel names.
 - JPEG and lossless JPEG 2000 SVS pyramid reads, tile serving, and exact TIFF ROI export.
 - A native window using WebView2, a JavaScript/Python bridge roundtrip, and a loaded viewer canvas.
-- A wired LUT toolbar, its transfer module, and the four packaged Fluent SVG icons.
+- A wired LUT toolbar, its transfer module, and the five packaged Fluent SVG icons, including Shading Correction.
 
 To reproduce in Windows with x64 Python 3.13.14, uv 0.12.10, Node.js 22, and
 Microsoft Edge WebView2 Runtime:
@@ -190,14 +205,14 @@ uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --
 ```
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.1.14-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.2.1-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.1.14-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.2.1-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks
