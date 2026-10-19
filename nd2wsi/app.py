@@ -4,7 +4,7 @@ A WKWebView or Edge WebView2 window around the same local server the CLI
 uses.  Opening a slide converts it once (pyramid + sidecar live next to the
 ND2), then the viewer loads from an ephemeral localhost port.
 
-    nd2wsi-viewer [slide.nd2|.svs]   # window; drag-drop / dialog if no file
+    nd2wsi-viewer [slide.nd2|.svs|.sdpc]  # window; drag-drop / dialog if no file
     nd2wsi-viewer --smoke slide.nd2  # headless self-test (used by packaging)
 """
 
@@ -85,7 +85,7 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
 <div id="drop"><div class="card">
   <div class="pyr"><div class="l1"></div><div class="l2"></div><div class="l3"></div></div>
   <h1>Drop a slide to open</h1>
-  <div class="sub"><b>.nd2</b>, <b>.svs</b>, or <b>.nd2svs</b> &nbsp;·&nbsp; click anywhere to browse</div>
+  <div class="sub"><b>.nd2</b>, <b>.svs</b>, <b>.sdpc</b>, or <b>.nd2svs</b> &nbsp;·&nbsp; click anywhere to browse</div>
   <div id="status"></div>
   <div id="bar"><span id="fill"></span></div>
   <div id="pct"></div>
@@ -159,19 +159,22 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
 def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     """The path the server should open for this slide.
 
-    An SVS already holds a pyramid, so it is served straight from the file
-    and nothing is built or asked. An ND2 has no pyramid inside, so its
+    SVS and SDPC already hold pyramids, so they can be served from the file
+    without building a viewing cache. An ND2 has no pyramid inside, so its
     store is built on first open, next to the slide.
     """
     from .cache import SINGLE_FILE_SUFFIX
     from .convert import ensure_cache, existing_cache_store
     from .plate import is_plate_file
+    from .sdpc import is_sdpc
     from .svs import is_svs
 
     if nd2_path.suffix.lower() == SINGLE_FILE_SUFFIX:
         if on_status:
             on_status(f"opening {nd2_path.name} …")
         return nd2_path
+    if is_sdpc(nd2_path):
+        return nd2_path  # SDPC is direct-only: never create or migrate a cache
     if is_svs(nd2_path) and existing_cache_store(nd2_path) is None:
         return nd2_path  # the registry serves it straight from the file
     if nd2_path.suffix.lower() == ".nd2" and is_plate_file(nd2_path):
@@ -269,7 +272,7 @@ def _install_open_files_handler():
         def application_openFiles_(self, app, filenames):
             paths = [str(f) for f in filenames]
             _dlog(f"openFiles event {paths}")
-            good = [p for p in paths if p.lower().endswith((".nd2", ".svs", ".nd2svs"))]
+            good = [p for p in paths if p.lower().endswith((".nd2", ".svs", ".sdpc", ".nd2svs"))]
             if good:
                 _dispatch_open(good)
             try:
@@ -282,7 +285,7 @@ def _install_open_files_handler():
         def application_openFile_(self, app, filename):
             _dlog(f"openFile event {filename}")
             p = str(filename)
-            if p.lower().endswith((".nd2", ".svs", ".nd2svs")):
+            if p.lower().endswith((".nd2", ".svs", ".sdpc", ".nd2svs")):
                 _dispatch_open([p])
                 return True
             return False
@@ -620,7 +623,7 @@ class Api:
             picked = webview.windows[0].create_file_dialog(
                 webview.OPEN_DIALOG,
                 allow_multiple=True,
-                file_types=("Slides and caches (*.nd2;*.svs;*.nd2svs)",),
+                file_types=("Slides and caches (*.nd2;*.svs;*.sdpc;*.nd2svs)",),
             )
             if not picked:
                 return None
@@ -636,8 +639,8 @@ class Api:
         good = []
         for raw in paths or []:
             p = Path(raw)
-            if p.suffix.lower() not in (".nd2", ".svs", ".nd2svs"):
-                self._status = f"{p.name}: not an .nd2, .svs, or .nd2svs file"
+            if p.suffix.lower() not in (".nd2", ".svs", ".sdpc", ".nd2svs"):
+                self._status = f"{p.name}: not an .nd2, .svs, .sdpc, or .nd2svs file"
             elif not p.is_file():
                 self._status = f"could not find {p.name}"
             else:
@@ -653,7 +656,7 @@ class Api:
         picked = webview.windows[0].create_file_dialog(
             webview.OPEN_DIALOG,
             allow_multiple=True,
-            file_types=("Slides and caches (*.nd2;*.svs;*.nd2svs)",),
+            file_types=("Slides and caches (*.nd2;*.svs;*.sdpc;*.nd2svs)",),
         )
         return [str(p) for p in picked] if picked else None
 
@@ -739,7 +742,7 @@ class Api:
     def _open_registered(self, path: Path, note, frac) -> str:
         if self._window_session is not None and self._window_session.role == "agent":
             # Do not call open_or_convert/ensure_cache before the registry can
-            # apply Agent policy. Existing ND2 caches, native SVS and plates
+            # apply Agent policy. Existing ND2 caches, native SVS/SDPC and plates
             # are opened read-only; missing/shared-cache repair is refused.
             note("opening in isolated Agent window")
             with self._server_lock:
@@ -1039,7 +1042,7 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog=APP_NAME, description=__doc__)
-    ap.add_argument("nd2", nargs="?", help="ND2 or SVS file to open at launch")
+    ap.add_argument("nd2", nargs="?", help="ND2, SVS or SDPC file to open at launch")
     ap.add_argument("--smoke", action="store_true", help="headless self-test")
     ap.add_argument("--gui-smoke", action="store_true", help="open, verify and close the native window")
     ap.add_argument("--smoke-report", type=Path, help="write the native GUI self-test result as JSON")

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nd2wsi-viewer"
-version = "2.2.1"
-description = "Local whole-slide viewing for stitched Nikon ND2 and Aperio SVS, with native-value ROI export"
+version = "2.3.0"
+description = "Local whole-slide viewing for stitched Nikon ND2, Aperio SVS, and SDPC, with native-value ROI export"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Myunghyun Jeong" }]
-keywords = ["nd2", "nikon", "nis-elements", "svs", "ome-zarr", "ngff", "whole-slide", "microscopy", "openseadragon"]
+keywords = ["nd2", "nikon", "nis-elements", "svs", "sdpc", "ome-zarr", "ngff", "whole-slide", "microscopy", "openseadragon"]
 dependencies = [
   "nd2>=0.10",
   "numpy>=1.24",
@@ -34,6 +34,8 @@ test = ["pytest>=7"]
 nd2export = ["limnd2>=0.4"]
 app = ["pywebview>=6.0"]
 svs = ["imagecodecs>=2023.9"]
+# Source/development decoding only; native redistribution is gated separately.
+sdpc = ["av==16.0.1"]
 
 [project.scripts]
 nd2wsi = "nd2wsi.cli:main"
@@ -47,6 +49,14 @@ nd2wsi = ["h_config.json", "static/**/*", "metal/*.dylib", "metal/*.m", "metal/*
 
 [tool.uv]
 extra-index-url = ["https://pypi.laboratory-imaging.com/simple"]
+
+[tool.uv.sources]
+av = { index = "pypi-sdpc" }
+
+[[tool.uv.index]]
+name = "pypi-sdpc"
+url = "https://pypi.org/simple"
+explicit = true
 
 [tool.ruff]
 line-length = 100

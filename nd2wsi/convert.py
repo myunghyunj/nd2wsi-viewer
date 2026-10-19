@@ -430,9 +430,12 @@ def convert(
     import nd2
 
     from .cache import commit_container
+    from .sdpc import is_sdpc
     from .svs import is_svs, open_svs
 
     source_path = Path(nd2_path)
+    if is_sdpc(source_path):
+        raise ValueError("SDPC supports direct viewing and ROI export, not pyramid conversion")
     final_path = Path(out_path)
     storage = storage or DEFAULT_STORAGE
     if tile is None:
@@ -687,9 +690,12 @@ def estimate_store_bytes(
     slide's own rather than one hardcoded number.
     """
     from .reader import PlaneSelection, level_shapes, nice_bytes, open_plane
+    from .sdpc import is_sdpc
     from .svs import is_svs, sample_planes
 
     path = Path(path)
+    if is_sdpc(path):
+        raise ValueError("SDPC is served directly and does not need a viewing cache")
     if tile is None:
         tile = auto_tile(default_store_path(path), storage)
     blocks: list[np.ndarray] = []
@@ -822,8 +828,11 @@ def ensure_cache(
         sweep_stale_builds,
         write_manifest,
     )
+    from .sdpc import is_sdpc
 
     slide = Path(slide).resolve()
+    if is_sdpc(slide):
+        raise ValueError("SDPC is served directly; open the slide instead of building a viewing cache")
     selection = selection or PlaneSelection()
     want = None if kind == "auto" else kind
 
@@ -1029,7 +1038,7 @@ def _legacy_store_matches_source(
             for item in slide.parent.iterdir()
             if item.is_file()
             and item.stem == slide.stem
-            and item.suffix.lower() in (".nd2", ".svs")
+            and item.suffix.lower() in (".nd2", ".svs", ".sdpc")
         ]
     except OSError:
         return False

@@ -5,7 +5,7 @@ Multiple slides are served at once, browser-tab style:
 GET  /                          tab shell (one tab per open slide)
 GET  /static/<path>             js / css / vendored OpenSeadragon (global)
 GET  /api/slides                open slides: [{sid, name, width, height}]
-POST /api/open                  {"path": "/…/slide.nd2|.svs|store.ome.zarr"}
+POST /api/open                  {"path": "/…/slide.nd2|.svs|.sdpc|store.ome.zarr"}
                                 converts if needed, registers, -> {sid}
 POST /api/close                 {"sid": "…"} unregister a slide
 
@@ -629,6 +629,7 @@ class SlideRegistry:
             read_manifest,
         )
         from .convert import CACHE_DIR_NAME, is_nd2wsi_store, open_store
+        from .sdpc import is_sdpc
         from .svs import is_svs
 
         requested_path = Path(store_path).expanduser()
@@ -660,6 +661,10 @@ class SlideRegistry:
             # (0.5 through 0.7 layouts) and stays trashable; a store the
             # user opened at any other explicit path never is
             trash_path = store_path
+        if is_sdpc(store_path):
+            # SDPC is direct-only. A decoder/layout error must not enter the
+            # ND2 conversion path or create/quarantine a research cache.
+            return self.add_direct(store_path)
         if is_svs(store_path):  # an SVS itself serves with no store
             slide_path = store_path
             try:
@@ -842,11 +847,15 @@ class SlideRegistry:
         return sid
 
     def add_direct(self, slide_path: str | Path) -> str:
-        """Serve an SVS straight from the file, writing nothing to disk."""
+        """Serve an RGB slide without a pixel cache; isolate Agent annotations."""
         from .cache import fingerprints_match, quick_fingerprint
-        from .direct import open_direct
+        from .sdpc import is_sdpc
 
         slide_path = Path(slide_path).resolve()
+        if is_sdpc(slide_path):
+            from .sdpc import open_direct
+        else:
+            from .direct import open_direct
         sid = self.sid_for(slide_path)
         stale = None
         with self._lock:
@@ -888,11 +897,18 @@ class SlideRegistry:
                 f"{str(fingerprint['quick_sha256'])[:16]}"
             )
             stale = self.slides.get(sid)
+            try:
+                annotations = self.annotation_path(slide_path, attrs)
+            except BaseException:
+                close = getattr(root, "close", None)
+                if close:
+                    close(delay=0)
+                raise
             st = ViewerState(
                 root,
                 attrs,
                 max_render_mpx=self.max_render_mpx,
-                annotations_path=self.annotation_path(slide_path, attrs),
+                annotations_path=annotations,
                 generation=gen,
                 source_path=slide_path,
                 manifest={"source": fingerprint},
@@ -996,12 +1012,15 @@ class SlideRegistry:
         """A slide file (converted on first open) or an existing store."""
         from .cache import SINGLE_FILE_SUFFIX
         from .convert import ensure_cache, existing_cache_store
+        from .sdpc import is_sdpc
         from .svs import is_svs
 
         path = Path(path).expanduser()
         if path.suffix.lower() == SINGLE_FILE_SUFFIX:
             return self.add_store(path)
         path = path.resolve()
+        if is_sdpc(path):
+            return self.add_direct(path)
         if path.suffix.lower() in SLIDE_SUFFIXES:
             if is_svs(path) and existing_cache_store(path, read_only=self.agent_window) is None:
                 try:
@@ -1024,7 +1043,7 @@ class SlideRegistry:
         elif path.is_dir():  # a user-supplied *.ome.zarr store
             return self.add_store(path)
         else:
-            raise ValueError(f"not an ND2/SVS slide, .nd2svs cache, or pyramid store: {path.name}")
+            raise ValueError(f"not an ND2/SVS/SDPC slide, .nd2svs cache, or pyramid store: {path.name}")
         # no explicit trash_path: add_store promotes a container store to its
         # container, so trashing removes manifest and pixels together
         return self.add_store(store, source_path=path)

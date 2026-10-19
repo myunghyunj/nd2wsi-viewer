@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-SLIDE_SUFFIXES = {".nd2", ".svs"}
+SLIDE_SUFFIXES = {".nd2", ".svs", ".sdpc"}
 
 def _manifest_source_path(container: Path, manifest: dict[str, Any]) -> Path | None:
     from .cache import source_base

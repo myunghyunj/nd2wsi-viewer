@@ -352,6 +352,9 @@ def export_roi_tiff(
     import tifffile
 
     meta = attrs["nd2wsi"]
+    # TIFF ImageDescription is ASCII, unlike the file path and HTTP download
+    # name. Keep non-ASCII source names recoverable without rejecting exports.
+    source_description = str(meta["source"]).encode("ascii", "backslashreplace").decode("ascii")
     lv = level_entry(meta["levels"], level)
     level_path = lv["path"]
     tile = min(int(meta["tile"]), 512)
@@ -388,7 +391,7 @@ def export_roi_tiff(
                 **res_kw,
                 compression="zlib",
                 description=(
-                    f"nd2wsi ROI from {meta['source']} level {level} "
+                    f"nd2wsi ROI from {source_description} level {level} "
                     f"(downsample {factor}) x={x} y={y} w={w} h={h}"
                 ),
             )
@@ -401,7 +404,7 @@ def export_roi_tiff(
                 **res_kw,
                 compression="zlib",
                 description=(
-                    f"nd2wsi ROI from {meta['source']} level {level} "
+                    f"nd2wsi ROI from {source_description} level {level} "
                     f"(downsample {factor}) x={x} y={y} w={w} h={h} "
                     f"channels={channels}"
                 ),

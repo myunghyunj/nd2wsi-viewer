@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import math
 import sys
 import tempfile
 import threading
@@ -32,6 +34,73 @@ def _fetch(url):
         return response.read()
 
 
+def _smoke_sdpc(work: Path) -> None:
+    """Mandatory 2.3 release check: use frozen synthetic bytes, never encode HEVC."""
+    import av
+    import numpy as np
+    import tifffile
+    from PIL import Image
+
+    from . import _sdpc_smoke_fixture as fixture
+    from .app import open_or_convert
+    from .sdpc import sdpc_info
+
+    decoder = av.Codec("hevc", "r")
+    assert decoder.is_decoder and decoder.type == "video", "bundled HEVC decoder missing"
+    encoded = fixture.load_sdpc()
+    slide = work / "synthetic-sdpc-smoke.sdpc"
+    slide.write_bytes(encoded)
+    assert open_or_convert(slide) == slide, "SDPC smoke unexpectedly requested conversion"
+    x, y, width, height = fixture.ROI
+    with _served(slide) as (httpd, url):
+        state = httpd.registry.get(None)
+        assert state.store_path is None, "SDPC must remain source-backed"
+        assert state.attrs["nd2wsi"]["source_format"] == "sdpc"
+        actual = np.moveaxis(np.asarray(state.root["0"][:]), 0, -1)
+        assert actual.shape == (fixture.HEIGHT, fixture.WIDTH, 3)
+        assert hashlib.sha256(actual.tobytes()).hexdigest() == fixture.RGB_SHA256, (
+            "SDPC native RGB differs from the independent decoded reference"
+        )
+        info = json.loads(_fetch(url + "api/inspect"))
+        assert info["storage"] == "direct" and info["rgb"] is True
+        assert info["calibration"]["pixel_size_um"] == [fixture.MPP, fixture.MPP]
+        assert info["objective_magnification"] == 40
+        with Image.open(io.BytesIO(_fetch(url + "api/tile/0/0/0.jpg"))) as image:
+            image.load()
+            assert image.mode == "RGB" and image.size == (fixture.WIDTH, fixture.HEIGHT)
+        pixel = json.loads(_fetch(
+            url + f"api/pixel?x={fixture.TILE_WIDTH}&y={fixture.TILE_HEIGHT}"
+        ))
+        assert [channel["value"] for channel in pixel["values"]] == actual[
+            fixture.TILE_HEIGHT, fixture.TILE_WIDTH
+        ].tolist()
+        roi = _fetch(url + f"api/roi?level=0&x={x}&y={y}&w={width}&h={height}&format=tiff")
+        with tifffile.TiffFile(io.BytesIO(roi)) as exported:
+            pixels = exported.asarray()
+            assert np.array_equal(pixels, actual[y:y+height, x:x+width]), (
+                "SDPC seam-crossing TIFF export changed decoded RGB"
+            )
+            assert hashlib.sha256(pixels.tobytes()).hexdigest() == fixture.ROI_RGB_SHA256
+            tags = exported.pages[0].tags
+            assert tags["ResolutionUnit"].value == 3, "SDPC TIFF must use centimeters"
+            for axis in ("XResolution", "YResolution"):
+                numerator, denominator = tags[axis].value
+                assert math.isclose(10000 * denominator / numerator, fixture.MPP,
+                                    rel_tol=1e-7), "SDPC TIFF calibration changed"
+    corrupt = work / "synthetic-sdpc-truncated.sdpc"
+    corrupt.write_bytes(encoded[:-1])
+    try:
+        sdpc_info(corrupt)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("SDPC truncated source was accepted")
+    print(
+        f"smoke ok: SDPC HEVC (PyAV {av.__version__}), native RGB reference exact; "
+        "tile/pixel APIs, seam-crossing TIFF RGB and calibration passed; truncation rejected"
+    )
+
+
 def run(nd2_path: Path) -> int:
     import nd2
     import numpy as np
@@ -44,6 +113,7 @@ def run(nd2_path: Path) -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="nd2wsi-smoke-") as temp:
             work = Path(temp)
+            _smoke_sdpc(work)
             # These compiled SciPy modules and the frozen settings must be in
             # the delivered bundle, not merely present in a developer venv.
             from . import h_adaptive, h_model

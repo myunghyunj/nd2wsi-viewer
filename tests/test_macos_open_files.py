@@ -51,7 +51,7 @@ def cocoa(monkeypatch):
 
 
 def test_finder_batch_is_accepted_as_soon_as_delegate_binds_before_any_window(cocoa):
-    paths = ["/isolated/1-2.nd2", "/isolated/한글.SVS", "/isolated/cache.nd2svs", "/isolated/notes.txt"]
+    paths = ["/isolated/1-2.nd2", "/isolated/한글.SVS", "/isolated/cache.nd2svs", "/isolated/whole slide.SDPC", "/isolated/notes.txt"]
     cocoa.native.on_bind = lambda delegate: delegate.application_openFiles_(cocoa.native, paths)
 
     app._install_open_files_handler()
@@ -60,7 +60,7 @@ def test_finder_batch_is_accepted_as_soon_as_delegate_binds_before_any_window(co
     assert delegate is not None
     assert cocoa.native.delegate() is delegate
     assert cocoa.allocations == cocoa.assignments == [delegate]
-    cocoa.dispatch.assert_called_once_with(paths[:3])
+    cocoa.dispatch.assert_called_once_with(paths[:4])
     cocoa.native.replyToOpenOrPrint_.assert_called_once_with(0)
 
 
@@ -102,12 +102,13 @@ def test_does_not_steal_an_existing_application_delegate(cocoa, installed_first)
     assert cocoa.assignments == previous_assignments
 
 
-def test_single_file_handler_accepts_slides_and_rejects_other_types(cocoa):
+@pytest.mark.parametrize("path", ["/isolated/1-2.ND2", "/isolated/whole slide.SDPC"])
+def test_single_file_handler_accepts_slides_and_rejects_other_types(cocoa, path):
     app._install_open_files_handler()
     delegate = cocoa.native.delegate()
 
-    assert delegate.application_openFile_(cocoa.native, "/isolated/1-2.ND2") is True
+    assert delegate.application_openFile_(cocoa.native, path) is True
     assert delegate.application_openFile_(cocoa.native, "/isolated/notes.txt") is False
 
-    cocoa.dispatch.assert_called_once_with(["/isolated/1-2.ND2"])
+    cocoa.dispatch.assert_called_once_with([path])
     cocoa.native.replyToOpenOrPrint_.assert_not_called()

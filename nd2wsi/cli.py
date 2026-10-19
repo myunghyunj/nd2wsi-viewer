@@ -100,12 +100,12 @@ def main(argv: list[str] | None = None) -> int:
         pass
     parser = argparse.ArgumentParser(
         prog="nd2wsi",
-        description="Local whole-slide viewing for stitched Nikon ND2 and Aperio SVS, "
+        description="Local whole-slide viewing for Nikon ND2, Aperio SVS and SDPC, "
         "with native-value ROI export.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_info = sub.add_parser("info", help="inspect an ND2/SVS file's internal layout")
+    p_info = sub.add_parser("info", help="inspect an ND2/SVS/SDPC file's internal layout")
     p_info.add_argument("nd2")
     p_info.add_argument("--json", action="store_true", help="machine-readable output")
 
@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("store", nargs="+", help="one tab per store")
     _add_serve_args(p_serve)
 
-    p_view = sub.add_parser("view", help="one shot: convert if needed, then serve")
+    p_view = sub.add_parser("view", help="serve a slide directly or build a viewing cache if needed")
     p_view.add_argument("nd2", nargs="+", help="one tab per slide")
     p_view.add_argument(
         "--store", help="portable pyramid location for an explicit conversion"
@@ -171,12 +171,32 @@ def main(argv: list[str] | None = None) -> int:
     _add_convert_args(p_view)
     _add_serve_args(p_view)
 
-    args = parser.parse_args(argv)
+    command_args = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(command_args)
+
+    from .sdpc import is_sdpc
+
+    if args.cmd == "convert" and is_sdpc(args.nd2):
+        parser.error("SDPC supports direct viewing and ROI export, not pyramid conversion; use 'view' to open it")
+    if args.cmd == "crop" and is_sdpc(args.nd2):
+        parser.error("'crop' reads native ND2 files only; open the SDPC with 'view' and use ROI export")
+    if args.cmd == "view" and any(is_sdpc(path) for path in args.nd2):
+        conversion_flags = {"--store", "--overwrite", "--t", "--position", "--z", "--tile", "--workers", "--yes", "-y"}
+        if any(argument.split("=", 1)[0] in conversion_flags for argument in command_args):
+            parser.error("SDPC supports direct viewing only; conversion and T/Z/position options are unavailable")
 
     if args.cmd == "info":
+        from .sdpc import sdpc_info
         from .svs import collect_svs_info, format_svs_info, is_svs
 
-        if is_svs(args.nd2):
+        if is_sdpc(args.nd2):
+            import json
+
+            # SDPC carries nested header/pyramid metadata. Preserve that
+            # structure in both human-readable and --json inspection output.
+            print(json.dumps(sdpc_info(args.nd2), indent=2, ensure_ascii=False))
+            return 0
+        elif is_svs(args.nd2):
             collect_info, format_info = collect_svs_info, format_svs_info
         else:
             from .inspect_nd2 import collect_info, format_info
@@ -334,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             if not explicit:
                 # the default view goes through the managed cache: identity
                 # checked, atomically built, straight from the file for SVS
-                if is_svs(slide) and existing_cache_store(slide) is None:
+                if is_sdpc(slide) or (is_svs(slide) and existing_cache_store(slide) is None):
                     print(f"{Path(slide).name}: serving straight from the file")
                     stores.append(Path(slide))
                 elif is_plate_file(slide):
