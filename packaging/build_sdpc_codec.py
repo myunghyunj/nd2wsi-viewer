@@ -82,14 +82,21 @@ def make_ffmpeg(source: Path, arguments: list[str], jobs: int,
         bash = Path(msys_bash or r"C:\msys64\usr\bin\bash.exe")
         if not bash.is_file():
             raise RuntimeError("MSYS2 bash is required; pass --msys-bash PATH")
+        if not (bash.parent / "make.exe").is_file():
+            raise RuntimeError("Install make in the selected MSYS2 environment (pacman -S make)")
         compiler = shutil.which("cl.exe")
         if not compiler:
             raise RuntimeError("Run in an x64 MSVC developer environment (cl.exe missing)")
-        shell_env = dict(env, MSYS2_PATH_TYPE="inherit")
+        shell_env = dict(env, MSYSTEM="MSYS", MSYS2_PATH_TYPE="inherit", SHELL="/usr/bin/bash")
         # Keep MSVC's link.exe before MSYS2's unrelated link command.
         shell_env["PATH"] = str(Path(compiler).parent) + os.pathsep + str(bash.parent) + os.pathsep + env["PATH"]
         cd = "cd " + shlex.quote(source.resolve().as_posix()) + " && "
-        for command in ("./configure " + shlex.join(arguments), f"make -j{jobs}", "make install"):
+        # Native Windows make can strip the backslashes in FFmpeg's MSVC AWK
+        # dependency rules. Use make and its recipe shell from this MSYS2 root,
+        # never a similarly named executable inherited from the runner PATH.
+        for command in ("./configure " + shlex.join(arguments),
+                        f"/usr/bin/make SHELL=/usr/bin/bash -j{jobs}",
+                        "/usr/bin/make SHELL=/usr/bin/bash install"):
             run([str(bash), "--noprofile", "--norc", "-c", cd + command], env=shell_env)
     else:
         run([str(source / "configure"), *arguments], cwd=source, env=env)
@@ -191,6 +198,9 @@ def main() -> None:
         archive.writestr("build-record.json", json.dumps(manifest, indent=2) + "\n")
         archive.writestr("REBUILD.txt", "Use matching native Python and prerequisites in packaging/build_sdpc_codec.py.\n"
                           "Run: python packaging/build_sdpc_codec.py --output NEW_EMPTY_DIR --source-cache sources\n"
+                          "On Windows, use an x64 MSVC developer environment, install make and diffutils\n"
+                          "in MSYS2, and append --msys-bash C:/path/to/msys64/usr/bin/bash.exe.\n"
+                          "The Bash path must belong to the MSYS2 installation containing those packages.\n"
                           "Upstream source archives are unmodified. The build selects LGPL-only shared\n"
                           "HEVC libraries; wheel repair changes library load paths. See the notice.\n")
     manifest["source_archive_sha256"] = sha256(bundle)

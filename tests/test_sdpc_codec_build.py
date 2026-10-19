@@ -2,8 +2,10 @@
 import hashlib
 import importlib.util
 import json
+import shlex
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -75,3 +77,61 @@ def test_native_manifest_hashes_actual_wheel_binaries_only(tmp_path):
         "av/core.so": hashlib.sha256(b"extension").hexdigest(),
         "av/.dylibs/libavcodec.dylib": hashlib.sha256(b"decoder").hexdigest(),
     }
+
+
+def test_windows_ffmpeg_uses_selected_msys_make_and_preserves_quoting(tmp_path, monkeypatch):
+    builder = load_script("build_sdpc_codec")
+    bash = tmp_path / "action-managed MSYS2" / "usr" / "bin" / "bash.exe"
+    bash.parent.mkdir(parents=True)
+    bash.touch()
+    (bash.parent / "make.exe").touch()
+    compiler = tmp_path / "Visual Studio" / "bin" / "cl.exe"
+    source = tmp_path / "FFmpeg's source"
+    arguments = ["--prefix=D:/build output/FFmpeg's install", "--toolchain=msvc"]
+    calls = []
+    monkeypatch.setattr(builder, "os", SimpleNamespace(name="nt", pathsep=";"))
+    monkeypatch.setattr(builder.shutil, "which", lambda name: str(compiler) if name == "cl.exe" else None)
+    monkeypatch.setattr(builder, "run", lambda command, **kwargs: calls.append((command, kwargs)))
+    builder.make_ffmpeg(source, arguments, 6, {"PATH": "native-make-directory"}, str(bash))
+
+    expected_commands = [["./configure", *arguments],
+                         ["/usr/bin/make", "SHELL=/usr/bin/bash", "-j6"],
+                         ["/usr/bin/make", "SHELL=/usr/bin/bash", "install"]]
+    assert len(calls) == len(expected_commands)
+    for (command, kwargs), expected in zip(calls, expected_commands):
+        assert command[:4] == [str(bash), "--noprofile", "--norc", "-c"]
+        assert shlex.split(command[4]) == ["cd", source.resolve().as_posix(), "&&", *expected]
+        assert kwargs["env"]["PATH"] == f"{compiler.parent};{bash.parent};native-make-directory"
+        assert kwargs["env"]["SHELL"] == "/usr/bin/bash"
+        assert kwargs["env"]["MSYSTEM"] == "MSYS"
+
+
+def test_windows_ffmpeg_rejects_msys_without_make_before_build(tmp_path, monkeypatch):
+    builder = load_script("build_sdpc_codec")
+    bash = tmp_path / "bash.exe"
+    bash.touch()
+    monkeypatch.setattr(builder, "os", SimpleNamespace(name="nt"))
+    with pytest.raises(RuntimeError, match="Install make in the selected MSYS2"):
+        builder.make_ffmpeg(tmp_path, [], 1, {"PATH": "native-make-directory"}, str(bash))
+
+
+def test_non_windows_ffmpeg_retains_native_make_commands(tmp_path, monkeypatch):
+    builder = load_script("build_sdpc_codec")
+    calls = []
+    env = {"PATH": "native-build-tools"}
+    monkeypatch.setattr(builder, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(builder, "run", lambda command, **kwargs: calls.append((command, kwargs)))
+    builder.make_ffmpeg(tmp_path, ["--enable-shared"], 6, env, None)
+    assert calls == [
+        ([str(tmp_path / "configure"), "--enable-shared"], {"cwd": tmp_path, "env": env}),
+        (["make", "-j6"], {"cwd": tmp_path, "env": env}),
+        (["make", "install"], {"cwd": tmp_path, "env": env}),
+    ]
+
+
+def test_windows_workflow_passes_action_managed_msys_bash():
+    workflow = (ROOT / ".github/workflows/windows.yml").read_text(encoding="utf-8")
+    assert "- uses: msys2/setup-msys2@v2\n        id: msys2" in workflow
+    assert "MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}" in workflow
+    assert "$msysBash = Join-Path $env:MSYS2_LOCATION 'usr\\bin\\bash.exe'" in workflow
+    assert "--jobs 6 --msys-bash $msysBash" in workflow

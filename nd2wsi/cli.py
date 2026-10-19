@@ -7,6 +7,7 @@ self-contained OME-Zarr pyramid. ``crop`` reads native ND2 pixels directly.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -92,12 +93,24 @@ def _selection(args: argparse.Namespace) -> PlaneSelection:
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:  # be a polite unix citizen when piped into `head` etc.
-        import signal
+    try:
+        try:
+            return _main(argv)
+        finally:
+            # Catch buffered output failures here, including argparse's exits.
+            sys.stdout.flush()
+    except BrokenPipeError:
+        # Keep Python's SIGPIPE handling: restoring SIG_DFL also kills the
+        # viewer on disconnected HTTP clients. Avoid another flush error at exit.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            os.close(devnull)
+        return 1
 
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    except (ImportError, AttributeError, ValueError):
-        pass
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="nd2wsi",
         description="Local whole-slide viewing for Nikon ND2, Aperio SVS and SDPC, "

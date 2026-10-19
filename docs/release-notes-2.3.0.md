@@ -33,6 +33,10 @@ TIFF ROI export also handles source names containing Korean, Chinese and other
 non-ASCII characters. Original slides, existing annotations, saved LUTs and
 the ND2/SVS cache formats retain their existing preservation rules.
 
+The command-line viewer keeps Python's safe handling of disconnected sockets.
+Closing a piped text-output consumer is handled locally, without changing the
+signal behavior of the embedded HTTP server.
+
 ## Limits
 
 SDPC support covers the validated HEVC variant, not every scanner or SDPC

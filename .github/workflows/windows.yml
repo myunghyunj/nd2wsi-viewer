@@ -64,15 +64,19 @@ jobs:
         with:
           arch: x64
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: MSYS
           path-type: inherit
           install: make diffutils
       - name: Build and install the source-verified LGPL SDPC decoder
         shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
         run: |
           $codecOutput = Join-Path $env:GITHUB_WORKSPACE 'build\sdpc-codec'
-          .venv/Scripts/python.exe packaging/build_sdpc_codec.py --output $codecOutput --jobs 6
+          $msysBash = Join-Path $env:MSYS2_LOCATION 'usr\bin\bash.exe'
+          .venv/Scripts/python.exe packaging/build_sdpc_codec.py --output $codecOutput --jobs 6 --msys-bash $msysBash
           if ($LASTEXITCODE -ne 0) { throw 'Source-built SDPC codec failed' }
           $codecManifest = Join-Path $codecOutput 'sdpc-codec-manifest.json'
           $codecMetadata = Get-Content -LiteralPath $codecManifest -Raw -Encoding UTF8 | ConvertFrom-Json
