@@ -50,7 +50,8 @@ context.renderAssociatedImages([]);
 console.log(JSON.stringify({initial, expanded, reduced, failed, fits}));
 """
     result = subprocess.run(
-        [NODE, "-e", script, str(APP)], check=True, capture_output=True, text=True,
+        [NODE, "-e", script, str(APP)], check=True, capture_output=True,
+        text=True, encoding="utf-8",
     )
     data = json.loads(result.stdout)
     assert data["initial"] == {

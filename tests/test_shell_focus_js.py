@@ -46,14 +46,18 @@ def run(body):
     return json.loads(result.stdout)
 
 
-def test_initial_ready_pane_receives_focus_and_channel_key_can_reach_it():
+@pytest.mark.parametrize('platform,modifier', [('MacIntel', 'metaKey'), ('Win32', 'ctrlKey')])
+def test_initial_ready_pane_receives_focus_and_channel_key_can_reach_it(platform, modifier):
     result = run('''
       activate('a'); const before=focused.slice();
       readyFrames.add('a'); paneCameUp('a');
+      const event={key:'c',code:'KeyC',[MODIFIER]:true,target:{tagName:'BODY'}};
       ({before,focused,target:document.activeElement.dataset.sid,
-        action:ShortcutRouter.panelForEvent({key:'c',code:'KeyC',target:{tagName:'BODY'}})});
-    ''')
-    assert result == {'before': [], 'focused': ['a', 'a:window'], 'target': 'a', 'action': 'channels'}
+        action:ShortcutRouter.panelForEvent(event,PLATFORM),
+        plain:ShortcutRouter.panelForEvent({...event,[MODIFIER]:false},PLATFORM)});
+    '''.replace('PLATFORM', json.dumps(platform)).replace('MODIFIER', json.dumps(modifier)))
+    assert result == {'before': [], 'focused': ['a', 'a:window'], 'target': 'a',
+                      'action': 'channels', 'plain': None}
 
 
 def test_switching_to_ready_tab_focuses_it_once_without_resetting_inner_editor():
@@ -87,14 +91,17 @@ def test_delayed_ready_does_not_take_focus_from_a_newly_selected_button():
     assert result == []
 
 
-def test_delayed_ready_keeps_new_checkbox_focus_while_c_remains_available():
+@pytest.mark.parametrize('platform,modifier', [('MacIntel', 'metaKey'), ('Win32', 'ctrlKey')])
+def test_delayed_ready_keeps_new_checkbox_focus_and_native_command_ownership(platform, modifier):
     result = run('''
       activate('a');document.activeElement={tagName:'INPUT',type:'checkbox'};
       readyFrames.add('a');paneCameUp('a');
+      const event={key:'c',code:'KeyC',[MODIFIER]:true,target:document.activeElement};
       ({focused,tag:document.activeElement.tagName,
-        action:ShortcutRouter.panelForEvent({key:'c',code:'KeyC',target:document.activeElement})});
-    ''')
-    assert result == {'focused': [], 'tag': 'INPUT', 'action': 'channels'}
+        action:ShortcutRouter.panelForEvent(event,PLATFORM),
+        plain:ShortcutRouter.panelForEvent({...event,[MODIFIER]:false},PLATFORM)});
+    '''.replace('PLATFORM', json.dumps(platform)).replace('MODIFIER', json.dumps(modifier)))
+    assert result == {'focused': [], 'tag': 'INPUT', 'action': None, 'plain': None}
 
 
 def test_inactive_ready_pane_does_not_take_focus_from_selected_slide():

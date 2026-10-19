@@ -155,6 +155,29 @@ const fs=require('fs'),vm=require('vm');
 const {script,mode,shadingModule}=JSON.parse(fs.readFileSync(0,'utf8'));
 const Shading=require(shadingModule);
 const fetches=[],calls={copy:0,paste:0};let toast='',copied=false,encoded='exact effective LUTs';
+const infoCalls={load:0,open:0,close:0,toggled:[]};
+let infoHidden=mode!=='info-already-open',inspectNames=null;
+const associatedNames=mode==='info-empty'?[]:['thumbnail','label'];
+const inspector={
+  isHidden:()=>infoHidden,
+  open(){infoCalls.open++;infoHidden=false;},
+  close(){infoCalls.close++;infoHidden=true;},
+};
+const infoImages=associatedNames.map(name=>{
+  let expanded=false;
+  const image={complete:true,naturalWidth:160,naturalHeight:80,
+    src:'http://viewer.test/private-token/s/test/api/associated/'+name+'.jpg?g=pyramid-test'};
+  image.parentElement={
+    getAttribute:attribute=>attribute==='aria-expanded'?String(expanded):null,
+    click(){
+      infoCalls.toggled.push(name);
+      if(mode==='info-enlargement-missing')return;
+      expanded=!expanded;
+      if(expanded){image.src+='&detail=1';image.naturalWidth=1024;image.naturalHeight=512;}
+    },
+  };
+  return image;
+});
 const buttons={
   'lut-type':{onclick(){}},
   'lut-copy':{disabled:false,classList:{contains:()=>copied},async onclick(){
@@ -171,6 +194,7 @@ const buttons={
 if(mode==='missing-handler')delete buttons['lut-paste'].onclick;
 const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){},fitsChannel(){}},
   Nd2ShadingCorrection:mode==='missing-shading-module'?null:Shading,
+  async loadSlideInspector(){infoCalls.load++;inspectNames=mode==='info-metadata-missing'?null:associatedNames;},
   parent:{pywebview:{platform:mode==='wrong-platform'?'cocoa':'edgechromium',api:{
     write_lut_clipboard:mode==='missing-native-write'?null:()=>{},
     read_lut_clipboard:mode==='missing-native-read'?null:()=>{}}}},
@@ -183,6 +207,8 @@ const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){
     if(expression==='state.shading.snapshot()')return mode==='legacy-shading-status'?{state:'idle',enabled:false}:
       {state:mode==='applied'?'ready':'idle',applied:mode==='applied',operation:null,can_cancel:false,generation:'pyramid-test'};
     if(expression==='state.info.generation')return 'pyramid-test';
+    if(expression==='state.windows.info')return inspector;
+    if(expression==='state.inspect && state.inspect.associated')return inspectNames;
     if(expression==='state.lutAutoPending.some(Boolean)')return mode==='autolut-timeout';
     if(expression.includes('planPaste'))return 2;
     return encoded;
@@ -190,6 +216,8 @@ const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){
 };
 const page={baseURI:'http://viewer.test/private-token/s/test/',
   querySelector:selector=>selector==='#stage canvas'?{width:100,height:100}:null,
+  querySelectorAll:selector=>selector==='#info-associated img'?
+    (mode==='info-images-missing'?infoImages.slice(1):infoImages):[],
   getElementById:id=>buttons[id]};
 const frame={dataset:{sid:'test'},contentDocument:page,contentWindow:view};
 const shellControls={
@@ -211,13 +239,18 @@ vm.createContext(context);
   const first=vm.runInContext(script,context);
   await frame.__nd2wsiSmokeLutTask;
   const result=vm.runInContext(script,context);
-  process.stdout.write(JSON.stringify({first,result,fetches,calls}));
+  process.stdout.write(JSON.stringify({first,result,fetches,calls,info:{calls:infoCalls,hidden:infoHidden,
+    expanded:infoImages.map(image=>image.parentElement.getAttribute('aria-expanded'))}}));
 })().catch(error=>{console.error(error);process.exitCode=1});
 """
 
 
 @pytest.mark.parametrize("mode, clipboard, error", [
     ("ready", False, None), ("ready", True, None), ("applied", False, None),
+    ("info-empty", False, None), ("info-already-open", False, None),
+    ("info-metadata-missing", False, "Slide Info metadata did not load"),
+    ("info-images-missing", False, "Slide Info omitted embedded images"),
+    ("info-enlargement-missing", False, "Slide Info enlargement is unavailable"),
     ("missing-module", False, "transfer module is unavailable"),
     ("missing-handler", False, "toolbar is not wired"),
     ("missing-shading-control", False, "Shading Correction controls are unavailable"),
@@ -266,10 +299,24 @@ def test_real_gui_smoke_script_checks_assets_and_opt_in_clipboard(
         if mode in {"wrong-platform", "missing-native-write", "missing-native-read"}:
             assert result["phase"] == "clipboard-transport"
             assert out["calls"] == {"copy": 0, "paste": 0}
+        if mode in {"info-metadata-missing", "info-images-missing", "info-enlargement-missing"}:
+            assert result["phase"] == "info-images"
+            assert out["info"]["calls"]["load"] == 1
     else:
         assert result["ok"] is result["module"] is result["handlers"] is True
         assert result["phase"] == "complete"
         assert result["clipboard_api"] == {"write": True, "read": True}
+        empty = mode == "info-empty"
+        assert result["info_images"] == {
+            "names": [] if empty else ["thumbnail", "label"],
+            "dimensions": [] if empty else [[160, 80], [160, 80]],
+            "enlarged": None if empty else [1024, 512],
+        }
+        assert out["info"] == {
+            "calls": {"load": 1, "open": 1, "close": int(mode != "info-already-open"),
+                      "toggled": [] if empty else ["label", "label"]},
+            "hidden": mode != "info-already-open", "expanded": [] if empty else ["false", "false"],
+        }
         assert result["shading_correction"] == {
             "state": "ready" if mode == "applied" else "idle", "applied": mode == "applied",
             "operation": None, "can_cancel": False, "generation": "pyramid-test", "toolbar": True, "confirmation": True,
