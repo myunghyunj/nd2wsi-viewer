@@ -135,3 +135,20 @@ def test_windows_workflow_passes_action_managed_msys_bash():
     assert "MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}" in workflow
     assert "$msysBash = Join-Path $env:MSYS2_LOCATION 'usr\\bin\\bash.exe'" in workflow
     assert "--jobs 6 --msys-bash $msysBash" in workflow
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_pyav_build_adds_msvc_import_library_directory_only_on_windows(tmp_path, monkeypatch, windows):
+    builder = load_script("build_sdpc_codec")
+    source = tmp_path / "PyAV source"
+    prefix = tmp_path / "FFmpeg install"
+    wheel_dir = tmp_path / "wheels"
+    env = {"PATH": "native-build-tools"}
+    calls = []
+    monkeypatch.setattr(builder, "run", lambda command, **kwargs: calls.append((command, kwargs)))
+    builder.build_pyav(source, prefix, "python", wheel_dir, 6, env, windows=windows)
+    build_options = ["build_ext", "-j6"]
+    if windows:
+        build_options.append(f"--library-dirs={prefix / 'bin'}")
+    assert calls == [(["python", "setup.py", f"--ffmpeg-dir={prefix}", *build_options,
+                      "bdist_wheel", "--dist-dir", str(wheel_dir)], {"cwd": source, "env": env})]

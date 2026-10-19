@@ -104,6 +104,18 @@ def make_ffmpeg(source: Path, arguments: list[str], jobs: int,
         run(["make", "install"], cwd=source, env=env)
 
 
+def build_pyav(source: Path, prefix: Path, python: str, wheel_dir: Path,
+               jobs: int, env: dict[str, str], *, windows: bool) -> None:
+    build_options = ["build_ext", f"-j{jobs}"]
+    if windows:
+        # FFmpeg's MSVC install puts its .lib import libraries beside the DLLs
+        # in bin; PyAV's --ffmpeg-dir searches only lib. Keep the upstream layout
+        # and add bin to the linker search path without changing either source.
+        build_options.append(f"--library-dirs={prefix / 'bin'}")
+    run([python, "setup.py", f"--ffmpeg-dir={prefix}", *build_options,
+         "bdist_wheel", "--dist-dir", str(wheel_dir)], cwd=source, env=env)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="new or empty output directory")
@@ -151,8 +163,7 @@ def main() -> None:
     run([python, "-m", "pip", "install", "--disable-pip-version-check", *BUILD_REQUIREMENTS, repair_requirement], env=env)
     raw = output / "unrepaired-wheel"
     raw.mkdir()
-    run([python, "setup.py", f"--ffmpeg-dir={prefix}", "build_ext", f"-j{args.jobs}",
-         "bdist_wheel", "--dist-dir", str(raw)], cwd=pyav, env=env)
+    build_pyav(pyav, prefix, python, raw, args.jobs, env, windows=system == "Windows")
     raw_wheels = list(raw.glob("*.whl"))
     if len(raw_wheels) != 1:
         raise RuntimeError("Expected exactly one source-built PyAV wheel")
