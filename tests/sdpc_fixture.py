@@ -44,7 +44,10 @@ def _encode_and_decode(rgb):
     with av.open(BytesIO(encoded), format="hevc") as container:
         frames = list(container.decode(video=0))
         assert len(frames) == 1
-        decoded = frames[0].to_ndarray(format="rgb24")
+        # Explicit chroma reconstruction and rounding avoid FFmpeg defaults
+        # changing by release: BILINEAR | SWS_ACCURATE_RND | SWS_BITEXACT.
+        decoded = frames[0].to_ndarray(format="rgb24", interpolation=2 | 0x40000 | 0x80000,
+                                       src_color_range=frames[0].color_range)
     return encoded, decoded
 
 

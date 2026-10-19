@@ -34,6 +34,28 @@ def _fetch(url):
         return response.read()
 
 
+def _verify_sdpc_runtime_license(av) -> None:
+    """Read the delivered libraries' own metadata, not a pre-signing hash claim."""
+    # Keep these restrictions aligned with packaging/verify_sdpc_codec.py.
+    required = {
+        "--disable-autodetect", "--disable-everything", "--disable-gpl", "--disable-nonfree",
+        "--disable-version3", "--disable-static", "--enable-shared", "--disable-network",
+        "--enable-decoder=hevc", "--enable-parser=hevc", "--enable-demuxer=hevc",
+    }
+    forbidden = ("--enable-gpl", "--enable-nonfree", "--enable-version3", "--enable-lib")
+    metadata = av._core.library_meta
+    assert av.__version__ == "16.0.1", "unexpected packaged PyAV version"
+    assert len(metadata) == 7, "expected seven packaged FFmpeg shared libraries"
+    for name, item in metadata.items():
+        assert item["license"] == "LGPL version 2.1 or later", f"unapproved {name} runtime license"
+        configuration = item["configuration"]
+        assert all(flag in configuration for flag in required), f"missing {name} runtime restrictions"
+        assert not any(flag in configuration for flag in forbidden), f"unapproved {name} runtime configuration"
+    assert "libx264" not in av.codecs_available and "libx265" not in av.codecs_available, (
+        "external encoders appeared in the packaged decoder-only runtime"
+    )
+
+
 def _smoke_sdpc(work: Path) -> None:
     """Mandatory 2.3 release check: use frozen synthetic bytes, never encode HEVC."""
     import av
@@ -47,6 +69,9 @@ def _smoke_sdpc(work: Path) -> None:
 
     decoder = av.Codec("hevc", "r")
     assert decoder.is_decoder and decoder.type == "video", "bundled HEVC decoder missing"
+    if getattr(sys, "frozen", False):
+        _verify_sdpc_runtime_license(av)
+        print("smoke ok: SDPC LGPL runtime, seven restricted shared libraries; no external encoders")
     encoded = fixture.load_sdpc()
     slide = work / "synthetic-sdpc-smoke.sdpc"
     slide.write_bytes(encoded)

@@ -20,6 +20,7 @@ REPO="$(dirname "$HERE")"
 OUT="${1:-$REPO/dist}"
 BUILD="$REPO/build/macapp"
 APPNAME="nd2wsi-viewer"
+: "${ND2WSI_SDPC_CODEC_MANIFEST:?Set ND2WSI_SDPC_CODEC_MANIFEST to the source-built LGPL codec manifest}"
 SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://raw.githubusercontent.com/myunghyunj/nd2wsi-viewer/main/updates/appcast.xml}"
 SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-RSPZ8oXqjqXqByfHTCoiskGziFs+zAHNJ/fGa3N/hvk=}"
 RELEASE_STAGE="$(mktemp -d /private/tmp/nd2wsi-release.XXXXXX)"
@@ -51,6 +52,9 @@ rm -rf "$BUILD/venv"
 PY="$BUILD/venv/bin/python"
 "$PY" -m pip -q install --upgrade pip
 "$PY" -m pip -q install "$REPO" pyinstaller "pywebview>=6.0" "imagecodecs>=2023.9"
+SDPC_WHEEL="$("$PY" "$HERE/bundle_sdpc_codec.py" wheel --manifest "$ND2WSI_SDPC_CODEC_MANIFEST")"
+"$PY" -m pip -q install --no-deps --force-reinstall "$SDPC_WHEEL"
+"$PY" "$HERE/verify_sdpc_codec.py" --manifest "$ND2WSI_SDPC_CODEC_MANIFEST"
 "$PY" -m pip -q install --index-url https://pypi.laboratory-imaging.com/simple limnd2 \
   || echo "warn: limnd2 unavailable — app will ship without ND2 export"
 "$PY" -c "import limnd2; print('   limnd2', limnd2.__version__, 'in build venv')" \
@@ -74,6 +78,7 @@ echo "==> pyinstaller"
   --collect-all xsdata \
   --collect-all xsdata_pydantic_basemodel \
   --collect-all webview \
+  --collect-all av \
   --distpath "$OUT" --workpath "$BUILD/pyi" --specpath "$BUILD" \
   "$HERE/launch.py"
 
@@ -98,6 +103,8 @@ bundle = base + (f"fc{match.group(4)}" if match.group(4) else "")
 info["CFBundleShortVersionString"] = base
 info["CFBundleVersion"] = bundle
 info["ND2WSIPackageVersion"] = version
+info["ND2WSISdpcBundled"] = True
+info["ND2WSIDevelopmentOnly"] = False
 
 info["UTImportedTypeDeclarations"] = [
     {
@@ -111,6 +118,12 @@ info["UTImportedTypeDeclarations"] = [
         "UTTypeDescription": "Aperio SVS whole-slide image",
         "UTTypeConformsTo": ["public.data"],
         "UTTypeTagSpecification": {"public.filename-extension": ["svs"]},
+    },
+    {
+        "UTTypeIdentifier": "com.sqray.sdpc",
+        "UTTypeDescription": "SQRAY SDPC whole-slide image",
+        "UTTypeConformsTo": ["public.data"],
+        "UTTypeTagSpecification": {"public.filename-extension": ["sdpc"]},
     },
 ]
 info["CFBundleDocumentTypes"] = [
@@ -132,6 +145,12 @@ info["CFBundleDocumentTypes"] = [
         "CFBundleTypeRole": "Viewer",
         "LSHandlerRank": "Default",
     },
+    {
+        "CFBundleTypeName": "SQRAY SDPC slide",
+        "LSItemContentTypes": ["com.sqray.sdpc"],
+        "CFBundleTypeRole": "Viewer",
+        "LSHandlerRank": "Default",
+    },
 ]
 
 info["UTExportedTypeDeclarations"] = [{
@@ -145,6 +164,9 @@ with open(path, "wb") as fh:
     plistlib.dump(info, fh)
 print("   document types declared")
 PLISTEOF
+VERSION="$("$PY" -c 'from importlib.metadata import version; print(version("nd2wsi-viewer"))')"
+"$PY" "$HERE/bundle_sdpc_codec.py" stage --manifest "$ND2WSI_SDPC_CODEC_MANIFEST" \
+  --resources "$OUT/$APPNAME.app/Contents/Resources" --output "$OUT" --version "$VERSION"
 
 if [ "${ND2WSI_SKIP_UPDATER:-}" = "1" ]; then
   echo "==> Sparkle SKIPPED by explicit request — do not ship this build"
@@ -171,7 +193,8 @@ echo "==> smoke test"
 # A release artifact must prove itself: convert, serve, tile, ND2 round-trip.
 # Only an explicit --skip-smoke (development convenience) may skip it.
 if [ -n "${ND2WSI_SMOKE_FILE:-}" ]; then
-  "$STAGED_APP/Contents/MacOS/$APPNAME" --smoke "$ND2WSI_SMOKE_FILE"
+  "$STAGED_APP/Contents/MacOS/$APPNAME" --smoke "$ND2WSI_SMOKE_FILE" | tee "$RELEASE_STAGE/packaged-smoke.log"
+  grep -Fq 'smoke ok: SDPC' "$RELEASE_STAGE/packaged-smoke.log" || { echo "ERROR: packaged SDPC checks did not complete" >&2; exit 4; }
 elif [ "${ND2WSI_SKIP_SMOKE:-}" = "1" ]; then
   echo "   SKIPPED by explicit request — do not ship this build"
 else

@@ -4,7 +4,10 @@ Generated from tests/sdpc_fixture.py::build_sdpc(width=97, height=65,
 tile_width=64, tile_height=48, levels=1), using development PyAV 16.0.1 and
 libx265. Contains only mathematical RGB patterns, no patient or slide data.
 The shipped test never imports the generator or needs an HEVC encoder.
-RGB digests were computed from independently decoded tiles by the generator.
+RGB digests use independent FFmpeg 8.0.1 CLI decoding with explicit
+bilinear+accurate_rnd+bitexact conversion, confirmed byte-identical with
+PyAV/FFmpeg 8.0 and 8.1.3. Those flags fix chroma reconstruction and rounding;
+default swscale fast paths are not pixel-identical between these versions.
 """
 
 import base64
@@ -16,8 +19,8 @@ TILE_WIDTH, TILE_HEIGHT = 64, 48
 MPP = 0.37
 ROI = (55, 39, 42, 26)  # crosses both tile seams and reaches the cropped edge
 SOURCE_SHA256 = "06362d570d7c6c4fc5bda3c393995f705c2015c921341c9d9401e03d1b27e7a5"
-RGB_SHA256 = "e09891028baa527478c0cfc0a033afb556f4818b9a1ef04714da8b7d3d856090"
-ROI_RGB_SHA256 = "815de4da33f2548b06475297254670f915795e714c2dc36f4e221dfa66892e6f"
+RGB_SHA256 = "08c72a33026dd6cf60ac046f7e4bd61e3a8f4f576766dc5a10f9cc6903f44c70"
+ROI_RGB_SHA256 = "91ae0c26c1648578073b8f56e6e8a6e0f61391353b284a1dad97221adbb3b70a"
 
 _DATA = (
     "c-rk(d05j}*QW@hETSTc2ugHD0U_8T1w<+c3IehSuAq)-nzq5V2}ugpg-sb3#8FWMml;qLS8xMCMHB@W6h}u#8Ak"
@@ -83,4 +86,3 @@ def load_sdpc() -> bytes:
     if hashlib.sha256(data).hexdigest() != SOURCE_SHA256:
         raise RuntimeError("packaged synthetic SDPC fixture integrity check failed")
     return data
-

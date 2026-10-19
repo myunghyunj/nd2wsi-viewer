@@ -41,6 +41,13 @@ if ($manifest.binary_architecture -ne 'x64') { throw 'Unexpected executable arch
 if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.executable_sha256) {
     throw 'The executable checksum does not match the build manifest.'
 }
+$codecManifest = Join-Path $testRoot 'nd2wsi-viewer\sdpc-codec-manifest.json'
+if ($manifest.sdpc_codec_bundled -ne $true -or $manifest.distribution_status -ne 'source-built-lgpl-codec') {
+    throw 'This release requires the verified source-built LGPL SDPC codec.'
+}
+if ((Get-FileHash -LiteralPath $codecManifest -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.sdpc_codec_manifest_sha256) {
+    throw 'The packaged SDPC codec provenance does not match the build manifest.'
+}
 
 $runs = @()
 $previousLog = $env:ND2WSI_LOG_FILE
@@ -77,8 +84,8 @@ try {
                 throw 'Packaged GUI smoke did not record successful completion.'
             }
         }
-        elseif (-not (Test-Path -LiteralPath $log) -or (Get-Content -LiteralPath $log -Raw -Encoding UTF8) -notmatch 'smoke ok') {
-            throw "Packaged --$mode did not record successful completion."
+        elseif (-not (Test-Path -LiteralPath $log) -or (Get-Content -LiteralPath $log -Raw -Encoding UTF8) -notmatch 'smoke ok: SDPC') {
+            throw "Packaged --$mode did not record successful SDPC decoder and ROI checks."
         }
         $runs += @{ mode = $mode; exit_code = $process.ExitCode; seconds = $timer.Elapsed.TotalSeconds }
         $process.Dispose()
@@ -95,6 +102,10 @@ try {
         source_snapshot_sha256 = $manifest.source.snapshot_sha256
         source_working_tree_dirty = $manifest.source.working_tree_dirty
         unicode_install_and_source_paths = $true
+        sdpc_packaged_decoder_and_roi_verified = $true
+        sdpc_codec_manifest_sha256 = $manifest.sdpc_codec_manifest_sha256
+        sdpc_codec_source_url = $manifest.sdpc_codec_source.source_url
+        sdpc_codec_source_archive_sha256 = $manifest.sdpc_codec_source.source_archive_sha256
         runs = $runs
     }
     $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidencePath 'verification.json') -Encoding utf8

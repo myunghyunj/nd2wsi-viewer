@@ -1,0 +1,52 @@
+SDPC HEVC decoder - third-party notices for nd2wsi-viewer 2.3.0
+
+This application uses FFmpeg 8.1.3 under the GNU Lesser General Public License
+version 2.1 or later and PyAV 16.0.1 under the BSD 3-Clause license. Full license
+texts and the source-build manifest accompany this notice. Their licenses are
+not replaced by the viewer application's license. FFmpeg is a trademark of
+Fabrice Bellard, originator of the FFmpeg project.
+
+The decoder is built from unmodified, checksum-pinned upstream source archives
+with shared linking. It contains the native FFmpeg HEVC decoder, parser,
+demuxer and core libraries needed by PyAV. GPL, nonfree, version-3-only,
+network and external-library features are disabled. No x264, x265, SQRAY
+runtime or proprietary microscope SDK is included. This is not the
+general-purpose prebuilt PyAV wheel distributed through PyPI.
+
+Exact corresponding sources, configuration, build and verification scripts,
+and licenses are provided alongside the application at:
+https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.3.0
+
+Source asset names:
+  sdpc-codec-sources-macos-arm64.zip
+  sdpc-codec-sources-windows-x64.zip
+
+Only the source asset matching the downloaded application is needed. It includes
+rebuilding instructions and remains available from the same release as the
+application binary. Application source:
+https://github.com/myunghyunj/nd2wsi-viewer/tree/v2.3.0
+
+Library replacement and modification
+FFmpeg is dynamically linked and may be replaced with compatible modified
+versions for your own use. Preserve the ABI, exported symbols and library
+filenames/load paths expected by PyAV. Locate the av and av.libs directories
+inside the application bundle/folder; the manifest's native_files entries
+identify the original wheel layout. Modified macOS bundles may need local
+ad-hoc signing because binary modification invalidates the original signature.
+No viewer license term prohibits reverse engineering for debugging changes
+to these LGPL-covered libraries. No additional codec license fee is imposed
+by this application.
+
+The software is provided without warranty, including merchantability or fitness
+for a particular purpose; see the accompanying license texts. This notice does
+not grant patent rights. Users and distributors must assess any codec patent
+obligations applicable in their jurisdictions.
+
+SDPC scope: tiled HEVC RGB only. Vendor colour correction has not been inferred;
+decoded RGB is displayed without an invented vendor CCM/gamma transformation.
+JPEG and other SDPC variants are not supported in this release.
+
+Upstream projects and licensing information:
+https://ffmpeg.org/
+https://ffmpeg.org/legal.html
+https://github.com/PyAV-Org/PyAV

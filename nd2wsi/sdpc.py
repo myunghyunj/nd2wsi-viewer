@@ -249,7 +249,15 @@ def _decode_tile(data: bytes, width: int, height: int) -> np.ndarray:
             frame = next(frames, None)
             if frame is None or (frame.width, frame.height) != (width, height):
                 raise ValueError("SDPC tile did not decode to its declared dimensions")
-            rgb = frame.to_ndarray(format="rgb24")
+            # Explicit chroma reconstruction/rounding avoids version/CPU-specific
+            # swscale fast paths. Preserve decoded colorspace and range metadata;
+            # this is not the vendor's separate gamma/CCM colour correction.
+            # PyAV 16 accepts integer swscale flags but exposes no enum names for
+            # SWS_ACCURATE_RND (0x40000) or SWS_BITEXACT (0x80000).
+            rgb = frame.to_ndarray(
+                format="rgb24", interpolation=2 | 0x40000 | 0x80000,
+                src_color_range=frame.color_range,
+            )
             if next(frames, None) is not None:
                 raise ValueError("SDPC tile contains multiple frames")
             return np.ascontiguousarray(rgb)

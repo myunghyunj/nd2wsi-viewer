@@ -1,8 +1,8 @@
-# SDPC support — v2.3 development
+# SDPC support — v2.3.0
 
 Version 2.3.0 adds direct viewing of the validated SQ/SDPC 24-bit HEVC
-whole-slide format. This is a source/development implementation, not a
-published native release. The decoder packaging gate is described in
+whole-slide format. Native release builds include a source-built decoder.
+Its build and redistribution requirements are described in
 [`packaging/SDPC-CODEC-NOTICE.txt`](../packaging/SDPC-CODEC-NOTICE.txt).
 
 ## Supported behavior
@@ -93,8 +93,22 @@ does not establish a complete public transform specification. The viewer
 therefore displays decoded RGB without applying a guessed gamma/CCM transform.
 Colour equivalence to a particular vendor-viewer preset remains unverified.
 
-Development checks used PyAV 16.0.1 on the current macOS machine. Public
-macOS/Windows binaries, the existing macOS 12 baseline, and bundled-codec
-redistribution have not been verified for this feature. Native builders exclude
-the codec by default; the explicit development opt-in is not a publishable
-release configuration. Existing installations are not replaced by this work.
+YUV-to-RGB conversion explicitly uses FFmpeg's bilinear, accurate-rounding,
+bit-exact mode. This fixes the conversion behavior instead of inheriting
+version-dependent swscale defaults. It is a colour reconstruction choice, not
+a recovery of pre-compression samples, and can differ from earlier development
+previews at high-contrast chroma edges.
+
+Native release builders require PyAV 16.0.1 linked to a restricted, shared-library
+FFmpeg 8.1.3 build from pinned upstream source archives. GPL, nonfree, external
+codec libraries, network access, and unneeded codecs are disabled. The builders
+verify the wheel, installed libraries, runtime license/configuration, and a
+fully synthetic SDPC decode/export smoke test. A matching source archive,
+build recipe, configuration, licenses, and checksums accompany each platform's
+release assets. The application also carries the notices and source location.
+
+The macOS deployment target remains 12.0; checking that target in the binaries
+is not equivalent to executing on macOS 12. Windows releases retain packaged
+x64 and ARM64-emulation checks. Results for a particular release must be taken
+from its completed build and verification records, not inferred from this
+format-level evidence.
