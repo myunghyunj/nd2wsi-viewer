@@ -78,6 +78,7 @@
 
 .tb-btn:hover { background: rgba(255, 255, 255, 0.075); }
 .tb-btn.active { background: rgba(255, 255, 255, 0.105); }
+.tb-icon-only { width: 29px; padding: 0; justify-content: center; }
 :root.light .tb-btn:hover { background: rgba(0, 0, 0, 0.05); }
 :root.light .tb-btn.active { background: rgba(0, 0, 0, 0.085); }
 
@@ -99,9 +100,11 @@
   color: currentColor;
 }
 
+.icon-region svg,
+.icon-note svg,
 .icon-info svg {
   width: 14px; height: 14px; fill: none; stroke: currentColor;
-  stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round;
+  stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
 }
 
 .icon-sliders::before {
@@ -122,32 +125,6 @@
     radial-gradient(circle at 4px 2px, currentColor 0 1.4px, transparent 1.6px),
     radial-gradient(circle at 9px 6px, currentColor 0 1.4px, transparent 1.6px),
     radial-gradient(circle at 6px 10px, currentColor 0 1.4px, transparent 1.6px);
-}
-
-.icon-region::before {
-  content: "";
-  width: 11px;
-  height: 9px;
-  border: 1.25px solid currentColor;
-  border-radius: 2px;
-  opacity: 0.9;
-}
-
-.icon-note::before {
-  content: "";
-  width: 10px;
-  height: 10px;
-  border: 1.2px solid currentColor;
-  border-radius: 3px;
-  opacity: 0.9;
-}
-.icon-note::after {
-  content: "";
-  position: absolute;
-  width: 6px;
-  height: 1.2px;
-  background: currentColor;
-  transform: rotate(-43deg);
 }
 
 .mac-window {

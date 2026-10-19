@@ -44,6 +44,9 @@ function makeTarget(spec) {
 
 const out = cases.map((entry) => {
   const event = {...entry.event, target: makeTarget(entry.target)};
+  event.target.ownerDocument = {getSelection: () => entry.selection === undefined ? null : {
+    isCollapsed: !!entry.selectionCollapsed, toString: () => entry.selection,
+  }};
   if (entry.path) event.composedPath = () => entry.path.map(makeTarget);
   // Historical Command-key cases model a Mac, even when Node runs on Windows.
   const platform = entry.platform || 'MacIntel';
@@ -52,7 +55,7 @@ const out = cases.map((entry) => {
     focusControl: Router.isFocusControl(event.target),
     plain: Router.plainLetterForEvent(event),
     letter: Router.letterCode(event),
-    panel: Router.panelForEvent(event),
+    panel: Router.panelForEvent(event, platform),
     orientationShortcut: Router.isOrientationShortcut(event, platform),
     orientation: Router.orientationForEvent(event, platform),
     tab: Router.tabIndexForEvent(event, platform),
@@ -76,9 +79,9 @@ def _run(cases):
 def test_panel_shortcuts_use_physical_codes_under_a_korean_input_source():
     out = _run(
         [
-            {"event": {"code": "KeyR", "key": "ㄱ"}},
-            {"event": {"code": "KeyA", "key": "ㅁ"}},
-            {"event": {"code": "KeyC", "key": "ㅊ"}},
+            {"event": {"code": "KeyE", "key": "ㄷ"}},
+            {"event": {"code": "KeyA", "key": "ㅁ", "metaKey": True}},
+            {"event": {"code": "KeyC", "key": "ㅊ", "metaKey": True}},
         ]
     )
     assert [item["typing"] for item in out] == [False, False, False]
@@ -89,27 +92,27 @@ def test_panel_shortcuts_use_physical_codes_under_a_korean_input_source():
 def test_letter_shortcuts_follow_latin_keycaps_and_fall_back_for_korean():
     out = _run(
         [
-            {"event": {"code": "KeyP", "key": "r"}},
-            {"event": {"code": "KeyQ", "key": "a"}},
-            {"event": {"code": "KeyI", "key": "c"}},
-            {"event": {"code": "KeyR", "key": "ㄱ"}},
+            {"event": {"code": "KeyP", "key": "e"}},
+            {"event": {"code": "KeyQ", "key": "a", "metaKey": True}},
+            {"event": {"code": "KeyI", "key": "c", "metaKey": True}},
+            {"event": {"code": "KeyE", "key": "ㄷ"}},
         ]
     )
-    assert [item["letter"] for item in out] == ["KeyR", "KeyA", "KeyC", "KeyR"]
+    assert [item["letter"] for item in out] == ["KeyE", "KeyA", "KeyC", "KeyE"]
     assert [item["panel"] for item in out] == ["region", "annot", "channels", "region"]
 
 
 def test_text_entry_and_ime_composition_suppress_shortcuts():
     out = _run(
         [
-            {"event": {"code": "KeyR"}, "target": {"tag": "INPUT"}},
-            {"event": {"code": "KeyR"}, "target": {"tag": "textarea"}},
-            {"event": {"code": "KeyR"}, "target": {"tag": "Select"}},
-            {"event": {"code": "KeyR"}, "target": {"contentEditable": True}},
-            {"event": {"code": "KeyR"}, "target": {"insideEditable": True}},
-            {"event": {"code": "KeyR"}, "target": {"insideTextbox": True}},
-            {"event": {"code": "KeyR", "isComposing": True}},
-            {"event": {"code": "KeyR", "keyCode": 229}},
+            {"event": {"code": "KeyE"}, "target": {"tag": "INPUT"}},
+            {"event": {"code": "KeyE"}, "target": {"tag": "textarea"}},
+            {"event": {"code": "KeyE"}, "target": {"tag": "Select"}},
+            {"event": {"code": "KeyE"}, "target": {"contentEditable": True}},
+            {"event": {"code": "KeyE"}, "target": {"insideEditable": True}},
+            {"event": {"code": "KeyE"}, "target": {"insideTextbox": True}},
+            {"event": {"code": "KeyE", "isComposing": True}},
+            {"event": {"code": "KeyE", "keyCode": 229}},
         ]
     )
     assert all(item["typing"] for item in out)
@@ -120,13 +123,13 @@ def test_checkbox_focus_allows_letters_but_keeps_native_space_and_focus_ownershi
     out = _run([
         {"target": {"tag": "INPUT", "type": "checkbox"}, "event": event}
         for event in [
-            {"key": "c", "code": "KeyC"}, {"key": "ㅊ", "code": "KeyC"},
+            {"key": "e", "code": "KeyE"}, {"key": "ㄷ", "code": "KeyE"},
             {"key": " ", "code": "Space"}, {"key": "Spacebar"}, {"keyCode": 32},
-            {"key": "c", "code": "KeyC", "isComposing": True},
-            {"key": "c", "code": "KeyC", "keyCode": 229},
+            {"key": "e", "code": "KeyE", "isComposing": True},
+            {"key": "e", "code": "KeyE", "keyCode": 229},
         ]
     ])
-    assert [row["panel"] for row in out] == ["channels", "channels", None, None, None, None, None]
+    assert [row["panel"] for row in out] == ["region", "region", None, None, None, None, None]
     assert [row["typing"] for row in out] == [False, False, True, True, True, True, True]
     assert all(row["focusControl"] for row in out)
 
@@ -149,24 +152,24 @@ def test_shadow_retargeting_does_not_hide_text_entry_from_shortcut_guards(target
     assert out["typing"] and out["plain"] is None
 
 
-def test_shadow_checkbox_allows_c_but_retains_space():
+def test_shadow_checkbox_allows_export_but_retains_space():
     out = _run([{"target": {"tag": "DIV"},
                  "path": [{"tag": "INPUT", "type": "checkbox"}, {"tag": "DIV"}],
                  "event": event}
-                for event in [{"key": "c", "code": "KeyC"}, {"key": " ", "code": "Space"}]])
-    assert [row["panel"] for row in out] == ["channels", None]
+                for event in [{"key": "e", "code": "KeyE"}, {"key": " ", "code": "Space"}]])
+    assert [row["panel"] for row in out] == ["region", None]
     assert [row["typing"] for row in out] == [False, True]
 
 
 def test_panel_shortcuts_reject_modifiers_repeats_and_prevented_events():
     out = _run(
         [
-            {"event": {"code": "KeyR", "metaKey": True}},
-            {"event": {"code": "KeyR", "ctrlKey": True}},
-            {"event": {"code": "KeyR", "altKey": True}},
-            {"event": {"code": "KeyR", "shiftKey": True}},
-            {"event": {"code": "KeyR", "repeat": True}},
-            {"event": {"code": "KeyR", "defaultPrevented": True}},
+            {"event": {"code": "KeyE", "metaKey": True}},
+            {"event": {"code": "KeyE", "ctrlKey": True}},
+            {"event": {"code": "KeyE", "altKey": True}},
+            {"event": {"code": "KeyE", "shiftKey": True}},
+            {"event": {"code": "KeyE", "repeat": True}},
+            {"event": {"code": "KeyE", "defaultPrevented": True}},
             {"event": {"code": "KeyX"}},
         ]
     )
@@ -211,7 +214,7 @@ def test_orientation_shortcuts_require_command_alone_and_reject_repeats(code):
     assert [item["orientationShortcut"] for item in out] == [
         False, False, False, False, False, True, False, False,
     ]
-    assert out[0]["panel"] == ("region" if code == "KeyR" else None)
+    assert out[0]["panel"] is None
 
 
 @pytest.mark.parametrize("code", ["KeyR", "KeyF"])
@@ -298,7 +301,7 @@ def test_contenteditable_false_does_not_hide_a_panel_shortcut():
     out = _run(
         [
             {
-                "event": {"code": "KeyC"},
+                "event": {"code": "KeyC", "metaKey": True},
                 "target": {"contentEditable": False},
             }
         ]
@@ -307,7 +310,7 @@ def test_contenteditable_false_does_not_hide_a_panel_shortcut():
         {
             "typing": False,
             "focusControl": False,
-            "plain": "KeyC",
+            "plain": None,
             "letter": "KeyC",
             "panel": "channels",
             "orientationShortcut": False,
@@ -337,10 +340,70 @@ def test_production_pages_use_the_router_and_document_the_same_shortcuts():
     missing_guard = 'if (index === null || !slides[index]) return;'
     assert shell_js.index(missing_guard) < shell_js.index("event.preventDefault();", shell_js.index(missing_guard))
 
-    assert '| `C` | show or hide Channels & LUTs |' in readme
-    assert '| `R` | show or hide Region |' in readme
-    assert '| `A` | show or hide Annotations |' in readme
+    assert '| `⌘C` | show or hide Channels & LUTs |' in readme
+    assert '| `E` | show or hide Export |' in readme
+    assert '| `⌘A` | show or hide Annotations |' in readme
     assert '| `⌘1` … `⌘9` | switch to that tab |' in readme
     assert "`⌘C` `⌘R` `⌘A`" not in readme
-    assert 'id="tb-channels" title="Show or hide Channels &amp; LUTs (C)"' in index
+    assert 'id="tb-channels" title="Show or hide Channels &amp; LUTs (⌘C)" aria-keyshortcuts="Meta+C"' in index
+    assert 'id="tb-region" title="Show or hide Export (E)" aria-keyshortcuts="E"' in index
+    assert 'id="tb-annot" title="Show or hide Annotations (⌘A)" aria-keyshortcuts="Meta+A"' in index
+    info_button = index.split('id="tb-info"', 1)[1].split('</button>', 1)[0]
+    assert 'aria-label="Slide Info"' in info_button and 'aria-keyshortcuts="Meta+I"' in info_button
+    assert '<span>Info</span>' not in info_button
+    assert '<span class="win-title">Export</span>' in index
     assert 'id="roi-toggle" class="btn" title="Drag on the slide to mark a region"' in index
+
+
+@pytest.mark.parametrize("platform,modifier", [("MacIntel", "metaKey"), ("Win32", "ctrlKey")])
+@pytest.mark.parametrize("code,panel", [("KeyC", "channels"), ("KeyA", "annot")])
+def test_command_panels_require_the_platform_command_key(platform, modifier, code, panel):
+    other = "ctrlKey" if modifier == "metaKey" else "metaKey"
+    modifiers = [{modifier: True}, {}, {other: True}, {modifier: True, other: True},
+                 {modifier: True, "shiftKey": True}, {modifier: True, "altKey": True},
+                 {modifier: True, "repeat": True}, {modifier: True, "defaultPrevented": True}]
+    out = _run([{"platform": platform, "event": {"code": code, **flags}} for flags in modifiers])
+    assert [row["panel"] for row in out] == [panel] + [None] * 7
+
+
+@pytest.mark.parametrize("code", ["KeyC", "KeyA"])
+@pytest.mark.parametrize("target", [{"tag": "INPUT"}, {"tag": "INPUT", "type": "checkbox"},
+                                    {"tag": "TEXTAREA"}, {"tag": "SELECT"},
+                                    {"contentEditable": True}, {"insideEditable": True},
+                                    {"insideTextbox": True}])
+def test_native_copy_and_select_all_keep_control_ownership(code, target):
+    out = _run([{"event": {"code": code, "metaKey": True}, "target": target}])[0]
+    assert out["panel"] is None
+
+
+@pytest.mark.parametrize("code", ["KeyC", "KeyA"])
+def test_shadow_checkbox_keeps_native_copy_and_select_all(code):
+    out = _run([{"event": {"code": code, "metaKey": True},
+                 "path": [{"tag": "INPUT", "type": "checkbox"}, {"tag": "DIV"}]}])[0]
+    assert out["panel"] is None
+
+
+@pytest.mark.parametrize("code,panel", [("KeyC", "channels"), ("KeyA", "annot")])
+def test_native_copy_and_select_all_keep_meaningful_selection(code, panel):
+    out = _run([{"event": {"code": code, "metaKey": True}, **selection}
+                for selection in [{"selection": "selected metadata"}, {"selection": "한글"},
+                                  {"selection": "  \n "}, {"selection": ""},
+                                  {"selection": "old selection", "selectionCollapsed": True}]])
+    assert [row["panel"] for row in out] == [None, None, panel, panel, panel]
+
+
+def test_windows_labels_localize_accessible_shortcut_names_too():
+    script = r"""
+    const R=require(process.argv[1]);
+    const entries=['Meta+C','Meta+A','Meta+I','E'].map(shortcut=>({
+      title:'Panels (⌘C, ⌘A); Export (E)',shortcut,
+      getAttribute(){return this.shortcut;},setAttribute(name,value){this.shortcut=value;},
+    }));
+    R.localizeLabels({documentElement:{classList:{toggle(){}}},querySelectorAll:()=>entries},'Win32');
+    process.stdout.write(JSON.stringify(entries));
+    """
+    result = subprocess.run([NODE, "-e", script, str(MODULE)], capture_output=True,
+                            text=True, check=True, timeout=20)
+    out = json.loads(result.stdout)
+    assert [row["shortcut"] for row in out] == ["Control+C", "Control+A", "Control+I", "E"]
+    assert all(row["title"] == "Panels (Ctrl+C, Ctrl+A); Export (E)" for row in out)

@@ -19,6 +19,11 @@ Its build and redistribution requirements are described in
   the supplied SDPC images use lossy HEVC.
 - Keep Agent annotation snapshots separate from shared user annotations.
   Normal user annotation saving retains the existing sidecar behavior.
+- Show source-embedded photographs and the thumbnail in Slide Info. Select an
+  image to enlarge it within the inspector. SDPC does not reliably identify
+  label versus macro photographs in the validated records, so the photographs
+  are named **Embedded image 1**, **Embedded image 2**, and so on, in file order.
+  They are read from the open source, not reconstructed from the tissue view.
 - Reject unsupported variants, invalid dimensions/offsets, truncated tiles,
   source replacement, and decode failures instead of returning blank tissue.
 
@@ -31,9 +36,10 @@ nd2wsi view /path/to/slide.sdpc
 ```
 
 SDPC is direct-only: portable whole-slide conversion, `--store`, and ND2
-plane-selection options are rejected. JPEG SDPC and other container variants,
-associated macro/label images, and vendor colour-correction emulation are not
-supported in this version. Existing ND2/SVS behavior is retained.
+plane-selection options are rejected. JPEG whole-slide SDPC and other container
+variants, and vendor colour-correction emulation, are not supported in this
+version. Embedded JPEG photographs and BMP/JPEG thumbnails are supported.
+Existing ND2/SVS behavior is retained.
 
 ## Container structure
 
@@ -43,8 +49,8 @@ The reader follows little-endian records:
 | --- | --- |
 | `SQ` | Declared file/header sizes, source dimensions, tile width/height, hierarchy count, scale, ruler (µm/pixel), objective, codec |
 | `EI` | Next-record link and colour-gamma metadata; no patient fields |
-| `MI` | 123-byte associated-image header, payload length at +34, next-record link at +43; payload skipped |
-| `IF`, layer 0 | 122-byte thumbnail header and payload; skipped |
+| `MI` | 123-byte associated-image header, payload length at +34, next-record link at +43; bounded JPEG photographs |
+| `IF`, layer 0 | 122-byte thumbnail header and bounded BMP/JPEG payload |
 | `IF`, layers 1…N | 122-byte level header, `uint32` tile-length table, independent row-major HEVC payloads |
 
 Each level's grid, edge padding, scale, calibration, payload sum, and next
@@ -52,6 +58,13 @@ offset must agree. All reads are range-checked. For layouts without the
 associated-image chain, baseline discovery is bounded to the first 16 MiB
 and requires validation of the entire pyramid. Index and tile sizes are
 bounded before allocation.
+
+Auxiliary images have separate compressed-byte and decoded-pixel limits, and
+their decoded dimensions must match the records. Their delivery is restricted
+to the registered source and rechecks source identity after decoding. Only
+images are exposed; unrelated patient metadata records are not surfaced.
+The inspector uses bounded 512-pixel previews and up to 2048-pixel enlarged
+views. It does not change the original embedded images or their orientation.
 
 The public [opensdpc structure declarations](https://github.com/WonderLandxD/opensdpc/blob/main/opensdpc/Sdpc_struct.py)
 and independent [SlideForge parser](https://github.com/drgexy/SlideForge/blob/main/slideforge/converter.py)

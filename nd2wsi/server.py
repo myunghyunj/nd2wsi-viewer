@@ -63,7 +63,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
 PLATE_FRAME_RE = re.compile(r"^/api/plate/frame/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
 ASSOCIATED_RE = re.compile(
-    r"^/api/associated/(thumbnail|label|macro)\.jpg$"
+    r"^/api/associated/(thumbnail|label|macro|associated-(?:[1-9]|1[0-6]))\.jpg$"
 )
 SLIDE_RE = re.compile(r"^/s/([0-9a-f]{8})(/.*)?$")
 
@@ -388,9 +388,9 @@ def _inspection_storage_details(
 
 
 def _associated_source_path(st: ViewerState) -> Path | None:
-    """A currently valid registered SVS source, never a request-supplied path."""
+    """A verified registered source, never a request-supplied path."""
     source = st.source_path
-    if source is None or source.suffix.lower() != ".svs" or not source.is_file():
+    if source is None or source.suffix.lower() not in {".svs", ".sdpc"} or not source.is_file():
         return None
     source_info = st.manifest.get("source") or {}
     fingerprint_keys = ("size", "mtime_ns", "quick_sha256")
@@ -413,7 +413,10 @@ def _associated_names(st: ViewerState) -> list[str]:
     if source is None:
         return []
     try:
-        from .svs import associated_image_names
+        if source.suffix.lower() == ".sdpc":
+            from .sdpc import associated_image_names
+        else:
+            from .svs import associated_image_names
 
         names = associated_image_names(source)
         return names if _associated_source_path(st) == source else []
@@ -1593,7 +1596,7 @@ def make_handler(
                     return self._annotations_get(st, q)
                 associated = ASSOCIATED_RE.match(sub)
                 if associated:
-                    return self._associated(st, associated.group(1))
+                    return self._associated(st, associated.group(1), q)
                 m = TILE_RE.match(sub)
                 if m:
                     return self._tile(st, m, q)
@@ -1887,14 +1890,22 @@ def make_handler(
                 return self._error(400, str(e))
             self._json(payload)
 
-        def _associated(self, st: ViewerState, name: str):
+        def _associated(self, st: ViewerState, name: str, q: dict):
             source = _associated_source_path(st)
             if source is None:
                 return self._error(404, "associated image source is unavailable")
             try:
-                from .svs import associated_image_jpeg
+                if source.suffix.lower() == ".sdpc":
+                    from .sdpc import associated_image_jpeg
+                else:
+                    from .svs import associated_image_jpeg
 
-                body = associated_image_jpeg(source, name)
+                # Two bounded display sizes; clients cannot request arbitrary
+                # decode sizes or address a source outside the open slide.
+                if q.get("detail") == ["1"]:
+                    body = associated_image_jpeg(source, name, max_side=2048)
+                else:
+                    body = associated_image_jpeg(source, name)
             except (KeyError, OSError, ValueError):
                 return self._error(404, f"associated image {name} is unavailable")
             # The path may have been atomically replaced while it was decoded.

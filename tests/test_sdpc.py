@@ -199,7 +199,9 @@ def test_invalid_hevc_payload_fails_when_the_tile_is_read(slide, synthetic):
         root.close(delay=0)
 
 
-def test_source_replacement_is_detected_even_for_a_cached_tile(slide, synthetic, monkeypatch):
+@pytest.mark.parametrize("mutation", ["replacement", "mtime"])
+def test_source_replacement_is_detected_even_for_a_cached_tile(slide, synthetic, monkeypatch,
+                                                             mutation):
     root, _ = sdpc.open_direct(slide)
     try:
         reference = root["0"][:, :10, :10]
@@ -209,17 +211,30 @@ def test_source_replacement_is_detected_even_for_a_cached_tile(slide, synthetic,
             pytest.fail("a source identity check must run before returning cached pixels")
 
         monkeypatch.setattr(sdpc, "_decode_tile", unexpected_decode)
-        replacement = slide.with_suffix(".replacement")
-        replacement.write_bytes(synthetic.data)
         stat = slide.stat()
-        os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-        # Same bytes, length and mtime still have a different filesystem identity.
-        try:
-            replacement.replace(slide)
-        except PermissionError as exc:
-            if os.name == "nt" and getattr(exc, "winerror", None) == 32:
-                pytest.skip("Windows sharing rules prevented replacing the open source")
-            raise
+        if mutation == "replacement":
+            replacement = slide.with_suffix(".replacement")
+            replacement.write_bytes(synthetic.data)
+            os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            # Same bytes, length and mtime still have a different filesystem identity.
+            try:
+                replacement.replace(slide)
+            except PermissionError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32):
+                    raise
+                # Windows can deny replacing an open file. Confirm that this
+                # preserved the original and its cached pixels, then exercise
+                # a real metadata mutation instead of skipping stale checks.
+                assert replacement.is_file()
+                assert sdpc._identity(slide.stat()) == sdpc._identity(stat)
+                np.testing.assert_array_equal(root["0"][:, :10, :10], reference)
+                mutation = "mtime"
+        if mutation == "mtime":
+            os.utime(slide, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+            changed = slide.stat()
+            assert (changed.st_dev, changed.st_ino, changed.st_size) == (
+                stat.st_dev, stat.st_ino, stat.st_size)
+            assert changed.st_mtime_ns != stat.st_mtime_ns
         with pytest.raises(ValueError, match="source changed"):
             root["0"][:, :10, :10]
     finally:

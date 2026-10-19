@@ -19,14 +19,18 @@
     </div>
     <div class="tb-spacer"></div>
     <div class="tb-group">
-      <button class="tb-btn" id="tb-channels" title="Show or hide Channels &amp; LUTs (C)" aria-keyshortcuts="C">
+      <button class="tb-btn" id="tb-channels" title="Show or hide Channels &amp; LUTs (⌘C)" aria-keyshortcuts="Meta+C">
         <span class="tb-ico icon-sliders" aria-hidden="true"></span><span>Channels</span>
       </button>
-      <button class="tb-btn" id="tb-region" title="Show or hide Region (R)" aria-keyshortcuts="R">
-        <span class="tb-ico icon-region" aria-hidden="true"></span><span>Region</span>
+      <button class="tb-btn" id="tb-region" title="Show or hide Export (E)" aria-keyshortcuts="E">
+        <span class="tb-ico icon-region" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M5 3a2 2 0 0 0-2 2M19 3a2 2 0 0 1 2 2M21 19a2 2 0 0 1-2 2M5 21a2 2 0 0 1-2-2M9 3h1M9 21h1M14 3h1M14 21h1M3 9v1M21 9v1M3 14v1M21 14v1"/></svg>
+        </span><span>Export</span>
       </button>
-      <button class="tb-btn" id="tb-annot" title="Show or hide Annotations (A)" aria-keyshortcuts="A">
-        <span class="tb-ico icon-note" aria-hidden="true"></span><span>Annotate</span>
+      <button class="tb-btn" id="tb-annot" title="Show or hide Annotations (⌘A)" aria-keyshortcuts="Meta+A">
+        <span class="tb-ico icon-note" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>
+        </span><span>Annotate</span>
       </button>
       <button type="button" class="tb-btn" id="t-auto" aria-pressed="false" aria-keyshortcuts="F" title="Autofocus (F)" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3.2"/><path d="M8 1v2.2M8 12.8V15M1 8h2.2M12.8 8H15"/></svg><span>Autofocus</span></button>
       <button class="tb-btn" id="tb-plate-view" title="Plate view options"
@@ -36,10 +40,10 @@
           <svg viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
         </span><span>View</span>
       </button>
-      <button class="tb-btn" id="tb-info" title="Show or hide Slide Info (⌘I)" aria-label="Slide Info">
+      <button class="tb-btn tb-icon-only" id="tb-info" title="Show or hide Slide Info (⌘I)" aria-label="Slide Info" aria-keyshortcuts="Meta+I">
         <span class="tb-ico icon-info" aria-hidden="true">
-          <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"></circle><path d="M8 7v4M8 4.5h.01"></path></svg>
-        </span><span>Info</span>
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+        </span>
       </button>
       <button class="tb-btn tb-theme" id="tb-theme" title="Appearance" aria-label="Appearance">
         <span class="tb-ico theme-glyph" aria-hidden="true"></span>
@@ -138,7 +142,7 @@
           <button class="tl tl-min" title="Collapse"></button>
           <button class="tl tl-zoom" title="Zoom"></button>
         </div>
-        <span class="win-title">Region</span>
+      <span class="win-title">Export</span>
       </div>
       <div class="win-body">
         <div class="tool-row">
@@ -223,6 +227,10 @@
           <button class="btn" id="info-retry">Retry</button>
         </div>
         <div id="info-content" hidden>
+          <section id="info-associated-section" hidden>
+            <h3 class="info-section-title">Slide Images</h3>
+            <div id="info-associated"></div>
+          </section>
           <dl class="info-grid" id="info-grid"></dl>
           <div class="tool-row info-actions">
             <button class="btn" id="info-copy">Copy Metadata</button>
@@ -230,10 +238,6 @@
             <button class="btn" id="info-reveal-cache">Reveal Cache</button>
           </div>
           <div class="hint" id="info-status"></div>
-          <section id="info-associated-section" hidden>
-            <h3 class="info-section-title">Associated Images</h3>
-            <div id="info-associated"></div>
-          </section>
         </div>
       </div>
     </section>

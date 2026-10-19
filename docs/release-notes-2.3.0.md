@@ -13,6 +13,17 @@ original pre-compression microscope samples when the SDPC uses lossy HEVC.
 RGB reconstruction uses explicit, deterministic FFmpeg conversion settings
 rather than version-dependent defaults.
 
+Slide Info now displays the SDPC source's embedded photographs and thumbnail,
+with in-panel enlargement for reading slide labels. Images without a verified
+label/macro discriminator are named “Embedded image” in their source order.
+No photograph or patient-identifying metadata is added to public fixtures.
+
+The toolbar uses a dashed-square **Export** button, a pencil for **Annotate**,
+and an icon-only **Info** button. Channels uses Command-C and Annotate uses
+Command-A on macOS (Control-C/A on Windows); Export uses E. Native text editing
+keeps its copy and select-all behavior. User-session badges are hidden while
+Agent windows remain visibly identified.
+
 The release includes a decoder-only FFmpeg/PyAV runtime, built from pinned
 sources. Codec notices and build provenance accompany the application, with
 corresponding source archives supplied separately with the release. No scanner
@@ -25,8 +36,8 @@ the ND2/SVS cache formats retain their existing preservation rules.
 ## Limits
 
 SDPC support covers the validated HEVC variant, not every scanner or SDPC
-revision. JPEG SDPC, associated macro/label images and portable whole-slide
-SDPC conversion are not included. Decoded RGB is shown without guessing the
+revision. JPEG whole-slide SDPC and portable whole-slide SDPC conversion are
+not included. Decoded RGB is shown without guessing the
 vendor's optional gamma/CCM correction; equivalence to a vendor-viewer colour
 preset has not been established. See the [format notes](sdpc-support.md).
 

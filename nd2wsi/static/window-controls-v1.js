@@ -24,7 +24,9 @@
       : "Separate window · shared annotations with conflict checks";
     menu.dataset.role = context.role;
     menu.dataset.sessionId = context.id;
-    menu.hidden = false;
+    // Keep role/session metadata and native File-menu actions intact while
+    // showing an identity badge only where Agent-window isolation matters.
+    menu.hidden = context.role !== "agent";
     const metalButton = doc.getElementById("open-metal-window");
     if (metalButton && context.metal_opt_in_supported && api.open_in_metal) {
       metalButton.hidden = false;

@@ -2,7 +2,8 @@
 
 Supported layout: packed SQ header, 122-byte IF records, uint32 tile-size
 tables and independent HEVC tiles in row-major order. Only the validated
-power-of-two RGB variant is accepted. Patient/label records are not exposed.
+power-of-two RGB variant is accepted. Explicit MI photographs and the layer-zero
+thumbnail are available separately; structured patient records are not exposed.
 Encoded RGB is preserved; undocumented vendor colour correction is not applied.
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 import math
 import os
 import struct
+import threading
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -28,6 +30,10 @@ _FIRST_LEVEL = b"IF\x7a\x00\x00\x00\x01\x00\x00\x00"
 _MAX_PREFIX = 16 * 1024 * 1024
 _MAX_TILES = 2_000_000
 _MAX_TILE_BYTES = 64 * 1024 * 1024
+_MAX_ASSOCIATED_BYTES = 16 * 1024 * 1024
+_MAX_ASSOCIATED_PIXELS = 16_000_000
+_MAX_ASSOCIATED_SIDE = 16_384
+_MAX_PREVIEW_SIDE = 2048
 DECODER_HINT = (
     'reading SDPC needs PyAV with HEVC decoding: pip install "nd2wsi-viewer[sdpc]"'
 )
@@ -60,9 +66,51 @@ class _Level:
     sizes: np.ndarray
 
 
+@dataclass(frozen=True)
+class _AssociatedImage:
+    name: str
+    width: int
+    height: int
+    offset: int
+    size: int
+    encoding: str
+
+
+def _associated_dimensions(width: int, height: int) -> None:
+    if (not 1 <= width <= _MAX_ASSOCIATED_SIDE
+            or not 1 <= height <= _MAX_ASSOCIATED_SIDE
+            or width * height > _MAX_ASSOCIATED_PIXELS):
+        raise ValueError("invalid or excessive SDPC associated-image dimensions")
+
+
+def _decode_associated(data: bytes, record: _AssociatedImage) -> np.ndarray:
+    """Native JPEG/BMP RGB without rotation, ICC/gamma edits, or EXIF exposure."""
+    from PIL import Image
+
+    _associated_dimensions(record.width, record.height)
+    try:
+        if record.encoding == "JPEG" and not (data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9")):
+            raise ValueError("truncated or invalid SDPC JPEG markers")
+        if record.encoding == "BMP" and (len(data) < 26 or struct.unpack_from("<I", data, 2)[0] != len(data)):
+            raise ValueError("truncated or invalid SDPC BMP length")
+        with Image.open(BytesIO(data), formats=[record.encoding]) as image:
+            if image.format != record.encoding or image.size != (record.width, record.height):
+                raise ValueError("SDPC associated image disagrees with its declared dimensions/format")
+            _associated_dimensions(*image.size)
+            if image.mode not in ("RGB", "L"):
+                raise ValueError("unsupported SDPC associated-image color mode")
+            image.load()
+            return np.array(image.convert("RGB"), dtype=np.uint8, copy=True, order="C")
+    except Exception as exc:
+        raise ValueError(f"cannot decode SDPC associated image: {exc}") from exc
+
+
 class _Slide:
     def __init__(self, path: str | Path):
         self.path = Path(path).resolve()
+        self._associated_life = _Lifecycle()
+        self._close_lock = threading.Lock()
+        self._closed = False
         self.fd = os.open(str(self.path), os.O_RDONLY | BINARY)
         try:
             self.ident = _identity(os.fstat(self.fd))
@@ -96,6 +144,7 @@ class _Slide:
          self.width, self.height, self.tw, self.th, _thumbw, _thumbh,
          bpp, quality, color_space, scale, self.mpp, self.objective,
          extra_offset, _tile_offset, codec, _reserved) = values
+        self.associated: list[_AssociatedImage] = []
         if flag != 0x5153 or not (_HEADER.size <= head_size <= self.size):
             raise ValueError("not a supported SQ/SDPC header")
         if file_size != self.size:
@@ -121,25 +170,41 @@ class _Slide:
             offset = struct.unpack_from("<q", extra, 6)[0]
             if offset < extra_offset + extra_size or not 0 <= macros <= 16:
                 raise ValueError("invalid SDPC associated-image chain")
-            # MI records are 123-byte headers followed by a JPEG payload.
-            # Read only lengths/links; never decode labels or patient records.
-            for _ in range(macros):
-                macro = self.read(offset, 51)
+            # MI records are 123-byte headers followed by a JPEG. No published
+            # discriminator establishes label versus macro: keep neutral names
+            # in file order rather than guessing from aspect ratio or contents.
+            for index in range(macros):
+                macro = self.read(offset, 123)
                 length = struct.unpack_from("<Q", macro, 34)[0]
                 next_offset = struct.unpack_from("<Q", macro, 43)[0]
-                if (macro[:2] != b"MI" or length > _MAX_TILE_BYTES
+                if (macro[:2] != b"MI" or not 0 < length <= _MAX_ASSOCIATED_BYTES
                         or next_offset != offset + 123 + length
                         or next_offset > self.size):
                     raise ValueError("invalid SDPC macro-image record")
+                width, height = struct.unpack_from("<2I", macro, 10)
+                _associated_dimensions(width, height)
+                self.associated.append(_AssociatedImage(
+                    f"associated-{index + 1}", width, height, offset + 123, length, "JPEG",
+                ))
                 offset = next_offset
             thumbnail = _LEVEL.unpack(self.read(offset, _LEVEL.size))
             if thumbnail[:3] == (0x4649, _LEVEL.size, 0):
                 length, next_offset = thumbnail[6:8]
                 # The layer-zero thumbnail has no tile-size table.
-                if (not 0 < length <= _MAX_TILE_BYTES
+                if (not 0 < length <= _MAX_ASSOCIATED_BYTES
                         or next_offset != offset + _LEVEL.size + length
                         or next_offset > self.size):
                     raise ValueError("invalid SDPC thumbnail record")
+                # The supplied layer-zero images are BMP, not HEVC. Only these
+                # bounded still-image formats are accepted; never infer pixels
+                # by passing an arbitrary record to a general media decoder.
+                signature = self.read(offset + _LEVEL.size, min(2, length))
+                encoding = {b"BM": "BMP", b"\xff\xd8": "JPEG"}.get(signature)
+                if encoding is not None:
+                    _associated_dimensions(_thumbw, _thumbh)
+                    self.associated.insert(0, _AssociatedImage(
+                        "thumbnail", _thumbw, _thumbh, offset + _LEVEL.size, length, encoding,
+                    ))
                 offset = next_offset
             baseline_offset = offset
         self.version = version.rstrip(b"\x00").decode("ascii", errors="replace")
@@ -217,13 +282,37 @@ class _Slide:
             "color_space_code": self.color_space, "quality_field": self.quality,
             "vendor_gamma_metadata": self.gamma,
             "color_policy": "decoded RGB; vendor colour correction not applied",
+            "associated_images": self.associated_image_metadata(),
             "levels": [{"level": k, "width": lv.width, "height": lv.height,
                         "downsample": 2**k, "tiles": len(lv.sizes)}
                        for k, lv in enumerate(self.levels)],
         }
 
+    def associated_image_metadata(self) -> list[dict[str, Any]]:
+        """Only fixed names, dimensions and image encoding; no private fields."""
+        with self._associated_life:
+            self.check_source()
+            return [{"name": record.name, "width": record.width, "height": record.height,
+                     "encoding": record.encoding} for record in self.associated]
+
+    def read_associated_image(self, name: str) -> np.ndarray:
+        with self._associated_life:
+            self.check_source()
+            record = next((record for record in self.associated if record.name == name), None)
+            if record is None:
+                raise KeyError(name)
+            pixels = _decode_associated(self.read(record.offset, record.size), record)
+            self.check_source()
+            return pixels
+
     def close(self) -> None:
-        os.close(self.fd)
+        with self._close_lock:
+            if self._closed:
+                return
+            if not self._associated_life.close():
+                raise TimeoutError("SDPC associated-image reads did not finish before close")
+            os.close(self.fd)
+            self._closed = True
 
 
 def sdpc_info(path: str | Path) -> dict[str, Any]:
@@ -232,6 +321,38 @@ def sdpc_info(path: str | Path) -> dict[str, Any]:
         return slide.info()
     finally:
         slide.close()
+
+
+def associated_image_names(path: str | Path) -> list[str]:
+    """Stable, bounded names: thumbnail, then associated-1 through associated-16."""
+    slide = _Slide(path)
+    try:
+        return [item["name"] for item in slide.associated_image_metadata()]
+    finally:
+        slide.close()
+
+
+def associated_image_rgb(path: str | Path, name: str) -> np.ndarray:
+    """Read native associated-image RGB without downsampling or color edits."""
+    slide = _Slide(path)
+    try:
+        return slide.read_associated_image(name)
+    finally:
+        slide.close()
+
+
+def associated_image_jpeg(path: str | Path, name: str, *, max_side: int = 512) -> bytes:
+    """A bounded UI preview; all source EXIF/ICC/text metadata is discarded."""
+    from PIL import Image
+
+    if type(max_side) is not int or not 1 <= max_side <= _MAX_PREVIEW_SIDE:
+        raise ValueError(f"SDPC associated-image preview size must be 1..{_MAX_PREVIEW_SIDE}")
+    pixels = associated_image_rgb(path, name)
+    image = Image.fromarray(pixels)
+    image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=90)
+    return output.getvalue()
 
 
 def _decode_tile(data: bytes, width: int, height: int) -> np.ndarray:

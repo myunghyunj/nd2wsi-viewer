@@ -72,7 +72,7 @@ def _smoke_sdpc(work: Path) -> None:
     if getattr(sys, "frozen", False):
         _verify_sdpc_runtime_license(av)
         print("smoke ok: SDPC LGPL runtime, seven restricted shared libraries; no external encoders")
-    encoded = fixture.load_sdpc()
+    encoded = fixture.add_associated_images(fixture.load_sdpc())
     slide = work / "synthetic-sdpc-smoke.sdpc"
     slide.write_bytes(encoded)
     assert open_or_convert(slide) == slide, "SDPC smoke unexpectedly requested conversion"
@@ -90,6 +90,14 @@ def _smoke_sdpc(work: Path) -> None:
         assert info["storage"] == "direct" and info["rgb"] is True
         assert info["calibration"]["pixel_size_um"] == [fixture.MPP, fixture.MPP]
         assert info["objective_magnification"] == 40
+        assert info["associated"] == ["thumbnail", "associated-1", "associated-2"]
+        for name, size in (("thumbnail", (48, 32)), ("associated-1", (96, 48)),
+                           ("associated-2", (80, 120))):
+            with Image.open(io.BytesIO(_fetch(url + f"api/associated/{name}.jpg?detail=1"))) as image:
+                image.load()
+                assert image.mode == "RGB" and image.size == size, (
+                    "SDPC Info did not serve the original embedded image"
+                )
         with Image.open(io.BytesIO(_fetch(url + "api/tile/0/0/0.jpg"))) as image:
             image.load()
             assert image.mode == "RGB" and image.size == (fixture.WIDTH, fixture.HEIGHT)
@@ -122,7 +130,8 @@ def _smoke_sdpc(work: Path) -> None:
         raise AssertionError("SDPC truncated source was accepted")
     print(
         f"smoke ok: SDPC HEVC (PyAV {av.__version__}), native RGB reference exact; "
-        "tile/pixel APIs, seam-crossing TIFF RGB and calibration passed; truncation rejected"
+        "tile/pixel and Info image APIs, seam-crossing TIFF RGB and calibration passed; "
+        "truncation rejected"
     )
 
 

@@ -6,9 +6,8 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
-  const PANEL_BY_CODE = Object.freeze({
+  const COMMAND_PANEL_BY_CODE = Object.freeze({
     KeyC: "channels",
-    KeyR: "region",
     KeyA: "annot",
   });
   const ORIENTATION_BY_CODE = Object.freeze({
@@ -42,10 +41,14 @@
       .replaceAll("⇧", "Shift+").replaceAll("Option-drag", "Alt-drag");
   }
 
-  function localizeLabels(document) {
-    document.documentElement.classList.toggle("platform-windows", !isMac());
+  function localizeLabels(document, platform) {
+    document.documentElement.classList.toggle("platform-windows", !isMac(platform));
     for (const element of document.querySelectorAll("[title]")) {
-      element.title = formatShortcutText(element.title);
+      element.title = formatShortcutText(element.title, platform);
+    }
+    if (!isMac(platform)) for (const element of document.querySelectorAll("[aria-keyshortcuts]")) {
+      element.setAttribute("aria-keyshortcuts",
+        element.getAttribute("aria-keyshortcuts").replaceAll("Meta+", "Control+"));
     }
   }
 
@@ -66,7 +69,7 @@
       const element = targetElement(target);
       const input = tag === "INPUT" ? target : element?.closest("input");
       if (input) {
-        // Checkbox focus does not own letters such as C. Space still belongs
+        // Checkbox focus does not own plain tool letters. Space still belongs
         // to its native toggle, including on a plate where Space means play.
         if (String(input.type || "text").toLowerCase() !== "checkbox") return true;
         if (event.key === " " || event.key === "Spacebar" ||
@@ -106,8 +109,29 @@
     return letterCode(event) || null;
   }
 
-  function panelForEvent(event) {
-    return PANEL_BY_CODE[plainLetterForEvent(event)] || null;
+  function hasTextSelection(event) {
+    const doc = event?.target?.ownerDocument ||
+      (typeof document === "undefined" ? null : document);
+    const selection = doc?.getSelection?.();
+    return Boolean(selection && !selection.isCollapsed && String(selection).trim());
+  }
+
+  function isPanelShortcut(event, platform) {
+    if (isBlocked(event) || event.altKey || event.shiftKey) return false;
+    const code = letterCode(event);
+    if (commandPressed(event, platform)) {
+      // Copy/select-all keep their native meaning in controls and whenever
+      // the document has meaningful selected text, including read-only Info.
+      const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+      return Boolean(COMMAND_PANEL_BY_CODE[code]) &&
+        ![event.target, ...path].some(isFocusControl) && !hasTextSelection(event);
+    }
+    return !event.metaKey && !event.ctrlKey && code === "KeyE";
+  }
+
+  function panelForEvent(event, platform) {
+    if (!isPanelShortcut(event, platform) || event.repeat) return null;
+    return letterCode(event) === "KeyE" ? "region" : COMMAND_PANEL_BY_CODE[letterCode(event)];
   }
 
   function isOrientationShortcut(event, platform) {
@@ -133,7 +157,8 @@
   }
 
   return {
-    isTypingEvent, isFocusControl, letterCode, plainLetterForEvent, panelForEvent, isOrientationShortcut,
+    isTypingEvent, isFocusControl, hasTextSelection, letterCode, plainLetterForEvent,
+    isPanelShortcut, panelForEvent, isOrientationShortcut,
     orientationForEvent, tabIndexForEvent, isMac, commandPressed,
     formatShortcutText, localizeLabels,
   };

@@ -180,6 +180,42 @@ def test_sdpc_registration_retries_changed_source_and_closes_stale_root(source, 
     assert all(root.closed for root in roots)
 
 
+def test_sdpc_associated_images_use_registered_source_and_bounded_detail(
+    source, backend, monkeypatch, tmp_path,
+):
+    from nd2wsi import sdpc
+
+    names = Mock(return_value=["thumbnail", "associated-1", "associated-2"])
+    jpeg = Mock(return_value=b"bounded synthetic JPEG")
+    monkeypatch.setattr(sdpc, "associated_image_names", names)
+    monkeypatch.setattr(sdpc, "associated_image_jpeg", jpeg)
+    session = create_window_session("agent", tmp_path / "sessions")
+    with served(source, session) as (_, url):
+        assert json.loads(fetch(url + "/api/inspect"))["associated"] == names.return_value
+        assert fetch(url + "/api/associated/associated-1.jpg") == jpeg.return_value
+        jpeg.assert_called_with(source.resolve(), "associated-1")
+        fetch(url + "/api/associated/associated-2.jpg?detail=1&path=/unregistered.sdpc")
+        jpeg.assert_called_with(source.resolve(), "associated-2", max_side=2048)
+        fetch(url + "/api/associated/thumbnail.jpg?detail=999999")
+        jpeg.assert_called_with(source.resolve(), "thumbnail")
+        before = jpeg.call_count
+        for name in ("associated-0", "associated-17", "patient", "baseline"):
+            with pytest.raises(urllib.error.HTTPError) as caught:
+                fetch(url + f"/api/associated/{name}.jpg")
+            assert caught.value.code == 404
+        assert jpeg.call_count == before
+
+        def replace_during_decode(*args, **kwargs):
+            source.write_bytes(source.read_bytes() + b" replaced")
+            return b"must not serve stale image"
+
+        jpeg.side_effect = replace_during_decode
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            fetch(url + "/api/associated/associated-1.jpg?detail=1")
+        assert caught.value.code == 404
+        assert json.loads(fetch(url + "/api/inspect"))["associated"] == []
+
+
 def test_sdpc_annotation_setup_failure_closes_new_reader(source, backend, monkeypatch):
     _, _, roots = backend
     registry = server.SlideRegistry()

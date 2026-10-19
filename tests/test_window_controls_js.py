@@ -33,6 +33,7 @@ def run_case(role="agent", fail=False, supported=True):
       }
       process.stdout.write(JSON.stringify({calls, errors,
         hidden:doc.getElementById('window-menu').hidden,
+        identity:doc.getElementById('window-menu').dataset,
         label:doc.getElementById('window-identity').textContent,
         status:doc.getElementById('window-action-status').textContent,
         disabled:doc.getElementById('new-agent-window').disabled}));
@@ -47,7 +48,8 @@ def test_actions_create_distinct_roles_without_retargeting_existing_tabs(role):
     result = run_case(role)
     assert result["calls"] == ["user", "agent"]
     assert result["label"] == f"{role.title()} · abcdef"
-    assert result["hidden"] is False
+    assert result["hidden"] is (role == "user")
+    assert result["identity"] == {"role": role, "sessionId": "abcdef123456", "wired": "true"}
     assert result["disabled"] is False
     assert result["errors"] == []
 

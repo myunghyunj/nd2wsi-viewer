@@ -102,28 +102,10 @@ def build_sdpc(width=1027, height=773, tile_width=384, tile_height=256, levels=2
 
 
 def add_associated_images(synthetic):
-    """Insert linked MI and layer-zero records; their dummy JPEGs stay opaque."""
-    jpeg = b"\xff\xd8\xff\xd9"  # no label or thumbnail pixels are ever decoded
-    macro_offset = synthetic.level_offsets[0]
-    thumbnail_offset = macro_offset + 123 + len(jpeg)
-    baseline_offset = thumbnail_offset + LEVEL.size + len(jpeg)
-    shift = baseline_offset - macro_offset
-    macro = bytearray(123)
-    macro[:2] = b"MI"
-    struct.pack_into("<Q", macro, 34, len(jpeg))
-    struct.pack_into("<Q", macro, 43, thumbnail_offset)
-    thumbnail = LEVEL.pack(0x4649, LEVEL.size, 0, 1, 1, 1,
-                           len(jpeg), baseline_offset, 1.0, 0.37, 0, 0, 0, b"")
-    data = bytearray(synthetic.data[:macro_offset] + bytes(macro) + jpeg
-                     + thumbnail + jpeg + synthetic.data[macro_offset:])
-    header = list(HEADER.unpack_from(data))
-    header[3] += shift  # file length
-    header[4] = 1  # associated macro count
-    header[20] += shift  # baseline index
-    HEADER.pack_into(data, 0, *header)
+    """Insert genuine, mathematical JPEG/BMP records; preserve all HEVC tiles."""
+    from nd2wsi._sdpc_smoke_fixture import add_associated_images as attach
+
+    data = attach(synthetic.data)
+    shift = len(data) - len(synthetic.data)
     offsets = tuple(offset + shift for offset in synthetic.level_offsets)
-    for offset in offsets:
-        level = list(LEVEL.unpack_from(data, offset))
-        level[7] += shift
-        LEVEL.pack_into(data, offset, *level)
-    return SyntheticSdpc(bytes(data), synthetic.decoded, offsets)
+    return SyntheticSdpc(data, synthetic.decoded, offsets)

@@ -190,7 +190,7 @@ Marks are saved automatically in a small `.json` file beside the slide, so they 
 
 ![A selected fluorescence region with channel controls and the Scale bar + SVG and Scale bar + JPEG buttons](docs/region-closeup.png)
 
-Press `R` to open the Region panel, choose **Select Region**, and drag a box, or type a size in pixels or micrometers. Then choose a format.
+Press `E` to open the Export panel, choose **Select Region**, and drag a box, or type a size in pixels or micrometers. Then choose a format.
 
 | Format | What you get |
 |---|---|
@@ -275,15 +275,15 @@ cache-delete button in the viewer; source scans and annotations remain separate.
 
 ## Keyboard
 
-Shortcuts act on the image workspace. They are ignored while typing in a text field, editing a note, or composing text with an input method (IME), so normal text-entry shortcuts remain available.
+Shortcuts act on the image workspace. They are ignored while typing in a text field, editing a note, or composing text with an input method (IME), so normal text-entry shortcuts remain available. `⌘C` and `⌘A` also keep their native copy/select-all behavior while meaningful text is selected, including in Slide Info. On Windows, use Ctrl instead of ⌘.
 
 ### Panels and tools
 
 | Key | Action |
 |---|---|
-| `C` | show or hide Channels & LUTs |
-| `R` | show or hide Region |
-| `A` | show or hide Annotations |
+| `⌘C` | show or hide Channels & LUTs |
+| `E` | show or hide Export |
+| `⌘A` | show or hide Annotations |
 | `M` | measure |
 | `P` | place a pin |
 | `B` | draw a box |
@@ -308,7 +308,7 @@ Shortcuts act on the image workspace. They are ignored while typing in a text fi
 
 `⌘R` and `⌘F` change the focused image when slides are unlinked. In Compare, they change the image selected in **Active linked slide**, while the reference stays fixed. They follow the same protections as the orientation buttons: choose **Remove Fit** before changing a fitted image, and open a site before orienting a plate image. They do not rotate or flip the plate grid.
 
-In the image workspace, `⌘R` and `⌘F` take the place of browser Reload and Find. Holding either shortcut applies only one change; release and press again for another. Plain `R` still opens Region, `A` opens Annotations, and `P` places a pin.
+In the image workspace, `⌘R` and `⌘F` take the place of browser Reload and Find. Holding either shortcut applies only one change; release and press again for another. `⌘C` opens Channels, `⌘A` opens Annotations, plain `E` opens Export, and `P` places a pin. Plain `C`, `A`, and `R` no longer open panels.
 
 ### Plate navigation
 

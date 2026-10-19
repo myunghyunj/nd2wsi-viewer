@@ -965,7 +965,42 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         if (svg.documentElement.tagName !== 'svg' || svg.documentElement.getAttribute('viewBox') !== '0 0 20 20' ||
                             !svg.querySelector('path')) throw new Error('Invalid packaged LUT icon: ' + name);
                       })));
+                      const infoImages = await step('info-images', async () => {
+                        const inspector = view.eval('state.windows.info');
+                        const wasHidden = inspector.isHidden();
+                        await view.loadSlideInspector();
+                        inspector.open();
+                        const names = view.eval('state.inspect && state.inspect.associated');
+                        if (!Array.isArray(names)) throw new Error('Slide Info metadata did not load');
+                        const images = [...page.querySelectorAll('#info-associated img')];
+                        if (images.length !== names.length) throw new Error('Slide Info omitted embedded images');
+                        const loaded = async () => {
+                          const deadline = Date.now() + 8000;
+                          while (images.some(image => !image.complete || !image.naturalWidth)) {
+                            if (Date.now() >= deadline) throw new Error('Slide Info image did not load');
+                            await new Promise(resolve => setTimeout(resolve, 40));
+                          }
+                        };
+                        await loaded();
+                        const dimensions = images.map(image => [image.naturalWidth, image.naturalHeight]);
+                        let enlarged = null;
+                        if (images.length) {
+                          const image = images.find(item => !item.src.includes('/thumbnail.jpg')) || images[0];
+                          const button = image.parentElement;
+                          button.click();
+                          await loaded();
+                          if (button.getAttribute('aria-expanded') !== 'true' ||
+                              !image.src.includes('detail=1') ||
+                              Math.max(image.naturalWidth, image.naturalHeight) > 2048)
+                            throw new Error('Slide Info enlargement is unavailable');
+                          enlarged = [image.naturalWidth, image.naturalHeight];
+                          button.click();
+                        }
+                        if (wasHidden) inspector.close();
+                        return {names, dimensions, enlarged};
+                      });
                       const outcome = {ok: true, phase: 'complete', module: true, handlers: true, icons: assets,
+                        info_images: infoImages,
                         shading_correction: {state: shadingStatus.state, applied: shadingStatus.applied,
                           operation: shadingStatus.operation, can_cancel: shadingStatus.can_cancel,
                           generation: shadingStatus.generation, actions: persistentActions,

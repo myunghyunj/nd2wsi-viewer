@@ -12,7 +12,9 @@ default swscale fast paths are not pixel-identical between these versions.
 
 import base64
 import hashlib
+import struct
 import zlib
+from io import BytesIO
 
 WIDTH, HEIGHT = 97, 65
 TILE_WIDTH, TILE_HEIGHT = 64, 48
@@ -86,3 +88,67 @@ def load_sdpc() -> bytes:
     if hashlib.sha256(data).hexdigest() != SOURCE_SHA256:
         raise RuntimeError("packaged synthetic SDPC fixture integrity check failed")
     return data
+
+
+def add_associated_images(data: bytes) -> bytes:
+    """Add two mathematical JPEG photographs and a BMP thumbnail in memory.
+
+    Only small Pillow still-image encoders are used. The existing frozen HEVC
+    payloads are retained byte for byte; no scanner/label/patient data is used.
+    Also accepts the generated test fixture with the same empty EI chain.
+    """
+    import numpy as np
+    from PIL import Image
+
+    header_struct = struct.Struct("<H16sIq9IBB4sfdIqqB48s")
+    level_struct = struct.Struct("<H5I2qfd2IB63s")
+    header = list(header_struct.unpack_from(data))
+    baseline = header[20]
+    if (header[0] != 0x5153 or header[3] != len(data) or header[4] != 0
+            or data[header[19]:header[19] + 2] != b"EI"
+            or struct.unpack_from("<q", data, header[19] + 6)[0] != baseline):
+        raise ValueError("synthetic SDPC must start with an empty associated-image chain")
+
+    def picture(width, height, phase, encoding):
+        y, x = np.indices((height, width), dtype=np.uint32)
+        rgb = np.stack(((11 * x + y + phase) % 256,
+                        (x + 7 * y + 2 * phase) % 256,
+                        (3 * x + 5 * y + 3 * phase) % 256), axis=-1).astype(np.uint8)
+        output = BytesIO()
+        options = {"quality": 92, "subsampling": 0} if encoding == "JPEG" else {}
+        Image.fromarray(rgb).save(output, format=encoding, **options)
+        return output.getvalue()
+
+    cursor = baseline
+    records = []
+    for index, (width, height) in enumerate(((96, 48), (80, 120))):
+        payload = picture(width, height, index * 53, "JPEG")
+        record = bytearray(123)
+        record[:2] = b"MI"
+        struct.pack_into("<3I", record, 10, width, height, 3)
+        struct.pack_into("<Q", record, 22, width * height * 3)
+        struct.pack_into("<Q", record, 34, len(payload))
+        record[42] = 92
+        cursor += len(record) + len(payload)
+        struct.pack_into("<Q", record, 43, cursor)
+        records.append(bytes(record) + payload)
+    thumbnail_width, thumbnail_height = 48, 32
+    thumbnail = picture(thumbnail_width, thumbnail_height, 107, "BMP")
+    cursor += level_struct.size + len(thumbnail)
+    record = level_struct.pack(0x4649, level_struct.size, 0, 1, 1, 1,
+                               len(thumbnail), cursor, 1.0, header[17], 0, 0, 1, b"")
+    records.append(record + thumbnail)
+    shift = cursor - baseline
+    result = bytearray(data[:baseline] + b"".join(records) + data[baseline:])
+    header[3] += shift
+    header[4] = 2
+    header[11], header[12] = thumbnail_width, thumbnail_height
+    header[20] += shift
+    header_struct.pack_into(result, 0, *header)
+    offset = baseline + shift
+    for _ in range(header[6]):
+        level = list(level_struct.unpack_from(result, offset))
+        level[7] += shift
+        level_struct.pack_into(result, offset, *level)
+        offset = level[7]
+    return bytes(result)

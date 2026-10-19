@@ -1504,7 +1504,7 @@ function syncFrameScopedControls() {
 function setTool(tool) {
   const turningOff = tool === null || state.tool === tool;
   if (!turningOff && state.plate && !activeFrameParams()) {
-    showToast("Choose a site before using Region or Annotations");
+    showToast("Choose a site before using Export or Annotations");
     return;
   }
   if (
@@ -3311,21 +3311,48 @@ function renderAssociatedImages(names) {
   const container = $("info-associated");
   container.replaceChildren();
   const available = new Set((Array.isArray(names) ? names : []).map((name) => String(name).toLowerCase()));
-  for (const name of ["thumbnail", "label", "macro"]) {
+  const namesInOrder = ["thumbnail", "label", "macro",
+    ...Array.from({ length: 16 }, (_, i) => "associated-" + (i + 1))];
+  for (const name of namesInOrder) {
     if (!available.has(name)) continue;
     const figure = document.createElement("figure");
+    const button = document.createElement("button");
     const image = document.createElement("img");
     const caption = document.createElement("figcaption");
-    image.alt = name[0].toUpperCase() + name.slice(1) + " associated image";
+    const label = name.startsWith("associated-")
+      ? "Embedded image " + name.split("-")[1]
+      : name[0].toUpperCase() + name.slice(1);
+    button.type = "button";
+    button.className = "info-image-toggle";
+    button.setAttribute("aria-expanded", "false");
+    button.setAttribute("aria-label", "Enlarge " + label.toLowerCase() + " image");
+    image.alt = label + " associated image";
     image.loading = "lazy";
-    image.src = "api/associated/" + name + ".jpg" +
-      (state.info.generation ? "?g=" + encodeURIComponent(state.info.generation) : "");
-    caption.textContent = name[0].toUpperCase() + name.slice(1);
+    const imageUrl = "api/associated/" + name + ".jpg";
+    const query = new URLSearchParams();
+    if (state.info.generation) query.set("g", state.info.generation);
+    image.src = imageUrl + "?" + query.toString();
+    caption.textContent = label + " · Enlarge";
+    let expanded = false;
+    button.addEventListener("click", () => {
+      expanded = !expanded;
+      figure.classList.toggle("expanded", expanded);
+      button.setAttribute("aria-expanded", String(expanded));
+      button.setAttribute("aria-label", (expanded ? "Reduce " : "Enlarge ") +
+        label.toLowerCase() + " image");
+      caption.textContent = label + (expanded ? " · Reduce" : " · Enlarge");
+      if (expanded) {
+        query.set("detail", "1");
+        image.src = imageUrl + "?" + query.toString();
+      }
+      state.windows?.info?.fitContent();
+    });
     image.addEventListener("error", () => {
       figure.remove();
       if (!container.children.length) section.hidden = true;
     });
-    figure.append(image, caption);
+    button.append(image);
+    figure.append(button, caption);
     container.append(figure);
   }
   section.hidden = !container.children.length;
@@ -4946,13 +4973,23 @@ function wireKeys() {
       }
       return;
     }
-    if (command) return;  // leave other shortcuts alone
     const panel = shortcuts ? shortcuts.panelForEvent(ev) : null;
+    if (command) {
+      if (shortcuts?.isPanelShortcut(ev)) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const btn = panel && $({ channels: "tb-channels", annot: "tb-annot" }[panel]);
+        if (btn && !btn.disabled) btn.click();
+      }
+      return; // preserve native copy/select-all when the router yields ownership
+    }
     // Own these letters before the target OSD canvas sees them. In particular
     // OSD's R rotates, A pans and F flips before a bubble listener can react.
+    // Legacy plain C/A/R no longer open panels; keep them reserved so old
+    // muscle memory cannot unexpectedly pan or rotate the image in OSD.
     // Repeats/Shift variants stay reserved but do not repeatedly toggle tools.
     const ownedLetter = !ev.altKey &&
-      ["KeyC", "KeyR", "KeyA", "KeyV", "KeyM", "KeyP", "KeyB", "KeyI", "KeyF"].includes(letterCode);
+      ["KeyC", "KeyR", "KeyA", "KeyE", "KeyV", "KeyM", "KeyP", "KeyB", "KeyI", "KeyF"].includes(letterCode);
     if (ownedLetter) {
       ev.preventDefault();
       ev.stopPropagation();
