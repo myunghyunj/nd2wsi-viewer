@@ -3,6 +3,21 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.3.1</title>
+            <pubDate>Tue, 20 Oct 2026 07:54:23 +0000</pubDate>
+            <sparkle:version>2.3.1</sparkle:version>
+            <sparkle:shortVersionString>2.3.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<ul>
+  <li>Maintenance release: shared reader lifetime, tile caching and RGB level access are organized in a common module.</li>
+  <li>Slide Info uses one reader-selection path for embedded images and previews.</li>
+  <li>Existing viewing features, pixel calculations, source checks, annotations, saved LUTs and storage formats are unchanged.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-macos-arm64.dmg" sparkle:edSignature="GmD1ZtGyzPNTpnEIQvSbeNOSJvAvnvMF5S2HQ+HKwu62BAcorMmWIuewsqQjqpV41DwqA+vwQJB3RgE7+IhwBA==" length="97754960" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.3.0</title>
             <pubDate>Mon, 19 Oct 2026 17:26:53 +0000</pubDate>
             <sparkle:version>2.3.0</sparkle:version>

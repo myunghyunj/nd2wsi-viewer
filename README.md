@@ -1,11 +1,11 @@
-> **v2.3.0 · macOS & Windows.** Open supported SQ/SDPC HEVC whole-slide images directly, alongside ND2 and SVS.
-> The decoder is included; there is no whole-slide conversion or pixel-pyramid cache for SDPC.
-> Original slides, annotations and saved LUTs retain their existing preservation rules. [Release details and limits](docs/release-notes-2.3.0.md).
+> **v2.3.1 · macOS & Windows.** Maintenance update: shared reader code is reorganized without changing viewing features or pixel calculations.
+> Opens supported SQ/SDPC HEVC whole-slide images directly, alongside ND2 and SVS, with the decoder included.
+> Original slides, annotations and saved LUTs retain their existing preservation rules. [Release details and limits](docs/release-notes-2.3.1.md).
 
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.3.0 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.3.1 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -59,17 +59,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.3.0-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.0/nd2wsi-viewer-2.3.0-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.3.1-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.3.0
+or GPU is required. This release provides a portable ZIP, not a v2.3.1
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.3.0) for the
+[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.3.1) for the
 exact source commit, archive checksums, and platform verification results.
 Windows 10 Education and local Parallels were not tested for this release.
 .NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
