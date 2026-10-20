@@ -25,6 +25,7 @@ and standard native frame.
 | Module | Responsibility | Boundary |
 | --- | --- | --- |
 | `server.py` | HTTP parsing/serialization, slide registry, annotation concurrency and export progress | Holds the slide lifecycle lease throughout export preparation, writing and transmission |
+| `direct_common.py` | Shared read lifetime, virtual roots, bounded tile cache and RGB level adapter | Owns one process-wide decoded-tile cache; format readers retain source validation and decoding |
 | `region_export.py` | ROI planning, format policy, rendering and raw temporary-file ownership | Receives slide state and the shared frame resolver; returns a rendered artifact or a context-managed file artifact |
 | `annotation_sidecars.py` | Source/plane/site naming and compatible legacy sidecar migration | Preserves source identity, ambiguous-source refusal and non-default-plane copies |
 | `cache_removal.py` | Annotation rescue and identity-checked file/tree removal | Called only after registry authorization; caller retains writer/build locks and transfers descriptor ownership explicitly |
@@ -35,6 +36,13 @@ finishes; success, writer failure and client disconnection all clean it up.
 Rendered exports retain the existing pixel cap, calibration and format policy.
 Moving these responsibilities does not change raw pixels, HTTP routes, storage
 formats, annotation conflicts or cache-removal authorization.
+
+SVS, SDPC, plate viewing and ROI export import their shared read primitives from
+`direct_common.py`. Compatibility imports from `direct.py` resolve to the same
+objects, including the single decoded-tile cache. Close waits, cache budgets,
+index validation and pixel downsampling are unchanged. Auxiliary-image names
+and JPEG requests share one lazy backend resolver while retaining source
+fingerprint checks before and after reading.
 
 ## Viewer pane
 
@@ -77,7 +85,7 @@ fixtures for real-data tests. The repository CI also checks Python 3.11–3.13,
 wheel installation and the same frozen Windows ZIP on x64 and Windows 11 ARM64
 via x64 emulation. Native platform checks supplement these module tests.
 
-This refactor is a main-branch change after the original 2.1.4 release. The
-published macOS 2.1.4 DMG and Windows 2.1.4 ZIP retain their original verified
-source; see [release notes](release-notes-2.1.4.md). It does not change their tag,
-version, update feed or installed application.
+The original desktop, export and browser-controller extraction followed the
+2.1.4 release; the shared direct-reader extraction is part of
+[2.3.1](release-notes-2.3.1.md). Previously published release artifacts and tags
+retain their original source.

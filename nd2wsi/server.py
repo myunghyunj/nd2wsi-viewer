@@ -56,7 +56,7 @@ from .cache_removal import (
     _validate_file_cache_for_trash,
     rescue_annotations,
 )
-from .direct import _Lifecycle
+from .direct_common import _Lifecycle
 from .region_export import JOB_RE, ExportRequestError, prepare_export
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -413,16 +413,22 @@ def _associated_names(st: ViewerState) -> list[str]:
     if source is None:
         return []
     try:
-        if source.suffix.lower() == ".sdpc":
-            from .sdpc import associated_image_names
-        else:
-            from .svs import associated_image_names
-
-        names = associated_image_names(source)
+        names = _associated_backend(source).associated_image_names(source)
         return names if _associated_source_path(st) == source else []
     except Exception:
         # An auxiliary image must never make the primary slide inspector fail.
         return []
+
+
+def _associated_backend(source: Path):
+    """Resolve the auxiliary-image reader for an already verified source."""
+    if source.suffix.lower() == ".sdpc":
+        from . import sdpc
+
+        return sdpc
+    from . import svs
+
+    return svs
 
 
 def _frame_args(
@@ -936,7 +942,7 @@ class SlideRegistry:
     def add_plate(self, slide_path: str | Path, *, cache_path: Path | None = None) -> str:
         """Serve a time series of sites straight from the ND2, writing nothing."""
         from .cache import fingerprints_match, quick_fingerprint
-        from .direct import _Root
+        from .direct_common import _Root
         from .plate import PlateSource
 
         slide_path = Path(slide_path).resolve()
@@ -1895,17 +1901,13 @@ def make_handler(
             if source is None:
                 return self._error(404, "associated image source is unavailable")
             try:
-                if source.suffix.lower() == ".sdpc":
-                    from .sdpc import associated_image_jpeg
-                else:
-                    from .svs import associated_image_jpeg
-
+                backend = _associated_backend(source)
                 # Two bounded display sizes; clients cannot request arbitrary
                 # decode sizes or address a source outside the open slide.
                 if q.get("detail") == ["1"]:
-                    body = associated_image_jpeg(source, name, max_side=2048)
+                    body = backend.associated_image_jpeg(source, name, max_side=2048)
                 else:
-                    body = associated_image_jpeg(source, name)
+                    body = backend.associated_image_jpeg(source, name)
             except (KeyError, OSError, ValueError):
                 return self._error(404, f"associated image {name} is unavailable")
             # The path may have been atomically replaced while it was decoded.

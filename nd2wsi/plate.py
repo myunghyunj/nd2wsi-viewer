@@ -46,7 +46,7 @@ from .cache import (
     source_tag,
 )
 from .contrast import auto_window
-from .direct import _Lifecycle, _parse_cyx_index, _Root, _TileCache
+from .direct_common import _Lifecycle, _parse_cyx_index, _Root, _TileCache
 from .plate_integrity import (
     DIGEST_ALGORITHM,
     DIGEST_NAME,

@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 
-from .direct import _TILE_CACHE, MAX_EXTRA, _Lifecycle, _Root, _SvsLevel
+from .direct_common import _TILE_CACHE, MAX_EXTRA, _Lifecycle, _Root, _SvsLevel
 from .platform_io import BINARY, read_at
 from .reader import ChannelInfo, PlaneSource, level_shapes
 

@@ -17,7 +17,7 @@ from typing import Any, BinaryIO
 import numpy as np
 
 from . import render
-from .direct import _parse_cyx_index
+from .direct_common import _parse_cyx_index
 
 JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
