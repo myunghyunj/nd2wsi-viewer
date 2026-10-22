@@ -3,6 +3,20 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.4.0</title>
+            <pubDate>Thu, 22 Oct 2026 17:31:54 +0000</pubDate>
+            <sparkle:version>2.4.0</sparkle:version>
+            <sparkle:shortVersionString>2.4.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Rank1 shading correction and panel shortcuts</h2>
+<p>Shading Correction now defaults to Rank1 (BF-free) for supported FITC and CY3 channels. BF and DAPI stay unchanged. Existing corrections remain readable, and BF-guided stays available as a manual choice.</p>
+<p>Panel shortcuts now work consistently from the tab toolbar and active slide, with held-key repeat suppression and editable-field protection.</p>
+<p>Original slides, annotations, saved LUTs and native-value exports retain their preservation rules. This macOS Apple silicon build is ad-hoc signed and is not Developer ID notarized.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.0/nd2wsi-viewer-2.4.0-macos-arm64.dmg" sparkle:edSignature="KWluJNyM1t8idho5xv/qqP9697cgWFdho77hWdwTCb49nH7oYAT2lpw9NCPFFyZfKXbVCbcWogxF5a8A1/jSDA==" length="99730863" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.3.1</title>
             <pubDate>Tue, 20 Oct 2026 07:54:23 +0000</pubDate>
             <sparkle:version>2.3.1</sparkle:version>
