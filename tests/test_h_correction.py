@@ -160,7 +160,7 @@ def test_controller_applies_then_rebuilds_raw_with_committed_generations(state, 
     controller = hc.HCorrectionController(state)
     assert controller.status()["state"] == "idle"
     assert controller.status()["applied"] is False
-    controller.start()
+    controller.start("h")
     applied = done(controller)
     assert applied["state"] == "ready"
     assert applied["applied"] is True
@@ -172,7 +172,7 @@ def test_controller_applies_then_rebuilds_raw_with_committed_generations(state, 
     assert applied["can_cancel"] is False
     assert prepared[0].published and prepared[0].closed
     with pytest.raises(ValueError, match="Revoke"):
-        controller.start()
+        controller.start("h")
     controller.revoke()
     reverted = done(controller)
     assert reverted["state"] == "idle"
@@ -219,6 +219,47 @@ def test_bf_remains_a_target_without_fluorescence_channels(state):
     assert status["state"] == "idle"
     assert hc._mapping(["Bright Field", "DAPI"]) == {"BF": 0, "DAPI": 1}
     assert controller._thread is None
+
+
+def test_rank1_is_default_without_bf_but_loading_does_not_start_work(state, monkeypatch):
+    state.attrs["omero"]["channels"][1]["label"] = "unknown"
+    controller = hc.HCorrectionController(state)
+    status = controller.status()
+    assert status["supported"] and not status["applied"]
+    assert status["method"] == "bffree"
+    assert not status["methods"]["h"]["supported"]
+    assert status["methods"]["bffree"]["supported"]
+    assert controller._thread is None
+    calls = []
+    monkeypatch.setattr(controller, "_start", lambda *args: calls.append(args))
+    controller.start()
+    controller.start("h")
+    assert calls == [("apply", "bffree"), ("apply", "h")]
+
+
+def test_rank1_requires_a_correctable_channel_but_legacy_dapi_mapping_loads():
+    with pytest.raises(hc.UnsupportedCorrection, match="FITC or CY3"):
+        hc._mapping(["BF", "DAPI"], "bffree")
+    assert hc._mapping(["BF", "DAPI"], "bffree", require_correctable=False) == {"DAPI": 1}
+
+
+def test_bffree_input_preparation_never_reads_bf_and_preserves_edge_means(state, tmp_path):
+    mapping = hc._mapping([ch["label"] for ch in state.attrs["omero"]["channels"]], "bffree")
+    assert mapping == {"CY3": 0, "DAPI": 2, "FITC": 3}
+    read_indices = set()
+
+    def read(ci, y0, y1, x0, x1):
+        assert ci != 1
+        read_indices.add(ci)
+        return state.root["0"][ci, y0:y1, x0:x1]
+
+    raw32 = hc._prepare_bffree_inputs(state, tmp_path, mapping, read, lambda: None, lambda _: None)
+    try:
+        assert read_indices == {0, 2, 3}
+        for target, ci in enumerate(sorted(mapping.values())):
+            np.testing.assert_array_equal(raw32[target], means(state.root["0"][ci], 32))
+    finally:
+        hc._close_maps([raw32])
 
 
 def test_cancel_revoke_keeps_the_committed_corrected_state(state, monkeypatch):
@@ -271,7 +312,7 @@ def test_failure_preserves_committed_correction_and_generation(state, monkeypatc
     else:
         state.replace_pyramid = fail
     controller = hc.HCorrectionController(state)
-    (controller.start if operation == "apply" else controller.revoke)()
+    (lambda: controller.start("h") if operation == "apply" else controller.revoke())()
     status = done(controller)
     assert status["state"] == "failed"
     assert "injected replacement failure" in status["reason"]
@@ -294,7 +335,7 @@ def test_publish_disables_cancellation_until_atomic_activation_completes(state, 
 
     state.replace_pyramid = replace
     controller = hc.HCorrectionController(state)
-    controller.start()
+    controller.start("h")
     assert entered.wait(3)
     assert controller.status()["state"] == "publishing"
     assert controller.status()["can_cancel"] is False
@@ -318,7 +359,7 @@ def test_changed_generation_after_preparation_cannot_publish(state, monkeypatch)
 
     monkeypatch.setattr(hp, "prepare_apply", changed)
     controller = hc.HCorrectionController(state)
-    controller.start()
+    controller.start("h")
     status = done(controller)
     assert not any(item.published for item in prepared)
     assert all(item.closed for item in prepared)
@@ -356,10 +397,10 @@ def test_cancel_fit_is_nonblocking_and_never_publishes(state, monkeypatch):
     monkeypatch.setattr(hc, "_metadata_for_state", metadata)
     monkeypatch.setattr(hc, "_fit_model", fit)
     controller = hc.HCorrectionController(state)
-    controller.start()
+    controller.start("h")
     assert entered.wait(3)
     first_thread = controller._thread
-    assert controller.start()["state"] == "fitting"
+    assert controller.start("h")["state"] == "fitting"
     assert controller._thread is first_thread
     begin = time.monotonic()
     controller.close()
@@ -380,7 +421,7 @@ def test_no_enabled_targets_is_unchanged_not_ready(state, monkeypatch):
     monkeypatch.setattr(hc, "_metadata_for_state", metadata)
     monkeypatch.setattr(hc, "_fit_model", fitter)
     controller = hc.HCorrectionController(state)
-    controller.start()
+    controller.start("h")
     status = done(controller)
     assert status["state"] == "unchanged"
     assert status["channels"] == []
@@ -407,10 +448,12 @@ def test_model_validation_abstention_is_readable_and_never_replaces_pyramid(stat
     monkeypatch.setattr(hp, "prepare_apply", forbidden)
     state.replace_pyramid = forbidden
     controller = hc.HCorrectionController(state)
-    controller.start()
+    controller.start("h")
     status = done(controller)
     assert status["state"] == "unsupported"
-    assert status["supported"] is False
+    assert status["supported"] is True  # The separate Rank1 method remains selectable.
+    assert status["methods"]["h"]["supported"] is False
+    assert status["methods"]["bffree"]["supported"] is True
     assert status["applied"] is False
     assert status["reason_code"] == code
     assert "Too few usable repeated fields" in status["reason"]
@@ -430,7 +473,6 @@ def test_model_validation_abstention_is_readable_and_never_replaces_pyramid(stat
         (lambda s: setattr(s, "plate", object()), "single-frame"),
         (lambda s: s.attrs["nd2wsi"].update(rgb=True), "scalar"),
         (lambda s: s.attrs["nd2wsi"]["selection"].update(z="max"), "projections"),
-        (lambda s: s.attrs["omero"]["channels"][1].update(label="unknown"), "BF"),
         (lambda s: s.attrs["omero"]["channels"][0].update(label="FITC"), "duplicate"),
         (lambda s: s.attrs["nd2wsi"]["levels"].pop(0), "level 0"),
     ],
@@ -438,7 +480,7 @@ def test_model_validation_abstention_is_readable_and_never_replaces_pyramid(stat
 def test_unsupported_state_never_starts_worker(state, change, reason):
     change(state)
     controller = hc.HCorrectionController(state)
-    status = controller.start()
+    status = controller.start("h")
     assert status["state"] == "unsupported"
     assert not status["supported"]
     assert reason in status["reason"]
@@ -494,6 +536,12 @@ def test_original_metadata_binding_and_no_direct_pixel_reads(state, monkeypatch)
     monkeypatch.setattr(nd2, "ND2File", Reader)
     result = hc._metadata_for_state(state)
     assert result["channel_mapping"] == {"CY3": 0, "BF": 1, "DAPI": 2, "FITC": 3}
+    def forbidden_camera_metadata(*args, **kwargs):
+        raise AssertionError("BF-free must never inspect camera or BF geometry")
+    monkeypatch.setattr(Reader, "unstructured_metadata", forbidden_camera_metadata)
+    bffree = hc._metadata_for_state(state, "bffree")
+    assert bffree["channel_mapping"] == {"CY3": 0, "DAPI": 2, "FITC": 3}
+    assert "channel_acquisition_settings" not in bffree
     Reader.sizes = {**Reader.sizes, "T": 2}
     with pytest.raises(hc.UnsupportedCorrection, match="single stitched frame"):
         hc._metadata_for_state(state)
@@ -511,7 +559,7 @@ def test_closed_source_guard_blocks_worker_reads(state, monkeypatch):
     monkeypatch.setattr(hc, "_fit_model", fake_fitter)
     state.busy.close()
     controller = hc.HCorrectionController(state)
-    controller.start()
+    controller.start("h")
     status = done(controller)
     assert status["state"] == "failed"
     assert "closed" in status["reason"]
@@ -548,7 +596,7 @@ def test_source_change_during_fit_cannot_publish(state, monkeypatch):
     monkeypatch.setattr(hc, "_metadata_for_state", metadata)
     monkeypatch.setattr(hc, "_fit_model", fitter)
     controller = hc.HCorrectionController(state)
-    controller.start()
+    controller.start("h")
     status = done(controller)
     assert status["state"] == "unsupported"
     assert "source changed" in status["reason"]
@@ -598,4 +646,4 @@ def test_preflight_estimate_is_null_for_unsupported_slide(state):
     state.attrs["nd2wsi"]["rgb"] = True
     controller = hc.HCorrectionController(state)
     assert controller.status()["estimated_seconds"] is None
-    assert controller.start()["estimated_seconds"] is None
+    assert controller.start("h")["estimated_seconds"] is None

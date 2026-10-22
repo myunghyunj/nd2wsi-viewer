@@ -140,6 +140,7 @@ window.nd2wsiNativeTrackpad = (input) => {
 
 function refreshShadingButton() {
   if (shadingConfirmation && !shadingConfirmationMatches()) closeShadingConfirmation(false);
+  if (shadingConfirmation) refreshShadingMethodChoice();
   const button = $("shading-correction");
   if (!button) return;
   const status = shadingStates.get(active);
@@ -213,15 +214,13 @@ function activateShadingCorrection() {
     closeShadingConfirmation(false);
     shadingConfirmation = { sid, shellToken: shadingTokens.get(sid),
       paneInstanceId: status.paneInstanceId, contextKey: status.contextKey,
-      generation: status.generation, state: status.state, action };
+      generation: status.generation, state: status.state, action,
+      ...(action === "start" ? { method: "bffree" } : {}) };
     const revoke = action === "revoke";
     $("shading-confirm").classList.toggle("revoke", revoke);
     $("shading-confirm-title").textContent = revoke ? "Revoke Shading Correction?" : "Shading Correction";
-    $("shading-confirm-message").textContent = revoke
-      ? "Rebuild the original pyramid from the source ND2."
-      : "Estimate shading in FITC, CY3 and BF for large scans. Only channels with sufficient evidence are corrected. DAPI and original measurements stay unchanged.";
     $("shading-confirm-continue").textContent = revoke ? "Revoke" : "Continue";
-    $("shading-confirm-estimate").textContent = window.Nd2ShadingCorrection.estimateLabel(status.estimated_seconds);
+    refreshShadingMethodChoice();
     $("shading-confirm").showModal();
     $("shading-confirm-cancel").focus({ preventScroll: true });
     return true;
@@ -229,6 +228,39 @@ function activateShadingCorrection() {
   return postToSlide(sid, { nd2wsi: "shading-command", version: VIEWPORT_PROTOCOL_VERSION, action,
     sid, shellToken: shadingTokens.get(sid), paneInstanceId: status.paneInstanceId,
     contextKey: status.contextKey, commandSeq: ++shadingCommandSeq });
+}
+
+function refreshShadingMethodChoice() {
+  const pending = shadingConfirmation;
+  if (!pending) return;
+  const revoke = pending.action === "revoke", status = shadingStates.get(pending.sid);
+  $("shading-methods").hidden = revoke;
+  $("shading-confirm-persistence").hidden = revoke;
+  for (const method of ["h", "bffree"]) {
+    const support = window.Nd2ShadingCorrection.methodSupport(status, method);
+    const radio = $("shading-method-" + method);
+    radio.checked = !revoke && pending.method === method;
+    radio.disabled = revoke || !support.supported;
+    $("shading-method-" + method + "-reason").textContent = support.supported ? "" : support.reason;
+  }
+  const rank1 = pending.method === "bffree";
+  const estimate = status.estimated_seconds;
+  $("shading-confirm-estimate").textContent = window.Nd2ShadingCorrection.estimateLabel(estimate);
+  $("shading-confirm-message").textContent = revoke
+    ? "Rebuild the original pyramid from the source ND2."
+    : rank1
+      ? "Use Rank1 to estimate the repeating illumination pattern from this slide's fluorescence channels and correct supported FITC and CY3 channels. BF and DAPI stay unchanged. Review the corrected image before quantitative analysis."
+      : "Estimate shading in FITC, CY3 and BF for large scans. Only channels with sufficient evidence are corrected. DAPI and original measurements stay unchanged.";
+  $("shading-confirm-continue").disabled = !revoke &&
+    !window.Nd2ShadingCorrection.methodSupport(status, pending.method).supported;
+}
+
+function selectShadingMethod(method) {
+  if (!shadingConfirmationMatches() || shadingConfirmation.action !== "start" ||
+      !window.Nd2ShadingCorrection.methodSupport(shadingStates.get(active), method).supported) return false;
+  shadingConfirmation.method = method;
+  refreshShadingMethodChoice();
+  return true;
 }
 
 function shadingConfirmationMatches() {
@@ -253,9 +285,16 @@ function closeShadingConfirmation(restoreFocus = true) {
 function continueShadingConfirmation() {
   if (!shadingConfirmationMatches()) { closeShadingConfirmation(false); return false; }
   const pending = shadingConfirmation;
+  if (pending.action === "start" &&
+      !window.Nd2ShadingCorrection.methodSupport(shadingStates.get(active), pending.method).supported) {
+    refreshShadingMethodChoice();
+    return false;
+  }
+  const selection = pending.action === "start" ? { method: pending.method } : {};
+  const { method, ...captured } = pending;
   closeShadingConfirmation();
   return postToSlide(pending.sid, { nd2wsi: "shading-command", version: VIEWPORT_PROTOCOL_VERSION,
-    ...pending, confirmed: true, commandSeq: ++shadingCommandSeq });
+    ...captured, ...selection, confirmed: true, commandSeq: ++shadingCommandSeq });
 }
 
 function dismissShadingConfirmation(event) {
@@ -276,6 +315,8 @@ $("shading-cancel").addEventListener("click", () => {
   else activateShadingCorrection();
 });
 $("shading-confirm-continue").addEventListener("click", continueShadingConfirmation);
+$("shading-method-h").addEventListener("change", () => selectShadingMethod("h"));
+$("shading-method-bffree").addEventListener("change", () => selectShadingMethod("bffree"));
 $("shading-confirm-cancel").addEventListener("click", () => closeShadingConfirmation());
 $("shading-confirm").addEventListener("cancel", dismissShadingConfirmation);
 $("shading-confirm").addEventListener("click", dismissShadingConfirmation);
@@ -2445,6 +2486,19 @@ function changeOrientation(action) {
   requestGroup("orientation", { targetSid, action });
 }
 
+function panelShortcut(panel) {
+  if (quitPreparation || pairPicker.open ||
+      !["channels", "region", "annot", "info"].includes(panel)) return false;
+  const st = compare.states.get(active);
+  if (!readyFrames.has(active) || !st?.paneInstanceId) return false;
+  // Pane key events stay local to their iframe. Only keys owned by the shell
+  // (tab strip/toolbar focus) need forwarding to the active tab, once.
+  return postToSlide(active, {
+    nd2wsi: "pane-panel-shortcut", version: VIEWPORT_PROTOCOL_VERSION,
+    panel, ...localIdentity(st),
+  });
+}
+
 function orientationShortcut(action) {
   if (!["rotate-right", "flip-horizontal"].includes(action) || quitPreparation) return false;
   if (compare.enabled) {
@@ -2541,6 +2595,13 @@ $("compare-mirror-policy").onchange = (event) => {
 };
 
 window.addEventListener("keydown", (event) => {
+  if (ShortcutRouter?.isPanelShortcut(event)) {
+    const panel = ShortcutRouter.panelForEvent(event);
+    event.preventDefault();
+    event.stopPropagation();
+    if (panel) panelShortcut(panel);
+    return;
+  }
   if (ShortcutRouter?.isOrientationShortcut(event)) {
     const action = ShortcutRouter.orientationForEvent(event);
     event.preventDefault();

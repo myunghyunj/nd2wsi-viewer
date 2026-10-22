@@ -1,11 +1,11 @@
-> **v2.3.1 · macOS & Windows.** Maintenance update: shared reader code is reorganized without changing viewing features or pixel calculations.
-> Opens supported SQ/SDPC HEVC whole-slide images directly, alongside ND2 and SVS, with the decoder included.
-> Original slides, annotations and saved LUTs retain their existing preservation rules. [Release details and limits](docs/release-notes-2.3.1.md).
+> **v2.4.0 · macOS & Windows.** Shading Correction now defaults to **Rank1 (BF-free)** for supported FITC and CY3 channels in stitched ND2 slides.
+> Rank1 estimates the repeating pattern from fluorescence; BF and DAPI stay unchanged. The existing **BF-guided** method remains available by manual selection.
+> Corrections persist in the viewing cache. Original slides, raw exports, annotations and saved LUTs retain their existing preservation rules. [Release details and limits](docs/release-notes-2.4.0.md).
 
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.3.1 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.4.0 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.0/nd2wsi-viewer-2.4.0-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -27,7 +27,7 @@
 
 ![Fluorescence slide with interactive channel histograms and LUT controls in nd2wsi-viewer](docs/overview-slide.png)
 
-## Why this exists
+## Motivation
 
 The Nikon NIS-Elements Viewer is heavy on memory and slow to move around a large scan, so looking at a slide takes longer than it should. This viewer was built to open the same files with almost no waiting and a simple screen.
 
@@ -39,7 +39,7 @@ nd2wsi-viewer gives an ND2 scan that pyramid. It builds the reduced copies once,
 
 Nothing leaves your computer. There is no upload and no account.
 
-## What you get
+## Here is what you get
 
 - Opens stitched Nikon `.nd2`, Aperio `.svs` and supported HEVC `.sdpc` slides, several at once in tabs.
 - Keeps each viewing cache in one `.nd2svs` file, easy to copy to an external SSD.
@@ -59,17 +59,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.3.1-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.4.0-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.0/nd2wsi-viewer-2.4.0-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.0/nd2wsi-viewer-2.4.0-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.3.1
+or GPU is required. This release provides a portable ZIP, not a v2.4.0
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.3.1) for the
+[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.4.0) for the
 exact source commit, archive checksums, and platform verification results.
 Windows 10 Education and local Parallels were not tested for this release.
 .NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
@@ -133,21 +133,25 @@ Every fluorescence channel has its own row in the Channels panel. Pick a color, 
 
 The standard viewer remembers each file's last-used minimum, maximum and gamma across app restarts. Saved LUTs take precedence over initial Auto; Reset restores the channel's metadata defaults and remembers that choice too. Preferences live in local application data, not in the image or its annotations. A moved, replaced or incompatible file uses normal defaults. The opt-in Metal viewer's independent controls are not persisted.
 
-The **Shading Correction** button in the tab strip estimates repeating illumination shading in a supported stitched ND2 scan and replaces its existing `.nd2svs` viewing pyramid with the corrected pyramid. The correction remains saved after closing and reopening the slide. Its shaded-circle icon turns red on hover. Click to see an estimated preparation time, then choose the green **Continue** button to begin or the red **Cancel** button to dismiss. The estimate varies with the computer and storage speed. During preparation, a progress bar shows the stage and an updated approximate remaining time; Cancel stops the work before the final replacement.
+The **Shading Correction** button in the tab strip estimates repeating illumination shading in a supported stitched ND2 scan and replaces its existing `.nd2svs` viewing pyramid with the corrected pyramid. The correction remains saved after closing and reopening the slide. The confirmation defaults to **Rank1 (BF-free)**, which uses the slide's fluorescence to correct supported FITC and CY3 channels while keeping BF and DAPI unchanged. A BF channel is not required. Choose **BF-guided** to use the existing H method instead when its requirements are met; the viewer does not switch methods automatically if Rank1 cannot fit a channel.
 
-| Before — original | After — Shading Correction |
+Click the button to review the method and estimated preparation time, then choose the green **Continue** button to begin or the red **Cancel** button to dismiss. Opening a slide alone does not start a correction. The estimate varies with the computer and storage speed. During preparation, a progress bar shows the stage and an updated approximate remaining time; Cancel stops the work before the final replacement.
+
+| Before — original | After — BF-guided (H) correction |
 |:---:|:---:|
 | ![Original FITC acquisition with vertical shading bands](docs/shading-correction-before.png) | ![The same FITC acquisition after H correction, with reduced vertical banding](docs/shading-correction-after.png) |
 
-*Selected FITC development example using the H method behind Shading Correction. Both panels show the full acquisition with identical LUT settings (6,435.36–26,115.71 ADU; gamma 1.0), reduced for display. Vertical banding is reduced, while some seams remain. Results vary by scan.*
+*Historical FITC development example of the BF-guided H method. These images do not show Rank1 results. Both panels show the full acquisition with identical LUT settings (6,435.36–26,115.71 ADU; gamma 1.0), reduced for display. Vertical banding is reduced, while some seams remain. Results vary by scan.*
 
 After applying correction, the button offers **Revoke**. Revoke rebuilds the original viewing pyramid from the source ND2 and replaces the corrected cache, so returning to the original display takes another preparation step. Both operations require the original ND2. Cancellation or failure before the final replacement leaves the current cache untouched. If the replacement is saved but cannot be activated immediately, the valid saved cache is retained; reopen the slide when prompted.
 
-Correction evaluates FITC, CY3 and BF separately, using the same slide's BF channel and recorded camera geometry. A spatially varying amplitude model can address shading that changes across the scan when the original fixed-region fit has insufficient repeat evidence. Version 2.2.1 uses local measurements to strengthen correction where supported, with local trough-depth limits and conservative handling of missing data. DAPI and channels that do not pass validation retain their original values. A scan can have visible shading and still fail validation; the viewer then explains why correction was not applied and keeps the original pyramid. Inspect the result, especially at tissue boundaries: the fitted pattern is an estimate, and its evidence checks do not guarantee improvement in every field or establish biological signal preservation. See the [method and validation limits](docs/shading-correction-validation.md).
+Rank1 uses the adopted `consensus_rank1` model: a repeating template for each supported channel with an amplitude that varies across the scan. FITC and CY3 are assessed separately; DAPI can contribute pattern proposals but is never corrected. BF pixels, BF-derived geometry and camera priors do not enter Rank1 fitting. Unsupported channels keep their original values. If no channel supports a correction, the original pyramid is retained and the viewer explains the outcome. Plate/time-series acquisitions and Z projections remain unsupported.
+
+The manually selected BF-guided method retains its existing FITC, CY3 and BF correction and DAPI preservation rules. Inspect either method's result, especially at tissue boundaries: repeating specimen structures can resemble illumination, and fitting checks do not guarantee improvement in every field or establish biological signal preservation. See the [method and validation limits](docs/shading-correction-validation.md).
 
 PNG, JPEG and SVG exports use the saved correction and include `shading-corrected` in their filenames. Native ND2/TIFF exports, including reduced-resolution exports, and pixel readouts retain original values. The original ND2, annotations and saved LUTs remain unchanged. Temporary preparation files are released after the operation; the corrected viewing cache remains saved until revoked.
 
-Caches containing adaptive or BF correction require version 2.2.0 or later. Legacy corrected caches from 2.1.15 remain readable; older viewers cannot read the new correction model.
+New Rank1 corrected caches require version 2.4.0 or later. Existing H corrections and earlier BF-free preview caches remain readable with their saved models; an application update does not silently refit them.
 
 Existing saved corrections are retained after an application update. Use **Revoke**, then **Apply**, to fit again with the current method.
 

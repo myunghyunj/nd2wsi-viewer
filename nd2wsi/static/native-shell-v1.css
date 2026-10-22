@@ -90,12 +90,21 @@ button { color:inherit; font:inherit; }
 #shading-confirm h2 { margin:0 0 14px; font-size:15px; font-weight:600; }
 #shading-confirm p { margin:0 0 10px; font-size:13px; line-height:1.5; }
 #shading-confirm-estimate { color:var(--label-2); }
+#shading-methods { margin:0 0 14px; padding:10px 12px; border:1px solid var(--hairline); border-radius:8px; }
+#shading-methods[hidden], #shading-confirm-persistence[hidden] { display:none; }
+#shading-methods legend { padding:0 4px; color:var(--label-2); font-size:12px; }
+#shading-methods label { display:flex; align-items:center; gap:6px; font-size:13px; line-height:1.6; }
+#shading-methods input { margin:0; accent-color:#007aff; }
+#shading-confirm .shading-method-reason { margin:2px 0 8px 20px; color:var(--label-2); font-size:12px; }
+#shading-confirm .shading-method-reason:empty { display:none; }
+#shading-confirm-persistence { color:var(--label-2); }
 .shading-confirm-actions { display:flex; justify-content:flex-end; gap:9px; margin-top:20px; }
 .shading-confirm-actions button { min-width:84px; padding:7px 13px; border:0; border-radius:7px; color:#fff; font-size:12px; font-weight:550; }
 #shading-confirm-continue { background:#248a3d; }
 #shading-confirm-cancel { background:#d72c30; }
 #shading-confirm.revoke #shading-confirm-continue { background:#007aff; }
 .shading-confirm-actions button:hover { filter:brightness(1.12); }
+.shading-confirm-actions button:disabled { opacity:.45; filter:none; }
 .shading-confirm-actions button:focus-visible { outline:2px solid var(--label); outline-offset:3px; }
 #shading-correction.preparing .shading-icon { animation:shading-pulse 1s ease-in-out infinite alternate; }
 #shading-status { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }

@@ -57,7 +57,7 @@ gate.setContext(config.grid ? null : {key:'context-test',kind:'slide'});
 if(config.compare) gate.bind({...gate.envelope(),groupSessionId:'group-test',
   groupEpoch:1,enabled:true,spatialEnabled:config.ready!==false});
 const state={
-  quitPreparing:false,roi:null,tool:null,pixel:{cursor:null},tabCount:2,
+  quitPreparing:!!config.quitPreparing,roi:null,tool:null,pixel:{cursor:null},tabCount:2,
   landmark:{active:!!config.landmark,points:[]},
   info:{plate:{Z:config.zCount ?? 5,T:4}},
   plate:config.plate ? {auto:false,focus:config.grid ? null : 0,t:0,placed:[]} : null,
@@ -104,7 +104,8 @@ const context=vm.createContext({
   },
 });
 for(const name of ['buildViewer','normalizedRotation','spatialIdentity','spatialImageReady',
-  'spatialPaneReady','applyOrientationShortcut','wirePlateKeys','wireCompareRelay','wireKeys']) {
+  'spatialPaneReady','applyOrientationShortcut','togglePanelForShortcut',
+  'wirePlateKeys','wireCompareRelay','wireKeys']) {
   vm.runInContext(production(name),context);
 }
 const applyOrientation=context.applyOrientationShortcut;
@@ -170,7 +171,8 @@ if(config.message) {
     ...gate.envelope(),...config.message};
   if(config.changeContext) gate.setContext({key:'new-context',kind:'slide'});
   for(const item of listeners.get('message') || []) item.fn({
-    origin:'http://qa.invalid',source:window.parent,data,
+    origin:config.messageOrigin || 'http://qa.invalid',
+    source:config.foreignSource ? {} : window.parent,data,
   });
 }
 out.pose={degrees:state.viewportRelay.displayRotation,flipped:state.viewportRelay.displayFlipped};
@@ -287,7 +289,8 @@ def test_clockwise_rotation_reverses_the_osd_increment_when_mirrored():
 
 
 @pytest.mark.parametrize("letter,meta", [("E", False), ("R", False), ("F", False),
-                                         ("R", True), ("F", True), ("C", True), ("A", True)])
+                                         ("R", True), ("F", True), ("C", True),
+                                         ("A", True), ("I", True)])
 def test_held_keys_are_reserved_without_repeating_panels_or_orientation(letter, meta):
     out = pane([key(letter, metaKey=meta, repeat=True)])
     assert out["events"] == [{"prevented": True, "stopped": True}]
@@ -303,8 +306,9 @@ def test_text_editing_keeps_plain_and_command_keys(target):
     out = pane([key("E", target=target, outsideCanvas=True),
                 key("F", target=target, outsideCanvas=True, metaKey=True),
                 key("C", target=target, outsideCanvas=True, metaKey=True),
-                key("A", target=target, outsideCanvas=True, metaKey=True)])
-    assert out["events"] == [{"prevented": False, "stopped": False}] * 4
+                key("A", target=target, outsideCanvas=True, metaKey=True),
+                key("I", target=target, outsideCanvas=True, metaKey=True)])
+    assert out["events"] == [{"prevented": False, "stopped": False}] * 5
     assert out["clicks"] == out["orientationCalls"] == out["applied"] == []
 
 
@@ -362,7 +366,8 @@ def test_ime_composition_remains_unhandled_and_latin_shortcuts_work_afterward():
     assert out["osdRotations"] == []
 
 
-@pytest.mark.parametrize("letter,button", [("C", "tb-channels"), ("A", "tb-annot")])
+@pytest.mark.parametrize("letter,button", [("C", "tb-channels"), ("A", "tb-annot"),
+                                          ("I", "tb-info")])
 @pytest.mark.parametrize("platform,modifier", [("MacIntel", "metaKey"), ("Win32", "ctrlKey")])
 def test_command_panels_run_once_before_osd(letter, button, platform, modifier):
     out = pane([key(letter, **{modifier: True}),
@@ -371,6 +376,103 @@ def test_command_panels_run_once_before_osd(letter, button, platform, modifier):
     assert out["events"] == [{"prevented": True, "stopped": True}] * 2
     assert out["targetDeliveries"] == out["osdKeydowns"] == 0
     assert out["osdRotations"] == out["pans"] == []
+
+
+@pytest.mark.parametrize("letter,panel", [("C", "channels"), ("A", "annot"),
+                                        ("E", "region"), ("I", "info")])
+@pytest.mark.parametrize("platform,modifier", [("MacIntel", "metaKey"), ("Win32", "ctrlKey")])
+def test_shell_panel_shortcuts_reach_only_the_active_tab_once(letter, panel, platform, modifier):
+    out = run_shell(f"""
+      active='a'; compare.orientationSid='c';
+      const flags={{code:'Key{letter}',{modifier}:{str(letter != 'E').lower()},
+        target:{{tagName:'BUTTON',closest:()=>null}}}};
+      const first=pressKey('{letter.lower()}',flags);
+      const held=pressKey('{letter.lower()}',{{...flags,repeat:true}});
+      ({{first,held,messages}});
+    """, platform=platform)
+    assert out["first"] == out["held"] == {"prevented": True, "stopped": True}
+    assert out["messages"] == [{
+        "sid": "a", "nd2wsi": "pane-panel-shortcut", "version": 2, "panel": panel,
+        "paneInstanceId": "pane-a", "contextEpoch": 1, "spatialContextKey": "context-a",
+    }]
+
+
+@pytest.mark.parametrize("letter", ["C", "A", "E", "I"])
+@pytest.mark.parametrize("overrides", [
+    "target:{tagName:'INPUT'}", "target:{tagName:'TEXTAREA'}",
+    "target:{isContentEditable:true}", "isComposing:true", "keyCode:229",
+    "defaultPrevented:true", "altKey:true", "shiftKey:true",
+])
+def test_shell_panel_shortcuts_leave_editing_and_other_key_combinations_alone(letter, overrides):
+    out = run_shell(f"""
+      const consumed=pressKey('{letter.lower()}',{{code:'Key{letter}',
+        metaKey:{str(letter != 'E').lower()},{overrides}}});
+      ({{consumed,messages}});
+    """)
+    assert out["messages"] == []
+    assert out["consumed"] == {"prevented": overrides == "defaultPrevented:true", "stopped": False}
+
+
+@pytest.mark.parametrize("letter", ["C", "A"])
+def test_shell_panel_shortcuts_preserve_native_copy_and_select_all_for_selected_text(letter):
+    out = run_shell(f"""
+      const consumed=pressKey('{letter.lower()}',{{code:'Key{letter}',metaKey:true,
+        target:{{tagName:'DIV',ownerDocument:{{getSelection:()=>({{
+          isCollapsed:false,toString:()=> 'selected metadata',
+        }})}}}}}});
+      ({{consumed,messages}});
+    """)
+    assert out == {"consumed": {"prevented": False, "stopped": False}, "messages": []}
+
+
+@pytest.mark.parametrize("setup", [
+    "active=null", "readyFrames.delete(active)", "compare.states.delete(active)",
+    "pairPicker.open=true", "quitPreparation={}",
+])
+def test_shell_does_not_send_panel_keys_to_missing_unready_or_modal_panes(setup):
+    out = run_shell(f"{setup}; pressKey('e',{{code:'KeyE'}}); messages;")
+    assert out == []
+
+
+def test_shell_panel_forwarding_also_works_without_compare_or_a_ready_image():
+    out = run_shell("""
+      compare.enabled=false;
+      Object.assign(compare.states.get(active),{imageReady:false,spatialContext:null,plateGrid:true});
+      pressKey('i',{code:'KeyI',metaKey:true}); messages;
+    """)
+    assert len(out) == 1 and out[0]["panel"] == "info"
+    assert out[0]["sid"] == "a" and out[0]["spatialContextKey"] is None
+
+
+@pytest.mark.parametrize("panel,button", [("channels", "tb-channels"), ("annot", "tb-annot"),
+                                        ("region", "tb-region"), ("info", "tb-info")])
+@pytest.mark.parametrize("config,accepted", [
+    ({}, True), ({"compare": {"enabled": True, "linked": True}}, True),
+    ({"plate": True, "grid": True}, True), ({"changeContext": True}, False),
+    ({"message": {"paneInstanceId": "old-pane"}}, False),
+    ({"message": {"contextEpoch": 0}}, False),
+    ({"message": {"spatialContextKey": "old-site"}}, False),
+    ({"message": {"version": 1}}, False),
+    ({"messageOrigin": "http://other.invalid"}, False), ({"foreignSource": True}, False),
+    ({"quitPreparing": True}, False),
+])
+def test_shell_panel_message_reaches_only_its_current_trusted_pane(panel, button, config, accepted):
+    config = dict(config)
+    message = {"nd2wsi": "pane-panel-shortcut", "panel": panel, **config.pop("message", {})}
+    out = pane(iframe=True, message=message, **config)
+    assert out["clicks"] == ([button] if accepted else [])
+
+
+@pytest.mark.parametrize("panel", ["unknown", "toString", "__proto__", None])
+def test_shell_panel_messages_do_not_dispatch_arbitrary_buttons(panel):
+    out = pane(iframe=True, message={"nd2wsi": "pane-panel-shortcut", "panel": panel})
+    assert out["clicks"] == []
+
+
+def test_disabled_panel_stays_disabled_for_forwarded_keys():
+    out = pane(iframe=True, disabled=["tb-region"],
+               message={"nd2wsi": "pane-panel-shortcut", "panel": "region"})
+    assert out["clicks"] == []
 
 
 @pytest.mark.parametrize("letter", ["C", "A"])
@@ -382,7 +484,8 @@ def test_selected_read_only_text_keeps_native_copy_and_select_all(letter, platfo
     assert out["events"] == [{"prevented": False, "stopped": False}]
 
 
-@pytest.mark.parametrize("letter,button", [("C", "tb-channels"), ("A", "tb-annot")])
+@pytest.mark.parametrize("letter,button", [("C", "tb-channels"), ("A", "tb-annot"),
+                                          ("I", "tb-info")])
 def test_disabled_command_panel_stays_reserved_without_toggling(letter, button):
     out = pane([key(letter, metaKey=True)], disabled=[button])
     assert out["clicks"] == []

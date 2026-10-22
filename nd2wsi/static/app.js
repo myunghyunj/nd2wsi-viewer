@@ -269,8 +269,18 @@ function receiveShadingCommand(message) {
       postShadingState();
       return;
     }
-    state.shadingCommandSeq = message.commandSeq;
-    state.shading?.activate(message.action, message.contextKey, message.confirmed === true);
+    if (message.action === "start") {
+      const method = message.method === undefined ? "bffree" : message.method;
+      if (!window.Nd2ShadingCorrection.methodSupport(status, method).supported) {
+        postShadingState();
+        return;
+      }
+      state.shadingCommandSeq = message.commandSeq;
+      state.shading?.activate(message.action, message.contextKey, true, method);
+    } else {
+      state.shadingCommandSeq = message.commandSeq;
+      state.shading?.activate(message.action, message.contextKey, message.confirmed === true);
+    }
   }
 }
 
@@ -3801,6 +3811,13 @@ function wireCompareRelay() {
       receiveCompareLifecycle(event.data);
     } else if (event.data.nd2wsi === "tab-shortcut-state") {
       state.tabCount = Math.max(0, Math.floor(Number(event.data.count) || 0));
+    } else if (event.data.nd2wsi === "pane-panel-shortcut") {
+      refreshSpatialContext();
+      // A shell key belongs to the pane/site selected when it was pressed,
+      // including a plate grid, not a later reload or site selection.
+      if (state.viewportRelay.commandGate.matchesLocal(event.data)) {
+        togglePanelForShortcut(event.data.panel);
+      }
     } else if (event.data.nd2wsi === "pane-orientation-shortcut") {
       refreshSpatialContext();
       // A shell-focused shortcut captures one pane/site. Never replay it on a
@@ -4925,6 +4942,15 @@ function applyOrientationShortcut(action) {
   return applyDesiredDisplayTransform();
 }
 
+function togglePanelForShortcut(panel) {
+  if (state.quitPreparing) return false;
+  const buttons = { channels: "tb-channels", region: "tb-region", annot: "tb-annot", info: "tb-info" };
+  const button = Object.hasOwn(buttons, panel) ? $(buttons[panel]) : null;
+  if (!button || button.disabled) return false;
+  button.click();
+  return true;
+}
+
 function wireKeys() {
   window.addEventListener("keydown", (ev) => {
     const shortcuts = window.Nd2ShortcutRouter;
@@ -4956,11 +4982,6 @@ function wireKeys() {
       $("ann-geojson").click();
       return;
     }
-    if (command && !ev.shiftKey && letterCode === "KeyI") {
-      ev.preventDefault();
-      $("tb-info").click();
-      return;
-    }
     const tabIndex = shortcuts ? shortcuts.tabIndexForEvent(ev) : null;
     if (tabIndex !== null) {
       // ⌘1 to ⌘9 pick a tab; the shell owns the tabs
@@ -4978,8 +4999,7 @@ function wireKeys() {
       if (shortcuts?.isPanelShortcut(ev)) {
         ev.preventDefault();
         ev.stopPropagation();
-        const btn = panel && $({ channels: "tb-channels", annot: "tb-annot" }[panel]);
-        if (btn && !btn.disabled) btn.click();
+        if (panel) togglePanelForShortcut(panel);
       }
       return; // preserve native copy/select-all when the router yields ownership
     }
@@ -4995,8 +5015,7 @@ function wireKeys() {
       ev.stopPropagation();
       if (ev.repeat || ev.shiftKey) return;
       if (panel) {
-        const btn = $({ channels: "tb-channels", region: "tb-region", annot: "tb-annot" }[panel]);
-        if (btn && !btn.disabled) btn.click();
+        togglePanelForShortcut(panel);
       } else if (letterCode === "KeyV") { if (state.roi) setTool("move"); }
       else if (letterCode === "KeyM") setTool("measure");
       else if (letterCode === "KeyP") setTool("pin");

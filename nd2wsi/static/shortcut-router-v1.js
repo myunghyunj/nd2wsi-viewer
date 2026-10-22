@@ -9,6 +9,7 @@
   const COMMAND_PANEL_BY_CODE = Object.freeze({
     KeyC: "channels",
     KeyA: "annot",
+    KeyI: "info",
   });
   const ORIENTATION_BY_CODE = Object.freeze({
     KeyR: "rotate-right",
@@ -120,11 +121,12 @@
     if (isBlocked(event) || event.altKey || event.shiftKey) return false;
     const code = letterCode(event);
     if (commandPressed(event, platform)) {
+      if (!Object.hasOwn(COMMAND_PANEL_BY_CODE, code)) return false;
+      if (code === "KeyI") return true;
       // Copy/select-all keep their native meaning in controls and whenever
       // the document has meaningful selected text, including read-only Info.
       const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-      return Boolean(COMMAND_PANEL_BY_CODE[code]) &&
-        ![event.target, ...path].some(isFocusControl) && !hasTextSelection(event);
+      return ![event.target, ...path].some(isFocusControl) && !hasTextSelection(event);
     }
     return !event.metaKey && !event.ctrlKey && code === "KeyE";
   }

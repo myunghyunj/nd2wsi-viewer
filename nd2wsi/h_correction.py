@@ -26,6 +26,7 @@ _ALIASES = {
     "BRIGHT FIELD": "BF",
 }
 _TARGET_CHANNELS = ("FITC", "CY3", "BF")
+_BFFREE_CHANNELS = ("FITC", "CY3", "DAPI")
 _ACTIVE = {"preparing", "fitting", "preparing_display", "rebuilding", "publishing"}
 _WORKSPACE_LIMIT = 4 * 1024**3
 _FIT_MEMORY_LIMIT = 1024**3
@@ -78,27 +79,33 @@ class _Cancelled(Exception):
     pass
 
 
-def _mapping(names: list[str]) -> dict[str, int]:
+def _mapping(names: list[str], method="h", *, require_correctable=True) -> dict[str, int]:
     result = {}
     for index, name in enumerate(names):
         canonical = _ALIASES.get(name.strip().upper())
+        if method == "bffree" and canonical not in _BFFREE_CHANNELS:
+            continue
         if canonical:
             if canonical in result:
                 raise UnsupportedCorrection(f"Ambiguous duplicate {canonical} channels")
             result[canonical] = index
-    if "BF" not in result:
+    if method == "bffree" and require_correctable and not {"FITC", "CY3"}.intersection(result):
+        raise UnsupportedCorrection("Rank1 correction needs FITC or CY3; DAPI may help estimate the pattern")
+    if method == "h" and "BF" not in result:
         raise UnsupportedCorrection("Shading Correction requires a BF channel")
     return result
 
 
-def _basic_reason(state: Any) -> str:
+def _basic_reason(state: Any, method="h") -> str:
     """Cheap capability hint; the worker verifies original metadata later."""
     try:
         meta = state.attrs["nd2wsi"]
         if not getattr(state, "correction_write_allowed", True):
             return "Agent windows can replace pyramids only in their private exports folder"
         if state.plate is not None or meta.get("plate"):
-            return "Shading Correction is available for stitched single-frame ND2 slides"
+            return ("Plate/time-series correction is not yet supported. The current method "
+                    "requires spatial repetition within a stitched single-frame ND2 slide; "
+                    "native plate frames remain unchanged.")
         path = state.source_path
         if path is None or Path(path).suffix.lower() != ".nd2" or not Path(path).is_file():
             return "Shading Correction needs the original ND2 source"
@@ -127,7 +134,7 @@ def _basic_reason(state: Any) -> str:
                 or tuple(state.root[str(k)].shape) != (c, level["height"], level["width"])
             ):
                 return "The pyramid geometry is unsupported for Shading Correction"
-        _mapping([ch["label"] for ch in state.attrs["omero"]["channels"]])
+        _mapping([ch["label"] for ch in state.attrs["omero"]["channels"]], method)
     except (KeyError, TypeError, ValueError, OSError) as exc:
         return (
             str(exc)
@@ -142,7 +149,7 @@ def _source_stamp(path: Path) -> tuple[int, int, int, int]:
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
-def _estimated_seconds(state: Any) -> int:
+def _estimated_seconds(state: Any, method="h") -> int:
     """Approximate preflight duration from metadata, without reading pixels.
 
     A verified source-backed 36,599 x 22,895 raster with four channels and
@@ -154,14 +161,15 @@ def _estimated_seconds(state: Any) -> int:
     Runtime ETA remains based on progress observed in the current job.
     """
     channels, height, width = state.root["0"].shape
-    mapping = _mapping([ch["label"] for ch in state.attrs["omero"]["channels"]])
-    targets = sum(name in mapping for name in _TARGET_CHANNELS)
+    mapping = _mapping([ch["label"] for ch in state.attrs["omero"]["channels"]], method)
+    targets = sum(name in mapping for name in (
+        _BFFREE_CHANNELS if method == "bffree" else _TARGET_CHANNELS))
     pixels = height * width / (36599 * 22895)
     seconds = pixels * (50.8 * channels / 4 + 9.7 + 112.8 * targets / 2)
     return max(30, math.ceil(1.25 * seconds / 15) * 15)
 
 
-def _metadata_for_state(state: Any) -> dict:
+def _metadata_for_state(state: Any, method="h") -> dict:
     """Read metadata only; every pixel continues through the registered root."""
     import nd2
 
@@ -195,13 +203,20 @@ def _metadata_for_state(state: Any) -> dict:
             raise UnsupportedCorrection(
                 "The original ND2 channel order differs from the open slide"
             )
-        mapping = _mapping(names)
+        mapping = _mapping(names, method)
         native = getattr(state.root, "raw_level0", state.root["0"])
         expected = (int(sizes.get("C", 1)), int(sizes["Y"]), int(sizes["X"]))
         if tuple(native.shape) != expected or np.dtype(reader.dtype) != np.dtype(native.dtype):
             raise UnsupportedCorrection(
                 "The original ND2 pixels differ from the registered native root"
             )
+        if method == "bffree":
+            if _source_stamp(path) != before:
+                raise UnsupportedCorrection("The ND2 source changed during metadata inspection")
+            # Rank1 receives no BF pixels, camera geometry, masks, or BF-derived
+            # initialization. Available fluorescence supplies the evidence.
+            return {"sizes": sizes, "dtype": str(native.dtype), "channel_names": names,
+                    "channel_mapping": mapping, "source_stamp": before}
         raw = reader.unstructured_metadata(strip_prefix=False)
         picture = raw.get("ImageMetadataSeqLV|0", {}).get("SLxPictureMetadata", {})
         samples = picture.get("sPicturePlanes", {}).get("sSampleSetting", {})
@@ -318,6 +333,29 @@ def _prepare_inputs(state, directory: Path, read_native, check, progress):
         raise
 
 
+def _prepare_bffree_inputs(state, directory, mapping, read_native, check, progress):
+    """Read only explicit fluorescence targets; preserve true partial-bin means."""
+    _, h, w = state.root["0"].shape
+    indices = sorted(mapping.values())
+    raw32 = _new_map(directory / "raw32.npy", (len(indices), -(-h // 32), -(-w // 32)))
+    rows, cols = _block_geometry(state)
+    try:
+        for y in range(0, h, rows):
+            for x in range(0, w, cols):
+                for target, ci in enumerate(indices):
+                    check()
+                    block = read_native(ci, y, min(y + rows, h), x, min(x + cols, w))
+                    mean = _mean_blocks(block, 32)
+                    raw32[target, y // 32:y // 32 + mean.shape[0],
+                          x // 32:x // 32 + mean.shape[1]] = mean
+            progress(5 + 35 * min(y + rows, h) / h)
+        raw32.flush()
+        return raw32
+    except BaseException:
+        _close_maps([raw32])
+        raise
+
+
 class HCorrectionController:
     """One asynchronous, source-bound cache transaction for an open slide."""
 
@@ -329,11 +367,17 @@ class HCorrectionController:
         self._thread = None
         self._closed = False
         self._started_at = self._finished_at = None
-        reason = _basic_reason(state)
-        self._estimated_seconds = None if reason else _estimated_seconds(state)
+        self._methods = {method: {"supported": not bool(reason), "reason": reason}
+                         for method in ("h", "bffree")
+                         for reason in [_basic_reason(state, method)]}
+        supported = any(item["supported"] for item in self._methods.values())
+        reason = "" if supported else self._methods["h"]["reason"]
+        estimate_method = "bffree" if self._methods["bffree"]["supported"] else "h"
+        self._estimated_seconds = _estimated_seconds(state, estimate_method) if supported else None
         self._status = {
             "state": "unsupported" if reason else "idle", "supported": not bool(reason),
-            "reason": reason, "pct": 0, "operation": None, "frame": None,
+            "reason": reason, "pct": 0, "operation": None, "frame": None, "method": "bffree",
+            "methods": self._methods,
         }
         self._sync_committed()
         if self._status["applied"] and not reason:
@@ -348,7 +392,10 @@ class HCorrectionController:
             correction_id=correction.get("correction_id"),
             channels=[names[i]["label"] for i in indices if 0 <= i < len(names)],
             generation=self.state.generation,
+            model_schema=correction.get("model_schema"),
         )
+        if correction.get("applied"):
+            self._status["method"] = correction.get("method", "h")
 
     def status(self) -> dict:
         with self._lock:
@@ -387,13 +434,18 @@ class HCorrectionController:
                 if self._status["state"] not in _ACTIVE:
                     self._finished_at = time.monotonic()
 
-    def start(self):
-        return self._start("apply")
+    def start(self, method="bffree", experimental_confirmed=False):
+        if method not in ("h", "bffree"):
+            raise ValueError("Unknown Shading Correction method")
+        # Retain the preview keyword for callers; Rank1 is the adopted default.
+        if not isinstance(experimental_confirmed, bool):
+            raise ValueError("Experimental confirmation must be a boolean")
+        return self._start("apply", method)
 
     def revoke(self):
         return self._start("revoke")
 
-    def _start(self, operation):
+    def _start(self, operation, method="h"):
         self.status()  # Observe another window's committed cache first.
         with self._lock:
             if self._closed:
@@ -402,6 +454,8 @@ class HCorrectionController:
                 return self.status()
             if not self._status["supported"]:
                 return self.status()
+            if operation == "apply" and not self._methods[method]["supported"]:
+                raise ValueError(self._methods[method]["reason"])
             if (operation == "apply") == self._status["applied"]:
                 raise ValueError("Revoke the applied correction first" if operation == "apply"
                                  else "There is no applied Shading Correction to revoke")
@@ -410,9 +464,11 @@ class HCorrectionController:
             self._started_at, self._finished_at = time.monotonic(), None
             self._status.update(state="preparing" if operation == "apply" else "rebuilding",
                                 operation=operation, reason="", pct=0)
+            if operation == "apply":
+                self._status["method"] = method
             self._status.pop("channel_results", None)
             self._status.pop("reason_code", None)
-            self._thread = threading.Thread(target=self._run, args=(self._cancel, operation),
+            self._thread = threading.Thread(target=self._run, args=(self._cancel, operation, method),
                                             daemon=True, name="h-correction")
             self._thread.start()
             return self.status()
@@ -433,7 +489,7 @@ class HCorrectionController:
             self._finished_at = time.monotonic()
             self._status.update(state="cancelled", reason="Slide closed")
 
-    def _run(self, event, operation):
+    def _run(self, event, operation, method="h"):
         from .h_persistence import PreparationCancelled, prepare_apply, prepare_revoke
 
         temporary = model = replacement = None
@@ -463,33 +519,53 @@ class HCorrectionController:
                 replacement = prepare_revoke(self.state, event,
                     lambda fraction: self._update(event, pct=round(95 * fraction)))
             else:
-                meta = _metadata_for_state(self.state)
+                meta = (_metadata_for_state(self.state, "bffree") if method == "bffree"
+                        else _metadata_for_state(self.state))
                 stamp = tuple(meta["source_stamp"])
                 check_source()
                 c, h, w = self.state.root["0"].shape
                 estimated = c * (-(-h // 8) * -(-w // 8) + -(-h // 32) * -(-w // 32)) * 4 + 16 * 1024**2
+                if method == "bffree":
+                    estimated = len(meta["channel_mapping"]) * -(-h // 32) * -(-w // 32) * 4 + 16 * 1024**2
                 if estimated > _WORKSPACE_LIMIT:
                     raise UnsupportedCorrection("This acquisition exceeds the correction fitting workspace limit")
                 temporary = tempfile.TemporaryDirectory(prefix="nd2wsi-h-")
                 directory = Path(temporary.name)
                 if shutil.disk_usage(directory).free < estimated + 256 * 1024**2:
                     raise UnsupportedCorrection("There is insufficient temporary space for Shading Correction")
-                raw8, raw32 = _prepare_inputs(self.state, directory, read_native, check_source,
-                    lambda pct: self._update(event, pct=round(pct)))
-                inputs = [raw8, raw32]
+                if method == "bffree":
+                    raw32 = _prepare_bffree_inputs(self.state, directory, meta["channel_mapping"],
+                        read_native, check_source, lambda pct: self._update(event, pct=round(pct)))
+                    inputs = [raw32]
+                else:
+                    raw8, raw32 = _prepare_inputs(self.state, directory, read_native, check_source,
+                        lambda pct: self._update(event, pct=round(pct)))
+                    inputs = [raw8, raw32]
                 check_source()
                 self._update(event, state="fitting", pct=40)
-                model, result = _fit_model(raw8, raw32, meta, directory / "model.npz", check,
-                    lambda fraction: self._update(event, pct=round(40 + 15 * fraction)))
+                if method == "bffree":
+                    from .bffree_model import Unsupported, fit
+                    fit_meta = {key: meta[key] for key in ("sizes", "channel_names", "channel_mapping")}
+                    fit_meta["sizes"] = {axis: meta["sizes"][axis] for axis in ("Y", "X")}
+                    try:
+                        model, result = fit(raw32, fit_meta, directory / "model.npz", check=check,
+                            progress=lambda fraction: self._update(event, pct=round(40 + 15 * fraction)))
+                    except Unsupported as exc:
+                        raise UnsupportedCorrection(str(exc), reason_code="bffree_working_memory_limit") from exc
+                else:
+                    model, result = _fit_model(raw8, raw32, meta, directory / "model.npz", check,
+                        lambda fraction: self._update(event, pct=round(40 + 15 * fraction)))
                 _close_maps(inputs)
                 inputs = []
                 for name in ("raw8.npy", "raw32.npy"):
-                    (directory / name).unlink()
+                    (directory / name).unlink(missing_ok=True)
                 check_source()
                 self._update(event, channel_results=result["selected"])
                 if not any(model.enabled):
                     self._update(event, state="unchanged", pct=100,
-                                 reason="No reproducible, valid FITC/CY3/BF correction was found")
+                                 reason=("No supported Rank1 correction was found"
+                                         if method == "bffree" else
+                                         "No reproducible, valid FITC/CY3/BF correction was found"))
                     return
                 self._update(event, state="preparing_display", pct=55)
                 replacement = prepare_apply(self.state, model, result, event,
@@ -511,7 +587,11 @@ class HCorrectionController:
                     self._status.update(state="cancelled",
                         reason="Slide closed" if self._closed else "Pyramid replacement cancelled")
         except UnsupportedCorrection as exc:
-            self._update(event, state="unsupported", supported=False, reason=str(exc),
+            if operation == "apply":
+                with self._lock:
+                    self._methods[method] = {"supported": False, "reason": str(exc)}
+            self._update(event, state="unsupported",
+                         supported=any(item["supported"] for item in self._methods.values()), reason=str(exc),
                          reason_code=exc.reason_code)
         except Exception as exc:
             self._update(event, state="failed", reason=f"{type(exc).__name__}: {exc}")

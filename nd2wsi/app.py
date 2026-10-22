@@ -826,6 +826,174 @@ def _startup_error(message: str, *, show_dialog: bool = True) -> None:
             pass
 
 
+def _gui_smoke_appkit_key(api: Api, window, context: dict, key: str, *, repeat: bool = False) -> dict:
+    """Send one process-local key through AppKit, only to this Agent key window.
+
+    Deliberately use NSApplication.sendEvent_ so native key equivalents and the
+    responder chain participate. This is not a physical/global keyboard event.
+    """
+    import AppKit
+    from Foundation import NSOperationQueue, NSThread
+
+    finished, cancelled = threading.Event(), threading.Event()
+    outcome = {}
+
+    def send():
+        try:
+            if cancelled.is_set():
+                return
+            current = api.window_context()
+            if (not current.get("enabled") or current.get("role") != "agent" or
+                    not current.get("id") or current.get("id") != context.get("id") or
+                    current.get("pid") != os.getpid() or getattr(window, "_js_api", None) is not api):
+                raise RuntimeError("Native keyboard smoke requires the same bound Agent session")
+            native = getattr(window, "native", None)
+            application = AppKit.NSApplication.sharedApplication()
+            if native is None or application.keyWindow() != native:
+                raise RuntimeError("Native keyboard smoke Agent window is not the exact key window")
+            number = int(native.windowNumber())
+            codes = {"a": 0, "c": 8, "e": 14, "i": 34}
+            modifiers = 0 if key == "e" else AppKit.NSEventModifierFlagCommand
+            outcome.update(window_number=number, key=key, command=key != "e", repeat=repeat)
+            for event_type in (AppKit.NSEventTypeKeyDown, AppKit.NSEventTypeKeyUp):
+                if cancelled.is_set():
+                    return
+                if application.keyWindow() != native or getattr(window, "native", None) != native:
+                    raise RuntimeError("Native keyboard smoke lost its Agent key window")
+                event = AppKit.NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(
+                    event_type, (0, 0), modifiers, time.monotonic(), number, None,
+                    key, key, repeat and event_type == AppKit.NSEventTypeKeyDown, codes[key])
+                if event is None:
+                    raise RuntimeError("AppKit did not create the smoke key event")
+                application.sendEvent_(event)
+        except Exception as exc:
+            outcome["error"] = str(exc)
+        finally:
+            finished.set()
+
+    if NSThread.isMainThread():
+        send()
+    else:
+        NSOperationQueue.mainQueue().addOperationWithBlock_(send)
+    if not finished.wait(5):
+        cancelled.set()  # A late main-queue callback must never inject a key.
+        raise TimeoutError("Native keyboard smoke main queue timed out")
+    if outcome.get("error"):
+        raise RuntimeError(outcome["error"])
+    return outcome
+
+
+_GUI_SMOKE_KEYBOARD_SETUP = """(() => {
+  const frame = document.querySelector('#frames iframe.active');
+  const view = frame && frame.contentWindow, page = frame && frame.contentDocument;
+  const toolbar = document.getElementById('newtab');
+  const ids = {annot:'tb-annot', channels:'tb-channels', region:'tb-region', info:'tb-info'};
+  if (!page || !toolbar || Object.values(ids).some(id => !page.getElementById(id)))
+    throw new Error('Native keyboard smoke controls are unavailable');
+  const panels = view.eval('state.windows');
+  const original = Object.fromEntries(Object.keys(ids).map(id => [id, panels[id].isHidden()]));
+  const focused = document.activeElement;
+  const input = document.createElement('input');
+  input.id = 'nd2wsi-native-keyboard-smoke-input'; input.type = 'text';
+  input.style.cssText = 'position:fixed;bottom:0;left:0;width:180px;z-index:99999';
+  document.body.appendChild(input);
+  const counts = Object.fromEntries(Object.keys(ids).map(id => [id, 0]));
+  const listeners = Object.entries(ids).map(([id, button]) => {
+    const element = page.getElementById(button), listener = () => { counts[id]++; };
+    element.addEventListener('click', listener); return [element, listener];
+  });
+  let events = [];
+  const observe = event => { events.push({key:event.key, code:event.code, repeat:event.repeat,
+    trusted:event.isTrusted, target:event.target.id || event.target.tagName}); };
+  window.addEventListener('keydown', observe, true);
+  window.__nd2wsiNativeKeyboardSmoke = {
+    prepare(editable, key) {
+      events = []; window.getSelection()?.removeAllRanges(); view.getSelection()?.removeAllRanges();
+      if (editable) {
+        input.value = key === 'c' || key === 'e' ? '' : 'native smoke';
+        input.focus(); input.setSelectionRange(0, 0);
+      } else toolbar.focus();
+      if (document.activeElement !== (editable ? input : toolbar))
+        throw new Error('Native keyboard smoke could not focus its target');
+      return this.snapshot();
+    },
+    snapshot() { return {counts:{...counts},
+      hidden:Object.fromEntries(Object.keys(ids).map(id => [id, panels[id].isHidden()])),
+      events:[...events], focused:document.activeElement.id, value:input.value,
+      selection:[input.selectionStart, input.selectionEnd]}; },
+    cleanup() {
+      window.removeEventListener('keydown', observe, true);
+      for (const [element, listener] of listeners) element.removeEventListener('click', listener);
+      for (const [id, hidden] of Object.entries(original)) {
+        if (panels[id].isHidden() !== hidden) panels[id][hidden ? 'close' : 'open']();
+      }
+      input.remove(); if (focused?.isConnected) focused.focus();
+      delete window.__nd2wsiNativeKeyboardSmoke;
+      return true;
+    },
+  };
+  return {ready:true};
+})()"""
+
+
+def _gui_smoke_native_keyboard(api: Api, window, *, slide: bool) -> dict:
+    """Bounded native menu/renderer check in the disposable macOS Agent only."""
+    report = {"status": "not_assessed", "scope": "process-local AppKit synthetic Latin keys; not physical input"}
+    if sys.platform != "darwin":
+        return {**report, "reason": "Native keyboard smoke is implemented for macOS only"}
+    context = api.window_context()
+    if not slide or not context.get("enabled") or context.get("role") != "agent":
+        return {**report, "reason": "Requires a loaded slide in a fresh Agent smoke window"}
+    report.update(status="failed", session_id=context.get("id"), steps=[])
+    setup = False
+    try:
+        if not context.get("id") or context.get("pid") != os.getpid() or getattr(window, "_js_api", None) is not api:
+            raise RuntimeError("Native keyboard smoke Agent identity is not bound to this window")
+        window.evaluate_js(_GUI_SMOKE_KEYBOARD_SETUP)
+        setup = True
+        for editable in (False, True):
+            for key, panel in (("a", "annot"), ("c", "channels"), ("e", "region"), ("i", "info")):
+                for repeat in ((False,) if editable else (False, True)):
+                    before = window.evaluate_js(
+                        f"window.__nd2wsiNativeKeyboardSmoke.prepare({str(editable).lower()}, {json.dumps(key)})")
+                    native = _gui_smoke_appkit_key(api, window, context, key, repeat=repeat)
+                    # WKWebView handles native input asynchronously. Give ignored
+                    # repeats/text shortcuts the same bounded observation window.
+                    deadline = time.monotonic() + 0.5
+                    while True:
+                        after = window.evaluate_js("window.__nd2wsiNativeKeyboardSmoke.snapshot()")
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.025)
+                    toggled = not editable and not repeat
+                    expected_counts = {name: count + int(toggled and name == panel)
+                                       for name, count in before["counts"].items()}
+                    expected_hidden = {name: (not hidden if toggled and name == panel else hidden)
+                                       for name, hidden in before["hidden"].items()}
+                    passed = after["counts"] == expected_counts and after["hidden"] == expected_hidden
+                    if editable:
+                        if key == "e":
+                            passed = passed and after["value"] == "e"
+                        elif key == "a":
+                            passed = passed and after["selection"] == [0, len(before["value"])]
+                        else:
+                            passed = passed and after["value"] == before["value"]
+                    report["steps"].append({**native, "focus": "editable" if editable else "shell-toolbar",
+                                            "panel": panel, "passed": passed, "before": before, "after": after})
+        report["status"] = "passed" if all(step["passed"] for step in report["steps"]) else "failed"
+        if report["status"] == "failed":
+            report["error"] = "Native keyboard routing, repeat suppression or editable protection failed"
+    except Exception as exc:
+        report["error"] = str(exc)
+    finally:
+        if setup:
+            try:
+                window.evaluate_js("window.__nd2wsiNativeKeyboardSmoke.cleanup()")
+            except Exception as exc:
+                report.update(status="failed", cleanup_error=str(exc))
+    return report
+
+
 def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 90) -> dict:
     """Exercise the real renderer, bridge and slide DOM, then close the app."""
     started = time.monotonic()
@@ -898,12 +1066,18 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                           !document.getElementById('shading-progress-title') ||
                           !document.getElementById('shading-cancel') ||
                           !['shading-confirm-title', 'shading-confirm-message', 'shading-confirm-estimate',
-                            'shading-confirm-continue', 'shading-confirm-cancel'].every(id => document.getElementById(id)) ||
+                            'shading-confirm-continue', 'shading-confirm-cancel', 'shading-method-h',
+                            'shading-method-bffree'].every(id => document.getElementById(id)) ||
                           typeof document.getElementById('shading-confirm')?.showModal !== 'function' ||
                           !window.Nd2ShadingCorrection || !view.Nd2ShadingCorrection ||
                           typeof window.Nd2ShadingCorrection.nextAction !== 'function' ||
-                          typeof view.Nd2ShadingCorrection.nextAction !== 'function')
+                          typeof view.Nd2ShadingCorrection.nextAction !== 'function' ||
+                          typeof window.Nd2ShadingCorrection.methodSupport !== 'function')
                         throw new Error('Packaged Shading Correction controls are unavailable');
+                      const rank1 = document.getElementById('shading-method-bffree');
+                      if (!rank1.defaultChecked || document.getElementById('shading-method-h').defaultChecked ||
+                          rank1.closest('label')?.textContent.trim() !== 'Rank1 (BF-free)')
+                        throw new Error('Packaged Rank1 label or default method is incorrect');
                       await step('shading-status', async () => {
                         const deadline = Date.now() + 10000;
                         while (!view.eval('state.shading && !state.shading.snapshot().refreshing && !state.shading.snapshot().view_stale && state.shading.snapshot().state !== "checking"') ||
@@ -1002,6 +1176,7 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                       const outcome = {ok: true, phase: 'complete', module: true, handlers: true, icons: assets,
                         info_images: infoImages,
                         shading_correction: {state: shadingStatus.state, applied: shadingStatus.applied,
+                          method: shadingStatus.method, methods: shadingStatus.methods,
                           operation: shadingStatus.operation, can_cancel: shadingStatus.can_cancel,
                           generation: shadingStatus.generation, actions: persistentActions,
                           progress: progressCheck, revoke_progress: revokeProgress, toolbar: true, confirmation: true},
@@ -1058,7 +1233,12 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         report.update(result)
                         if not matches_view_state(expected, result.get("observed_display")):
                             raise ValueError("Actual browser display state differs from the requested handoff")
-                    report.update(result, ok=True, phase="complete")
+                    native_keyboard = _gui_smoke_native_keyboard(api, window, slide=bool(result.get("slide")))
+                    report.update(result, native_keyboard=native_keyboard,
+                                  ok=native_keyboard["status"] != "failed", phase="complete")
+                    if native_keyboard["status"] == "failed":
+                        report.update(phase="native-keyboard", error=native_keyboard.get("error") or
+                                      native_keyboard.get("cleanup_error"))
                     break
             except Exception as exc:
                 report["last_error"] = str(exc)

@@ -9,10 +9,30 @@
   const working = new Set(["preparing", "fitting", "preparing_display", "rebuilding", "publishing"]);
   const terminal = new Set(["idle", "ready", "unchanged", "unsupported", "cancelled", "failed"]);
 
+  function methodSupport(status, method = "bffree") {
+    if (!["h", "bffree"].includes(method)) return { supported: false, reason: "Unknown correction method" };
+    const available = status?.methods ? status.methods[method] : method === "h" ? status : null;
+    if (status?.state === "unchanged" && !status.applied && (status.method || "h") === method) {
+      return { supported: false, reason: status.reason || "This method left the image unchanged" };
+    }
+    return { supported: available?.supported === true, reason: typeof available?.reason === "string"
+      ? available.reason : method === "bffree" ? "BF-free correction is unavailable for this source" : "" };
+  }
+
+  function anyMethodSupported(status) {
+    return methodSupport(status, "h").supported || methodSupport(status, "bffree").supported;
+  }
+
+  function methodLabel(method, modelSchema) {
+    return method === "bffree"
+      ? modelSchema === "BF_free_consensus_rank1/1" ? "Rank1 (BF-free)" : "BF-free (legacy preview)"
+      : method === "h" ? "BF-guided" : "";
+  }
+
   function nextAction(status) {
     if (!status || status.state === "checking" || status.pending || status.refreshing || status.view_stale) return null;
     if (working.has(status.state)) return status.can_cancel === true ? "cancel" : null;
-    if (!status.supported || (status.state === "unchanged" && !status.applied)) return null;
+    if (!anyMethodSupported(status) && !(status.applied && status.supported)) return null;
     return status.applied ? "revoke" : "start";
   }
 
@@ -30,10 +50,10 @@
       label: (status.operation === "revoke" ? "Rebuilding original pyramid " : "Applying Shading Correction ") +
         Math.round(Number(status.pct) || 0) + "%" + (status.can_cancel ? " · Click to cancel" : " · Saving"),
     };
-    if (status.state === "unchanged" && !status.applied) return {
+    if (status.state === "unchanged" && !status.applied && !anyMethodSupported(status)) return {
       disabled: true, busy: false, label: "Shading Correction: image unchanged" + reason,
     };
-    if (!status.supported) return { disabled: true, busy: false, label: "Shading Correction unavailable" + reason };
+    if (!anyMethodSupported(status) && !(status.applied && status.supported)) return { disabled: true, busy: false, label: "Shading Correction unavailable" + reason };
     if (status.state === "failed") return {
       disabled: false, busy: false,
       label: (status.operation === "revoke" ? "Revoke Shading Correction failed" : "Shading Correction failed") + reason + " · Click to retry",
@@ -41,7 +61,8 @@
     if (status.state === "cancelled") return { disabled: false, busy: false,
       label: "Pyramid rebuild cancelled · " + (status.applied ? "Shading Correction remains applied" : "Click to retry") };
     return { disabled: false, busy: false, label: status.applied
-      ? "Shading Correction applied · Revoke…" : "Apply Shading Correction" };
+      ? "Shading Correction applied · " + (methodLabel(status.method, status.model_schema) ? methodLabel(status.method, status.model_schema) + " · " : "") + "Revoke…"
+      : "Apply Shading Correction" };
   }
 
   function progress(status) {
@@ -130,7 +151,7 @@
       const generationHere = initiatedGeneration;
       const channels = Array.isArray(payload.channels) ? payload.channels.filter(value => typeof value === "string") : [];
       status = {
-        ...payload, pending: null, channels, supported: payload.supported === true,
+        ...payload, pending: null, channels, supported: payload.supported === true || anyMethodSupported(payload),
         applied: payload.applied === true, can_cancel: payload.can_cancel === true,
         operation: ["apply", "revoke"].includes(payload.operation) ? payload.operation : null,
         reason: typeof payload.reason === "string" ? payload.reason : "",
@@ -173,7 +194,7 @@
       schedulePoll();
       return true;
     }
-    async function request(action) {
+    async function request(action, selection = null) {
       if (disposed || !current()) return false;
       stopRequest();
       const captured = context, ticket = sequence;
@@ -181,7 +202,7 @@
       const settings = { cache: "no-store", signal: abort?.signal };
       if (action !== "status") Object.assign(settings, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ generation: captured.generation }),
+        body: JSON.stringify({ generation: captured.generation, ...(action === "start" ? selection : {}) }),
       });
       try {
         const response = await fetcher("api/shading/" + action, settings);
@@ -231,9 +252,14 @@
       if ((now?.key || null) !== (context?.key || null)) load();
       else emit();
     }
-    function activate(action, expectedKey, confirmed = false) {
+    function activate(action, expectedKey, confirmed = false, method = "bffree") {
       if (disposed || !current() || (expectedKey && expectedKey !== context.key) || options.isBlocked?.()) return Promise.resolve(false);
       if (action !== nextAction(snapshot())) return Promise.resolve(false);
+      let selection = null;
+      if (action === "start") {
+        if (!methodSupport(status, method).supported) return Promise.resolve(false);
+        selection = { method };
+      }
       if (action === "cancel") {
         initiatedOperation = null;
         initiatedGeneration = null;
@@ -244,10 +270,11 @@
         initiatedGeneration = context.generation;
         outcome = null;
         status = { ...status, state: action === "revoke" ? "rebuilding" : "preparing",
+          ...(action === "start" ? { method } : {}),
           operation: initiatedOperation, pending: action, pct: 0, reason: "", can_cancel: false };
       }
       emit();
-      return request(action);
+      return request(action, selection);
     }
     function dismissOutcome(expectedKey) {
       if (disposed || !current() || expectedKey !== context.key || !outcome) return false;
@@ -259,5 +286,5 @@
     return { load, syncContext, activate, dismissOutcome, snapshot, dispose };
   }
 
-  return { createController, nextAction, describe, progress, estimateLabel };
+  return { createController, nextAction, describe, progress, estimateLabel, methodSupport, methodLabel };
 });

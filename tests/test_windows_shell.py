@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import runpy
 import shutil
 import subprocess
@@ -227,6 +228,9 @@ const shellControls={
   'shading-confirm':mode==='missing-shading-confirmation'?null:{showModal(){}},
   'shading-confirm-title':{},'shading-confirm-message':{},'shading-confirm-estimate':{},
   'shading-confirm-continue':{},'shading-confirm-cancel':{},
+  'shading-method-h':{defaultChecked:mode==='wrong-shading-default'},
+  'shading-method-bffree':{defaultChecked:mode!=='missing-rank1-default',
+    closest:()=>({textContent:mode==='wrong-rank1-label'?'BaSiC':' Rank1 (BF-free)'})},
 };
 const context={window:{pywebview:{api:{update_status(){}}},__nd2wsiSmokeBridge:{version:'test'},Nd2ShadingCorrection:Shading},
   document:{readyState:'complete',querySelector:()=>frame,getElementById:id=>shellControls[id]||null},
@@ -256,6 +260,9 @@ vm.createContext(context);
     ("missing-shading-control", False, "Shading Correction controls are unavailable"),
     ("missing-shading-module", False, "Shading Correction controls are unavailable"),
     ("missing-shading-confirmation", False, "Shading Correction controls are unavailable"),
+    ("wrong-shading-default", False, "Rank1 label or default method is incorrect"),
+    ("missing-rank1-default", False, "Rank1 label or default method is incorrect"),
+    ("wrong-rank1-label", False, "Rank1 label or default method is incorrect"),
     ("legacy-shading-status", False, "committed pyramid state"),
     ("missing-icon", False, "HTTP 404"), ("invalid-icon", False, "Invalid packaged LUT icon"),
     ("copy-failure", True, "copy failed: Write permission denied"),
@@ -347,6 +354,176 @@ def test_gui_smoke_timeout_is_a_failure_and_closes_the_window(fake_webview):
     report = app.gui_smoke(app.Api(None), window, timeout=0)
     assert report["ok"] is False and "did not finish" in report["error"]
     window.destroy.assert_called_once()
+
+
+@pytest.fixture()
+def fake_native_keys(monkeypatch):
+    context = {"enabled": True, "role": "agent", "id": "fresh-agent", "pid": os.getpid()}
+    api = SimpleNamespace(window_context=lambda: dict(context))
+    native = SimpleNamespace(windowNumber=lambda: 47)
+    window = SimpleNamespace(native=native, _js_api=api, evaluate_js=Mock())
+    application = SimpleNamespace(keyWindow=Mock(return_value=native), sendEvent_=Mock())
+    event_factory = Mock(side_effect=lambda *args: args)
+    queue = SimpleNamespace(addOperationWithBlock_=Mock(side_effect=lambda callback: callback()))
+    main_thread = Mock(return_value=False)
+    monkeypatch.setitem(sys.modules, "AppKit", SimpleNamespace(
+        NSApplication=SimpleNamespace(sharedApplication=lambda: application),
+        NSEvent=SimpleNamespace(
+            keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_=event_factory),
+        NSEventTypeKeyDown=10, NSEventTypeKeyUp=11, NSEventModifierFlagCommand=1 << 20,
+    ))
+    monkeypatch.setitem(sys.modules, "Foundation", SimpleNamespace(
+        NSOperationQueue=SimpleNamespace(mainQueue=lambda: queue),
+        NSThread=SimpleNamespace(isMainThread=main_thread),
+    ))
+    monkeypatch.setattr(app.sys, "platform", "darwin")
+    return SimpleNamespace(api=api, window=window, context=context, application=application,
+                           event_factory=event_factory, queue=queue, main_thread=main_thread)
+
+
+@pytest.mark.parametrize("key, code, command", [("a", 0, True), ("c", 8, True), ("e", 14, False), ("i", 34, True)])
+@pytest.mark.parametrize("on_main_thread", [False, True])
+def test_native_smoke_uses_appkit_menu_path_on_main_queue(fake_native_keys, key, code, command, on_main_thread):
+    fake = fake_native_keys
+    fake.main_thread.return_value = on_main_thread
+    result = app._gui_smoke_appkit_key(fake.api, fake.window, fake.context, key, repeat=True)
+    assert result == {"window_number": 47, "key": key, "command": command, "repeat": True}
+    assert fake.queue.addOperationWithBlock_.call_count == int(not on_main_thread)
+    down, up = [call.args for call in fake.event_factory.call_args_list]
+    assert down[:3] == (10, (0, 0), (1 << 20) if command else 0)
+    assert down[4:] == (47, None, key, key, True, code)
+    assert up[0] == 11 and up[-2] is False
+    assert [call.args[0] for call in fake.application.sendEvent_.call_args_list] == [down, up]
+
+
+@pytest.mark.parametrize("change", ["user", "disabled", "session", "pid", "binding", "native", "key-window"])
+def test_native_smoke_refuses_other_identity_or_window(fake_native_keys, change):
+    fake = fake_native_keys
+    expected = dict(fake.context)
+    if change == "user":
+        fake.context["role"] = "user"
+    elif change == "disabled":
+        fake.context["enabled"] = False
+    elif change == "session":
+        fake.context["id"] = "another-agent"
+    elif change == "pid":
+        fake.context["pid"] = -1
+    elif change == "binding":
+        fake.window._js_api = object()
+    elif change == "native":
+        fake.window.native = None
+    else:
+        fake.application.keyWindow.return_value = object()
+    with pytest.raises(RuntimeError, match="Agent"):
+        app._gui_smoke_appkit_key(fake.api, fake.window, expected, "a")
+    fake.application.sendEvent_.assert_not_called()
+
+
+def test_native_smoke_rechecks_key_window_before_key_up(fake_native_keys):
+    fake = fake_native_keys
+    fake.application.sendEvent_.side_effect = lambda _event: setattr(fake.application.keyWindow, "return_value", object())
+    with pytest.raises(RuntimeError, match="lost its Agent key window"):
+        app._gui_smoke_appkit_key(fake.api, fake.window, fake.context, "e")
+    assert fake.application.sendEvent_.call_count == 1
+
+
+def test_native_smoke_cancels_late_main_queue_callback(fake_native_keys, monkeypatch):
+    fake = fake_native_keys
+    fake.queue.addOperationWithBlock_.side_effect = None
+
+    class ImmediateTimeout:
+        def __init__(self):
+            self.flag = False
+
+        def is_set(self):
+            return self.flag
+
+        def set(self):
+            self.flag = True
+
+        def wait(self, _timeout):
+            return False
+
+    monkeypatch.setattr(app.threading, "Event", ImmediateTimeout)
+    with pytest.raises(TimeoutError, match="main queue timed out"):
+        app._gui_smoke_appkit_key(fake.api, fake.window, fake.context, "e")
+    fake.queue.addOperationWithBlock_.call_args.args[0]()
+    fake.application.sendEvent_.assert_not_called()
+
+
+@pytest.mark.parametrize("condition", ["windows", "user", "no-slide"])
+def test_native_keyboard_skips_unsupported_scope_without_dom_or_input(fake_native_keys, monkeypatch, condition):
+    fake = fake_native_keys
+    if condition == "windows":
+        monkeypatch.setattr(app.sys, "platform", "win32")
+    if condition == "user":
+        fake.context["role"] = "user"
+    result = app._gui_smoke_native_keyboard(fake.api, fake.window, slide=condition != "no-slide")
+    assert result["status"] == "not_assessed"
+    fake.window.evaluate_js.assert_not_called()
+    fake.application.sendEvent_.assert_not_called()
+
+
+def test_gui_smoke_native_failure_is_not_retried(fake_webview, monkeypatch):
+    _, window = fake_webview
+    window.evaluate_js.return_value = {"bridge": True, "slide": True, "lut_toolbar": {"ok": True}}
+    native = Mock(return_value={"status": "failed", "error": "Native menu consumed Command-A"})
+    monkeypatch.setattr(app, "_gui_smoke_native_keyboard", native)
+    result = app.gui_smoke(app.Api(None), window, expect_slide=True)
+    assert result["ok"] is False and result["phase"] == "native-keyboard"
+    assert result["error"] == "Native menu consumed Command-A"
+    native.assert_called_once()
+    assert window.evaluate_js.call_count == 1
+    window.destroy.assert_called_once()
+
+
+def test_native_keyboard_dom_probe_observes_and_restores_agent_controls():
+    if NODE is None:
+        pytest.skip("node is not installed")
+    harness = r"""
+const fs=require('fs'),vm=require('vm'),script=JSON.parse(fs.readFileSync(0,'utf8'));
+const events={},handlers={},inputs=[];
+const hidden={annot:true,channels:false,region:true,info:true};
+const panels=Object.fromEntries(Object.keys(hidden).map(id=>[id,{
+  isHidden:()=>hidden[id],open:()=>hidden[id]=false,close:()=>hidden[id]=true,
+}]));
+const buttons=Object.fromEntries(Object.keys(hidden).map(id=>['tb-'+id,{
+  addEventListener:(_,callback)=>handlers[id]=callback,
+  removeEventListener:()=>delete handlers[id],
+}]));
+const focused={id:'original',isConnected:true,focus(){document.activeElement=this;}};
+const toolbar={id:'newtab',focus(){document.activeElement=this;}};
+const document={activeElement:focused,
+  getElementById:()=>toolbar,
+  querySelector:()=>({contentDocument:{getElementById:id=>buttons[id]},
+    contentWindow:{eval:()=>panels,getSelection:()=>({removeAllRanges(){}})}}),
+  body:{appendChild:input=>inputs.push(input)},
+  createElement:()=>({style:{},value:'',focus(){document.activeElement=this;},
+    setSelectionRange(a,b){this.selectionStart=a;this.selectionEnd=b;},remove(){inputs.pop();}}),
+};
+const window={getSelection:()=>({removeAllRanges(){}}),
+  addEventListener:(_,callback)=>events.keydown=callback,removeEventListener:()=>delete events.keydown};
+vm.runInNewContext(script,{document,window});
+const probe=window.__nd2wsiNativeKeyboardSmoke;
+const before=probe.prepare(false,'a');
+handlers.annot();hidden.annot=false;
+events.keydown({key:'a',code:'KeyA',repeat:false,isTrusted:true,target:toolbar});
+const after=probe.snapshot();
+const editable=probe.prepare(true,'a');
+probe.cleanup();
+process.stdout.write(JSON.stringify({before,after,editable,restored:hidden,focused:document.activeElement.id,
+  handlers:Object.keys(handlers),inputs:inputs.length,events:Object.keys(events),probe:!!window.__nd2wsiNativeKeyboardSmoke}));
+"""
+    result = subprocess.run([NODE, "-e", harness], input=json.dumps(app._GUI_SMOKE_KEYBOARD_SETUP),
+                            text=True, capture_output=True, check=True, timeout=10)
+    out = json.loads(result.stdout)
+    assert out["before"]["focused"] == "newtab"
+    assert out["before"]["counts"]["annot"] == 0 and out["after"]["counts"]["annot"] == 1
+    assert out["before"]["hidden"]["annot"] is True and out["after"]["hidden"]["annot"] is False
+    assert out["after"]["events"] == [{"key": "a", "code": "KeyA", "repeat": False, "trusted": True, "target": "newtab"}]
+    assert out["editable"]["value"] == "native smoke" and out["editable"]["selection"] == [0, 0]
+    assert out["restored"] == out["before"]["hidden"] and out["focused"] == "original"
+    assert out["handlers"] == out["events"] == [] and out["inputs"] == 0 and out["probe"] is False
 
 
 def test_gui_smoke_timeout_preserves_last_pending_phase(fake_webview, monkeypatch):

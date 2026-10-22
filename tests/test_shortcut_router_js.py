@@ -82,11 +82,12 @@ def test_panel_shortcuts_use_physical_codes_under_a_korean_input_source():
             {"event": {"code": "KeyE", "key": "ㄷ"}},
             {"event": {"code": "KeyA", "key": "ㅁ", "metaKey": True}},
             {"event": {"code": "KeyC", "key": "ㅊ", "metaKey": True}},
+            {"event": {"code": "KeyI", "key": "ㅑ", "metaKey": True}},
         ]
     )
-    assert [item["typing"] for item in out] == [False, False, False]
-    assert [item["panel"] for item in out] == ["region", "annot", "channels"]
-    assert [item["tab"] for item in out] == [None, None, None]
+    assert [item["typing"] for item in out] == [False] * 4
+    assert [item["panel"] for item in out] == ["region", "annot", "channels", "info"]
+    assert [item["tab"] for item in out] == [None] * 4
 
 
 def test_letter_shortcuts_follow_latin_keycaps_and_fall_back_for_korean():
@@ -356,7 +357,8 @@ def test_production_pages_use_the_router_and_document_the_same_shortcuts():
 
 
 @pytest.mark.parametrize("platform,modifier", [("MacIntel", "metaKey"), ("Win32", "ctrlKey")])
-@pytest.mark.parametrize("code,panel", [("KeyC", "channels"), ("KeyA", "annot")])
+@pytest.mark.parametrize("code,panel", [("KeyC", "channels"), ("KeyA", "annot"),
+                                       ("KeyI", "info")])
 def test_command_panels_require_the_platform_command_key(platform, modifier, code, panel):
     other = "ctrlKey" if modifier == "metaKey" else "metaKey"
     modifiers = [{modifier: True}, {}, {other: True}, {modifier: True, other: True},
@@ -364,6 +366,14 @@ def test_command_panels_require_the_platform_command_key(platform, modifier, cod
                  {modifier: True, "repeat": True}, {modifier: True, "defaultPrevented": True}]
     out = _run([{"platform": platform, "event": {"code": code, **flags}} for flags in modifiers])
     assert [row["panel"] for row in out] == [panel] + [None] * 7
+
+
+def test_info_shortcut_keeps_typing_guards_but_does_not_require_clearing_read_only_selection():
+    out = _run([{"event": {"code": "KeyI", "metaKey": True},
+                 "selection": "selected metadata", "target": target}
+                for target in [{"tag": "DIV"}, {"tag": "INPUT"}, {"tag": "TEXTAREA"},
+                               {"tag": "SELECT"}, {"contentEditable": True}]])
+    assert [row["panel"] for row in out] == ["info", None, None, None, None]
 
 
 @pytest.mark.parametrize("code", ["KeyC", "KeyA"])

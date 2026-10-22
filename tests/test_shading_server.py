@@ -166,6 +166,44 @@ def test_corrected_display_pixel_probe_reads_original_raw_level0(setup):
     assert np.all(st.root["0"] == 200)
 
 
+@pytest.mark.parametrize("extra", [
+    {"method": "bffree", "experimental_confirmed": "true"}, {"method": "unknown"},
+])
+def test_invalid_method_and_confirmation_type_are_rejected(setup, extra):
+    st, _, _, handler, response, calls = setup
+    handler.path = "/s/12345678/api/shading/start"
+    handler._body_json = lambda **kw: {"generation": st.generation, **extra}
+    handler.do_POST()
+    assert response["status"] == 400 and calls == []
+
+
+@pytest.mark.parametrize("extra", [{"method": "bffree"}, {"method": "bffree", "experimental_confirmed": False}])
+def test_rank1_does_not_require_experimental_opt_in(setup, extra):
+    st, _, _, handler, response, calls = setup
+    st._shading.start = lambda method, **kwargs: calls.append((method, kwargs)) or st.shading.status()
+    handler.path = "/s/12345678/api/shading/start"
+    handler._body_json = lambda **kw: {"generation": st.generation, **extra}
+    handler.do_POST()
+    assert response["status"] == 200
+    assert calls == [("bffree", {"experimental_confirmed": False})]
+
+
+def test_experimental_opt_in_is_forwarded_only_for_current_private_slide(setup):
+    st, _, _, handler, response, calls = setup
+    st._shading.start = lambda method, **kwargs: calls.append((method, kwargs)) or st.shading.status()
+    handler.path = "/s/12345678/api/shading/start"
+    handler._body_json = lambda **kw: {"generation": st.generation, "method": "bffree",
+                                     "experimental_confirmed": True}
+    handler.do_POST()
+    assert response["status"] == 200
+    assert calls == [("bffree", {"experimental_confirmed": True})]
+    calls.clear()
+    handler._body_json = lambda **kw: {"generation": "stale", "method": "bffree",
+                                     "experimental_confirmed": True}
+    handler.do_POST()
+    assert response["status"] == 409 and calls == []
+
+
 def test_slide_close_cancels_and_closes_correction_controller(setup):
     st, _, registry, _, _, calls = setup
     assert registry.remove("12345678")

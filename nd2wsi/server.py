@@ -259,6 +259,11 @@ class ViewerState:
 
     def refresh_pyramid(self):
         """Observe another window's atomic replacement without resetting sidecars."""
+        # PlateSource owns native frames and refreshes its thumbs.zarr cache.
+        # Thumbnail/focus writes legitimately change this container's identity;
+        # they are not replacement stitched pyramids under store.ome.zarr.
+        if self.plate is not None or self.attrs.get("nd2wsi", {}).get("plate"):
+            return
         identity = self._pyramid_identity()
         if identity is None or identity == self._cache_identity or self._closed:
             return
@@ -1648,8 +1653,17 @@ def make_handler(
                 if st is not None and sub in ("/api/shading/start", "/api/shading/revoke", "/api/shading/cancel"):
                     try:
                         data = self._body_json(limit=1000)
-                        if not isinstance(data, dict) or set(data) != {"generation"} or not isinstance(data["generation"], str):
+                        allowed = ({"generation", "method", "experimental_confirmed"}
+                                   if sub == "/api/shading/start" else {"generation"})
+                        if (not isinstance(data, dict) or "generation" not in data
+                                or set(data) - allowed or not isinstance(data["generation"], str)):
                             raise ValueError("expected the current slide generation")
+                        if sub == "/api/shading/start":
+                            if data.get("method", "bffree") not in ("h", "bffree"):
+                                raise ValueError("Unknown Shading Correction method")
+                            if ("experimental_confirmed" in data
+                                    and not isinstance(data["experimental_confirmed"], bool)):
+                                raise ValueError("Experimental confirmation must be a boolean")
                     except (ValueError, json.JSONDecodeError) as e:
                         return self._error(400, str(e))
                     try:
@@ -1659,8 +1673,12 @@ def make_handler(
                             return self._error(409, "The pyramid changed; refresh before continuing")
                         if not st.correction_write_allowed:
                             return self._error(403, "Agent windows can replace pyramids only in their private exports folder")
-                        action = {"/api/shading/start": controller.start,
-                                  "/api/shading/revoke": controller.revoke,
+                        if sub == "/api/shading/start":
+                            if "method" not in data:
+                                return self._json(controller.start())
+                            return self._json(controller.start(data["method"],
+                                experimental_confirmed=data.get("experimental_confirmed", False)))
+                        action = {"/api/shading/revoke": controller.revoke,
                                   "/api/shading/cancel": controller.cancel}[sub]
                         return self._json(action())
                     except ValueError as e:

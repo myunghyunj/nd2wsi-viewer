@@ -1,10 +1,26 @@
 # Shading Correction: method and validation limits
 
+## Rank1 (BF-free), the 2.4.0 default
+
+The confirmation dialog defaults to **Rank1 (BF-free)**, implemented by the adopted `consensus_rank1` procedure. It estimates repeating illumination from the current slide's fluorescence. FITC and CY3 are the only channels eligible for correction. DAPI may contribute frequency proposals and diagnostics, but its applied gain remains exactly one. BF and all other channels also remain unchanged. No BF pixels, BF-derived masks or geometry, camera priors, or model from another slide enter this fit.
+
+The fitter uses actual means of 32 × 32 native-pixel bins. Short final bins are excluded from fitting. Each eligible channel must support its own repeating template before a spatial amplitude field is fitted. The native gain is `G = 1 + A(x,y) × T(phase)`, and corrected display values are calculated as `raw / G` using float64 division before float32 storage. Intensity baselines are fitting terms only; the method does not normalize overall brightness or a time series. Channels without sufficient evidence retain identity gain. If none is corrected, the existing pyramid is retained.
+
+The saved model records its channel mapping, native dimensions, template, amplitude field, configuration and fit decisions in the `BF_free_consensus_rank1/1` format. On loading, the implementation checks these fields and rejects malformed, incompatible or oversized archives. The fitting admission budget is an estimate of working allocations, currently 1 GiB; it is not a limit on the entire application's memory use, which also includes decoding and pyramid construction.
+
+Rank1 requires a supported stitched, single-frame ND2 slide with the original source available and at least one FITC or CY3 channel. Plate/time-series acquisitions, Z projections, RGB data and other source formats are not supported for this correction. The existing **BF-guided** H method remains a separate manual choice when its own BF and camera-metadata requirements are met. An unsupported Rank1 fit does not silently invoke H.
+
+Source tests cover equivalence to the frozen reference procedure, channel decisions, native gain interpolation, subregion consistency, float64 division, exact identity for BF/DAPI, model reopen, malformed archives, memory admission and cancellation. Transaction tests cover cache publication, reopening, Revoke and original-value export paths. These are engineering checks. Within-acquisition periodic consistency cannot establish whether a repeating structure is illumination or specimen signal, and it does not establish biological preservation or quantitative assay validity. Inspect the corrected image before using rendered exports.
+
+The README before/after images and all numerical results in the following H sections describe the older BF-guided method. They are not evidence of Rank1 performance. The macOS source GUI smoke passed 12 checks of panel routing, held-key repeats and editable-field protection through AppKit and WKWebView. This used process-local synthetic Latin key events, not physical keyboard input. Packaged platform checks are recorded with the release artifacts. This smoke does not assess native Windows keyboard input.
+
+## BF-guided (H): retained method and historical evidence
+
 Version 2.2.1 evaluates FITC, CY3 and BF separately using the same scan's BF channel and recorded camera geometry. DAPI remains unchanged. When the original H fit cannot find enough complete repeated fields in its fixed validation regions, an adaptive fallback fits a periodic template with an amplitude that varies smoothly across the scan. Each target channel must pass its own evidence checks before it is corrected.
 
 Visible shading does not ensure that a scan contains enough usable repeated fields in the required validation regions. At least four supported fields per spatial group are required. If no target channel passes fitting and validation, no replacement pyramid is prepared or published. The viewer retains an explanation until it is dismissed. The unchanged-pyramid notice is limited to a confirmed unsuccessful attempt with the original cache generation; a lost connection alone does not establish that outcome.
 
-## Adaptive model checks
+### H adaptive model checks
 
 The acceptance criteria used for evaluation are read from the configuration and copied into the fit record. The adaptive fitter receives the same working-memory budget as the original fitter. This budget bounds estimated fitting allocations; it is not a measurement or limit on the whole application's resident memory, which also includes the ND2 decoder and pyramid generation.
 
@@ -20,9 +36,9 @@ A channel with insufficient calibration evidence or invalid gain bounds remains 
 
 This empirical bound does not guarantee improvement at every unseen pixel. Synthetic tests cover three-channel save/reopen/Revoke, exact original-value and DAPI preservation, malformed models, working-memory admission, and cancellation/publication behaviour. These engineering checks are distinct from the native-image results below.
 
-## Native validation of the 2.2.1 refinement
+### Native validation of the H 2.2.1 refinement
 
-The refinement addresses the visible residual bands in the same `1-2.nd2` acquisition. Development used the 27 previously exposed regions. In regions with a RAW-identifiable trough and complete flanks, median absolute depth suppression increased from 57.5% to 76.9% for FITC (16 regions), 37.7% to 70.7% for CY3 (18), and 36.7% to 78.2% for BF (16). No full-band region exceeded the unchanged dark-to-bright reversal threshold. These are development results, not independent validation.
+The refinement addresses the visible residual bands in the same development acquisition. Development used the 27 previously exposed regions. In regions with a RAW-identifiable trough and complete flanks, median absolute depth suppression increased from 57.5% to 76.9% for FITC (16 regions), 37.7% to 70.7% for CY3 (18), and 36.7% to 78.2% for BF (16). No full-band region exceeded the unchanged dark-to-bright reversal threshold. These are development results, not independent validation.
 
 Four further native regions were selected and frozen from RAW data before their corrected outputs were inspected. They do not overlap the previous regions or the template-training rectangle. With the final method fixed, all four regions passed each channel's reversal checks on both background and all-acquired profiles. Median background trough-depth suppression was:
 
@@ -38,7 +54,7 @@ The narrow `dim_FITC` and `full_band` crops retain signed-depth flags when their
 
 Across the 27 earlier regions, the four new regions and the expanded context, no polarity change occurred in 5,301 RAW-qualified BF object comparisons. DAPI, unsupported zeros and nested crop values remain exact. Some regions still have weak reduction, and one CY3 background profile has a larger residual depth than RAW. Whole-scan comparisons use identical saved LUTs; neither those images nor the selected-region percentages establish uniform improvement or biological preservation. Real-file application and package checks accompany the delivered build.
 
-## Native validation of the 2.2.0 candidate
+### Native validation of the H 2.2.0 candidate
 
 The final candidate was evaluated on one four-channel acquisition using 19 exposed development/regression regions and eight additional regions selected from RAW geometry before their corrected results were examined. Earlier candidates and their failures are retained: BF-only attenuation exposed a fluorescence reversal, and single-cell prediction calibration did not fully resolve it. Those exposed regions were used only as development evidence for the final spatial prediction check.
 
@@ -48,7 +64,7 @@ Additional fits excluded each test region from both geometry and fitting inputs.
 
 A preserved second acquisition exercised the original H fitter with all three channels enabled, with FITC/CY3 gains exactly equal to its previous two-channel fit. This is a regression check using preserved mean arrays, not a fresh decoder or independent-acquisition validation of the adaptive method. The native results above do not establish biological preservation or quantitative assay validity. Real-file application and delivered-package checks are recorded separately with each build.
 
-## Historical experiments excluded from 2.1.15
+### Historical H experiments excluded from 2.1.15
 
 A four-channel development acquisition (30,415 × 19,146 native pixels) was rejected by the original method because its fixed row-validation region contained too few usable repeated fields. The following earlier extensions were evaluated to determine whether other fields could support a correction. None was included in 2.1.15; this table is historical evidence, not validation of the 2.2 adaptive model.
 
@@ -63,8 +79,8 @@ The final percentages each describe one accepted field, not whole-slide performa
 
 ## Interpretation and storage
 
-The README comparison is a selected development example of the original H method. It illustrates a result on that acquisition; it does not establish improvement on other scans. Visual preference and local contrast checks do not establish biological preservation or quantitative assay validity.
+The README comparison is a selected development example of the original H method. It illustrates a result on that acquisition; it does not establish Rank1 performance or improvement on other scans. Visual preference and local contrast checks do not establish biological preservation or quantitative assay validity.
 
-An accepted correction replaces the viewing pyramid and persists its model, source identity, settings and selection record. Revoke rebuilds the original pyramid from the ND2. Native ND2/TIFF exports and pixel readouts retain original values. The original ND2, annotations and saved LUTs remain unchanged.
+An accepted correction replaces the viewing pyramid and persists its model, source identity, settings and selection record. Reopening uses that saved correction. Revoke rebuilds the original pyramid from the ND2. PNG/JPEG/SVG exports render the corrected display and use a `shading-corrected` filename suffix; native ND2/TIFF exports, including reduced-resolution exports, and pixel readouts retain original values. The original ND2, annotations and saved LUTs remain unchanged. Cancellation or failure before publication leaves the current committed cache intact.
 
-Updating the application retains existing saved corrections. Revoke and Apply are required to refit an already corrected cache with the new method.
+Updating the application retains existing saved corrections. The loader still reads earlier H formats and the BF-free preview format `BF_free_periodic_x1/1`; that preview fitter is not the 2.4.0 default. New Rank1 caches require version 2.4.0 or later. Revoke and Apply are required to refit an already corrected cache with the selected method.
