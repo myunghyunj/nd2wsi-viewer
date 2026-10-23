@@ -37,7 +37,9 @@ qa = Path(os.environ["ASTROMAP_QA_ROOT"]).resolve()
 report_path = qa / os.environ.get("ASTROMAP_QA_REPORT", "translucent-native-check.json")
 session = create_window_session("agent", qa / "sessions")
 api, parent = app.create_app_window(None, window_session=session)
-report = {"ok": False, "module": nd2wsi.__file__, "session": session.as_dict()}
+include_keyboard = os.environ.get("ND2WSI_QA_KEYBOARD") != "0"
+report = {"ok": False, "module": nd2wsi.__file__, "session": session.as_dict(),
+          "scope": "translucent-native-and-keyboard" if include_keyboard else "translucent-native-without-keyboard"}
 
 
 def write_report():
@@ -189,11 +191,42 @@ def pair_checks(overlay, child):
     child.evaluate_js("document.getElementById('overlay-lock').click(); true")
     wait_for(lambda: child.evaluate_js("!nd2Translucent.state.locked && !nd2Translucent.state.pending"),
              description="ROI navigation unlock")
+    minimum_layout = minimum_size_checks(child)
     check(hashes == [hashlib.sha256(path.read_bytes()).hexdigest() for path in (text, image)],
           "Pair import changed the reference files")
     return {"mapped": state["rois"], "first_camera": after_first, "next_camera": after_second,
             "inclusive_endpoints": True, "scale_preserved": True, "locked_navigation_blocked": True,
-            "reference_files_unchanged": True}
+            "reference_files_unchanged": True, "minimum_size_controls": minimum_layout}
+
+
+def minimum_size_checks(child):
+    """Keep the slider separate from ROI navigation and resize handles at 220 px."""
+    before = camera(child)
+    check(bridge_result(child, "pywebview.api.resize_window(220,160)")["ok"], "Minimum native resize failed")
+    wait_for(lambda: child.evaluate_js("innerWidth===220 && innerHeight===160"), description="minimum overlay size")
+    bridge_result(child, "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))")
+    geometry = child.evaluate_js("""(() => {
+      const rect=element=>{const r=element.getBoundingClientRect();return [r.x,r.y,r.width,r.height];};
+      return {opacity:rect(document.getElementById('opacity-control')),
+        navigation:rect(document.getElementById('window-controls')),
+        handles:[...document.querySelectorAll('.resize-handle')].map(rect),
+        navVisible:!document.getElementById('roi-controls').hidden};
+    })()""")
+    x, y, width, height = geometry["opacity"]
+    check(width > 100 and height > 0 and x >= 0 and y >= 0 and x + width <= 220 and y + height <= 160,
+          f"Minimum-size opacity control is clipped: {geometry}")
+    check(geometry["navVisible"], "Minimum-size check requires visible imported ROI navigation")
+    for rx, ry, rw, rh in [geometry["navigation"], *geometry["handles"]]:
+        check(min(x + width, rx + rw) <= max(x, rx) or min(y + height, ry + rh) <= max(y, ry),
+              f"Opacity control overlaps navigation or a resize handle: {geometry}")
+    time.sleep(.2)
+    path = save_cocoa_snapshot(child, session.exports_root / "translucent-minimum-size.png")
+    check_camera(camera(child), before, description="minimum-size resize")
+    check(bridge_result(child, f"pywebview.api.resize_window({before['size'][0]},{before['size'][1]})")["ok"],
+          "Could not restore native overlay size")
+    wait_for(lambda: child.evaluate_js(f"innerWidth==={before['size'][0]} && innerHeight==={before['size'][1]}"),
+             description="restore overlay size")
+    return {**geometry, "snapshot": str(path), "no_overlap": True}
 
 
 def hydrate_checks():
@@ -242,8 +275,14 @@ def run():
         wait_for(lambda: pane_eval(parent, "!!(state.info && state.annReady && state.viewer.isOpen())"),
                  description="private synthetic fluorescence source")
         report["shell_toolbar"] = shell_toolbar_checks()
-        report["native_keyboard"] = app._gui_smoke_native_keyboard(api, parent, slide=True)
-        check(report["native_keyboard"]["status"] == "passed", "Native keyboard smoke failed")
+        if include_keyboard:
+            report["native_keyboard"] = app._gui_smoke_native_keyboard(api, parent, slide=True)
+            check(report["native_keyboard"]["status"] == "passed", "Native keyboard smoke failed")
+        else:
+            report["native_keyboard"] = {
+                "status": "not_run",
+                "reason": "focused translucent behavior check; shared focus keyboard probe separately recorded",
+            }
         pane_eval(parent, """state.channels=[1]; state.luts=[null,{lo:100,hi:3500,gamma:.7}];
           const p=state.viewer.viewport; p.setRotation(90,true); p.setFlip(true);
           p.zoomTo(p.imageToViewportZoom(.8),null,true);

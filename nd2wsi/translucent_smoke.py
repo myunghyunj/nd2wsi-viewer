@@ -196,7 +196,7 @@ def save_cocoa_snapshot(window, path, *, timeout=30):
     return path
 
 
-def snapshot_cocoa(window, path, *, timeout=30):
+def snapshot_cocoa(window, path, *, timeout=30, expected_opacity=.55):
     """Snapshot this WKWebView, then inspect real PNG alpha and glyph pixels."""
     from PIL import Image
 
@@ -213,13 +213,71 @@ def snapshot_cocoa(window, path, *, timeout=30):
             (0, 0), (image.width - 1, 0), (0, image.height - 1), (image.width - 1, image.height - 1))]
         x, y, width, height = geometry["lock"]
         crop = pixels.crop((int(x * sx), int(y * sy), int((x + width) * sx), int((y + height) * sy)))
-        whites = sum(1 for r, g, b, a in crop.getdata() if min(r, g, b) > 230 and a > 170)
+        # The glyph has its own CSS opacity, so a more opaque image underneath
+        # darkens the composite RGB even when that glyph remains unchanged.
+        # Recover foreground coverage from alpha instead of requiring RGB>230.
+        glyph = [(r, g, b, a) for r, g, b, a in crop.getdata() if min(r, g, b) > 200 and a > 170]
+        whites = len(glyph)
+        background_alpha = round(expected_opacity * 255)
+        foreground_alpha = ((max(pixel[3] for pixel in glyph) - background_alpha) / (255 - background_alpha)
+                            if glyph and background_alpha < 255 else None)
         result = {"path": str(path), "size": [image.width, image.height], "center_rgba": middle,
-                  "corner_alpha": corners, "white_lock_pixels": whites}
+                  "corner_alpha": corners, "white_lock_pixels": whites,
+                  "lock_foreground_alpha": foreground_alpha}
     _check(all(alpha < 10 for alpha in corners), f"Rounded corners are not transparent: {result}")
-    _check(125 <= middle[3] <= 155, f"Image alpha is not approximately 55%: {result}")
+    _check(abs(middle[3] - round(expected_opacity * 255)) <= 8,
+           f"Image alpha is not approximately {expected_opacity:.0%}: {result}")
     _check(whites > 10, f"White lock glyph missing from native snapshot: {result}")
+    if expected_opacity < 1:
+        _check(foreground_alpha is not None and .75 <= foreground_alpha <= 1,
+               f"Image opacity also reduced the lock control: {result}")
     return result
+
+
+def exercise_opacity_controls(child, *, timeout=30, screenshot_path=None):
+    """Use the real range input; verify its bridge and native/layer effect."""
+    initial = child.evaluate_js("""(() => {
+      const slider=document.getElementById('overlay-opacity');
+      return {min:slider.min,max:slider.max,value:slider.value,disabled:slider.disabled,
+        confirmed:nd2Translucent.state.confirmedOpacity};
+    })()""")
+    _check(initial == {"min": "10", "max": "100", "value": "55", "disabled": False, "confirmed": .55},
+           f"Opacity slider did not start at 55% with 10–100% limits: {initial}")
+    before_camera = camera(child)
+    before_frame = native_state(child, timeout=timeout)["frame"]
+    steps = []
+    for percent in (30, 80, 55):
+        child.evaluate_js("""(() => {
+          const slider=document.getElementById('overlay-opacity');
+          slider.value=""" + json.dumps(str(percent)) + """;
+          slider.dispatchEvent(new Event('input',{bubbles:true})); return true;
+        })()""")
+        value = percent / 100
+        wait_for(lambda: child.evaluate_js(
+            f"Math.abs(nd2Translucent.state.confirmedOpacity-{value})<1e-6 && "
+            f"Math.abs(nd2Translucent.state.opacity-{value})<1e-6"),
+            timeout=timeout, description=f"opacity slider {percent}%")
+        context = bridge_result(child, "pywebview.api.translucent_context()", timeout=timeout)
+        actual = child.evaluate_js("""({layer:Number(getComputedStyle(document.getElementById('translucent-stage')).opacity),
+          value:document.getElementById('overlay-opacity').value,
+          label:document.getElementById('opacity-value').textContent})""")
+        _check(math.isclose(context["opacity"], value), "Bridge did not persist the confirmed opacity")
+        _check(actual["value"] == str(percent) and actual["label"] == f"{percent}%", "Opacity UI label disagrees with its value")
+        expected_layer = 1 if sys.platform == "win32" else value
+        _check(math.isclose(actual["layer"], expected_layer), "Opacity was applied to the wrong layer")
+        if sys.platform == "win32":
+            actual["native"] = native_state(child, timeout=timeout)["opacity"]
+            _check(math.isclose(actual["native"], value), "Windows native opacity disagrees with the slider")
+        elif screenshot_path is not None and percent != 55:
+            wait_for(lambda: child.evaluate_js("nd2Translucent.viewer.world.getItemAt(0).getFullyLoaded()"),
+                     timeout=timeout, description="opacity snapshot tiles")
+            time.sleep(.2)
+            path = Path(screenshot_path).with_name(f"translucent-opacity-{percent}.png")
+            actual["snapshot"] = snapshot_cocoa(child, path, timeout=timeout, expected_opacity=value)
+        check_camera(camera(child), before_camera, description="opacity adjustment")
+        _check(native_state(child, timeout=timeout)["frame"] == before_frame, "Opacity adjustment moved the window")
+        steps.append({"requested": value, "confirmed": context["opacity"], **actual})
+    return {"initial": initial, "steps": steps, "camera_and_window_unchanged": True}
 
 
 def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None, extra_checks=None):
@@ -265,6 +323,7 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
                "Lock control has an unwanted background or non-white glyph")
         _check(styles["navHidden"] == (not bool(source.get("rois"))), "ROI navigation visibility does not match imported data")
         result["styles"] = styles
+        result["opacity_control"] = exercise_opacity_controls(child, timeout=timeout, screenshot_path=screenshot_path)
 
         before = camera(child)
         _check(bridge_result(child, "pywebview.api.resize_window(744, 528)", timeout=timeout)["ok"], "Native resize failed")
@@ -303,6 +362,15 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
         child.evaluate_js("document.getElementById('overlay-lock').click(); true")
         wait_for(lambda: child.evaluate_js("nd2Translucent.state.locked && !nd2Translucent.state.pending"),
                  timeout=timeout, description="overlay lock")
+        _check(child.evaluate_js("document.getElementById('overlay-opacity').disabled"), "Lock did not disable the opacity slider")
+        rejected_opacity = bridge_result(child, "pywebview.api.set_translucent_opacity(.3)", timeout=timeout)
+        _check(not rejected_opacity["ok"] and math.isclose(rejected_opacity["opacity"], .55),
+               "Locked native bridge accepted an opacity change")
+        _check(math.isclose(bridge_result(child, "pywebview.api.translucent_context()", timeout=timeout)["opacity"], .55),
+               "Locked opacity changed its stored value")
+        if sys.platform == "win32":
+            _check(math.isclose(native_state(child, timeout=timeout)["opacity"], .55), "Locked native opacity changed")
+        result["locked_opacity_blocked"] = True
         before, before_native = camera(child), native_state(child, timeout=timeout)
         wheel(child)
         drag_image(child)

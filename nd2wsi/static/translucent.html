@@ -19,6 +19,10 @@
     <button type="button" id="overlay-lock" aria-label="Lock image and window" aria-pressed="false" title="Lock image and window (L)"><span class="overlay-glyph lock-glyph" aria-hidden="true"></span></button>
     <button type="button" id="overlay-close" aria-label="Close translucent viewer" title="Close translucent viewer (Esc)"><span class="overlay-glyph close-glyph" aria-hidden="true"></span></button>
   </div>
+  <div id="opacity-control">
+    <input type="range" id="overlay-opacity" min="10" max="100" step="1" value="55" aria-label="Opacity" aria-valuetext="55%" />
+    <output id="opacity-value" for="overlay-opacity" aria-hidden="true">55%</output>
+  </div>
   <div id="overlay-status" role="status" aria-live="polite">Opening image…</div>
   <div class="resize-handle" data-edge="n" aria-hidden="true"></div>
   <div class="resize-handle" data-edge="e" aria-hidden="true"></div>

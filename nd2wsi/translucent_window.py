@@ -19,6 +19,8 @@ from pathlib import Path
 from .window_chrome import NativeTitlebarDrag
 
 OPACITY = 0.55
+MIN_OPACITY = 0.10
+OPACITY_TIMEOUT = 5
 MIN_SIZE = (220, 160)
 MAX_SIZE = 8192
 
@@ -109,7 +111,7 @@ def validate_context(store, payload, *, slide_url):
     context = {"version": 1, "slide_url": slide_url, "query": "?" + cleaned if cleaned else "",
                "center": center, "zoom": zoom, "rotation": rotation, "flip": flip,
                "dimensions": [width, height],
-               "opacity": 1.0 if sys.platform == "win32" else OPACITY,
+               "opacity": OPACITY, "opacity_mode": "native" if sys.platform == "win32" else "layer",
                "locked": False}
     if payload.get("roi") is not None:
         context["roi"] = validate_roi(store, payload["roi"])
@@ -160,6 +162,8 @@ class TranslucentApi:
 
     def __init__(self, context, *, logger, on_closed):
         self._context = copy.deepcopy(context)
+        self._context.setdefault("opacity", OPACITY)
+        self._context["opacity_mode"] = "native" if sys.platform == "win32" else "layer"
         self._logger = logger
         self._on_closed = on_closed
         self._window = None
@@ -172,7 +176,8 @@ class TranslucentApi:
         self._lock = threading.RLock()
 
     def translucent_context(self):
-        return {**copy.deepcopy(self._context), "locked": self._locked}
+        with self._lock:
+            return {**copy.deepcopy(self._context), "locked": self._locked}
 
     def choose_roi_file(self):
         """Choose a coordinate-reference JPG and its AstroMapper TXT together."""
@@ -325,7 +330,7 @@ class TranslucentApi:
                 # WebView2's ordinary HWND host does not provide per-pixel
                 # desktop alpha. Native form opacity supplies the tracing
                 # effect (including controls) without applying alpha twice.
-                native.Opacity = OPACITY
+                native.Opacity = self._context["opacity"]
                 native.TopMost = True
                 native.ShowInTaskbar = False
                 self._round_windows_region()
@@ -356,6 +361,55 @@ class TranslucentApi:
         path.Dispose()
         if previous is not None:
             previous.Dispose()
+
+    def set_translucent_opacity(self, value):
+        """Change only this overlay; report the applied value for UI rollback."""
+        def rejected(message):
+            return {"ok": False, "opacity": self._context["opacity"], "message": message}
+
+        try:
+            value = _number(value, "Opacity", MIN_OPACITY, 1.0)
+        except ValueError as exc:
+            return rejected(str(exc))
+        with self._lock:
+            if self._closed or self._locked:
+                return rejected("Unlock the translucent viewer to change opacity.")
+            if sys.platform == "darwin":
+                # The browser applies alpha to image pixels only. Controls keep
+                # their original alpha and the native window remains clear.
+                self._context["opacity"] = value
+                return {"ok": True, "opacity": value}
+            if sys.platform != "win32" or self._window is None:
+                return rejected("Native opacity is unavailable.")
+            epoch = self._epoch
+
+        complete, cancelled = threading.Event(), threading.Event()
+        outcome = {}
+
+        def apply():
+            try:
+                with self._lock:
+                    if cancelled.is_set() or self._closed or self._locked or epoch != self._epoch:
+                        outcome.update(rejected("Opacity change was cancelled because the window state changed."))
+                        return
+                    native = self._window.native
+                    native.Opacity = value
+                    actual = _number(float(native.Opacity), "Native opacity", MIN_OPACITY, 1.0)
+                    self._context["opacity"] = actual
+                    outcome.update(ok=True, opacity=actual)
+            except Exception as exc:
+                outcome.update(rejected(f"Could not change opacity: {exc}"))
+            finally:
+                complete.set()
+
+        try:
+            self._dispatch(apply)
+        except Exception as exc:
+            return rejected(f"Could not change opacity: {exc}")
+        if not complete.wait(OPACITY_TIMEOUT):
+            cancelled.set()  # A delayed UI callback must not apply a stale value.
+            return rejected("Native opacity change timed out.")
+        return outcome
 
     def set_translucent_locked(self, locked):
         if type(locked) is not bool:

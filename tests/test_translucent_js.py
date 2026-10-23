@@ -39,7 +39,7 @@ function fakeViewer(){
   return {viewport,calls,handlers,nav:true,addHandler(name,cb){handlers[name]=cb;},
     forceRedraw(){},setMouseNavEnabled(value){this.nav=value;},destroy(){}};
 }
-function harness({failLock=false,initialContext={}}={}){
+function harness({failLock=false,failOpacity=false,opacityResult,initialContext={},bridgeOverrides={}}={}){
   const elements=new Map();
   function element(id){if(!elements.has(id))elements.set(id,{id,style:{},dataset:{},attributes:{},
     listeners:{},clientWidth:800,clientHeight:500,disabled:false,hidden:false,
@@ -54,9 +54,12 @@ function harness({failLock=false,initialContext={}}={}){
   const nativeCalls=[];
   const bridge={async set_translucent_locked(value){nativeCalls.push(['lock',value]);
       return failLock?{ok:false,error:'lock unavailable'}:{ok:true,locked:value};},
+    async set_translucent_opacity(value){nativeCalls.push(['opacity',value]);
+      return failOpacity?{ok:false,message:'opacity unavailable'}:{ok:true,opacity:opacityResult??value};},
     async close_translucent(){nativeCalls.push(['close']);return true;},
     async choose_roi_file(){nativeCalls.push(['choose']);return {ok:true,name:'test.txt',
       text:'INDEX\tX1\tY1\tX2\tY2\tNOTE\n1\t0\t0\t3\t3\t',coordinateSize:{width:1000,height:500}};}};
+  Object.assign(bridge,bridgeOverrides);
   const mounted=api.mount({window:win,document:doc,api:bridge,OSD,context:{...context,...initialContext},info,importer});
   viewer.handlers.open();
   return {mounted,viewer,element,win,nativeCalls,osdOptions,documentListeners};
@@ -270,3 +273,91 @@ def test_rgb_raster_uses_existing_tile_source_while_brightfield_remains_unsuppor
     """)
     assert result["rejected"] is True
     assert "/api/tile/0/0/0.jpg?" in result["url"]
+
+
+@pytest.mark.parametrize("mode,opacity", [("layer", .55), ("layer", .73), ("native", .73)])
+def test_opacity_slider_honors_initial_selection_without_double_applying_native_alpha(mode, opacity):
+    result = run(f"""
+      const h=harness({{initialContext:{{opacity_mode:{json.dumps(mode)},opacity:{opacity}}}}});
+      const slider=h.element('overlay-opacity');
+      return {{value:slider.value,label:h.element('opacity-value').textContent,
+        accessible:slider.attributes['aria-valuetext'],disabled:slider.disabled,
+        layer:h.element('translucent-stage').style.opacity,native:h.nativeCalls,
+        defaultOpacity:api.validateContext({{...context,opacity:undefined}},context.slide_url).opacity}};
+    """)
+    percent = str(round(opacity * 100))
+    assert result == {"value": percent, "label": percent + "%", "accessible": percent + "%",
+                      "disabled": False, "layer": "1" if mode == "native" else str(opacity),
+                      "native": [], "defaultOpacity": .55}
+
+
+@pytest.mark.parametrize("mode", ["layer", "native"])
+def test_opacity_slider_updates_live_then_syncs_response_without_moving_image_or_roi(mode):
+    result = run(f"""
+      const h=harness({{initialContext:{{opacity_mode:{json.dumps(mode)}}},opacityResult:.63}}),m=h.mounted;
+      m.setRois({{rois:[{{x:0,y:0,w:1,h:1}},{{x:100,y:100,w:1,h:1}}]}});
+      const before=api.camera(h.viewer),slider=h.element('overlay-opacity');
+      slider.value='70';const update=slider.listeners.input();
+      const live=h.element('translucent-stage').style.opacity;
+      await update;
+      let prevented=0,stopped=0;
+      const event={{key:'ArrowRight',altKey:false,target:{{closest:()=>h.element('opacity-control')}},
+        preventDefault(){{prevented++;}},stopPropagation(){{stopped++;}}}};
+      h.documentListeners.keydown(event);
+      const arrowPrevented=prevented;
+      h.element('opacity-control').listeners.pointerdown(event);
+      h.element('opacity-control').listeners.wheel(event);
+      h.element('overlay').listeners.pointerdown({{...event,altKey:true}});
+      return {{live,layer:h.element('translucent-stage').style.opacity,value:slider.value,
+        label:h.element('opacity-value').textContent,opacity:m.state.opacity,
+        confirmed:m.state.confirmedOpacity,native:h.nativeCalls,
+        cameraUnchanged:JSON.stringify(before)===JSON.stringify(api.camera(h.viewer)),
+        roi:m.state.roiIndex,arrowPrevented,prevented,stopped,gesture:m.state.gesture}};
+    """)
+    assert result == {"live": "1" if mode == "native" else "0.7",
+                      "layer": "1" if mode == "native" else "0.63",
+                      "value": "63", "label": "63%", "opacity": .63, "confirmed": .63,
+                      "native": [["opacity", .7]], "cameraUnchanged": True,
+                      "roi": 0, "arrowPrevented": 0, "prevented": 1, "stopped": 2, "gesture": None}
+
+
+def test_lock_drains_in_flight_and_latest_queued_opacity_before_freezing_slider():
+    result = run("""
+      let finish;const calls=[];
+      const h=harness({bridgeOverrides:{set_translucent_opacity(value){
+        calls.push(['opacity',value]);
+        return value===.3?new Promise(resolve=>{finish=resolve;}):Promise.resolve({ok:true,opacity:value});},
+        async set_translucent_locked(value){calls.push(['lock',value]);return {ok:true,locked:value};}}}),m=h.mounted;
+      const update=m.setOpacity(.3);await Promise.resolve();
+      m.setOpacity(.8);
+      const locking=m.toggleLock(),disabled=h.element('overlay-opacity').disabled;
+      const rejected=await m.setOpacity(.9),before=calls.slice();
+      finish({ok:true,opacity:.3});await update;await locking;
+      const locked={value:h.element('overlay-opacity').value,opacity:m.state.opacity,
+        disabled:h.element('overlay-opacity').disabled};
+      await m.toggleLock();
+      return {disabled,rejected,before,locked,calls,unlocked:h.element('overlay-opacity').disabled};
+    """)
+    assert result == {"disabled": True, "rejected": False, "before": [["opacity", .3]],
+                      "locked": {"value": "80", "opacity": .8, "disabled": True},
+                      "calls": [["opacity", .3], ["opacity", .8], ["lock", True], ["lock", False]],
+                      "unlocked": False}
+
+
+def test_failed_opacity_change_rolls_back_selection_and_image_to_last_confirmed_value():
+    result = run("""
+      let failing=false;
+      const h=harness({bridgeOverrides:{async set_translucent_opacity(value){
+        return failing?{ok:false,message:'opacity unavailable'}:{ok:true,opacity:value};}}}),m=h.mounted;
+      await m.setOpacity(.3);failing=true;
+      const update=m.setOpacity(.8),live=h.element('translucent-stage').style.opacity;
+      const success=await update;
+      const failed={success,live,value:h.element('overlay-opacity').value,
+        opacity:m.state.opacity,layer:h.element('translucent-stage').style.opacity,
+        label:h.element('opacity-value').textContent,error:h.element('overlay-status').textContent};
+      failing=false;await m.setOpacity(.7);
+      return {failed,recovered:m.state.opacity,statusHidden:h.element('overlay-status').hidden};
+    """)
+    assert result == {"failed": {"success": False, "live": "0.8", "value": "30", "opacity": .3,
+                                 "layer": "0.3", "label": "30%", "error": "opacity unavailable"},
+                      "recovered": .7, "statusHidden": True}

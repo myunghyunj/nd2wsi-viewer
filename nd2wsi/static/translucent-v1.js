@@ -22,7 +22,7 @@
       }
     }
     return { ...value, slide_url: slide.href, query: query.toString(),
-      opacity: Math.max(0, Math.min(1, Number.isFinite(value.opacity) ? value.opacity : .55)) };
+      opacity: Math.max(.1, Math.min(1, Number.isFinite(value.opacity) ? value.opacity : .55)) };
   }
 
   function makeTileSource(info, context, OSD) {
@@ -136,10 +136,68 @@
     const previousRoi = doc.getElementById("roi-previous");
     const nextRoi = doc.getElementById("roi-next");
     const roiIndex = doc.getElementById("roi-index");
+    const opacityControl = doc.getElementById("opacity-control");
+    const opacitySlider = doc.getElementById("overlay-opacity");
+    const opacityValue = doc.getElementById("opacity-value");
+    const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
+    const initialOpacity = validOpacity(context.opacity) ? context.opacity : .55;
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
-      rois: [], roiIndex: -1, roiName: "", loadingRois: false };
+      rois: [], roiIndex: -1, roiName: "", loadingRois: false,
+      opacity: initialOpacity, confirmedOpacity: initialOpacity };
     const showStatus = message => { status.textContent = message; status.hidden = !message; };
-    stage.style.opacity = String(context.opacity);
+    let opacityTask = null, opacityError = "";
+    const paintOpacity = () => {
+      const percent = Math.round(state.opacity * 100);
+      opacitySlider.value = String(percent);
+      opacitySlider.setAttribute("aria-valuetext", percent + "%");
+      opacitySlider.disabled = state.locked || state.pending;
+      opacityValue.textContent = percent + "%";
+      stage.style.opacity = context.opacity_mode === "native" ? "1" : String(state.opacity);
+    };
+    const setOpacity = value => {
+      if (state.locked || state.pending || !validOpacity(value)) {
+        paintOpacity();
+        return Promise.resolve(false);
+      }
+      state.opacity = value;
+      paintOpacity();
+      if (opacityTask) return opacityTask;
+      // A drag can emit input faster than the native bridge responds. Keep one
+      // request in flight and send only the latest remaining selection next.
+      opacityTask = Promise.resolve().then(async () => {
+        try {
+          while (true) {
+            const requested = state.opacity;
+            const result = await api.set_translucent_opacity(requested);
+            if (result?.ok === false && validOpacity(result.opacity)) state.confirmedOpacity = result.opacity;
+            requireSuccess(result, "Could not change the opacity");
+            state.confirmedOpacity = validOpacity(result?.opacity) ? result.opacity : requested;
+            if (state.opacity === requested) {
+              state.opacity = state.confirmedOpacity;
+              paintOpacity();
+              if (opacityError && status.textContent === opacityError) showStatus("");
+              opacityError = "";
+              return true;
+            }
+          }
+        } catch (error) {
+          state.opacity = state.confirmedOpacity;
+          paintOpacity();
+          opacityError = error.message || "Could not change the opacity";
+          showStatus(opacityError);
+          return false;
+        } finally { opacityTask = null; }
+      });
+      return opacityTask;
+    };
+    opacitySlider.addEventListener("input", () => setOpacity(Number(opacitySlider.value) / 100));
+    for (const name of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) {
+      opacityControl.addEventListener(name, event => event.stopPropagation());
+    }
+    opacityControl.addEventListener("wheel", event => {
+      event.preventDefault(); event.stopPropagation();
+    }, { passive: false });
+    paintOpacity();
     const viewer = OSD({
       element: stage, tileSources: makeTileSource(info, context, OSD),
       showNavigationControl: false, showNavigator: false, showSequenceControl: false,
@@ -174,6 +232,7 @@
       lock.title = (state.locked ? "Unlock" : "Lock") + " image and window (L)";
       lock.disabled = state.pending;
       viewer.setMouseNavEnabled(!state.locked && !state.pending);
+      paintOpacity();
       paintRois();
     };
     const cancelGesture = () => {
@@ -189,6 +248,8 @@
       if (state.ready) restoreCamera(viewer, camera(viewer)); // stop any in-flight pan/zoom
       paintLock();
       try {
+        // Finish the last opacity update before the native lock freezes it.
+        if (opacityTask) await opacityTask;
         const result = requireSuccess(await api.set_translucent_locked(state.locked), "Could not change the lock");
         if (typeof result?.locked === "boolean") state.locked = result.locked;
       } catch (error) {
@@ -320,7 +381,7 @@
     };
     doc.getElementById("window-drag").addEventListener("pointerdown", event => startGesture(event));
     overlay.addEventListener("pointerdown", event => {
-      if (event.altKey && !event.target.closest("button, .resize-handle")) startGesture(event);
+      if (event.altKey && !event.target.closest("button, input, #opacity-control, .resize-handle")) startGesture(event);
     }, true);
     for (const handle of doc.querySelectorAll(".resize-handle")) {
       handle.addEventListener("pointerdown", event => startGesture(event, handle.dataset.edge));
@@ -345,6 +406,7 @@
         event.preventDefault(); chooseRois(); return;
       }
       if (event.ctrlKey || event.metaKey) return;
+      if (event.target?.closest?.("#opacity-control") && /^(Arrow|Home$|End$|Page)/.test(event.key)) return;
       if (event.key === "Escape") { event.preventDefault(); close(); }
       else if (event.key.toLowerCase() === "l") { event.preventDefault(); toggleLock(); }
       else if (event.key === "ArrowLeft") { event.preventDefault(); selectRoi(state.roiIndex - 1); }
@@ -353,7 +415,7 @@
     // Keep the embedded page itself at 100%; zoom belongs to the image.
     doc.addEventListener("wheel", event => { if (event.ctrlKey || state.locked) event.preventDefault(); }, { passive: false });
     win.addEventListener("pagehide", () => { cancelGesture(); observer?.disconnect(); viewer.destroy(); }, { once: true });
-    return { viewer, state, toggleLock, close, resize, setRois, selectRoi };
+    return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity };
   }
 
   async function boot(win) {

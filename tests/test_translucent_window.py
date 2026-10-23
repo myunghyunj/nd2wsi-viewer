@@ -48,6 +48,7 @@ def test_context_preserves_display_query_and_image_coordinates(store, payload):
     assert result["rotation"] == 90
     assert result["flip"] is True
     assert result["dimensions"] == [8000, 6000]
+    assert result["opacity"] == overlay.OPACITY
     assert store.attrs == before
 
 
@@ -207,6 +208,101 @@ def test_native_configuration_uses_standalone_transparent_top_level(cocoa_api):
     q.api._configure_and_show()
     q.queued.pop(0)()
     q.native.makeKeyAndOrderFront_.assert_called_once()
+
+
+@pytest.mark.parametrize("value", [True, False, None, ".3", float("nan"), float("inf"), -.1, 0, .099, 1.01])
+def test_opacity_rejects_invalid_values_without_changing_display(cocoa_api, value):
+    q = cocoa_api
+    result = q.api.set_translucent_opacity(value)
+    assert result["ok"] is False and result["opacity"] == overlay.OPACITY
+    assert q.api.translucent_context()["opacity"] == overlay.OPACITY
+    assert not q.queued and not q.native.mock_calls
+
+
+def test_mac_opacity_persists_image_layer_value_and_rejects_locked_or_closed_changes(cocoa_api):
+    q = cocoa_api
+    for value in (.1, .3, .8, 1):
+        assert q.api.set_translucent_opacity(value) == {"ok": True, "opacity": value}
+        context = q.api.translucent_context()
+        assert context["opacity"] == value and context["opacity_mode"] == "layer"
+        context["opacity"] = .4
+        assert q.api.translucent_context()["opacity"] == value
+    q.native.setAlphaValue_.assert_not_called()
+    q.api.set_translucent_locked(True)
+    assert not q.api.set_translucent_opacity(.3)["ok"]
+    assert q.api.translucent_context()["opacity"] == 1
+    q.api.set_translucent_locked(False)
+    q.api.close_translucent()
+    assert not q.api.set_translucent_opacity(.3)["ok"]
+
+
+@pytest.fixture
+def windows_opacity_api(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda operation: operation))
+    native = SimpleNamespace(InvokeRequired=False, Opacity=overlay.OPACITY)
+    api = overlay.TranslucentApi({}, logger=Mock(), on_closed=Mock())
+    api._window = SimpleNamespace(native=native)
+    return api, native
+
+
+def test_windows_opacity_applies_native_alpha_before_returning_actual_value(windows_opacity_api):
+    api, native = windows_opacity_api
+    for value in (.1, .3, .8, 1):
+        assert api.set_translucent_opacity(value) == {"ok": True, "opacity": value}
+        assert native.Opacity == value
+        assert api.translucent_context()["opacity"] == value
+        assert api.translucent_context()["opacity_mode"] == "native"
+    api.set_translucent_locked(True)
+    assert not api.set_translucent_opacity(.3)["ok"]
+    assert native.Opacity == 1
+
+
+def test_windows_opacity_discards_queued_request_after_lock_cycle(windows_opacity_api, monkeypatch):
+    api, native = windows_opacity_api
+
+    def lock_cycle_then_apply(callback):
+        # A lock/unlock between the bridge call and its UI callback must cancel
+        # that request even though the current lock value is false again.
+        api._epoch += 2
+        callback()
+
+    monkeypatch.setattr(api, "_dispatch", lock_cycle_then_apply)
+    assert not api.set_translucent_opacity(.3)["ok"]
+    assert native.Opacity == overlay.OPACITY
+    assert api.translucent_context()["opacity"] == overlay.OPACITY
+
+
+def test_windows_opacity_timeout_cancels_late_native_callback(windows_opacity_api, monkeypatch):
+    api, native = windows_opacity_api
+    queued = []
+    monkeypatch.setattr(api, "_dispatch", queued.append)
+    monkeypatch.setattr(overlay, "OPACITY_TIMEOUT", .001)
+    result = api.set_translucent_opacity(.3)
+    assert not result["ok"] and "timed out" in result["message"]
+    queued.pop()()
+    assert native.Opacity == overlay.OPACITY
+    assert api.translucent_context()["opacity"] == overlay.OPACITY
+
+
+def test_windows_opacity_native_failure_preserves_confirmed_context(windows_opacity_api):
+    api, _ = windows_opacity_api
+
+    class UnavailableNative:
+        InvokeRequired = False
+
+        @property
+        def Opacity(self):
+            return overlay.OPACITY
+
+        @Opacity.setter
+        def Opacity(self, value):
+            raise RuntimeError("native window is unavailable")
+
+    api._window.native = UnavailableNative()
+    result = api.set_translucent_opacity(.3)
+    assert not result["ok"] and "unavailable" in result["message"]
+    assert result["opacity"] == api.translucent_context()["opacity"] == overlay.OPACITY
 
 
 def test_roi_picker_reads_only_own_window_pair_and_respects_lock(cocoa_api, monkeypatch, tmp_path, raw_roi_pair):
@@ -382,7 +478,8 @@ def test_windows_applies_alpha_once_and_uses_dpi_scaled_geometry(store, payload,
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda operation: operation))
     context = overlay.validate_context(store, payload, slide_url="local/")
-    assert context["opacity"] == 1
+    assert context["opacity"] == overlay.OPACITY
+    assert context["opacity_mode"] == "native"
     native = SimpleNamespace(InvokeRequired=False, _scale=1.5, Left=100, Top=100,
                              Show=Mock(), Width=640, Height=480)
     api = overlay.TranslucentApi(context, logger=Mock(), on_closed=Mock())
