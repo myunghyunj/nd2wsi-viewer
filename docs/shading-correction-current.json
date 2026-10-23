@@ -1,0 +1,651 @@
+{
+  "schema": "readme-shading-explicit-7-pair/1",
+  "source_selection": "Exactly the two user-requested source ND2 files, in requested order: 7.nd2 then 7-1.nd2. No other acquisitions.",
+  "layout": "2 acquisition rows by 2 Before/After columns. FITC/CY3/DAPI fluorescence composite, no BF context panel.",
+  "application_run_id": "nd2-shading-readme-7-pair-w7b4wekd",
+  "method": "Current nd2wsi.bffree_model.fit consensus method, fitted independently from each source actual 32x32 mean bins. No model or display settings transferred from previous acquisitions.",
+  "display": "Native pixels corrected with the current model then reduced to float32 1/8 means. RAW-derived current app auto_window settings computed once per fluorescence channel on RAW32; gamma 1 and source colors fixed before/after. Full physical extent retained.",
+  "scientific_scope": "New illustrative applications, not independent accepted biological validation. No previous benchmark measurements transferred.",
+  "limitations": [
+    "Periodic consistency cannot establish that removed patterns are optical shading rather than repeating specimen structure.",
+    "DAPI is identity by design; unsupported FITC/CY3 channels remain identity.",
+    "Original ND2 identity uses size, mtime and sampled quick hash, not a full-file cryptographic hash.",
+    "Display LUTs are newly computed illustration choices, not manual accepted settings."
+  ],
+  "originals_and_user_state": "Original ND2, existing cache, manual LUT and annotations are not modified. Application artifacts are isolated outside the source directory.",
+  "sources": [
+    {
+      "source_name": "7.nd2",
+      "source_path_relative_to_volume_workspace": "ExM-SLACS/261012_ExM_IS/raw nd2/7.nd2",
+      "source_fingerprint": {
+        "name": "7.nd2",
+        "size": 6703714304,
+        "mtime_ns": 1791958802000000000,
+        "quick_sha256": "68e99be7cc8e1a31f60c89250608356461e6fb3efa11d2a8e0bcf3dae317b599"
+      },
+      "selection": {
+        "T": 0,
+        "P": 0,
+        "Z": 0
+      },
+      "native_shape_yx": [
+        22895,
+        36599
+      ],
+      "display_shape_yx": [
+        2862,
+        4575
+      ],
+      "display_channels": [
+        "FITC",
+        "CY3",
+        "DAPI"
+      ],
+      "original_channel_order": [
+        "FITC",
+        "CY3",
+        "DAPI",
+        "BF"
+      ],
+      "excluded_from_figure": [
+        "BF"
+      ],
+      "source_colors_rgb": {
+        "FITC": [
+          0,
+          255,
+          0
+        ],
+        "CY3": [
+          255,
+          0,
+          0
+        ],
+        "DAPI": [
+          0,
+          0,
+          255
+        ]
+      },
+      "fixed_display_limits": {
+        "FITC": {
+          "minimum": 2701.5617314453125,
+          "maximum": 25945.990185546874,
+          "gamma": 1
+        },
+        "CY3": {
+          "minimum": 1823.690049328804,
+          "maximum": 2539.084638671875,
+          "gamma": 1
+        },
+        "DAPI": {
+          "minimum": 342.14134615063625,
+          "maximum": 1689.0720263671851,
+          "gamma": 1
+        }
+      },
+      "display_lut_origin": "New illustration display settings: current nd2wsi.contrast.auto_window applied once to each RAW32 channel, dtype uint16, background_mode true, RGB false; gamma 1. Identical fixed limits before/after; not manual accepted LUTs.",
+      "same_lut_and_physical_extent_before_after": true,
+      "scale_bar": {
+        "length_um": 2000,
+        "native_length_x_pixels": 3028.6199067423213,
+        "pixel_size_um_yx": [
+          0.660366788036886,
+          0.660366788036886
+        ],
+        "axes_calibrated_xy": true,
+        "origin": "Original ND2 public metadata"
+      },
+      "model": {
+        "path_relative_to_application_run": "7/model.npz",
+        "sha256": "8a1ab078ad7612969307ced47fc59711135769d3edec5f210c5181ddeb575a85",
+        "schema": "BF_free_consensus/1",
+        "selected": [
+          {
+            "channel": "FITC",
+            "channel_index": 0,
+            "input_row": 0,
+            "model": "consensus",
+            "outcome": "fitted",
+            "enabled": true,
+            "reason": null,
+            "axes": [
+              {
+                "axis": "x",
+                "status": "accepted",
+                "period_native_pixels": 1921.5081747662555,
+                "frequency_cycles_per_native_pixel": 0.0005204245358579577,
+                "supported_harmonics": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7
+                ]
+              }
+            ],
+            "gain_min": 0.8232103205028259,
+            "gain_max": 1.0717911798538038
+          },
+          {
+            "channel": "CY3",
+            "channel_index": 1,
+            "input_row": 1,
+            "model": "consensus",
+            "outcome": "fitted",
+            "enabled": true,
+            "reason": null,
+            "axes": [
+              {
+                "axis": "x",
+                "status": "accepted",
+                "period_native_pixels": 1921.6202466598186,
+                "frequency_cycles_per_native_pixel": 0.0005203941838863381,
+                "supported_harmonics": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6
+                ]
+              }
+            ],
+            "gain_min": 0.8403120042712751,
+            "gain_max": 1.0641125257656343
+          },
+          {
+            "channel": "DAPI",
+            "channel_index": 2,
+            "input_row": 2,
+            "model": null,
+            "outcome": "unchanged",
+            "enabled": false,
+            "reason": "DAPI_identity_policy",
+            "axes": [
+              {
+                "axis": "x",
+                "status": "accepted",
+                "period_native_pixels": 1920.3131816412392,
+                "frequency_cycles_per_native_pixel": 0.0005207483912313341,
+                "supported_harmonics": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5
+                ]
+              }
+            ],
+            "gain_min": 1.0,
+            "gain_max": 1.0
+          }
+        ],
+        "configuration": {
+          "family": "consensus",
+          "candidate_id": "consensus",
+          "display_name": "Consensus",
+          "port_version": 1,
+          "parameters": {
+            "template": {
+              "axes": [
+                "x",
+                "y"
+              ],
+              "period_min_px": 12.0,
+              "period_max_px": 128.0,
+              "min_repeats": 6.0,
+              "harmonics": 3,
+              "min_valid_fraction": 0.7,
+              "min_profile_fraction": 0.9,
+              "min_modulation": 0.005,
+              "peak_ratio": 8.0,
+              "min_explained_fraction": 0.08,
+              "harmonic_relative_threshold": 0.1,
+              "frequency_tolerance": 0.05,
+              "split_correlation": 0.75,
+              "axis_score_ratio": 1.25,
+              "period_score_ratio": 1.15,
+              "gain_min": 0.5,
+              "gain_max": 2.0,
+              "spectral_peaks_per_channel": 6,
+              "huber_iterations": 4,
+              "huber_constant": 1.345,
+              "harmonic_split_correlation": 0.85,
+              "harmonic_peak_ratio": 8.0,
+              "max_native_axis_pixels": 2000000,
+              "phase_bins": 64,
+              "template_smoothing_sigma_bins": 1.0,
+              "template_max_harmonics": 8,
+              "min_original_samples_per_harmonic": 4,
+              "template_split_correlation": 0.8,
+              "cycle_correlation": 0.5,
+              "cycle_explained_fraction": 0.3,
+              "min_supported_cycles": 4,
+              "min_supported_cycle_fraction": 0.5,
+              "amplitude_sigma_cycles": 0.75,
+              "amplitude_max": 0.5,
+              "edge_taper_cycles": 1.0
+            },
+            "evidence": {
+              "min_positive_fraction": 0.7,
+              "min_samples": 10,
+              "alternating_iterations": 12,
+              "huber_constant": 1.345,
+              "confidence_floor": 0.02,
+              "split_scale": 0.02,
+              "edge_taper_cycles": 1.0
+            },
+            "amplitude": {
+              "orthogonal_smoothness_periods": 0.25,
+              "periodic_smoothness_periods": 0.5,
+              "huber_scale_multiplier": 1.345,
+              "minimum_huber_scale_cap_fraction": 0.005,
+              "support_radius_periods": 2.0,
+              "maximum_iterations": 500,
+              "function_tolerance": 1e-11,
+              "gradient_tolerance": 1e-08,
+              "rank": 1
+            }
+          },
+          "research_source_sha256": {
+            "joint_periodic.py": "a8f02710340a95cd52e32d076ccb1fcdbc738a9b33a1eed0bd6b86722bf53733",
+            "channel_periodic.py": "0ad64238acc5fec41452ac23862fad3fc1bff9142fd6897ba0450279535ea1f5",
+            "common.py": "9e82182ef02b69cb119aae48e75744f35e695f2a2500964f9211bddf5445c676",
+            "model_consensus.py": "56e02b6f1c04b6f3ac61d32ec972ce14d1a1e303fb4b1c5520360ec719d11c91"
+          },
+          "downsample": 32,
+          "preparation": "actual mean of each 32x32 bin; short final bins excluded from fitting",
+          "interpolation": "native sampled T with circular linear interpolation; P-spaced A with C1 convex interpolation and zero edge taper",
+          "formula": "G = 1 + A(x,y) * fixed_T(phi); corrected = float32(raw / float64(G))",
+          "baseline_policy": "intensity baselines are fitting nuisances only; no brightness normalization"
+        }
+      },
+      "application_receipt": {
+        "path_relative_to_application_run": "7/application.json",
+        "sha256": "bfbd45334200764645bb10d21d9aebcae850608b2ddc84dd07fee4ebc0cf48b1"
+      },
+      "artifacts": {
+        "raw32.npy": {
+          "sha256": "7eb08636b0376feafbb45c51562a903619ce6afb66bcbe47451a97edcf51775a",
+          "bytes": 9829376
+        },
+        "raw8.npy": {
+          "sha256": "3d0d0eaa5f88c0bdaf588e36c42ffeed5378f65a5bcd5be1c5255c06f0ca077f",
+          "bytes": 157123928
+        },
+        "after8.npy": {
+          "sha256": "a3dc3bacf8b35a2b0dbdc2f95b9206f30c9fb1a785b27678412f984dc569bebb",
+          "bytes": 157123928
+        },
+        "model.npz": {
+          "sha256": "8a1ab078ad7612969307ced47fc59711135769d3edec5f210c5181ddeb575a85",
+          "bytes": 465920
+        },
+        "model.json": {
+          "sha256": "e55fa73b58bdfd18582e7334707d39c858d7ffb2f768464f1747484969beb292",
+          "bytes": 5817
+        }
+      },
+      "implementation_sha256": {
+        "nd2wsi/bffree_model.py": "404f66b385434068e43fe5af0738e2f75e88e740e699b3d7109b59e44557a5e6",
+        "nd2wsi/bffree_consensus.py": "37ace245beb5716cbc44575773bbfb773f14d6bc17c41fae5b2be8fe4b769fc7",
+        "nd2wsi/bffree_consensus_amplitude.py": "6a37f8a6b50925a8999365ae0f7b9fe64c24e499a84db917ae6f8b108676b4ee",
+        "nd2wsi/contrast.py": "54d5db09033d99005f31f27322d2034bda14c7b52a208e74c3185ea41a3edddf",
+        "nd2wsi/h_correction.py": "ad2aed39ac32a75f900827f339838c5f401f758d97acd8260f76c22e37cc80db"
+      },
+      "DAPI_exact_identity": true,
+      "source_and_existing_cache_unchanged": true,
+      "new_independent_source_specific_fit": true,
+      "native_corrected_pixel_count": {
+        "FITC": 837934105,
+        "CY3": 837934105,
+        "DAPI": 0
+      },
+      "elapsed_seconds": 79.73627354199562
+    },
+    {
+      "source_name": "7-1.nd2",
+      "source_path_relative_to_volume_workspace": "ExM-SLACS/261012_ExM_IS/raw nd2/7-1.nd2",
+      "source_fingerprint": {
+        "name": "7-1.nd2",
+        "size": 8810434560,
+        "mtime_ns": 1791805660000000000,
+        "quick_sha256": "1d41b73098cc330e0ed7b1366981c52a0b5521f7e85c280e261a7512f47acb0f"
+      },
+      "selection": {
+        "T": 0,
+        "P": 0,
+        "Z": 0
+      },
+      "native_shape_yx": [
+        29460,
+        37382
+      ],
+      "display_shape_yx": [
+        3683,
+        4673
+      ],
+      "display_channels": [
+        "FITC",
+        "CY3",
+        "DAPI"
+      ],
+      "original_channel_order": [
+        "FITC",
+        "CY3",
+        "DAPI",
+        "BF"
+      ],
+      "excluded_from_figure": [
+        "BF"
+      ],
+      "source_colors_rgb": {
+        "FITC": [
+          0,
+          255,
+          0
+        ],
+        "CY3": [
+          255,
+          0,
+          0
+        ],
+        "DAPI": [
+          0,
+          0,
+          255
+        ]
+      },
+      "fixed_display_limits": {
+        "FITC": {
+          "minimum": 2277.20605078125,
+          "maximum": 27311.17892578126,
+          "gamma": 1
+        },
+        "CY3": {
+          "minimum": 2008.4684476852437,
+          "maximum": 2932.166181640628,
+          "gamma": 1
+        },
+        "DAPI": {
+          "minimum": 1933.022965126052,
+          "maximum": 4884.677900390661,
+          "gamma": 1
+        }
+      },
+      "display_lut_origin": "New illustration display settings: current nd2wsi.contrast.auto_window applied once to each RAW32 channel, dtype uint16, background_mode true, RGB false; gamma 1. Identical fixed limits before/after; not manual accepted LUTs.",
+      "same_lut_and_physical_extent_before_after": true,
+      "scale_bar": {
+        "length_um": 2000,
+        "native_length_x_pixels": 3029.018010593954,
+        "pixel_size_um_yx": [
+          0.6602799960267731,
+          0.6602799960267731
+        ],
+        "axes_calibrated_xy": true,
+        "origin": "Original ND2 public metadata"
+      },
+      "model": {
+        "path_relative_to_application_run": "7-1/model.npz",
+        "sha256": "96e8a29e01753aa29a606a1c7e21e95a4bd8c2214924ccd20d5daeccc76a0183",
+        "schema": "BF_free_consensus/1",
+        "selected": [
+          {
+            "channel": "FITC",
+            "channel_index": 0,
+            "input_row": 0,
+            "model": "consensus",
+            "outcome": "fitted",
+            "enabled": true,
+            "reason": null,
+            "axes": [
+              {
+                "axis": "x",
+                "status": "accepted",
+                "period_native_pixels": 1861.543147815149,
+                "frequency_cycles_per_native_pixel": 0.0005371887303142435,
+                "supported_harmonics": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5
+                ]
+              }
+            ],
+            "gain_min": 0.7942637319970285,
+            "gain_max": 1.0946680739122734
+          },
+          {
+            "channel": "CY3",
+            "channel_index": 1,
+            "input_row": 1,
+            "model": "consensus",
+            "outcome": "fitted",
+            "enabled": true,
+            "reason": null,
+            "axes": [
+              {
+                "axis": "x",
+                "status": "accepted",
+                "period_native_pixels": 1861.575037584567,
+                "frequency_cycles_per_native_pixel": 0.0005371795279858937,
+                "supported_harmonics": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5
+                ]
+              }
+            ],
+            "gain_min": 0.8103459453723977,
+            "gain_max": 1.0840803261542693
+          },
+          {
+            "channel": "DAPI",
+            "channel_index": 2,
+            "input_row": 2,
+            "model": null,
+            "outcome": "unchanged",
+            "enabled": false,
+            "reason": "DAPI_identity_policy",
+            "axes": [
+              {
+                "axis": "x",
+                "status": "accepted",
+                "period_native_pixels": 1860.5657148173211,
+                "frequency_cycles_per_native_pixel": 0.0005374709380249891,
+                "supported_harmonics": [
+                  1,
+                  2,
+                  3,
+                  4
+                ]
+              }
+            ],
+            "gain_min": 1.0,
+            "gain_max": 1.0
+          }
+        ],
+        "configuration": {
+          "family": "consensus",
+          "candidate_id": "consensus",
+          "display_name": "Consensus",
+          "port_version": 1,
+          "parameters": {
+            "template": {
+              "axes": [
+                "x",
+                "y"
+              ],
+              "period_min_px": 12.0,
+              "period_max_px": 128.0,
+              "min_repeats": 6.0,
+              "harmonics": 3,
+              "min_valid_fraction": 0.7,
+              "min_profile_fraction": 0.9,
+              "min_modulation": 0.005,
+              "peak_ratio": 8.0,
+              "min_explained_fraction": 0.08,
+              "harmonic_relative_threshold": 0.1,
+              "frequency_tolerance": 0.05,
+              "split_correlation": 0.75,
+              "axis_score_ratio": 1.25,
+              "period_score_ratio": 1.15,
+              "gain_min": 0.5,
+              "gain_max": 2.0,
+              "spectral_peaks_per_channel": 6,
+              "huber_iterations": 4,
+              "huber_constant": 1.345,
+              "harmonic_split_correlation": 0.85,
+              "harmonic_peak_ratio": 8.0,
+              "max_native_axis_pixels": 2000000,
+              "phase_bins": 64,
+              "template_smoothing_sigma_bins": 1.0,
+              "template_max_harmonics": 8,
+              "min_original_samples_per_harmonic": 4,
+              "template_split_correlation": 0.8,
+              "cycle_correlation": 0.5,
+              "cycle_explained_fraction": 0.3,
+              "min_supported_cycles": 4,
+              "min_supported_cycle_fraction": 0.5,
+              "amplitude_sigma_cycles": 0.75,
+              "amplitude_max": 0.5,
+              "edge_taper_cycles": 1.0
+            },
+            "evidence": {
+              "min_positive_fraction": 0.7,
+              "min_samples": 10,
+              "alternating_iterations": 12,
+              "huber_constant": 1.345,
+              "confidence_floor": 0.02,
+              "split_scale": 0.02,
+              "edge_taper_cycles": 1.0
+            },
+            "amplitude": {
+              "orthogonal_smoothness_periods": 0.25,
+              "periodic_smoothness_periods": 0.5,
+              "huber_scale_multiplier": 1.345,
+              "minimum_huber_scale_cap_fraction": 0.005,
+              "support_radius_periods": 2.0,
+              "maximum_iterations": 500,
+              "function_tolerance": 1e-11,
+              "gradient_tolerance": 1e-08,
+              "rank": 1
+            }
+          },
+          "research_source_sha256": {
+            "joint_periodic.py": "a8f02710340a95cd52e32d076ccb1fcdbc738a9b33a1eed0bd6b86722bf53733",
+            "channel_periodic.py": "0ad64238acc5fec41452ac23862fad3fc1bff9142fd6897ba0450279535ea1f5",
+            "common.py": "9e82182ef02b69cb119aae48e75744f35e695f2a2500964f9211bddf5445c676",
+            "model_consensus.py": "56e02b6f1c04b6f3ac61d32ec972ce14d1a1e303fb4b1c5520360ec719d11c91"
+          },
+          "downsample": 32,
+          "preparation": "actual mean of each 32x32 bin; short final bins excluded from fitting",
+          "interpolation": "native sampled T with circular linear interpolation; P-spaced A with C1 convex interpolation and zero edge taper",
+          "formula": "G = 1 + A(x,y) * fixed_T(phi); corrected = float32(raw / float64(G))",
+          "baseline_policy": "intensity baselines are fitting nuisances only; no brightness normalization"
+        }
+      },
+      "application_receipt": {
+        "path_relative_to_application_run": "7-1/application.json",
+        "sha256": "11b54f85eb0d7d6bb6001237e44a1f14081b9abe8ec1ebf1ebaeed1c0178b9cb"
+      },
+      "artifacts": {
+        "raw32.npy": {
+          "sha256": "bc5105ce285888aa885383941fe3e4b54b0e8e32fdf609f5aae9d1f155cc4da8",
+          "bytes": 12919916
+        },
+        "raw8.npy": {
+          "sha256": "dd2311d59d83660bf5439fc484c1edd88c7dbfe674ce087889ae7103d3f07b7a",
+          "bytes": 206528036
+        },
+        "after8.npy": {
+          "sha256": "4ef59bf5cb24f99b4b84db8e0121f631a74a05218ceea4bae5e0b29aae350b03",
+          "bytes": 206528036
+        },
+        "model.npz": {
+          "sha256": "96e8a29e01753aa29a606a1c7e21e95a4bd8c2214924ccd20d5daeccc76a0183",
+          "bytes": 632280
+        },
+        "model.json": {
+          "sha256": "0bc5a788b513fd062555c2732c8dcfc9f5e7cbf8b1e289ec0b295fa358940ef5",
+          "bytes": 5755
+        }
+      },
+      "implementation_sha256": {
+        "nd2wsi/bffree_model.py": "404f66b385434068e43fe5af0738e2f75e88e740e699b3d7109b59e44557a5e6",
+        "nd2wsi/bffree_consensus.py": "37ace245beb5716cbc44575773bbfb773f14d6bc17c41fae5b2be8fe4b769fc7",
+        "nd2wsi/bffree_consensus_amplitude.py": "6a37f8a6b50925a8999365ae0f7b9fe64c24e499a84db917ae6f8b108676b4ee",
+        "nd2wsi/contrast.py": "54d5db09033d99005f31f27322d2034bda14c7b52a208e74c3185ea41a3edddf",
+        "nd2wsi/h_correction.py": "ad2aed39ac32a75f900827f339838c5f401f758d97acd8260f76c22e37cc80db"
+      },
+      "DAPI_exact_identity": true,
+      "source_and_existing_cache_unchanged": true,
+      "new_independent_source_specific_fit": true,
+      "native_corrected_pixel_count": {
+        "FITC": 1101273720,
+        "CY3": 1101273720,
+        "DAPI": 0
+      },
+      "elapsed_seconds": 240.28848287499568
+    }
+  ],
+  "legend_rgb": {
+    "FITC": [
+      0,
+      255,
+      0
+    ],
+    "CY3": [
+      255,
+      0,
+      0
+    ],
+    "DAPI": [
+      0,
+      0,
+      255
+    ]
+  },
+  "renderer_script_sha256": "332efc0bfc2a2a0c23c13343b0565a67a1adbe0fb6910f9ee15bdbf17d44f3ab",
+  "output": {
+    "path": "docs/shading-correction-current.png",
+    "sha256": "efdcd2bfcc8f8d3e365ba30939681988585076e00eac440686157b651664f483",
+    "bytes": 4176886,
+    "dimensions_px": [
+      2160,
+      1784
+    ],
+    "dpi": 300
+  },
+  "verification": "One application pass checks original source identity before/after, native source coverage for corrected channels, unchanged cache stat, finite outputs and exact DAPI identity. Rendering reuses these checks and fixes identical LUT, coordinates and source colors.",
+  "versions": {
+    "numpy": "2.5.2",
+    "matplotlib": "3.11.2"
+  },
+  "visible_acquisition_labels": false,
+  "visual_review": {
+    "completed": true,
+    "checked": "Only the two acquisition filename text labels were removed. Pixel comparison against the preserved prior PNG confirms identical dimensions and exactly two narrow changed text bands outside the image panels. Before/After headings, panel pixels, physical geometry, LUTs, four 2 mm scale bars and channel legend are unchanged.",
+    "filename_text_difference_y_ranges_px": [
+      [
+        87,
+        114
+      ],
+      [
+        817,
+        844
+      ]
+    ],
+    "difference_x_range_px": [
+      67,
+      193
+    ],
+    "scientific_recomputation": false
+  }
+}

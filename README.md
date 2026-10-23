@@ -1,417 +1,125 @@
-> **v2.4.1 · macOS & Windows.** Fixed keyboard shortcuts and whole-slide TIFF export at half resolution.
-> Added periodic shading correction for supported FITC/CY3 channels, with BF and DAPI unchanged.
-> Added Astromapper ROI import/export, direct JPG annotation and optional PDF reports. [Release details](docs/release-notes-2.4.1.md).
-
-> [!NOTE]
-> **Windows support is now available, including ARM PCs.**<br>
-> Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.4.1 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.1/nd2wsi-viewer-2.4.1-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
-
 <p align="center">
-  <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
+  <img src="docs/icon.png" alt="" width="88">
 </p>
 
 <h1 align="center">nd2wsi-viewer</h1>
 
 <p align="center">
-  <strong>A fast slide viewer for Nikon ND2, Aperio SVS and supported SDPC slides, on macOS and Windows.</strong><br>
-  Open a scan, fly from the whole slide to single cells, measure, mark, and cut out what you need.
+  <strong>Browse whole slides. Inspect channels. Export the region you need.</strong><br>
+  A local microscopy viewer for macOS and Windows.<br>
+  <strong>Supported formats:</strong> JPG · PNG · ND2 · SVS · <a href="docs/sdpc-support.md">SDPC</a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/macOS-Apple%20silicon-1d1d1f?style=flat-square&logo=apple&logoColor=white" alt="macOS, Apple silicon">
-  <img src="https://img.shields.io/badge/Windows-x64%20%2F%20ARM64-0078D4?style=flat-square" alt="Windows x64 and Windows 11 ARM64 via x64 emulation">
-  <img src="https://img.shields.io/badge/Python-3.11%2B-0A84FF?style=flat-square" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/license-MIT-8E8E93?style=flat-square" alt="MIT">
+  <a href="#download">Download</a> ·
+  <a href="#features">Features</a> ·
+  <a href="docs/user-guide.md">User guide</a> ·
+  <a href="https://github.com/myunghyunj/nd2wsi-viewer/releases">Release notes</a> ·
+  <a href="docs/user-guide.md#numbered-regions-with-astromapper" title="Astromapper">☆</a>
 </p>
 
-![Fluorescence slide with interactive channel histograms and LUT controls in nd2wsi-viewer](docs/overview-slide.png)
-
-## Motivation
+## Latest update
 
-The Nikon NIS-Elements Viewer is heavy on memory and slow to move around a large scan, so looking at a slide takes longer than it should. This viewer was built to open the same files with almost no waiting and a simple screen.
+- **Translucent viewer:** adjustable opacity, ROI navigation and a lock to keep the reference in place.
+- **Collapsible tools and separate windows:** more room for the image; **⌘N / Ctrl+N** opens another viewer window.
+- **GeoJSON import:** bring annotations back into the viewer alongside your existing marks.
+- **External-drive caches:** improved pyramid creation on macOS exFAT drives.
 
-The reason the Nikon viewer feels heavy is the file itself. A stitched `.nd2` scan stores the slide as one flat picture at full resolution. The scanner shoots a grid of fields and stitches them into that single plane, and the file keeps no smaller copies of it. Any viewer has to read the whole plane before it can show even an overview.
+<p align="center">
+  <img src="docs/overview-sdpc.png" alt="Brightfield SDPC slide with Slide Info in the light appearance" width="50%"><img src="docs/overview-nd2.png" alt="Fluorescence ND2 image with Channels &amp; LUTs in the dark appearance" width="50%">
+</p>
 
-An Aperio `.svs` slide is built the other way. It keeps the same picture at a few fixed reduced sizes, like a pyramid. A viewer reads a small copy when you are zoomed out and only the full-resolution tiles on screen when you are zoomed in. That is what makes whole-slide viewers feel instant.
+## Download
 
-nd2wsi-viewer gives an ND2 scan that pyramid. It builds the reduced copies once, beside the file, and never touches the original. The full-resolution pixels are read straight from the ND2. The price is disk space for the reduced copies, about a quarter of the size of the ND2. An SVS already carries its pyramid and opens with no conversion at all.
+| Platform | Download · 2.5.1 | Requirements |
+| --- | --- | --- |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.1/nd2wsi-viewer-2.5.1-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.1/nd2wsi-viewer-2.5.1-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
 
-Nothing leaves your computer. There is no upload and no account.
+On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
+and keep `_internal` beside `nd2wsi-viewer.exe`. See the
+[installation guide](docs/user-guide.md#get-started) for first-launch prompts.
 
-## Here is what you get
+Drop an image into the window or use **+**. The first open of a stitched ND2 may
+prepare a viewing cache; later opens reuse it.
 
-- Opens stitched Nikon `.nd2`, Aperio `.svs` and supported HEVC `.sdpc` slides, several at once in tabs.
-- Keeps each viewing cache in one `.nd2svs` file, easy to copy to an external SSD.
-- Plays a time series of a plate, with every site at any z plane and any time, straight from the ND2.
-- Follows the sharpest plane of each site through a time lapse, so focus drift over a day does not blur the series.
-- Moves from the whole slide to single cells without stutter.
-- Shows each fluorescence channel in its own color, with brightness range, gamma, and an on/off switch.
-- Reads the raw pixel values under your cursor.
-- Measures distances in micrometers, using the calibration stored in the file.
-- Marks the slide with pins, rulers, and boxes, and keeps them in a small file beside the slide.
-- Cuts out any region as ND2, TIFF, PNG, or JPEG, or exports the whole slide at a reduced size.
-- Puts up to four slides of the same case side by side and keeps them in step while you move.
-- Aligns serial sections with four clicked points.
-- On macOS, checks once a day for signed GitHub releases and always asks before installing one.
+Try the public CC0 examples:
+[three-channel cells, 28 MB](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/testdata-v1/example_cell.nd2) ·
+[two-channel tissue, 47 MB](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/testdata-v1/example_tissue.nd2).
 
-## Get started
+## Features
 
-### Windows (Intel, AMD, and ARM PCs)
+### Channels & LUTs
 
-Download [nd2wsi-viewer-2.4.1-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.1/nd2wsi-viewer-2.4.1-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.1/nd2wsi-viewer-2.4.1-windows-x64.zip.sha256).
-Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
-Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.4.1
-Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
+![Channels & LUTs with separate FITC, CY3, DAPI and BF histograms](docs/channels-luts.png)
 
-The x64 app targets Windows 10 version 1709 or later and Windows 11 on
-Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
-silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.4.1) for the
-exact source commit, archive checksums, and platform verification results.
-Windows 10 Education and local Parallels were not tested for this release.
-.NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
-install WebView2 separately if it is missing.
+- Set each channel's colour, visibility, intensity range and gamma.
+- Drag the histogram controls, enter exact values, or use **Auto** for contrast.
+- **Copy / Paste** transfers minimum, maximum and gamma between matching channel names.
+- The standard viewer restores each file's last-used minimum, maximum and gamma when you reopen it, including after restarting the app.
 
-Use **Ctrl** in place of the Mac **⌘** shortcuts below, and **Alt** for
-**Option**. Open files using `+`, drag and drop, or pass a file to the executable.
-Windows uses its standard title bar and window buttons. Updates are installed
-manually from [Releases](https://github.com/myunghyunj/nd2wsi-viewer/releases);
-Windows does not use the macOS Sparkle updater.
+**Auto-fit** fits the histogram axis to the signal; it does not change contrast.
+These display controls leave source pixels unchanged.
 
-The Windows executable is not Authenticode-signed, so Windows may display an
-unknown-publisher warning. See [Windows distribution and verification](docs/windows.md)
-for requirements, tested behavior, and build instructions.
+### Annotations
 
-### macOS (Apple silicon)
+Add calibrated rulers, pins and boxes with notes. Export annotations as
+**GeoJSON**, or import a `.geojson` file through the annotation panel's **Open**
+button. Imported marks are added to existing annotations in the original image's
+pixel coordinates. [Annotation guide](docs/user-guide.md#measuring-and-marking).
 
-1. Download the `macos-arm64.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. This release requires an Apple silicon Mac running macOS 14 or later.
-2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
-3. Drop an `.nd2`, `.svs` or supported `.sdpc` file onto the window, or press `+` to browse.
+### Export
 
-The macOS bundle is ad-hoc signed and uses signed Sparkle updates. This is not
-Developer ID signing or notarization.
+Select a region and export source channels as **ND2 / TIFF**, or the current
+colours and contrast as **PNG / JPEG**. Add a calibrated scale bar directly to
+an image or as an editable **SVG**. Full-resolution data exports preserve source
+values; smaller exports resample the image. [Export options](docs/user-guide.md#cutting-out-a-region).
 
-Version 1.2.1 is the first release that contains the updater, so it must be
-installed from the DMG once. After that, use
-**nd2wsi-viewer → Check for Updates…**. The tab-strip shaded-circle button
-controls Shading Correction. The app checks quietly once
-a day and shows Sparkle's standard update window only when a newer signed
-release exists; it never installs an update without asking. Close the other
-viewer windows before installing; each window checks its unsaved work first.
-Versions 2.1.1–2.1.4 did not start automatic checks, so download the latest release
-manually once if you are upgrading from one of those versions. Automatic checks
-were restored in 2.1.5.
+### Link and compare
 
-The first time you open an ND2 scan the viewer builds its reduced copies. A 3 GB scan takes well under a minute on a laptop, and the next open is instant. An SVS opens right away.
+![Linked H&E, Masson's trichrome and CD31 fluorescence views](docs/compare-serial-sections.jpg)
 
-Supported SQ/SDPC HEVC slides also open directly from their embedded tiles.
-TIFF ROI export preserves decoded RGB and calibration, not the pre-compression
-microscope samples. Slide Info displays the source-embedded photographs and
-thumbnail, with click-to-enlarge viewing. JPEG whole-slide SDPC and vendor
-colour-correction emulation are not supported. See [SDPC support and limits](docs/sdpc-support.md).
-The bundled decoder's corresponding sources and licenses accompany the release.
+Compare up to four images at the same physical scale. Link movement after manual
+alignment, then rotate, reflect or nudge each view. This supports visual comparison
+of serial sections; it does not establish cell-to-cell correspondence.
+[Comparison controls](docs/user-guide.md#comparing-scans-and-serial-sections).
 
-### Try it with the example scans
+### Translucent viewer
 
-Two small Nikon Ti2 acquisitions are published for testing, free to use under CC0.
+![Floating fluorescence reference with opacity and navigation controls](docs/translucent-viewer.png)
 
-| File | Channels | Size | Download |
-|---|---|---|---|
-| `example_cell.nd2` | CY3, FITC, DAPI | 28 MB | [example_cell.nd2](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/testdata-v1/example_cell.nd2) |
-| `example_tissue.nd2` | CY5, DAPI | 47 MB | [example_tissue.nd2](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/testdata-v1/example_tissue.nd2) |
+Click the **cloud** to keep the current image above other apps. Adjust its opacity,
+navigate imported ROIs, or lock the view while you work underneath it.
 
-Drop either one onto the app.
+### Shading correction
 
-## Looking at a slide
+![Two fluorescence scans before and after shading correction](docs/shading-correction-current.png)
 
-![Per-channel colors, brightness range, gamma, and histogram](docs/channels-panel.png)
+*FITC, CY3 and DAPI composites. Each pair uses the same display settings before
+and after correction; DAPI is unchanged.*
 
-Every fluorescence channel has its own row in the Channels panel. Pick a color, turn the channel on or off, and drag the two triangles under the histogram to set the darkest and brightest values shown. ND2 without saved LUTs opens with automatic contrast and **Auto-fit** enabled, fitting each channel's axis to its signal distribution. Uncheck it to show the full integer data range, such as 0 to 65,535 for uint16. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. For typical fluorescence histograms, its lower end follows the background peak, while rare bright pixels have less influence on its upper end. This display adjustment preserves native pixel values. Hold Shift while dragging to move every channel together.
+Reduce grid-like shadows from uneven illumination by learning the repeating
+pattern and adapting its strength across the image. Supported FITC and CY3 channels
+are corrected from the slide's fluorescence; BF and DAPI remain unchanged.
+[Method and validation limits](docs/shading-correction-validation.md).
 
-The standard viewer remembers each file's last-used minimum, maximum and gamma across app restarts. Saved LUTs take precedence over initial Auto; Reset restores the channel's metadata defaults and remembers that choice too. Preferences live in local application data, not in the image or its annotations. A moved, replaced or incompatible file uses normal defaults. The opt-in Metal viewer's independent controls are not persisted.
+## Your files stay local
 
-### Translucent viewer — 2.5 beta
+No upload or account is required. Original images are not modified. Viewing caches
+and annotations live in an `nd2wsi` folder beside the image. **Move that folder
+with the source image** to keep them together; a compact `.nd2svs` viewing cache
+still needs its source for full resolution.
 
-Click **‹** at the right of the top tab strip to expand its tools: **cloud**, **Astromapper**, **Shading Correction**, **Compare slides**, and **Slide Info**. **›** collapses them again. The cloud opens the current fluorescence image in a separate, always-on-top tracing window. It keeps the current channels, LUTs, plane, orientation and image scale. The image starts at 55% opacity; use its **Opacity** slider to adjust it from 10% to 100%. You can minimize the main viewer while using this window.
+[Storage and portability](docs/user-guide.md#what-the-viewer-writes-on-your-disk) ·
+[Plate, time and Z navigation](docs/user-guide.md#time-series-of-a-plate) ·
+[Source installation and development](docs/development.md)
 
-Drag the image to pan and scroll or pinch to zoom. Drag the empty top edge, or Option/Alt-drag, to move the window. Drag an edge or corner to resize it: the image scale stays fixed and only the field of view changes. The white **lock** freezes image navigation, opacity and window placement; click it again to unlock. **×** closes the tracing window. The main viewer's source tab must remain open.
-
-Without imported coordinates, the controls are the opacity slider, lock and close. With AstroMapper regions already imported in the current image, or after dropping the matching whole-image **JPG + TXT** pair into the tracing window, ROI boxes and **‹ number ›** appear. The selected ROI is emphasized. Right-click the image or use **Cmd/Ctrl+O** to choose a pair; click the number to replace it. The arrows and Left/Right keys jump to each ROI's center while preserving the current scale. Imported coordinates use the same inclusive-pixel mapping as Astromapper. Use the matching uncropped JPG with the same orientation; the files do not encode a crop or registration transform. These navigation copies do not modify saved annotations.
-
-On macOS the image is translucent while the white controls and ROI outlines keep their normal appearance. Windows uses native whole-window opacity, which also makes the controls and ROI outlines translucent. The mode is available in the standard desktop viewer, including its small JPG/PNG tabs; a browser tab cannot float over other apps.
-
-The **Shading Correction** button in the tab strip estimates repeating illumination shading from a supported stitched ND2 scan's fluorescence. It corrects supported FITC and CY3 channels while keeping BF and DAPI unchanged; a BF channel is not required. The corrected `.nd2svs` viewing pyramid remains saved after closing and reopening the slide.
-
-The confirmation shows the saved-pyramid notice and estimated preparation time. Choose the green **Continue** button to begin or the red **Cancel** button to dismiss. Opening a slide alone does not start a correction. During preparation, a progress bar shows the stage and approximate remaining time; Cancel stops the work before the final replacement.
-
-After applying correction, the button offers **Revoke**. Revoke rebuilds the original viewing pyramid from the source ND2 and replaces the corrected cache. Both operations require the original ND2. Cancellation or failure before the final replacement leaves the current cache untouched. If the replacement is saved but cannot be activated immediately, the valid saved cache is retained; reopen the slide when prompted.
-
-The model estimates a repeating template for each supported channel with an amplitude that varies across the scan. FITC and CY3 are assessed separately; DAPI can contribute pattern proposals but is never corrected. BF pixels, BF-derived geometry and camera priors do not enter fitting. Unsupported channels keep their original values. If no channel supports a correction, the original pyramid is retained. Plate/time-series acquisitions and Z projections remain unsupported. See the [method and validation limits](docs/shading-correction-validation.md).
-
-PNG, JPEG and SVG exports use the saved correction and include `shading-corrected` in their filenames. Native ND2/TIFF exports, including reduced-resolution exports, and pixel readouts retain original values. The original ND2, annotations and saved LUTs remain unchanged. Temporary preparation files are released after the operation; the corrected viewing cache remains saved until revoked.
-
-Existing H corrections and earlier BF-free preview caches remain readable with their saved models; an application update does not silently refit them. Use **Revoke**, then **Apply**, to fit again with the current method.
-
-For exact settings, choose the **Type LUT** pencil icon and enter each channel's minimum, maximum and gamma. Apply updates the channels together; invalid entries leave every channel unchanged, and Cancel discards the edits. Use **Copy LUT** and **Paste LUT** to reuse those settings in another window. Paste matches unique channel names regardless of order and skips unmatched, duplicate, invalid or incompatible entries. It does not copy colors or visibility and does not change raw pixels or annotations. The pencil, copy and paste actions use matching borderless 16 px Fluent icons. Hover over each icon for about one second to see a short explanation, also available with keyboard focus. A successful copy immediately changes the copy icon to a brief green check with **Copied!**.
-
-A color brightfield slide such as an H&E opens with a light window, and a fluorescence scan opens with a dark one. You can switch either way with the appearance button.
-
-Move the cursor over the slide and the status bar shows the raw value of every channel at that pixel, straight from the file. Press `I` for a small readout that follows the cursor.
-
-![Slide Info showing an SVS label and macro image](docs/slide-info-svs.png)
-
-Press `⌘I` for Slide Info. It lists the pixel size and where it came from, the objective, the size of the scan, and the space the reduced copies take on disk. For an SVS it also shows the label and the macro photo stored inside the file.
-
-On macOS, the tab strip and toolbar take the place of a separate title bar. Drag their empty space to move the window using native Cocoa window dragging, including after a display configuration changes. Double-click either one to zoom the window, as you would a title bar, and double-click again to bring it back. The gesture follows the title bar setting in System Settings under Desktop & Dock. Windows retains its standard title bar and window buttons.
-
-The mark at the left of the toolbar names the kind of file in two words. 2D or 3D says whether the file holds a z stack, and SLIDE or PLATE says whether it holds one scan position or several. A stitched scan reads 2D SLIDE and the phage assay reads 3D PLATE.
-
-### Time series of a plate
-
-![Six sites of a phage assay in plate mode](docs/plate-mode.png)
-
-Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, and there is nothing to stitch. The viewer opens such a file in plate mode and reads every frame straight from the ND2. The only thing it writes is a small store of reduced frames beside the file, about two percent of the ND2, which fills in the background so the series becomes instant to scrub. The status bar counts it up while it fills. Once the store is full its frames are read into memory in the background, one chunk per time point and plane, so a scrub of z or time never waits on the drive.
-
-![Scrubbing time and stepping through z planes](docs/plate-time-z.gif)
-
-The sites sit in a grid. Coordinate names such as `A01` become lettered and numbered row and column headers, so a label does not cover every small image. Lab patterns such as `10(5)_MOI` still become condition and dilution headers. The transpose button swaps rows and columns, and the choice is remembered. The slider on the right is the z plane, and the capsule under the grid is time. A plate with only one z plane or one time point hides the corresponding control automatically. The toolbar's **View** menu can show or hide Site Labels, Timeline, and Z Axis at any time.
-
-Autofocus compares every Z plane for each site and time point. It uses the gradient detail of the mean image of all raw channels, independently of the visible channel selection. The toolbar button becomes available when a current site's full Z curve is ready, and remains accessible when the timeline is hidden. Only complete curves are applied: the grid reports `AF 4/6 ready`, with incomplete sites staying at the manual plane. The Z readout shows the range of planes actually displayed. Reaching for the Z control returns to a shared manual plane; in focused mode it steps from that site's displayed plane. A single-position acquisition opens focused, and a single-Z file hides autofocus.
-
-Two gestures do most of the work. Over the grid, a vertical scroll moves through z and a horizontal swipe on the trackpad scrubs time. Click a site, or press its number, and it fills the stage as a deep zoom, where a vertical scroll zooms, a horizontal swipe still scrubs time, and Option with a vertical scroll moves through z. With keyboard focus on a grid cell, arrows move between sites and Enter opens one. On the image stage, arrows step z and time, Space plays, and Esc or the All sites capsule returns to the grid. Time and Z controls also support keyboard adjustment and announce their values to assistive technology.
-
-In the deep zoom the ruler, pins, boxes, pixel values, and region export all work on the frame you are looking at. Marks are kept per site in a small file beside the ND2 and are shared across time and z planes. Slide Info lists the sites and their arrangement, the z planes with their step and home, the length of the series and the interval between frames, and the exposure.
-
-The grid has no implicitly selected site. Choose a site to measure pixels, view its histogram or use Auto LUT, edit/import/export annotations, or export a region. Manual channel visibility, window and gamma controls still apply to every site in the grid. A plate's **Full Field** export is the selected site's current T/Z frame. Changing sites clears the region; changing T/Z within one site keeps its geometry and refreshes the preview. Pending pixel and histogram responses from an older frame cannot replace the current result.
-
-## Measuring and marking
-
-![A ruler, a pin, and a box on a slide](docs/annotations-ruler.png)
-
-Press `M` and drag for a ruler, `P` for a pin, and `B` for a box. Each mark can carry a note.
-
-The ruler is honest about its numbers. It counts full-resolution pixels between its two ends and multiplies by the micrometers per pixel that the file itself recorded, the voxel size in an ND2 or the MPP tag in an SVS. If a file carries no trustworthy calibration, the ruler reports pixels instead of inventing a number.
-
-Marks are saved automatically in a small `.json` file beside the slide, so they come back the next time you open it and can be shared with the file. Press `⌘⇧E` to export them as GeoJSON, which QuPath imports directly.
-
-## Cutting out a region
-
-![A selected fluorescence region with channel controls and the Scale bar + SVG and Scale bar + JPEG buttons](docs/region-closeup.png)
-
-Press `E` to open the Export panel, choose **Select Region**, and drag a box, or type a size in pixels or micrometers. Then choose a format.
-
-| Format | What you get |
-|---|---|
-| ND2 | the original numbers of the selected channels, as a new ND2 file |
-| TIFF | the original numbers, as a tiled TIFF |
-| PNG or JPEG | a picture of the region exactly as it looks on screen |
-| Scale bar + SVG | a lossless PNG image embedded in an SVG, with an editable vector scale bar and label |
-| Scale bar + JPEG | a high-quality JPEG with the calibrated scale bar and label baked in |
-
-ND2 and TIFF keep the raw values, so what you export is what the scanner recorded. PNG and JPEG apply your colors and brightness settings, which makes them right for figures and wrong for measurement.
-
-### Editable scale bars in Adobe Illustrator
-
-Choose **Scale bar + SVG** to export a single SVG file combining the rendered PNG with a white vector bar and text label. The label uses **Arial by default**. Open it in Adobe Illustrator to edit the label's font or move the bar. The embedded microscopy image keeps the selected export resolution; SVG does not turn it into vector artwork or add image detail.
-
-The horizontal bar is calibrated from the file's recorded micrometers per pixel, adjusted for the selected export scale: **bar width (px) = bar length (µm) ÷ (source µm/px × downsample factor)**. For example, a half-resolution export uses twice the source µm/px. Scale-bar export is unavailable without valid calibration. In Illustrator, resize the image and bar together to preserve their physical relationship; do not stretch the bar independently.
-
-![The exported PNG-plus-SVG figure open in Adobe Illustrator, with an editable 100 µm scale bar and the Character panel](docs/region-scalebar-illustrator.png)
-
-*The microscopy image is raster PNG; the scale bar and its label are separate, editable SVG elements.*
-
-### Exporting the whole slide
-
-![The whole slide selected for a reduced-size export](docs/region-wholeslide.png)
-
-The `Full` button selects the entire slide. A very large picture export is made at a reduced size instead of at native resolution, and the panel tells you the size it will produce.
-
-## Comparing scans and serial sections
-
-![The same case linked three ways, H&E, Masson's trichrome, and CD31 immunofluorescence](docs/compare-serial-sections.jpg)
-
-From left: H&E, Masson's trichrome, and CD31 immunofluorescence of the same case, linked. Moving any one pane moves the other two.
-
-Open two or more slides, press `⌘\`, and choose which slide to compare with the one in front. Then choose **Off**, **Link scale**, or **Link scale + frame**. Link scale matches micrometres per displayed pixel while letting you move each image independently; Link scale + frame also links movement using the alignment. Press `+` in the capsule to add more slides, up to four. Two slides share the screen, three take a column each, and four fill a grid. Physical linking requires valid pixel calibration in every image; incompatible pixel shapes or orientations show a reason instead of claiming equal scale. Zoom percentages may differ between scans because their pixel sizes differ. Here, frame means viewport position, not acquisition T/P/Z indices.
-
-Scans taken through opposite sides of the glass may need a reflection, not just a rotation. In Compare, choose the image in **Active linked slide**, then use **Flip ↔** (`⌘F`), **Flip ↕**, **↶ 90°**, **↷ 90°** (`⌘T`), or **Transpose** (swap the displayed horizontal and vertical axes). These are image-orientation controls, distinct from transposing the well grid. The reference stays fixed; only the selected linked image changes, around the current view center. **Reset Orientation** restores its original orientation without resetting that center. The viewer does not guess the orientation from `.svs` or `.nd2` filenames. Pair orientations are remembered while the app remains open.
-
-The comparison toolbox's **×** only hides the tools: the linked panes and their alignment stay active. Use the **Show comparison tools** sliders button beside the tab-bar link button to reopen them. The tab-bar **link** button (or `⌘\`) ends the comparison; the link button inside the toolbox opens the three linking choices without closing the panes. Hiding tools also preserves an in-progress landmark edit, which can be resumed by reopening the toolbox.
-
-To refine the alignment, press **Align** and click the same four structures on every image, in the same order. The viewer fits rotation, uniform scale and shift, preserving the current mirror state unless **Infer mirror** is selected. This is similarity alignment, not perspective or deformable registration. Landmark residuals are shown in micrometers when calibrated (relative units otherwise). **Done** commits a valid draft; **Cancel** preserves the previous alignment. **Clear Points** clears only the draft. A fitted image's orientation buttons and shortcuts remain protected until **Remove Fit** removes the committed fit. These are display transforms: source pixels, annotation coordinates, and raw exports remain unchanged.
-
-Even a good alignment drifts by a few cells at high magnification. With **Link scale + frame**, the arrow keys move the linked slide by one screen pixel, Shift with an arrow by ten, and an Option-drag moves one pane alone. Each nudge becomes part of the alignment. Scale-only movement does not alter the saved alignment.
-
-This is a navigation and manual similarity-alignment aid, not automatic or deformable image registration. Matching orientation alone does not establish pixel correspondence. For serial sections it never claims that cells in sections separated in depth are the same cells.
-
-## What the viewer writes on your disk
-
-Everything the viewer makes goes into one folder beside the slide.
-
-```text
-experiment/
-├── slide.nd2
-└── nd2wsi/
-    ├── annotations/     your pins, rulers, boxes, and notes
-    └── caches/
-        └── slide.nd2--t0-p0-zmid.nd2svs
-```
-
-Version 2.0 stores each cache as one `.nd2svs` file. It contains the manifest,
-OME-Zarr v2 metadata and compressed image chunks in an application-owned SQLite
-container, with no permanent companion database files. This avoids the allocation
-overhead of thousands of small files on external drives. Open the source scan or
-the `.nd2svs` file directly in the viewer; no unpacking is required.
-
-The original scan is never modified. A compact cache contains reduced levels,
-**not the original full-resolution ND2**. Move the scan and its `nd2wsi` folder
-together to retain native-resolution viewing and annotations. Moving only a
-compact cache allows overview-only viewing, with annotation editing disabled
-until the matching source is available. Pins, rulers and ROIs remain separate in
-`nd2wsi/annotations/` and are never discarded with the cache.
-
-Older directory caches remain readable. Opening a source scan with a matching
-managed scan-pyramid directory cache creates a verified single-file copy and
-keeps the old directory; deletion of the old copy is a separate explicit cleanup.
-Legacy multi-site plate directory caches are reused read-only without conversion.
-Portable `.ome.zarr` exports
-remain supported and are not converted or removed automatically. A tiled SVS
-normally needs no additional cache.
-
-Viewing caches are retained for future opens. macOS 2.1.1 no longer exposes a
-cache-delete button in the viewer; source scans and annotations remain separate.
-
-## Keyboard
-
-Shortcuts act on the image workspace. They are ignored while typing in a text field, editing a note, or composing text with an input method (IME), so normal text-entry shortcuts remain available. `⌘C` and `⌘A` also keep their native copy/select-all behavior while meaningful text is selected, including in Slide Info. On Windows, use Ctrl instead of ⌘.
-
-### Panels and tools
-
-| Key | Action |
-|---|---|
-| `C` | show or hide Channels & LUTs |
-| `E` | show or hide Export |
-| `A` | show or hide Annotations |
-| `M` | measure |
-| `P` | place a pin |
-| `B` | draw a box |
-| `V` | move the selected region |
-| `0` | fit the slide |
-| `I` | pixel values under the cursor |
-| `⌘I` | Slide Info |
-| `⌘N` / `Ctrl+N` on Windows | open a separate viewer window |
-| `⌘1` … `⌘9` | switch to that tab |
-| `⌘⇧E` | export marks as GeoJSON |
-| `Esc` | cancel the active tool, or return to all sites |
-
-### Orientation and comparison
-
-| Key | Action |
-|---|---|
-| `⌘T` | rotate the image 90° clockwise on screen (`⌘R` also works) |
-| `⌘F` | flip the image horizontally on screen |
-| `⌘\` | link slides |
-| `L` | choose Off, Link scale, or Link scale + frame |
-| `←` `→` `↑` `↓` | nudge the linked slide by a pixel, ten with Shift |
-| `⌥` drag | move one linked pane alone |
-
-`⌘T` and `⌘F` change the focused image when slides are unlinked. Annotations and ROI overlays follow the image; their saved source coordinates remain unchanged. In Compare, these shortcuts change the image selected in **Active linked slide**, while the reference stays fixed. They follow the same protections as the orientation buttons: choose **Remove Fit** before changing a fitted image, and open a site before orienting a plate image. They do not rotate or flip the plate grid.
-
-In the image workspace, `⌘T` and `⌘F` control orientation. `⌘R` remains an alias for a clockwise turn. Holding an orientation shortcut applies only one change; release and press again for another. Plain `C` opens Channels, `A` opens Annotations, `E` opens Export, and `P` places a pin. `⌘C` and `⌘A` remain available as aliases when they do not conflict with native copy/select-all. Plain `R` remains reserved.
-
-### Plate navigation
-
-| Key | Action |
-|---|---|
-| `↑` `↓` | z plane of a plate |
-| `←` `→` | time frame of a plate |
-| `Space` | play or pause a plate |
-| `F` | follow the sharpest plane of each site |
-| `1` to `9` | open a site of a plate |
-
-These navigation shortcuts apply on the image stage; arrows instead move between sites when a grid cell has keyboard focus, and Enter opens that site. While movement is linked in Compare, arrows nudge the linked image and plate navigation shortcuts are paused. Plain `F` toggles autofocus only for an eligible plate with multiple Z planes when autofocus is ready; otherwise it does nothing. Use `⌘F` to flip an image.
-
-## Questions and requests
-
-### An older version freezes while installing an update
-
-Version 1.2.8 fixes a main-thread deadlock in the app's preparation for an update. Annotation saving and file-handle cleanup now run in the background; Sparkle resumes on the main thread only after they finish. Aborted attempts cannot resume a later installation.
-
-An older app still runs its old updater code before it can replace itself. If it freezes at this step, save your work and close the viewer, download the latest DMG from [Releases](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest), and replace the app in Applications once. Keep your slide files, annotation sidecars, and viewing caches; none need to be deleted for this repair.
-
-The viewer grew out of one lab's need for speed, so it does what that lab needed first. If something is missing or unclear, open an [issue](https://github.com/myunghyunj/nd2wsi-viewer/issues).
-
-<details>
-<summary><strong>For developers</strong></summary>
-
-### Install from source
-
-Python 3.11 or newer.
-
-```bash
-python -m pip install ".[app,svs]"
-```
-
-ND2 export needs Laboratory Imaging's package index.
-
-```bash
-python -m pip install ".[nd2export]" \
-  --extra-index-url https://pypi.laboratory-imaging.com/simple
-```
-
-### Command line
-
-```text
-nd2wsi info FILE
-nd2wsi view FILE [FILE ...]
-nd2wsi convert FILE [OUTPUT.ome.zarr]
-nd2wsi crop INPUT.nd2 OUTPUT.nd2 --x X --y Y --w W --h H [--c 0,2]
-nd2wsi serve STORE [STORE ...]
-nd2wsi tidy FOLDER [FOLDER ...]
-```
-
-`view` opens the browser UI on a local port. `convert` writes a portable OME-Zarr pyramid with every level. `crop` cuts a native ND2 region with no pyramid at all.
-
-### How it works
-
-An eligible ND2, meaning a modern uncompressed file with one stored T/P/Z plane, gets a compact cache that holds only the reduced levels, while level 0 is the ND2 itself read through its memory map. Compressed and legacy files fall back to a full pyramid. A tiled SVS is served from its own embedded pyramid. An ND2 of camera fields over time, sites, or z planes opens in plate mode, where each frame is read from the file with one sequential read and its reduced copies live in a small zarr store beside the file, one chunk per time point and plane, warmed into memory once it is full. A small server on loopback, behind a random capability URL, hands tiles to OpenSeadragon. Regions are read from the raw tiles for TIFF and ND2 export and rendered for PNG and JPEG.
-
-Rebuilding a working set of 39 scans totalling 190 GB measured the trade. Full pyramids took 152 GB, compact caches 36 GB, and a cold 512 px native window from the largest scan read in 170 ms.
-
-### Development
-
-See [application boundaries and regression coverage](docs/architecture.md) for
-the desktop lifecycle, HTTP/export services and viewer controllers.
-
-```bash
-uv sync --all-extras
-uv run ruff check nd2wsi tests
-uv run pytest -q -m "not realdata"
-
-python scripts/fetch_testdata.py
-uv run pytest -q -m realdata
-
-ND2WSI_SMOKE_FILE=docs/example_cell.nd2 packaging/build_mac_app.sh dist
-```
-
-CI tests Python 3.11 through 3.13, runs Ruff, builds and installs the wheel, and runs the real-data suite on every tag.
-
-Alignment/Compare now keeps landmark drafts separate from committed geometry, requires four valid corresponding points before Done, and scopes spatial commands and remembered fits to the current pane/source/site. Clear Points, Reset Orientation, and Remove Fit have separate meanings. Physical links that cannot be represented by the renderer are blocked; Relative mapping is an explicit display-only choice. ROI previews show the final source-aligned export rectangle, and the scalebar accounts for display rotation and X/Y calibration. See [v1.2.6 validation](docs/v1.2.6-validation.md) for coverage and limitations.
-
-### Prior work
-
-- [`tlambert03/nd2`](https://github.com/tlambert03/nd2) for ND2 reading and metadata
-- [`Laboratory-Imaging/limnd2`](https://github.com/Laboratory-Imaging/limnd2) for ND2 writing
-- [`girder/large_image`](https://github.com/girder/large_image) as the direct ND2 tile-source reference
-- [OME-NGFF](https://ngff.openmicroscopy.org/) for multiscale metadata
-- [OpenSeadragon](https://openseadragon.github.io/) for deep zoom
-- [tifffile](https://github.com/cgohlke/tifffile) for TIFF and SVS access
-
-</details>
+Built by Myunghyun Jeong for day-to-day microscopy work.
+[Report an issue](https://github.com/myunghyunj/nd2wsi-viewer/issues) with the app
+version, platform and file type.
 
 ## License
 
-MIT. The example acquisitions are CC0, described in `TESTDATA_LICENSE.md`. OpenSeadragon is included under its BSD-3-Clause license. Translucent-viewer icons are from [Icons8](https://icons8.com); their licenses and source links are included in `nd2wsi/static/vendor/icons8-win10/`.
+MIT. The example acquisitions are CC0; see [their license](TESTDATA_LICENSE.md).
+OpenSeadragon is included under BSD-3-Clause.
+Third-party SDPC decoder sources and licenses accompany the binary releases.

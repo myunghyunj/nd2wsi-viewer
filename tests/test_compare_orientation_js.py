@@ -417,4 +417,5 @@ def test_visible_orientation_controls_are_wired_and_explained():
     assert 'Remove Fit' in html + shell
     assert 'Clear Points' in html + shell
     assert 'Keep mirror state' in html + shell
-    assert 'Transpose' in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert 'docs/user-guide.md' in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert 'Transpose' in (ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")

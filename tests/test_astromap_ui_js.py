@@ -488,7 +488,7 @@ c.state.annotations=[{id:'one',type:'box',astromap:true,x:0,y:0,w:10,h:10},
 c.astromapItems=()=>c.state.annotations.filter(a=>a.astromap);
 c.toEl=(x,y)=>({x,y});c.annColor=()=> '#123456';c.hexAlpha=()=> 'ordinary-fill';
 c.svgEl=(tag,attrs)=>{if(tag==='polygon')polygons.push(attrs);return {addEventListener(){}};};
-c.chip=()=>{};c.renderLandmarks=()=>{};c.flyToAnnotation=a=>located.push(a.id);
+c.chip=()=>{};c.renderLandmarks=()=>{};c.panToAstromapRoi=a=>located.push(a.id);
 c.$('ann-layer').replaceChildren=()=>{polygons.length=0;};
 c.annotationsChanged=()=>c.renderAnnotations();
 vm.runInContext(production('renderAnnotations')+'\n'+production('selectAstromapRoi')+'\n'+production('removeAnnotation'),c);
@@ -525,7 +525,7 @@ c.state.annotations=[{id:'one',type:'box',astromap:true,x:0,y:0,w:10,h:10,text:'
   {id:'two',type:'box',astromap:true,x:20,y:20,w:10,h:10,text:'second'}];
 c.astromapItems=()=>c.state.annotations;
 c.frameOwnsRoi=()=>true;c.postAstromapState=()=>{};c.renderAnnotations=()=>{};
-c.flyToAnnotation=a=>located.push(a.id);
+c.panToAstromapRoi=a=>located.push(a.id);
 vm.runInContext(production('refreshAstromapPanel')+'\n'+production('selectAstromapRoi'),c);
 c.refreshAstromapPanel();c.state.astromap.rows.get('two').number.onclick();
 return {located,active:c.state.astromap.activeId,rows:[...c.state.astromap.rows.values()].map(r=>({

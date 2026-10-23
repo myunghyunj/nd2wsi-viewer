@@ -1868,8 +1868,18 @@ function selectAstromapRoi(id, locate = true) {
   state.astromap.activeId = id;
   renderAnnotations();
   refreshAstromapPanel();
-  if (locate) flyToAnnotation(item);
+  if (locate) panToAstromapRoi(item);
   return true;
+}
+
+function panToAstromapRoi(item) {
+  const viewport = state.viewer.viewport;
+  const center = viewport.imageToViewportCoordinates(
+    new OpenSeadragon.Point(item.x + item.w / 2, item.y + item.h / 2));
+  // Retain the displayed scale even if a previous zoom is still animating.
+  // This changes only the camera center; ROI size never determines zoom.
+  viewport.zoomTo(viewport.getZoom(true), null, true);
+  viewport.panTo(center, true);
 }
 
 function postAstromapState() {
@@ -2681,6 +2691,8 @@ function renderAnnotations() {
       const note = a.astromap === true ? astromapDisplayNote(a) : a.text;
       chip(layer, left, top - 22, a.astromap === true
         ? `${astromapNumber}${note ? " · " + note : ""}` : a.text || "Box", a.id);
+    } else if (a.type === "geojson") {
+      renderImportedGeoJSON(a, layer);
     } else if (a.type === "pin") {
       const p = toEl(a.x, a.y);
       const g = svgEl("g", { class: "hit" }, layer);
@@ -2692,6 +2704,25 @@ function renderAnnotations() {
   }
   if (state.tempLine) drawLine({ ...state.tempLine, text: "" }, true);
   renderLandmarks(layer);
+}
+
+function renderImportedGeoJSON(item, layer) {
+  const api = window.Nd2AnnotationGeoJSON;
+  try {
+    const parts = api.displayParts(item.geojson.geometry, toEl);
+    const group = svgEl("g", { class: "hit" }, layer);
+    for (const path of parts.paths) svgEl("path", {
+      d: path.d, fill: path.closed ? hexAlpha(annColor(item), .08) : "none",
+      "fill-rule": "evenodd", stroke: annColor(item), "stroke-width": 1.5,
+      "stroke-linejoin": "round",
+    }, group);
+    for (const point of parts.points) svgEl("circle", {
+      cx: point.x, cy: point.y, r: 6, fill: annColor(item), stroke: "#fff", "stroke-width": 1.5,
+    }, group);
+    group.addEventListener("pointerdown", event => { event.stopPropagation(); openEditor(item.id); });
+    const rect = api.bounds(item.geojson.geometry), anchor = toEl(rect.x, rect.y);
+    chip(layer, anchor.x, anchor.y - 22, api.label(item), item.id);
+  } catch (_) { /* Invalid legacy sidecar geometry must not break other annotations. */ }
 }
 
 /* ---- alignment landmarks --------------------------------------------------
@@ -2845,6 +2876,10 @@ function openEditor(id) {
   const p =
     a.type === "pin" ? toEl(a.x, a.y)
     : a.type === "box" ? toEl(a.x + a.w, a.y)
+    : a.type === "geojson" ? (() => {
+      const bounds = window.Nd2AnnotationGeoJSON.bounds(a.geojson.geometry);
+      return toEl(bounds.x + bounds.w, bounds.y);
+    })()
     : toEl((a.x1 + a.x2) / 2, (a.y1 + a.y2) / 2);
   const wrap = $("stage-wrap");
   ed.style.left = clamp(p.x + 14, 8, wrap.clientWidth - 246) + "px";
@@ -2891,42 +2926,50 @@ function wireAnnotationPanel() {
   };
   $("ann-geojson").onclick = exportAnnotationsGeoJSON;
   $("ann-open").onclick = () => {
-    if (annotationOwnerReady()) $("ann-file").click();
-    else showToast("Choose a site before opening annotations");
+    if (annLocked() || state.quitPreparing) showToast("Annotations are currently locked or unavailable");
+    else if (!annotationOwnerReady()) showToast("Choose a site and wait for its annotations before opening a file");
+    else $("ann-file").click();
   };
-  $("ann-file").addEventListener("change", () => {
-    const f = $("ann-file").files[0];
-    if (!f) return;
-    const context = state.annContext;
-    const site = state.annSite;
-    if (!annotationOwnerReady()) {
-      $("ann-file").value = "";
-      showToast("Choose a site before opening annotations");
-      return;
+  $("ann-file").addEventListener("change", () => openAnnotationFile($("ann-file").files[0]));
+}
+
+async function openAnnotationFile(file) {
+  if (!file) return false;
+  const context = state.annContext, site = state.annSite, revision = state.annRevision;
+  const request = state.annImportSeq = (state.annImportSeq || 0) + 1;
+  try {
+    if (!annotationOwnerReady() || annLocked() || state.quitPreparing) {
+      throw new Error("annotations are unavailable or locked for this image");
     }
-    f.text().then((txt) => {
-      try {
-        if (
-          context !== state.annContext || site !== state.annSite ||
-          !annotationOwnerReady()
-        ) {
-          throw new Error("the plate site changed while the file was opening");
-        }
-        const data = JSON.parse(txt);
-        const { items, verified } = annotationItemsForThisSlide(data);
-        state.annotations = items;
-        annotationsChanged();
-        setAnnStatus(
-          "Opened " + f.name + " (" + items.length + ")" +
-          (verified ? "" : " · legacy file, source not verified")
-        );
-      } catch (e) {
-        showToast("could not open annotations: " + e.message);
-      }
-    }).catch((e) => {
-      showToast("could not open annotations: " + e.message);
-    }).finally(() => { $("ann-file").value = ""; });
-  });
+    if (file.size > window.Nd2AnnotationGeoJSON.MAX_BYTES) throw new Error("annotation files must be smaller than 8 MB");
+    const text = await file.text();
+    if (request !== state.annImportSeq) return false;
+    if (context !== state.annContext || site !== state.annSite || !annotationOwnerReady() ||
+        annLocked() || state.quitPreparing) throw new Error("the image or annotation state changed while the file was opening");
+    const { items, verified, append = false } = annotationItemsForThisSlide(JSON.parse(text), /\.geojson$/i.test(file.name));
+    if (!append && revision !== state.annRevision) throw new Error("annotations changed while the file was opening");
+    const usedIds = new Set(state.annotations.map(item => item.id));
+    const imported = append ? items.map(item => {
+      let id;
+      do { id = "a" + Date.now().toString(36) + annCounter++; } while (usedIds.has(id));
+      usedIds.add(id);
+      return { ...item, id };
+    }) : items;
+    const combined = append ? state.annotations.concat(imported) : imported;
+    if (new Blob([JSON.stringify({ items: combined })]).size > window.Nd2AnnotationGeoJSON.MAX_BYTES) {
+      throw new Error("the combined annotations exceed the 8 MB import limit");
+    }
+    if (!append) closeEditor(false);
+    state.annotations = combined;
+    annotationsChanged();
+    setAnnStatus((append ? "Imported " : "Opened ") + file.name + " (" + imported.length + ")" +
+      (append ? " · added to existing annotations" : "") +
+      (verified ? "" : " · source not verified"));
+    return true;
+  } catch (error) {
+    showToast("could not open annotations: " + error.message);
+    return false;
+  } finally { if (request === state.annImportSeq) $("ann-file").value = ""; }
 }
 
 function downloadJsonFile(data, filename, mime) {
@@ -2945,6 +2988,7 @@ function downloadJsonFile(data, filename, mime) {
 
 function annotationFeature(item) {
   if (!item || typeof item !== "object") return null;
+  if (item.geojson) return window.Nd2AnnotationGeoJSON.featureForAnnotation(item);
   const finite = (...values) => values.every((value) =>
     value !== null && value !== "" && value !== undefined && Number.isFinite(Number(value))
   );
@@ -2978,6 +3022,8 @@ function annotationFeature(item) {
     properties: {
       objectType: "annotation",
       name: item.text === null || item.text === undefined ? "" : String(item.text),
+      ...(/^#[0-9a-f]{6}$/i.test(item.color || "")
+        ? { color: [1, 3, 5].map(start => parseInt(item.color.slice(start, start + 2), 16)) } : {}),
     },
   };
 }
@@ -3028,6 +3074,10 @@ function exportAnnotationsGeoJSON() {
     return;
   }
   const doc = annotationsToGeoJSON(state.annotations);
+  const owner = annotationDocument();
+  doc.coordinate_space = owner.coordinate_space;
+  doc.source = owner.source;
+  doc.selection = owner.selection;
   downloadJsonFile(doc, geojsonFilename(state.info), "application/geo+json");
   showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON");
 }
@@ -3074,7 +3124,21 @@ function normalizedSelection(selection) {
   };
 }
 
-function annotationItemsForThisSlide(data) {
+function annotationItemsForThisSlide(data, geojsonFile = false) {
+  if (geojsonFile || window.Nd2AnnotationGeoJSON.isGeoJSON(data)) {
+    const items = window.Nd2AnnotationGeoJSON.parse(data, state.info);
+    if (data.selection) {
+      const current = currentSelection();
+      if (!current) throw new Error("choose a plate site first");
+      const expected = normalizedSelection(current), actual = normalizedSelection(data.selection);
+      if (expected.t !== actual.t || expected.p !== actual.p || expected.z !== actual.z) {
+        throw new Error("annotations belong to a different T/P/Z plane");
+      }
+    }
+    const { verified } = annotationItemsForThisSlide({ items: [], source: data.source,
+      coordinate_space: data.coordinate_space, selection: data.selection });
+    return { items, verified, append: true };
+  }
   if (Array.isArray(data)) return { items: data, verified: false };
   if (!data || !Array.isArray(data.items)) throw new Error("no items array");
 
@@ -3129,6 +3193,7 @@ function rebuildAnnList() {
     const txt = document.createElement("span");
     txt.className = "txt";
     txt.textContent =
+      a.type === "geojson" ? window.Nd2AnnotationGeoJSON.label(a) :
       a.type === "line" ? (a.text || "Measurement") : (a.text || (a.type === "pin" ? "Pin" : "Box"));
     const meta = document.createElement("span");
     meta.className = "meta";
@@ -3152,6 +3217,10 @@ function flyToAnnotation(a) {
     const r =
       a.type === "box"
         ? new OpenSeadragon.Rect(a.x, a.y, a.w, a.h)
+        : a.type === "geojson" ? (() => {
+          const bounds = window.Nd2AnnotationGeoJSON.bounds(a.geojson.geometry);
+          return new OpenSeadragon.Rect(bounds.x, bounds.y, bounds.w || 1, bounds.h || 1);
+        })()
         : new OpenSeadragon.Rect(
             Math.min(a.x1, a.x2), Math.min(a.y1, a.y2),
             Math.abs(a.x2 - a.x1) || 1, Math.abs(a.y2 - a.y1) || 1

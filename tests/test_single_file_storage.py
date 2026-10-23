@@ -1,10 +1,12 @@
 """Single-file persistence checks use tiny synthetic data, never real caches."""
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
 import sqlite3
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urlsplit
 
@@ -268,6 +270,85 @@ def test_exclusive_creation_never_adopts_an_existing_file(tmp_path):
     with pytest.raises(FileExistsError):
         SQLiteStore.create_exclusive(path)
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+def test_new_database_identity_is_stable_before_sqlite_opens(tmp_path, monkeypatch, platform):
+    path = tmp_path / "new.nd2svs"
+    real_fsync = os.fsync
+    real_connect = sqlite3.connect
+    initialized = []
+    opened = []
+
+    def record_fsync(fd):
+        assert path.read_bytes() == b"S"
+        initialized.append(fd)
+        return real_fsync(fd)
+
+    def checked_connect(*args, **kwargs):
+        if not opened:
+            assert path.read_bytes() == (b"S" if platform == "darwin" else b"")
+            assert len(initialized) == (1 if platform == "darwin" else 0)
+            for fd in initialized:
+                with pytest.raises(OSError) as closed:
+                    os.fstat(fd)
+                assert closed.value.errno == errno.EBADF
+        opened.append(True)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(sqlite3, "connect", checked_connect)
+    with SQLiteStore.create_exclusive(path) as store:
+        store.write_bytes("value", b"original")
+    before = path.read_bytes()
+    for read_only in (True, False):
+        with SQLiteStore(path, read_only=read_only) as store:
+            assert store.read_bytes("value") == b"original"
+    assert path.read_bytes() == before
+    assert len(initialized) == (1 if platform == "darwin" else 0)
+
+
+@pytest.mark.parametrize("failure", ["short-write", "fsync"])
+def test_new_database_initialization_failure_closes_fd_and_preserves_files(
+    tmp_path, monkeypatch, failure,
+):
+    existing = tmp_path / "existing.nd2svs"
+    with SQLiteStore.create_exclusive(existing) as store:
+        store.write_bytes("value", b"preserve")
+    before = existing.read_bytes()
+    path = tmp_path / "new.nd2svs"
+    real_write = os.write
+    descriptors = []
+
+    def fail_write(fd, payload):
+        descriptors.append(fd)
+        if failure == "short-write":
+            return 0
+        return real_write(fd, payload)
+
+    def fail_fsync(fd):
+        raise OSError(errno.EIO, "injected initialization flush failure")
+
+    def must_not_connect(*args, **kwargs):
+        raise AssertionError("failed initialization must stop before SQLite opens the file")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "write", fail_write)
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    monkeypatch.setattr(sqlite3, "connect", must_not_connect)
+    with pytest.raises(OSError) as failure_result:
+        SQLiteStore.create_exclusive(path)
+    assert failure_result.value.errno == errno.EIO
+    assert len(descriptors) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(descriptors[0])
+    assert closed.value.errno == errno.EBADF
+    assert path.read_bytes() == (b"" if failure == "short-write" else b"S")
+    for preserved in (path, existing):
+        with pytest.raises(FileExistsError):
+            SQLiteStore.create_exclusive(preserved)
+    assert existing.read_bytes() == before
 
 
 @pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])

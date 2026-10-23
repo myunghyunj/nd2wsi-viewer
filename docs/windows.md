@@ -1,80 +1,40 @@
 # Windows distribution
 
-## Current v2.3.1 download
+[Back to the README](../README.md) · [User guide](user-guide.md)
 
-Use the [v2.3.1 portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.3.1/nd2wsi-viewer-2.3.1-windows-x64.zip.sha256).
-See the [release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.3.1)
-for the exact source commit, artifact checksum, and platform verification results.
-Extract the whole ZIP and retain
-`_internal` beside the EXE. WebView2 is required. No 2.3.1 Setup installer is included.
+## Downloads
 
-Version 2.3.1 reorganizes shared reader lifetime, tile caching and RGB level
-access, and consolidates embedded-image reader selection. Pixel calculations,
-source checks, viewing features and storage formats are unchanged. See the
-[2.3.1 release notes](release-notes-2.3.1.md).
+| Channel | Download | Verification |
+| --- | --- | --- |
+| Stable 2.4.1 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.1/nd2wsi-viewer-2.4.1-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.4.1) |
+| 2.5 Beta1 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.0b1/nd2wsi-viewer-2.5.0b1-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.5.0b1) |
 
-Version 2.3.0 adds direct viewing of supported SQ/SDPC HEVC slides, with the
-decoder included. It reads embedded tiles without creating a whole-slide
-pixel cache. TIFF ROI export preserves decoded RGB and physical calibration;
-it cannot recover samples lost during the source's lossy compression.
-Corresponding decoder sources, build configuration and licenses are supplied
-with the release. See the [2.3.0 release notes](release-notes-2.3.0.md) and
-[SDPC format limits](sdpc-support.md); JPEG SDPC and vendor colour correction
-are not supported.
+Extract the entire ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
+The archive includes Python and the scientific libraries. Install Microsoft
+Edge WebView2 Runtime separately if it is missing. The app also requires .NET
+Framework 4.6.2 or later.
 
-**Shading Correction** evaluates FITC, CY3 and BF, including an adaptive fallback
-for scans with insufficient repeated fields in the original fixed validation
-regions. Local measurements restore correction strength while trough-depth bounds
-limit dark-to-bright reversal. Channels without sufficient evidence remain unchanged.
-The corrected viewing pyramid remains saved after reopening. Updating retains
-existing saved corrections; use **Revoke**, then **Apply**, to refit them with 2.2.1.
-Both operations require the original ND2. DAPI, native ND2/TIFF exports, pixel
-readouts, source files, annotations and LUT settings remain unchanged. Adaptive
-and BF-corrected caches require 2.2.0 or later; 2.1.15 corrected caches remain readable.
-See the [2.2.1 release notes](release-notes-2.2.1.md) and
-[method and validation limits](shading-correction-validation.md). Spatial checks
-within one development acquisition do not establish biological preservation or
-performance across independent acquisitions.
+The x64 app targets Windows 10 version 1709 or later and Windows 11 on
+Intel/AMD. Windows 11 ARM64 uses the same executable through x64 emulation;
+this is not a native ARM64 build. Release records identify the exact executable
+and the x64/ARM64 execution targets checked. Windows 10 Education and local
+Parallels were not separately tested for these releases.
 
-The viewing and LUT features introduced in earlier releases remain available.
-The standard viewer remembers each file's last-used channel minimum, maximum and
-gamma, including across app restarts. Preferences are stored locally and separately
-from the source image; saved values take precedence over initial Auto.
+The executable is not Authenticode-signed, so Windows may show an
+unknown-publisher warning. Updates are installed manually from Releases.
+Windows uses the standard title bar and does not use the macOS Sparkle updater.
+Use **Ctrl** for Mac **⌘** shortcuts and **Alt** for **Option**.
 
-The **Type LUT** action now uses a compact pencil icon matching the adjacent copy
-and paste actions. Its numeric dialog still accepts each channel's minimum,
-maximum and gamma; invalid entries leave every channel unchanged. **Auto-fit** is the shorter label
-for the histogram-axis checkbox. Copy and paste LUTs between windows by unique
-channel name, regardless of channel order. Unmatched, duplicate, invalid or
-incompatible entries are skipped; raw pixels, annotations, channel colors and
-visibility stay unchanged. macOS and Windows share the same borderless 16 px
-Fluent icons. Hover over edit, copy or paste for about one second to see a short
-explanation, also available with keyboard focus. A successful copy immediately
-shows a brief green check and **Copied!**. See the
-[2.1.14 release notes](release-notes-2.1.14.md).
+Stable 2.4.1 includes Astromap ROI import/export and supported HEVC SDPC viewing.
+Shading Correction assesses supported FITC and CY3 channels; BF and DAPI remain
+unchanged. See the [current method and limits](shading-correction-validation.md).
 
-ND2 without saved LUTs opens with automatic contrast and a fitted LUT graph. The robust bright limit
-reduces sensitivity to rare bright pixels, while manual edits, full-range inspection
-and raw pixel values remain available. Floating panels have reachable resize edges
-and a visible corner grip. Plate controls also use a dedicated controller
-with direct tests for navigation, playback and stale-request cancellation.
-macOS title-bar dragging now uses the native Cocoa operation, including after
-display changes; Windows retains its native title bar.
-The 2.1.8 maintenance
-refactor remains included, with no storage-format change or research-data migration.
-It retains the 2.1.7
-RGB brightfield ND2 and SVS controls: independent Red, Green and Blue ranges,
-gamma and visibility, with a light theme. RGB ND2 Auto uses a shared window across
-components; SVS retains its original default colours.
-Calibrated SVG/JPEG scale-bar exports and Arial-default SVG labels remain available.
-Shared session startup also avoids false “update in progress” errors during simultaneous window starts on slow storage.
-It also retains fractional LUT precision, Z-stack direction, checkbox and
-comparison shortcuts, histogram retry, cache-free plate status, and the opening
-and recovery fixes from 2.1.5. Windows uses the standard viewer and manual ZIP
-updates; Metal and Sparkle remain macOS-only.
-Windows 10 Education and local Parallels remain untested for this release.
-Windows 11 ARM64 uses the x64 executable through emulation, not a native ARM build.
+2.5 Beta1 adds the collapsible top tools and translucent viewer, with ROI boxes,
+navigation, locking and a 10–100% opacity slider. Windows applies opacity to
+the whole floating window, including its controls and ROI outlines. See the
+[2.5 Beta1 notes](release-notes-2.5.0b1.md).
+
+Older validation records below apply only to the versions named in them.
 
 ## Historical v2.1.4 download
 
@@ -107,10 +67,10 @@ emulation, not an ARM64-native binary.
 
 ## Installer build tooling
 
-The current source targets viewer 2.3.1, with a native Windows frame
-and Microsoft Edge WebView2. Installer tooling can produce
-`nd2wsi-viewer-2.3.1-Setup.exe`, but no Setup is published or verified for this
-release. The tooling installs the app
+The Windows app uses a native frame and Microsoft Edge WebView2. Installer
+tooling can produce a versioned Setup executable, but the current stable 2.4.1
+and 2.5 Beta1 downloads are portable ZIPs; no Setup installer is published for
+those releases. The tooling installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
 Windows Settings > Apps for removal. The executable and `_internal` directory
@@ -122,7 +82,7 @@ whole extracted folder together; the EXE depends on its `_internal` directory.
 Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
-v1.2.8 results below do not establish v2.3.1 Windows hardware verification.
+v1.2.8 results below do not establish verification of later releases.
 The current release provides the portable ZIP described above.
 
 Target execution modes (the verified CI environments are listed above):
@@ -219,14 +179,14 @@ uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --
 ```
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.2.1-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.5.0b1-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.2.1-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.5.0b1-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks

@@ -195,14 +195,14 @@
         <div id="ann-list"></div>
         <div class="hint" id="ann-empty">Measurements and notes are stored outside the viewing cache.</div>
         <div class="tool-row footer">
-          <button id="ann-open" class="btn" title="Load an annotation file">Open…</button>
+          <button id="ann-open" class="btn" title="Load annotations (.json or .geojson)">Open…</button>
           <button id="ann-export" class="btn" title="Download the annotation file">Export</button>
         </div>
         <div class="tool-row footer geojson-footer">
           <button id="ann-geojson" class="btn full" title="Export QuPath-compatible GeoJSON (⌘⇧E)">Export GeoJSON</button>
         </div>
         <div class="hint" id="ann-status"></div>
-        <input type="file" id="ann-file" accept=".json,application/json" hidden />
+        <input type="file" id="ann-file" accept=".json,.geojson,application/json,application/geo+json" hidden />
       </div>
     </section>
 
@@ -358,6 +358,7 @@
 <script src="../../static/shading-correction-v1.js"></script>
 <script src="../../static/astromap-v1.js"></script>
 <script src="../../static/astromap-import-v1.js"></script>
+<script src="../../static/annotation-geojson-v1.js"></script>
 <script src="../../static/app.js"></script>
 </body>
 </html>

@@ -11,6 +11,7 @@ APP = ROOT / "nd2wsi" / "static" / "app.js"
 CSS = ROOT / "nd2wsi" / "static" / "style.css"
 INDEX = ROOT / "nd2wsi" / "static" / "index.html"
 README = ROOT / "README.md"
+USER_GUIDE = ROOT / "docs" / "user-guide.md"
 
 
 def test_well_headers_and_view_menu_are_loaded_and_wired():
@@ -64,9 +65,11 @@ def test_hidden_controls_reclaim_space_without_hiding_focus_strip_labels():
     assert "#stage-wrap.plate-labels-hidden #plate-strip" not in css
 
 
-def test_readme_explains_coordinate_headers_and_view_options():
+def test_linked_user_guide_explains_coordinate_headers_and_view_options():
     readme = README.read_text(encoding="utf-8")
+    guide = USER_GUIDE.read_text(encoding="utf-8")
 
-    assert "Coordinate names such as `A01` become lettered and numbered" in readme
-    assert "one z plane or one time point hides the corresponding control" in readme
-    assert "**View** menu can show or hide Site Labels, Timeline, and Z Axis" in readme
+    assert "docs/user-guide.md" in readme
+    assert "Coordinate names such as `A01` become lettered and numbered" in guide
+    assert "one z plane or one time point hides the corresponding control" in guide
+    assert "**View** menu can show or hide Site Labels, Timeline, and Z Axis" in guide

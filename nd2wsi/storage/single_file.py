@@ -14,6 +14,7 @@ import ntpath
 import os
 import sqlite3
 import stat
+import sys
 import threading
 from collections.abc import AsyncIterator, Iterable, Iterator
 from contextlib import contextmanager
@@ -248,7 +249,17 @@ class SQLiteStore(Store):
                         raise
                     pass  # Validate the winner; never adopt an unknown existing file.
                 else:
-                    os.close(fd)
+                    try:
+                        if sys.platform == "darwin":
+                            # macOS exFAT can change a new file's inode on its
+                            # first flush. Stabilize it before SQLite records
+                            # the identity, as newer SQLite's Unix VFS does.
+                            # Only our exclusive new file may be initialized.
+                            if os.write(fd, b"S") != 1:
+                                raise OSError(errno.EIO, "could not initialize cache file", native)
+                            os.fsync(fd)
+                    finally:
+                        os.close(fd)
                     created = True
             if not created:
                 # Check identity before asking SQLite to open untrusted data.

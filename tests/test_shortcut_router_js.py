@@ -19,6 +19,7 @@ INDEX = ROOT / "nd2wsi" / "static" / "index.html"
 SHELL_JS = ROOT / "nd2wsi" / "static" / "shell-v1.js"
 SHELL_HTML = ROOT / "nd2wsi" / "static" / "shell.html"
 README = ROOT / "README.md"
+USER_GUIDE = ROOT / "docs" / "user-guide.md"
 NODE = shutil.which("node")
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -336,6 +337,7 @@ def test_production_pages_use_the_router_and_document_the_same_shortcuts():
     shell_js = SHELL_JS.read_text(encoding="utf-8")
     shell_html = SHELL_HTML.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
+    guide = USER_GUIDE.read_text(encoding="utf-8")
 
     assert index.index("shortcut-router-v1.js") < index.index("app.js")
     assert shell_html.index("shortcut-router-v1.js") < shell_html.index("shell-v1.js")
@@ -350,13 +352,14 @@ def test_production_pages_use_the_router_and_document_the_same_shortcuts():
     missing_guard = 'if (index === null || !slides[index]) return;'
     assert shell_js.index(missing_guard) < shell_js.index("event.preventDefault();", shell_js.index(missing_guard))
 
-    assert '| `C` | show or hide Channels & LUTs |' in readme
-    assert '| `E` | show or hide Export |' in readme
-    assert '| `⌘T` | rotate the image 90° clockwise on screen (`⌘R` also works) |' in readme
+    assert 'docs/user-guide.md' in readme
+    assert '| `C` | show or hide Channels & LUTs |' in guide
+    assert '| `E` | show or hide Export |' in guide
+    assert '| `⌘T` | rotate the image 90° clockwise on screen (`⌘R` also works) |' in guide
     assert 'title="Rotate the selected image 90° clockwise (⌘T)"' in shell_html
-    assert '| `A` | show or hide Annotations |' in readme
-    assert '| `⌘1` … `⌘9` | switch to that tab |' in readme
-    assert "`⌘C` `⌘R` `⌘A`" not in readme
+    assert '| `A` | show or hide Annotations |' in guide
+    assert '| `⌘1` … `⌘9` | switch to that tab |' in guide
+    assert "`⌘C` `⌘R` `⌘A`" not in readme + guide
     assert 'id="tb-channels" title="Show or hide Channels &amp; LUTs (C)" aria-keyshortcuts="C"' in index
     assert 'id="tb-region" title="Show or hide Export (E)" aria-keyshortcuts="E"' in index
     assert 'id="tb-annot" title="Show or hide Annotations (A)" aria-keyshortcuts="A"' in index

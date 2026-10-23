@@ -180,6 +180,11 @@ def test_final_durability_flush_uses_nontruncating_writable_handle(tmp_path, mon
 
     def checked_fsync(fd):
         handles = [(mode, handle) for mode, handle in target_handles if not handle.closed]
+        if not target_handles:
+            # Darwin first stabilizes the exclusive one-byte file's identity;
+            # this check concerns the later flush of the verified container.
+            assert os.fstat(fd).st_size == 1 and target.read_bytes() == b"S"
+            return real_fsync(fd)
         assert len(handles) == 1
         mode, handle = handles[0]
         assert fd == handle.fileno()
