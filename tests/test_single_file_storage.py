@@ -276,9 +276,10 @@ def test_exclusive_creation_never_adopts_an_existing_file(tmp_path):
 def test_new_database_identity_is_stable_before_sqlite_opens(tmp_path, monkeypatch, platform):
     path = tmp_path / "new.nd2svs"
     real_fsync = os.fsync
-    real_connect = sqlite3.connect
     initialized = []
-    opened = []
+
+    class SQLiteOpenReached(Exception):
+        pass
 
     def record_fsync(fd):
         assert path.read_bytes() == b"S"
@@ -286,19 +287,26 @@ def test_new_database_identity_is_stable_before_sqlite_opens(tmp_path, monkeypat
         return real_fsync(fd)
 
     def checked_connect(*args, **kwargs):
-        if not opened:
-            assert path.read_bytes() == (b"S" if platform == "darwin" else b"")
-            assert len(initialized) == (1 if platform == "darwin" else 0)
-            for fd in initialized:
-                with pytest.raises(OSError) as closed:
-                    os.fstat(fd)
-                assert closed.value.errno == errno.EBADF
-        opened.append(True)
-        return real_connect(*args, **kwargs)
+        assert path.read_bytes() == (b"S" if platform == "darwin" else b"")
+        assert len(initialized) == (1 if platform == "darwin" else 0)
+        for fd in initialized:
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
+        # sys.platform selects our initialization branch, not SQLite's native
+        # VFS. Test the ordering here and real database I/O on the host below.
+        raise SQLiteOpenReached
 
     monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setattr(os, "fsync", record_fsync)
     monkeypatch.setattr(sqlite3, "connect", checked_connect)
+    with pytest.raises(SQLiteOpenReached):
+        SQLiteStore.create_exclusive(path)
+    assert len(initialized) == (1 if platform == "darwin" else 0)
+
+
+def test_new_database_roundtrips_on_native_platform(tmp_path):
+    path = tmp_path / "new.nd2svs"
     with SQLiteStore.create_exclusive(path) as store:
         store.write_bytes("value", b"original")
     before = path.read_bytes()
@@ -306,7 +314,6 @@ def test_new_database_identity_is_stable_before_sqlite_opens(tmp_path, monkeypat
         with SQLiteStore(path, read_only=read_only) as store:
             assert store.read_bytes("value") == b"original"
     assert path.read_bytes() == before
-    assert len(initialized) == (1 if platform == "darwin" else 0)
 
 
 @pytest.mark.parametrize("failure", ["short-write", "fsync"])
