@@ -180,9 +180,9 @@ class ViewerState:
         """Persistent, source-bound correction of the registered display pyramid."""
         with self._shading_lock:
             if self._shading is None:
-                from .h_correction import HCorrectionController
+                from .h_correction import ShadingCorrectionController
 
-                self._shading = HCorrectionController(self)
+                self._shading = ShadingCorrectionController(self)
             return self._shading
 
     def close_shading(self) -> None:

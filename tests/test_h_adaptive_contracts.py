@@ -123,7 +123,7 @@ def cancel():
     lambda: adaptive.compute_subcell_observations([{}], [], {}, [], {}, check=cancel),
     lambda: adaptive.compute_train_channel_coupling([{"group": "train"}], ["FITC"], check=cancel),
     lambda: adaptive._build_conservative_subcell_field([{}], (0, 0), (1, 1), None, check=cancel),
-    lambda: adaptive.build_m5_adaptive_hybrid_nodes([], ["FITC"], (0, 0), (1, 1), {}, check=cancel),
+    lambda: adaptive.build_coupled_subcell_amplitude_nodes([], ["FITC"], (0, 0), (1, 1), {}, check=cancel),
 ])
 def test_long_cell_and_node_loops_honor_cancellation(operation):
     with pytest.raises(Cancelled):

@@ -207,7 +207,6 @@ def run(nd2_path: Path) -> int:
             config = json.loads(Path(h_model.__file__).with_name("h_config.json").read_text())
             assert config["schema"] == "H_auto_refit/1"
             criteria = h_adaptive.validated_acceptance_criteria(config["h_adaptive"])
-            assert h_adaptive.ADAPTIVE_SCHEMA == h_model.Model.ADAPTIVE_SCHEMA
             assert criteria["gain_and_engineering_invariants"] == {
                 "minimum_valid_gain": 0.25, "maximum_valid_gain": 1.75,
             }

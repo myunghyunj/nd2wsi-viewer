@@ -54,9 +54,9 @@ def test_cap_search_never_uses_singular_or_out_of_range_gains():
 
 def test_strong_supported_regions_restore_strength_and_local_weak_region_is_bounded(sampled):
     cells, template = sampled
-    m5, _ = adaptive.build_m5_adaptive_hybrid_nodes(cells, ["BF"], (0, 0), (3, 5), {"BF": 1.})
-    nodes, record = build(cells, template, m5_nodes=m5)
-    assert nodes[0, 3, 1] > 1.7 * (.5 * m5[0, 3, 1])
+    coupled, _ = adaptive.build_coupled_subcell_amplitude_nodes(cells, ["BF"], (0, 0), (3, 5), {"BF": 1.})
+    nodes, record = build(cells, template, coupled_nodes=coupled)
+    assert nodes[0, 3, 1] > 1.7 * (.5 * coupled[0, 3, 1])
     assert nodes[0, 3, 9] <= .3
     assert record["channels"]["BF"]["cap_observations"] > 0
     assert record["channels"]["BF"]["restored_above_fallback_nodes"] > 0
@@ -87,9 +87,9 @@ def test_missing_sample_forces_every_influencing_node_to_fallback(sampled):
     cell["values_fit"][0, 80, 100] = np.nan
     support = adaptive.finite_node_support(cells, (0, 0), (3, 5))
     np.testing.assert_array_equal(support[2:4, 4:6], np.zeros((2, 2)))
-    m5, _ = adaptive.build_m5_adaptive_hybrid_nodes(cells, ["BF"], (0, 0), (3, 5), {"BF": 1.})
-    nodes, _ = build(cells, template, m5_nodes=m5)
-    np.testing.assert_array_equal(nodes[0, 2:4, 4:6], .5 * m5[0, 2:4, 4:6])
+    coupled, _ = adaptive.build_coupled_subcell_amplitude_nodes(cells, ["BF"], (0, 0), (3, 5), {"BF": 1.})
+    nodes, _ = build(cells, template, coupled_nodes=coupled)
+    np.testing.assert_array_equal(nodes[0, 2:4, 4:6], .5 * coupled[0, 2:4, 4:6])
     assert support[3, 1] == 1
 
 
@@ -127,5 +127,5 @@ def test_local_helpers_honor_cancellation(sampled):
             cancel()
 
     with pytest.raises(InterruptedError):
-        build(cells, template, m5_nodes=np.ones((1, 7, 11)), check=cancel_during_loop)
+        build(cells, template, coupled_nodes=np.ones((1, 7, 11)), check=cancel_during_loop)
     assert calls == 25
