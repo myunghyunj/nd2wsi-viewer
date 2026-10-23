@@ -100,7 +100,8 @@ const viewer={viewport,world:{getItemCount:()=>config.ready===false ? 0 : 1},
   rotationIncrement:90,pixelsPerArrowPress:40,
   panHorizontal:true,panVertical:true,goToPreviousPage(){},goToNextPage(){}};
 state.viewer=viewer;
-const window={Nd2ShortcutRouter:Router,addEventListener(kind,fn,options){
+const window={Nd2ShortcutRouter:Router,Nd2ViewerGeometry:require(root+'/viewer-geometry-v1.js'),
+  addEventListener(kind,fn,options){
   if(!listeners.has(kind)) listeners.set(kind,[]);
   listeners.get(kind).push({fn,capture:options===true || !!options?.capture});
 }};
