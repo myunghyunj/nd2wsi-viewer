@@ -1,14 +1,16 @@
 #!/bin/bash
-# Build a separate local beta. No install, release signing, upload, or appcast.
+# Historical recipe for the local Astromap beta (2.4.0b1); the feature shipped
+# in the regular app with 2.4.1. No install, release signing, upload, or appcast.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(dirname "$HERE")"
+REPO="$(cd "$HERE/../.." && pwd)"
 OUT="${1:?usage: build_astromap_beta.sh /absolute/new-output-directory}"
 PY="${ND2WSI_BUILD_PYTHON:-$REPO/.venv/bin/python}"
 TOOLS="${ND2WSI_BUILD_TOOLS:-$REPO/qa/build-tools}"
 RUNTIME="${ND2WSI_BUILD_RUNTIME:-$REPO/qa/runtime}"
 CODEC_APP="${ND2WSI_CODEC_APP:-}"
 NAME="nd2wsi-viewer Astromap Beta"
+BUNDLE_ID="com.nd2wsi.viewer.astromap-beta"
 VERSION="2.4.0b1"
 [[ "$(uname -sm)" == "Darwin arm64" ]] || { echo "macOS arm64 is required" >&2; exit 2; }
 [[ "$OUT" == /* && ! -e "$OUT" ]] || { echo "Choose a new absolute output directory" >&2; exit 2; }
@@ -76,7 +78,7 @@ PY
 STAGE="$(mktemp -d /private/tmp/nd2wsi-astromap-beta.XXXXXX)"
 echo "Beta build stage: $STAGE"
 "$PY" -m PyInstaller --noconfirm --windowed --name "$NAME" \
-  --icon "$HERE/AppIcon.icns" --osx-bundle-identifier com.nd2wsi.viewer.astromap-beta \
+  --icon "$HERE/../AppIcon.icns" --osx-bundle-identifier "$BUNDLE_ID" \
   --paths "$RUNTIME" --paths "$REPO" \
   --collect-all nd2wsi --collect-all nd2 --collect-all scipy \
   --collect-all zarr --collect-all numcodecs --collect-all dask \
@@ -93,18 +95,19 @@ if [[ -n "$CODEC_APP" ]]; then
   done
   /usr/bin/ditto "$CODEC_APP/Contents/Resources/sdpc-codec-licenses" "$APP/Contents/Resources/sdpc-codec-licenses"
 fi
-"$PY" - "$APP/Contents/Info.plist" <<'PY'
+"$PY" - "$APP/Contents/Info.plist" "$NAME" "$BUNDLE_ID" "$VERSION" <<'PY'
 import plistlib
+import re
 import sys
 
-path = sys.argv[1]
+path, name, bundle_id, version = sys.argv[1:]
+# The marketing version drops the pre-release suffix: 2.4.0b1 -> 2.4.0.
+short_version = re.match(r'\d+(\.\d+)*', version).group(0)
 with open(path, 'rb') as stream:
     info = plistlib.load(stream)
-info.update(CFBundleName='nd2wsi-viewer Astromap Beta',
-            CFBundleDisplayName='nd2wsi-viewer Astromap Beta',
-            CFBundleIdentifier='com.nd2wsi.viewer.astromap-beta',
-            CFBundleShortVersionString='2.4.0', CFBundleVersion='2.4.0b1',
-            ND2WSIPackageVersion='2.4.0b1', ND2WSIDevelopmentOnly=True,
+info.update(CFBundleName=name, CFBundleDisplayName=name, CFBundleIdentifier=bundle_id,
+            CFBundleShortVersionString=short_version, CFBundleVersion=version,
+            ND2WSIPackageVersion=version, ND2WSIDevelopmentOnly=True,
             LSMinimumSystemVersion='12.0', SUEnableAutomaticChecks=False)
 for key in ('CFBundleDocumentTypes', 'UTExportedTypeDeclarations',
             'UTImportedTypeDeclarations', 'SUFeedURL', 'SUPublicEDKey'):
@@ -114,44 +117,14 @@ with open(path, 'wb') as stream:
 PY
 
 # Prove the beta contains this checkout, not the stable editable install.
-"$PY" - "$APP" "$REPO" "$STAGE/packaged-source.json" <<'PY'
-import json
-import plistlib
-import sys
-from pathlib import Path
-from types import CodeType
-from PyInstaller.archive.readers import CArchiveReader
-
-app, root, report = map(Path, sys.argv[1:])
-archive = CArchiveReader(str(app / 'Contents/MacOS/nd2wsi-viewer Astromap Beta')).open_embedded_archive('PYZ.pyz')
-for required in ('reportlab.pdfgen.canvas', 'reportlab.pdfbase.ttfonts',
-                 'pypdf', 'charset_normalizer'):
-    assert required in archive.toc, required
-assert (app / 'Contents/Resources/reportlab/fonts/Vera.ttf').is_file()
-def normalized(code):
-    return code.replace(co_filename='<source>', co_consts=tuple(
-        normalized(item) if isinstance(item, CodeType) else item for item in code.co_consts))
-modules, assets = [], []
-for source in sorted((root / 'nd2wsi').rglob('*.py')):
-    parts = list(source.relative_to(root).with_suffix('').parts)
-    if parts[-1] == '__init__':
-        parts.pop()
-    module = '.'.join(parts)
-    assert normalized(archive.extract(module)) == normalized(compile(source.read_text(), '<source>', 'exec')), module
-    modules.append(module)
-for source in sorted((root / 'nd2wsi/static').rglob('*')):
-    if source.is_file():
-        relative = source.relative_to(root)
-        assert (app / 'Contents/Resources' / relative).read_bytes() == source.read_bytes(), str(relative)
-        assets.append(str(relative))
-info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
-assert info['ND2WSIPackageVersion'] == '2.4.0b1'
-assert info['CFBundleIdentifier'] == 'com.nd2wsi.viewer.astromap-beta'
-assert not info['SUEnableAutomaticChecks'] and 'SUFeedURL' not in info
-report.write_text(json.dumps(dict(ok=True, version='2.4.0b1', python_modules=modules,
-                                 static_assets=assets), indent=2))
-print(f'Verified {len(modules)} modules and {len(assets)} static assets')
-PY
+"$PY" "$REPO/scripts/verify_packaged_source.py" \
+  --app "$APP" --output "$STAGE/packaged-source.json" \
+  --executable "$NAME" --bundle-name "$NAME" --bundle-id "$BUNDLE_ID" \
+  --expected-version "$VERSION" \
+  --require-module reportlab.pdfgen.canvas --require-module reportlab.pdfbase.ttfonts \
+  --require-module pypdf --require-module charset_normalizer \
+  --require-resource reportlab/fonts/Vera.ttf \
+  --expect-updates-disabled
 
 /usr/bin/xattr -cr "$APP"
 /usr/bin/codesign --force --deep --sign - "$APP"
