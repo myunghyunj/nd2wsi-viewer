@@ -70,6 +70,7 @@ def test_browser_modules_load_before_application_without_commonjs_or_dom_side_ef
         "lut-controls-v1.js": "Nd2LutControls",
         "frame-data-v1.js": "Nd2FrameData",
         "floating-windows-v1.js": "Nd2FloatingWindows",
+        "annotation-store-v1.js": "Nd2AnnotationStore",
     }
     for filename in modules:
         assert index.index(filename) < index.index("app.js")
