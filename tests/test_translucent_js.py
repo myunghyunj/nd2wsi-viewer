@@ -177,6 +177,28 @@ def test_failed_lock_restores_interaction_and_invalid_roi_import_keeps_previous_
                       "locked": False, "mouse": True, "error": "lock unavailable"}
 
 
+def test_invalid_200_roi_pair_reports_both_data_issues_and_preserves_loaded_list_and_camera():
+    result = run(r"""
+      const h=harness(),m=h.mounted;
+      m.setRois({ok:true,name:'valid.txt',rois:[{x:100,y:100,w:4,h:4,index:7}]});
+      const before={camera:api.camera(h.viewer),rois:m.state.rois};
+      const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n'+Array.from({length:200},(_,i)=>{
+        const index=i+1;
+        if(index===199)return '199\t4877\t8248\t4876\t8247\t199';
+        const y=index>=58&&index<=182?5900:100;
+        return `${index}\t100\t${y}\t110\t${y+10}\t${index}`;
+      }).join('\n');
+      const accepted=m.setRois({ok:true,name:'200.txt',text,coordinateSize:{width:8000,height:5830}});
+      return {accepted,name:m.state.roiName,label:h.element('roi-index').textContent,
+        error:h.element('overlay-status').textContent,
+        unchanged:JSON.stringify(before)===JSON.stringify({camera:api.camera(h.viewer),rois:m.state.rois})};
+    """)
+    assert result["accepted"] is False and result["unchanged"]
+    assert result["name"] == "valid.txt" and result["label"] == "1/1"
+    assert "INDEX 199 has zero area (4877, 8248) → (4876, 8247)" in result["error"]
+    assert "125 regions are outside" in result["error"] and "first INDEX 58" in result["error"]
+
+
 def test_native_resize_anchor_follows_minimum_dimensions():
     assert run("return api.resizeGeometry(800,500,'nw',1000,1000);") == {
         "width": 220, "height": 160, "left": 580, "top": 340,

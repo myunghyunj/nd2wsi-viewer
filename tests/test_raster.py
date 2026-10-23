@@ -1,4 +1,4 @@
-"""Small-image opening keeps the TXT pixel grid and annotation ownership."""
+"""Raster opening keeps the TXT pixel grid and annotation ownership."""
 import json
 
 import numpy as np
@@ -100,12 +100,76 @@ def test_pixel_limit_and_memory_preflight_happen_before_full_decode(tmp_path, mo
     path = save_image(tmp_path)
     monkeypatch.setattr(Image.Image, "load", lambda _: pytest.fail("decoded before preflight"))
     monkeypatch.setattr(raster, "MAX_PIXELS", 10)
-    with pytest.raises(ValueError, match="64 megapixels"):
+    with pytest.raises(ValueError, match="PNG input exceeds"):
         raster.open_direct(path)
     monkeypatch.setattr(raster, "MAX_PIXELS", 64_000_000)
+    monkeypatch.setattr("nd2wsi.convert.available_memory_bytes", lambda: None)
     monkeypatch.setattr("nd2wsi.render._available_memory", lambda: 1)
-    with pytest.raises(ValueError, match="Not enough free memory"):
+    with pytest.raises(ValueError, match="Not enough memory"):
         raster.open_direct(path)
+
+
+def test_jpeg_uses_local_pixel_limit_without_changing_pillow_global(tmp_path, monkeypatch):
+    path = save_image(tmp_path, name="sample.jpg")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 500)
+    with pytest.raises(Image.DecompressionBombError):
+        Image.open(path)
+    root, _ = raster.open_direct(path)
+    try:
+        assert root["0"].shape == (3, 43, 67)
+        assert root["0"][:, 7:17, 9:29].shape == (3, 10, 20)
+        assert Image.MAX_IMAGE_PIXELS == 500
+        # Other decoders retain Pillow's ordinary global protection.
+        png = save_image(tmp_path)
+        with pytest.raises(Image.DecompressionBombError):
+            raster.open_direct(png)
+    finally:
+        root.close(delay=0)
+
+
+def jpeg_with_large_header(tmp_path, width, height):
+    """Exercise preflight limits without allocating a large test image."""
+    import struct
+
+    path = save_image(tmp_path, name="large.jpg")
+    content = bytearray(path.read_bytes())
+    frame = content.index(b"\xff\xc0")
+    content[frame + 5:frame + 9] = struct.pack(">HH", height, width)
+    path.write_bytes(content)
+    return path
+
+
+def test_large_jpeg_pixel_limit_is_checked_before_decode(tmp_path, monkeypatch):
+    from PIL import JpegImagePlugin
+
+    path = jpeg_with_large_header(tmp_path, 25000, 22000)
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "load", lambda _: pytest.fail("decoded before preflight"))
+    with pytest.raises(ValueError, match="JPEG input exceeds 512 megapixels"):
+        raster.open_direct(path)
+
+
+@pytest.mark.parametrize("available", [16 << 30, 1 << 30])
+def test_large_jpeg_uses_current_available_memory_before_decode(tmp_path, monkeypatch, available):
+    from PIL import JpegImagePlugin
+
+    path = jpeg_with_large_header(tmp_path, 24000, 16000)
+    monkeypatch.setattr("nd2wsi.convert.available_memory_bytes", lambda: available)
+    # The old macOS-only probe's Windows fallback must not cap a capable PC.
+    monkeypatch.setattr("nd2wsi.render._available_memory", lambda: pytest.fail("used fallback instead of available RAM"))
+
+    class DecoderReached(Exception):
+        pass
+
+    def decode(_):
+        raise DecoderReached
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "load", decode)
+    if available == 16 << 30:
+        with pytest.raises(DecoderReached):
+            raster.open_direct(path)
+    else:
+        with pytest.raises(ValueError, match="Not enough memory"):
+            raster.open_direct(path)
 
 
 def test_agent_raster_opens_without_shared_cache_or_sidecar_writes(tmp_path, monkeypatch):

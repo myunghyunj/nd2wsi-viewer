@@ -76,6 +76,64 @@ process.stdout.write(JSON.stringify({count:parsed.count,mapped:mapped.length,err
     assert "2000" in out["error"]
 
 
+def test_200_valid_regions_preserve_indices_notes_and_exact_pixel_bounds():
+    out = run(r"""
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\r\n'+Array.from({length:200},(_,i)=>
+  `${i+1}\t${10+i}\t${20+i}\t${13+i}\t${25+i}\tROI ${i+1}`).join('\r\n');
+const parsed=api.parse(text,{width:8000,height:5830}),before=JSON.stringify(parsed);
+const mapped=api.mapToSource(parsed.rows,{width:8000,height:5830},{width:16000,height:11660});
+process.stdout.write(JSON.stringify({count:parsed.count,unchanged:before===JSON.stringify(parsed),mapped}));
+""")
+    assert out["count"] == len(out["mapped"]) == 200 and out["unchanged"]
+    for offset, region in enumerate(out["mapped"]):
+        assert {key: region[key] for key in ("x", "y", "w", "h")} == {
+            "x": (10 + offset) * 2, "y": (20 + offset) * 2, "w": 8, "h": 12,
+        }
+        assert region["astromapImportIndex"] == offset + 1
+        assert region["text"] == f"ROI {offset + 1}"
+
+
+def test_empty_roi_and_reference_mismatch_are_reported_together_without_normalization():
+    out = run(r"""
+const header='INDEX\tX1\tY1\tX2\tY2\tNOTE\n';
+const lines=Array.from({length:200},(_,i)=>{
+  const index=i+1;
+  if(index===199)return '199\t4877\t8248\t4876\t8247\t199';
+  const y=index>=58&&index<=182?5900:100;
+  return `${index}\t100\t${y}\t110\t${y+10}\t${index}`;
+});
+const text=header+lines.join('\n');let error;
+try {api.parse(text,{width:8000,height:5830});}catch(e){error=e.message;}
+const nonempty=api.parse(header+lines.filter(line=>!line.startsWith('199\t')).join('\n'));
+const before=JSON.stringify(nonempty.rows);let mappingError;
+try {api.mapToSource(nonempty.rows,{width:8000,height:5830},{width:8000,height:5830});}
+catch(e){mappingError=e.message;}
+process.stdout.write(JSON.stringify({error,mappingError,unchanged:JSON.stringify(nonempty.rows)===before}));
+""")
+    assert "INDEX 199 has zero area (4877, 8248) → (4876, 8247)" in out["error"]
+    for message in (out["error"], out["mappingError"]):
+        assert "125 regions are outside" in message
+        assert "8000 × 5830" in message and "first INDEX 58" in message
+        assert "confirmed TXT coordinate dimensions" in message
+    assert out["unchanged"]
+
+
+def test_zero_area_is_distinct_from_reversed_endpoints_and_invalid_rows_still_count_toward_limit():
+    out = run(r"""
+const header='INDEX\tX1\tY1\tX2\tY2\tNOTE\n';
+const messages=[];
+for(const text of [header+'7\t4\t5\t3\t10\tzero width',
+  header+'8\t4\t5\t2\t10\treversed',
+  header+Array.from({length:2001},(_,i)=>`${i+1}\t4\t5\t3\t4\tempty`).join('\n')]) {
+ try {api.parse(text);}catch(e){messages.push(e.message);}
+}
+process.stdout.write(JSON.stringify(messages));
+""")
+    assert "INDEX 7 has zero area" in out[0]
+    assert "INDEX 8 has reversed endpoints" in out[1]
+    assert "2000" in out[2]
+
+
 def test_odd_dimensions_inclusive_endpoints_and_last_pixels_roundtrip_exactly():
     out = run("""
 const exportApi=require(require('path').join(require('path').dirname(process.argv[1]),'astromap-v1.js'));

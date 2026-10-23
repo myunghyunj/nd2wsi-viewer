@@ -42,7 +42,7 @@ if(actionAt<0 || actionStart<0 || actionEnd<0 || dispatchAt<0 || dispatchEnd<0) 
 }
 const out={clicks:[],panels:[],translucent:0,tools:[],messages:[],toasts:[],applied:[],orientationCalls:[],
   osdRotations:[],osdFlips:0,pans:[],zooms:[],homes:0,autofocus:[],
-  targetDeliveries:0,osdKeydowns:0,events:[]};
+  targetDeliveries:0,osdKeydowns:0,events:[],roiPans:[],roiZooms:[],roiScrolls:[],roiFocus:[]};
 const listeners=new Map(), elements=new Map(), viewerHandlers=new Map();
 function element(id='') {
   if(!elements.has(id)) elements.set(id,{
@@ -59,6 +59,8 @@ if(config.compare) gate.bind({...gate.envelope(),groupSessionId:'group-test',
 const state={
   quitPreparing:!!config.quitPreparing,roi:null,tool:null,pixel:{cursor:null},tabCount:2,
   landmark:{active:!!config.landmark,points:[]},
+  annotations:config.astromap?.items || [],
+  astromap:{activeId:config.astromap?.activeId || null,rows:new Map()},
   info:{plate:{Z:config.zCount ?? 5,T:4}},
   plate:config.plate ? {auto:false,focus:config.grid ? null : 0,t:0,placed:[]} : null,
   viewportRelay:{commandGate:gate,compare:config.compare || null,
@@ -71,6 +73,13 @@ state.windows={info:config.disabled?.includes('info') ? null : {
   open(){infoHidden=false;out.panels.push({panel:'info',open:true});},
   close(){infoHidden=true;out.panels.push({panel:'info',open:false});},
 }};
+if(config.astromap) {
+  state.windows.astromap={isHidden:()=>!!config.astromap.hidden};
+  for(const item of state.annotations) state.astromap.rows.set(item.id,{
+    el:{scrollIntoView:()=>out.roiScrolls.push(item.id)},
+    number:{focus:()=>out.roiFocus.push(item.id)},
+  });
+}
 let rotation=config.degrees || 0, flipped=!!config.flipped;
 const viewport={
   getRotation:()=>rotation,getFlip:()=>flipped,
@@ -79,6 +88,8 @@ const viewport={
   toggleFlip(){flipped=!flipped;out.osdFlips++;},
   applyConstraints(){},deltaPointsFromPixels:p=>p,
   panBy:p=>out.pans.push(p),zoomBy:value=>out.zooms.push(value),goHome:()=>out.homes++,
+  getZoom:()=>3.25,zoomTo:(...args)=>out.roiZooms.push(args),
+  imageToViewportCoordinates:p=>p,panTo:(...args)=>out.roiPans.push(args),
 };
 const viewer={viewport,world:{getItemCount:()=>config.ready===false ? 0 : 1},
   addHandler(name,callback){
@@ -95,11 +106,15 @@ const window={Nd2ShortcutRouter:Router,addEventListener(kind,fn,options){
 }};
 window.parent=config.iframe ? {postMessage:data=>out.messages.push(data)} : window;
 if(config.newWindowNative) window.parent.pywebview={api:{new_window(){}}};
+const OpenSeadragon=()=>viewer;
+OpenSeadragon.Point=function(x,y){this.x=x;this.y=y;};
 const context=vm.createContext({
   state,window,document:{body:element('body')},location:{origin:'http://qa.invalid'},
   VIEWPORT_PROTOCOL_VERSION:2,$:element,structuredClone,
-  OpenSeadragon:()=>viewer,makeTileSource:()=>({}),
+  OpenSeadragon,makeTileSource:()=>({}),
   renderAnnotations(){},updateAlignmentDrag(){},debounceToast:()=>()=>{},
+  refreshAstromapPanel(){},activeFrameContext:()=>config.grid ? null : {},
+  annotationOwnerReady:()=>config.astromap?.ownerReady!==false,
   refreshSpatialContext(){},postSpatialReadiness(){},currentSlideSid:()=> 'test',
   showToast:message=>out.toasts.push(message),
   openTranslucentViewer(){out.translucent++;},
@@ -113,6 +128,7 @@ const context=vm.createContext({
 });
 for(const name of ['buildViewer','normalizedRotation','spatialIdentity','spatialImageReady',
   'spatialPaneReady','applyOrientationShortcut','togglePanelForShortcut',
+  'astromapItems','selectAstromapRoi','panToAstromapRoi','navigateAstromapKey','wireAstromapKeys',
   'wirePlateKeys','wireCompareRelay','wireKeys']) {
   vm.runInContext(production(name),context);
 }
@@ -122,6 +138,7 @@ context.applyOrientationShortcut=action=>{
 };
 // Keep real viewer keyboard-event hooks and initialization order too.
 context.buildViewer();
+context.wireAstromapKeys();
 if(config.plate) context.wirePlateKeys();
 context.wireCompareRelay();
 context.wireKeys();
@@ -150,6 +167,7 @@ function press(spec) {
       if(targetSpec.insideEditable && selector.includes('contenteditable')) return {};
       if(targetSpec.insideTextbox && selector.includes('[role="textbox"]')) return {};
       if(targetSpec.plateMenu && selector.includes('#plate-view-menu')) return {};
+      if(targetSpec.astromapRow && selector.includes('#astromap-list')) return {};
       return null;
     }};
   const event={key:'',code:'',keyCode:0,repeat:false,metaKey:false,ctrlKey:false,
@@ -184,6 +202,8 @@ if(config.message) {
   });
 }
 out.pose={degrees:state.viewportRelay.displayRotation,flipped:state.viewportRelay.displayFlipped};
+out.activeRoi=state.astromap.activeId;
+out.annotations=state.annotations;
 process.stdout.write(JSON.stringify(out));
 """
 

@@ -37,7 +37,7 @@ for requirements, tested behavior, and build instructions.
 
 1. Download the `macos-arm64.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. This release requires an Apple silicon Mac running macOS 14 or later.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
-3. Drop an `.nd2`, `.svs` or supported `.sdpc` file onto the window, or press `+` to browse.
+3. Drop a `.jpg`, `.png`, `.nd2`, `.svs` or supported `.sdpc` file onto the window, or press `+` to browse.
 
 The macOS bundle is ad-hoc signed and uses signed Sparkle updates. This is not
 Developer ID signing or notarization.
@@ -54,6 +54,12 @@ manually once if you are upgrading from one of those versions. Automatic checks
 were restored in 2.1.5.
 
 The first open of a stitched ND2 may prepare a viewing cache. Preparation time and disk use depend on the acquisition, compression and storage. Later opens reuse the cache. Supported tiled SVS slides use their embedded pyramid directly.
+
+JPEG images up to 512 megapixels and PNG images up to 64 megapixels open at their
+stored resolution, subject to a memory check before decoding. Large JPEGs can use
+substantial memory; close unused image tabs if the memory check refuses an image.
+Stored pixel axes are preserved for ROI coordinates, including images with EXIF
+rotation metadata. These images have no assumed physical calibration.
 
 Supported SQ/SDPC HEVC slides also open directly from their embedded tiles.
 TIFF ROI export preserves decoded RGB and calibration, not the pre-compression
@@ -91,7 +97,7 @@ Drag the image to pan and scroll or pinch to zoom. Drag the empty top edge, or O
 
 Without imported coordinates, the controls are the opacity slider, lock and close. With Astromapper regions already imported in the current image, or after dropping the matching whole-image **JPG + TXT** pair into the tracing window, ROI boxes and **‹ number ›** appear. The selected ROI is emphasized. Right-click the image or use **Cmd/Ctrl+O** to choose a pair; click the number to replace it. The arrows and Left/Right keys jump to each ROI's center while preserving the current scale. Imported coordinates use the same inclusive-pixel mapping as Astromapper. Use the matching uncropped JPG with the same orientation; the files do not encode a crop or registration transform. These navigation copies do not modify saved annotations.
 
-On macOS the image is translucent while the white controls and ROI outlines keep their normal appearance. Windows uses native whole-window opacity, which also makes the controls and ROI outlines translucent. The mode is available in the standard desktop viewer, including its small JPG/PNG tabs; a browser tab cannot float over other apps.
+On macOS the image is translucent while the white controls and ROI outlines keep their normal appearance. Windows uses native whole-window opacity, which also makes the controls and ROI outlines translucent. The mode is available in the standard desktop viewer, including its JPG/PNG tabs; a browser tab cannot float over other apps.
 
 ### Shading correction
 
@@ -158,7 +164,10 @@ QuPath ellipses, geometry collections, and annotations tied to a non-default cha
 Open **Astromapper** with the star or **⌘⇧A / Ctrl+Shift+A**.
 Expand the top tools first to reveal the star. Shift-drag to add a rectangle,
 or choose **Add current region**. Click an ROI number to centre it **without changing the current zoom**;
-the selected region is yellow and the others are grey.
+the selected region is yellow and the others are grey. While the panel is open,
+press **Left / Right** to select and centre the previous or next ROI in the list
+at the same zoom. Navigation stops at the first and last region. When editing a
+note, the arrow keys keep their normal text-editing behaviour.
 
 ![Astromapper with numbered ROI boxes and the selected region highlighted](astromap-regions.png)
 
@@ -167,6 +176,10 @@ whole-image JPG, or enter that coordinate image's width and height. The viewer
 scales the coordinates into the current image and includes the end pixels.
 Use the corresponding uncropped image in the same orientation: dimensions alone
 cannot account for a crop or register a different image.
+Up to 2000 regions can be imported. Invalid rows or coordinates outside the
+confirmed reference image reject the import and leave existing annotations intact;
+the error identifies the affected index and reference dimensions. Check the
+coordinate file and its matching image rather than assuming a region-count limit.
 
 **Export JPG + TXT** creates a ZIP with a small whole-image JPEG and matching
 coordinates. **Export ZIP with PDF** adds a landscape report with numbered ROI

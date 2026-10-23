@@ -30,18 +30,30 @@
     if (!row || typeof row !== "object") throw new Error(`${label} is not a region.`);
     integer(row.index, `${label} INDEX`, 1);
     for (const key of ["x1", "y1", "x2", "y2"]) integer(row[key], `${label} ${key.toUpperCase()}`);
-    if (row.x2 < row.x1 || row.y2 < row.y1)
-      throw new Error(`${label} has reversed endpoints; X2/Y2 must include the last pixel.`);
+    if (row.x2 < row.x1 || row.y2 < row.y1) {
+      const width = row.x2 - row.x1 + 1, height = row.y2 - row.y1 + 1;
+      const issue = width >= 0 && height >= 0 && (!width || !height) ? "has zero area" : "has reversed endpoints";
+      throw new Error(`${label}: INDEX ${row.index} ${issue} (${row.x1}, ${row.y1}) → (${row.x2}, ${row.y2}); X2/Y2 must include the last pixel.`);
+    }
     if (typeof row.note !== "string" || row.note.length > MAX_NOTE)
       throw new Error(`${label} NOTE must be text of at most ${MAX_NOTE} characters.`);
   }
 
-  function parse(text) {
+  function outsideMessage(rows, grid) {
+    const outside = rows.filter(row => row.x2 >= grid.width || row.y2 >= grid.height);
+    if (!outside.length) return "";
+    return `${outside.length} region${outside.length === 1 ? " is" : "s are"} outside the coordinate JPG ` +
+      `${grid.width} × ${grid.height} px (first INDEX ${outside[0].index}). ` +
+      "Choose the matching coordinate JPG or enter the confirmed TXT coordinate dimensions.";
+  }
+
+  function parse(text, coordinateSize = null) {
     if (typeof text !== "string") throw new Error("Choose an AstroMapper TXT file.");
     if (text.length > MAX_TEXT) throw new Error("The TXT file is too large for 2000 regions.");
+    const grid = coordinateSize === null ? null : validateSize(coordinateSize, "Coordinate JPG");
     const lines = text.replace(/^\uFEFF/, "").split(/\r\n|\n|\r/);
-    const rows = [], indices = new Set();
-    let header = false;
+    const rows = [], indices = new Set(), errors = [];
+    let header = false, count = 0;
     for (let line = 0; line < lines.length; line++) {
       const value = lines[line];
       if (!value.trim()) continue;
@@ -54,20 +66,26 @@
         continue;
       }
       const label = `Line ${line + 1}`;
-      if (fields.length !== HEADER.length)
-        throw new Error(`${label} must contain exactly six tab-separated fields.`);
-      const numbers = fields.slice(0, 5).map((field, i) => {
-        if (!/^\d+$/.test(field.trim())) throw new Error(`${label} ${HEADER[i]} must be an integer.`);
-        return integer(Number(field.trim()), `${label} ${HEADER[i]}`, i === 0 ? 1 : 0);
-      });
-      const row = { index: numbers[0], x1: numbers[1], y1: numbers[2],
-        x2: numbers[3], y2: numbers[4], note: fields[5] };
-      validateRow(row, label);
-      if (indices.has(row.index)) throw new Error(`${label} repeats INDEX ${row.index}.`);
-      indices.add(row.index);
-      rows.push(row);
-      if (rows.length > MAX_ROIS) throw new Error(`Import at most ${MAX_ROIS} regions at once.`);
+      if (++count > MAX_ROIS) throw new Error(`Import at most ${MAX_ROIS} regions at once.`);
+      try {
+        if (fields.length !== HEADER.length)
+          throw new Error(`${label} must contain exactly six tab-separated fields.`);
+        const numbers = fields.slice(0, 5).map((field, i) => {
+          if (!/^\d+$/.test(field.trim())) throw new Error(`${label} ${HEADER[i]} must be an integer.`);
+          return integer(Number(field.trim()), `${label} ${HEADER[i]}`, i === 0 ? 1 : 0);
+        });
+        const row = { index: numbers[0], x1: numbers[1], y1: numbers[2],
+          x2: numbers[3], y2: numbers[4], note: fields[5] };
+        validateRow(row, label);
+        if (indices.has(row.index)) throw new Error(`${label} repeats INDEX ${row.index}.`);
+        indices.add(row.index);
+        rows.push(row);
+      } catch (error) { errors.push(error.message); }
     }
+    const outside = grid ? outsideMessage(rows, grid) : "";
+    if (errors.length || outside) throw new Error([
+      ...errors.slice(0, 3), errors.length > 3 ? `${errors.length - 3} more invalid rows.` : "", outside,
+    ].filter(Boolean).join(" "));
     if (!rows.length) throw new Error("The TXT file contains no regions.");
     return { rows, count: rows.length };
   }
@@ -100,13 +118,15 @@
     if ((cross < 0n ? -cross : cross) > tolerance)
       throw new Error("JPG and current image have different aspect ratios. Use the matching uncropped JPG.");
     const indices = new Set();
-    return rows.map((row, i) => {
+    rows.forEach((row, i) => {
       const label = `Region ${i + 1}`;
       validateRow(row, label);
       if (indices.has(row.index)) throw new Error(`${label} repeats INDEX ${row.index}.`);
       indices.add(row.index);
-      if (row.x2 >= grid.width || row.y2 >= grid.height)
-        throw new Error(`${label} is outside the coordinate JPG. Check its width and height.`);
+    });
+    const outside = outsideMessage(rows, grid);
+    if (outside) throw new Error(outside);
+    return rows.map((row) => {
       const [x, right] = pixelRange(row.x1, row.x2, grid.width, source.width);
       const [y, bottom] = pixelRange(row.y1, row.y2, grid.height, source.height);
       return { type: "box", x, y, w: right - x, h: bottom - y, text: row.note,

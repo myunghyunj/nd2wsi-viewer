@@ -1,4 +1,4 @@
-"""Small JPEG/PNG images as a read-only RGB pyramid, in stored pixel axes.
+"""JPEG/PNG images as a read-only RGB pyramid, in stored pixel axes.
 
 Astromapper coordinates describe the decoded pixel grid, so EXIF display
 rotation and DPI do not change the image dimensions or invent calibration.
@@ -17,6 +17,7 @@ from .reader import ChannelInfo, PlaneSource, level_shapes
 
 RASTER_SUFFIXES = {".jpg", ".jpeg", ".png"}
 MAX_PIXELS = 64_000_000  # includes an 8000 x 8000 Astromap image
+MAX_JPEG_PIXELS = 512_000_000  # full-resolution stitched microscopy JPEGs
 
 
 def is_raster(path: str | Path) -> bool:
@@ -53,25 +54,35 @@ class _RasterLevel:
 
 def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
     """Open a bounded raster once, with no pixel cache or source writes."""
-    from PIL import Image
+    from PIL import Image, JpegImagePlugin
 
-    from .convert import build_group_attrs
+    from .convert import available_memory_bytes, build_group_attrs
     from .render import _available_memory
 
     path = Path(path)
-    image = Image.open(path)
+    with path.open("rb") as probe:
+        is_jpeg = probe.read(3) == b"\xff\xd8\xff"
+    # Use Pillow's ordinary JPEG header handler directly, then apply our own
+    # pixel and memory limits before decoding. Image.open's generic bomb limit
+    # rejects legitimate large microscopy JPEGs; never change that global limit.
+    image = JpegImagePlugin.jpeg_factory(path) if is_jpeg else Image.open(path)
     try:
         if image.format not in {"JPEG", "PNG"}:
-            raise ValueError("Small-image input must be a JPEG or PNG file")
+            raise ValueError("Raster input must be a JPEG or PNG file")
         if getattr(image, "n_frames", 1) != 1:
             raise ValueError("Animated PNG is not supported; open a single frame")
         width, height = image.size
-        if width * height > MAX_PIXELS:
-            raise ValueError("Small-image input exceeds 64 megapixels; open the original ND2 instead")
+        max_pixels = MAX_JPEG_PIXELS if image.format == "JPEG" else MAX_PIXELS
+        if width * height > max_pixels:
+            raise ValueError(f"{image.format} input exceeds {max_pixels / 1_000_000:g} megapixels")
         # Budget the source decode, RGB/RGBA conversion, and alpha mask before
         # asking Pillow's decoder to allocate pixels (RGB uses four bytes/px).
-        if width * height * 16 > _available_memory() // 2:
-            raise ValueError("Not enough free memory to open this small image; close other slides and retry")
+        # Windows/Linux report current available physical memory. On macOS,
+        # keep the established conservative quarter-of-physical-memory budget.
+        available = available_memory_bytes()
+        budget = (available if available is not None else _available_memory()) // 2
+        if width * height * 16 > budget:
+            raise ValueError("Not enough memory to open this image at full resolution; close other slides and retry")
         orientation = image.getexif().get(274, 1)
         notes = ["Stored pixel orientation; physical calibration is unavailable"]
         if orientation != 1:

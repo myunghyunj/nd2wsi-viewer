@@ -57,9 +57,15 @@ const zooms=[],pans=[],zoomTo=viewport.zoomTo,panTo=viewport.panTo;
 viewport.zoomTo=function(...args){zooms.push(args);return zoomTo.apply(this,args);};
 viewport.panTo=function(...args){pans.push(args);return panTo.apply(this,args);};
 const item={id:'roi',type:'box',astromap:true,...config.rect};
-const state={viewer:{viewport},annotations:[item],astromap:{activeId:null}};
-Object.assign(context,{state,renderAnnotations(){},refreshAstromapPanel(){}});
-for(const name of ['astromapItems','selectAstromapRoi','panToAstromapRoi','imageToViewerElementPoint'])
+const state={viewer:{viewport,world:{getItemCount:()=>1}},
+  annotations:config.keyboard ? [{...item,id:'previous',x:0,y:0},item] : [item],
+  astromap:{activeId:config.keyboard ? 'previous' : null,rows:new Map()},
+  windows:{astromap:{isHidden:()=>false}},landmark:{active:false},viewportRelay:{}};
+Object.assign(context,{state,renderAnnotations(){},refreshAstromapPanel(){},
+  window:{Nd2ShortcutRouter:require(root+'/shortcut-router-v1.js')},
+  activeFrameContext:()=>({}),annotationOwnerReady:()=>true});
+for(const name of ['astromapItems','selectAstromapRoi','panToAstromapRoi','imageToViewerElementPoint',
+  'navigateAstromapKey','spatialImageReady'])
   vm.runInContext(production(name),context);
 const center={x:item.x+item.w/2,y:item.y+item.h/2};
 function scale() {
@@ -68,7 +74,8 @@ function scale() {
   return Math.hypot(b.x-a.x,b.y-a.y)/100;
 }
 const before=JSON.stringify(item),scaleBefore=scale(),zoomBefore=viewport.getZoom(true);
-const selected=context.selectAstromapRoi(item.id);
+const selected=config.keyboard ? context.navigateAstromapKey({key:'ArrowRight',target:{tagName:'BUTTON'},
+  preventDefault(){},stopImmediatePropagation(){}}) : context.selectAstromapRoi(item.id);
 const immediate={zoom:viewport.getZoom(true),pixel:context.imageToViewerElementPoint(center),scale:scale()};
 clock+=2000;viewport.update();
 const later={zoom:viewport.getZoom(true),targetZoom:viewport.getZoom(),
@@ -83,12 +90,13 @@ process.stdout.write(JSON.stringify({selected,missing,active:state.astromap.acti
 
 @pytest.mark.parametrize("rotation,flip", [(0, False), (37, True), (90, False), (270, True)])
 @pytest.mark.parametrize("animating", [False, True])
+@pytest.mark.parametrize("keyboard", [False, True])
 @pytest.mark.parametrize("rect", [
     {"x": 12345, "y": 6789, "w": 1, "h": 1},
     {"x": 1000, "y": 2000, "w": 30000, "h": 15000},
 ])
-def test_roi_number_centers_source_geometry_without_changing_displayed_scale(rotation, flip, animating, rect):
-    config = {"rotation": rotation, "flip": flip, "animating": animating, "rect": rect}
+def test_roi_navigation_centers_source_geometry_without_changing_displayed_scale(rotation, flip, animating, keyboard, rect):
+    config = {"rotation": rotation, "flip": flip, "animating": animating, "keyboard": keyboard, "rect": rect}
     result = subprocess.run([NODE, "-e", SCRIPT, str(STATIC), json.dumps(config)],
                             capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert result.returncode == 0, result.stderr

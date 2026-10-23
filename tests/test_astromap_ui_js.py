@@ -437,6 +437,43 @@ return {invalid,stale,late,unchanged:before===JSON.stringify(f.c.state.annotatio
     assert not out["busy"] and "image changed" in out["error"]
 
 
+def test_import_reports_empty_roi_and_grid_mismatch_without_changing_existing_annotations():
+    out = _run_import(r"""
+const f=importFixture(),before=JSON.stringify(f.c.state.annotations);
+Object.assign(f.c.state.info,{raster:true,width:8000,height:5830});
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n'+Array.from({length:200},(_,i)=>{
+  const index=i+1;
+  if(index===199)return '199\t4877\t8248\t4876\t8247\t199';
+  const y=index>=58&&index<=182?5900:100;
+  return `${index}\t100\t${y}\t110\t${y+10}\t${index}`;
+}).join('\n');
+const read=await f.c.readAstromapImportFile({name:'regions.txt',size:text.length,text:async()=>text});
+return {read,message:f.nodes.get('astromap-import-status').textContent,
+  unchanged:before===JSON.stringify(f.c.state.annotations),saved:f.c.saved,pending:f.c.state.astromap.pendingImport};
+""")
+    assert out["read"] is False and out["pending"] is None
+    assert out["unchanged"] and out["saved"] == 0
+    assert "INDEX 199 has zero area (4877, 8248) → (4876, 8247)" in out["message"]
+    assert "125 regions are outside" in out["message"] and "first INDEX 58" in out["message"]
+
+
+def test_valid_out_of_default_grid_can_still_confirm_explicit_coordinate_dimensions():
+    out = _run_import(r"""
+const f=importFixture(),before=JSON.stringify(f.c.state.annotations);
+Object.assign(f.c.state.info,{raster:true,width:1000,height:500});
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n42\t1200\t600\t1219\t619\tmanual grid';
+const read=await f.c.readAstromapImportFile({name:'larger-grid.txt',size:text.length,text:async()=>text});
+const unchanged=before===JSON.stringify(f.c.state.annotations);
+f.nodes.get('astromap-import-width').value='2000';f.nodes.get('astromap-import-height').value='1000';
+const imported=f.c.commitAstromapImport();
+return {read,unchanged,imported,last:f.c.state.annotations.at(-1),saved:f.c.saved};
+""")
+    assert out["read"] and out["unchanged"] and out["imported"] and out["saved"] == 1
+    assert {key: out["last"][key] for key in ("x", "y", "w", "h", "astromapImportIndex")} == {
+        "x": 600, "y": 300, "w": 10, "h": 10, "astromapImportIndex": 42,
+    }
+
+
 @pytest.mark.parametrize("image_bytes", [
     [255, 216, 255, 192, 0, 11, 8, 0, 50, 0, 100, 1, 1, 17, 0, 255, 217],
     [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,

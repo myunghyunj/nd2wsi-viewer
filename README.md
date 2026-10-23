@@ -20,10 +20,9 @@
 
 ## Latest update
 
-- **Translucent viewer:** adjustable opacity, ROI navigation and a lock to keep the reference in place.
-- **Collapsible tools and separate windows:** more room for the image; **⌘N / Ctrl+N** opens another viewer window.
-- **GeoJSON import:** bring annotations back into the viewer alongside your existing marks.
-- **External-drive caches:** improved pyramid creation on macOS exFAT drives.
+- **Large JPGs:** open images up to 512 megapixels at their original resolution, subject to the memory check.
+- **Astromapper review:** select a numbered ROI, then use **← / →** to review adjacent regions at the same zoom.
+- **ROI import diagnostics:** identify invalid coordinates and a mismatched reference image while keeping existing annotations intact.
 
 <p align="center">
   <img src="docs/overview-sdpc.png" alt="Brightfield SDPC slide with Slide Info in the light appearance" width="50%"><img src="docs/overview-nd2.png" alt="Fluorescence ND2 image with Channels &amp; LUTs in the dark appearance" width="50%">
@@ -31,10 +30,10 @@
 
 ## Download
 
-| Platform | Download · 2.5.1 | Requirements |
+| Platform | Download · 2.5.2 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.1/nd2wsi-viewer-2.5.1-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.1/nd2wsi-viewer-2.5.1-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.2/nd2wsi-viewer-2.5.2-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.2/nd2wsi-viewer-2.5.2-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
 
 On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
 and keep `_internal` beside `nd2wsi-viewer.exe`. See the

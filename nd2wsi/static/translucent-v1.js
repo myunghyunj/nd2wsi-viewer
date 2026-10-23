@@ -93,7 +93,7 @@
     let rois;
     if (typeof result?.text === "string") {
       if (!importer?.parse || !importer?.mapToSource) throw new Error("AstroMapper import is unavailable");
-      rois = importer.mapToSource(importer.parse(result.text).rows, result.coordinateSize,
+      rois = importer.mapToSource(importer.parse(result.text, result.coordinateSize).rows, result.coordinateSize,
         { width: info.width, height: info.height });
     } else {
       rois = result?.rois;

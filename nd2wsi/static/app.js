@@ -229,6 +229,7 @@ async function init() {
   buildChannelPanel();
   buildLevelLamps();
   buildViewer();
+  wireAstromapKeys();
   wireShellToolState();
   buildPlate();
   if (state.plate) pollPlateStatus();
@@ -1872,6 +1873,38 @@ function selectAstromapRoi(id, locate = true) {
   return true;
 }
 
+function navigateAstromapKey(ev) {
+  const step = ev.key === "ArrowLeft" ? -1 : ev.key === "ArrowRight" ? 1 : 0;
+  const shortcuts = window.Nd2ShortcutRouter;
+  if (!step || ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.altKey || ev.shiftKey ||
+      !shortcuts || shortcuts.isTypingEvent(ev)) return false;
+  if (state.quitPreparing || state.landmark.active || state.viewportRelay.alignmentDrag ||
+      !state.windows?.astromap || state.windows.astromap.isHidden() ||
+      !state.astromap?.activeId || !activeFrameContext() ||
+      !annotationOwnerReady() || !spatialImageReady()) return false;
+  // Match the numbered rows, including regions excluded from export. Neither
+  // their IDs nor imported labels necessarily follow the displayed order.
+  const items = astromapItems();
+  const index = items.findIndex((item) => item.id === state.astromap.activeId);
+  if (index < 0) return false;
+  ev.preventDefault();
+  ev.stopImmediatePropagation(); // no plate/Compare arrow action or OSD pan
+  const next = Math.max(0, Math.min(items.length - 1, index + step));
+  if (next !== index) {
+    const focusRow = !!ev.target.closest?.("#astromap-list");
+    selectAstromapRoi(items[next].id);
+    const row = state.astromap.rows.get(items[next].id);
+    row?.el.scrollIntoView({ block: "nearest", inline: "nearest" });
+    if (focusRow) row?.number.focus({ preventScroll: true });
+  }
+  return true;
+}
+
+function wireAstromapKeys() {
+  // Register before plate/Compare handlers so one key has one navigation owner.
+  window.addEventListener("keydown", navigateAstromapKey, true);
+}
+
 function panToAstromapRoi(item) {
   const viewport = state.viewer.viewport;
   const center = viewport.imageToViewportCoordinates(
@@ -2073,9 +2106,16 @@ async function readAstromapImportFile(file) {
     if (seq !== state.astromap.importSeq) return false;
     if (contextKey !== activeFrameContext()?.key || !astromapReady())
       throw new Error("The displayed image changed. Choose the TXT again for the intended image.");
-    const parsed = window.Nd2AstromapImport.parse(text);
     const size = state.info.raster ? { width: state.info.width, height: state.info.height }
       : window.Nd2Astromap.exportSize(state.info.width, state.info.height);
+    let parsed;
+    try { parsed = window.Nd2AstromapImport.parse(text); }
+    catch (error) {
+      // Include an independent reference-size mismatch in a malformed-file
+      // diagnostic. Valid files still reach the explicit dimension controls.
+      window.Nd2AstromapImport.parse(text, size);
+      throw error;
+    }
     state.astromap.pendingImport = { rows: parsed.rows, contextKey, name: file.name };
     $("astromap-import-width").value = size.width;
     $("astromap-import-height").value = size.height;
