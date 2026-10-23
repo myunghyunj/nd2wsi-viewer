@@ -25,7 +25,6 @@ from . import window_lifecycle as _window_lifecycle
 APP_NAME = os.environ.get("ND2WSI_APP_NAME", "nd2wsi-viewer") if sys.platform == "darwin" else "nd2wsi-viewer"
 OPEN_SUFFIXES = (".nd2", ".svs", ".sdpc", ".nd2svs", ".jpg", ".jpeg", ".png")
 OPEN_FILE_TYPES = ("Slides and images (*.nd2;*.svs;*.sdpc;*.nd2svs;*.jpg;*.jpeg;*.png)",)
-RELEASES_URL = "https://github.com/myunghyunj/nd2wsi-viewer/releases/latest"
 _UPDATER_HANDLE = None
 _UPDATER_COORDINATOR = None
 
