@@ -3,6 +3,28 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.5.1</title>
+            <pubDate>Fri, 23 Oct 2026 15:37:08 +0000</pubDate>
+            <sparkle:version>2.5.1</sparkle:version>
+            <sparkle:shortVersionString>2.5.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<p>This release adds a translucent reference window and improves annotation exchange, ROI navigation and cache creation on external drives.</p>
+<ul>
+<li><strong>Translucent reference:</strong> use the cloud button to keep the current image above   other apps. Adjust opacity, pan and zoom, or lock the window. Resizing changes   the field of view while preserving image scale.</li>
+<li><strong>ROI navigation:</strong> a matching whole-image JPG and Astromapper TXT adds numbered   ROI boxes and previous/next navigation to the reference window. Clicking an ROI   number in the main Astromapper panel now centres it without changing the current   zoom, including while a zoom animation is running.</li>
+<li><strong>More workspace:</strong> collapse the top tools, and use <strong>⌘N / Ctrl+N</strong> to open a   separate viewer window.</li>
+<li><strong>GeoJSON import:</strong> bring points, lines, polygons with holes and multipart   annotations into the open image. Imports append to existing marks and preserve   image coordinates and feature metadata. Invalid or unsupported features reject   the whole import. QuPath ellipses, geometry collections and non-default planes   remain unsupported; see the <a href="https://github.com/myunghyunj/nd2wsi-viewer/blob/v2.5.1/docs/user-guide.md#measuring-and-marking">annotation guide</a>.</li>
+<li><strong>External-drive cache fix:</strong> new viewing caches on macOS exFAT volumes no longer   fail because SQLite sees the newly created database file as having moved.</li>
+<li><strong>Updated documentation:</strong> the README and user guide now show the current UI,   explain LUT persistence and distinguish shading illustrations from the   development validation results.</li>
+</ul>
+<p>The original scans, saved annotations and LUT preferences are preserved. Shading illustrations use the current method with identical display settings before and after correction; they are not independent biological validation.</p>
+<p>The macOS app requires Apple silicon and macOS 14 or later. It is ad-hoc signed and uses signed Sparkle updates; it is not notarized. The Windows portable ZIP contains an x64 app and supports Windows 11 ARM64 through x64 emulation.</p>
+<p>On macOS only the image layer changes opacity. Windows applies whole-window opacity, including to controls and ROI outlines. Keep the source tab open while using its translucent reference, and use the corresponding uncropped JPG in the same orientation when importing ROI coordinates.</p>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.1/nd2wsi-viewer-2.5.1-macos-arm64.dmg" sparkle:edSignature="/RC8mGuCTO1CLAK4FMRo9mjiuUxQTJ8RQDq4ArIpZVWcBeftHAvWsQVO74DafV1Y8UtVoX8zLWi+Y6jusX3SCQ==" length="137967394" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.4.1</title>
             <pubDate>Fri, 23 Oct 2026 19:19:04 +0900</pubDate>
             <sparkle:version>2.4.1</sparkle:version>
