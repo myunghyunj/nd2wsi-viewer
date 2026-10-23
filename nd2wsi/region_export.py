@@ -18,6 +18,7 @@ import numpy as np
 
 from . import render
 from .direct_common import _parse_cyx_index
+from .metal import reduce2x_cpu
 
 JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
@@ -47,7 +48,6 @@ class _OriginalReducedLevel:
         selected = np.atleast_1d(selected)
         out = np.empty((len(selected), y1 - y0, x1 - x0), dtype=self.dtype)
         _, ph, pw = self.previous.shape
-        integer = np.issubdtype(self.dtype, np.integer)
         for slot, ci in enumerate(selected):
             for y in range(y0, y1, 128):
                 ey = min(y + 128, y1)
@@ -59,10 +59,8 @@ class _OriginalReducedLevel:
                         block = np.repeat(block, 2, axis=0)
                     if pw == 1:
                         block = np.repeat(block, 2, axis=1)
-                    mean = block.reshape(ey - y, 2, ex - x, 2).mean(
-                        axis=(1, 3), dtype=np.float32)
-                    values = np.rint(mean) if integer else mean
-                    out[slot, y - y0:ey - y0, x - x0:ex - x0] = values.astype(self.dtype)
+                    out[slot, y - y0:ey - y0, x - x0:ex - x0] = reduce2x_cpu(
+                        block, self.dtype)
         return out[0] if scalar else out
 
 

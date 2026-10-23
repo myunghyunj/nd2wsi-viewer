@@ -18,6 +18,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -164,11 +165,35 @@ def reduce2x(block: np.ndarray) -> np.ndarray | None:
                 incoming.close()
 
 
-def reduce2x_or_cpu(block: np.ndarray) -> np.ndarray:
-    result = reduce2x(block)
-    if result is not None:
-        return result
-    c, h, w = block.shape
-    crop = block[:, :h // 2 * 2, :w // 2 * 2]
-    mean = crop.reshape(c, h // 2, 2, w // 2, 2).mean(axis=(2, 4), dtype=np.float32)
-    return np.rint(mean).astype(block.dtype)
+def reduce2x_cpu(block: np.ndarray, out_dtype: Any = None) -> np.ndarray:
+    """The exact CPU ``box-mean-floor-v1`` kernel shared by every 2x reducer.
+
+    ``block`` is 2D YX or 3D CYX. Each 2x2 box is averaged in float32 (exact
+    for four uint8/uint16 values) and an odd trailing row or column is
+    dropped; a caller repeats an axis already collapsed to one pixel before
+    calling. ``out_dtype`` defaults to the block's dtype: an integer output
+    takes the mean through ``np.rint`` (ties-to-even) before the cast, a
+    floating output is cast without any rounding.
+    """
+    dtype = np.dtype(block.dtype if out_dtype is None else out_dtype)
+    h, w = (int(n) // 2 * 2 for n in block.shape[-2:])
+    boxes = block[..., :h, :w].reshape((*block.shape[:-2], h // 2, 2, w // 2, 2))
+    mean = boxes.mean(axis=(-3, -1), dtype=np.float32)
+    if np.issubdtype(dtype, np.integer):
+        return np.rint(mean).astype(dtype)
+    return mean.astype(dtype)
+
+
+def reduce2x_or_cpu(block: np.ndarray, out_dtype: Any = None) -> np.ndarray:
+    """:func:`reduce2x` first, then the identical :func:`reduce2x_cpu` kernel.
+
+    Same shapes and output-dtype rule as :func:`reduce2x_cpu`. The GPU kernel
+    rounds like the integer rule, so it is consulted only for an integer
+    output; a floating output always takes the unrounded CPU mean.
+    """
+    dtype = np.dtype(block.dtype if out_dtype is None else out_dtype)
+    if np.issubdtype(dtype, np.integer):
+        result = reduce2x(block)
+        if result is not None:
+            return result.astype(dtype, copy=False)
+    return reduce2x_cpu(block, dtype)
