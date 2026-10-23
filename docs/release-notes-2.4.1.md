@@ -42,8 +42,9 @@ and evidence supporting these behaviors.
 
 ## Platform notes
 
-The macOS download is for Apple silicon, ad-hoc signed and not Developer ID
-notarized. Signed Sparkle updates retain their existing signing identity.
+The macOS download requires Apple silicon and macOS 14 or later, matching the
+bundled NumPy/SciPy runtime. It is ad-hoc signed and not Developer ID notarized.
+Signed Sparkle updates retain their existing signing identity.
 Windows uses the x64 application, including x64 emulation on Windows 11 ARM64;
 it requires WebView2 and is not Authenticode-signed. Windows updates remain
 manual.

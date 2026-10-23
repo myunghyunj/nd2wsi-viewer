@@ -87,7 +87,7 @@ for requirements, tested behavior, and build instructions.
 
 ### macOS (Apple silicon)
 
-1. Download the `macos-arm64.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. It runs on Apple silicon Macs.
+1. Download the `macos-arm64.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. This release requires an Apple silicon Mac running macOS 14 or later.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
 3. Drop an `.nd2`, `.svs` or supported `.sdpc` file onto the window, or press `+` to browse.
 
