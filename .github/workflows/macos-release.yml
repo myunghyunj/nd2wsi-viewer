@@ -1,0 +1,182 @@
+name: macos-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact 40-character commit SHA to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Standard macos-15 is Apple Silicon; assert this before any build work.
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      REQUESTED_REF: ${{ inputs.ref }}
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      SPARKLE_SHA256: 52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192
+    steps:
+      - name: Require an exact source SHA and native Apple Silicon
+        run: |
+          [[ "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'ref must be a full lowercase commit SHA' >&2; exit 1; }
+          [[ "$(uname -m)" == arm64 ]] || { echo 'A native arm64 runner is required' >&2; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Verify and record the source commit
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$REQUESTED_REF" ]] || { echo 'Checked out the wrong commit' >&2; exit 1; }
+          mkdir -p dist/macos/build-evidence
+          git show -s --format=fuller HEAD > dist/macos/build-evidence/source-commit.txt
+          sw_vers > dist/macos/build-evidence/runner.txt
+          uname -a >> dist/macos/build-evidence/runner.txt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.14'
+          architecture: arm64
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.12.10'
+      - name: Install and verify the locked source environment
+        run: |
+          uv sync --frozen --all-extras --python "$(command -v python)" 2>&1 | tee dist/macos/build-evidence/uv-sync.log
+          .venv/bin/python -c 'import _tkinter, platform; assert platform.machine() == "arm64", platform.machine()'
+          uv pip freeze --python .venv/bin/python > dist/macos/build-evidence/source-environment.txt
+          echo "ND2WSI_BUILD_PYTHON=$GITHUB_WORKSPACE/.venv/bin/python" >> "$GITHUB_ENV"
+      - name: Fetch checksum-verified real ND2 acquisitions
+        run: |
+          .venv/bin/python scripts/fetch_testdata.py 2>&1 | tee dist/macos/build-evidence/testdata.log
+          echo "ND2WSI_SMOKE_FILE=$GITHUB_WORKSPACE/docs/example_cell.nd2" >> "$GITHUB_ENV"
+      - name: Build the source-verified LGPL SDPC decoder
+        run: |
+          codec_output="$GITHUB_WORKSPACE/build/sdpc-codec"
+          .venv/bin/python packaging/build_sdpc_codec.py --output "$codec_output" --jobs 2 2>&1 | tee dist/macos/build-evidence/sdpc-build.log
+          .venv/bin/python packaging/verify_sdpc_codec.py --manifest "$codec_output/sdpc-codec-manifest.json" --wheel-only 2>&1 | tee dist/macos/build-evidence/sdpc-verification.log
+          cp "$codec_output/sdpc-codec-manifest.json" dist/macos/build-evidence/
+          echo "ND2WSI_SDPC_CODEC_MANIFEST=$codec_output/sdpc-codec-manifest.json" >> "$GITHUB_ENV"
+      - name: Fetch and verify official Sparkle 2.9.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sparkle_dir="$RUNNER_TEMP/sparkle-2.9.6"
+          mkdir -p "$sparkle_dir"
+          gh release download 2.9.6 --repo sparkle-project/Sparkle --pattern Sparkle-2.9.6.tar.xz --dir "$sparkle_dir"
+          printf '%s  %s\n' "$SPARKLE_SHA256" "$sparkle_dir/Sparkle-2.9.6.tar.xz" | shasum -a 256 --check | tee dist/macos/build-evidence/sparkle-checksum.txt
+          tar -xJf "$sparkle_dir/Sparkle-2.9.6.tar.xz" -C "$sparkle_dir"
+          .venv/bin/python - "$sparkle_dir/Sparkle.framework/Versions/Current/Resources/Info.plist" <<'PY'
+          import plistlib
+          import sys
+          with open(sys.argv[1], "rb") as handle:
+              version = plistlib.load(handle)["CFBundleShortVersionString"]
+          assert version == "2.9.6", version
+          PY
+          echo "SPARKLE_FRAMEWORK=$sparkle_dir/Sparkle.framework" >> "$GITHUB_ENV"
+      - name: Build the production app and require packaged smoke
+        run: |
+          bash packaging/build_mac_app.sh "$GITHUB_WORKSPACE/dist/macos" 2>&1 | tee dist/macos/build-evidence/mac-build.log
+      - name: Verify the signed artifact and record build proof
+        run: |
+          app="$GITHUB_WORKSPACE/dist/macos/nd2wsi-viewer.app"
+          [[ "$(lipo -archs "$app/Contents/MacOS/nd2wsi-viewer")" == arm64 ]]
+          codesign --verify --deep --strict --verbose=2 "$app" 2>&1 | tee dist/macos/build-evidence/codesign-verification.log
+          hdiutil verify dist/macos/nd2wsi-viewer.dmg 2>&1 | tee dist/macos/build-evidence/dmg-verification.log
+          build/macapp/venv/bin/python -m pip freeze > dist/macos/build-evidence/packaged-environment.txt
+          .venv/bin/python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          import plistlib
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          def sha256(path):
+              with path.open("rb") as handle:
+                  return hashlib.file_digest(handle, "sha256").hexdigest()
+
+          root = Path.cwd()
+          output = root / "dist/macos"
+          evidence = output / "build-evidence"
+          app = output / "nd2wsi-viewer.app"
+          with (app / "Contents/Info.plist").open("rb") as handle:
+              info = plistlib.load(handle)
+          with (root / "pyproject.toml").open("rb") as handle:
+              version = tomllib.load(handle)["project"]["version"]
+          assert info["ND2WSIPackageVersion"] == version
+          assert info["ND2WSIDevelopmentOnly"] is False
+          assert info["CFBundleIdentifier"] == "com.nd2wsi.viewer"
+          assert info["SUEnableAutomaticChecks"] is True
+          assert info["SUAutomaticallyUpdate"] is False
+          with (app / "Contents/Frameworks/Sparkle.framework/Versions/Current/Resources/Info.plist").open("rb") as handle:
+              sparkle_version = plistlib.load(handle)["CFBundleShortVersionString"]
+          assert sparkle_version == "2.9.6"
+          manifest_path = Path(os.environ["ND2WSI_SDPC_CODEC_MANIFEST"])
+          manifest = json.loads(manifest_path.read_text())
+          assert manifest["platform"] == "macos-arm64"
+          assert sha256(app / "Contents/Resources/sdpc-codec-manifest.json") == sha256(manifest_path)
+          source_archive = output / Path(manifest["source_archive_file"]).name
+          assert sha256(source_archive) == manifest["source_archive_sha256"]
+          fixture_sha = sha256(root / "docs/example_cell.nd2")
+          assert fixture_sha == "51d603317947b04c3b43c8e694f3ba97a16478ce30e795857ec6ae0321d41c33"
+          smoke_log = (evidence / "mac-build.log").read_text()
+          for marker in ("smoke ok: SDPC", "smoke ok: Astromap JPEG, TXT and PDF", "smoke ok: whole-slide reduced TIFF export"):
+              assert marker in smoke_log, f"Missing required packaged check: {marker}"
+          source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          assert source_sha == os.environ["REQUESTED_REF"]
+          artifacts = {}
+          for path in (output / "nd2wsi-viewer.dmg", source_archive):
+              digest = sha256(path)
+              artifacts[path.name] = {"sha256": digest, "bytes": path.stat().st_size}
+              path.with_name(path.name + ".sha256").write_text(f"{digest}  {path.name}\n", encoding="ascii")
+          proof = {
+              "source_sha": source_sha,
+              "version": version,
+              "platform": platform.platform(),
+              "architecture": platform.machine(),
+              "python": platform.python_version(),
+              "run_url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "sparkle_version": sparkle_version,
+              "sparkle_archive_sha256": os.environ["SPARKLE_SHA256"],
+              "sdpc_manifest_sha256": sha256(manifest_path),
+              "smoke_fixture_sha256": fixture_sha,
+              "app_executable_sha256": sha256(app / "Contents/MacOS/nd2wsi-viewer"),
+              "signing": "ad-hoc",
+              "packaged_headless_smoke": "passed",
+              "native_gui_validation": "required on the downloaded artifact before release",
+              "artifacts": artifacts,
+          }
+          (output / "build-info.json").write_text(json.dumps(proof, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-release
+          path: |
+            dist/macos/nd2wsi-viewer.dmg
+            dist/macos/nd2wsi-viewer.dmg.sha256
+            dist/macos/sdpc-codec-sources-macos-arm64.zip
+            dist/macos/sdpc-codec-sources-macos-arm64.zip.sha256
+            dist/macos/build-info.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-build-evidence
+          path: dist/macos/build-evidence/
+          retention-days: 30

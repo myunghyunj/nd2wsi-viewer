@@ -23,6 +23,8 @@ from . import window_chrome as _window_chrome
 from . import window_lifecycle as _window_lifecycle
 
 APP_NAME = os.environ.get("ND2WSI_APP_NAME", "nd2wsi-viewer") if sys.platform == "darwin" else "nd2wsi-viewer"
+OPEN_SUFFIXES = (".nd2", ".svs", ".sdpc", ".nd2svs", ".jpg", ".jpeg", ".png")
+OPEN_FILE_TYPES = ("Slides and images (*.nd2;*.svs;*.sdpc;*.nd2svs;*.jpg;*.jpeg;*.png)",)
 RELEASES_URL = "https://github.com/myunghyunj/nd2wsi-viewer/releases/latest"
 _UPDATER_HANDLE = None
 _UPDATER_COORDINATOR = None
@@ -85,7 +87,7 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
 <div id="drop"><div class="card">
   <div class="pyr"><div class="l1"></div><div class="l2"></div><div class="l3"></div></div>
   <h1>Drop a slide to open</h1>
-  <div class="sub"><b>.nd2</b>, <b>.svs</b>, <b>.sdpc</b>, or <b>.nd2svs</b> &nbsp;·&nbsp; click anywhere to browse</div>
+  <div class="sub"><b>.nd2</b>, <b>.svs</b>, <b>.sdpc</b>, <b>.nd2svs</b>, or <b>JPEG/PNG</b> &nbsp;·&nbsp; click anywhere to browse</div>
   <div id="status"></div>
   <div id="bar"><span id="fill"></span></div>
   <div id="pct"></div>
@@ -166,6 +168,7 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     from .cache import SINGLE_FILE_SUFFIX
     from .convert import ensure_cache, existing_cache_store
     from .plate import is_plate_file
+    from .raster import is_raster
     from .sdpc import is_sdpc
     from .svs import is_svs
 
@@ -173,8 +176,8 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
         if on_status:
             on_status(f"opening {nd2_path.name} …")
         return nd2_path
-    if is_sdpc(nd2_path):
-        return nd2_path  # SDPC is direct-only: never create or migrate a cache
+    if is_sdpc(nd2_path) or is_raster(nd2_path):
+        return nd2_path  # Direct sources need no cache creation or migration.
     if is_svs(nd2_path) and existing_cache_store(nd2_path) is None:
         return nd2_path  # the registry serves it straight from the file
     if nd2_path.suffix.lower() == ".nd2" and is_plate_file(nd2_path):
@@ -272,7 +275,7 @@ def _install_open_files_handler():
         def application_openFiles_(self, app, filenames):
             paths = [str(f) for f in filenames]
             _dlog(f"openFiles event {paths}")
-            good = [p for p in paths if p.lower().endswith((".nd2", ".svs", ".sdpc", ".nd2svs"))]
+            good = [p for p in paths if p.lower().endswith(OPEN_SUFFIXES)]
             if good:
                 _dispatch_open(good)
             try:
@@ -285,7 +288,7 @@ def _install_open_files_handler():
         def application_openFile_(self, app, filename):
             _dlog(f"openFile event {filename}")
             p = str(filename)
-            if p.lower().endswith((".nd2", ".svs", ".sdpc", ".nd2svs")):
+            if p.lower().endswith(OPEN_SUFFIXES):
                 _dispatch_open([p])
                 return True
             return False
@@ -631,7 +634,7 @@ class Api:
             picked = webview.windows[0].create_file_dialog(
                 webview.OPEN_DIALOG,
                 allow_multiple=True,
-                file_types=("Slides and caches (*.nd2;*.svs;*.sdpc;*.nd2svs)",),
+                file_types=OPEN_FILE_TYPES,
             )
             if not picked:
                 return None
@@ -647,8 +650,8 @@ class Api:
         good = []
         for raw in paths or []:
             p = Path(raw)
-            if p.suffix.lower() not in (".nd2", ".svs", ".sdpc", ".nd2svs"):
-                self._status = f"{p.name}: not an .nd2, .svs, .sdpc, or .nd2svs file"
+            if p.suffix.lower() not in OPEN_SUFFIXES:
+                self._status = f"{p.name}: not a supported slide, cache, or JPEG/PNG image"
             elif not p.is_file():
                 self._status = f"could not find {p.name}"
             else:
@@ -664,7 +667,7 @@ class Api:
         picked = webview.windows[0].create_file_dialog(
             webview.OPEN_DIALOG,
             allow_multiple=True,
-            file_types=("Slides and caches (*.nd2;*.svs;*.sdpc;*.nd2svs)",),
+            file_types=OPEN_FILE_TYPES,
         )
         return [str(p) for p in picked] if picked else None
 
@@ -1073,19 +1076,16 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                           !document.getElementById('shading-progress-bar') ||
                           !document.getElementById('shading-progress-title') ||
                           !document.getElementById('shading-cancel') ||
-                          !['shading-confirm-title', 'shading-confirm-message', 'shading-confirm-estimate',
-                            'shading-confirm-continue', 'shading-confirm-cancel', 'shading-method-h',
-                            'shading-method-bffree'].every(id => document.getElementById(id)) ||
+                          !['shading-confirm-title', 'shading-confirm-persistence', 'shading-confirm-estimate',
+                            'shading-confirm-continue', 'shading-confirm-cancel'].every(id => document.getElementById(id)) ||
                           typeof document.getElementById('shading-confirm')?.showModal !== 'function' ||
                           !window.Nd2ShadingCorrection || !view.Nd2ShadingCorrection ||
                           typeof window.Nd2ShadingCorrection.nextAction !== 'function' ||
                           typeof view.Nd2ShadingCorrection.nextAction !== 'function' ||
                           typeof window.Nd2ShadingCorrection.methodSupport !== 'function')
                         throw new Error('Packaged Shading Correction controls are unavailable');
-                      const rank1 = document.getElementById('shading-method-bffree');
-                      if (!rank1.defaultChecked || document.getElementById('shading-method-h').defaultChecked ||
-                          rank1.closest('label')?.textContent.trim() !== 'Rank1 (BF-free)')
-                        throw new Error('Packaged Rank1 label or default method is incorrect');
+                      if (document.getElementById('shading-methods') || document.getElementById('shading-confirm-message'))
+                        throw new Error('Packaged Shading Correction contains obsolete method controls');
                       await step('shading-status', async () => {
                         const deadline = Date.now() + 10000;
                         while (!view.eval('state.shading && !state.shading.snapshot().refreshing && !state.shading.snapshot().view_stale && state.shading.snapshot().state !== "checking"') ||
@@ -1102,12 +1102,13 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         throw new Error('Shading Correction did not initialize its committed pyramid state');
                       const shading = window.Nd2ShadingCorrection;
                       const persistentActions = {
-                        apply: shading.nextAction({state: 'idle', supported: true, applied: false}),
-                        revoke: shading.nextAction({state: 'ready', supported: true, applied: true}),
+                        apply: shading.nextAction({state: 'idle', supported: true, applied: false, methods: {bffree: {supported: true}}}),
+                        revoke: shading.nextAction({state: 'ready', supported: true, applied: true, method: 'h'}),
+                        unavailable: shading.nextAction({state: 'idle', supported: true, applied: false, methods: {h: {supported: true}, bffree: {supported: false}}}),
                         cancel: shading.nextAction({state: 'rebuilding', operation: 'revoke', applied: true, can_cancel: true}),
                         publishing: shading.nextAction({state: 'publishing', operation: 'revoke', applied: true, can_cancel: false}),
                       };
-                      if (persistentActions.apply !== 'start' || persistentActions.revoke !== 'revoke' ||
+                      if (persistentActions.apply !== 'start' || persistentActions.revoke !== 'revoke' || persistentActions.unavailable !== null ||
                           persistentActions.cancel !== 'cancel' || persistentActions.publishing !== null)
                         throw new Error('Persistent Shading Correction actions are unavailable');
                       const progressCheck = window.Nd2ShadingCorrection.progress({
@@ -1265,7 +1266,7 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog=APP_NAME, description=__doc__)
-    ap.add_argument("nd2", nargs="?", help="ND2, SVS or SDPC file to open at launch")
+    ap.add_argument("nd2", nargs="?", help="ND2, SVS, SDPC, JPEG or PNG file to open at launch")
     ap.add_argument("--smoke", action="store_true", help="headless self-test")
     ap.add_argument("--gui-smoke", action="store_true", help="open, verify and close the native window")
     ap.add_argument("--smoke-report", type=Path, help="write the native GUI self-test result as JSON")

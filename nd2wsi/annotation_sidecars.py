@@ -48,6 +48,11 @@ def _legacy_sidecar_matches(path: Path, source_name: str, home: Path) -> bool:
     declared = _annotation_source_name(path)
     if declared is not None:
         return declared == source_name
+    from .raster import RASTER_SUFFIXES
+    # An unscoped same-stem sidecar may describe the full ND2 pixel grid.
+    # A downscaled JPG must never inherit those coordinates implicitly.
+    if Path(source_name).suffix.lower() in RASTER_SUFFIXES:
+        return False
     stem = Path(source_name).stem
     try:
         siblings = [
@@ -55,7 +60,7 @@ def _legacy_sidecar_matches(path: Path, source_name: str, home: Path) -> bool:
             for item in home.iterdir()
             if item.is_file()
             and item.stem == stem
-            and item.suffix.lower() in SLIDE_SUFFIXES
+            and item.suffix.lower() in SLIDE_SUFFIXES | RASTER_SUFFIXES
         ]
     except OSError:
         siblings = []

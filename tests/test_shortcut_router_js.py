@@ -80,8 +80,8 @@ def test_panel_shortcuts_use_physical_codes_under_a_korean_input_source():
     out = _run(
         [
             {"event": {"code": "KeyE", "key": "ㄷ"}},
-            {"event": {"code": "KeyA", "key": "ㅁ", "metaKey": True}},
-            {"event": {"code": "KeyC", "key": "ㅊ", "metaKey": True}},
+            {"event": {"code": "KeyA", "key": "ㅁ"}},
+            {"event": {"code": "KeyC", "key": "ㅊ"}},
             {"event": {"code": "KeyI", "key": "ㅑ", "metaKey": True}},
         ]
     )
@@ -94,8 +94,8 @@ def test_letter_shortcuts_follow_latin_keycaps_and_fall_back_for_korean():
     out = _run(
         [
             {"event": {"code": "KeyP", "key": "e"}},
-            {"event": {"code": "KeyQ", "key": "a", "metaKey": True}},
-            {"event": {"code": "KeyI", "key": "c", "metaKey": True}},
+            {"event": {"code": "KeyQ", "key": "a"}},
+            {"event": {"code": "KeyI", "key": "c"}},
             {"event": {"code": "KeyE", "key": "ㄷ"}},
         ]
     )
@@ -103,34 +103,38 @@ def test_letter_shortcuts_follow_latin_keycaps_and_fall_back_for_korean():
     assert [item["panel"] for item in out] == ["region", "annot", "channels", "region"]
 
 
-def test_text_entry_and_ime_composition_suppress_shortcuts():
+@pytest.mark.parametrize("code", ["KeyC", "KeyE", "KeyA"])
+def test_text_entry_and_ime_composition_suppress_shortcuts(code):
     out = _run(
         [
-            {"event": {"code": "KeyE"}, "target": {"tag": "INPUT"}},
-            {"event": {"code": "KeyE"}, "target": {"tag": "textarea"}},
-            {"event": {"code": "KeyE"}, "target": {"tag": "Select"}},
-            {"event": {"code": "KeyE"}, "target": {"contentEditable": True}},
-            {"event": {"code": "KeyE"}, "target": {"insideEditable": True}},
-            {"event": {"code": "KeyE"}, "target": {"insideTextbox": True}},
-            {"event": {"code": "KeyE", "isComposing": True}},
-            {"event": {"code": "KeyE", "keyCode": 229}},
+            {"event": {"code": code}, "target": {"tag": "INPUT"}},
+            {"event": {"code": code}, "target": {"tag": "textarea"}},
+            {"event": {"code": code}, "target": {"tag": "Select"}},
+            {"event": {"code": code}, "target": {"contentEditable": True}},
+            {"event": {"code": code}, "target": {"insideEditable": True}},
+            {"event": {"code": code}, "target": {"insideTextbox": True}},
+            {"event": {"code": code, "isComposing": True}},
+            {"event": {"code": code, "keyCode": 229}},
         ]
     )
     assert all(item["typing"] for item in out)
     assert all(item["panel"] is None and item["tab"] is None for item in out)
 
 
-def test_checkbox_focus_allows_letters_but_keeps_native_space_and_focus_ownership():
+@pytest.mark.parametrize("letter,korean,panel", [("C", "ㅊ", "channels"),
+                                                ("E", "ㄷ", "region"),
+                                                ("A", "ㅁ", "annot")])
+def test_checkbox_focus_allows_letters_but_keeps_native_space_and_focus_ownership(letter, korean, panel):
     out = _run([
         {"target": {"tag": "INPUT", "type": "checkbox"}, "event": event}
         for event in [
-            {"key": "e", "code": "KeyE"}, {"key": "ㄷ", "code": "KeyE"},
+            {"key": letter.lower(), "code": "Key" + letter}, {"key": korean, "code": "Key" + letter},
             {"key": " ", "code": "Space"}, {"key": "Spacebar"}, {"keyCode": 32},
-            {"key": "e", "code": "KeyE", "isComposing": True},
-            {"key": "e", "code": "KeyE", "keyCode": 229},
+            {"key": letter.lower(), "code": "Key" + letter, "isComposing": True},
+            {"key": letter.lower(), "code": "Key" + letter, "keyCode": 229},
         ]
     ])
-    assert [row["panel"] for row in out] == ["region", "region", None, None, None, None, None]
+    assert [row["panel"] for row in out] == [panel, panel, None, None, None, None, None]
     assert [row["typing"] for row in out] == [False, False, True, True, True, True, True]
     assert all(row["focusControl"] for row in out)
 
@@ -178,7 +182,7 @@ def test_panel_shortcuts_reject_modifiers_repeats_and_prevented_events():
     assert all(item["panel"] is None for item in out)
 
 
-def test_command_r_and_f_rotate_clockwise_and_flip_horizontally():
+def test_command_t_and_r_alias_rotate_clockwise_and_f_flips_horizontally():
     out = _run(
         [
             {"event": {"code": "KeyR", "key": "r", "metaKey": True}},
@@ -187,17 +191,21 @@ def test_command_r_and_f_rotate_clockwise_and_flip_horizontally():
             {"event": {"code": "KeyF", "key": "ㄹ", "metaKey": True}},
             {"event": {"code": "KeyP", "key": "r", "metaKey": True}},
             {"event": {"code": "KeyU", "key": "F", "metaKey": True}},
+            {"event": {"code": "KeyT", "key": "t", "metaKey": True}},
+            {"event": {"code": "KeyT", "key": "ㅅ", "metaKey": True}},
+            {"event": {"code": "KeyP", "key": "T", "metaKey": True}},
         ]
     )
     assert [item["orientation"] for item in out] == [
         "rotate-right", "flip-horizontal", "rotate-right", "flip-horizontal",
         "rotate-right", "flip-horizontal",
+        "rotate-right", "rotate-right", "rotate-right",
     ]
     assert all(item["orientationShortcut"] for item in out)
     assert all(item["panel"] is None and item["tab"] is None for item in out)
 
 
-@pytest.mark.parametrize("code", ["KeyR", "KeyF"])
+@pytest.mark.parametrize("code", ["KeyT", "KeyR", "KeyF"])
 def test_orientation_shortcuts_require_command_alone_and_reject_repeats(code):
     out = _run(
         [
@@ -218,7 +226,7 @@ def test_orientation_shortcuts_require_command_alone_and_reject_repeats(code):
     assert out[0]["panel"] is None
 
 
-@pytest.mark.parametrize("code", ["KeyR", "KeyF"])
+@pytest.mark.parametrize("code", ["KeyT", "KeyR", "KeyF"])
 def test_orientation_shortcuts_respect_text_entry_and_ime_composition(code):
     out = _run(
         [
@@ -254,15 +262,16 @@ def test_command_digits_select_tabs_and_accept_the_numeric_keypad():
     assert all(item["panel"] is None for item in out)
 
 
-def test_windows_control_shortcuts_preserve_ime_and_modifier_guards():
+@pytest.mark.parametrize("turn_code,turn_key", [("KeyT", "ㅅ"), ("KeyR", "ㄱ")])
+def test_windows_control_shortcuts_preserve_ime_and_modifier_guards(turn_code, turn_key):
     out = _run([
-        {"platform": "Win32", "event": {"code": "KeyR", "key": "ㄱ", "ctrlKey": True}},
+        {"platform": "Win32", "event": {"code": turn_code, "key": turn_key, "ctrlKey": True}},
         {"platform": "Windows", "event": {"code": "KeyF", "ctrlKey": True}},
         {"platform": "Win32", "event": {"code": "Numpad3", "ctrlKey": True}},
-        {"platform": "Win32", "event": {"code": "KeyR", "metaKey": True}},
+        {"platform": "Win32", "event": {"code": turn_code, "metaKey": True}},
         {"platform": "Win32", "event": {"code": "KeyF", "ctrlKey": True, "altKey": True}},
         {"platform": "Win32", "event": {"code": "Digit1", "ctrlKey": True, "metaKey": True}},
-        {"platform": "Win32", "event": {"code": "KeyR", "ctrlKey": True, "isComposing": True}},
+        {"platform": "Win32", "event": {"code": turn_code, "ctrlKey": True, "isComposing": True}},
         {"platform": "Win32", "event": {"code": "KeyF", "ctrlKey": True}, "target": {"tag": "INPUT"}},
     ])
     assert [item["orientation"] for item in out] == ["rotate-right", "flip-horizontal", None, None, None, None, None, None]
@@ -341,14 +350,16 @@ def test_production_pages_use_the_router_and_document_the_same_shortcuts():
     missing_guard = 'if (index === null || !slides[index]) return;'
     assert shell_js.index(missing_guard) < shell_js.index("event.preventDefault();", shell_js.index(missing_guard))
 
-    assert '| `⌘C` | show or hide Channels & LUTs |' in readme
+    assert '| `C` | show or hide Channels & LUTs |' in readme
     assert '| `E` | show or hide Export |' in readme
-    assert '| `⌘A` | show or hide Annotations |' in readme
+    assert '| `⌘T` | rotate the image 90° clockwise on screen (`⌘R` also works) |' in readme
+    assert 'title="Rotate the selected image 90° clockwise (⌘T)"' in shell_html
+    assert '| `A` | show or hide Annotations |' in readme
     assert '| `⌘1` … `⌘9` | switch to that tab |' in readme
     assert "`⌘C` `⌘R` `⌘A`" not in readme
-    assert 'id="tb-channels" title="Show or hide Channels &amp; LUTs (⌘C)" aria-keyshortcuts="Meta+C"' in index
+    assert 'id="tb-channels" title="Show or hide Channels &amp; LUTs (C)" aria-keyshortcuts="C"' in index
     assert 'id="tb-region" title="Show or hide Export (E)" aria-keyshortcuts="E"' in index
-    assert 'id="tb-annot" title="Show or hide Annotations (⌘A)" aria-keyshortcuts="Meta+A"' in index
+    assert 'id="tb-annot" title="Show or hide Annotations (A)" aria-keyshortcuts="A"' in index
     info_button = index.split('id="tb-info"', 1)[1].split('</button>', 1)[0]
     assert 'aria-label="Slide Info"' in info_button and 'aria-keyshortcuts="Meta+I"' in info_button
     assert '<span>Info</span>' not in info_button
@@ -359,13 +370,21 @@ def test_production_pages_use_the_router_and_document_the_same_shortcuts():
 @pytest.mark.parametrize("platform,modifier", [("MacIntel", "metaKey"), ("Win32", "ctrlKey")])
 @pytest.mark.parametrize("code,panel", [("KeyC", "channels"), ("KeyA", "annot"),
                                        ("KeyI", "info")])
-def test_command_panels_require_the_platform_command_key(platform, modifier, code, panel):
+def test_command_panel_aliases_require_the_platform_command_key(platform, modifier, code, panel):
     other = "ctrlKey" if modifier == "metaKey" else "metaKey"
     modifiers = [{modifier: True}, {}, {other: True}, {modifier: True, other: True},
                  {modifier: True, "shiftKey": True}, {modifier: True, "altKey": True},
                  {modifier: True, "repeat": True}, {modifier: True, "defaultPrevented": True}]
     out = _run([{"platform": platform, "event": {"code": code, **flags}} for flags in modifiers])
-    assert [row["panel"] for row in out] == [panel] + [None] * 7
+    assert [row["panel"] for row in out] == [panel, panel if code in {"KeyC", "KeyA"} else None] + [None] * 6
+
+
+@pytest.mark.parametrize("platform", ["MacIntel", "Win32"])
+@pytest.mark.parametrize("code,panel", [("KeyC", "channels"), ("KeyE", "region"), ("KeyA", "annot")])
+def test_plain_panels_open_once_without_modifiers(platform, code, panel):
+    flags = [{}, {"repeat": True}, {"shiftKey": True}, {"altKey": True}, {"defaultPrevented": True}]
+    out = _run([{"platform": platform, "event": {"code": code, **flag}} for flag in flags])
+    assert [row["panel"] for row in out] == [panel, None, None, None, None]
 
 
 def test_info_shortcut_keeps_typing_guards_but_does_not_require_clearing_read_only_selection():

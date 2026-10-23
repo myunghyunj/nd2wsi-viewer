@@ -41,7 +41,7 @@ function shellFixture(){
   const c=vm.createContext({$,window:{Nd2ShadingCorrection:S},shadingStates:new Map(),shadingTokens:new Map([['a','ta'],['b','tb']]),
     active:'a',readyFrames:new Set(['a','b']),quitPreparation:null,shadingCommandSeq:0,shadingConfirmation:null,VIEWPORT_PROTOCOL_VERSION:2,
     postToSlide:(sid,data)=>{messages.push({sid,data});return true}});
-  for(const name of ['refreshShadingButton','receiveShadingState','activateShadingCorrection','dismissShadingOutcome','refreshShadingMethodChoice','selectShadingMethod','shadingConfirmationMatches','closeShadingConfirmation','continueShadingConfirmation','dismissShadingConfirmation'])vm.runInContext(production(source,name),c);
+  for(const name of ['refreshShadingButton','receiveShadingState','activateShadingCorrection','dismissShadingOutcome','refreshShadingConfirmation','shadingConfirmationMatches','closeShadingConfirmation','continueShadingConfirmation','dismissShadingConfirmation'])vm.runInContext(production(source,name),c);
   function status(sid,extra={}){return {sid,shellToken:'t'+sid,paneInstanceId:'pane-'+sid,seq:1,
     state:'idle',supported:true,applied:false,can_cancel:false,methods:{h:{supported:extra.supported!==false},bffree:{supported:extra.supported!==false}},channels:[],generation:'g1',estimated_seconds:225,contextKey:sid+':g1',...extra};}
   return {c,$,messages,status};
@@ -94,20 +94,21 @@ def test_reopened_applied_pyramid_is_authoritative_and_does_not_start_any_operat
                    "requests": 1, "reloads": 0, "delay": 5000}
 
 
-def test_rank1_default_requires_confirmation_and_current_context():
+def test_correction_requires_confirmation_and_current_context():
     out = run("""
       const f=fixture();f.api.load();f.requests[0].resolve(f.payload('idle',{
         methods:{h:{supported:true},bffree:{supported:true}}}));await flush();
       const unconfirmed=await f.api.activate('start','a:g1',false,'bffree');
       const invalid=await f.api.activate('start','a:g1',true,'unknown',true);
+      const legacyStart=await f.api.activate('start','a:g1',true,'h');
       const wrongContext=await f.api.activate('start','old',true,'bffree',true);
       f.api.activate('start','a:g1',true,'bffree',true);
       const selected=JSON.parse(f.requests[1].options.body);
       f.requests[1].resolve(f.payload('cancelled',{method:'bffree',methods:{h:{supported:true},bffree:{supported:true}}}));await flush();
       f.api.activate('start','a:g1',true);
-      return {unconfirmed,invalid,wrongContext,selected,defaultBody:JSON.parse(f.requests[2].options.body)};
+      return {unconfirmed,invalid,legacyStart,wrongContext,selected,defaultBody:JSON.parse(f.requests[2].options.body)};
     """)
-    assert out == {"unconfirmed": False, "invalid": False, "wrongContext": False,
+    assert out == {"unconfirmed": False, "invalid": False, "legacyStart": False, "wrongContext": False,
                    "selected": {"generation": "g1", "method": "bffree"},
                    "defaultBody": {"generation": "g1", "method": "bffree"}}
 
@@ -138,15 +139,18 @@ def test_bffree_stale_generation_refresh_never_replays_experimental_request():
                    "method": "h", "applied": True}
 
 
-def test_applied_method_label_and_unchanged_alternative_remain_explicit():
+def test_applied_correction_label_and_legacy_revoke():
     out = run("""
       const methods={h:{supported:true},bffree:{supported:true}},unchanged={state:'unchanged',supported:true,applied:false,method:'h',methods};
-      return {label:S.describe({state:'ready',supported:true,applied:true,method:'bffree',model_schema:'BF_free_consensus_rank1/1',methods}).label,
+      const legacyApplied={state:'ready',supported:true,applied:true,method:'h'};
+      return {label:S.describe({state:'ready',supported:true,applied:true,method:'bffree',methods}).label,
         action:S.nextAction(unchanged),h:S.methodSupport(unchanged,'h').supported,
-        bffree:S.methodSupport(unchanged,'bffree').supported,legacy:S.nextAction({...unchanged,methods:undefined})};
+        bffree:S.methodSupport(unchanged,'bffree').supported,legacy:S.nextAction({...unchanged,methods:undefined}),
+        legacyApplied:S.nextAction(legacyApplied),legacyDisabled:S.describe(legacyApplied).disabled};
     """)
-    assert out == {"label": "Shading Correction applied · Rank1 (BF-free) · Revoke…",
-                   "action": "start", "h": False, "bffree": True, "legacy": None}
+    assert out == {"label": "Shading Correction applied · Revoke…",
+                   "action": "start", "h": False, "bffree": True, "legacy": None,
+                   "legacyApplied": "revoke", "legacyDisabled": False}
 
 
 def test_stale_generation_rejection_refreshes_status_without_replaying_operation():
@@ -370,12 +374,12 @@ def test_confirmation_targets_exact_operation_and_captured_pane_once(applied, ac
       const f=shellFixture(),c=f.c;c.receiveShadingState('a',f.status('a',{applied:APPLIED}));c.activateShadingCorrection();
       const before={open:f.$('shading-confirm').open,estimate:f.$('shading-confirm-estimate').textContent,
         title:f.$('shading-confirm-title').textContent,button:f.$('shading-confirm-continue').textContent,
-        message:f.$('shading-confirm-message').textContent,messages:f.messages.length,revoke:f.$('shading-confirm').classes.has('revoke')};
+        message:f.$('shading-confirm-persistence').textContent,messages:f.messages.length,revoke:f.$('shading-confirm').classes.has('revoke')};
       const first=c.continueShadingConfirmation(),second=c.continueShadingConfirmation();
       return {before,first,second,open:f.$('shading-confirm').open,messages:f.messages};
     """.replace("APPLIED", str(applied).lower()))
     assert out["before"] == {"open": True, "estimate": "Est. time: about 4 min", "title": title, "button": button,
-                             "message": "Rebuild the original pyramid from the source ND2." if applied else "Use Rank1 to estimate the repeating illumination pattern from this slide's fluorescence channels and correct supported FITC and CY3 channels. BF and DAPI stay unchanged. Review the corrected image before quantitative analysis.",
+                             "message": "Rebuild the original pyramid from the source ND2." if applied else "Applying correction rebuilds and saves this slide's display pyramid. Original measurements stay unchanged.",
                              "messages": 0, "revoke": applied}
     assert out["first"] is True and out["second"] is False and out["open"] is False
     command, = out["messages"]
@@ -384,52 +388,49 @@ def test_confirmation_targets_exact_operation_and_captured_pane_once(applied, ac
     assert command["data"]["generation"] == "g1" and command["data"]["contextKey"] == "a:g1"
 
 
-def test_dialog_defaults_to_rank1_and_dismissal_does_not_apply():
+def test_dialog_has_one_correction_and_dismissal_does_not_apply():
     out = run("""
       const f=shellFixture(),c=f.c,methods={h:{supported:false,reason:'No BF channel'},bffree:{supported:true}};
       c.receiveShadingState('a',f.status('a',{state:'unsupported',supported:false,method:'h',methods}));
-      const opened=c.activateShadingCorrection(),initial={h:f.$('shading-method-h').checked,
-        bffree:f.$('shading-method-bffree').checked,disabled:f.$('shading-confirm-continue').disabled};
+      const opened=c.activateShadingCorrection(),initial={method:c.shadingConfirmation.method,
+        disabled:f.$('shading-confirm-continue').disabled};
       const before=f.messages.length;
-      const selected={message:f.$('shading-confirm-message').textContent,disabled:f.$('shading-confirm-continue').disabled,
+      const selected={message:f.$('shading-confirm-persistence').textContent,disabled:f.$('shading-confirm-continue').disabled,
         estimate:f.$('shading-confirm-estimate').textContent};
       c.closeShadingConfirmation();c.activateShadingCorrection();
       const reset={method:c.shadingConfirmation.method,
         disabled:f.$('shading-confirm-continue').disabled};
-      c.selectShadingMethod('bffree');const submitted=c.continueShadingConfirmation();
+      const submitted=c.continueShadingConfirmation();
       return {opened,initial,before,selected,reset,submitted,messages:f.messages};
     """)
     assert out["opened"] is True and out["before"] == 0 and out["submitted"] is True
-    assert out["initial"] == {"h": False, "bffree": True, "disabled": False}
+    assert out["initial"] == {"method": "bffree", "disabled": False}
     assert out["reset"] == {"method": "bffree", "disabled": False}
-    assert out["selected"]["disabled"] is False
-    assert out["selected"]["estimate"] == "Est. time: about 4 min"
-    assert "FITC and CY3" in out["selected"]["message"]
-    assert "BF and DAPI stay unchanged" in out["selected"]["message"]
-    assert "Review the corrected image before quantitative analysis" in out["selected"]["message"]
+    assert out["selected"] == {
+        "message": "Applying correction rebuilds and saves this slide's display pyramid. Original measurements stay unchanged.",
+        "disabled": False, "estimate": "Est. time: about 4 min"}
     command, = out["messages"]
     assert command["data"]["method"] == "bffree" and "experimental_confirmed" not in command["data"]
 
 
-def test_dialog_defaults_to_rank1_and_method_availability_is_rechecked():
+def test_dialog_rechecks_availability_without_falling_back_to_legacy_method():
     out = run("""
       const f=shellFixture(),c=f.c,methods={h:{supported:true},bffree:{supported:true}};
       c.receiveShadingState('a',f.status('a',{methods}));c.activateShadingCorrection();c.continueShadingConfirmation();
-      const first=f.messages[0].data;c.activateShadingCorrection();c.selectShadingMethod('bffree');
+      const first=f.messages[0].data;c.activateShadingCorrection();
       c.receiveShadingState('a',f.status('a',{seq:2,methods:{h:{supported:true},bffree:{supported:false,reason:'Source changed'}}}));
-      const blocked=c.continueShadingConfirmation(),disabled=f.$('shading-confirm-continue').disabled;
-      c.selectShadingMethod('h');c.continueShadingConfirmation();
-      return {first,blocked,disabled,last:f.messages[1].data,count:f.messages.length};
+      return {first,blocked:c.continueShadingConfirmation(),reopened:c.activateShadingCorrection(),
+        pending:c.shadingConfirmation,disabled:f.$('shading-correction').disabled,count:f.messages.length};
     """)
     assert out["first"]["method"] == "bffree" and "experimental_confirmed" not in out["first"]
-    assert out["blocked"] is False and out["disabled"] is True and out["count"] == 2
-    assert out["last"]["method"] == "h" and "experimental_confirmed" not in out["last"]
+    assert out["blocked"] is False and out["reopened"] is False
+    assert out["disabled"] is True and out["count"] == 1 and out["pending"] is None
 
 
 def test_selected_bffree_confirmation_is_invalidated_by_generation_change():
     out = run("""
       const f=shellFixture(),c=f.c,methods={h:{supported:true},bffree:{supported:true}};
-      c.receiveShadingState('a',f.status('a',{methods}));c.activateShadingCorrection();c.selectShadingMethod('bffree');
+      c.receiveShadingState('a',f.status('a',{methods}));c.activateShadingCorrection();
       c.receiveShadingState('a',f.status('a',{seq:2,generation:'g2',contextKey:'a:g2',methods}));
       return {submitted:c.continueShadingConfirmation(),pending:c.shadingConfirmation,messages:f.messages};
     """)
@@ -621,8 +622,10 @@ def test_selected_icon_confirmation_colors_and_original_pixel_label_are_preserve
     assert pane.index("shading-correction-v1.js") < pane.index("app.js")
     assert 'id="update-check"' not in shell
     assert 'id="shading-progress-bar"' in shell
-    assert 'Rank1 (BF-free)' in shell and 'BF, DAPI and original measurements stay unchanged.' in shell
-    assert 'aria-describedby="shading-confirm-message shading-confirm-estimate"' in shell
+    assert 'Applying correction rebuilds and saves' in shell
+    assert 'id="shading-methods"' not in shell and 'id="shading-confirm-message"' not in shell
+    assert '#shading-status, #shading-confirm-title { position:absolute;' in css
+    assert 'aria-describedby="shading-confirm-persistence shading-confirm-estimate"' in shell
     assert '#shading-confirm-continue { background:#248a3d; }' in css
     assert '#shading-confirm-cancel { background:#d72c30; }' in css
     assert '#shading-confirm.revoke #shading-confirm-continue { background:#007aff; }' in css

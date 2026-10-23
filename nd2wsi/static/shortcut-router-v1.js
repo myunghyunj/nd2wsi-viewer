@@ -11,7 +11,13 @@
     KeyA: "annot",
     KeyI: "info",
   });
+  const PLAIN_PANEL_BY_CODE = Object.freeze({
+    KeyC: "channels",
+    KeyE: "region",
+    KeyA: "annot",
+  });
   const ORIENTATION_BY_CODE = Object.freeze({
+    KeyT: "rotate-right",
     KeyR: "rotate-right",
     KeyF: "flip-horizontal",
   });
@@ -128,12 +134,13 @@
       const path = typeof event.composedPath === "function" ? event.composedPath() : [];
       return ![event.target, ...path].some(isFocusControl) && !hasTextSelection(event);
     }
-    return !event.metaKey && !event.ctrlKey && code === "KeyE";
+    return !event.metaKey && !event.ctrlKey && Object.hasOwn(PLAIN_PANEL_BY_CODE, code);
   }
 
   function panelForEvent(event, platform) {
     if (!isPanelShortcut(event, platform) || event.repeat) return null;
-    return letterCode(event) === "KeyE" ? "region" : COMMAND_PANEL_BY_CODE[letterCode(event)];
+    const panels = commandPressed(event, platform) ? COMMAND_PANEL_BY_CODE : PLAIN_PANEL_BY_CODE;
+    return panels[letterCode(event)];
   }
 
   function isAstromapShortcut(event, platform) {

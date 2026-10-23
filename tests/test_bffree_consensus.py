@@ -1,4 +1,4 @@
-"""Packaged rank-1 port equivalence and native/persistence boundaries.
+"""Packaged consensus port equivalence and native/persistence boundaries.
 
 The reference was produced once by the pinned original research implementations,
 not by this package. Tests never need an external drive or a research slide.
@@ -17,6 +17,7 @@ from nd2wsi import bffree_consensus as bc
 from nd2wsi import bffree_consensus_amplitude as ba
 from nd2wsi import bffree_consensus_template as bt
 from nd2wsi import bffree_model as bm
+from nd2wsi.bffree_serialization import SUPPORTED_SCHEMAS, contract_for_schema
 
 
 def synthetic_raw():
@@ -39,7 +40,7 @@ def metadata(raw):
 def fitted(tmp_path_factory):
     raw = synthetic_raw()
     before = raw.copy()
-    folder = tmp_path_factory.mktemp("consensus-rank1")
+    folder = tmp_path_factory.mktemp("consensus")
     progress = []
     model, result = bm.fit(raw, metadata(raw), folder / "model.npz", progress=progress.append)
     np.testing.assert_array_equal(raw, before)
@@ -50,15 +51,15 @@ def fitted(tmp_path_factory):
 
 def test_port_matches_pinned_original_template_amplitude_native_gain_and_decisions(fitted):
     model, result, _ = fitted
-    reference = json.loads((Path(__file__).parent / "fixtures/consensus_rank1_port_reference.json").read_text())
+    reference = json.loads((Path(__file__).parent / "fixtures/consensus_port_reference.json").read_text())
     assert hashlib.sha256(synthetic_raw().tobytes()).hexdigest() == reference["raw_sha256"]
     assert result["config"]["parameters"] == reference["parameters"]
     for name, digest in reference["source_sha256"].items():
         assert result["config"]["research_source_sha256"][name] == digest
-    assert model.model_schema == bm.SCHEMA == "BF_free_consensus_rank1/1"
+    assert model.model_schema == bm.SCHEMA == "BF_free_consensus/1"
     assert set(model.data.files) == bm.FIELD_NAMES
     assert model.indices == [0, 2, 3] and model.enabled == [True, True, False]
-    assert result["config"]["candidate_id"] == "consensus_rank1"
+    assert result["config"]["candidate_id"] == "consensus"
     assert result["uses_bf"] is False and result["BF_modified"] is False and result["DAPI_modified"] is False
     assert result["working_memory"]["estimated_peak_bytes"] <= 1024**3
     for row, (actual, expected) in enumerate(zip(model.prediction["channel_models"], reference["channel_models"])):
@@ -101,6 +102,37 @@ def test_roundtrip_from_read_only_bytes_preserves_exact_native_gain(fitted):
     try:
         assert reopened.path is None
         assert json.loads((folder / "model.json").read_text())["config"] == result["config"]
+        for channel in model.indices:
+            np.testing.assert_array_equal(reopened.gain(channel, (19, 23), (4101, 5133)),
+                                          model.gain(channel, (19, 23), (4101, 5133)))
+    finally:
+        reopened.data.close()
+
+
+@pytest.mark.parametrize("mixed_names", [False, True])
+def test_previous_named_archive_preserves_gain_and_rejects_mixed_provenance(fitted, mixed_names):
+    model, _, folder = fitted
+    schema, = SUPPORTED_SCHEMAS - {bc.SCHEMA}
+    with np.load(folder / "model.npz", allow_pickle=False) as data:
+        fields = {key: data[key].copy() for key in data.files}
+    fields["model_schema"] = np.asarray(schema)
+    prediction = json.loads(fields["prediction_json"].item())
+    diagnostics = prediction["diagnostics"]
+    diagnostics["schema"] = schema
+    diagnostics["method"] = contract_for_schema(schema)["method"]
+    if not mixed_names:
+        diagnostics["config"] = bc.frozen_config(schema)
+    fields["prediction_json"] = np.asarray(json.dumps(prediction))
+    payload = io.BytesIO()
+    np.savez_compressed(payload, **fields)
+    payload.seek(0)
+    if mixed_names:
+        with pytest.raises(ValueError, match="provenance"):
+            bm.Model(payload)
+        return
+    reopened = bm.Model(payload)
+    try:
+        assert reopened.model_schema == schema
         for channel in model.indices:
             np.testing.assert_array_equal(reopened.gain(channel, (19, 23), (4101, 5133)),
                                           model.gain(channel, (19, 23), (4101, 5133)))
@@ -173,7 +205,7 @@ def test_cancellation_reaches_optimizer_and_preserves_prior_files(tmp_path, monk
 
 
 @pytest.mark.parametrize("change", ["DAPI", "BF", "nan", "bounds", "template", "phase", "spacing", "method", "schema"])
-def test_malformed_rank1_archive_rejected(fitted, tmp_path, change):
+def test_malformed_consensus_archive_rejected(fitted, tmp_path, change):
     model, _, folder = fitted
     with np.load(folder / "model.npz", allow_pickle=False) as data:
         fields = {key: data[key].copy() for key in data.files}

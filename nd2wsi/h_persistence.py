@@ -23,6 +23,11 @@ from pathlib import Path
 
 import numpy as np
 
+from .bffree_serialization import (
+    NATIVE_CONTRACT,
+    SUPPORTED_SCHEMAS,
+    contract_for_schema,
+)
 from .cache import (
     CORRECTED_SINGLE_FILE_FORMAT,
     MANIFEST_NAME,
@@ -42,7 +47,7 @@ MODEL_KEY = "h-correction/model.npz"
 PROVENANCE_KEY = "h-correction/provenance.json"
 SCHEMA = "nd2wsi-h-correction/1"
 _MODEL_LIMIT = 32 * 1024**2
-RANK1_NATIVE_CONTRACT = "BF-free-consensus-rank1-native-sampled-T-P-spaced-A-then-box-mean"
+CONSENSUS_NATIVE_CONTRACT = NATIVE_CONTRACT
 LEGACY_BFFREE_NATIVE_CONTRACT = "BF-free-32x-bin-center-interpolation(native)-then-box-mean"
 
 
@@ -67,7 +72,6 @@ def _identity(path, *, single_link=True):
 
 def _bffree_source_binding(model, labels, shape):
     """Bind original fluorescence indices and native geometry before use."""
-    from .bffree_model import SCHEMA as RANK1_SCHEMA
     from .h_correction import _mapping
 
     if (not isinstance(labels, list) or len(labels) != int(shape[0])
@@ -78,34 +82,33 @@ def _bffree_source_binding(model, labels, shape):
         raise ValueError("Invalid BF-free target channel mapping")
     if tuple(model.native_shape_yx) != tuple(shape[-2:]):
         raise ValueError("BF-free model native geometry differs from source")
-    if model.model_schema == RANK1_SCHEMA:
+    if model.model_schema in SUPPORTED_SCHEMAS:
         if (any(mapping.get(name) != index for name, index in zip(model.channel_names, model.indices))
                 or any(name == "DAPI" and enabled for name, enabled in zip(model.channel_names, model.enabled))):
-            raise ValueError("Rank1 model channels differ from original source channels")
+            raise ValueError("Consensus model channels differ from original source channels")
     return mapping
 
 
-def _rank1_fit_binding(model, record):
-    """Do not save an independent-x/h1 label beside rank-1 image pixels."""
+def _consensus_fit_binding(model, record):
+    """Do not save an independent-x/h1 label beside consensus image pixels."""
     if (not isinstance(record, dict) or record.get("schema") != model.model_schema
             or record.get("config") != model.prediction["diagnostics"]["config"]
             or record.get("uses_bf") is not False or record.get("BF_modified") is not False
             or record.get("DAPI_modified") is not False
             or record.get("native_shape_yx") != model.native_shape_yx.tolist()
             or record.get("target_channels") != model.channel_names):
-        raise ValueError("Rank1 fit provenance differs from the saved model")
+        raise ValueError("Consensus fit provenance differs from the saved model")
     selected = record.get("selected")
     if (not isinstance(selected, list) or len(selected) != len(model.indices)
             or any(not isinstance(row, dict) or row.get("channel") != name
                    or row.get("channel_index") != index or row.get("enabled") is not enabled
                    for row, name, index, enabled in zip(selected, model.channel_names, model.indices, model.enabled))):
-        raise ValueError("Rank1 fit channel provenance differs from the saved model")
+        raise ValueError("Consensus fit channel provenance differs from the saved model")
 
 
 def load_model(container, manifest):
     """Load a bounded, hash-verified model without extracting a sidecar."""
     from .bffree_model import FIELD_NAMES, LEGACY_FIELD_NAMES, LEGACY_SCHEMA
-    from .bffree_model import SCHEMA as RANK1_SCHEMA
     from .bffree_model import Model as BFFreeModel
     from .h_model import Model
 
@@ -165,19 +168,19 @@ def load_model(container, manifest):
             stored_labels = [row.get("label") for row in stored_attrs.get("omero", {}).get("channels", [])]
             if stored_labels != labels:
                 raise ValueError("Stored BF-free source channel provenance differs")
-            if model.model_schema == RANK1_SCHEMA:
-                if (correction.get("model_schema") != RANK1_SCHEMA
-                        or provenance.get("model_schema") != RANK1_SCHEMA
+            if model.model_schema in SUPPORTED_SCHEMAS:
+                if (correction.get("model_schema") != model.model_schema
+                        or provenance.get("model_schema") != model.model_schema
                         or correction.get("experimental") is not False
                         or provenance.get("experimental") is not False
-                        or correction.get("native_coordinate_contract") != RANK1_NATIVE_CONTRACT
-                        or provenance.get("native_coordinate_contract") != RANK1_NATIVE_CONTRACT
+                        or correction.get("native_coordinate_contract") != contract_for_schema(model.model_schema)["native_contract"]
+                        or provenance.get("native_coordinate_contract") != contract_for_schema(model.model_schema)["native_contract"]
                         or provenance.get("source_shape_cyx") != shape
                         or provenance.get("source_channel_mapping") != mapping
                         or provenance.get("config") != model.prediction["diagnostics"]["config"]
                         or provenance.get("config_sha256") != _sha(_json_bytes(provenance["config"]))):
-                    raise ValueError("Rank1 persisted model/provenance contract differs")
-                _rank1_fit_binding(model, provenance.get("fit"))
+                    raise ValueError("Consensus persisted model/provenance contract differs")
+                _consensus_fit_binding(model, provenance.get("fit"))
             elif (model.model_schema != LEGACY_SCHEMA
                     or correction.get("model_schema", LEGACY_SCHEMA) != LEGACY_SCHEMA
                     or provenance.get("model_schema", LEGACY_SCHEMA) != LEGACY_SCHEMA
@@ -338,17 +341,17 @@ def prepare_apply(state, model, model_record, event, progress):
         channels, height, width = native.shape
         model_payload = Path(model.path).read_bytes()
         method = "bffree" if getattr(model, "model_schema", "").startswith("BF_free_") else "h"
-        rank1 = False
+        consensus = False
         source_labels = source_mapping = None
         native_contract = "H(native)-then-box-mean"
         if method == "bffree":
-            from .bffree_model import SCHEMA as RANK1_SCHEMA
-            rank1 = model.model_schema == RANK1_SCHEMA
+            consensus = model.model_schema in SUPPORTED_SCHEMAS
             source_labels = [channel["label"] for channel in state.attrs["omero"]["channels"]]
             source_mapping = _bffree_source_binding(model, source_labels, native.shape)
-            native_contract = RANK1_NATIVE_CONTRACT if rank1 else LEGACY_BFFREE_NATIVE_CONTRACT
-            if rank1:
-                _rank1_fit_binding(model, model_record)
+            native_contract = (contract_for_schema(model.model_schema)["native_contract"]
+                               if consensus else LEGACY_BFFREE_NATIVE_CONTRACT)
+            if consensus:
+                _consensus_fit_binding(model, model_record)
         config_payload = (_json_bytes(model_record["config"]) if method == "bffree" else
                           Path(__file__).with_name("h_config.json").read_bytes())
         revision = uuid.uuid4().hex
@@ -363,11 +366,11 @@ def prepare_apply(state, model, model_record, event, progress):
         if method == "bffree":
             provenance.update(source_channel_names=source_labels, source_channel_mapping=source_mapping,
                               source_shape_cyx=list(native.shape), model_schema=model.model_schema,
-                              experimental=not rank1, native_coordinate_contract=native_contract)
+                              experimental=not consensus, native_coordinate_contract=native_contract)
         provenance_payload = _json_bytes(provenance)
         correction = {
             "schema": SCHEMA, "applied": True, "correction_id": revision, "method": method,
-            "experimental": method == "bffree" and not rank1,
+            "experimental": method == "bffree" and not consensus,
             "model_key": MODEL_KEY, "model_sha256": _sha(model_payload),
             "provenance_key": PROVENANCE_KEY, "provenance_sha256": _sha(provenance_payload),
             "channel_indices": indices, "raw_dtype": str(native.dtype),

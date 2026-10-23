@@ -47,6 +47,7 @@ function unproject(p) {
 const state = {
   info: {width: config.width, height: config.height, channels: [0], nd2Export: true},
   landmark: {active: false}, tool: null, channels: [0],
+  viewer: {addHandler() {}},
 };
 const context = {
   state, URLSearchParams, window: {devicePixelRatio: config.dpr},
@@ -59,6 +60,7 @@ const context = {
   addAnnotation(item) { annotations.push(item); return {...item, id:'test'}; },
   activeFrameContext() { return {frame: null}; }, frameOwnsRoi() { return true; },
   appendFrameParams(q) { return q; },
+  roiScale() { return {d: 1}; }, levelPathFor() { return 0; },
   openEditor() {}, clearRoi() {}, trackExport() {},
   wireRoiDims() {}, wireAnnotationPanel() {}, showToast() {},
 };

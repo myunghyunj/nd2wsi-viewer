@@ -72,6 +72,9 @@ echo "==> pyinstaller"
   --collect-all numcodecs \
   --collect-all dask \
   --collect-all tifffile \
+  --collect-all reportlab \
+  --collect-all pypdf \
+  --collect-all charset_normalizer \
   --collect-all imagecodecs \
   --collect-all limnd2 \
   --collect-all ome_types \
@@ -195,6 +198,7 @@ echo "==> smoke test"
 if [ -n "${ND2WSI_SMOKE_FILE:-}" ]; then
   "$STAGED_APP/Contents/MacOS/$APPNAME" --smoke "$ND2WSI_SMOKE_FILE" | tee "$RELEASE_STAGE/packaged-smoke.log"
   grep -Fq 'smoke ok: SDPC' "$RELEASE_STAGE/packaged-smoke.log" || { echo "ERROR: packaged SDPC checks did not complete" >&2; exit 4; }
+  grep -Fq 'smoke ok: Astromap JPEG, TXT and PDF' "$RELEASE_STAGE/packaged-smoke.log" || { echo "ERROR: packaged Astromap checks did not complete" >&2; exit 4; }
 elif [ "${ND2WSI_SKIP_SMOKE:-}" = "1" ]; then
   echo "   SKIPPED by explicit request — do not ship this build"
 else

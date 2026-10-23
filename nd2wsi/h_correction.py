@@ -90,7 +90,7 @@ def _mapping(names: list[str], method="h", *, require_correctable=True) -> dict[
                 raise UnsupportedCorrection(f"Ambiguous duplicate {canonical} channels")
             result[canonical] = index
     if method == "bffree" and require_correctable and not {"FITC", "CY3"}.intersection(result):
-        raise UnsupportedCorrection("Rank1 correction needs FITC or CY3; DAPI may help estimate the pattern")
+        raise UnsupportedCorrection("Shading Correction needs FITC or CY3; DAPI may help estimate the pattern")
     if method == "h" and "BF" not in result:
         raise UnsupportedCorrection("Shading Correction requires a BF channel")
     return result
@@ -213,7 +213,7 @@ def _metadata_for_state(state: Any, method="h") -> dict:
         if method == "bffree":
             if _source_stamp(path) != before:
                 raise UnsupportedCorrection("The ND2 source changed during metadata inspection")
-            # Rank1 receives no BF pixels, camera geometry, masks, or BF-derived
+            # Consensus receives no BF pixels, camera geometry, masks, or BF-derived
             # initialization. Available fluorescence supplies the evidence.
             return {"sizes": sizes, "dtype": str(native.dtype), "channel_names": names,
                     "channel_mapping": mapping, "source_stamp": before}
@@ -437,7 +437,7 @@ class HCorrectionController:
     def start(self, method="bffree", experimental_confirmed=False):
         if method not in ("h", "bffree"):
             raise ValueError("Unknown Shading Correction method")
-        # Retain the preview keyword for callers; Rank1 is the adopted default.
+        # Retain the preview keyword for callers; Consensus is the adopted default.
         if not isinstance(experimental_confirmed, bool):
             raise ValueError("Experimental confirmation must be a boolean")
         return self._start("apply", method)
@@ -563,7 +563,7 @@ class HCorrectionController:
                 self._update(event, channel_results=result["selected"])
                 if not any(model.enabled):
                     self._update(event, state="unchanged", pct=100,
-                                 reason=("No supported Rank1 correction was found"
+                                 reason=("No supported shading correction was found"
                                          if method == "bffree" else
                                          "No reproducible, valid FITC/CY3/BF correction was found"))
                     return

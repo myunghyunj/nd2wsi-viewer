@@ -58,7 +58,7 @@ def test_initial_ready_pane_receives_focus_and_channel_key_can_reach_it(platform
         plain:ShortcutRouter.panelForEvent({...event,[MODIFIER]:false},PLATFORM)});
     '''.replace('PLATFORM', json.dumps(platform)).replace('MODIFIER', json.dumps(modifier)))
     assert result == {'before': [], 'focused': ['a', 'a:window'], 'target': 'a',
-                      'action': 'channels', 'plain': None}
+                      'action': 'channels', 'plain': 'channels'}
 
 
 def test_switching_to_ready_tab_focuses_it_once_without_resetting_inner_editor():
@@ -102,7 +102,9 @@ def test_delayed_ready_keeps_new_checkbox_focus_and_native_command_ownership(pla
         action:ShortcutRouter.panelForEvent(event,PLATFORM),
         plain:ShortcutRouter.panelForEvent({...event,[MODIFIER]:false},PLATFORM)});
     '''.replace('PLATFORM', json.dumps(platform)).replace('MODIFIER', json.dumps(modifier)))
-    assert result == {'focused': [], 'tag': 'INPUT', 'action': None, 'plain': None}
+    # Plain C opens Channels even from a checkbox; Cmd/Ctrl+C keeps native
+    # ownership, and readiness still must not move focus from that checkbox.
+    assert result == {'focused': [], 'tag': 'INPUT', 'action': None, 'plain': 'channels'}
 
 
 def test_inactive_ready_pane_does_not_take_focus_from_selected_slide():

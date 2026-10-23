@@ -9,6 +9,12 @@
 __pycache__/
 build/
 dist/
+dist-astromap-beta/
+qa/*
+!qa/run_native_check.py
+!qa/check_native_astromap.py
+!qa/check_native_orientation.py
+!qa/check_native_final_beta.py
 nd2wsi/metal/*.dylib
 nd2wsi/metal_viewport/*.dylib
 docs/*.nd2

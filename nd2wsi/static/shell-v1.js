@@ -6,7 +6,6 @@ const readyFrames = new Set();
 const shadingStates = new Map();
 const shadingTokens = new Map();
 const astromapStates = new Map();
-let astromapUnlocked = false;
 let shadingCommandSeq = 0;
 let shadingConfirmation = null;
 let slides = [];
@@ -96,7 +95,7 @@ function refreshAstromapButton() {
   if (!button) return;
   const status = astromapStates.get(active);
   const open = status?.paneInstanceId === compare.states.get(active)?.paneInstanceId && !!status?.open;
-  button.hidden = !astromapUnlocked;
+  button.hidden = false;
   button.disabled = !readyFrames.has(active) || !!quitPreparation;
   button.classList.toggle("active", open);
   button.setAttribute("aria-pressed", String(open));
@@ -106,11 +105,9 @@ function activateAstromap() {
   if (!readyFrames.has(active) || quitPreparation || pairPicker.open) return false;
   const identity = localIdentity(compare.states.get(active));
   if (!identity?.paneInstanceId) return false;
-  const open = !astromapUnlocked;
-  astromapUnlocked = true;
   refreshAstromapButton();
   return postToSlide(active, { nd2wsi: "astromap-toggle", version: VIEWPORT_PROTOCOL_VERSION,
-    sid: active, ...identity, open });
+    sid: active, ...identity, open: false });
 }
 
 function receiveAstromapShortcut(senderSid, data) {
@@ -126,7 +123,7 @@ function receiveAstromapState(senderSid, data) {
 }
 
 $("astromap-toggle").onclick = () => {
-  if (astromapUnlocked) activateAstromap();
+  activateAstromap();
 };
 
 function showError(message) {
@@ -180,7 +177,7 @@ window.nd2wsiNativeTrackpad = (input) => {
 
 function refreshShadingButton() {
   if (shadingConfirmation && !shadingConfirmationMatches()) closeShadingConfirmation(false);
-  if (shadingConfirmation) refreshShadingMethodChoice();
+  if (shadingConfirmation) refreshShadingConfirmation();
   const button = $("shading-correction");
   if (!button) return;
   const status = shadingStates.get(active);
@@ -260,7 +257,7 @@ function activateShadingCorrection() {
     $("shading-confirm").classList.toggle("revoke", revoke);
     $("shading-confirm-title").textContent = revoke ? "Revoke Shading Correction?" : "Shading Correction";
     $("shading-confirm-continue").textContent = revoke ? "Revoke" : "Continue";
-    refreshShadingMethodChoice();
+    refreshShadingConfirmation();
     $("shading-confirm").showModal();
     $("shading-confirm-cancel").focus({ preventScroll: true });
     return true;
@@ -270,37 +267,16 @@ function activateShadingCorrection() {
     contextKey: status.contextKey, commandSeq: ++shadingCommandSeq });
 }
 
-function refreshShadingMethodChoice() {
+function refreshShadingConfirmation() {
   const pending = shadingConfirmation;
   if (!pending) return;
   const revoke = pending.action === "revoke", status = shadingStates.get(pending.sid);
-  $("shading-methods").hidden = revoke;
-  $("shading-confirm-persistence").hidden = revoke;
-  for (const method of ["h", "bffree"]) {
-    const support = window.Nd2ShadingCorrection.methodSupport(status, method);
-    const radio = $("shading-method-" + method);
-    radio.checked = !revoke && pending.method === method;
-    radio.disabled = revoke || !support.supported;
-    $("shading-method-" + method + "-reason").textContent = support.supported ? "" : support.reason;
-  }
-  const rank1 = pending.method === "bffree";
-  const estimate = status.estimated_seconds;
-  $("shading-confirm-estimate").textContent = window.Nd2ShadingCorrection.estimateLabel(estimate);
-  $("shading-confirm-message").textContent = revoke
+  $("shading-confirm-persistence").textContent = revoke
     ? "Rebuild the original pyramid from the source ND2."
-    : rank1
-      ? "Use Rank1 to estimate the repeating illumination pattern from this slide's fluorescence channels and correct supported FITC and CY3 channels. BF and DAPI stay unchanged. Review the corrected image before quantitative analysis."
-      : "Estimate shading in FITC, CY3 and BF for large scans. Only channels with sufficient evidence are corrected. DAPI and original measurements stay unchanged.";
+    : "Applying correction rebuilds and saves this slide's display pyramid. Original measurements stay unchanged.";
+  $("shading-confirm-estimate").textContent = window.Nd2ShadingCorrection.estimateLabel(status.estimated_seconds);
   $("shading-confirm-continue").disabled = !revoke &&
-    !window.Nd2ShadingCorrection.methodSupport(status, pending.method).supported;
-}
-
-function selectShadingMethod(method) {
-  if (!shadingConfirmationMatches() || shadingConfirmation.action !== "start" ||
-      !window.Nd2ShadingCorrection.methodSupport(shadingStates.get(active), method).supported) return false;
-  shadingConfirmation.method = method;
-  refreshShadingMethodChoice();
-  return true;
+    !window.Nd2ShadingCorrection.methodSupport(status).supported;
 }
 
 function shadingConfirmationMatches() {
@@ -326,11 +302,11 @@ function continueShadingConfirmation() {
   if (!shadingConfirmationMatches()) { closeShadingConfirmation(false); return false; }
   const pending = shadingConfirmation;
   if (pending.action === "start" &&
-      !window.Nd2ShadingCorrection.methodSupport(shadingStates.get(active), pending.method).supported) {
-    refreshShadingMethodChoice();
+      !window.Nd2ShadingCorrection.methodSupport(shadingStates.get(active)).supported) {
+    refreshShadingConfirmation();
     return false;
   }
-  const selection = pending.action === "start" ? { method: pending.method } : {};
+  const selection = pending.action === "start" ? { method: "bffree" } : {};
   const { method, ...captured } = pending;
   closeShadingConfirmation();
   return postToSlide(pending.sid, { nd2wsi: "shading-command", version: VIEWPORT_PROTOCOL_VERSION,
@@ -355,8 +331,6 @@ $("shading-cancel").addEventListener("click", () => {
   else activateShadingCorrection();
 });
 $("shading-confirm-continue").addEventListener("click", continueShadingConfirmation);
-$("shading-method-h").addEventListener("change", () => selectShadingMethod("h"));
-$("shading-method-bffree").addEventListener("change", () => selectShadingMethod("bffree"));
 $("shading-confirm-cancel").addEventListener("click", () => closeShadingConfirmation());
 $("shading-confirm").addEventListener("cancel", dismissShadingConfirmation);
 $("shading-confirm").addEventListener("click", dismissShadingConfirmation);

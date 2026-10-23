@@ -21,7 +21,7 @@
       <span id="window-action-status" role="status" aria-live="polite"></span>
     </div>
   </details>
-  <button id="astromap-toggle" class="shell-icon-button" type="button" hidden disabled
+  <button id="astromap-toggle" class="shell-icon-button" type="button" disabled
    title="Astromap (⌘⇧A)" aria-label="Astromap" aria-keyshortcuts="Meta+Shift+A" aria-pressed="false">
     <span class="astromap-icon" aria-hidden="true"></span>
   </button>
@@ -133,7 +133,7 @@
         <button id="compare-rotate-left" class="compare-control text-control" type="button"
                 title="Rotate the selected image 90° counterclockwise" aria-label="Rotate left 90 degrees">↶ 90°</button>
         <button id="compare-rotate-right" class="compare-control text-control" type="button"
-          title="Rotate the selected image 90° clockwise (⌘R)" aria-label="Rotate right 90 degrees">↷ 90°</button>
+          title="Rotate the selected image 90° clockwise (⌘T)" aria-label="Rotate right 90 degrees">↷ 90°</button>
         <button id="compare-transpose" class="compare-control text-control" type="button"
                 title="Swap horizontal and vertical image axes (diagonal reflection)">Transpose</button>
         <button id="compare-orientation-reset" class="compare-control text-control" type="button"
@@ -168,17 +168,9 @@
     </div>
   </div>
 </div>
-<dialog id="shading-confirm" aria-labelledby="shading-confirm-title" aria-describedby="shading-confirm-message shading-confirm-estimate">
+<dialog id="shading-confirm" aria-labelledby="shading-confirm-title" aria-describedby="shading-confirm-persistence shading-confirm-estimate">
   <h2 id="shading-confirm-title">Shading Correction</h2>
-  <fieldset id="shading-methods">
-    <legend>Method</legend>
-    <label><input id="shading-method-bffree" type="radio" name="shading-method" value="bffree" checked aria-describedby="shading-method-bffree-reason"> Rank1 (BF-free)</label>
-    <p id="shading-method-bffree-reason" class="shading-method-reason"></p>
-    <label><input id="shading-method-h" type="radio" name="shading-method" value="h" aria-describedby="shading-method-h-reason"> BF-guided</label>
-    <p id="shading-method-h-reason" class="shading-method-reason"></p>
-  </fieldset>
-  <p id="shading-confirm-message" aria-live="polite">Use Rank1 to correct supported FITC and CY3 channels from this slide's fluorescence. BF, DAPI and original measurements stay unchanged.</p>
-  <p id="shading-confirm-persistence">Applying correction rebuilds and saves this slide's display pyramid. Original measurements stay unchanged.</p>
+  <p id="shading-confirm-persistence" aria-live="polite">Applying correction rebuilds and saves this slide's display pyramid. Original measurements stay unchanged.</p>
   <p id="shading-confirm-estimate">Est. time: unavailable until preparation starts</p>
   <div class="shading-confirm-actions">
     <button id="shading-confirm-cancel" type="button">Cancel</button>

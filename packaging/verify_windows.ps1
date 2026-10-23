@@ -87,6 +87,9 @@ try {
         elseif (-not (Test-Path -LiteralPath $log) -or (Get-Content -LiteralPath $log -Raw -Encoding UTF8) -notmatch 'smoke ok: SDPC') {
             throw "Packaged --$mode did not record successful SDPC decoder and ROI checks."
         }
+        elseif ((Get-Content -LiteralPath $log -Raw -Encoding UTF8) -notmatch 'smoke ok: Astromap JPEG, TXT and PDF') {
+            throw "Packaged --$mode did not record successful Astromap export checks."
+        }
         $runs += @{ mode = $mode; exit_code = $process.ExitCode; seconds = $timer.Elapsed.TotalSeconds }
         $process.Dispose()
     }
@@ -103,6 +106,7 @@ try {
         source_working_tree_dirty = $manifest.source.working_tree_dirty
         unicode_install_and_source_paths = $true
         sdpc_packaged_decoder_and_roi_verified = $true
+        astromap_jpeg_txt_pdf_verified = $true
         sdpc_codec_manifest_sha256 = $manifest.sdpc_codec_manifest_sha256
         sdpc_codec_source_url = $manifest.sdpc_codec_source.source_url
         sdpc_codec_source_archive_sha256 = $manifest.sdpc_codec_source.source_archive_sha256

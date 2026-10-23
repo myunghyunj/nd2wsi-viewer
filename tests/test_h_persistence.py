@@ -1,6 +1,7 @@
 """Persistent H replacement uses only small private, synthetic ND2/cache fixtures."""
 
 import copy
+import io
 import json
 import os
 import shutil
@@ -269,7 +270,7 @@ def test_bffree_persistence_reopens_exact_native_gains_and_preserves_bf(original
         incompatible["h_correction"]["method"] = "h"
         with pytest.raises(ValueError, match="source/selection|method"):
             hp.load_model(replacement.staging, incompatible)
-        # Caches written before rank-1 adoption have no explicit model_schema
+        # Caches written before consensus adoption have no explicit model_schema
         # in their manifest/provenance. Their archived schema remains authoritative.
         old_manifest = copy.deepcopy(replacement.manifest)
         old_manifest["h_correction"].pop("model_schema")
@@ -296,11 +297,11 @@ def test_bffree_persistence_reopens_exact_native_gains_and_preserves_bf(original
 
 
 @pytest.fixture(scope="module")
-def rank1_persisted(tmp_path_factory):
+def consensus_persisted(tmp_path_factory):
     """Fit once on actual 32x32 means, then reuse a private prepared cache."""
     from nd2wsi.bffree_model import fit
 
-    folder = tmp_path_factory.mktemp("rank1-persistence")
+    folder = tmp_path_factory.mktemp("consensus-persistence")
     x = np.arange(12288, dtype=float)
     native = np.stack([np.broadcast_to(np.rint(line).astype(np.uint16), (256, len(x))) for line in (
         np.full(x.shape, 500),
@@ -313,7 +314,7 @@ def rank1_persisted(tmp_path_factory):
     metadata = {"channel_mapping": {"FITC": 1, "CY3": 2, "DAPI": 3},
                 "channel_names": ["BF", "FITC", "CY3", "DAPI"],
                 "sizes": {"Y": 256, "X": 12288}}
-    model, result = fit(raw32, metadata, folder / "rank1.npz")
+    model, result = fit(raw32, metadata, folder / "consensus.npz")
     assert model.enabled == [True, True, False]
     replacement = hp.prepare_apply(state, model, result, threading.Event(), lambda _: None)
     try:
@@ -323,17 +324,17 @@ def rank1_persisted(tmp_path_factory):
         model.data.close()
 
 
-def test_rank1_persistence_reopens_exact_pixels_and_keeps_dapi_bf_identity(rank1_persisted, monkeypatch):
-    from nd2wsi.bffree_model import SCHEMA as RANK1_SCHEMA
+def test_consensus_persistence_reopens_exact_pixels_and_keeps_dapi_bf_identity(consensus_persisted, monkeypatch):
+    from nd2wsi.bffree_model import SCHEMA as CONSENSUS_SCHEMA
 
-    state, model, result, replacement = rank1_persisted
+    state, model, result, replacement = consensus_persisted
     source_before = state.source_path.read_bytes()
     correction = replacement.manifest["h_correction"]
-    assert correction["model_schema"] == RANK1_SCHEMA and correction["experimental"] is False
+    assert correction["model_schema"] == CONSENSUS_SCHEMA and correction["experimental"] is False
     assert correction["method"] == "bffree" and correction["channel_indices"] == [1, 2]
-    assert correction["native_coordinate_contract"] == hp.RANK1_NATIVE_CONTRACT
+    assert correction["native_coordinate_contract"] == hp.CONSENSUS_NATIVE_CONTRACT
     provenance = json.loads(read_entry(replacement.staging, hp.PROVENANCE_KEY))
-    assert provenance["model_schema"] == RANK1_SCHEMA and provenance["experimental"] is False
+    assert provenance["model_schema"] == CONSENSUS_SCHEMA and provenance["experimental"] is False
     assert provenance["source_shape_cyx"] == [4, 256, 12288]
     assert provenance["source_channel_mapping"] == {"FITC": 1, "CY3": 2, "DAPI": 3}
     assert provenance["config"] == result["config"]
@@ -362,8 +363,8 @@ def test_rank1_persistence_reopens_exact_pixels_and_keeps_dapi_bf_identity(rank1
 
 @pytest.mark.parametrize("change", ["schema", "missing_schema", "experimental", "native_contract", "shape",
                                     "channel_labels", "channel_mapping", "stored_labels", "fit_config", "fit_channels"])
-def test_rank1_persisted_provenance_mismatch_is_rejected(rank1_persisted, tmp_path, change):
-    _, _, _, replacement = rank1_persisted
+def test_consensus_persisted_provenance_mismatch_is_rejected(consensus_persisted, tmp_path, change):
+    _, _, _, replacement = consensus_persisted
     target = tmp_path / "changed.nd2svs"
     shutil.copyfile(replacement.staging, target)
     manifest = copy.deepcopy(replacement.manifest)
@@ -400,12 +401,12 @@ def test_rank1_persisted_provenance_mismatch_is_rejected(rank1_persisted, tmp_pa
         store.write_bytes(hp.PROVENANCE_KEY, payload)
         store.write_bytes("manifest.json", hp._json_bytes(manifest))
         store.write_bytes("store.ome.zarr/.zattrs", hp._json_bytes(attrs))
-    with pytest.raises(ValueError, match="Rank1|BF-free"):
+    with pytest.raises(ValueError, match="Consensus|BF-free"):
         hp.load_model(target, manifest)
 
 
-def test_rank1_wrong_source_mapping_refused_before_pyramid_work(rank1_persisted, tmp_path, monkeypatch):
-    state, model, result, _ = rank1_persisted
+def test_consensus_wrong_source_mapping_refused_before_pyramid_work(consensus_persisted, tmp_path, monkeypatch):
+    state, model, result, _ = consensus_persisted
     # A separate cache/source avoids touching the shared read-only staged fixture.
     local = copy.copy(state)
     local.source_path = tmp_path / "original.nd2"
@@ -418,6 +419,65 @@ def test_rank1_wrong_source_mapping_refused_before_pyramid_work(rank1_persisted,
     local.attrs["omero"]["channels"][2]["label"] = "FITC"
     before = local.container_path.read_bytes()
     monkeypatch.setattr(hp, "_read_native", lambda *_a: pytest.fail("Mismatched model reached pixel work"))
-    with pytest.raises(ValueError, match="Rank1 model channels"):
+    with pytest.raises(ValueError, match="Consensus model channels"):
         hp.prepare_apply(local, model, result, threading.Event(), lambda _: None)
     assert local.container_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("mixed_contract", [False, True])
+def test_previous_named_consensus_cache_remains_readable_without_rewrite(
+        consensus_persisted, tmp_path, mixed_contract):
+    from nd2wsi import bffree_consensus as bc
+    from nd2wsi.bffree_serialization import SUPPORTED_SCHEMAS, contract_for_schema
+
+    _, current, _, replacement = consensus_persisted
+    schema, = SUPPORTED_SCHEMAS - {bc.SCHEMA}
+    contract = contract_for_schema(schema)
+    target = tmp_path / "previous-format.nd2svs"
+    shutil.copyfile(replacement.staging, target)
+    manifest = copy.deepcopy(replacement.manifest)
+    correction = manifest["h_correction"]
+    provenance = json.loads(read_entry(target, hp.PROVENANCE_KEY))
+    with np.load(io.BytesIO(read_entry(target, hp.MODEL_KEY)), allow_pickle=False) as data:
+        fields = {key: data[key].copy() for key in data.files}
+    fields["model_schema"] = np.asarray(schema)
+    prediction = json.loads(fields["prediction_json"].item())
+    prediction["diagnostics"].update(schema=schema, method=contract["method"],
+                                     config=bc.frozen_config(schema))
+    fields["prediction_json"] = np.asarray(json.dumps(prediction))
+    output = io.BytesIO()
+    np.savez_compressed(output, **fields)
+    model_payload = output.getvalue()
+    correction.update(model_schema=schema, model_sha256=hp._sha(model_payload))
+    if not mixed_contract:
+        correction["native_coordinate_contract"] = contract["native_contract"]
+    provenance.update(model_schema=schema, native_coordinate_contract=contract["native_contract"],
+                      config=bc.frozen_config(schema))
+    provenance["config_sha256"] = hp._sha(hp._json_bytes(provenance["config"]))
+    provenance["fit"].update(schema=schema, config=bc.frozen_config(schema))
+    for row in provenance["fit"]["selected"]:
+        if row["model"] is not None:
+            row["model"] = contract["method"]
+    provenance_payload = hp._json_bytes(provenance)
+    correction["provenance_sha256"] = hp._sha(provenance_payload)
+    attrs = json.loads(read_entry(target, "store.ome.zarr/.zattrs"))
+    attrs["nd2wsi"]["h_correction"] = correction
+    with SQLiteStore(target) as store:
+        store.write_bytes(hp.MODEL_KEY, model_payload)
+        store.write_bytes(hp.PROVENANCE_KEY, provenance_payload)
+        store.write_bytes("manifest.json", hp._json_bytes(manifest))
+        store.write_bytes("store.ome.zarr/.zattrs", hp._json_bytes(attrs))
+    digest = hp._sha(target.read_bytes())
+    if mixed_contract:
+        with pytest.raises(ValueError, match="provenance contract"):
+            hp.load_model(target, manifest)
+    else:
+        loaded = hp.load_model(target, manifest)
+        try:
+            assert loaded.model_schema == schema
+            for channel in current.indices:
+                np.testing.assert_array_equal(loaded.gain(channel, (19, 23), (31, 5133)),
+                                              current.gain(channel, (19, 23), (31, 5133)))
+        finally:
+            loaded.data.close()
+    assert hp._sha(target.read_bytes()) == digest

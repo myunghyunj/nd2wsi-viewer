@@ -178,7 +178,7 @@ def test_invalid_method_and_confirmation_type_are_rejected(setup, extra):
 
 
 @pytest.mark.parametrize("extra", [{"method": "bffree"}, {"method": "bffree", "experimental_confirmed": False}])
-def test_rank1_does_not_require_experimental_opt_in(setup, extra):
+def test_consensus_does_not_require_experimental_opt_in(setup, extra):
     st, _, _, handler, response, calls = setup
     st._shading.start = lambda method, **kwargs: calls.append((method, kwargs)) or st.shading.status()
     handler.path = "/s/12345678/api/shading/start"

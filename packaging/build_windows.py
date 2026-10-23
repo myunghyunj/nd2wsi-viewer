@@ -137,6 +137,8 @@ def smoke(exe: Path, source: Path, evidence: Path) -> None:
                 raise RuntimeError("Packaged GUI smoke did not record successful completion")
         elif not log.exists() or "smoke ok: SDPC" not in log.read_text(encoding="utf-8"):
             raise RuntimeError(f"Packaged {flag} did not record successful SDPC decoder and ROI checks")
+        elif "smoke ok: Astromap JPEG, TXT and PDF" not in log.read_text(encoding="utf-8"):
+            raise RuntimeError(f"Packaged {flag} did not record successful Astromap export checks")
 
 
 def main() -> int:
@@ -162,7 +164,7 @@ def main() -> int:
     sdpc_manifest, sdpc_options = sdpc_bundle_options()
 
     # Fail before packaging if either scientific export or image codecs is absent.
-    run(sys.executable, "-c", "import _tkinter, limnd2, imagecodecs, clr, webview; "
+    run(sys.executable, "-c", "import _tkinter, limnd2, imagecodecs, clr, webview, reportlab, pypdf; "
         "assert imagecodecs.JPEG.available and imagecodecs.JPEG2K.available")
     from PIL import Image
 
@@ -178,7 +180,7 @@ def main() -> int:
     for package in (
         "nd2wsi", "nd2", "scipy", "zarr", "numcodecs", "dask", "tifffile", "imagecodecs",
         "limnd2", "ome_types", "xsdata", "xsdata_pydantic_basemodel", "webview",
-        "pythonnet", "clr_loader",
+        "pythonnet", "clr_loader", "reportlab", "pypdf", "charset_normalizer",
     ):
         command += ["--collect-all", package]
     command += sdpc_options

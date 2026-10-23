@@ -10,6 +10,8 @@
   --compare-split: 50%;
   --compare-line: rgba(255,255,255,.28);
   --control-bg: rgba(38,38,41,.92);
+  --material: rgba(29,29,31,.82);
+  --window-shadow: inset 0 1px 0 rgba(255,255,255,.10), inset 0 -1px 0 rgba(255,255,255,.04), 0 0 0 .5px rgba(255,255,255,.12), 0 0 0 1.5px rgba(0,0,0,.38), 0 1px 3px rgba(0,0,0,.28), 0 8px 15px rgba(0,0,0,.22);
   --font-text: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", sans-serif;
   --shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 1px 3px rgba(0,0,0,.20), 0 8px 15px rgba(0,0,0,.06);
 }
@@ -23,6 +25,9 @@
   --label-3: rgba(0,0,0,.32);
   --compare-line: rgba(0,0,0,.22);
   --control-bg: rgba(250,250,252,.94);
+  /* Lighter tint keeps the slide visible through the confirmation material. */
+  --material: rgba(246,246,248,.72);
+  --window-shadow: inset 0 1px 0 rgba(255,255,255,.85), inset 0 -1px 0 rgba(0,0,0,.03), 0 0 0 .5px rgba(0,0,0,.14), 0 1px 3px rgba(0,0,0,.12), 0 8px 15px rgba(0,0,0,.10);
   --shadow: inset 0 1px 0 rgba(255,255,255,.88), 0 1px 3px rgba(0,0,0,.09), 0 8px 15px rgba(0,0,0,.045);
 }
 * { box-sizing: border-box; }
@@ -92,18 +97,10 @@ button { color:inherit; font:inherit; }
 #shading-progress-bar::-webkit-progress-value { background:var(--accent); border-radius:3px; transition:width .2s; }
 #shading-progress-bar::-moz-progress-bar { background:var(--accent); border-radius:3px; }
 #shading-eta { color:var(--label-2); font-size:11px; }
-#shading-confirm { width:min(360px,calc(100vw - 32px)); padding:20px; border:1px solid var(--hairline); border-radius:14px; background:var(--control-bg); color:var(--label); box-shadow:0 18px 48px rgba(0,0,0,.3); }
+#shading-confirm { width:min(360px,calc(100vw - 32px)); padding:20px; border:1px solid var(--hairline); border-radius:14px; background:var(--material); color:var(--label); box-shadow:var(--window-shadow); -webkit-backdrop-filter:blur(28px) saturate(180%); backdrop-filter:blur(28px) saturate(180%); }
 #shading-confirm::backdrop { background:rgba(0,0,0,.32); }
-#shading-confirm h2 { margin:0 0 14px; font-size:15px; font-weight:600; }
 #shading-confirm p { margin:0 0 10px; font-size:13px; line-height:1.5; }
 #shading-confirm-estimate { color:var(--label-2); }
-#shading-methods { margin:0 0 14px; padding:10px 12px; border:1px solid var(--hairline); border-radius:8px; }
-#shading-methods[hidden], #shading-confirm-persistence[hidden] { display:none; }
-#shading-methods legend { padding:0 4px; color:var(--label-2); font-size:12px; }
-#shading-methods label { display:flex; align-items:center; gap:6px; font-size:13px; line-height:1.6; }
-#shading-methods input { margin:0; accent-color:#007aff; }
-#shading-confirm .shading-method-reason { margin:2px 0 8px 20px; color:var(--label-2); font-size:12px; }
-#shading-confirm .shading-method-reason:empty { display:none; }
 #shading-confirm-persistence { color:var(--label-2); }
 .shading-confirm-actions { display:flex; justify-content:flex-end; gap:9px; margin-top:20px; }
 .shading-confirm-actions button { min-width:84px; padding:7px 13px; border:0; border-radius:7px; color:#fff; font-size:12px; font-weight:550; }
@@ -114,7 +111,7 @@ button { color:inherit; font:inherit; }
 .shading-confirm-actions button:disabled { opacity:.45; filter:none; }
 .shading-confirm-actions button:focus-visible { outline:2px solid var(--label); outline-offset:3px; }
 #shading-correction.preparing .shading-icon { animation:shading-pulse 1s ease-in-out infinite alternate; }
-#shading-status { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+#shading-status, #shading-confirm-title { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
 #compare-picker { position:absolute; top:calc(100% + 6px); right:8px; z-index:180; width:min(360px,calc(100vw - 16px)); max-height:min(520px,calc(100vh - 56px)); padding:10px; overflow:auto; border:1px solid var(--hairline); border-radius:13px; color:var(--label); background:var(--control-bg); box-shadow:0 18px 46px rgba(0,0,0,.32), var(--shadow); backdrop-filter:blur(24px) saturate(165%); -webkit-backdrop-filter:blur(24px) saturate(165%); }
 #compare-picker[hidden] { display:none; }
 .compare-picker-head { display:flex; align-items:flex-start; gap:10px; padding:2px 2px 9px 4px; }

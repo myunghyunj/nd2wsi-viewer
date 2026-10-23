@@ -227,16 +227,18 @@ def _main(argv: list[str] | None = None) -> int:
     command_args = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(command_args)
 
+    from .raster import is_raster
     from .sdpc import is_sdpc
 
     if args.cmd == "convert" and is_sdpc(args.nd2):
         parser.error("SDPC supports direct viewing and ROI export, not pyramid conversion; use 'view' to open it")
     if args.cmd == "crop" and is_sdpc(args.nd2):
         parser.error("'crop' reads native ND2 files only; open the SDPC with 'view' and use ROI export")
-    if args.cmd == "view" and any(is_sdpc(path) for path in args.nd2):
+    if args.cmd == "view" and any(is_sdpc(path) or is_raster(path) for path in args.nd2):
         conversion_flags = {"--store", "--overwrite", "--t", "--position", "--z", "--tile", "--workers", "--yes", "-y"}
         if any(argument.split("=", 1)[0] in conversion_flags for argument in command_args):
-            parser.error("SDPC supports direct viewing only; conversion and T/Z/position options are unavailable")
+            source_format = "SDPC" if any(is_sdpc(path) for path in args.nd2) else "JPEG/PNG"
+            parser.error(f"{source_format} supports direct viewing only; conversion and T/Z/position options are unavailable")
 
     if args.cmd == "info":
         from .sdpc import sdpc_info
@@ -407,7 +409,7 @@ def _main(argv: list[str] | None = None) -> int:
             if not explicit:
                 # the default view goes through the managed cache: identity
                 # checked, atomically built, straight from the file for SVS
-                if is_sdpc(slide) or (is_svs(slide) and existing_cache_store(slide) is None):
+                if is_raster(slide) or is_sdpc(slide) or (is_svs(slide) and existing_cache_store(slide) is None):
                     print(f"{Path(slide).name}: serving straight from the file")
                     stores.append(Path(slide))
                 elif is_plate_file(slide):

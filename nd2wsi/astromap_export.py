@@ -28,7 +28,7 @@ MAX_EDGE = 8000
 MAX_ROIS = 2000
 READ_EDGE = 512
 # Plate ND2 exposes a zero-copy frame view, but some compressed readers may
-# decode it eagerly. Refuse larger frames before opening that view in this beta.
+# decode it eagerly. Refuse larger frames before opening that view.
 MAX_PLATE_FRAME_BYTES = 64 * 1024 * 1024
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")
 HEADER = "INDEX\tX1\tY1\tX2\tY2\tNOTE\n"
@@ -126,6 +126,9 @@ class AstromapPlan:
     channels: tuple[int, ...]
     window: str | None
     stem: str
+    include_pdf: bool = False
+    source_boxes: tuple[ExportBox, ...] = ()
+    levels: tuple[dict, ...] = ()
 
     def render_image(self):
         """One final RGB canvas plus bounded channel/tile intermediates."""
@@ -197,21 +200,33 @@ class AstromapPlan:
         """Disk-backed JPEG and ZIP; no large image-encoded bytes in memory."""
         jpg = directory / f"{self.stem}.jpg"
         txt = directory / f"{self.stem}.txt"
+        pdf = directory / f"{self.stem}_rois.pdf"
         output = directory / f"{self.stem}_astromap.zip"
         with self.render_image() as image:
             image.save(jpg, "JPEG", quality=92)
         txt.write_text(coordinates_text(self.boxes), encoding="utf-8", newline="")
+        if self.include_pdf:
+            from .astromap_pdf import write_pdf
+
+            write_pdf(self, jpg, pdf)
         with zipfile.ZipFile(output, "w") as bundle:
             bundle.write(jpg, jpg.name, compress_type=zipfile.ZIP_STORED)
             bundle.write(txt, txt.name, compress_type=zipfile.ZIP_DEFLATED)
+            if self.include_pdf:
+                bundle.write(pdf, pdf.name, compress_type=zipfile.ZIP_STORED)
         jpg.unlink()
         txt.unlink()
+        if self.include_pdf:
+            pdf.unlink()
         return output
 
 
 def prepare_astromap(state, payload: dict, *, resolve_frame, filename_prefix="") -> AstromapPlan:
     if not isinstance(payload, dict):
         raise AstromapError("Expected an AstroMap export object")
+    include_pdf = payload.get("include_pdf", False)
+    if type(include_pdf) is not bool:
+        raise AstromapError("include_pdf must be a boolean")
     if not isinstance(payload.get("generation"), str):
         raise AstromapError("The slide generation is required")
     if payload["generation"] != state.generation:
@@ -221,6 +236,7 @@ def prepare_astromap(state, payload: dict, *, resolve_frame, filename_prefix="")
     width, height = (int(levels[0][key]) for key in ("width", "height"))
     size = output_size(width, height)
     boxes = convert_boxes(payload.get("rois"), (width, height), size)
+    source_boxes = convert_boxes(payload.get("rois"), (width, height), (width, height)) if include_pdf else ()
     channels = payload.get("channels")
     count = len(state.attrs["omero"]["channels"])
     if (not isinstance(channels, list) or len(channels) > count
@@ -253,7 +269,7 @@ def prepare_astromap(state, payload: dict, *, resolve_frame, filename_prefix="")
         frame_bytes = math.prod(state.plate.frame_shape) * np.dtype(state.plate.dtype).itemsize
         if channels and frame_bytes > MAX_PLATE_FRAME_BYTES:
             raise AstromapError(
-                "This plate frame exceeds the 64 MiB AstroMap beta limit; "
+                "This plate frame exceeds the 64 MiB Astromap frame limit; "
                 "large plate-frame export is not supported yet"
             )
         levels = [levels[0]]
@@ -264,7 +280,8 @@ def prepare_astromap(state, payload: dict, *, resolve_frame, filename_prefix="")
     candidates = [lv for lv in levels if lv["width"] >= size[0] and lv["height"] >= size[1]]
     level = min(candidates or [levels[0]], key=lambda lv: lv["width"] * lv["height"])
     stem = filename_prefix + _filename(str(meta.get("source", "slide"))) + suffix
-    return AstromapPlan(root, state.attrs, str(level["path"]), size, boxes, tuple(channels), window, stem)
+    return AstromapPlan(root, state.attrs, str(level["path"]), size, boxes, tuple(channels), window, stem,
+                       include_pdf, source_boxes, tuple(levels))
 
 
 @dataclass

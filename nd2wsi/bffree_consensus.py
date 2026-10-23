@@ -1,4 +1,4 @@
-"""Fluorescence-only consensus rank-1 model and bounded native application.
+"""Fluorescence-only consensus model and bounded native application.
 
 Research equations are packaged in the adjacent consensus modules. Only
 overview pixels enter fitting; no pretrained slide, BF image or camera prior
@@ -18,15 +18,15 @@ from . import bffree_consensus_amplitude as amplitude
 from . import bffree_consensus_evidence as evidence
 from . import bffree_consensus_template as template
 from .bffree_consensus_math import cancellation, checkpoint
+from .bffree_serialization import SCHEMA, SUPPORTED_SCHEMAS, contract_for_schema
 
-SCHEMA = "BF_free_consensus_rank1/1"
 FIELD_NAMES = frozenset(("model_schema", "channel_indices", "channel_names", "enabled",
                          "native_shape_yx", "downsample", "prediction_json"))
 MAX_MODEL_BYTES = 32 * 1024**2
 DOWNSAMPLE = 32
 _TEMPLATE_PARAMETERS = copy.deepcopy(template.DEFAULT_CONFIG)
 _EVIDENCE_PARAMETERS = copy.deepcopy(evidence.EVIDENCE_CONFIG)
-_AMPLITUDE_PARAMETERS = copy.deepcopy(amplitude.VARIANTS["consensus_rank1"])
+_AMPLITUDE_PARAMETERS = copy.deepcopy(amplitude.DEFAULT_CONFIG)
 _SOURCES = {
     "joint_periodic.py": "a8f02710340a95cd52e32d076ccb1fcdbc738a9b33a1eed0bd6b86722bf53733",
     "channel_periodic.py": "0ad64238acc5fec41452ac23862fad3fc1bff9142fd6897ba0450279535ea1f5",
@@ -35,9 +35,10 @@ _SOURCES = {
 }
 
 
-def frozen_config():
-    return {"family": "consensus_rank1", "candidate_id": "consensus_rank1",
-            "display_name": "Consensus rank-1", "port_version": 1,
+def frozen_config(schema=SCHEMA):
+    contract = contract_for_schema(schema)
+    return {"family": contract["method"], "candidate_id": contract["method"],
+            "display_name": contract["display_name"], "port_version": 1,
             "parameters": {"template": copy.deepcopy(_TEMPLATE_PARAMETERS),
                            "evidence": copy.deepcopy(_EVIDENCE_PARAMETERS),
                            "amplitude": copy.deepcopy(_AMPLITUDE_PARAMETERS)},
@@ -91,7 +92,7 @@ def fit_prediction(raw32, names, native, *, check=lambda: None, progress=lambda 
     return {"channel_models": records,
             "diagnostics": {"schema": SCHEMA, "uses_bf": False, "channel_names": list(names),
                 "native_shape_yx": list(native), "downsample": DOWNSAMPLE,
-                "input_shape_ncyx": [1, *raw32.shape], "method": "consensus_rank1",
+                "input_shape_ncyx": [1, *raw32.shape], "method": "consensus",
                 "config": frozen_config(), "DAPI_application": "exact_identity",
                 "status": "accepted" if any(rec["applied"] for rec in records) else "abstained"}}
 
@@ -108,7 +109,7 @@ def _integer(value, label):
 def _finite(value):
     array = np.asarray(value)
     if array.dtype.kind not in "iuf" or not np.isfinite(array).all():
-        raise ValueError("Nonfinite or non-real rank-1 model")
+        raise ValueError("Nonfinite or non-real consensus model")
     return array
 
 
@@ -120,9 +121,9 @@ def _archive_budget(path, limit):
             if (len(entries) != len(FIELD_NAMES)
                     or {entry.filename for entry in entries} != {name + ".npy" for name in FIELD_NAMES}
                     or sum(entry.file_size for entry in entries) > limit):
-                raise ValueError("Unsupported or oversized rank-1 model archive")
+                raise ValueError("Unsupported or oversized consensus model archive")
     except zipfile.BadZipFile as exc:
-        raise ValueError("Invalid rank-1 model archive") from exc
+        raise ValueError("Invalid consensus model archive") from exc
     finally:
         if position is not None:
             path.seek(position)
@@ -138,8 +139,8 @@ class Model:
         self.data = np.load(path, allow_pickle=False)
         try:
             schema = self.data["model_schema"]
-            if schema.shape != () or schema.dtype.kind != "U" or schema.item() != SCHEMA:
-                raise ValueError("Unsupported rank-1 model schema")
+            if schema.shape != () or schema.dtype.kind != "U" or schema.item() not in SUPPORTED_SCHEMAS:
+                raise ValueError("Unsupported consensus model schema")
             self.model_schema = schema.item()
             indices, enabled = self.data["channel_indices"], self.data["enabled"]
             names = self.data["channel_names"]
@@ -147,18 +148,18 @@ class Model:
                     or np.any(indices < 0) or len(np.unique(indices)) != len(indices)
                     or enabled.shape != indices.shape or enabled.dtype.kind != "b"
                     or names.shape != indices.shape or names.dtype.kind != "U"):
-                raise ValueError("Invalid rank-1 channel mapping")
+                raise ValueError("Invalid consensus channel mapping")
             self.indices, self.enabled, self.channel_names = list(map(int, indices)), list(map(bool, enabled)), names.tolist()
             self.native_shape_yx = self.data["native_shape_yx"]
             factor = self.data["downsample"]
             if factor.shape != () or factor.dtype.kind not in "iu" or factor.item() != DOWNSAMPLE:
-                raise ValueError("Invalid rank-1 mean-bin factor")
+                raise ValueError("Invalid consensus mean-bin factor")
             self.downsample = int(factor.item())
             payload = self.data["prediction_json"]
             if payload.shape != () or payload.dtype.kind != "U":
-                raise ValueError("Invalid rank-1 prediction record")
+                raise ValueError("Invalid consensus prediction record")
             self.prediction = json.loads(payload.item(), parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError("Nonfinite rank-1 JSON value")))
+                ValueError("Nonfinite consensus JSON value")))
             self.validate()
         except BaseException:
             self.data.close()
@@ -167,69 +168,70 @@ class Model:
     def validate(self):
         native = self.native_shape_yx
         if native.shape != (2,) or native.dtype.kind not in "iu" or np.any(native < 1):
-            raise ValueError("Invalid rank-1 native geometry")
+            raise ValueError("Invalid consensus native geometry")
         if (len(self.indices) != len(self.enabled) or len(self.indices) != len(self.channel_names)
                 or not 1 <= len(self.indices) <= 3 or len(set(self.indices)) != len(self.indices)
                 or any(_integer(index, "Channel index") < 0 for index in self.indices)
                 or len(set(self.channel_names)) != len(self.channel_names)
                 or set(self.channel_names) - {"FITC", "CY3", "DAPI"}
                 or any(not isinstance(item, (bool, np.bool_)) for item in self.enabled)):
-            raise ValueError("Invalid rank-1 channel mapping")
+            raise ValueError("Invalid consensus channel mapping")
         prediction = self.prediction
         if not isinstance(prediction, dict) or set(prediction) != {"channel_models", "diagnostics"}:
-            raise ValueError("Invalid rank-1 prediction")
+            raise ValueError("Invalid consensus prediction")
         diag = prediction["diagnostics"]
-        if (not isinstance(diag, dict) or diag.get("schema") != SCHEMA or diag.get("uses_bf") is not False
-                or diag.get("method") != "consensus_rank1" or diag.get("config") != frozen_config()
+        if (not isinstance(diag, dict) or diag.get("schema") != self.model_schema or diag.get("uses_bf") is not False
+                or diag.get("method") != contract_for_schema(self.model_schema)["method"]
+                or diag.get("config") != frozen_config(self.model_schema)
                 or diag.get("DAPI_application") != "exact_identity"
                 or diag.get("channel_names") != self.channel_names
                 or diag.get("native_shape_yx") != native.tolist() or diag.get("downsample") != DOWNSAMPLE
                 or diag.get("input_shape_ncyx") != [1, len(self.indices), *((int(n) + 31) // 32 for n in native)]):
-            raise ValueError("Rank-1 geometry, method or provenance differs")
+            raise ValueError("Consensus geometry, method or provenance differs")
         records = prediction["channel_models"]
         if not isinstance(records, list) or len(records) != len(self.indices):
-            raise ValueError("Invalid rank-1 channel records")
+            raise ValueError("Invalid consensus channel records")
         bounds = []
         for row, (name, enabled, rec) in enumerate(zip(self.channel_names, self.enabled, records)):
             if (not isinstance(rec, dict) or rec.get("channel_index") != row or rec.get("channel_name") != name
                     or rec.get("status") not in ("accepted", "abstained") or type(rec.get("applied")) is not bool
                     or (enabled and not rec["applied"]) or (name == "DAPI" and (enabled or rec["applied"]))):
-                raise ValueError("Invalid rank-1 application policy")
+                raise ValueError("Invalid consensus application policy")
             model = rec.get("model")
             if model is None:
                 if rec["applied"] or enabled or rec["status"] != "abstained":
-                    raise ValueError("Rank-1 enabled channel lacks a model")
+                    raise ValueError("Consensus enabled channel lacks a model")
                 bounds.append((1.0, 1.0))
                 continue
             if rec["status"] != "accepted" or not isinstance(model, dict):
-                raise ValueError("Invalid rank-1 accepted model")
+                raise ValueError("Invalid consensus accepted model")
             required = set(evidence.FROZEN_KEYS) | {"joint_amplitude_nodes", "joint_phase_nodes",
                 "joint_orthogonal_native_nodes", "amplitude_cap", "frozen_template_sha256"}
             if set(model) != required or model["axis"] not in ("x", "y"):
-                raise ValueError("Invalid rank-1 model fields or axis")
+                raise ValueError("Invalid consensus model fields or axis")
             frequency = _finite(model["frequency_cycles_per_native_pixel"])
             period = _finite(model["period_native_pixels"])
             if (frequency.shape != () or period.shape != () or not 12 * 32 <= period <= 128 * 32
                     or not np.isclose(frequency * period, 1., rtol=1e-12, atol=0)):
-                raise ValueError("Invalid rank-1 period")
+                raise ValueError("Invalid consensus period")
             phase = _finite(model["phase_grid"])
             wave = _finite(model["template_values"])
             if (phase.shape != (64,) or not np.array_equal(phase, np.arange(64) / 64)
                     or wave.shape != phase.shape or abs(float(wave.mean())) > 1e-10
                     or not np.isclose(np.mean(wave**2), 1, rtol=1e-10, atol=1e-10)):
-                raise ValueError("Invalid rank-1 normalized sampled template")
+                raise ValueError("Invalid consensus normalized sampled template")
             harmonics = model["supported_harmonics"]
             if (not isinstance(harmonics, list) or not harmonics or len(set(harmonics)) != len(harmonics)
                     or any(type(k) is not int or not 1 <= k <= 8 for k in harmonics)):
-                raise ValueError("Invalid rank-1 harmonic support")
+                raise ValueError("Invalid consensus harmonic support")
             frozen = {key: model[key] for key in evidence.FROZEN_KEYS}
             if evidence.json_hash(frozen) != model["frozen_template_sha256"]:
-                raise ValueError("Rank-1 frozen template digest differs")
+                raise ValueError("Consensus frozen template digest differs")
             axis = 1 if model["axis"] == "x" else 0
             coords = evidence.centers(int(native[axis]), 32)[:int(native[axis]) // 32]
             orth = evidence.centers(int(native[1-axis]), 32)[:int(native[1-axis]) // 32]
             if len(coords) < 8 or len(orth) < 8:
-                raise ValueError("Invalid rank-1 complete-bin geometry")
+                raise ValueError("Invalid consensus complete-bin geometry")
             first = int(np.ceil(coords[0] * frequency))
             last = int(np.floor(coords[-1] * frequency - phase[-1]))
             pn = _finite(model["joint_phase_nodes"])
@@ -240,11 +242,11 @@ class Model:
                     or not np.array_equal(on, orth) or nodes.shape != (len(orth), len(pn))
                     or cap.shape != () or not np.isclose(cap, evidence._amplitude_limits(wave)[1], rtol=1e-12, atol=0)
                     or np.any(nodes < 0) or np.any(nodes > cap)):
-                raise ValueError("Invalid rank-1 amplitude lattice or cap")
+                raise ValueError("Invalid consensus amplitude lattice or cap")
             maximum = float(nodes.max())
             lower, upper = 1 + maximum * float(wave.min()), 1 + maximum * float(wave.max())
             if lower < .5 - 1e-12 or upper > 2.0 + 1e-12:
-                raise ValueError("Rank-1 gain lies outside frozen bounds")
+                raise ValueError("Consensus gain lies outside frozen bounds")
             bounds.append((lower, upper) if enabled else (1.0, 1.0))
         self.gain_bounds = bounds
         # Preserve numeric views once; native tiles do not repeatedly parse lists.

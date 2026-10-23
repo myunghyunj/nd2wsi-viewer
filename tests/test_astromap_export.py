@@ -10,7 +10,6 @@ import urllib.parse
 import urllib.request
 import zipfile
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np

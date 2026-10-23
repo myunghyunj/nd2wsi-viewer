@@ -17,13 +17,13 @@ const fs=require('fs'), vm=require('vm');
 const src=fs.readFileSync(process.argv[1], 'utf8'), cfg=JSON.parse(process.argv[2]);
 const downloads=[], toasts=[], controls={};
 const context={URLSearchParams, Number, Math,
-  state:{roi:{x:110,y:220,w:800,h:776}, channels:[1],
+  state:{roi:cfg.roi||{x:110,y:220,w:800,h:776}, channels:[1],
     info:{channels:[0,1], levels:[{path:'3',downsample:8}], maxRenderMpx:400,generation:cfg.generation}},
   activeFrameContext:()=>cfg.hasFrame===false?null:{frame:{t:2,p:3,z:4}},
   frameOwnsRoi:()=>cfg.hasRoi!==false && cfg.hasFrame!==false,
   pixelSize:()=>cfg.pixelSize===undefined?[.8,.5]:cfg.pixelSize,
-  roiScale:()=>({d:8,w:cfg.width||100,h:97}),
-  levelPathFor:()=> '3',
+  roiScale:()=>cfg.noScale?null:({d:cfg.downsample||8,w:cfg.width||100,h:97}),
+  levelPathFor:()=> cfg.levelPath||'3',
   lutParam:()=> '158:2144:1,204:2820:1.5',
   appendFrameParams:(q,f)=>{for(const [k,v] of Object.entries(f))q.set(k,v);},
   scopedButton:(id,disabled,title)=>{controls[id]={disabled,title};},
@@ -69,6 +69,31 @@ def test_rendered_exports_name_committed_pyramid_and_raw_exports_stay_source_bou
             assert "win" in q
         else:
             assert "g" not in q and "win" not in q
+            assert q["level"] == (["3"] if q["format"] == ["tiff"] else ["0"])
+
+
+def test_whole_slide_tiff_honors_half_scale_without_applying_lut_or_changing_nd2():
+    out = run({"formats": ["tiff", "nd2"], "downsample": 2, "levelPath": "1",
+               "roi": {"x": 0, "y": 0, "w": 3406, "h": 3650}})
+    tiff, nd2 = [parse_qs(urlparse(url).query) for url in out["downloads"]]
+    assert {k: tiff[k][0] for k in ["level", "x", "y", "w", "h"]} == {
+        "level": "1", "x": "0", "y": "0", "w": "1703", "h": "1825",
+    }
+    assert {k: nd2[k][0] for k in ["level", "w", "h"]} == {
+        "level": "0", "w": "3406", "h": "3650",
+    }
+    for query in (tiff, nd2):
+        assert query["c"] == ["1"] and "job" in query
+        assert "win" not in query and "scalebar" not in query
+        assert {k: query[k][0] for k in ["t", "p", "z"]} == {"t": "2", "p": "3", "z": "4"}
+
+
+def test_tiff_can_still_stream_native_when_no_render_scale_fits():
+    out = run({"formats": ["tiff"], "noScale": True})
+    assert len(out["downloads"]) == 1
+    query = parse_qs(urlparse(out["downloads"][0]).query)
+    assert {k: query[k][0] for k in ["level", "w", "h"]} == {"level": "0", "w": "800", "h": "776"}
+    assert out["toasts"] == []
 
 
 @pytest.mark.parametrize("config,reason", [({"pixelSize":None},"calibration"),

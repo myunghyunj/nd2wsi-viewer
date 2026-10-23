@@ -24,3 +24,8 @@ verify `role == "agent"` and a fresh session `id` before continuing.
 - Publish platform updates only within the user's requested scope and after
   verifying the exact delivered artifact on its documented execution targets.
   Do not replace an active installed app as part of local validation.
+
+For local `qa/check_native_*.py` checks, use `qa/run_native_check.py APP SCRIPT`
+and run one native check at a time. The launcher verifies the private Agent
+session has closed and reaps only its own child if native teardown lingers.
+Wait for the launcher to finish before starting another native check.

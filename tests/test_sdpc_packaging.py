@@ -118,7 +118,8 @@ def test_windows_packaged_smoke_requires_actual_sdpc_success(monkeypatch, tmp_pa
     module = windows_builder()
 
     def run(command, *, env, timeout):
-        marker = "smoke ok: SDPC" if sdpc_success else "smoke ok: ND2"
+        marker = ("smoke ok: SDPC\nsmoke ok: Astromap JPEG, TXT and PDF" if sdpc_success
+                  else "smoke ok: ND2")
         Path(env["ND2WSI_LOG_FILE"]).write_text(marker)
         if "--gui-smoke" in command:
             Path(command[-1]).write_text('{"ok":true}')
@@ -130,6 +131,18 @@ def test_windows_packaged_smoke_requires_actual_sdpc_success(monkeypatch, tmp_pa
     else:
         with pytest.raises(RuntimeError, match="SDPC decoder and ROI"):
             module.smoke(tmp_path / "viewer.exe", tmp_path / "input.nd2", tmp_path / "evidence")
+
+
+def test_windows_packaged_smoke_rejects_missing_astromap_marker(monkeypatch, tmp_path):
+    module = windows_builder()
+
+    def run(command, *, env, timeout):
+        Path(env["ND2WSI_LOG_FILE"]).write_text("smoke ok: SDPC")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="Astromap export checks"):
+        module.smoke(tmp_path / "viewer.exe", tmp_path / "input.nd2", tmp_path / "evidence")
 
 
 def test_windows_verifies_same_archive_on_x64_and_arm64_after_codec_build():

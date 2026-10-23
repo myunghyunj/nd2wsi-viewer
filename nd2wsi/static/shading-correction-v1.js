@@ -19,26 +19,17 @@
       ? available.reason : method === "bffree" ? "BF-free correction is unavailable for this source" : "" };
   }
 
-  function anyMethodSupported(status) {
-    return methodSupport(status, "h").supported || methodSupport(status, "bffree").supported;
-  }
-
-  function methodLabel(method, modelSchema) {
-    return method === "bffree"
-      ? modelSchema === "BF_free_consensus_rank1/1" ? "Rank1 (BF-free)" : "BF-free (legacy preview)"
-      : method === "h" ? "BF-guided" : "";
-  }
-
   function nextAction(status) {
     if (!status || status.state === "checking" || status.pending || status.refreshing || status.view_stale) return null;
     if (working.has(status.state)) return status.can_cancel === true ? "cancel" : null;
-    if (!anyMethodSupported(status) && !(status.applied && status.supported)) return null;
+    if (!methodSupport(status).supported && !(status.applied && status.supported)) return null;
     return status.applied ? "revoke" : "start";
   }
 
   function describe(status) {
     if (!status) return { disabled: true, busy: false, label: "Open a slide to use Shading Correction" };
-    const reason = status.reason ? ": " + status.reason : "";
+    const unavailable = status.reason || (!status.applied ? methodSupport(status).reason : "");
+    const reason = unavailable ? ": " + unavailable : "";
     if (status.state === "checking") return { disabled: true, busy: true, label: "Checking Shading Correction availability" };
     if (status.refreshing) return { disabled: true, busy: true, label: "Loading the rebuilt pyramid" };
     if (status.view_stale) return { disabled: true, busy: false, label: "The pyramid changed; refreshing the view" + reason };
@@ -50,10 +41,10 @@
       label: (status.operation === "revoke" ? "Rebuilding original pyramid " : "Applying Shading Correction ") +
         Math.round(Number(status.pct) || 0) + "%" + (status.can_cancel ? " · Click to cancel" : " · Saving"),
     };
-    if (status.state === "unchanged" && !status.applied && !anyMethodSupported(status)) return {
+    if (status.state === "unchanged" && !status.applied && !methodSupport(status).supported) return {
       disabled: true, busy: false, label: "Shading Correction: image unchanged" + reason,
     };
-    if (!anyMethodSupported(status) && !(status.applied && status.supported)) return { disabled: true, busy: false, label: "Shading Correction unavailable" + reason };
+    if (!methodSupport(status).supported && !(status.applied && status.supported)) return { disabled: true, busy: false, label: "Shading Correction unavailable" + reason };
     if (status.state === "failed") return {
       disabled: false, busy: false,
       label: (status.operation === "revoke" ? "Revoke Shading Correction failed" : "Shading Correction failed") + reason + " · Click to retry",
@@ -61,7 +52,7 @@
     if (status.state === "cancelled") return { disabled: false, busy: false,
       label: "Pyramid rebuild cancelled · " + (status.applied ? "Shading Correction remains applied" : "Click to retry") };
     return { disabled: false, busy: false, label: status.applied
-      ? "Shading Correction applied · " + (methodLabel(status.method, status.model_schema) ? methodLabel(status.method, status.model_schema) + " · " : "") + "Revoke…"
+      ? "Shading Correction applied · Revoke…"
       : "Apply Shading Correction" };
   }
 
@@ -151,7 +142,7 @@
       const generationHere = initiatedGeneration;
       const channels = Array.isArray(payload.channels) ? payload.channels.filter(value => typeof value === "string") : [];
       status = {
-        ...payload, pending: null, channels, supported: payload.supported === true || anyMethodSupported(payload),
+        ...payload, pending: null, channels, supported: payload.supported === true || methodSupport(payload).supported,
         applied: payload.applied === true, can_cancel: payload.can_cancel === true,
         operation: ["apply", "revoke"].includes(payload.operation) ? payload.operation : null,
         reason: typeof payload.reason === "string" ? payload.reason : "",
@@ -257,7 +248,7 @@
       if (action !== nextAction(snapshot())) return Promise.resolve(false);
       let selection = null;
       if (action === "start") {
-        if (!methodSupport(status, method).supported) return Promise.resolve(false);
+        if (method !== "bffree" || !methodSupport(status).supported) return Promise.resolve(false);
         selection = { method };
       }
       if (action === "cancel") {
@@ -286,5 +277,5 @@
     return { load, syncContext, activate, dismissOutcome, snapshot, dispose };
   }
 
-  return { createController, nextAction, describe, progress, estimateLabel, methodSupport, methodLabel };
+  return { createController, nextAction, describe, progress, estimateLabel, methodSupport };
 });

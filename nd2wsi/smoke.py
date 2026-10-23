@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import urllib.request
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -135,6 +136,56 @@ def _smoke_sdpc(work: Path) -> None:
     )
 
 
+def _smoke_astromap(work: Path) -> None:
+    """Require the delivered raster decoder, PDF renderer and stream writer."""
+    from PIL import Image
+    from pypdf import PdfReader
+
+    from .astromap_export import HEADER, prepare_astromap
+    from .server import SlideRegistry
+
+    image_path = work / "astromap-source.jpg"
+    with Image.new("RGB", (317, 151), (40, 100, 170)) as image:
+        image.save(image_path, "JPEG")
+    source_sha = hashlib.sha256(image_path.read_bytes()).hexdigest()
+    registry = SlideRegistry()
+    try:
+        sid = registry.open_path(image_path)
+        state = registry.get(sid)
+        assert state.attrs["nd2wsi"]["raster"] is True
+        assert state.attrs["nd2wsi"]["pixel_size_um"] is None
+        assert state.cache_path is None, "JPEG input unexpectedly created a pyramid cache"
+        payload = {"generation": state.generation, "channels": [0, 1, 2],
+                   "rois": [{"x": 11, "y": 13, "w": 21, "h": 17, "note": "검증 ROI"}]}
+        ordinary = {}
+        for include_pdf in (False, True):
+            output = work / ("astromap-pdf" if include_pdf else "astromap-ordinary")
+            output.mkdir()
+            plan = prepare_astromap(state, {**payload, "include_pdf": include_pdf},
+                                    resolve_frame=None)
+            with zipfile.ZipFile(plan.write(output)) as bundle:
+                names = bundle.namelist()
+                assert len(names) == (3 if include_pdf else 2), "Astromap ZIP members differ"
+                jpg = next(name for name in names if name.endswith(".jpg"))
+                txt = next(name for name in names if name.endswith(".txt"))
+                assert bundle.read(txt).decode("utf-8") == HEADER + "1\t11\t13\t31\t29\t검증 ROI\n"
+                with Image.open(io.BytesIO(bundle.read(jpg))) as image:
+                    image.load()
+                    assert image.size == (317, 151) and image.mode == "RGB"
+                if include_pdf:
+                    assert all(bundle.read(name) == data for name, data in ordinary.items())
+                    pdf = PdfReader(io.BytesIO(bundle.read(next(name for name in names if name.endswith(".pdf")))))
+                    assert len(pdf.pages) == 1
+                    assert float(pdf.pages[0].mediabox.width) > float(pdf.pages[0].mediabox.height)
+                    assert "ROI" in pdf.pages[0].extract_text(), "PDF labels could not be read"
+                else:
+                    ordinary = {jpg: bundle.read(jpg), txt: bundle.read(txt)}
+        assert hashlib.sha256(image_path.read_bytes()).hexdigest() == source_sha
+    finally:
+        registry.close_all(immediate=True)
+    print("smoke ok: Astromap JPEG, TXT and PDF; pixel coordinates and source preserved")
+
+
 def run(nd2_path: Path) -> int:
     import nd2
     import numpy as np
@@ -148,6 +199,7 @@ def run(nd2_path: Path) -> int:
         with tempfile.TemporaryDirectory(prefix="nd2wsi-smoke-") as temp:
             work = Path(temp)
             _smoke_sdpc(work)
+            _smoke_astromap(work)
             # These compiled SciPy modules and the frozen settings must be in
             # the delivered bundle, not merely present in a developer venv.
             from . import h_adaptive, h_model
@@ -175,6 +227,14 @@ def run(nd2_path: Path) -> int:
                 with Image.open(io.BytesIO(tile)) as image:
                     image.load()
                     assert min(image.size) > 0
+                if len(info["levels"]) > 1:
+                    reduced = info["levels"][1]
+                    tiff = _fetch(url + "api/roi?level=" + str(reduced["path"]) +
+                                  f"&x=0&y=0&w={reduced['width']}&h={reduced['height']}&format=tiff")
+                    with tifffile.TiffFile(io.BytesIO(tiff)) as exported:
+                        page = exported.pages[0]
+                        assert (page.imagewidth, page.imagelength) == (reduced["width"], reduced["height"])
+                    print("smoke ok: whole-slide reduced TIFF export")
                 roi = work / "roi.nd2"
                 roi.write_bytes(_fetch(
                     url + "api/roi?level=0&x=0&y=0&w=64&h=64&format=nd2"

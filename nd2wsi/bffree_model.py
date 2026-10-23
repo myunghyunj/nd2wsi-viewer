@@ -1,4 +1,4 @@
-"""Consensus rank-1 fitting with read compatibility for the prior x/h1 model.
+"""Consensus fitting with read compatibility for the prior x/h1 model.
 
 Only FITC/CY3/DAPI mean-bin arrays enter estimation; DAPI and BF application
 remain identity. The legacy fitter is retained solely for compatibility tests.
@@ -281,8 +281,9 @@ def fit_legacy(raw32, metadata, output, *, check=lambda: None, progress=lambda _
     return LegacyModel(output), result
 
 
-# Public route: new fits use consensus rank-1; archived x/h1 gains remain readable.
+# Public route: new fits use consensus; archived x/h1 gains remain readable.
 SCHEMA = consensus.SCHEMA
+SUPPORTED_SCHEMAS = consensus.SUPPORTED_SCHEMAS
 FIELD_NAMES = consensus.FIELD_NAMES
 
 
@@ -312,7 +313,7 @@ class Model:
 
 
 def fit(raw32, metadata, output, *, check=lambda: None, progress=lambda _fraction: None):
-    """Fit the frozen fluorescence-only consensus rank-1 procedure.
+    """Fit the frozen fluorescence-only consensus procedure.
 
     `raw32` contains actual 32x32 means sorted by original channel index.
     Source/selection fingerprints remain the caller's transaction boundary;
@@ -326,7 +327,7 @@ def fit(raw32, metadata, output, *, check=lambda: None, progress=lambda _fractio
     memory["estimated_peak_bytes"] += max(native) * 64 + raw32.shape[-2] * 1024
     memory["channel_order"] = "all fluorescence profiles, then one target amplitude lattice at a time"
     if memory["estimated_peak_bytes"] > MAX_WORKING_BYTES:
-        raise Unsupported("working_memory_budget_exceeded: rank-1 fitting workspace exceeds 1 GiB")
+        raise Unsupported("working_memory_budget_exceeded: consensus fitting workspace exceeds 1 GiB")
     output = Path(output)
     if output.suffix.lower() != ".npz":
         raise ValueError("BF-free model output must have an .npz suffix")
@@ -345,7 +346,7 @@ def fit(raw32, metadata, output, *, check=lambda: None, progress=lambda _fractio
         else:
             bounds = [1., 1.]
         selected.append({"channel": name, "channel_index": index, "input_row": row,
-            "model": "consensus_rank1" if applied else None,
+            "model": "consensus" if applied else None,
             "outcome": "fitted" if applied else "unchanged", "enabled": applied,
             "reason": "DAPI_identity_policy" if name == "DAPI" else (rec["template_reason"] or rec["reason"]),
             "axes": [] if field is None else [{"axis": field["axis"], "status": rec["status"],
@@ -363,10 +364,10 @@ def fit(raw32, metadata, output, *, check=lambda: None, progress=lambda _fractio
     prediction_text = json.dumps(prediction, separators=(",", ":"), allow_nan=False)
     payload = json.dumps(result, indent=2, allow_nan=False) + "\n"
     if len(prediction_text) * 4 + 4096 > MAX_MODEL_BYTES:
-        raise Unsupported("model_storage_budget_exceeded: rank-1 model exceeds 32 MiB")
+        raise Unsupported("model_storage_budget_exceeded: consensus model exceeds 32 MiB")
     check()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".bffree-rank1-model-", dir=output.parent) as folder:
+    with tempfile.TemporaryDirectory(prefix=".bffree-consensus-model-", dir=output.parent) as folder:
         staged = Path(folder) / "model.npz"
         np.savez_compressed(staged, model_schema=np.asarray(SCHEMA),
             channel_indices=np.asarray([index for index, _ in pairs], dtype=np.int64),

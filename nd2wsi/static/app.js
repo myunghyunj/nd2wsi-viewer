@@ -24,7 +24,7 @@ const state = {
   roiOverlayEl: null, // projected SVG polygon in raw image coordinates
   tool: null, // null | "roi" | "measure" | "pin" | "box"
   renderScale: null, // chosen PNG/JPEG downsample; null = finest that fits
-  astromap: { exporting: false, rows: new Map() },
+  astromap: { exporting: false, rows: new Map(), activeId: null },
   annotations: [], // {id, type: "line"|"pin"|"box", ...image coords, text}
   annPath: null, // sidecar file, reported by the server
   annSite: null, // plate site whose sidecar is displayed; null in the grid
@@ -1534,6 +1534,7 @@ function setTool(tool) {
     setAnnStatus("Annotation is locked while the source file is missing");
     return;
   }
+  state.cancelToolDrag?.();
   state.tool = state.tool === tool ? null : tool;
   const on = state.tool;
   if ((on === "roi" || on === "move") && state.windows.region.isHidden())
@@ -1544,7 +1545,9 @@ function setTool(tool) {
   $("roi-toggle").textContent = on === "roi" ? "Drag to Mark…" : "Select Region";
   $("stage").classList.toggle("selecting", !!on && on !== "move");
   $("stage").classList.toggle("moving", on === "move");
-  state.viewer.setMouseNavEnabled(!on);
+  // Astromap owns only Shift + primary drag. Leave the viewer's tracker
+  // active for ordinary panning, wheel zoom and trackpad gestures.
+  state.viewer.setMouseNavEnabled(!on || on === "astromap");
   if (!on) {
     $("rubber").style.display = "none";
     state.tempLine = null;
@@ -1612,6 +1615,8 @@ function wireTools() {
   let start = null; // element coords
   let startImg = null;
   let dragContext = null;
+  let dragPointer = null;
+  let current = null;
 
   $("roi-toggle").onclick = () => setTool("roi");
   $("roi-move").onclick = () => {
@@ -1624,19 +1629,38 @@ function wireTools() {
 
   let moveFrom = null; // roi origin at drag start (move mode)
   let landmarkStart = null; // a click, not a drag, places an alignment point
+  const drawStart = () => state.tool === "astromap"
+    ? imageToViewerElementPoint(startImg) : start;
+  const clearDrag = () => {
+    const pointer = dragPointer;
+    start = startImg = dragContext = dragPointer = current = moveFrom = null;
+    rubber.style.display = "none";
+    stage.classList.remove("grabbing");
+    try { if (pointer !== null) stage.releasePointerCapture(pointer); } catch (_) { /* optional */ }
+  };
+  state.cancelToolDrag = clearDrag;
+  state.viewer.addHandler("update-viewport", () => {
+    if (state.tool === "astromap" && start && current)
+      positionRubber(drawStart(), current);
+  });
   stage.addEventListener("pointerdown", (ev) => {
-    if (!state.tool && !state.landmark.active && ev.button === 0 && ev.shiftKey &&
-        !ev.metaKey && !ev.ctrlKey && !ev.altKey && !state.windows.astromap.isHidden() &&
+    if (dragPointer !== null) return;
+    const astromapDrag = ev.button === 0 && ev.pointerType !== "touch" && ev.shiftKey &&
+      !ev.metaKey && !ev.ctrlKey && !ev.altKey;
+    if (!state.tool && !state.landmark.active && astromapDrag && !state.windows.astromap.isHidden() &&
         astromapReady()) setTool("astromap");
     if (state.landmark.active && !state.tool && ev.button === 0) {
       landmarkStart = elementPoint(ev, stage);
       return; // OpenSeadragon keeps the drag, so the user can still pan
     }
     if (!state.tool || ev.button !== 0) return;
+    if (state.tool === "astromap" && (!astromapDrag || !astromapReady())) return;
     if (state.tool === "move" && !state.roi) return;
-    start = elementPoint(ev, stage);
-    startImg = imgPoint(start);
+    start = current = elementPoint(ev, stage);
+    // A camera change during the drag must not move its source-image anchor.
+    startImg = state.tool === "astromap" ? viewerElementToImagePoint(start) : imgPoint(start);
     dragContext = activeFrameContext()?.key;
+    dragPointer = ev.pointerId;
     if (state.tool === "move") {
       moveFrom = { x: state.roi.x, y: state.roi.y };
       stage.classList.add("grabbing");
@@ -1651,8 +1675,8 @@ function wireTools() {
   }, true);
 
   stage.addEventListener("pointermove", (ev) => {
-    if (!state.tool || !start) return;
-    const cur = elementPoint(ev, stage);
+    if (!state.tool || !start || ev.pointerId !== dragPointer) return;
+    const cur = current = elementPoint(ev, stage);
     if (state.tool === "move" && moveFrom) {
       const p = imgPoint(cur);
       const r = state.roi;
@@ -1660,7 +1684,7 @@ function wireTools() {
       r.y = Math.round(clamp(moveFrom.y + (p.y - startImg.y), 0, state.info.height - r.h));
       moveRoiOverlay();
     } else if (state.tool === "roi" || state.tool === "box" || state.tool === "astromap") {
-      positionRubber(start, cur);
+      positionRubber(drawStart(), cur);
     } else if (state.tool === "measure") {
       const p = imgPoint(cur);
       state.tempLine = { x1: startImg.x, y1: startImg.y, x2: p.x, y2: p.y };
@@ -1678,17 +1702,15 @@ function wireTools() {
       if (moved < 6 && state.landmark.active && !state.tool) placeLandmark(end);
       return;
     }
-    if (!state.tool || !start) return;
+    if (!state.tool || !start || ev.pointerId !== dragPointer || ev.button !== 0) return;
     if (dragContext !== activeFrameContext()?.key) {
-      start = startImg = dragContext = null;
-      rubber.style.display = "none";
       setTool(null);
       return;
     }
     const end = elementPoint(ev, stage);
     const endImg = imgPoint(end);
     const rectangle = state.tool === "roi" || state.tool === "box" || state.tool === "astromap"
-      ? positionRubber(start, end) : null;
+      ? positionRubber(drawStart(), end) : null;
     rubber.style.display = "none";
     const tool = state.tool;
     const moved = Math.hypot(end.x - start.x, end.y - start.y);
@@ -1726,17 +1748,18 @@ function wireTools() {
         openEditor(item.id);
       }
     }
-    start = null;
-    startImg = null;
+    clearDrag();
     ev.preventDefault();
     ev.stopPropagation();
   }, true);
 
-  stage.addEventListener("pointercancel", () => {
-    start = startImg = dragContext = null;
-    rubber.style.display = "none";
+  const cancelDrag = (ev) => {
+    if (ev.pointerId !== dragPointer) return;
+    clearDrag();
     if (state.tool === "astromap") setTool(null);
-  }, true);
+  };
+  stage.addEventListener("pointercancel", cancelDrag, true);
+  stage.addEventListener("lostpointercapture", cancelDrag, true);
 
   $("roi-clear").onclick = clearRoi;
   $("roi-full").onclick = () => applyRoi(0, 0, state.info.width, state.info.height);
@@ -1767,6 +1790,24 @@ function astromapReady() {
 
 function astromapItems() {
   return state.annotations.filter((a) => a.type === "box" && a.astromap === true);
+}
+
+function astromapDisplayNote(item) {
+  const text = item.text || "";
+  // AstroMapper's default NOTE repeats INDEX. Keep it in the annotation and
+  // subsequent exports, but show only our numbered button/overlay label.
+  return Number.isSafeInteger(item.astromapImportIndex) &&
+    text.trim() === String(item.astromapImportIndex) ? "" : text;
+}
+
+function selectAstromapRoi(id, locate = true) {
+  const item = astromapItems().find((a) => a.id === id);
+  if (!item) return false;
+  state.astromap.activeId = id;
+  renderAnnotations();
+  refreshAstromapPanel();
+  if (locate) flyToAnnotation(item);
+  return true;
 }
 
 function postAstromapState() {
@@ -1804,14 +1845,29 @@ function addAstromapRoi(rect) {
   }
   const item = addAnnotation({ type: "box", ...normalized, text: "",
     astromap: true, astromapEnabled: true });
-  refreshAstromapPanel();
+  selectAstromapRoi(item.id, false);
   state.astromap.rows.get(item.id)?.note.focus({ preventScroll: true });
   return item;
+}
+
+function clearAstromapRois() {
+  if (!astromapReady() || state.astromap.importReading) return false;
+  const ids = new Set(astromapItems().map((item) => item.id));
+  if (!ids.size) return false;
+  if (ids.has(state.editingId)) closeEditor(false);
+  if (state.tool === "astromap") state.cancelToolDrag?.();
+  state.annotations = state.annotations.filter((item) => item.type !== "box" || item.astromap !== true);
+  state.astromap.activeId = null;
+  // One revision, render and save for the whole batch; manual annotations stay.
+  annotationsChanged();
+  $("astromap-status").textContent = `Cleared ${ids.size} Astromap region${ids.size === 1 ? "" : "s"}.`;
+  return true;
 }
 
 function refreshAstromapPanel() {
   if (!state.astromap || !state.info || !$("astromap-list")) return;
   const items = astromapItems(), ready = astromapReady();
+  if (!items.some((a) => a.id === state.astromap.activeId)) state.astromap.activeId = items[0]?.id || null;
   const list = $("astromap-list"), rows = state.astromap.rows;
   const ids = new Set(items.map((a) => a.id));
   for (const [id, row] of rows) if (!ids.has(id)) { row.el.remove(); rows.delete(id); }
@@ -1834,7 +1890,7 @@ function refreshAstromapPanel() {
         const item = find(); if (!item || !astromapReady()) return;
         item.text = note.value; annotationsChanged();
       };
-      number.onclick = () => { const item = find(); if (item) flyToAnnotation(item); };
+      number.onclick = () => selectAstromapRoi(a.id);
       remove.onclick = () => { if (astromapReady() && find()) removeAnnotation(a.id); };
       el.append(include, number, note, remove, coords);
       row = { el, include, number, note, remove, coords };
@@ -1844,14 +1900,16 @@ function refreshAstromapPanel() {
     row.include.setAttribute("aria-label", `Include region ${index + 1}`);
     row.number.textContent = String(index + 1);
     row.number.title = `Go to region ${index + 1}`;
+    row.number.setAttribute("aria-pressed", String(a.id === state.astromap.activeId));
     row.note.setAttribute("aria-label", `Note for region ${index + 1}`);
-    row.note.placeholder = `Region ${index + 1}`;
-    if (document.activeElement !== row.note) row.note.value = a.text || "";
+    row.note.placeholder = "Note";
+    if (document.activeElement !== row.note) row.note.value = astromapDisplayNote(a);
     row.remove.setAttribute("aria-label", `Delete region ${index + 1}`);
     row.include.disabled = row.note.disabled = row.remove.disabled = !ready;
     const box = window.Nd2Astromap.scaledCoordinates(a, state.info.width, state.info.height, size.width, size.height);
     row.coords.textContent = `JPG px: ${box.x1}, ${box.y1} → ${box.x2}, ${box.y2}`;
     row.el.classList.toggle("excluded", a.astromapEnabled === false);
+    row.el.classList.toggle("selected", a.id === state.astromap.activeId);
     // Reuse the same nodes while typing; moving existing nodes would lose IME focus in WebKit.
     if (list.children[index] !== row.el) list.insertBefore(row.el, list.children[index] || null);
   });
@@ -1864,12 +1922,15 @@ function refreshAstromapPanel() {
   $("astromap-hint").textContent = reason;
   $("astromap-draw").disabled = !ready;
   $("astromap-add-current").disabled = !ready || !frameOwnsRoi();
-  $("astromap-export").disabled = !ready || !window.Nd2Astromap.selectedRois(state.annotations).length;
+  const exportDisabled = !ready || !window.Nd2Astromap.selectedRois(state.annotations).length;
+  $("astromap-export").disabled = $("astromap-export-pdf").disabled = exportDisabled;
   $("astromap-export").textContent = state.astromap.exporting ? "Preparing export…" : "Export JPG + TXT";
+  $("astromap-export-pdf").textContent = state.astromap.exporting ? "Preparing export…" : "Export ZIP with PDF";
+  refreshAstromapImport(ready);
   postAstromapState();
 }
 
-async function exportAstromap() {
+async function exportAstromap(includePdf = false) {
   if (!astromapReady()) return false;
   closeEditor(true);
   const captured = activeFrameContext();
@@ -1877,8 +1938,10 @@ async function exportAstromap() {
   if (!rois.length) { showToast("Select at least one Astromap region"); return false; }
   const payload = { generation: state.info.generation || "", rois,
     channels: [...state.channels], window: lutParam() || null, frame: captured.frame };
+  const withPdf = includePdf === true;
+  if (withPdf) payload.include_pdf = true;
   state.astromap.exporting = true;
-  $("astromap-status").textContent = "Preparing JPG and coordinates…";
+  $("astromap-status").textContent = withPdf ? "Preparing JPG, coordinates and PDF…" : "Preparing JPG and coordinates…";
   refreshAstromapPanel();
   try {
     const response = await fetch("api/astromap", { method: "POST",
@@ -1895,7 +1958,7 @@ async function exportAstromap() {
     const a = document.createElement("a");
     a.href = url.href; a.download = result.filename || "";
     document.body.append(a); a.click(); a.remove();
-    $("astromap-status").textContent = `${result.count} regions · ${fmtInt(result.width)} × ${fmtInt(result.height)} px · JPG + TXT in ZIP`;
+    $("astromap-status").textContent = `${result.count} regions · ${fmtInt(result.width)} × ${fmtInt(result.height)} px · JPG + TXT${withPdf ? " + PDF" : ""} in ZIP`;
     showToast("Astromap export ready — choose where to save the ZIP");
     return true;
   } catch (error) {
@@ -1908,12 +1971,142 @@ async function exportAstromap() {
   }
 }
 
+function refreshAstromapImport(ready = astromapReady()) {
+  const pending = state.astromap.pendingImport;
+  const busy = !!state.astromap.importReading;
+  $("astromap-import").disabled = !ready || busy;
+  $("astromap-clear-all").disabled = !ready || busy || !astromapItems().length;
+  $("astromap-import-options").hidden = !pending;
+  const size = [Number($("astromap-import-width").value), Number($("astromap-import-height").value)];
+  const validSize = size.every((n) => Number.isSafeInteger(n) && n > 0);
+  const current = pending && pending.contextKey === activeFrameContext()?.key;
+  if (pending && !current)
+    $("astromap-import-status").textContent = "The displayed image changed. Choose the TXT again for the intended image.";
+  $("astromap-import-confirm").disabled = !ready || busy || !current || !validSize;
+  $("astromap-import-jpg").disabled = !ready || busy || !current;
+  $("astromap-import-width").disabled = $("astromap-import-height").disabled = busy;
+}
+
+async function readAstromapImportFile(file) {
+  if (!file || !astromapReady()) return false;
+  const contextKey = activeFrameContext()?.key;
+  const seq = state.astromap.importSeq = (state.astromap.importSeq || 0) + 1;
+  state.astromap.pendingImport = null;
+  state.astromap.importReading = true;
+  $("astromap-import-status").textContent = "Reading ROI coordinates…";
+  refreshAstromapImport();
+  try {
+    if (file.size > 16 * 1024 * 1024) throw new Error("ROI TXT must be smaller than 16 MiB");
+    const text = await file.text();
+    if (seq !== state.astromap.importSeq) return false;
+    if (contextKey !== activeFrameContext()?.key || !astromapReady())
+      throw new Error("The displayed image changed. Choose the TXT again for the intended image.");
+    const parsed = window.Nd2AstromapImport.parse(text);
+    const size = state.info.raster ? { width: state.info.width, height: state.info.height }
+      : window.Nd2Astromap.exportSize(state.info.width, state.info.height);
+    state.astromap.pendingImport = { rows: parsed.rows, contextKey, name: file.name };
+    $("astromap-import-width").value = size.width;
+    $("astromap-import-height").value = size.height;
+    $("astromap-import-name").textContent = `${file.name} · ${parsed.count} regions`;
+    $("astromap-import-status").textContent = "Check the JPG dimensions, then select Import regions.";
+    return true;
+  } catch (error) {
+    if (seq === state.astromap.importSeq) $("astromap-import-status").textContent = error.message;
+    return false;
+  } finally {
+    if (seq === state.astromap.importSeq) {
+      state.astromap.importReading = false;
+      refreshAstromapImport();
+    }
+  }
+}
+
+async function readAstromapImportJpg(file) {
+  const pending = state.astromap.pendingImport;
+  if (!file || !pending || !astromapReady() || state.astromap.importReading) return false;
+  const seq = state.astromap.importSeq = (state.astromap.importSeq || 0) + 1;
+  state.astromap.importReading = true;
+  refreshAstromapImport();
+  try {
+    const size = await window.Nd2AstromapImport.readImageSize(file);
+    if (seq !== state.astromap.importSeq) return false;
+    if (state.astromap.pendingImport !== pending || pending.contextKey !== activeFrameContext()?.key)
+      throw new Error("The displayed image changed. Choose the TXT again for the intended image.");
+    $("astromap-import-width").value = size.width;
+    $("astromap-import-height").value = size.height;
+    $("astromap-import-status").textContent = `${file.name}: ${fmtInt(size.width)} × ${fmtInt(size.height)} px. Ready to import.`;
+    return true;
+  } catch (error) {
+    if (seq === state.astromap.importSeq) $("astromap-import-status").textContent = error.message;
+    return false;
+  } finally {
+    if (seq === state.astromap.importSeq) {
+      state.astromap.importReading = false;
+      refreshAstromapImport();
+    }
+  }
+}
+
+function commitAstromapImport() {
+  const pending = state.astromap.pendingImport;
+  if (!pending || !astromapReady() || state.astromap.importReading) return false;
+  try {
+    if (pending.contextKey !== activeFrameContext()?.key)
+      throw new Error("The displayed image changed. Choose the TXT again for the intended image.");
+    const boxes = window.Nd2AstromapImport.mapToSource(pending.rows,
+      { width: Number($("astromap-import-width").value), height: Number($("astromap-import-height").value) },
+      { width: state.info.width, height: state.info.height });
+    if (astromapItems().length + boxes.length > 2000) throw new Error("Astromap supports up to 2000 regions");
+    closeEditor(true);
+    // Validate every row first, then append once, keeping imported overlaps
+    // and the current frame's existing annotations unchanged.
+    const imported = boxes.map((box) => ({ id: "a" + Date.now().toString(36) + annCounter++, ...box }));
+    state.annotations.push(...imported);
+    state.astromap.activeId = imported[0]?.id || state.astromap.activeId;
+    state.astromap.pendingImport = null;
+    annotationsChanged();
+    $("astromap-import-status").textContent = `Imported ${boxes.length} regions from ${pending.name}.`;
+    return true;
+  } catch (error) {
+    $("astromap-import-status").textContent = error.message;
+    return false;
+  }
+}
+
+function wireAstromapImport() {
+  $("astromap-import").onclick = () => { if (astromapReady()) $("astromap-import-file").click(); };
+  $("astromap-import-file").onchange = async () => {
+    const input = $("astromap-import-file");
+    await readAstromapImportFile(input.files[0]);
+    input.value = "";
+  };
+  $("astromap-import-jpg").onclick = () => $("astromap-import-jpg-file").click();
+  $("astromap-import-jpg-file").onchange = async () => {
+    const input = $("astromap-import-jpg-file");
+    await readAstromapImportJpg(input.files[0]);
+    input.value = "";
+  };
+  $("astromap-import-confirm").onclick = commitAstromapImport;
+  $("astromap-import-cancel").onclick = () => {
+    state.astromap.importSeq = (state.astromap.importSeq || 0) + 1;
+    state.astromap.pendingImport = null;
+    state.astromap.importReading = false;
+    $("astromap-import-status").textContent = "";
+    refreshAstromapImport();
+  };
+  for (const id of ["astromap-import-width", "astromap-import-height"])
+    $(id).oninput = () => refreshAstromapImport();
+}
+
 function wireAstromap() {
+  wireAstromapImport();
   $("astromap-draw").onclick = () => { if (astromapReady()) setTool("astromap"); };
   $("astromap-add-current").onclick = () => {
     if (frameOwnsRoi()) addAstromapRoi({ ...state.roi });
   };
-  $("astromap-export").onclick = exportAstromap;
+  $("astromap-clear-all").onclick = clearAstromapRois;
+  $("astromap-export").onclick = () => exportAstromap();
+  $("astromap-export-pdf").onclick = () => exportAstromap(true);
   const observer = new MutationObserver(() => {
     if (state.windows.astromap.isHidden() && state.tool === "astromap") setTool(null);
     postAstromapState();
@@ -1935,7 +2128,12 @@ function addAnnotation(props) {
 }
 
 function removeAnnotation(id) {
+  const previous = astromapItems().findIndex((a) => a.id === id);
   state.annotations = state.annotations.filter((a) => a.id !== id);
+  if (state.astromap.activeId === id) {
+    const remaining = astromapItems();
+    state.astromap.activeId = remaining[Math.min(previous, remaining.length - 1)]?.id || null;
+  }
   if (state.editingId === id) closeEditor();
   annotationsChanged();
 }
@@ -2355,6 +2553,8 @@ function chip(parent, x, y, text, id) {
   );
   if (id) g.addEventListener("pointerdown", (ev) => {
     ev.stopPropagation();
+    if (state.annotations.some(a => a.id === id && a.type === "box" && a.astromap === true))
+      selectAstromapRoi(id, false);
     openEditor(id);
   });
   return g;
@@ -2364,6 +2564,8 @@ function renderAnnotations() {
   const layer = $("ann-layer");
   if (!state.viewer) return;
   layer.replaceChildren();
+  if (state.astromap && !state.annotations.some((a) => a.type === "box" && a.astromap === true && a.id === state.astromap.activeId))
+    state.astromap.activeId = state.annotations.find((a) => a.type === "box" && a.astromap === true)?.id || null;
 
   const drawLine = (a, isTemp) => {
     const col = annColor(a);
@@ -2402,15 +2604,21 @@ function renderAnnotations() {
       const left = Math.min(...corners.map((c) => c.x));
       const top = Math.min(...corners.map((c) => c.y));
       const g = svgEl("g", { class: "hit" }, layer);
+      const active = a.astromap === true && a.id === state.astromap.activeId;
       svgEl("polygon", {
         points: corners.map((c) => c.x + "," + c.y).join(" "),
-        fill: a.astromap === true ? "rgba(255,217,102,.35)" : hexAlpha(annColor(a), 0.08),
-        stroke: a.astromap === true ? "#fff" : annColor(a), "stroke-width": 1.5,
+        fill: a.astromap === true ? active ? "rgba(255,217,102,.35)" : "rgba(160,166,174,.15)" : hexAlpha(annColor(a), 0.08),
+        stroke: a.astromap === true ? active ? "#ffd966" : "#a0a6ae" : annColor(a), "stroke-width": 1.5,
         "stroke-linejoin": "round",
       }, g);
-      g.addEventListener("pointerdown", (ev) => { ev.stopPropagation(); openEditor(a.id); });
+      g.addEventListener("pointerdown", (ev) => {
+        ev.stopPropagation();
+        if (a.astromap === true) selectAstromapRoi(a.id, false);
+        openEditor(a.id);
+      });
+      const note = a.astromap === true ? astromapDisplayNote(a) : a.text;
       chip(layer, left, top - 22, a.astromap === true
-        ? `${astromapNumber}${a.text ? " · " + a.text : ""}` : a.text || "Box", a.id);
+        ? `${astromapNumber}${note ? " · " + note : ""}` : a.text || "Box", a.id);
     } else if (a.type === "pin") {
       const p = toEl(a.x, a.y);
       const g = svgEl("g", { class: "hit" }, layer);
@@ -3031,12 +3239,12 @@ function updateRoiPanel() {
   updateScaleStrip();
 }
 
-/* ---- render scale: how PNG and JPEG leave -------------------------------
+/* ---- export scale: how TIFF, PNG and JPEG leave -------------------------
    Each option is one pyramid level. The strip shows the same field at every
    scale so the pixel cost is visible, the dims line shows what the file
    will hold, and the size is measured from one real 512 px sample at that
-   level rather than guessed. ND2 and TIFF ignore all of this and stream at
-   native resolution. */
+   level rather than guessed. TIFF preserves raw channels at the selected
+   scale. ND2 always streams native-resolution pixels. */
 function scaleOptions() {
   const r = state.roi;
   if (!r) return [];
@@ -3111,10 +3319,10 @@ function updateScaleStrip() {
 
   dims.textContent = fmtInt(sel.w) + " × " + fmtInt(sel.h) + " px";
   const note = $("roi-scale-note");
-  note.textContent = "ND2 and TIFF stay native.";
+  note.textContent = "TIFF uses this scale; ND2 stays native.";
   estimateRenderBytes(sel, winQ, r).then((t) => {
     if (seq === scaleSeq && activeFrameContext()?.key === context.key && t) {
-      note.textContent = t + " · ND2 and TIFF retain original values.";
+      note.textContent = t + " · TIFF keeps raw channels at this scale; ND2 stays native.";
     }
   });
 }
@@ -3229,9 +3437,8 @@ function downloadRoi(fmt, scaleBar = false) {
     const issue = scaleBarExportIssue();
     if (issue) { showToast(issue); return; }
   }
-  // ND2 and TIFF stream raw pixels at native resolution; a rendered PNG or
-  // JPEG too big for one image drops to the pyramid level that fits, which
-  // is how the whole slide leaves as one picture
+  // TIFF streams raw channels at the selected scale; ND2 stays native.
+  // Rendered images use the same selection, bounded by the raster limit.
   let level = 0;
   let d = 1;
   if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
@@ -3245,6 +3452,12 @@ function downloadRoi(fmt, scaleBar = false) {
     }
     d = sel.d;
     level = Number(levelPathFor(d));
+  } else if (fmt === "tiff") {
+    const sel = roiScale();
+    if (sel) {
+      d = sel.d;
+      level = Number(levelPathFor(d));
+    }
   }
   const q = new URLSearchParams({
     level,
@@ -5218,8 +5431,8 @@ function wireKeys() {
     }
     // Own these letters before the target OSD canvas sees them. In particular
     // OSD's R rotates, A pans and F flips before a bubble listener can react.
-    // Legacy plain C/A/R no longer open panels; keep them reserved so old
-    // muscle memory cannot unexpectedly pan or rotate the image in OSD.
+    // Plain C/E/A toggle panels before OSD can use A to pan. R remains
+    // reserved so it cannot unexpectedly rotate the image.
     // Repeats/Shift variants stay reserved but do not repeatedly toggle tools.
     const ownedLetter = !ev.altKey &&
       ["KeyC", "KeyR", "KeyA", "KeyE", "KeyV", "KeyM", "KeyP", "KeyB", "KeyI", "KeyF"].includes(letterCode);

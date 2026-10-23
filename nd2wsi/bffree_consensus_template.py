@@ -1,6 +1,6 @@
 """Pinned fluorescence-only research mathematics, packaged without external paths.
 
-Ported from the verified ExM consensus rank-1 implementation. Numerical
+Ported from the verified ExM consensus implementation. Numerical
 operations and frozen defaults are retained; checkpoints support cancellation.
 """
 from __future__ import annotations

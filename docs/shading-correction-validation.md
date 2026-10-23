@@ -1,20 +1,20 @@
 # Shading Correction: method and validation limits
 
-## Rank1 (BF-free), the 2.4.0 default
+## Periodic fluorescence correction in 2.4.1
 
-The confirmation dialog defaults to **Rank1 (BF-free)**, implemented by the adopted `consensus_rank1` procedure. It estimates repeating illumination from the current slide's fluorescence. FITC and CY3 are the only channels eligible for correction. DAPI may contribute frequency proposals and diagnostics, but its applied gain remains exactly one. BF and all other channels also remain unchanged. No BF pixels, BF-derived masks or geometry, camera priors, or model from another slide enter this fit.
+The viewer applies the fluorescence-only consensus procedure from the Shading Correction confirmation. It estimates repeating illumination from the current slide's fluorescence. FITC and CY3 are the only channels eligible for correction. DAPI may contribute frequency proposals and diagnostics, but its applied gain remains exactly one. BF and all other channels also remain unchanged. No BF pixels, BF-derived masks or geometry, camera priors, or model from another slide enter this fit.
 
 The fitter uses actual means of 32 × 32 native-pixel bins. Short final bins are excluded from fitting. Each eligible channel must support its own repeating template before a spatial amplitude field is fitted. The native gain is `G = 1 + A(x,y) × T(phase)`, and corrected display values are calculated as `raw / G` using float64 division before float32 storage. Intensity baselines are fitting terms only; the method does not normalize overall brightness or a time series. Channels without sufficient evidence retain identity gain. If none is corrected, the existing pyramid is retained.
 
-The saved model records its channel mapping, native dimensions, template, amplitude field, configuration and fit decisions in the `BF_free_consensus_rank1/1` format. On loading, the implementation checks these fields and rejects malformed, incompatible or oversized archives. The fitting admission budget is an estimate of working allocations, currently 1 GiB; it is not a limit on the entire application's memory use, which also includes decoding and pyramid construction.
+The saved model records its channel mapping, native dimensions, template, amplitude field, configuration and fit decisions in the `BF_free_consensus/1` format. Existing archives with the earlier name remain readable through the compatibility loader. On loading, the implementation checks these fields and rejects malformed, incompatible or oversized archives. The fitting admission budget is an estimate of working allocations, currently 1 GiB; it is not a limit on the entire application's memory use, which also includes decoding and pyramid construction.
 
-Rank1 requires a supported stitched, single-frame ND2 slide with the original source available and at least one FITC or CY3 channel. Plate/time-series acquisitions, Z projections, RGB data and other source formats are not supported for this correction. The existing **BF-guided** H method remains a separate manual choice when its own BF and camera-metadata requirements are met. An unsupported Rank1 fit does not silently invoke H.
+Correction requires a supported stitched, single-frame ND2 slide with the original source available and at least one FITC or CY3 channel. Plate/time-series acquisitions, Z projections, RGB data and other source formats are not supported for this correction. Existing H corrections remain readable and can be revoked. New applications use the fluorescence-only method; an unsupported fit does not switch to H.
 
 Source tests cover equivalence to the frozen reference procedure, channel decisions, native gain interpolation, subregion consistency, float64 division, exact identity for BF/DAPI, model reopen, malformed archives, memory admission and cancellation. Transaction tests cover cache publication, reopening, Revoke and original-value export paths. These are engineering checks. Within-acquisition periodic consistency cannot establish whether a repeating structure is illumination or specimen signal, and it does not establish biological preservation or quantitative assay validity. Inspect the corrected image before using rendered exports.
 
-The README before/after images and all numerical results in the following H sections describe the older BF-guided method. They are not evidence of Rank1 performance. The macOS source GUI smoke passed 12 checks of panel routing, held-key repeats and editable-field protection through AppKit and WKWebView. This used process-local synthetic Latin key events, not physical keyboard input. Packaged platform checks are recorded with the release artifacts. This smoke does not assess native Windows keyboard input.
+The numerical results in the following H sections describe the older BF-guided method; they are not performance evidence for the current fluorescence-only method. Packaged platform checks are recorded with the release artifacts.
 
-## BF-guided (H): retained method and historical evidence
+## BF-guided (H): legacy corrections and historical evidence
 
 Version 2.2.1 evaluates FITC, CY3 and BF separately using the same scan's BF channel and recorded camera geometry. DAPI remains unchanged. When the original H fit cannot find enough complete repeated fields in its fixed validation regions, an adaptive fallback fits a periodic template with an amplitude that varies smoothly across the scan. Each target channel must pass its own evidence checks before it is corrected.
 
@@ -79,8 +79,8 @@ The final percentages each describe one accepted field, not whole-slide performa
 
 ## Interpretation and storage
 
-The README comparison is a selected development example of the original H method. It illustrates a result on that acquisition; it does not establish Rank1 performance or improvement on other scans. Visual preference and local contrast checks do not establish biological preservation or quantitative assay validity.
+The historical H examples describe selected development acquisitions; they do not establish performance of the current fluorescence-only method or improvement on other scans. Visual preference and local contrast checks do not establish biological preservation or quantitative assay validity.
 
 An accepted correction replaces the viewing pyramid and persists its model, source identity, settings and selection record. Reopening uses that saved correction. Revoke rebuilds the original pyramid from the ND2. PNG/JPEG/SVG exports render the corrected display and use a `shading-corrected` filename suffix; native ND2/TIFF exports, including reduced-resolution exports, and pixel readouts retain original values. The original ND2, annotations and saved LUTs remain unchanged. Cancellation or failure before publication leaves the current committed cache intact.
 
-Updating the application retains existing saved corrections. The loader still reads earlier H formats and the BF-free preview format `BF_free_periodic_x1/1`; that preview fitter is not the 2.4.0 default. New Rank1 caches require version 2.4.0 or later. Revoke and Apply are required to refit an already corrected cache with the selected method.
+Updating the application retains existing saved corrections. The loader still reads earlier H formats and the BF-free preview format `BF_free_periodic_x1/1`; that preview fitter is not the 2.4.0 default. New consensus caches require this release or later. Revoke and Apply are required to refit an already corrected cache with the current method.

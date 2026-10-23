@@ -221,7 +221,7 @@ def test_bf_remains_a_target_without_fluorescence_channels(state):
     assert controller._thread is None
 
 
-def test_rank1_is_default_without_bf_but_loading_does_not_start_work(state, monkeypatch):
+def test_consensus_is_default_without_bf_but_loading_does_not_start_work(state, monkeypatch):
     state.attrs["omero"]["channels"][1]["label"] = "unknown"
     controller = hc.HCorrectionController(state)
     status = controller.status()
@@ -237,7 +237,7 @@ def test_rank1_is_default_without_bf_but_loading_does_not_start_work(state, monk
     assert calls == [("apply", "bffree"), ("apply", "h")]
 
 
-def test_rank1_requires_a_correctable_channel_but_legacy_dapi_mapping_loads():
+def test_consensus_requires_a_correctable_channel_but_legacy_dapi_mapping_loads():
     with pytest.raises(hc.UnsupportedCorrection, match="FITC or CY3"):
         hc._mapping(["BF", "DAPI"], "bffree")
     assert hc._mapping(["BF", "DAPI"], "bffree", require_correctable=False) == {"DAPI": 1}
@@ -451,7 +451,7 @@ def test_model_validation_abstention_is_readable_and_never_replaces_pyramid(stat
     controller.start("h")
     status = done(controller)
     assert status["state"] == "unsupported"
-    assert status["supported"] is True  # The separate Rank1 method remains selectable.
+    assert status["supported"] is True  # The default correction remains supported.
     assert status["methods"]["h"]["supported"] is False
     assert status["methods"]["bffree"]["supported"] is True
     assert status["applied"] is False

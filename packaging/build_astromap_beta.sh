@@ -57,7 +57,8 @@ from nd2wsi.smoke import _verify_sdpc_runtime_license
 
 assert pathlib.Path(nd2wsi.__file__).resolve().parent == pathlib.Path(sys.argv[1]) / 'nd2wsi'
 for name in ('PyInstaller', 'numpy', 'scipy', 'nd2', 'zarr', 'numcodecs', 'dask',
-             'tifffile', 'imagecodecs', 'limnd2', 'av', '_tkinter'):
+             'tifffile', 'imagecodecs', 'limnd2', 'av', '_tkinter',
+             'reportlab', 'pypdf', 'charset_normalizer'):
     if importlib.util.find_spec(name) is None:
         raise SystemExit(f'Missing build dependency: {name}')
 scripts = pathlib.Path(webview.__file__).parent / 'js'
@@ -82,6 +83,7 @@ echo "Beta build stage: $STAGE"
   --collect-all tifffile --collect-all imagecodecs --collect-all limnd2 \
   --collect-all ome_types --collect-all xsdata --collect-all xsdata_pydantic_basemodel \
   --collect-all webview --collect-all av \
+  --collect-all reportlab --collect-all pypdf --collect-all charset_normalizer \
   --distpath "$STAGE/dist" --workpath "$STAGE/build" --specpath "$STAGE" \
   "$HERE/launch_astromap_beta.py"
 APP="$STAGE/dist/$NAME.app"
@@ -122,6 +124,10 @@ from PyInstaller.archive.readers import CArchiveReader
 
 app, root, report = map(Path, sys.argv[1:])
 archive = CArchiveReader(str(app / 'Contents/MacOS/nd2wsi-viewer Astromap Beta')).open_embedded_archive('PYZ.pyz')
+for required in ('reportlab.pdfgen.canvas', 'reportlab.pdfbase.ttfonts',
+                 'pypdf', 'charset_normalizer'):
+    assert required in archive.toc, required
+assert (app / 'Contents/Resources/reportlab/fonts/Vera.ttf').is_file()
 def normalized(code):
     return code.replace(co_filename='<source>', co_consts=tuple(
         normalized(item) if isinstance(item, CodeType) else item for item in code.co_consts))

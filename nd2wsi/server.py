@@ -652,6 +652,7 @@ class SlideRegistry:
             read_manifest,
         )
         from .convert import CACHE_DIR_NAME, is_nd2wsi_store, open_store
+        from .raster import is_raster
         from .sdpc import is_sdpc
         from .svs import is_svs
 
@@ -662,6 +663,8 @@ class SlideRegistry:
         registered_source = (
             Path(source_path).expanduser().resolve() if source_path is not None else None
         )
+        if is_raster(store_path):
+            return self.add_direct(store_path)
         if store_path.suffix.lower() == ".nd2" and store_path.is_file():
             from .plate import is_plate_file
 
@@ -872,10 +875,13 @@ class SlideRegistry:
     def add_direct(self, slide_path: str | Path) -> str:
         """Serve an RGB slide without a pixel cache; isolate Agent annotations."""
         from .cache import fingerprints_match, quick_fingerprint
+        from .raster import is_raster
         from .sdpc import is_sdpc
 
         slide_path = Path(slide_path).resolve()
-        if is_sdpc(slide_path):
+        if is_raster(slide_path):
+            from .raster import open_direct
+        elif is_sdpc(slide_path):
             from .sdpc import open_direct
         else:
             from .direct import open_direct
@@ -1035,6 +1041,7 @@ class SlideRegistry:
         """A slide file (converted on first open) or an existing store."""
         from .cache import SINGLE_FILE_SUFFIX
         from .convert import ensure_cache, existing_cache_store
+        from .raster import is_raster
         from .sdpc import is_sdpc
         from .svs import is_svs
 
@@ -1042,7 +1049,7 @@ class SlideRegistry:
         if path.suffix.lower() == SINGLE_FILE_SUFFIX:
             return self.add_store(path)
         path = path.resolve()
-        if is_sdpc(path):
+        if is_sdpc(path) or is_raster(path):
             return self.add_direct(path)
         if path.suffix.lower() in SLIDE_SUFFIXES:
             if is_svs(path) and existing_cache_store(path, read_only=self.agent_window) is None:
@@ -1066,7 +1073,7 @@ class SlideRegistry:
         elif path.is_dir():  # a user-supplied *.ome.zarr store
             return self.add_store(path)
         else:
-            raise ValueError(f"not an ND2/SVS/SDPC slide, .nd2svs cache, or pyramid store: {path.name}")
+            raise ValueError(f"not an ND2/SVS/SDPC slide, JPEG/PNG image, .nd2svs cache, or pyramid store: {path.name}")
         # no explicit trash_path: add_store promotes a container store to its
         # container, so trashing removes manifest and pixels together
         return self.add_store(store, source_path=path)
@@ -1846,7 +1853,8 @@ def make_handler(
                     for ch in st.attrs["omero"]["channels"]
                 ],
                 "maxRenderMpx": st.max_render_mpx,
-                "nd2Export": _limnd2_available(),
+                "nd2Export": _limnd2_available() and not meta.get("raster", False),
+                "raster": bool(meta.get("raster")),
                 "direct": bool(meta.get("direct")),
                 "trashable": st.trash_path is not None and registry.window_session is None,
                 "generation": st.generation,

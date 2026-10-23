@@ -19,7 +19,7 @@
     </div>
     <div class="tb-spacer"></div>
     <div class="tb-group">
-      <button class="tb-btn" id="tb-channels" title="Show or hide Channels &amp; LUTs (⌘C)" aria-keyshortcuts="Meta+C">
+      <button class="tb-btn" id="tb-channels" title="Show or hide Channels &amp; LUTs (C)" aria-keyshortcuts="C">
         <span class="tb-ico icon-sliders" aria-hidden="true"></span><span>Channels</span>
       </button>
       <button class="tb-btn" id="tb-region" title="Show or hide Export (E)" aria-keyshortcuts="E">
@@ -27,7 +27,7 @@
           <svg viewBox="0 0 24 24"><path d="M5 3a2 2 0 0 0-2 2M19 3a2 2 0 0 1 2 2M21 19a2 2 0 0 1-2 2M5 21a2 2 0 0 1-2-2M9 3h1M9 21h1M14 3h1M14 21h1M3 9v1M21 9v1M3 14v1M21 14v1"/></svg>
         </span><span>Export</span>
       </button>
-      <button class="tb-btn" id="tb-annot" title="Show or hide Annotations (⌘A)" aria-keyshortcuts="Meta+A">
+      <button class="tb-btn" id="tb-annot" title="Show or hide Annotations (A)" aria-keyshortcuts="A">
         <span class="tb-ico icon-note" aria-hidden="true">
           <svg viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>
         </span><span>Annotate</span>
@@ -162,11 +162,11 @@
             <span class="unit">µm</span></span></div>
           <div class="roi-line"><span class="k">Raw size</span><span class="v" id="roi-bytes">–</span></div>
           <div class="roi-line"><span class="k">Scale</span><span class="v" id="roi-scale-dims">–</span></div>
-          <div id="roi-scales" class="scale-strip" title="Rendered export scale"></div>
-          <div class="hint" id="roi-scale-note">ND2 and TIFF use native values.</div>
+          <div id="roi-scales" class="scale-strip" title="TIFF, PNG and JPEG export scale"></div>
+          <div class="hint" id="roi-scale-note">TIFF uses the selected scale; ND2 stays native.</div>
           <div class="roi-actions">
             <button id="roi-dl-nd2" class="btn primary" title="Original values before Shading Correction, with supported source metadata">ND2</button>
-            <button id="roi-dl-tiff" class="btn" title="Tiled original values before Shading Correction">TIFF</button>
+            <button id="roi-dl-tiff" class="btn" title="Raw channels before Shading Correction, at the selected scale">TIFF</button>
             <button id="roi-dl-png" class="btn" title="Rendered as displayed">PNG</button>
             <button id="roi-dl-jpg" class="btn" title="Rendered as displayed">JPEG</button>
           </div>
@@ -221,6 +221,27 @@
         <span class="win-title"><span class="astromap-icon" aria-hidden="true"></span>Astromap</span>
       </div>
       <div class="win-body">
+        <div class="tool-row astromap-import-row">
+          <button type="button" id="astromap-import" class="btn full">Import ROI TXT</button>
+          <input type="file" id="astromap-import-file" accept=".txt,text/plain" hidden />
+        </div>
+        <div id="astromap-import-options" hidden>
+          <p class="hint" id="astromap-import-name"></p>
+          <p class="hint">Confirm the coordinate image size, or choose the matching JPG or PNG.</p>
+          <div class="astromap-import-size">
+            <label>Width <input id="astromap-import-width" class="dim" type="number" inputmode="numeric" min="1" step="1" aria-label="Coordinate image width in pixels" /> px</label>
+            <label>Height <input id="astromap-import-height" class="dim" type="number" inputmode="numeric" min="1" step="1" aria-label="Coordinate image height in pixels" /> px</label>
+          </div>
+          <div class="tool-row footer">
+            <button type="button" id="astromap-import-jpg" class="btn">Choose matching small.jpg</button>
+            <input type="file" id="astromap-import-jpg-file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" hidden />
+          </div>
+          <div class="tool-row footer">
+            <button type="button" id="astromap-import-cancel" class="btn">Cancel</button>
+            <button type="button" id="astromap-import-confirm" class="btn primary grow2">Import regions</button>
+          </div>
+        </div>
+        <p id="astromap-import-status" class="hint" role="status" aria-live="polite"></p>
         <div class="tool-row">
           <button type="button" id="astromap-draw" class="btn">Draw ROI</button>
           <button type="button" id="astromap-add-current" class="btn">Add current region</button>
@@ -228,9 +249,15 @@
         <p class="hint" id="astromap-hint">Shift-drag to add a rectangle. Pan and zoom as usual.</p>
         <div id="astromap-list" aria-label="Astromap regions"></div>
         <p class="hint" id="astromap-empty">Add a region, then enter a note.</p>
+        <div class="tool-row footer">
+          <button type="button" id="astromap-clear-all" class="btn danger full" title="Remove all Astromap regions">Clear all</button>
+        </div>
         <p class="hint" id="astromap-size"></p>
         <div class="tool-row footer">
           <button type="button" id="astromap-export" class="btn primary full">Export JPG + TXT</button>
+        </div>
+        <div class="tool-row footer astromap-pdf-footer">
+          <button type="button" id="astromap-export-pdf" class="btn astromap-pdf full" title="Include an SG-layout ROI navigation PDF with vector labels">Export ZIP with PDF</button>
         </div>
         <div id="astromap-status" class="hint" role="status" aria-live="polite"></div>
       </div>
@@ -334,6 +361,7 @@
 <script src="../../static/plate-controller-v1.js"></script>
 <script src="../../static/shading-correction-v1.js"></script>
 <script src="../../static/astromap-v1.js"></script>
+<script src="../../static/astromap-import-v1.js"></script>
 <script src="../../static/app.js"></script>
 </body>
 </html>

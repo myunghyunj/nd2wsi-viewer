@@ -196,7 +196,7 @@ def key(letter, **kwargs):
 
 @pytest.mark.parametrize("letter,button,tool", [
     ("E", "tb-region", None), ("P", None, "pin"),
-    ("C", None, None), ("A", None, None), ("R", None, None),
+    ("C", "tb-channels", None), ("A", "tb-annot", None), ("R", None, None),
 ])
 def test_owned_letters_run_before_osd_canvas_defaults(letter, button, tool):
     out = pane([key(letter)])
@@ -268,6 +268,7 @@ def test_osd_vetoes_composition_even_when_the_browser_reports_a_latin_keycode(
 
 
 @pytest.mark.parametrize("letter,action,pose", [
+    ("T", "rotate-right", {"degrees": 90, "flipped": False}),
     ("R", "rotate-right", {"degrees": 90, "flipped": False}),
     ("F", "flip-horizontal", {"degrees": 0, "flipped": True}),
 ])
@@ -282,14 +283,16 @@ def test_command_orientation_runs_the_production_action_once(letter, action, pos
     assert out["events"] == [{"prevented": True, "stopped": True}]
 
 
-def test_clockwise_rotation_reverses_the_osd_increment_when_mirrored():
-    out = pane([key("R", metaKey=True)], degrees=0, flipped=True)
+@pytest.mark.parametrize("turn_key", ["T", "R"])
+def test_clockwise_rotation_reverses_the_osd_increment_when_mirrored(turn_key):
+    out = pane([key(turn_key, metaKey=True)], degrees=0, flipped=True)
     assert out["pose"] == {"degrees": 270, "flipped": True}
     assert out["applied"] == [out["pose"]]
 
 
 @pytest.mark.parametrize("letter,meta", [("E", False), ("R", False), ("F", False),
-                                         ("R", True), ("F", True), ("C", True),
+                                         ("C", False), ("A", False),
+                                         ("T", True), ("R", True), ("F", True), ("C", True),
                                          ("A", True), ("I", True)])
 def test_held_keys_are_reserved_without_repeating_panels_or_orientation(letter, meta):
     out = pane([key(letter, metaKey=meta, repeat=True)])
@@ -304,21 +307,25 @@ def test_held_keys_are_reserved_without_repeating_panels_or_orientation(letter, 
 ])
 def test_text_editing_keeps_plain_and_command_keys(target):
     out = pane([key("E", target=target, outsideCanvas=True),
+                key("C", target=target, outsideCanvas=True),
+                key("A", target=target, outsideCanvas=True),
                 key("F", target=target, outsideCanvas=True, metaKey=True),
+                key("T", target=target, outsideCanvas=True, metaKey=True),
                 key("C", target=target, outsideCanvas=True, metaKey=True),
                 key("A", target=target, outsideCanvas=True, metaKey=True),
                 key("I", target=target, outsideCanvas=True, metaKey=True)])
-    assert out["events"] == [{"prevented": False, "stopped": False}] * 5
+    assert out["events"] == [{"prevented": False, "stopped": False}] * 8
     assert out["clicks"] == out["orientationCalls"] == out["applied"] == []
 
 
 @pytest.mark.parametrize("plate", [False, True])
-def test_checkbox_export_shortcut_runs_and_space_remains_native(plate):
+@pytest.mark.parametrize("letter,button", [("C", "tb-channels"), ("E", "tb-region"), ("A", "tb-annot")])
+def test_checkbox_panel_shortcut_runs_and_space_remains_native(plate, letter, button):
     target = {"tag": "INPUT", "type": "checkbox"}
-    out = pane([key("E", target=target, outsideCanvas=True),
+    out = pane([key(letter, target=target, outsideCanvas=True),
                 {"key": " ", "code": "Space", "keyCode": 32, "target": target, "outsideCanvas": True}],
                plate=plate)
-    assert out["clicks"] == ["tb-region"]
+    assert out["clicks"] == [button]
     assert out["events"] == [{"prevented": True, "stopped": True},
                              {"prevented": False, "stopped": False}]
     assert out["osdKeydowns"] == 0
@@ -357,13 +364,29 @@ def test_shell_plain_l_opens_compare_link_menu_from_non_typing_controls(key_valu
     assert out == {"consumed": {"prevented": True, "stopped": False}, "menuHidden": False}
 
 
-def test_ime_composition_remains_unhandled_and_latin_shortcuts_work_afterward():
-    out = pane([key("E", key="ㄷ", keyCode=229, isComposing=True),
-                key("E", key="ㄷ", keyCode=69)])
+@pytest.mark.parametrize("letter,korean,button", [("C", "ㅊ", "tb-channels"),
+                                                 ("E", "ㄷ", "tb-region"),
+                                                 ("A", "ㅁ", "tb-annot")])
+def test_ime_composition_remains_unhandled_and_latin_shortcuts_work_afterward(letter, korean, button):
+    out = pane([key(letter, key=korean, keyCode=229, isComposing=True),
+                key(letter, key=korean)])
     assert out["events"] == [{"prevented": False, "stopped": False},
                              {"prevented": True, "stopped": True}]
-    assert out["clicks"] == ["tb-region"]
+    assert out["clicks"] == [button]
     assert out["osdRotations"] == []
+
+
+@pytest.mark.parametrize("platform", ["MacIntel", "Win32"])
+@pytest.mark.parametrize("letter,korean,button", [("C", "ㅊ", "tb-channels"),
+                                                 ("E", "ㄷ", "tb-region"),
+                                                 ("A", "ㅁ", "tb-annot")])
+def test_plain_panels_run_once_before_osd_in_both_keyboard_layouts(platform, letter, korean, button):
+    out = pane([key(letter), key(letter, repeat=True), key(letter, key=korean),
+                key(letter, key=korean, repeat=True)], platform=platform)
+    assert out["clicks"] == [button, button]
+    assert out["events"] == [{"prevented": True, "stopped": True}] * 4
+    assert out["targetDeliveries"] == out["osdKeydowns"] == 0
+    assert out["osdRotations"] == out["pans"] == []
 
 
 @pytest.mark.parametrize("letter,button", [("C", "tb-channels"), ("A", "tb-annot"),
@@ -397,6 +420,40 @@ def test_shell_panel_shortcuts_reach_only_the_active_tab_once(letter, panel, pla
     }]
 
 
+@pytest.mark.parametrize("platform", ["MacIntel", "Win32"])
+@pytest.mark.parametrize("letter,korean,panel", [("C", "ㅊ", "channels"),
+                                                ("E", "ㄷ", "region"),
+                                                ("A", "ㅁ", "annot")])
+def test_shell_plain_panels_target_active_tab_from_buttons_and_checkboxes(platform, letter, korean, panel):
+    out = run_shell(f"""
+      active='a'; compare.orientationSid='c';
+      const flags={{code:'Key{letter}',target:{{tagName:'BUTTON',closest:()=>null}}}};
+      const first=pressKey('{letter.lower()}',flags);
+      const held=pressKey('{letter.lower()}',{{...flags,repeat:true}});
+      const korean=pressKey({json.dumps(korean)},{{...flags,
+        target:{{tagName:'INPUT',type:'checkbox',closest:()=>null}}}});
+      ({{first,held,korean,messages}});
+    """, platform=platform)
+    assert out["first"] == out["held"] == out["korean"] == {"prevented": True, "stopped": True}
+    assert out["messages"] == [{
+        "sid": "a", "nd2wsi": "pane-panel-shortcut", "version": 2, "panel": panel,
+        "paneInstanceId": "pane-a", "contextEpoch": 1, "spatialContextKey": "context-a",
+    }] * 2
+
+
+@pytest.mark.parametrize("letter", ["C", "E", "A"])
+def test_shell_plain_panel_letters_preserve_text_entry_ime_and_unowned_modifiers(letter):
+    out = run_shell(f"""
+      const events=[{{target:{{tagName:'INPUT'}}}},{{target:{{tagName:'TEXTAREA'}}}},
+        {{target:{{isContentEditable:true}}}},{{isComposing:true}},{{keyCode:229}},
+        {{altKey:true}},{{shiftKey:true}}].map(flags=>
+          pressKey('{letter.lower()}',{{code:'Key{letter}',...flags}}));
+      ({{events,messages}});
+    """)
+    assert out["events"] == [{"prevented": False, "stopped": False}] * 7
+    assert out["messages"] == []
+
+
 @pytest.mark.parametrize("letter", ["C", "A", "E", "I"])
 @pytest.mark.parametrize("overrides", [
     "target:{tagName:'INPUT'}", "target:{tagName:'TEXTAREA'}",
@@ -411,7 +468,7 @@ def test_shell_panel_shortcuts_preserve_editing_and_route_only_owned_chords(lett
     """)
     if letter == "A" and overrides == "shiftKey:true":
         assert out["messages"] == [{
-            "sid": "a", "nd2wsi": "astromap-toggle", "version": 2, "open": True,
+            "sid": "a", "nd2wsi": "astromap-toggle", "version": 2, "open": False,
             "paneInstanceId": "pane-a", "contextEpoch": 1, "spatialContextKey": "context-a",
         }]
         assert out["consumed"] == {"prevented": True, "stopped": True}
@@ -549,6 +606,7 @@ def test_shell_focused_message_is_bound_to_the_same_local_pane_context(config, a
 
 
 @pytest.mark.parametrize("letter,pose", [
+    ("t", {"degrees": 90, "flipped": False}),
     ("r", {"degrees": 90, "flipped": False}),
     ("f", {"degrees": 0, "flipped": True}),
 ])
@@ -572,9 +630,10 @@ def test_shell_command_orientation_targets_active_linked_slide(letter, pose, pla
     "{metaKey:true,target:{tagName:'INPUT',closest:()=>null}}",
     "{metaKey:true,isComposing:true}",
 ])
-def test_shell_orientation_uses_strict_command_modifiers_and_typing_guards(overrides):
+@pytest.mark.parametrize("turn_key", ["T", "R"])
+def test_shell_orientation_uses_strict_command_modifiers_and_typing_guards(overrides, turn_key):
     out = run_shell(f"""
-      const consumed=pressKey('r',{{code:'KeyR',...{overrides}}});
+      const consumed=pressKey('{turn_key.lower()}',{{code:'Key{turn_key}',...{overrides}}});
       ({{consumed,pending:compare.pendingRequest,commands:messages.filter(m=>m.nd2wsi)}});
     """)
     assert out["pending"] is None

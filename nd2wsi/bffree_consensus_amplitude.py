@@ -1,6 +1,6 @@
 """Pinned fluorescence-only research mathematics, packaged without external paths.
 
-Ported from the verified ExM consensus rank-1 implementation. Numerical
+Ported from the verified ExM consensus implementation. Numerical
 operations and frozen defaults are retained; checkpoints support cancellation.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ METHOD_DESCRIPTION = (
     "Confidence-weighted robust nonnegative low-rank amplitude decomposition "
     "A = U @ V.T, jointly optimized over orthogonal positions and complete "
     "periods. Quadratic amplitude-gradient penalties use physical distance in "
-    "units of P. Exactly two candidates allow rank 1 or rank 2. T and its "
+    "units of P. T and its "
     "P-spaced phase lattice are not changed. Invalid nodes stay zero. Valid "
     "zero-weight nodes can be predicted within two periods of supported "
     "evidence in their valid connected component. Only the inherited generic "
@@ -32,10 +32,7 @@ _BASE = dict(
     function_tolerance=1e-11,
     gradient_tolerance=1e-8,
 )
-VARIANTS = {
-    "consensus_rank1": {**_BASE, "rank": 1},
-    "consensus_rank2": {**_BASE, "rank": 2},
-}
+DEFAULT_CONFIG = {**_BASE, "rank": 1}
 
 
 def _weighted_median(values, weights):

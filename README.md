@@ -1,11 +1,11 @@
-> **v2.4.0 · macOS & Windows.** Shading Correction now defaults to **Rank1 (BF-free)** for supported FITC and CY3 channels in stitched ND2 slides.
-> Rank1 estimates the repeating pattern from fluorescence; BF and DAPI stay unchanged. The existing **BF-guided** method remains available by manual selection.
-> Corrections persist in the viewing cache. Original slides, raw exports, annotations and saved LUTs retain their existing preservation rules. [Release details and limits](docs/release-notes-2.4.0.md).
+> **v2.4.1 · macOS & Windows.** Fixed keyboard shortcuts and whole-slide TIFF export at half resolution.
+> Added periodic shading correction for supported FITC/CY3 channels, with BF and DAPI unchanged.
+> Added Astromapper ROI import/export, direct JPG annotation and optional PDF reports. [Release details](docs/release-notes-2.4.1.md).
 
 > [!NOTE]
 > **Windows support is now available, including ARM PCs.**<br>
 > Runs on Intel/AMD (x64) PCs and Windows 11 ARM64 PCs through x64 emulation, including Parallels on Apple silicon.<br>
-> [Download Windows v2.4.0 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.0/nd2wsi-viewer-2.4.0-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
+> [Download Windows v2.4.1 (portable ZIP)](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.1/nd2wsi-viewer-2.4.1-windows-x64.zip) · [Windows installation guide](#windows-intel-amd-and-arm-pcs)
 
 <p align="center">
   <img src="docs/icon.png" alt="nd2wsi-viewer icon" width="112">
@@ -59,17 +59,17 @@ Nothing leaves your computer. There is no upload and no account.
 
 ### Windows (Intel, AMD, and ARM PCs)
 
-Download [nd2wsi-viewer-2.4.0-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.0/nd2wsi-viewer-2.4.0-windows-x64.zip)
-and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.0/nd2wsi-viewer-2.4.0-windows-x64.zip.sha256).
+Download [nd2wsi-viewer-2.4.1-windows-x64.zip](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.1/nd2wsi-viewer-2.4.1-windows-x64.zip)
+and its [SHA-256 checksum](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.1/nd2wsi-viewer-2.4.1-windows-x64.zip.sha256).
 Extract the entire ZIP and open `nd2wsi-viewer.exe`; keep `_internal` beside it.
 Python and scientific libraries are included; no separate Python installation
-or GPU is required. This release provides a portable ZIP, not a v2.4.0
+or GPU is required. This release provides a portable ZIP, not a v2.4.1
 Setup installer. The older v1.2.8 Setup cannot read v2 `.nd2svs` caches.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
 Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
-[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.4.0) for the
+[release](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.4.1) for the
 exact source commit, archive checksums, and platform verification results.
 Windows 10 Education and local Parallels were not tested for this release.
 .NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
@@ -133,27 +133,17 @@ Every fluorescence channel has its own row in the Channels panel. Pick a color, 
 
 The standard viewer remembers each file's last-used minimum, maximum and gamma across app restarts. Saved LUTs take precedence over initial Auto; Reset restores the channel's metadata defaults and remembers that choice too. Preferences live in local application data, not in the image or its annotations. A moved, replaced or incompatible file uses normal defaults. The opt-in Metal viewer's independent controls are not persisted.
 
-The **Shading Correction** button in the tab strip estimates repeating illumination shading in a supported stitched ND2 scan and replaces its existing `.nd2svs` viewing pyramid with the corrected pyramid. The correction remains saved after closing and reopening the slide. The confirmation defaults to **Rank1 (BF-free)**, which uses the slide's fluorescence to correct supported FITC and CY3 channels while keeping BF and DAPI unchanged. A BF channel is not required. Choose **BF-guided** to use the existing H method instead when its requirements are met; the viewer does not switch methods automatically if Rank1 cannot fit a channel.
+The **Shading Correction** button in the tab strip estimates repeating illumination shading from a supported stitched ND2 scan's fluorescence. It corrects supported FITC and CY3 channels while keeping BF and DAPI unchanged; a BF channel is not required. The corrected `.nd2svs` viewing pyramid remains saved after closing and reopening the slide.
 
-Click the button to review the method and estimated preparation time, then choose the green **Continue** button to begin or the red **Cancel** button to dismiss. Opening a slide alone does not start a correction. The estimate varies with the computer and storage speed. During preparation, a progress bar shows the stage and an updated approximate remaining time; Cancel stops the work before the final replacement.
+The confirmation shows the saved-pyramid notice and estimated preparation time. Choose the green **Continue** button to begin or the red **Cancel** button to dismiss. Opening a slide alone does not start a correction. During preparation, a progress bar shows the stage and approximate remaining time; Cancel stops the work before the final replacement.
 
-| Before — original | After — BF-guided (H) correction |
-|:---:|:---:|
-| ![Original FITC acquisition with vertical shading bands](docs/shading-correction-before.png) | ![The same FITC acquisition after H correction, with reduced vertical banding](docs/shading-correction-after.png) |
+After applying correction, the button offers **Revoke**. Revoke rebuilds the original viewing pyramid from the source ND2 and replaces the corrected cache. Both operations require the original ND2. Cancellation or failure before the final replacement leaves the current cache untouched. If the replacement is saved but cannot be activated immediately, the valid saved cache is retained; reopen the slide when prompted.
 
-*Historical FITC development example of the BF-guided H method. These images do not show Rank1 results. Both panels show the full acquisition with identical LUT settings (6,435.36–26,115.71 ADU; gamma 1.0), reduced for display. Vertical banding is reduced, while some seams remain. Results vary by scan.*
-
-After applying correction, the button offers **Revoke**. Revoke rebuilds the original viewing pyramid from the source ND2 and replaces the corrected cache, so returning to the original display takes another preparation step. Both operations require the original ND2. Cancellation or failure before the final replacement leaves the current cache untouched. If the replacement is saved but cannot be activated immediately, the valid saved cache is retained; reopen the slide when prompted.
-
-Rank1 uses the adopted `consensus_rank1` model: a repeating template for each supported channel with an amplitude that varies across the scan. FITC and CY3 are assessed separately; DAPI can contribute pattern proposals but is never corrected. BF pixels, BF-derived geometry and camera priors do not enter Rank1 fitting. Unsupported channels keep their original values. If no channel supports a correction, the original pyramid is retained and the viewer explains the outcome. Plate/time-series acquisitions and Z projections remain unsupported.
-
-The manually selected BF-guided method retains its existing FITC, CY3 and BF correction and DAPI preservation rules. Inspect either method's result, especially at tissue boundaries: repeating specimen structures can resemble illumination, and fitting checks do not guarantee improvement in every field or establish biological signal preservation. See the [method and validation limits](docs/shading-correction-validation.md).
+The model estimates a repeating template for each supported channel with an amplitude that varies across the scan. FITC and CY3 are assessed separately; DAPI can contribute pattern proposals but is never corrected. BF pixels, BF-derived geometry and camera priors do not enter fitting. Unsupported channels keep their original values. If no channel supports a correction, the original pyramid is retained. Plate/time-series acquisitions and Z projections remain unsupported. See the [method and validation limits](docs/shading-correction-validation.md).
 
 PNG, JPEG and SVG exports use the saved correction and include `shading-corrected` in their filenames. Native ND2/TIFF exports, including reduced-resolution exports, and pixel readouts retain original values. The original ND2, annotations and saved LUTs remain unchanged. Temporary preparation files are released after the operation; the corrected viewing cache remains saved until revoked.
 
-New Rank1 corrected caches require version 2.4.0 or later. Existing H corrections and earlier BF-free preview caches remain readable with their saved models; an application update does not silently refit them.
-
-Existing saved corrections are retained after an application update. Use **Revoke**, then **Apply**, to fit again with the current method.
+Existing H corrections and earlier BF-free preview caches remain readable with their saved models; an application update does not silently refit them. Use **Revoke**, then **Apply**, to fit again with the current method.
 
 For exact settings, choose the **Type LUT** pencil icon and enter each channel's minimum, maximum and gamma. Apply updates the channels together; invalid entries leave every channel unchanged, and Cancel discards the edits. Use **Copy LUT** and **Paste LUT** to reuse those settings in another window. Paste matches unique channel names regardless of order and skips unmatched, duplicate, invalid or incompatible entries. It does not copy colors or visibility and does not change raw pixels or annotations. The pencil, copy and paste actions use matching borderless 16 px Fluent icons. Hover over each icon for about one second to see a short explanation, also available with keyboard focus. A successful copy immediately changes the copy icon to a brief green check with **Copied!**.
 
@@ -237,7 +227,7 @@ From left: H&E, Masson's trichrome, and CD31 immunofluorescence of the same case
 
 Open two or more slides, press `⌘\`, and choose which slide to compare with the one in front. Then choose **Off**, **Link scale**, or **Link scale + frame**. Link scale matches micrometres per displayed pixel while letting you move each image independently; Link scale + frame also links movement using the alignment. Press `+` in the capsule to add more slides, up to four. Two slides share the screen, three take a column each, and four fill a grid. Physical linking requires valid pixel calibration in every image; incompatible pixel shapes or orientations show a reason instead of claiming equal scale. Zoom percentages may differ between scans because their pixel sizes differ. Here, frame means viewport position, not acquisition T/P/Z indices.
 
-Scans taken through opposite sides of the glass may need a reflection, not just a rotation. In Compare, choose the image in **Active linked slide**, then use **Flip ↔** (`⌘F`), **Flip ↕**, **↶ 90°**, **↷ 90°** (`⌘R`), or **Transpose** (swap the displayed horizontal and vertical axes). These are image-orientation controls, distinct from transposing the well grid. The reference stays fixed; only the selected linked image changes, around the current view center. **Reset Orientation** restores its original orientation without resetting that center. The viewer does not guess the orientation from `.svs` or `.nd2` filenames. Pair orientations are remembered while the app remains open.
+Scans taken through opposite sides of the glass may need a reflection, not just a rotation. In Compare, choose the image in **Active linked slide**, then use **Flip ↔** (`⌘F`), **Flip ↕**, **↶ 90°**, **↷ 90°** (`⌘T`), or **Transpose** (swap the displayed horizontal and vertical axes). These are image-orientation controls, distinct from transposing the well grid. The reference stays fixed; only the selected linked image changes, around the current view center. **Reset Orientation** restores its original orientation without resetting that center. The viewer does not guess the orientation from `.svs` or `.nd2` filenames. Pair orientations are remembered while the app remains open.
 
 The comparison toolbox's **×** only hides the tools: the linked panes and their alignment stay active. Use the **Show comparison tools** sliders button beside the tab-bar link button to reopen them. The tab-bar **link** button (or `⌘\`) ends the comparison; the link button inside the toolbox opens the three linking choices without closing the panes. Hiding tools also preserves an in-progress landmark edit, which can be resumed by reopening the toolbox.
 
@@ -292,9 +282,9 @@ Shortcuts act on the image workspace. They are ignored while typing in a text fi
 
 | Key | Action |
 |---|---|
-| `⌘C` | show or hide Channels & LUTs |
+| `C` | show or hide Channels & LUTs |
 | `E` | show or hide Export |
-| `⌘A` | show or hide Annotations |
+| `A` | show or hide Annotations |
 | `M` | measure |
 | `P` | place a pin |
 | `B` | draw a box |
@@ -310,16 +300,16 @@ Shortcuts act on the image workspace. They are ignored while typing in a text fi
 
 | Key | Action |
 |---|---|
-| `⌘R` | rotate the image 90° clockwise on screen |
+| `⌘T` | rotate the image 90° clockwise on screen (`⌘R` also works) |
 | `⌘F` | flip the image horizontally on screen |
 | `⌘\` | link slides |
 | `L` | choose Off, Link scale, or Link scale + frame |
 | `←` `→` `↑` `↓` | nudge the linked slide by a pixel, ten with Shift |
 | `⌥` drag | move one linked pane alone |
 
-`⌘R` and `⌘F` change the focused image when slides are unlinked. In Compare, they change the image selected in **Active linked slide**, while the reference stays fixed. They follow the same protections as the orientation buttons: choose **Remove Fit** before changing a fitted image, and open a site before orienting a plate image. They do not rotate or flip the plate grid.
+`⌘T` and `⌘F` change the focused image when slides are unlinked. Annotations and ROI overlays follow the image; their saved source coordinates remain unchanged. In Compare, these shortcuts change the image selected in **Active linked slide**, while the reference stays fixed. They follow the same protections as the orientation buttons: choose **Remove Fit** before changing a fitted image, and open a site before orienting a plate image. They do not rotate or flip the plate grid.
 
-In the image workspace, `⌘R` and `⌘F` take the place of browser Reload and Find. Holding either shortcut applies only one change; release and press again for another. `⌘C` opens Channels, `⌘A` opens Annotations, plain `E` opens Export, and `P` places a pin. Plain `C`, `A`, and `R` no longer open panels.
+In the image workspace, `⌘T` and `⌘F` control orientation. `⌘R` remains an alias for a clockwise turn. Holding an orientation shortcut applies only one change; release and press again for another. Plain `C` opens Channels, `A` opens Annotations, `E` opens Export, and `P` places a pin. `⌘C` and `⌘A` remain available as aliases when they do not conflict with native copy/select-all. Plain `R` remains reserved.
 
 ### Plate navigation
 
