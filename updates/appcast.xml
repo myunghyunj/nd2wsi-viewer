@@ -3,6 +3,23 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.5.2</title>
+            <pubDate>Fri, 23 Oct 2026 22:40:53 +0000</pubDate>
+            <sparkle:version>2.5.2</sparkle:version>
+            <sparkle:shortVersionString>2.5.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Astromapper, large JPEGs and linked-view alignment</h2>
+<ul>
+<li>Select a numbered Astromapper ROI, then use Left and Right to review adjacent regions without changing magnification.</li>
+<li>Open JPEGs up to 512 megapixels at their stored resolution, subject to a memory check before decoding.</li>
+<li>ROI import errors now identify invalid rows and mismatched reference dimensions while preserving existing annotations.</li>
+<li>Shift-drag adjusts one linked view's offset; the updated guide illustrates four-point manual alignment using corresponding histological features.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.2/nd2wsi-viewer-2.5.2-macos-arm64.dmg" sparkle:edSignature="dtbuXkooxXK+NlBvqeNvttqHG36B94+0FgAz7+spojHDoUbpdoR+IYyYovD7MEXkIRmOFFchSuOcZ1cXHh5tBg==" length="137317724" type="application/octet-stream"/>
+        </item>
+        <item>
             <title>2.5.1</title>
             <pubDate>Fri, 23 Oct 2026 15:37:08 +0000</pubDate>
             <sparkle:version>2.5.1</sparkle:version>
