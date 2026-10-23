@@ -157,7 +157,7 @@ def fake_persistence(state, monkeypatch):
 
 def test_controller_applies_then_rebuilds_raw_with_committed_generations(state, monkeypatch):
     prepared = fake_persistence(state, monkeypatch)
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     assert controller.status()["state"] == "idle"
     assert controller.status()["applied"] is False
     controller.start("h")
@@ -189,7 +189,7 @@ def test_controller_applies_then_rebuilds_raw_with_committed_generations(state, 
 
 def test_reopened_controller_restores_applied_status_from_manifest(state):
     mark_applied(state)
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     status = controller.status()
     assert status["state"] == "ready"
     assert status["applied"] is True
@@ -205,7 +205,7 @@ def test_reopened_controller_restores_applied_status_from_manifest(state):
 def test_reopened_controller_reports_all_three_corrected_channels(state):
     mark_applied(state)
     state.manifest["h_correction"]["channel_indices"] = [3, 0, 1]
-    status = hc.HCorrectionController(state).status()
+    status = hc.ShadingCorrectionController(state).status()
     assert status["channels"] == ["FITC", "CY3", "BF"]
     assert status["applied"] is True
 
@@ -213,7 +213,7 @@ def test_reopened_controller_reports_all_three_corrected_channels(state):
 def test_bf_remains_a_target_without_fluorescence_channels(state):
     state.attrs["omero"]["channels"][0]["label"] = "CY5"
     state.attrs["omero"]["channels"][3]["label"] = "GFP"
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     status = controller.status()
     assert status["supported"] is True
     assert status["state"] == "idle"
@@ -223,7 +223,7 @@ def test_bf_remains_a_target_without_fluorescence_channels(state):
 
 def test_consensus_is_default_without_bf_but_loading_does_not_start_work(state, monkeypatch):
     state.attrs["omero"]["channels"][1]["label"] = "unknown"
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     status = controller.status()
     assert status["supported"] and not status["applied"]
     assert status["method"] == "bffree"
@@ -276,7 +276,7 @@ def test_cancel_revoke_keeps_the_committed_corrected_state(state, monkeypatch):
         raise hp.PreparationCancelled()
 
     monkeypatch.setattr(hp, "prepare_revoke", prepare)
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     controller.revoke()
     assert entered.wait(3)
     running = controller.status()
@@ -311,7 +311,7 @@ def test_failure_preserves_committed_correction_and_generation(state, monkeypatc
         monkeypatch.setattr(hp, "prepare_" + operation, fail)
     else:
         state.replace_pyramid = fail
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     (lambda: controller.start("h") if operation == "apply" else controller.revoke())()
     status = done(controller)
     assert status["state"] == "failed"
@@ -334,7 +334,7 @@ def test_publish_disables_cancellation_until_atomic_activation_completes(state, 
         original_replace(replacement)
 
     state.replace_pyramid = replace
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     controller.start("h")
     assert entered.wait(3)
     assert controller.status()["state"] == "publishing"
@@ -358,7 +358,7 @@ def test_changed_generation_after_preparation_cannot_publish(state, monkeypatch)
         return replacement
 
     monkeypatch.setattr(hp, "prepare_apply", changed)
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     controller.start("h")
     status = done(controller)
     assert not any(item.published for item in prepared)
@@ -396,7 +396,7 @@ def test_cancel_fit_is_nonblocking_and_never_publishes(state, monkeypatch):
 
     monkeypatch.setattr(hc, "_metadata_for_state", metadata)
     monkeypatch.setattr(hc, "_fit_model", fit)
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     controller.start("h")
     assert entered.wait(3)
     first_thread = controller._thread
@@ -420,7 +420,7 @@ def test_no_enabled_targets_is_unchanged_not_ready(state, monkeypatch):
 
     monkeypatch.setattr(hc, "_metadata_for_state", metadata)
     monkeypatch.setattr(hc, "_fit_model", fitter)
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     controller.start("h")
     status = done(controller)
     assert status["state"] == "unchanged"
@@ -447,7 +447,7 @@ def test_model_validation_abstention_is_readable_and_never_replaces_pyramid(stat
     monkeypatch.setattr(h_model, "fit", abstain)
     monkeypatch.setattr(hp, "prepare_apply", forbidden)
     state.replace_pyramid = forbidden
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     controller.start("h")
     status = done(controller)
     assert status["state"] == "unsupported"
@@ -479,7 +479,7 @@ def test_model_validation_abstention_is_readable_and_never_replaces_pyramid(stat
 )
 def test_unsupported_state_never_starts_worker(state, change, reason):
     change(state)
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     status = controller.start("h")
     assert status["state"] == "unsupported"
     assert not status["supported"]
@@ -558,7 +558,7 @@ def test_closed_source_guard_blocks_worker_reads(state, monkeypatch):
     monkeypatch.setattr(hc, "_metadata_for_state", metadata)
     monkeypatch.setattr(hc, "_fit_model", fake_fitter)
     state.busy.close()
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     controller.start("h")
     status = done(controller)
     assert status["state"] == "failed"
@@ -568,7 +568,7 @@ def test_closed_source_guard_blocks_worker_reads(state, monkeypatch):
 
 
 def test_eta_is_estimated_only_after_progress(state, monkeypatch):
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     monkeypatch.setattr(hc.time, "monotonic", lambda: 110)
     controller._started_at = 100
     controller._status.update(state="preparing", pct=0)
@@ -595,7 +595,7 @@ def test_source_change_during_fit_cannot_publish(state, monkeypatch):
 
     monkeypatch.setattr(hc, "_metadata_for_state", metadata)
     monkeypatch.setattr(hc, "_fit_model", fitter)
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     controller.start("h")
     status = done(controller)
     assert status["state"] == "unsupported"
@@ -625,7 +625,7 @@ def test_preflight_estimate_scales_with_pixel_and_channel_work_without_reads(sta
             {"path": "0", "height": height, "width": width, "downsample": 1}
         ]
         state.attrs["omero"]["channels"] = [{"label": name} for name in names]
-        controller = hc.HCorrectionController(state)
+        controller = hc.ShadingCorrectionController(state)
         status = controller.status()
         assert status["state"] == "idle"
         assert controller._thread is None
@@ -644,6 +644,6 @@ def test_preflight_estimate_scales_with_pixel_and_channel_work_without_reads(sta
 
 def test_preflight_estimate_is_null_for_unsupported_slide(state):
     state.attrs["nd2wsi"]["rgb"] = True
-    controller = hc.HCorrectionController(state)
+    controller = hc.ShadingCorrectionController(state)
     assert controller.status()["estimated_seconds"] is None
     assert controller.start("h")["estimated_seconds"] is None
