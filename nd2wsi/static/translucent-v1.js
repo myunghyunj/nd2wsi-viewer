@@ -121,6 +121,20 @@
     return true;
   }
 
+  function roiElementPoints(viewer, rect, info, OSD) {
+    const bounds = roiBounds(rect, info), viewport = viewer.viewport;
+    // Match the main viewer's imageToViewerElementPoint: OSD includes rotation
+    // in this conversion; its horizontal display flip is applied separately.
+    return [[bounds.x, bounds.y], [bounds.x + bounds.width, bounds.y],
+      [bounds.x + bounds.width, bounds.y + bounds.height], [bounds.x, bounds.y + bounds.height]]
+      .map(([x, y]) => {
+        const point = viewport.imageToViewerElementCoordinates(new OSD.Point(x, y));
+        const px = viewport.getFlip() ? viewport.getContainerSize().x - point.x : point.x;
+        if (!Number.isFinite(px) || !Number.isFinite(point.y)) throw new Error("Invalid ROI display coordinates");
+        return { x: px, y: point.y };
+      });
+  }
+
   function requireSuccess(result, message) {
     if (result === false || result?.ok === false) throw new Error(result?.error || result?.message || message);
     return result;
@@ -136,6 +150,7 @@
     const previousRoi = doc.getElementById("roi-previous");
     const nextRoi = doc.getElementById("roi-next");
     const roiIndex = doc.getElementById("roi-index");
+    const roiLayer = doc.getElementById("roi-overlay");
     const opacityControl = doc.getElementById("opacity-control");
     const opacitySlider = doc.getElementById("overlay-opacity");
     const opacityValue = doc.getElementById("opacity-value");
@@ -210,6 +225,34 @@
       gestureSettingsMouse: { clickToZoom: false, dblClickToZoom: false, scrollToZoom: true },
       gestureSettingsTouch: { pinchToZoom: true, flickEnabled: false, clickToZoom: false, dblClickToZoom: false },
     });
+    let drawnRois = null, roiBoxes = [];
+    const renderRoiBoxes = () => {
+      if (!state.ready) return;
+      if (drawnRois !== state.rois) {
+        roiLayer.replaceChildren();
+        roiBoxes = state.rois.map((rect, index) => {
+          const box = doc.createElementNS("http://www.w3.org/2000/svg", "polygon");
+          box.setAttribute("class", "roi-box");
+          box.setAttribute("data-roi-index", String(index));
+          roiLayer.appendChild(box);
+          return box;
+        });
+        drawnRois = state.rois;
+      }
+      const size = viewer.viewport.getContainerSize();
+      roiLayer.setAttribute("viewBox", "0 0 " + size.x + " " + size.y);
+      roiBoxes.forEach((box, index) => {
+        box.setAttribute("data-selected", String(index === state.roiIndex));
+        try {
+          const points = roiElementPoints(viewer, state.rois[index], info, OSD);
+          box.setAttribute("points", points.map(point => point.x + "," + point.y).join(" "));
+          box.style.display = "";
+        } catch (_) { box.style.display = "none"; }
+      });
+      // Keep the selected outline visible when source regions overlap.
+      const selected = roiBoxes[state.roiIndex];
+      if (selected && roiLayer.lastElementChild !== selected) roiLayer.appendChild(selected);
+    };
     const paintRois = () => {
       const hasRois = state.rois.length > 0;
       doc.getElementById("roi-controls").hidden = !hasRois;
@@ -224,6 +267,7 @@
       roiIndex.title = (state.roiName ? state.roiName + (label ? " · " + label : "") + " · " : "") + "Open AstroMapper JPG and TXT pair";
       roiIndex.setAttribute("aria-label", state.roiIndex < 0 ? "Open AstroMapper JPG and TXT pair" :
         "ROI " + (state.roiIndex + 1) + " of " + state.rois.length + ". Open AstroMapper JPG and TXT pair");
+      renderRoiBoxes();
     };
     const paintLock = () => {
       overlay.dataset.locked = String(state.locked);
@@ -327,8 +371,12 @@
     });
     viewer.addHandler("open-failed", () => showStatus("Could not load this image. Close and reopen the translucent viewer."));
     viewer.addHandler("tile-load-failed", () => showStatus("Some image tiles could not load. Close and reopen the translucent viewer."));
+    viewer.addHandler("update-viewport", renderRoiBoxes);
     const resize = () => {
-      if (state.ready) resizePreservingScale(viewer, stage.clientWidth, stage.clientHeight, OSD);
+      if (state.ready) {
+        resizePreservingScale(viewer, stage.clientWidth, stage.clientHeight, OSD);
+        renderRoiBoxes();
+      }
     };
     const observer = win.ResizeObserver ? new win.ResizeObserver(resize) : null;
     observer?.observe(stage);
@@ -443,5 +491,5 @@
   }
 
   return { validateContext, makeTileSource, camera, restoreCamera, resizePreservingScale,
-    resizeGeometry, roiBounds, importedRois, focusRoi, mount, boot };
+    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, mount, boot };
 });

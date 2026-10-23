@@ -22,7 +22,7 @@ const context={version:1,slide_url:'http://localhost:9876/token/s/abc/',
   center:[400,250],zoom:2,rotation:90,flip:true,opacity:.55};
 const Point=class {constructor(x,y){this.x=x;this.y=y;}};
 function fakeViewer(){
-  let width=800,height=500,zoom=2.5,center=new Point(.4,.25);
+  let width=800,height=500,zoom=2.5,center=new Point(.4,.25),rotation=0,flipped=false;
   const calls=[],handlers={};
   const viewport={
     getContainerSize(){return new Point(width,height);},
@@ -31,22 +31,32 @@ function fakeViewer(){
     imageToViewportZoom(z){return z*info.width/width;},
     imageToViewportCoordinates(x,y){return typeof x==='object'
       ? new Point(x.x/info.width,x.y/info.width):new Point(x/info.width,y/info.width);},
+    imageToViewerElementCoordinates(point){
+      const scale=zoom*width/info.width,angle=rotation*Math.PI/180;
+      const dx=(point.x-center.x*info.width)*scale,dy=(point.y-center.y*info.width)*scale;
+      return new Point(width/2+dx*Math.cos(angle)-dy*Math.sin(angle),height/2+dx*Math.sin(angle)+dy*Math.cos(angle));},
     resize(size){width=size.x;height=size.y;zoom=99;center=new Point(99,99);},
     zoomTo(value){zoom=value;calls.push(['zoom',value]);},
     panTo(value){center={...value};calls.push(['pan',center]);},
-    setRotation(value){calls.push(['rotate',value]);},setFlip(value){calls.push(['flip',value]);},
+    setRotation(value){rotation=value;calls.push(['rotate',value]);},getRotation(){return rotation;},
+    setFlip(value){flipped=value;calls.push(['flip',value]);},getFlip(){return flipped;},
   };
   return {viewport,calls,handlers,nav:true,addHandler(name,cb){handlers[name]=cb;},
     forceRedraw(){},setMouseNavEnabled(value){this.nav=value;},destroy(){}};
 }
 function harness({failLock=false,failOpacity=false,opacityResult,initialContext={},bridgeOverrides={}}={}){
   const elements=new Map();
-  function element(id){if(!elements.has(id))elements.set(id,{id,style:{},dataset:{},attributes:{},
+  function newElement(id){return {id,style:{},dataset:{},attributes:{},children:[],
     listeners:{},clientWidth:800,clientHeight:500,disabled:false,hidden:false,
     addEventListener(name,cb){this.listeners[name]=cb;},
-    setAttribute(name,value){this.attributes[name]=value;}});return elements.get(id);}
+    setAttribute(name,value){this.attributes[name]=value;},
+    replaceChildren(...children){this.children=children;},
+    appendChild(child){this.children=this.children.filter(item=>item!==child);this.children.push(child);return child;},
+    get lastElementChild(){return this.children[this.children.length-1];}};}
+  function element(id){if(!elements.has(id))elements.set(id,newElement(id));return elements.get(id);}
   const documentListeners={};
-  const doc={getElementById:element,querySelectorAll(){return [];},addEventListener(name,cb){documentListeners[name]=cb;}};
+  const doc={getElementById:element,createElementNS(namespace,name){return newElement(name);},
+    querySelectorAll(){return [];},addEventListener(name,cb){documentListeners[name]=cb;}};
   const win={innerWidth:800,innerHeight:500,addEventListener(){}};
   const viewer=fakeViewer();
   let osdOptions;
@@ -361,3 +371,87 @@ def test_failed_opacity_change_rolls_back_selection_and_image_to_last_confirmed_
     assert result == {"failed": {"success": False, "live": "0.8", "value": "30", "opacity": .3,
                                  "layer": "0.3", "label": "30%", "error": "opacity unavailable"},
                       "recovered": .7, "statusHidden": True}
+
+
+def test_roi_boxes_draw_all_source_rectangles_and_selection_changes_without_geometry_edits():
+    result = run("""
+      const rois=[{x:390,y:240,w:20,h:20},{x:450,y:250,w:10,h:10}];
+      const h=harness({initialContext:{rotation:0,flip:false,rois,roiIndex:0}}),m=h.mounted;
+      const layer=h.element('roi-overlay'),snapshot=()=>layer.children.map(box=>({...box.attributes}));
+      const initial=snapshot(),before=JSON.stringify(m.state.rois),zoom=api.camera(h.viewer).zoom;
+      m.selectRoi(1);
+      const selected=snapshot();
+      await m.setOpacity(.1);await m.toggleLock();
+      return {initial,selected,locked:snapshot(),sourceUnchanged:before===JSON.stringify(m.state.rois),
+        inputUnchanged:rois,zoomUnchanged:zoom===api.camera(h.viewer).zoom,
+        imageOpacity:h.element('translucent-stage').style.opacity,layerOpacity:layer.style.opacity??null};
+    """)
+    initial = {item["data-roi-index"]: item for item in result["initial"]}
+    assert initial["0"]["points"] == "380,230 420,230 420,270 380,270"
+    assert initial["1"]["points"] == "500,250 520,250 520,270 500,270"
+    assert initial["0"]["data-selected"] == "true"
+    assert initial["1"]["data-selected"] == "false"
+    assert result["selected"][-1]["data-roi-index"] == "1"
+    assert result["selected"][-1]["data-selected"] == "true"
+    assert result["selected"][-1]["points"] == "390,240 410,240 410,260 390,260"
+    assert result["locked"] == result["selected"]
+    assert result["sourceUnchanged"] is True
+    assert result["inputUnchanged"] == [{"x": 390, "y": 240, "w": 20, "h": 20},
+                                         {"x": 450, "y": 250, "w": 10, "h": 10}]
+    assert result["zoomUnchanged"] is True
+    assert result["imageOpacity"] == "0.1"
+    assert result["layerOpacity"] is None  # Image opacity never writes the sibling ROI layer.
+
+
+def test_roi_box_points_follow_pan_zoom_and_resize_at_constant_image_scale():
+    result = run("""
+      const h=harness({initialContext:{rotation:0,flip:false,rois:[{x:400,y:250,w:20,h:10}],roiIndex:0}}),m=h.mounted;
+      const layer=h.element('roi-overlay'),points=()=>layer.children[0].attributes.points;
+      const initial=points();
+      h.viewer.viewport.panTo(new Point(.41,.255));
+      h.viewer.viewport.zoomTo(h.viewer.viewport.imageToViewportZoom(3));
+      h.viewer.handlers['update-viewport']();
+      const moved=points(),camera=api.camera(h.viewer);
+      h.element('translucent-stage').clientWidth=220;h.element('translucent-stage').clientHeight=160;
+      m.resize();
+      return {initial,moved,resized:points(),viewBox:layer.attributes.viewBox,
+        cameraUnchanged:JSON.stringify(camera)===JSON.stringify(api.camera(h.viewer)),roi:m.state.rois[0]};
+    """)
+    assert result == {"initial": "400,250 440,250 440,270 400,270",
+                      "moved": "370,235 430,235 430,265 370,265",
+                      "resized": "80,65 140,65 140,95 80,95", "viewBox": "0 0 220 160",
+                      "cameraUnchanged": True,
+                      "roi": {"x": 400, "y": 250, "w": 20, "h": 10, "label": ""}}
+
+
+@pytest.mark.parametrize("rotation,flip,expected", [
+    (90, False, [[420, 230], [420, 270], [400, 270], [400, 230]]),
+    (90, True, [[380, 230], [380, 270], [400, 270], [400, 230]]),
+    (30, True, [[407.3205080756888, 222.67949192431124],
+                [372.6794919243112, 242.67949192431124],
+                [382.6794919243112, 260], [417.3205080756888, 240]]),
+])
+def test_roi_box_uses_four_rotated_and_flipped_corners(rotation, flip, expected):
+    result = run(f"""
+      const h=harness({{initialContext:{{rotation:0,flip:false,rois:[{{x:390,y:240,w:20,h:10}}],roiIndex:0}}}});
+      h.viewer.viewport.setRotation({rotation});h.viewer.viewport.setFlip({str(flip).lower()});
+      h.viewer.handlers['update-viewport']();
+      return h.element('roi-overlay').children[0].attributes.points.split(' ').map(point=>point.split(',').map(Number));
+    """)
+    for actual, coordinates in zip(result, expected, strict=True):
+        assert actual == pytest.approx(coordinates)
+
+
+def test_invalid_roi_replacement_keeps_existing_boxes_and_nonfinite_projection_is_hidden():
+    result = run("""
+      const h=harness({initialContext:{rotation:0,flip:false,rois:[{x:390,y:240,w:20,h:10}],roiIndex:0}}),m=h.mounted;
+      const layer=h.element('roi-overlay'),before=JSON.stringify(layer.children[0].attributes);
+      const rejected=m.setRois({rois:[{x:1001,y:0,w:1,h:1}]});
+      const unchanged=before===JSON.stringify(layer.children[0].attributes);
+      h.viewer.viewport.imageToViewerElementCoordinates=()=>({x:NaN,y:0});
+      h.viewer.handlers['update-viewport']();
+      return {rejected,unchanged,display:layer.children[0].style.display,
+        source:m.state.rois[0],count:layer.children.length};
+    """)
+    assert result == {"rejected": False, "unchanged": True, "display": "none",
+                      "source": {"x": 390, "y": 240, "w": 20, "h": 10, "label": ""}, "count": 1}

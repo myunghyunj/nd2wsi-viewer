@@ -6,6 +6,10 @@ body { user-select: none; -webkit-user-select: none; }
 #translucent-stage { position: absolute; inset: 0; opacity: .55; background: transparent; cursor: grab; }
 #translucent-stage:active { cursor: grabbing; }
 #translucent-stage .openseadragon-container, #translucent-stage .openseadragon-canvas { background: transparent !important; outline: none; }
+#roi-overlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: hidden; z-index: 1; opacity: 1; }
+#roi-overlay, #roi-overlay * { pointer-events: none; }
+#roi-overlay .roi-box { fill: rgba(160,166,174,.15); stroke: #a0a6ae; stroke-width: 1.5px; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+#roi-overlay .roi-box[data-selected="true"] { fill: rgba(255,217,102,.35); stroke: #ffd966; }
 #window-drag { position: absolute; top: 7px; left: 12px; right: 104px; height: 28px; cursor: move; touch-action: none; }
 [data-has-rois="true"] #window-drag { right: 216px; }
 #roi-controls { display: flex; gap: 4px; }

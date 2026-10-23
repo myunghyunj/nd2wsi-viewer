@@ -25,6 +25,7 @@ from nd2wsi.translucent_smoke import (  # noqa: E402
     bridge_result,
     camera,
     check_camera,
+    check_roi_boxes,
     click_shell_cloud,
     exercise_translucent_viewer,
     pane_eval,
@@ -172,6 +173,8 @@ def pair_checks(overlay, child):
     first = state["rois"][0]
     check([first[key] for key in ("x", "y", "w", "h")] == [40, 80, 4, 4],
           f"Inclusive single-pixel rectangle changed: {first}")
+    first_boxes = check_roi_boxes(child, expected_rois=state["rois"], expected_index=0,
+                                  description="imported single-pixel ROI")
     after_first = camera(child)
     check_camera(after_first, before, center=False, description="first ROI jump")
     check(max(abs(a - b) for a, b in zip(after_first["center"], [42, 82])) < .01,
@@ -181,11 +184,14 @@ def pair_checks(overlay, child):
     check_camera(after_second, before, center=False, description="next ROI jump")
     check(max(abs(a - b) for a, b in zip(after_second["center"], [532, 332])) < .01,
           "Next arrow selected the wrong ROI center")
+    next_boxes = check_roi_boxes(child, expected_rois=state["rois"], expected_index=1,
+                                 description="imported next ROI")
     child.evaluate_js("document.getElementById('overlay-lock').click(); true")
     wait_for(lambda: child.evaluate_js("nd2Translucent.state.locked && !nd2Translucent.state.pending"),
              description="ROI navigation lock")
     child.evaluate_js("document.getElementById('roi-previous').click(); true")
     check_camera(camera(child), after_second, description="locked ROI navigation")
+    check_roi_boxes(child, expected_rois=state["rois"], expected_index=1, description="locked imported ROI")
     check(not child.evaluate_js("window.nd2TranslucentSetRois(" + json.dumps(native_read) + ")"),
           "Locked overlay accepted a pair replacement")
     child.evaluate_js("document.getElementById('overlay-lock').click(); true")
@@ -195,6 +201,7 @@ def pair_checks(overlay, child):
     check(hashes == [hashlib.sha256(path.read_bytes()).hexdigest() for path in (text, image)],
           "Pair import changed the reference files")
     return {"mapped": state["rois"], "first_camera": after_first, "next_camera": after_second,
+            "first_boxes": first_boxes, "next_boxes": next_boxes,
             "inclusive_endpoints": True, "scale_preserved": True, "locked_navigation_blocked": True,
             "reference_files_unchanged": True, "minimum_size_controls": minimum_layout}
 
@@ -222,11 +229,12 @@ def minimum_size_checks(child):
     time.sleep(.2)
     path = save_cocoa_snapshot(child, session.exports_root / "translucent-minimum-size.png")
     check_camera(camera(child), before, description="minimum-size resize")
+    roi_boxes = check_roi_boxes(child, description="minimum-size ROI")
     check(bridge_result(child, f"pywebview.api.resize_window({before['size'][0]},{before['size'][1]})")["ok"],
           "Could not restore native overlay size")
     wait_for(lambda: child.evaluate_js(f"innerWidth==={before['size'][0]} && innerHeight==={before['size'][1]}"),
              description="restore overlay size")
-    return {**geometry, "snapshot": str(path), "no_overlap": True}
+    return {**geometry, "snapshot": str(path), "no_overlap": True, "roi_boxes": roi_boxes}
 
 
 def hydrate_checks():
@@ -250,11 +258,15 @@ def hydrate_checks():
         check_camera(camera(child), expected, description="hydration retains source camera")
         state = child.evaluate_js("({index:nd2Translucent.state.roiIndex,text:document.getElementById('roi-index').textContent})")
         check(state == {"index": 1, "text": "2/2"}, f"Wrong imported ROI selection: {state}")
+        initial_boxes = check_roi_boxes(child, expected_index=1, description="hydrated imported ROI")
         child.evaluate_js("document.getElementById('roi-previous').click(); true")
         check_camera(camera(child), expected, center=False, description="hydrated previous ROI scale")
+        previous_boxes = check_roi_boxes(child, expected_rois=initial_boxes["rois"], expected_index=0,
+                                        description="hydrated previous ROI")
         check(pane_eval(parent, "JSON.stringify(state.annotations)") == annotations,
               "Overlay modified the source's imported annotation geometry")
-        return {"selected_index": 1, "initial_camera_preserved": True, "source_annotations_unchanged": True}
+        return {"selected_index": 1, "initial_camera_preserved": True, "source_annotations_unchanged": True,
+                "initial_boxes": initial_boxes, "previous_boxes": previous_boxes}
     finally:
         overlay.close_translucent()
         wait_for(lambda: not api._translucent_windows, description="hydrated overlay close")

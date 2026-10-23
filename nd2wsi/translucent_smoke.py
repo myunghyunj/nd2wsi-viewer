@@ -280,6 +280,159 @@ def exercise_opacity_controls(child, *, timeout=30, screenshot_path=None):
     return {"initial": initial, "steps": steps, "camera_and_window_unchanged": True}
 
 
+def check_roi_boxes(child, *, expected_rois=None, expected_index=None, timeout=30, description="ROI boxes"):
+    """Compare rendered corners with an independent image-to-screen calculation."""
+    def inspect():
+        value = child.evaluate_js("""(() => {
+          const view=nd2Translucent,svg=document.getElementById('roi-overlay');
+          if(!svg) return null;
+          const style=getComputedStyle(svg),rect=svg.getBoundingClientRect();
+          return {rois:view.state.rois,index:view.state.roiIndex,
+            layer:{width:rect.width,height:rect.height,opacity:Number(style.opacity),
+              pointerEvents:style.pointerEvents,outsideImage:!document.getElementById('translucent-stage').contains(svg)},
+            boxes:[...svg.querySelectorAll('polygon.roi-box')].map(box=>{
+              const s=getComputedStyle(box);
+              return {index:Number(box.dataset.roiIndex),selected:box.dataset.selected==='true',
+                points:[...box.points].map(p=>[p.x,p.y]),stroke:s.stroke,width:Number.parseFloat(s.strokeWidth),
+                pointerEvents:s.pointerEvents,vectorEffect:s.vectorEffect,display:s.display};
+            }).sort((a,b)=>a.index-b.index)};
+        })()""")
+        if not value or not value["rois"] or len(value["boxes"]) != len(value["rois"]):
+            return None
+        view = camera(child)
+        theta = math.radians(view["rotation"])
+        cosine, sine = math.cos(theta), math.sin(theta)
+        width, height = view["size"]
+        maximum_error = 0
+        for index, (roi, box) in enumerate(zip(value["rois"], value["boxes"])):
+            if box["index"] != index or len(box["points"]) != 4:
+                return None
+            x, y, w, h = (roi[key] for key in ("x", "y", "w", "h"))
+            expected = []
+            for px, py in ((x, y), (x + w, y), (x + w, y + h), (x, y + h)):
+                dx, dy = (px - view["center"][0]) * view["zoom"], (py - view["center"][1]) * view["zoom"]
+                sx = width / 2 + dx * cosine - dy * sine
+                sy = height / 2 + dx * sine + dy * cosine
+                expected.append([width - sx if view["flip"] else sx, sy])
+            error = max(abs(a - b) for actual, wanted in zip(box["points"], expected)
+                        for a, b in zip(actual, wanted))
+            maximum_error = max(maximum_error, error)
+        # An update-viewport paint can trail the camera by one animation frame.
+        if maximum_error > .15:
+            return None
+        return {**value, "camera": view, "maximum_corner_error_css_px": maximum_error}
+
+    value = wait_for(inspect, timeout=timeout, description=description + " aligned corners")
+    rois, selected, layer = value["rois"], value["index"], value["layer"]
+    if expected_rois is not None:
+        _check(rois == expected_rois, f"{description}: canonical ROI geometry changed")
+    if expected_index is not None:
+        _check(selected == expected_index, f"{description}: wrong selected ROI")
+    _check(layer["outsideImage"] and layer["opacity"] == 1 and layer["pointerEvents"] == "none",
+           f"{description}: ROI layer fades with the image or captures pointer input")
+    _check([layer["width"], layer["height"]] == value["camera"]["size"],
+           f"{description}: ROI layer does not fill the viewer")
+    for index, box in enumerate(value["boxes"]):
+        _check(box["selected"] == (index == selected), f"{description}: selection highlight is stale")
+        _check(box["stroke"] == ("rgb(255, 217, 102)" if index == selected else "rgb(160, 166, 174)"),
+               f"{description}: ROI colors differ from the main viewer")
+        _check(math.isclose(box["width"], 1.5) and box["vectorEffect"] == "non-scaling-stroke",
+               f"{description}: ROI stroke does not stay at 1.5 screen pixels")
+        _check(box["pointerEvents"] == "none", f"{description}: ROI box captures pointer input")
+        _check(box["display"] != "none", f"{description}: ROI box is hidden")
+    return value
+
+
+def snapshot_roi_boxes(child, path, geometry, *, timeout=30):
+    """Confirm visible golden strokes in this overlay's own native snapshot."""
+    from PIL import Image
+
+    path = save_cocoa_snapshot(child, path, timeout=timeout)
+    selected = next(box for box in geometry["boxes"] if box["selected"])
+    with Image.open(path) as image:
+        pixels = image.convert("RGBA")
+        sx, sy = image.width / geometry["camera"]["size"][0], image.height / geometry["camera"]["size"][1]
+        matched, samples = 0, 0
+        points = selected["points"]
+        for start, end in zip(points, points[1:] + points[:1]):
+            for fraction in (.25, .5, .75):
+                x = round((start[0] + fraction * (end[0] - start[0])) * sx)
+                y = round((start[1] + fraction * (end[1] - start[1])) * sy)
+                _check(3 <= x < image.width - 3 and 3 <= y < image.height - 3,
+                       "ROI snapshot sample is clipped")
+                nearby = pixels.crop((x - 3, y - 3, x + 4, y + 4))
+                matched += any(r > 200 and g > 150 and b < 170 and a > 230
+                               for r, g, b, a in nearby.getdata())
+                samples += 1
+    _check(matched >= 10, f"Selected ROI stroke is not visibly opaque: {matched}/{samples} edge samples")
+    return {"path": str(path), "visible_selected_edge_samples": matched, "edge_samples": samples}
+
+
+def exercise_roi_boxes(child, *, timeout=30, screenshot_path=None):
+    """Add temporary diagnostic boxes only to the newly owned overlay."""
+    before = camera(child)
+    size = child.evaluate_js("(() => {const p=nd2Translucent.viewer.world.getItemAt(0).getContentSize();return [p.x,p.y];})()")
+    width, height = size
+    rois = [
+        {"x": width * .30, "y": height * .30, "w": width * .12, "h": height * .14,
+         "index": 7, "label": "QA first"},
+        {"x": width * .52, "y": height * .44, "w": width * .14, "h": height * .12,
+         "index": 19, "label": "QA second"},
+    ]
+    payload = {"ok": True, "name": "private diagnostic ROI boxes", "rois": rois}
+    _check(child.evaluate_js("nd2Translucent.setRois(" + json.dumps(payload) + ",{pan:false,index:0})"),
+           "Diagnostic ROI boxes were not accepted")
+    checks = {"initial": check_roi_boxes(child, expected_rois=rois, expected_index=0, timeout=timeout)}
+    check_camera(camera(child), before, description="ROI boxes initial paint")
+    child.evaluate_js("document.getElementById('roi-next').click(); true")
+    checks["next"] = check_roi_boxes(child, expected_rois=rois, expected_index=1,
+                                    timeout=timeout, description="next ROI")
+    check_camera(camera(child), before, center=False, description="ROI box jump scale")
+    center = [rois[1]["x"] + rois[1]["w"] / 2, rois[1]["y"] + rois[1]["h"] / 2]
+    _check(max(abs(a - b) for a, b in zip(camera(child)["center"], center)) < .01,
+           "Selected ROI box is not centered after navigation")
+    child.evaluate_js("nd2Translucent.viewer.viewport.setRotation(37,true); "
+                      "nd2Translucent.viewer.viewport.setFlip(false); nd2Translucent.viewer.forceRedraw(); true")
+    checks["rotated"] = check_roi_boxes(child, expected_rois=rois, expected_index=1,
+                                       timeout=timeout, description="rotated ROI")
+    child.evaluate_js("nd2Translucent.viewer.viewport.setFlip(true); nd2Translucent.viewer.forceRedraw(); true")
+    checks["flipped"] = check_roi_boxes(child, expected_rois=rois, expected_index=1,
+                                       timeout=timeout, description="flipped ROI")
+    if screenshot_path is not None and sys.platform == "darwin":
+        time.sleep(.2)
+        checks["snapshot"] = snapshot_roi_boxes(
+            child, Path(screenshot_path).with_name("translucent-roi-boxes.png"), checks["flipped"], timeout=timeout)
+    child.evaluate_js("""(() => {
+      const v=nd2Translucent.viewer,p=v.viewport;
+      p.zoomTo(p.getZoom(true)*1.2,null,true);
+      p.panBy(new OpenSeadragon.Point(.025,.018),true);v.forceRedraw();return true;
+    })()""")
+    checks["pan_zoom"] = check_roi_boxes(child, expected_rois=rois, expected_index=1,
+                                        timeout=timeout, description="pan and zoom ROI")
+    _check(bridge_result(child, "pywebview.api.resize_window(680,492)", timeout=timeout)["ok"],
+           "ROI native resize failed")
+    wait_for(lambda: child.evaluate_js("innerWidth===680 && innerHeight===492"),
+             timeout=timeout, description="ROI resized window")
+    checks["resized"] = check_roi_boxes(child, expected_rois=rois, expected_index=1,
+                                       timeout=timeout, description="resized ROI")
+    check_camera(checks["resized"]["camera"], checks["pan_zoom"]["camera"], description="ROI resize scale")
+    _check(bridge_result(child, f"pywebview.api.resize_window({before['size'][0]},{before['size'][1]})",
+                         timeout=timeout)["ok"], "Could not restore ROI check window size")
+    wait_for(lambda: child.evaluate_js(f"innerWidth==={before['size'][0]} && innerHeight==={before['size'][1]}"),
+             timeout=timeout, description="restore ROI window size")
+    child.evaluate_js("""(() => {
+      const p=nd2Translucent.viewer.viewport,saved=""" + json.dumps(before) + """;
+      p.setRotation(saved.rotation,true);p.setFlip(saved.flip);
+      p.zoomTo(p.imageToViewportZoom(saved.zoom),null,true);
+      p.panTo(p.imageToViewportCoordinates(...saved.center),true);nd2Translucent.viewer.forceRedraw();return true;
+    })()""")
+    checks["restored"] = check_roi_boxes(child, expected_rois=rois, expected_index=1,
+                                        timeout=timeout, description="restored ROI")
+    check_camera(camera(child), before, description="ROI check camera restoration")
+    return {"ok": True, "scope": "temporary overlay-only diagnostic ROIs", "source_geometry_unchanged": True,
+            "checks": checks}
+
+
 def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None, extra_checks=None):
     """Exercise one newly-created overlay and close it, returning bounded evidence."""
     result = {"ok": False, "platform": sys.platform}
@@ -356,6 +509,10 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
                      timeout=timeout, description="overlay tiles")
             time.sleep(.2)
             result["snapshot"] = snapshot_cocoa(child, screenshot_path, timeout=timeout)
+        source_annotations = pane_eval(parent, "JSON.stringify(state.annotations)")
+        result["roi_boxes"] = exercise_roi_boxes(child, timeout=timeout, screenshot_path=screenshot_path)
+        _check(pane_eval(parent, "JSON.stringify(state.annotations)") == source_annotations,
+               "ROI box diagnostic changed source annotations")
         if extra_checks is not None:
             result["extra"] = extra_checks(overlay, child)
 
