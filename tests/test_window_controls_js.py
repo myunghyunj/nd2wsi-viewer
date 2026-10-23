@@ -134,5 +134,5 @@ def test_empty_entry_embeds_the_same_shared_shortcut_and_window_controller():
     from nd2wsi.app import BOOT_HTML
 
     static = MODULE.parent
-    assert (static / "shortcut-router-v1.js").read_text() in BOOT_HTML
-    assert MODULE.read_text() in BOOT_HTML
+    assert (static / "shortcut-router-v1.js").read_text(encoding="utf-8") in BOOT_HTML
+    assert MODULE.read_text(encoding="utf-8") in BOOT_HTML

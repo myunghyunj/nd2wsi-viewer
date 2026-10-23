@@ -30,8 +30,8 @@ class Elements(HTMLParser):
 
 
 def test_tools_share_the_top_group_and_lower_toolbar_has_no_duplicate_proxies():
-    shell = Elements((STATIC / "shell.html").read_text()).elements
-    lower = Elements((STATIC / "index.html").read_text()).elements
+    shell = Elements((STATIC / "shell.html").read_text(encoding="utf-8")).elements
+    lower = Elements((STATIC / "index.html").read_text(encoding="utf-8")).elements
     for key in ["translucent-toggle", "astromap-toggle", "shading-correction", "compare-toggle", "info-toggle"]:
         assert "shell-tools" in shell[key][1]
     assert "hidden" in shell["shell-tools"][0]
@@ -39,12 +39,12 @@ def test_tools_share_the_top_group_and_lower_toolbar_has_no_duplicate_proxies():
     assert shell["shell-tools-toggle"][0]["aria-controls"] == "shell-tools"
     assert "tb-info" not in lower and "tb-translucent" not in lower
     assert all(key in lower for key in ["tb-channels", "tb-region", "tb-annot", "tb-theme", "win-info"])
-    style = (STATIC / "native-shell-v1.css").read_text()
+    style = (STATIC / "native-shell-v1.css").read_text(encoding="utf-8")
     assert 'url("vendor/icons8-win10/angle-left.svg")' in style
     assert '#shell-tools-toggle[aria-expanded="true"] .tools-chevron' in style
     assert 'url("vendor/icons8-win10/angle-right.svg")' in style
     assert 'url("vendor/icons8-win10/share.svg")' in style
-    assert 'url("vendor/icons8-win10/channels-sliders.svg")' in (STATIC / "native-v1.css").read_text()
+    assert 'url("vendor/icons8-win10/channels-sliders.svg")' in (STATIC / "native-v1.css").read_text(encoding="utf-8")
 
 
 def test_disclosure_hides_the_whole_group_and_keeps_focus_accessible():
