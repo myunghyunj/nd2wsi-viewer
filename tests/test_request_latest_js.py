@@ -47,8 +47,11 @@ def test_production_loads_helper_and_separates_backing_from_user_frames():
     assert "matchesResponse: responseMatchesFrameContext" in app
     assert 'fetch("api/pixel?"' in frame_data and "requested.context.frame" in frame_data
     assert 'fetch("api/histogram"' in frame_data and "matchesResponse(data, context)" in frame_data
-    assert "function normalizeAnnotationSite(site)" in app
-    assert "normalizeAnnotationSite(site === undefined ? state.annSite : site)" in app
+    store = MODULE.with_name("annotation-store-v1.js").read_text(encoding="utf-8")
+    assert index.index("annotation-store-v1.js") < index.index("app.js")
+    assert "function normalizeAnnotationSite(site)" in app  # wrapper keeps the name
+    assert "function normalizeAnnotationSite(site)" in store
+    assert "normalizeAnnotationSite(site === undefined ? state.annSite : site)" in store
     assert "appendFrameParams(q, context.frame); // explicit active frame" in app
 
 

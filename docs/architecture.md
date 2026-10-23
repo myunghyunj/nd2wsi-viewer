@@ -52,6 +52,7 @@ fingerprint checks before and after reading.
 | `static/lut-controls-v1.js` | Histogram/curve drawing, full/auto/manual axes, pointer/native scrolling and live-update cadence | Channel, DOM, theme, clock and change/flush/shift callbacks |
 | `static/frame-data-v1.js` | Histogram and pixel requests, coalescing, cancellation and retry | Request state, frame identity, fetch, clock and render callbacks |
 | `static/floating-windows-v1.js` | Panel focus, geometry, drag/resize, collapse and persistence | Stage, document and storage |
+| `static/annotation-store-v1.js` | Annotation sidecar saves: debounce, serialized queue, revision/context guards, 409 recovery drafts and plate-site owner switches | Pane state, fetch, clock, lock/frame queries and status/render/notice callbacks |
 
 `index.html` loads each controller before `app.js`. The same controller modules
 are loaded directly by the JavaScript regression harness; tests no longer need
@@ -63,6 +64,16 @@ Frame changes invalidate requests before debounce starts. Replies must still
 match their request and frame identity before they can update a histogram or
 pixel readout. An older finalizer cannot clear a newer request. Panel geometry
 and collapse state persist; closed state remains specific to the session.
+
+Annotation saves for one pane are serialized in capture order, so a save for
+site A issued before switching to B completes before B's or A's next load
+reads the sidecar, and an A -> B -> A return never reinstalls older contents.
+A 409 conflict is never overwritten or merged: the snapshot stays in the
+failed-save map, is shown again when the user returns to that site, and the
+pane can only close with it after the user explicitly keeps the recovery
+drafts. Older loads and finalizers are rejected by load-sequence, context and
+revision guards. The store keeps these fields on the pane state (`state.ann*`)
+so the rest of `app.js` reads them unchanged; only the store writes them.
 
 ## Verification and distribution
 
@@ -78,6 +89,9 @@ window-role and JavaScript suites, with additional tests in:
 - `tests/test_frame_data_js.py`: stale completion rejection, coalescing and retry.
 - `tests/test_floating_windows_js.py`: geometry, focus, persistence and unavailable
   local storage.
+- `tests/test_annotation_site_transitions_js.py`: save ordering across plate-site
+  switches, A -> B -> A recovery, 409 drafts and explicit acceptance, flush before
+  update or close, and stale load rejection, through the store module's API.
 
 Run `python -m pytest tests -q` in the locked test environment, with Node.js
 available. `scripts/fetch_testdata.py` supplies the checksummed public ND2
