@@ -24,6 +24,7 @@ const state = {
   roiOverlayEl: null, // projected SVG polygon in raw image coordinates
   tool: null, // null | "roi" | "measure" | "pin" | "box"
   renderScale: null, // chosen PNG/JPEG downsample; null = finest that fits
+  astromap: { exporting: false, rows: new Map() },
   annotations: [], // {id, type: "line"|"pin"|"box", ...image coords, text}
   annPath: null, // sidecar file, reported by the server
   annSite: null, // plate site whose sidecar is displayed; null in the grid
@@ -172,6 +173,7 @@ async function init() {
   wireCompareRelay();
   initializeShadingCorrection();
   wireTools();
+  wireAstromap();
   syncFrameScopedControls();
   wireKeys();
   loadAnnotations();
@@ -611,6 +613,7 @@ function buildViewer() {
     updateReadout();
     restoreRoiOverlay();
     if (!state.viewportRelay.reopening) postViewportState("user");
+    refreshAstromapPanel();
   });
   viewer.addHandler("animation", () => {
     updateReadout();
@@ -1436,6 +1439,7 @@ const TOOL_BTN = {
   measure: "tool-measure",
   pin: "tool-pin",
   box: "tool-box",
+  astromap: "astromap-draw",
 };
 
 function annLocked() {
@@ -1466,6 +1470,7 @@ function scopedButton(id, disabled, reason) {
 }
 
 function syncFrameScopedControls() {
+  refreshAstromapPanel();
   const context = activeFrameContext();
   const hasFrame = !!context;
   const chooseSite = "Choose a site first";
@@ -1518,14 +1523,14 @@ function setTool(tool) {
     return;
   }
   if (
-    !turningOff && (tool === "measure" || tool === "pin" || tool === "box") &&
+    !turningOff && (tool === "measure" || tool === "pin" || tool === "box" || tool === "astromap") &&
     !annotationOwnerReady()
   ) {
     setAnnStatus("Choose a site and wait for its annotations to load");
     return;
   }
   if (!turningOff && tool === "move" && !frameOwnsRoi()) return;
-  if (annLocked() && (tool === "measure" || tool === "pin" || tool === "box")) {
+  if (annLocked() && (tool === "measure" || tool === "pin" || tool === "box" || tool === "astromap")) {
     setAnnStatus("Annotation is locked while the source file is missing");
     return;
   }
@@ -1606,6 +1611,7 @@ function wireTools() {
   const rubber = $("rubber");
   let start = null; // element coords
   let startImg = null;
+  let dragContext = null;
 
   $("roi-toggle").onclick = () => setTool("roi");
   $("roi-move").onclick = () => {
@@ -1619,6 +1625,9 @@ function wireTools() {
   let moveFrom = null; // roi origin at drag start (move mode)
   let landmarkStart = null; // a click, not a drag, places an alignment point
   stage.addEventListener("pointerdown", (ev) => {
+    if (!state.tool && !state.landmark.active && ev.button === 0 && ev.shiftKey &&
+        !ev.metaKey && !ev.ctrlKey && !ev.altKey && !state.windows.astromap.isHidden() &&
+        astromapReady()) setTool("astromap");
     if (state.landmark.active && !state.tool && ev.button === 0) {
       landmarkStart = elementPoint(ev, stage);
       return; // OpenSeadragon keeps the drag, so the user can still pan
@@ -1627,11 +1636,12 @@ function wireTools() {
     if (state.tool === "move" && !state.roi) return;
     start = elementPoint(ev, stage);
     startImg = imgPoint(start);
+    dragContext = activeFrameContext()?.key;
     if (state.tool === "move") {
       moveFrom = { x: state.roi.x, y: state.roi.y };
       stage.classList.add("grabbing");
     }
-    if (state.tool === "roi" || state.tool === "box") {
+    if (state.tool === "roi" || state.tool === "box" || state.tool === "astromap") {
       rubber.style.display = "block";
       positionRubber(start, start);
     }
@@ -1649,7 +1659,7 @@ function wireTools() {
       r.x = Math.round(clamp(moveFrom.x + (p.x - startImg.x), 0, state.info.width - r.w));
       r.y = Math.round(clamp(moveFrom.y + (p.y - startImg.y), 0, state.info.height - r.h));
       moveRoiOverlay();
-    } else if (state.tool === "roi" || state.tool === "box") {
+    } else if (state.tool === "roi" || state.tool === "box" || state.tool === "astromap") {
       positionRubber(start, cur);
     } else if (state.tool === "measure") {
       const p = imgPoint(cur);
@@ -1669,9 +1679,15 @@ function wireTools() {
       return;
     }
     if (!state.tool || !start) return;
+    if (dragContext !== activeFrameContext()?.key) {
+      start = startImg = dragContext = null;
+      rubber.style.display = "none";
+      setTool(null);
+      return;
+    }
     const end = elementPoint(ev, stage);
     const endImg = imgPoint(end);
-    const rectangle = state.tool === "roi" || state.tool === "box"
+    const rectangle = state.tool === "roi" || state.tool === "box" || state.tool === "astromap"
       ? positionRubber(start, end) : null;
     rubber.style.display = "none";
     const tool = state.tool;
@@ -1694,6 +1710,9 @@ function wireTools() {
         setTool(null); // hand the mouse back for panning and zooming
       }
       renderAnnotations();
+    } else if (tool === "astromap") {
+      if (moved >= 6) addAstromapRoi(rectangle);
+      setTool(null);
     } else if (tool === "box") {
       if (moved >= 6 && rectangle && rectangle.w > 0 && rectangle.h > 0) {
         const item = addAnnotation({ type: "box", ...rectangle, text: "" });
@@ -1711,6 +1730,12 @@ function wireTools() {
     startImg = null;
     ev.preventDefault();
     ev.stopPropagation();
+  }, true);
+
+  stage.addEventListener("pointercancel", () => {
+    start = startImg = dragContext = null;
+    rubber.style.display = "none";
+    if (state.tool === "astromap") setTool(null);
   }, true);
 
   $("roi-clear").onclick = clearRoi;
@@ -1731,6 +1756,171 @@ function wireTools() {
 
   wireRoiDims();
   wireAnnotationPanel();
+}
+
+/* ---- Astromap: persistent vector regions and bounded whole-slide export --- */
+
+function astromapReady() {
+  return !!(state.info && activeFrameContext() && annotationOwnerReady() &&
+    !annLocked() && !state.quitPreparing && !state.astromap.exporting && spatialImageReady());
+}
+
+function astromapItems() {
+  return state.annotations.filter((a) => a.type === "box" && a.astromap === true);
+}
+
+function postAstromapState() {
+  if (window.parent === window || !state.windows?.astromap) return;
+  window.parent.postMessage({ nd2wsi: "astromap-state", version: VIEWPORT_PROTOCOL_VERSION,
+    sid: currentSlideSid(), paneInstanceId: state.viewportRelay.commandGate.paneInstanceId,
+    open: !state.windows.astromap.isHidden(), ready: !!activeFrameContext() }, location.origin);
+}
+
+function toggleAstromap(forceOpen = false) {
+  if (state.quitPreparing || !state.windows?.astromap) return false;
+  const panel = state.windows.astromap;
+  if (forceOpen || panel.isHidden()) panel.open();
+  else { panel.close(); if (state.tool === "astromap") setTool(null); }
+  refreshAstromapPanel();
+  return true;
+}
+
+function requestAstromap() {
+  if (state.quitPreparing) return false;
+  if (window.parent === window) return toggleAstromap();
+  refreshSpatialContext();
+  window.parent.postMessage({ nd2wsi: "astromap-shortcut", version: VIEWPORT_PROTOCOL_VERSION,
+    sid: currentSlideSid(), ...spatialIdentity() }, location.origin);
+  return true;
+}
+
+function addAstromapRoi(rect) {
+  if (!astromapReady()) return null;
+  const normalized = window.Nd2Astromap.normalizeRect(rect, state.info.width, state.info.height);
+  if (!normalized) { showToast("Draw a region inside the image"); return null; }
+  if (astromapItems().some((a) => window.Nd2Astromap.overlaps(normalized, a))) {
+    showToast("This region overlaps another Astromap region");
+    return null;
+  }
+  const item = addAnnotation({ type: "box", ...normalized, text: "",
+    astromap: true, astromapEnabled: true });
+  refreshAstromapPanel();
+  state.astromap.rows.get(item.id)?.note.focus({ preventScroll: true });
+  return item;
+}
+
+function refreshAstromapPanel() {
+  if (!state.astromap || !state.info || !$("astromap-list")) return;
+  const items = astromapItems(), ready = astromapReady();
+  const list = $("astromap-list"), rows = state.astromap.rows;
+  const ids = new Set(items.map((a) => a.id));
+  for (const [id, row] of rows) if (!ids.has(id)) { row.el.remove(); rows.delete(id); }
+  const size = window.Nd2Astromap.exportSize(state.info.width, state.info.height);
+  items.forEach((a, index) => {
+    let row = rows.get(a.id);
+    if (!row) {
+      const el = document.createElement("div"); el.className = "astromap-item";
+      const include = document.createElement("input"); include.type = "checkbox";
+      const number = document.createElement("button"); number.className = "astromap-number"; number.type = "button";
+      const note = document.createElement("input"); note.type = "text"; note.maxLength = 4096; note.className = "astromap-note";
+      const remove = document.createElement("button"); remove.type = "button"; remove.className = "astromap-remove"; remove.textContent = "×";
+      const coords = document.createElement("div"); coords.className = "astromap-coordinates";
+      const find = () => state.annotations.find((item) => item.id === a.id && item.astromap === true);
+      include.onchange = () => {
+        const item = find(); if (!item || !astromapReady()) return;
+        item.astromapEnabled = include.checked; annotationsChanged();
+      };
+      note.oninput = () => {
+        const item = find(); if (!item || !astromapReady()) return;
+        item.text = note.value; annotationsChanged();
+      };
+      number.onclick = () => { const item = find(); if (item) flyToAnnotation(item); };
+      remove.onclick = () => { if (astromapReady() && find()) removeAnnotation(a.id); };
+      el.append(include, number, note, remove, coords);
+      row = { el, include, number, note, remove, coords };
+      rows.set(a.id, row);
+    }
+    row.include.checked = a.astromapEnabled !== false;
+    row.include.setAttribute("aria-label", `Include region ${index + 1}`);
+    row.number.textContent = String(index + 1);
+    row.number.title = `Go to region ${index + 1}`;
+    row.note.setAttribute("aria-label", `Note for region ${index + 1}`);
+    row.note.placeholder = `Region ${index + 1}`;
+    if (document.activeElement !== row.note) row.note.value = a.text || "";
+    row.remove.setAttribute("aria-label", `Delete region ${index + 1}`);
+    row.include.disabled = row.note.disabled = row.remove.disabled = !ready;
+    const box = window.Nd2Astromap.scaledCoordinates(a, state.info.width, state.info.height, size.width, size.height);
+    row.coords.textContent = `JPG px: ${box.x1}, ${box.y1} → ${box.x2}, ${box.y2}`;
+    row.el.classList.toggle("excluded", a.astromapEnabled === false);
+    // Reuse the same nodes while typing; moving existing nodes would lose IME focus in WebKit.
+    if (list.children[index] !== row.el) list.insertBefore(row.el, list.children[index] || null);
+  });
+  $("astromap-empty").hidden = items.length > 0;
+  $("astromap-size").textContent = `${fmtInt(size.width)} × ${fmtInt(size.height)} px JPG · coordinates match this image`;
+  const reason = annLocked() ? "The source file is missing; annotation is locked"
+    : !activeFrameContext() ? "Choose a site before adding regions"
+    : !annotationOwnerReady() ? "Wait for this site's annotations to load"
+    : "Shift-drag to add a rectangle. Pan and zoom as usual.";
+  $("astromap-hint").textContent = reason;
+  $("astromap-draw").disabled = !ready;
+  $("astromap-add-current").disabled = !ready || !frameOwnsRoi();
+  $("astromap-export").disabled = !ready || !window.Nd2Astromap.selectedRois(state.annotations).length;
+  $("astromap-export").textContent = state.astromap.exporting ? "Preparing export…" : "Export JPG + TXT";
+  postAstromapState();
+}
+
+async function exportAstromap() {
+  if (!astromapReady()) return false;
+  closeEditor(true);
+  const captured = activeFrameContext();
+  const rois = window.Nd2Astromap.selectedRois(state.annotations);
+  if (!rois.length) { showToast("Select at least one Astromap region"); return false; }
+  const payload = { generation: state.info.generation || "", rois,
+    channels: [...state.channels], window: lutParam() || null, frame: captured.frame };
+  state.astromap.exporting = true;
+  $("astromap-status").textContent = "Preparing JPG and coordinates…";
+  refreshAstromapPanel();
+  try {
+    const response = await fetch("api/astromap", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Export failed (HTTP ${response.status})`);
+    if (activeFrameContext()?.key !== captured.key || state.quitPreparing) {
+      throw new Error("The displayed image changed. Export again from the intended image.");
+    }
+    const url = new URL(result.download_url, location.href);
+    if (url.origin !== location.origin || url.pathname !== location.pathname + "api/astromap/download") {
+      throw new Error("The export returned an invalid download location");
+    }
+    const a = document.createElement("a");
+    a.href = url.href; a.download = result.filename || "";
+    document.body.append(a); a.click(); a.remove();
+    $("astromap-status").textContent = `${result.count} regions · ${fmtInt(result.width)} × ${fmtInt(result.height)} px · JPG + TXT in ZIP`;
+    showToast("Astromap export ready — choose where to save the ZIP");
+    return true;
+  } catch (error) {
+    $("astromap-status").textContent = error.message || "Astromap export failed";
+    showToast(error.message || "Astromap export failed");
+    return false;
+  } finally {
+    state.astromap.exporting = false;
+    refreshAstromapPanel();
+  }
+}
+
+function wireAstromap() {
+  $("astromap-draw").onclick = () => { if (astromapReady()) setTool("astromap"); };
+  $("astromap-add-current").onclick = () => {
+    if (frameOwnsRoi()) addAstromapRoi({ ...state.roi });
+  };
+  $("astromap-export").onclick = exportAstromap;
+  const observer = new MutationObserver(() => {
+    if (state.windows.astromap.isHidden() && state.tool === "astromap") setTool(null);
+    postAstromapState();
+  });
+  observer.observe($("win-astromap"), { attributes: true, attributeFilter: ["class"] });
+  window.addEventListener("pagehide", () => observer.disconnect(), { once: true });
+  refreshAstromapPanel();
 }
 
 /* ---- annotations: model, sidecar persistence, SVG rendering ---------------- */
@@ -1757,6 +1947,7 @@ function annotationsChanged() {
   state.annAcceptedDrafts?.clear();
   renderAnnotations();
   rebuildAnnList();
+  refreshAstromapPanel();
   updateAnnotationRecoveryNotice();
   scheduleAnnSave();
 }
@@ -2199,7 +2390,10 @@ function renderAnnotations() {
     chip(layer, mx, my, label, isTemp ? null : a.id);
   };
 
+  let astromapNumber = 0;
   for (const a of state.annotations) {
+    if (a.astromap === true) astromapNumber += 1;
+    if (a.astromap === true && a.astromapEnabled === false) continue;
     if (a.type === "line") drawLine(a, false);
     else if (a.type === "box") {
       const corners = [
@@ -2210,11 +2404,13 @@ function renderAnnotations() {
       const g = svgEl("g", { class: "hit" }, layer);
       svgEl("polygon", {
         points: corners.map((c) => c.x + "," + c.y).join(" "),
-        fill: hexAlpha(annColor(a), 0.08), stroke: annColor(a), "stroke-width": 1.5,
+        fill: a.astromap === true ? "rgba(255,217,102,.35)" : hexAlpha(annColor(a), 0.08),
+        stroke: a.astromap === true ? "#fff" : annColor(a), "stroke-width": 1.5,
         "stroke-linejoin": "round",
       }, g);
       g.addEventListener("pointerdown", (ev) => { ev.stopPropagation(); openEditor(a.id); });
-      chip(layer, left, top - 22, a.text || "Box", a.id);
+      chip(layer, left, top - 22, a.astromap === true
+        ? `${astromapNumber}${a.text ? " · " + a.text : ""}` : a.text || "Box", a.id);
     } else if (a.type === "pin") {
       const p = toEl(a.x, a.y);
       const g = svgEl("g", { class: "hit" }, layer);
@@ -2809,6 +3005,7 @@ function clearRoi() {
 }
 
 function updateRoiPanel() {
+  refreshAstromapPanel();
   const r = state.roi;
   if (!r) return;
   const ps = pixelSize();
@@ -3798,7 +3995,11 @@ function wireCompareRelay() {
       event.origin !== location.origin || !event.data ||
       event.data.version !== VIEWPORT_PROTOCOL_VERSION
     ) return;
-    if (["shading-status-request", "shading-command"].includes(event.data.nd2wsi)) {
+    if (event.data.nd2wsi === "astromap-toggle") {
+      refreshSpatialContext();
+      if (event.data.sid === currentSlideSid() &&
+          state.viewportRelay.commandGate.matchesLocal(event.data)) toggleAstromap(event.data.open === true);
+    } else if (["shading-status-request", "shading-command"].includes(event.data.nd2wsi)) {
       receiveShadingCommand(event.data);
     } else if (event.data.nd2wsi === "prepare-quit") {
       const requestId = String(event.data.requestId || "");
@@ -4042,6 +4243,12 @@ function buildWindows() {
       zoomW: 340,
       toolbarBtn: $("tb-annot"),
       startClosed: true,
+    }),
+    astromap: makeMacWindow($("win-astromap"), {
+      key: "astromap",
+      def: () => ({ x: Math.max(14, stage.clientWidth - 330), y: 68, w: 312, h: null }),
+      minW: 280, minH: 180, maxW: 500, zoomW: 400, startClosed: true,
+      onOpen: () => refreshAstromapPanel(),
     }),
     info: makeMacWindow($("win-info"), {
       key: "info",
@@ -4960,6 +5167,12 @@ function wireKeys() {
     if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
     const command = ev.metaKey || ev.ctrlKey;
     const letterCode = shortcuts ? shortcuts.letterCode(ev) : ev.code;
+    if (shortcuts?.isAstromapShortcut(ev)) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (!ev.repeat) requestAstromap();
+      return;
+    }
     if (shortcuts?.isOrientationShortcut(ev)) {
       const action = shortcuts.orientationForEvent(ev);
       ev.preventDefault(); // reserve Reload/Find, including held-key repeats

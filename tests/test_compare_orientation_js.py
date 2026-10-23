@@ -67,7 +67,7 @@ const context = vm.createContext({
   }}, location:{origin:'http://qa.invalid'},
   frames:new Map(), readyFrames:new Set(['a','b','c']),
   slides:['a','b','c'].map(sid=>({sid,name:sid+'.nd2',path:'/'+sid+'.nd2'})),
-  active:'a', pairPicker:{open:false,mode:'start',replaceSid:null},
+  active:'a', astromapUnlocked:false, pairPicker:{open:false,mode:'start',replaceSid:null},
   $:element,
   setTimeout: (fn, delay) => {const id=++timerSeq; timers.set(id,{fn,delay}); return id;},
   clearTimeout: id => timers.delete(id),
@@ -99,7 +99,7 @@ Object.assign(context, {
   showError:message=>messages.push({error:message}),
   updateCompareControls(){}, updateOrientationControls(){},
   render(){}, applyFrameLayout(){}, renderPairPicker(){},
-  sendTabShortcutState(){}, scheduleNativeGestureScopes(){}, refreshShadingButton(){},
+  sendTabShortcutState(){}, scheduleNativeGestureScopes(){}, refreshShadingButton(){}, refreshAstromapButton(){},
   closePairPicker(){}, ensureFrame(){}, activate:sid=>{context.active=sid;},
 });
 const realSyncFromAnchor = context.syncFromAnchor;

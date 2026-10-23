@@ -136,6 +136,13 @@
     return letterCode(event) === "KeyE" ? "region" : COMMAND_PANEL_BY_CODE[letterCode(event)];
   }
 
+  function isAstromapShortcut(event, platform) {
+    if (isBlocked(event) || !commandPressed(event, platform) || !event.shiftKey ||
+        event.altKey || letterCode(event) !== "KeyA") return false;
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    return ![event.target, ...path].some(isFocusControl) && !hasTextSelection(event);
+  }
+
   function isOrientationShortcut(event, platform) {
     if (
       isBlocked(event) || !commandPressed(event, platform) ||
@@ -160,7 +167,7 @@
 
   return {
     isTypingEvent, isFocusControl, hasTextSelection, letterCode, plainLetterForEvent,
-    isPanelShortcut, panelForEvent, isOrientationShortcut,
+    isPanelShortcut, panelForEvent, isAstromapShortcut, isOrientationShortcut,
     orientationForEvent, tabIndexForEvent, isMac, commandPressed,
     formatShortcutText, localizeLabels,
   };

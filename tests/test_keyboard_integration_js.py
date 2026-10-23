@@ -403,12 +403,19 @@ def test_shell_panel_shortcuts_reach_only_the_active_tab_once(letter, panel, pla
     "target:{isContentEditable:true}", "isComposing:true", "keyCode:229",
     "defaultPrevented:true", "altKey:true", "shiftKey:true",
 ])
-def test_shell_panel_shortcuts_leave_editing_and_other_key_combinations_alone(letter, overrides):
+def test_shell_panel_shortcuts_preserve_editing_and_route_only_owned_chords(letter, overrides):
     out = run_shell(f"""
       const consumed=pressKey('{letter.lower()}',{{code:'Key{letter}',
         metaKey:{str(letter != 'E').lower()},{overrides}}});
       ({{consumed,messages}});
     """)
+    if letter == "A" and overrides == "shiftKey:true":
+        assert out["messages"] == [{
+            "sid": "a", "nd2wsi": "astromap-toggle", "version": 2, "open": True,
+            "paneInstanceId": "pane-a", "contextEpoch": 1, "spatialContextKey": "context-a",
+        }]
+        assert out["consumed"] == {"prevented": True, "stopped": True}
+        return
     assert out["messages"] == []
     assert out["consumed"] == {"prevented": overrides == "defaultPrevented:true", "stopped": False}
 

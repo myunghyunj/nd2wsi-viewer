@@ -69,6 +69,13 @@ button { color:inherit; font:inherit; }
   -webkit-mask:url("icons/fluent-circle-highlight-20-regular.svg") center / contain no-repeat;
   mask:url("icons/fluent-circle-highlight-20-regular.svg") center / contain no-repeat; }
 #shading-control { position:relative; flex:none; }
+#astromap-toggle { flex:none; }
+#astromap-toggle[hidden] { display:none; }
+.astromap-icon {
+  display:inline-block; flex:none; width:20px; height:20px; background:currentColor;
+  -webkit-mask:url("icons/fluent-star-20-regular.svg") center / contain no-repeat;
+  mask:url("icons/fluent-star-20-regular.svg") center / contain no-repeat;
+}
 #shading-correction:hover:not(:disabled) { color:#ff453a; }
 #shading-progress { position:absolute; right:0; top:calc(100% + 9px); z-index:190; width:min(290px,calc(100vw - 32px)); padding:13px; box-sizing:border-box; border:1px solid var(--hairline); border-radius:11px; background:var(--control-bg); color:var(--label); box-shadow:var(--shadow); backdrop-filter:blur(24px); -webkit-backdrop-filter:blur(24px); }
 #shading-progress[hidden] { display:none; }

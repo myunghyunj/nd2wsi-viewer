@@ -49,6 +49,12 @@ from .annotation_sidecars import (
     annotations_sidecar,
     plate_annotations_sidecar,
 )
+from .astromap_export import (
+    AstromapConflict,
+    AstromapDownloads,
+    AstromapError,
+    prepare_astromap,
+)
 from .cache_removal import (
     _delete_verified_cache_file,
     _delete_verified_cache_tree,
@@ -593,6 +599,9 @@ class SlideRegistry:
         self.max_render_mpx = max_render_mpx
         self._lock = threading.Lock()
         self.window_session = window_session
+        self.astromap_downloads = AstromapDownloads(
+            getattr(window_session, "exports_root", None)
+        )
         self.annotation_workspace = None
         if window_session is not None:
             from .annotation_workspace import AnnotationWorkspace
@@ -1624,6 +1633,8 @@ def make_handler(
                     return self._json(st.plate.focus_map())
                 if sub == "/api/roi":
                     return self._roi(st, q)
+                if sub == "/api/astromap/download":
+                    return self._astromap_download(st, q)
                 return self._error(404, f"no route for {path}")
             except BrokenPipeError:
                 pass
@@ -1687,6 +1698,8 @@ def make_handler(
                     return self._lut_settings_post(st)
                 if st is not None and sub == "/api/annotations":
                     return self._annotations_post(st, q)
+                if st is not None and sub == "/api/astromap":
+                    return self._astromap(st)
                 if st is not None and sub == "/api/reveal":
                     return self._reveal(st)
                 return self._error(404, f"no POST route for {path}")
@@ -2162,6 +2175,44 @@ def make_handler(
                 except Exception:  # pragma: no cover - prefetch never reaches a client
                     pass
 
+        def _astromap(self, st: ViewerState):
+            try:
+                payload = self._body_json(limit=1_000_000)
+            except (ValueError, json.JSONDecodeError) as exc:
+                return self._error(400, str(exc))
+            prefix = (f"agent-{registry.window_session.id[:12]}_" if registry.agent_window else "")
+            try:
+                # A pyramid replacement drains this lease before changing root,
+                # attrs or generation. Do not acquire _replacement_lock here:
+                # replacement holds it while waiting for readers to finish.
+                with st.busy:
+                    plan = prepare_astromap(st, payload, resolve_frame=_frame_args,
+                                           filename_prefix=prefix)
+                    result = registry.astromap_downloads.create(plan, st)
+            except AstromapConflict as exc:
+                return self._error(409, str(exc))
+            except AstromapError as exc:
+                return self._error(400, str(exc))
+            except ValueError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _astromap_download(self, st: ViewerState, q: dict):
+            key = (q.get("token") or [""])[0]
+            try:
+                with registry.astromap_downloads.download(key, st) as (item, source):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(item.path.stat().st_size))
+                    self.send_header("Content-Disposition", content_disposition(item.filename))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    while chunk := source.read(1024 * 1024):
+                        self.wfile.write(chunk)
+            except AstromapError as exc:
+                return self._error(404, str(exc))
+
         def _roi(self, st: ViewerState, q: dict):
             try:
                 with st.busy:
@@ -2245,6 +2296,7 @@ def create_server(
             if getattr(self, "_registry_closed", False):
                 return
             self._registry_closed = True
+            registry.astromap_downloads.close()
             registry.close_all(immediate=True)
 
         def shutdown(self) -> None:
@@ -2257,6 +2309,7 @@ def create_server(
             if getattr(self, "_registry_closed", False):
                 return
             self._registry_closed = True
+            registry.astromap_downloads.close()
             registry.close_all_for_relaunch()
 
         def server_close(self) -> None:

@@ -428,9 +428,10 @@ class Api:
         self._browser_benchmark_enabled = False
         self._open_attempt_id = None
         self._fallback_consumed = False
-        self._updates_disabled = sys.platform == "darwin" and (
+        self._local_beta = os.environ.get("ND2WSI_DISABLE_UPDATES") == "1"
+        self._updates_disabled = self._local_beta or (sys.platform == "darwin" and (
             window_session is not None and window_session.role == "agent"
-        )
+        ))
         self._server_lock = threading.Lock()
         if native_gesture_scopes is None:
             from .native_gestures import NativeGestureScopeCache
@@ -545,6 +546,11 @@ class Api:
 
     def update_status(self) -> dict:
         """Status shown by the shell's persistent update button."""
+        if self._local_beta:
+            from . import __version__
+
+            return {"available": False, "version": __version__, "mode": "disabled",
+                    "message": "Local beta — updates are disabled."}
         try:
             from importlib.metadata import version
 
@@ -563,6 +569,8 @@ class Api:
 
     def check_for_updates(self) -> dict:
         """Open Windows release downloads or the macOS Sparkle update window."""
+        if self._local_beta:
+            return {"ok": False, "message": "Local beta — updates are disabled."}
         if self._updates_disabled:
             from .release_selection import check_for_updates
 

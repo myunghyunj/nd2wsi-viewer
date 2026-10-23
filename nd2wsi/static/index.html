@@ -211,6 +211,31 @@
       </div>
     </section>
 
+    <section class="mac-window hidden" id="win-astromap" aria-label="Astromap">
+      <div class="win-titlebar">
+        <div class="traffic">
+          <button class="tl tl-close" title="Close" aria-label="Close Astromap"></button>
+          <button class="tl tl-min" title="Collapse" aria-label="Collapse Astromap"></button>
+          <button class="tl tl-zoom" title="Zoom" aria-label="Resize Astromap"></button>
+        </div>
+        <span class="win-title"><span class="astromap-icon" aria-hidden="true"></span>Astromap</span>
+      </div>
+      <div class="win-body">
+        <div class="tool-row">
+          <button type="button" id="astromap-draw" class="btn">Draw ROI</button>
+          <button type="button" id="astromap-add-current" class="btn">Add current region</button>
+        </div>
+        <p class="hint" id="astromap-hint">Shift-drag to add a rectangle. Pan and zoom as usual.</p>
+        <div id="astromap-list" aria-label="Astromap regions"></div>
+        <p class="hint" id="astromap-empty">Add a region, then enter a note.</p>
+        <p class="hint" id="astromap-size"></p>
+        <div class="tool-row footer">
+          <button type="button" id="astromap-export" class="btn primary full">Export JPG + TXT</button>
+        </div>
+        <div id="astromap-status" class="hint" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
     <section class="mac-window" id="win-info">
       <div class="win-titlebar">
         <div class="traffic">
@@ -308,6 +333,7 @@
 <script src="../../static/floating-windows-v1.js"></script>
 <script src="../../static/plate-controller-v1.js"></script>
 <script src="../../static/shading-correction-v1.js"></script>
+<script src="../../static/astromap-v1.js"></script>
 <script src="../../static/app.js"></script>
 </body>
 </html>

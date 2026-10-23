@@ -105,7 +105,7 @@ for (const sid of ['a', 'b']) {
   const context = vm.createContext({
     state, window:paneWindow, location:{origin}, VIEWPORT_PROTOCOL_VERSION:2,
     $:element, setTimeout, clearTimeout,
-    renderAnnotations(){}, rebuildAnnList(){}, annLocked:()=>false,
+    renderAnnotations(){}, rebuildAnnList(){}, refreshAstromapPanel(){}, annLocked:()=>false,
     setAnnStatus:message=>statuses.push(message), basename:path=>path,
     currentSlideSid:()=>sid, refreshSpatialContext(){}, postSpatialReadiness(){},
     fetch:(_url, options) => new Promise(resolve => {

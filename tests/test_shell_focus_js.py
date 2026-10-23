@@ -25,6 +25,7 @@ for (const sid of ['a','b']) {
 }
 const context=vm.createContext({document,frames,readyFrames,ShortcutRouter,focused,messages,
   active:null,location:{origin:'http://qa.invalid'},quitPreparation:null,
+  refreshAstromapButton(){},
   pairPicker:{open:false},compare:{enabled:false,members:['b']},
   closePairPicker(){},rememberSlide(){},ensureFrame(){},applyFrameLayout(){},render(){},
   scheduleNativeGestureScopes(){},refreshShadingButton(){},inGroup:sid=>['a','b'].includes(sid),

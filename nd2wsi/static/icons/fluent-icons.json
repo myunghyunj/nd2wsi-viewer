@@ -2,7 +2,7 @@
   "source": "Microsoft Fluent UI System Icons",
   "repository": "https://github.com/microsoft/fluentui-system-icons",
   "retrieved": "2026-10-14",
-  "updated": "2026-10-18",
+  "updated": "2026-10-23",
   "license": "MIT",
   "license_file": "LICENSE-Fluent-Icons.txt",
   "license_url": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/LICENSE",
@@ -15,6 +15,7 @@
     "fluent-copy-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Copy/SVG/ic_fluent_copy_20_regular.svg",
     "fluent-clipboard-paste-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Clipboard%20Paste/SVG/ic_fluent_clipboard_paste_20_regular.svg",
     "fluent-checkmark-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Checkmark/SVG/ic_fluent_checkmark_20_regular.svg",
-    "fluent-circle-highlight-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Circle%20Highlight/SVG/ic_fluent_circle_highlight_20_regular.svg"
+    "fluent-circle-highlight-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Circle%20Highlight/SVG/ic_fluent_circle_highlight_20_regular.svg",
+    "fluent-star-20-regular.svg": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Star/SVG/ic_fluent_star_20_regular.svg"
   }
 }

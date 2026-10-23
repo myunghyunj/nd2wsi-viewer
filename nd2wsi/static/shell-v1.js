@@ -5,6 +5,8 @@ const frames = new Map();
 const readyFrames = new Set();
 const shadingStates = new Map();
 const shadingTokens = new Map();
+const astromapStates = new Map();
+let astromapUnlocked = false;
 let shadingCommandSeq = 0;
 let shadingConfirmation = null;
 let slides = [];
@@ -87,6 +89,44 @@ const compare = {
   layoutRequestTimer: null,
   routeTimers: new Map(),
   routeLatest: new Map(),
+};
+
+function refreshAstromapButton() {
+  const button = $("astromap-toggle");
+  if (!button) return;
+  const status = astromapStates.get(active);
+  const open = status?.paneInstanceId === compare.states.get(active)?.paneInstanceId && !!status?.open;
+  button.hidden = !astromapUnlocked;
+  button.disabled = !readyFrames.has(active) || !!quitPreparation;
+  button.classList.toggle("active", open);
+  button.setAttribute("aria-pressed", String(open));
+}
+
+function activateAstromap() {
+  if (!readyFrames.has(active) || quitPreparation || pairPicker.open) return false;
+  const identity = localIdentity(compare.states.get(active));
+  if (!identity?.paneInstanceId) return false;
+  const open = !astromapUnlocked;
+  astromapUnlocked = true;
+  refreshAstromapButton();
+  return postToSlide(active, { nd2wsi: "astromap-toggle", version: VIEWPORT_PROTOCOL_VERSION,
+    sid: active, ...identity, open });
+}
+
+function receiveAstromapShortcut(senderSid, data) {
+  if (senderSid !== active || data.sid !== senderSid || !readyFrames.has(senderSid) ||
+      !sameIdentity(localIdentity(compare.states.get(senderSid)), data)) return false;
+  return activateAstromap();
+}
+
+function receiveAstromapState(senderSid, data) {
+  if (data.sid !== senderSid || data.paneInstanceId !== compare.states.get(senderSid)?.paneInstanceId) return;
+  astromapStates.set(senderSid, { open: !!data.open, paneInstanceId: data.paneInstanceId });
+  if (senderSid === active) refreshAstromapButton();
+}
+
+$("astromap-toggle").onclick = () => {
+  if (astromapUnlocked) activateAstromap();
 };
 
 function showError(message) {
@@ -413,6 +453,7 @@ function slideName(sid) {
 
 function render() {
   refreshShadingButton();
+  refreshAstromapButton();
   const bar = $("tabbar");
   bar.querySelectorAll(".tab").forEach((tab) => tab.remove());
   const plus = $("newtab");
@@ -533,6 +574,7 @@ function focusActivePane(deferred = false) {
 function paneCameUp(sid) {
   sendTabShortcutState(sid);
   refreshShadingButton();
+  refreshAstromapButton();
   if (sid === active) focusActivePane(true);
   scheduleNativeGestureScopes();
   if (!inGroup(sid)) return;
@@ -654,6 +696,7 @@ function refresh(selectSid) {
           nativeGesturePaneScopes.delete(key);
           readyFrames.delete(key);
           shadingStates.delete(key);
+          astromapStates.delete(key);
           shadingTokens.delete(key);
           compare.states.delete(key);
         }
@@ -2595,6 +2638,12 @@ $("compare-mirror-policy").onchange = (event) => {
 };
 
 window.addEventListener("keydown", (event) => {
+  if (ShortcutRouter?.isAstromapShortcut(event)) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!event.repeat) activateAstromap();
+    return;
+  }
   if (ShortcutRouter?.isPanelShortcut(event)) {
     const panel = ShortcutRouter.panelForEvent(event);
     event.preventDefault();
@@ -2734,7 +2783,13 @@ window.addEventListener("message", (event) => {
   const senderSid = frameSidForSource(event.source);
   const kind = event.data.nd2wsi;
   const versioned = event.data.version === VIEWPORT_PROTOCOL_VERSION;
-  if (kind === "shading-state") {
+  if (kind === "astromap-shortcut") {
+    if (!senderSid || !versioned) return;
+    receiveAstromapShortcut(senderSid, event.data);
+  } else if (kind === "astromap-state") {
+    if (!senderSid || !versioned) return;
+    receiveAstromapState(senderSid, event.data);
+  } else if (kind === "shading-state") {
     if (!senderSid || !versioned) return;
     receiveShadingState(senderSid, event.data);
   } else if (kind === "quit-ready") {
