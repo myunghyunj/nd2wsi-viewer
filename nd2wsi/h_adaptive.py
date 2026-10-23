@@ -36,9 +36,6 @@ from scipy.optimize import minimize
 from . import h_model as base
 
 ADAPTIVE_SCHEMA = "H_adaptive_hybrid_subcell/1"
-POLY2_SCHEMA = "H_poly2_envelope_x/1"
-BF_COUPLED_SCHEMA = "H_bf_coupled_smooth_x/1"
-GLOBAL_X_SCHEMA = "H_vertical_supported/1"
 
 DEFAULT_JUSTIFIED_CRITERIA = {
     "reduced_resolution_gates": {
