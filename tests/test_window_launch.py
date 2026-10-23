@@ -1,4 +1,4 @@
-"""Headless contracts for independent macOS windows and safe native close."""
+"""Headless contracts for independent native windows and safe native close."""
 
 import os
 import queue
@@ -51,8 +51,11 @@ def test_child_environment_resets_pyinstaller_without_mutating_parent(monkeypatc
 
 
 @pytest.mark.parametrize("frozen", [False, True])
-def test_launch_detaches_child_and_does_not_reuse_parent_io(monkeypatch, frozen):
-    monkeypatch.setattr(sys, "platform", "darwin")
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_launch_detaches_child_and_does_not_reuse_parent_io(monkeypatch, frozen, platform):
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(window_launch.subprocess, "DETACHED_PROCESS", 8, raising=False)
+    monkeypatch.setattr(window_launch.subprocess, "CREATE_NEW_PROCESS_GROUP", 512, raising=False)
     monkeypatch.setattr(sys, "frozen", frozen, raising=False)
     monkeypatch.delenv("ND2WSI_WINDOW_LAUNCHER", raising=False)
     child = Mock(pid=4321)
@@ -60,7 +63,13 @@ def test_launch_detaches_child_and_does_not_reuse_parent_io(monkeypatch, frozen)
     monkeypatch.setattr(window_launch.subprocess, "Popen", popen)
     assert window_launch.launch_window(app_name="Beta") == {"ok": True, "pid": 4321, "role": "agent"}
     options = popen.call_args.kwargs
-    assert options["start_new_session"] is True and options["close_fds"] is True
+    assert options["close_fds"] is True
+    if platform == "win32":
+        assert options["creationflags"] == 520
+        assert "start_new_session" not in options
+    else:
+        assert options["start_new_session"] is True
+        assert "creationflags" not in options
     assert all(options[key] == window_launch.subprocess.DEVNULL for key in ("stdin", "stdout", "stderr"))
     assert options["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
     assert options["env"]["ND2WSI_APP_NAME"] == "Beta"
@@ -75,15 +84,16 @@ def test_launch_detaches_child_and_does_not_reuse_parent_io(monkeypatch, frozen)
 def test_launch_is_platform_gated_and_errors_are_reported(monkeypatch):
     popen = Mock(side_effect=OSError("launch blocked"))
     monkeypatch.setattr(window_launch.subprocess, "Popen", popen)
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "platform", "linux")
     assert window_launch.launch_window()["ok"] is False
     popen.assert_not_called()
     monkeypatch.setattr(sys, "platform", "darwin")
     assert "launch blocked" in window_launch.launch_window()["message"]
 
 
-def test_api_default_agent_and_scoped_context(monkeypatch, tmp_path):
-    monkeypatch.setattr(sys, "platform", "darwin")
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_api_default_agent_and_scoped_context(monkeypatch, tmp_path, platform):
+    monkeypatch.setattr(sys, "platform", platform)
     session = create_window_session("agent", tmp_path)
     api = app.Api(None, window_session=session)
     launch = Mock(return_value={"ok": True})
@@ -93,6 +103,8 @@ def test_api_default_agent_and_scoped_context(monkeypatch, tmp_path):
     context = api.window_context()
     assert context["role"] == "agent" and context["id"] == session.id
     assert context["exports_root"] == str(session.exports_root)
+    assert context["new_window_supported"] is True
+    assert context["metal_opt_in_supported"] is (platform == "darwin")
     assert "NEW Agent window" in context["agent_directive"]
     assert api.update_status()["mode"] == "manual-download"
     check = Mock(return_value={"ok": True, "message": "Close every window before installing."})
@@ -187,8 +199,9 @@ def test_mac_window_title_and_close_binding(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("argv,role", [([], "user"), (["--new-window"], "user"), (["--agent-window"], "agent")])
-def test_mac_main_creates_fresh_session_private_webview_and_marks_closed(monkeypatch, tmp_path, argv, role):
-    monkeypatch.setattr(sys, "platform", "darwin")
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monkeypatch, tmp_path, argv, role, platform):
+    monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path))
     api = SimpleNamespace(_startup_error=None, stop_server_for_update=Mock())
     create = Mock(return_value=(api, object()))
@@ -199,7 +212,10 @@ def test_mac_main_creates_fresh_session_private_webview_and_marks_closed(monkeyp
     session = create.call_args.kwargs["window_session"]
     assert session.role == role
     assert '"state": "closed"' in (session.root / "session.json").read_text()
-    webview.start.assert_called_once_with(private_mode=True)
+    expected = {"private_mode": True}
+    if platform == "win32":
+        expected["gui"] = "edgechromium"
+    webview.start.assert_called_once_with(**expected)
     api.stop_server_for_update.assert_called_once()
 
 

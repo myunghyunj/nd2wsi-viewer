@@ -2553,6 +2553,16 @@ function changeOrientation(action) {
   requestGroup("orientation", { targetSid, action });
 }
 
+function receiveNewWindowShortcut(senderSid, data) {
+  if (quitPreparation || !readyFrames.has(senderSid) || data.sid !== senderSid ||
+      !["user", "agent"].includes(data.role) ||
+      !sameIdentity(localIdentity(compare.states.get(senderSid)), data)) return false;
+  const controls = window.Nd2WindowControls;
+  if (!controls?.canOpenWindow(document) || ShortcutRouter.isMac()) return false;
+  controls.requestWindow(document, data.role);
+  return true;
+}
+
 function panelShortcut(panel) {
   if (quitPreparation || pairPicker.open ||
       !["channels", "region", "annot", "info"].includes(panel)) return false;
@@ -2807,7 +2817,10 @@ window.addEventListener("message", (event) => {
   const senderSid = frameSidForSource(event.source);
   const kind = event.data.nd2wsi;
   const versioned = event.data.version === VIEWPORT_PROTOCOL_VERSION;
-  if (kind === "astromap-shortcut") {
+  if (kind === "new-window-shortcut") {
+    if (!senderSid || !versioned) return;
+    receiveNewWindowShortcut(senderSid, event.data);
+  } else if (kind === "astromap-shortcut") {
     if (!senderSid || !versioned) return;
     receiveAstromapShortcut(senderSid, event.data);
   } else if (kind === "astromap-state") {

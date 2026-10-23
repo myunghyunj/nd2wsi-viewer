@@ -43,7 +43,7 @@ def test_tools_share_the_top_group_and_lower_toolbar_has_no_duplicate_proxies():
     assert 'url("vendor/icons8-win10/angle-left.svg")' in style
     assert '#shell-tools-toggle[aria-expanded="true"] .tools-chevron' in style
     assert 'url("vendor/icons8-win10/angle-right.svg")' in style
-    assert 'url("vendor/icons8-win10/columns.svg")' in style
+    assert 'url("vendor/icons8-win10/share.svg")' in style
     assert 'url("vendor/icons8-win10/channels-sliders.svg")' in (STATIC / "native-v1.css").read_text()
 
 
@@ -108,3 +108,17 @@ def test_info_state_follows_active_pane_even_while_tools_are_collapsed():
         disabled:$('info-toggle').disabled,hidden:$('shell-tools').hidden});
     """)
     assert result == {"first": False, "second": True, "disabled": False, "hidden": True}
+
+
+@pytest.mark.parametrize("setup,accepted", [
+    ("", True), ("readyFrames.delete('b')", False), ("quitPreparation={}", False),
+    ("data.paneInstanceId='stale'", False), ("data.contextEpoch=0", False),
+    ("data.sid='a'", False), ("data.role='invalid'", False),
+])
+def test_windows_pane_new_window_request_validates_identity_before_shared_controller(setup, accepted):
+    result = run("""
+      const calls=[];
+      window.Nd2WindowControls={canOpenWindow:()=>true,requestWindow:(doc,role)=>calls.push(role)};
+      const data={sid:'b',role:'user',...localIdentity(compare.states.get('b'))};
+    """ + setup + "; ({accepted:receiveNewWindowShortcut('b',data),calls});", platform="Win32")
+    assert result == {"accepted": accepted, "calls": ["user"] if accepted else []}

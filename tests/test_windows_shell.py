@@ -53,7 +53,7 @@ class Event:
         return self
 
 @pytest.fixture()
-def fake_webview(monkeypatch):
+def fake_webview(monkeypatch, tmp_path):
     window = SimpleNamespace(
         events=SimpleNamespace(**{name: Event() for name in (
             "before_load", "closed", "loaded", "shown", "initialized",
@@ -65,10 +65,14 @@ def fake_webview(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "webview", webview)
     monkeypatch.setattr(app.sys, "platform", "win32")
+    monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path / "sessions"))
     monkeypatch.delenv("ND2WSI_SMOKE_LUT_CLIPBOARD", raising=False)
     monkeypatch.setattr(app, "_wire_file_drop", Mock())
     monkeypatch.setattr(
         "nd2wsi.translucent_smoke.exercise_translucent_viewer", Mock(return_value={"ok": True}),
+    )
+    monkeypatch.setattr(
+        "nd2wsi.window_smoke.exercise_independent_window", Mock(return_value={"ok": True}),
     )
     return webview, window
 
@@ -154,6 +158,22 @@ def test_gui_smoke_reports_translucent_failure_and_closes(fake_webview, monkeypa
     assert report["phase"] == "translucent-viewer"
     assert report["error"] == "Overlay did not preserve pixel scale"
     window.destroy.assert_called_once()
+
+
+def test_gui_smoke_reports_independent_window_failure_and_never_recurses_from_boot(fake_webview, monkeypatch):
+    _, window = fake_webview
+    independent = Mock(return_value={"ok": False, "error": "Child did not close its own session"})
+    monkeypatch.setattr("nd2wsi.window_smoke.exercise_independent_window", independent)
+    window.evaluate_js.return_value = {"bridge": True, "version": "test", "boot": True}
+    assert app.gui_smoke(app.Api(None), window)["ok"] is True
+    independent.assert_not_called()
+    window.evaluate_js.return_value = {
+        "bridge": True, "version": "test", "slide": True, "lut_toolbar": {"ok": True},
+    }
+    report = app.gui_smoke(app.Api(None), window, expect_slide=True)
+    assert report["ok"] is False and report["phase"] == "independent-window"
+    assert report["error"] == "Child did not close its own session"
+    independent.assert_called_once()
 
 
 @pytest.mark.parametrize("platform, opt_in, enabled", [
@@ -626,7 +646,7 @@ def test_main_passes_edge_renderer_and_writes_gui_report(fake_webview, monkeypat
     webview.start = Mock(side_effect=lambda callback, **_kwargs: callback())
     path = tmp_path / "gui-smoke.json"
     assert app.main(["--gui-smoke", "--smoke-report", str(path)]) == 0
-    assert webview.start.call_args.kwargs == {"gui": "edgechromium"}
+    assert webview.start.call_args.kwargs == {"gui": "edgechromium", "private_mode": True}
     assert json.loads(path.read_text(encoding="utf-8"))["ok"] is True
 
 

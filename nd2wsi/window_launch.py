@@ -1,4 +1,4 @@
-"""Launch one independent macOS process per native viewer window.
+"""Launch one independent process per macOS or Windows viewer window.
 
 Never forward the current process's argv: a child must not inherit an opening
 slide, a smoke-test exit, or another window's session. The child creates its own
@@ -49,8 +49,8 @@ def child_environment(*, app_name: str | None = None) -> dict[str, str]:
 def launch_window(role: str = "agent", *, app_name: str | None = None,
                   source: str | Path | None = None, prefer_metal: bool = False,
                   handoff_state: str | Path | None = None, retry_metal: bool = False) -> dict:
-    if sys.platform != "darwin":
-        return {"ok": False, "message": "Independent windows are macOS-only in this beta."}
+    if sys.platform not in ("darwin", "win32"):
+        return {"ok": False, "message": "Independent windows require the macOS or Windows app."}
     try:
         frozen = bool(getattr(sys, "frozen", False))
         command = build_window_command(role, frozen=frozen)
@@ -67,7 +67,10 @@ def launch_window(role: str = "agent", *, app_name: str | None = None,
         if source is not None:
             command.append(str(Path(source).expanduser().resolve()))
         environment = child_environment(app_name=app_name)
-        kwargs = {}
+        if sys.platform == "win32":
+            kwargs = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            kwargs = {"start_new_session": True}
         if not frozen:
             source_root = str(Path(__file__).resolve().parents[1])
             # Script launchers have packaging/ as sys.path[0]; explicitly keep
@@ -76,7 +79,7 @@ def launch_window(role: str = "agent", *, app_name: str | None = None,
             environment["PYTHONPATH"] = source_root + (os.pathsep + inherited if inherited else "")
             kwargs["cwd"] = source_root
         process = subprocess.Popen(
-            command, env=environment, start_new_session=True, close_fds=True,
+            command, env=environment, close_fds=True,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **kwargs,
         )

@@ -7,7 +7,7 @@ bundled locally so opening and operating the overlay does not contact a CDN.
 
 `lock-2.svg`, `unlock-2.svg`, `chevron-left.svg` and
 `chevron-right.svg`, `angle-left.svg`, `angle-right.svg`, `channels-sliders.svg`
-and `columns.svg` are unmodified upstream SVGs from
+`columns.svg` and `share.svg` are unmodified upstream SVGs from
 [Icons8 Windows 10 Icons](https://github.com/icons8/windows-10-icons), revision
 `bb4b59b3cf8fd21b76ea21a45d4a23b497ef3df0`:
 
@@ -19,17 +19,19 @@ and `columns.svg` are unmodified upstream SVGs from
 - `svg/production/angle_right.svg` → `angle-right.svg`
 - `svg/production/timeline.svg` → `channels-sliders.svg`
 - `svg/production/columns.svg` → `columns.svg`
+- `svg/production/share.svg` → `share.svg`
 
 These correspond to the `icons8-lock-2`, `icons8-unlock-2`,
 `icons8-chevron-left`, `icons8-chevron-right`, `icons8-angle-left`,
-`icons8-angle-right`, `icons8-timeline` and `icons8-columns`
+`icons8-angle-right`, `icons8-timeline`, `icons8-columns` and `icons8-share`
 glyphs in the [requested font preview](https://icons8.github.io/windows-10-icons/font/).
 They are used under the MIT option in the accompanying upstream `LICENSE.md`.
 Copyright (c) 2025 Icons8.
 
 The timeline glyph matches the Channels reference: three horizontal rails,
-round slider knobs and a vertical left edge. The columns glyph supplies the
-requested split-rectangle icon for slide linking. Both retain their source geometry.
+round slider knobs and a vertical left edge. The share glyph supplies the
+requested multi-slide comparison/linking icon. The columns glyph is retained
+as the earlier split-rectangle reference. All retain their source geometry.
 The top toolbar disclosure uses the explicitly requested angle-left/right glyphs;
 the separate ROI previous/next controls retain their chevron glyphs.
 

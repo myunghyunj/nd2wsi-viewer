@@ -5450,6 +5450,15 @@ function wireKeys() {
   window.addEventListener("keydown", (ev) => {
     const shortcuts = window.Nd2ShortcutRouter;
     if (ev.defaultPrevented) return;
+    if (shortcuts && !shortcuts.isMac() && shortcuts.isNewWindowShortcut(ev) &&
+        window.parent !== window && window.parent.pywebview?.api?.new_window) {
+      const role = shortcuts.newWindowRoleForEvent(ev);
+      ev.preventDefault(); ev.stopPropagation();
+      if (role) window.parent.postMessage({ nd2wsi: "new-window-shortcut",
+        version: VIEWPORT_PROTOCOL_VERSION, sid: currentSlideSid(), role,
+        ...spatialIdentity() }, location.origin);
+      return;
+    }
     if (shortcuts && shortcuts.isTypingEvent(ev)) return;
     if (!shortcuts && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
     if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;

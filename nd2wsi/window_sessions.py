@@ -1,4 +1,4 @@
-"""Private, durable identity for one macOS native window/process.
+"""Private, durable identity for one native viewer window/process.
 
 Automation contract: open a fresh Agent window before interacting with slides.
 Never repurpose a User window. Annotation snapshots and conflict drafts belong
@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import sys
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -103,9 +104,13 @@ def create_window_session(role: str, base_path: str | Path | None = None) -> Win
     if role not in ("user", "agent"):
         raise ValueError("window role must be 'user' or 'agent'")
     if base_path is None:
-        base_path = os.environ.get("ND2WSI_WINDOW_SESSION_ROOT") or (
-            Path.home() / "Library" / "Application Support" / "nd2wsi-viewer" / "window-sessions"
-        )
+        base_path = os.environ.get("ND2WSI_WINDOW_SESSION_ROOT")
+        if not base_path:
+            if sys.platform == "win32":
+                local_data = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+                base_path = local_data / "nd2wsi-viewer" / "window-sessions"
+            else:
+                base_path = Path.home() / "Library" / "Application Support" / "nd2wsi-viewer" / "window-sessions"
     base = Path(base_path).expanduser().resolve()
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
     return _create_session(role, base)

@@ -302,6 +302,7 @@ Shortcuts act on the image workspace. They are ignored while typing in a text fi
 | `0` | fit the slide |
 | `I` | pixel values under the cursor |
 | `⌘I` | Slide Info |
+| `⌘N` / `Ctrl+N` on Windows | open a separate viewer window |
 | `⌘1` … `⌘9` | switch to that tab |
 | `⌘⇧E` | export marks as GeoJSON |
 | `Esc` | cancel the active tool, or return to all sites |

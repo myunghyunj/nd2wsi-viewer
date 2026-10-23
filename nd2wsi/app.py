@@ -158,6 +158,17 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
 </script></body></html>"""
 
 
+# The empty entry page has no server URL or menu, but uses the same native-window
+# controller and keyboard classification as the loaded slide shell.
+BOOT_HTML = BOOT_HTML.replace(
+    "</body></html>",
+    "<script>" + "\n".join(
+        (Path(__file__).parent / "static" / name).read_text(encoding="utf-8")
+        for name in ("shortcut-router-v1.js", "window-controls-v1.js")
+    ) + "</script></body></html>",
+)
+
+
 def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     """The path the server should open for this slide.
 
@@ -432,9 +443,9 @@ class Api:
         self._open_attempt_id = None
         self._fallback_consumed = False
         self._local_beta = os.environ.get("ND2WSI_DISABLE_UPDATES") == "1"
-        self._updates_disabled = self._local_beta or (sys.platform == "darwin" and (
+        self._updates_disabled = self._local_beta or (
             window_session is not None and window_session.role == "agent"
-        ))
+        )
         self._server_lock = threading.Lock()
         self._translucent_lock = threading.RLock()
         self._translucent_windows = {}
@@ -571,7 +582,8 @@ class Api:
         """Identify this window before automation reads or changes viewer state."""
         if self._window_session is None:
             return {"enabled": False, "role": "user", "id": None,
-                    "agent_directive": "Use an isolated macOS Agent window for automation."}
+                    "new_window_supported": False,
+                    "agent_directive": "Use an isolated native Agent window for automation."}
         return {**self._window_session.as_dict(), "enabled": True, "pid": os.getpid(),
                 "new_window_default_role": "agent", "metal_opt_in_supported": sys.platform == "darwin",
                 "open_attempt_id": self._open_attempt_id, "fallback_consumed": self._fallback_consumed}
@@ -1317,6 +1329,14 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         if not tracing.get("ok"):
                             report.update(ok=False, phase="translucent-viewer",
                                           error=tracing.get("error", "Translucent viewer check failed"))
+                    if report["ok"] and expect_slide and sys.platform == "win32":
+                        from .window_smoke import exercise_independent_window
+
+                        independent = exercise_independent_window(api)
+                        report["independent_window"] = independent
+                        if not independent.get("ok"):
+                            report.update(ok=False, phase="independent-window",
+                                          error=independent.get("error", "Independent window check failed"))
                     break
             except Exception as exc:
                 report["last_error"] = str(exc)
@@ -1350,8 +1370,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--benchmark-context", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--benchmark-test-root", type=Path, help=argparse.SUPPRESS)
     role_args = ap.add_mutually_exclusive_group()
-    role_args.add_argument("--new-window", action="store_true", help="open a fresh macOS User window")
-    role_args.add_argument("--agent-window", action="store_true", help="open an isolated macOS Agent window")
+    role_args.add_argument("--new-window", action="store_true", help="open a fresh User window")
+    role_args.add_argument("--agent-window", action="store_true", help="open an isolated Agent window")
     args, _ = ap.parse_known_args(argv)  # tolerate Finder's -psn_* args
 
     initial = Path(args.nd2).expanduser() if args.nd2 else None
@@ -1387,7 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
     api = None
     window_session = None
     try:
-        if sys.platform == "darwin":
+        if sys.platform in ("darwin", "win32"):
             from .window_sessions import create_window_session
 
             window_session = create_window_session("agent" if args.agent_window else "user")
@@ -1407,7 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
             api._requested_handoff = api._handoff_state
             api._handoff_source = initial.resolve()
         kwargs = {"gui": "edgechromium"} if sys.platform == "win32" else {}
-        if sys.platform == "darwin":
+        if window_session is not None:
             kwargs["private_mode"] = True
         if args.browser_replay_report:
             from .viewport_benchmark import run_browser_replay
@@ -1476,7 +1496,7 @@ def create_app_window(initial: Path | None, window_session=None):
         webview.settings["ALLOW_DOWNLOADS"] = True  # ROI exports save natively
     except (AttributeError, TypeError, KeyError):
         pass
-    if sys.platform == "darwin" and window_session is None:
+    if sys.platform in ("darwin", "win32") and window_session is None:
         from .window_sessions import create_window_session
 
         window_session = create_window_session("user")

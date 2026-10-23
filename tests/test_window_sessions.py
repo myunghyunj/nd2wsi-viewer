@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -65,3 +66,24 @@ def test_explicit_session_root_for_isolated_validation(tmp_path, monkeypatch):
     if os.name != "nt":
         assert session.root.stat().st_mode & 0o777 == 0o700
         assert (session.root / "session.json").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("with_local_app_data", [False, True])
+def test_windows_default_session_root_uses_local_app_data(tmp_path, monkeypatch, with_local_app_data):
+    from pathlib import Path
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("ND2WSI_WINDOW_SESSION_ROOT", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    if with_local_app_data:
+        local_data = tmp_path / "한글 Local Data"
+        monkeypatch.setenv("LOCALAPPDATA", str(local_data))
+    else:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        local_data = tmp_path / "AppData" / "Local"
+    session = create_window_session("agent")
+    try:
+        assert session.root.parent == local_data / "nd2wsi-viewer" / "window-sessions"
+        assert session.as_dict()["new_window_supported"] is True
+    finally:
+        session.mark_closed()

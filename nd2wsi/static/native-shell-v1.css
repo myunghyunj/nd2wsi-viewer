@@ -73,11 +73,11 @@ button { color:inherit; font:inherit; }
 #shell-tools[hidden] { display:none; }
 #shell-tools-toggle { flex:none; width:26px; }
 .shell-icon-button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-.cloud-icon, .columns-icon, .tools-chevron { display:block; background:currentColor;
+.cloud-icon, .share-icon, .tools-chevron { display:block; background:currentColor;
   -webkit-mask:var(--shell-icon) center / contain no-repeat;
   mask:var(--shell-icon) center / contain no-repeat; }
 .cloud-icon { width:20px; height:20px; --shell-icon:url("vendor/icons8-win10/cloud.png"); }
-.columns-icon { width:22px; height:22px; --shell-icon:url("vendor/icons8-win10/columns.svg"); }
+.share-icon { width:22px; height:22px; --shell-icon:url("vendor/icons8-win10/share.svg"); }
 .tools-chevron { width:18px; height:18px; --shell-icon:url("vendor/icons8-win10/angle-left.svg"); }
 #shell-tools-toggle[aria-expanded="true"] .tools-chevron { --shell-icon:url("vendor/icons8-win10/angle-right.svg"); }
 .shell-info-icon { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }

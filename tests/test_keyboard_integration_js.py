@@ -94,6 +94,7 @@ const window={Nd2ShortcutRouter:Router,addEventListener(kind,fn,options){
   listeners.get(kind).push({fn,capture:options===true || !!options?.capture});
 }};
 window.parent=config.iframe ? {postMessage:data=>out.messages.push(data)} : window;
+if(config.newWindowNative) window.parent.pywebview={api:{new_window(){}}};
 const context=vm.createContext({
   state,window,document:{body:element('body')},location:{origin:'http://qa.invalid'},
   VIEWPORT_PROTOCOL_VERSION:2,$:element,structuredClone,
@@ -727,3 +728,26 @@ def test_cloud_command_reaches_only_the_current_trusted_pane(config, accepted):
     message = {"nd2wsi": "pane-translucent-open", "sid": "test", **config.pop("message", {})}
     out = pane(iframe=True, message=message, **config)
     assert out["translucent"] == int(accepted)
+
+
+@pytest.mark.parametrize("target", [{"tag": "DIV"}, {"tag": "INPUT"}, {"tag": "TEXTAREA"}])
+def test_windows_pane_new_window_shortcut_forwards_once_before_typing_guards(target):
+    out = pane([key("N", ctrlKey=True, target=target), key("N", ctrlKey=True, repeat=True, target=target),
+                key("N", ctrlKey=True, shiftKey=True, target=target)],
+               platform="Win32", iframe=True, newWindowNative=True)
+    assert [message["role"] for message in out["messages"]] == ["user", "agent"]
+    assert all(message["nd2wsi"] == "new-window-shortcut" and message["sid"] == "test" and
+               message["paneInstanceId"] == "pane-test" for message in out["messages"])
+    assert out["events"] == [{"prevented": True, "stopped": True}] * 3
+
+
+@pytest.mark.parametrize("config,flags", [
+    ({"platform": "MacIntel"}, {"metaKey": True}),
+    ({"platform": "Win32"}, {"metaKey": True}),
+    ({"platform": "Win32"}, {"ctrlKey": True, "altKey": True}),
+    ({"platform": "Win32"}, {"ctrlKey": True, "isComposing": True, "keyCode": 229}),
+    ({"platform": "Win32", "newWindowNative": False}, {"ctrlKey": True}),
+])
+def test_pane_does_not_duplicate_native_mac_or_unsupported_new_window_actions(config, flags):
+    out = pane([key("N", **flags)], iframe=True, **{"newWindowNative": True, **config})
+    assert out["messages"] == []

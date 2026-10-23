@@ -143,6 +143,17 @@
     return panels[letterCode(event)];
   }
 
+  function isNewWindowShortcut(event, platform) {
+    // New Window is an app command, including while a text field owns focus.
+    return !!event && !event.defaultPrevented && !event.isComposing && event.keyCode !== 229 &&
+      commandPressed(event, platform) && !event.altKey && letterCode(event) === "KeyN";
+  }
+
+  function newWindowRoleForEvent(event, platform) {
+    if (!isNewWindowShortcut(event, platform) || event.repeat) return null;
+    return event.shiftKey ? "agent" : "user";
+  }
+
   function isAstromapShortcut(event, platform) {
     if (isBlocked(event) || !commandPressed(event, platform) || !event.shiftKey ||
         event.altKey || letterCode(event) !== "KeyA") return false;
@@ -175,6 +186,7 @@
   return {
     isTypingEvent, isFocusControl, hasTextSelection, letterCode, plainLetterForEvent,
     isPanelShortcut, panelForEvent, isAstromapShortcut, isOrientationShortcut,
+    isNewWindowShortcut, newWindowRoleForEvent,
     orientationForEvent, tabIndexForEvent, isMac, commandPressed,
     formatShortcutText, localizeLabels,
   };
