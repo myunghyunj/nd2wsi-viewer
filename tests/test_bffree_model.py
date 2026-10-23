@@ -5,11 +5,12 @@ import io
 import warnings
 import zipfile
 
+import bffree_periodic_legacy as bp
 import numpy as np
 import pytest
+from legacy_bffree_fitter import fit_legacy
 
 from nd2wsi import bffree_model as bm
-from nd2wsi import bffree_periodic as bp
 
 # Frozen from the independent x/h1 research implementation, SHA256
 # d75563963b39b1231c7ac0aeb42c3c740cea5e428cc4f327f8e53a04240b20e6.
@@ -73,12 +74,17 @@ def metadata(raw, *, native=None):
             "sizes": dict(zip(("Y", "X"), native or tuple(n * 32 for n in raw.shape[-2:])))}
 
 
-@pytest.fixture
-def target_data():
+def synthetic_target_data():
+    """Deterministic CY3/DAPI/FITC mean bins (rows sorted by original index)."""
     y, x = np.indices((48, 512), dtype=np.float64)
     raw = np.stack([1000 * (1 + .02 * y / 48 + amplitude * np.cos(2 * np.pi * x / period + phase))
                     for amplitude, period, phase in ((.08, 25.7, .2), (.14, 31.2, .7), (.12, 29.2, 1.1))])
     return raw.astype(np.float32)
+
+
+@pytest.fixture
+def target_data():
+    return synthetic_target_data()
 
 
 def one_metadata(raw, *, native=None):
@@ -98,7 +104,7 @@ def test_equivalent_to_frozen_benchmark_and_no_input_mutation(target_data, tmp_p
     before = target_data.copy()
     reference = _frozen_gains()
     progress = []
-    model, result = bm.fit_legacy(target_data, metadata(target_data), tmp_path / "model.npz", progress=progress.append)
+    model, result = fit_legacy(target_data, metadata(target_data), tmp_path / "model.npz", progress=progress.append)
     try:
         assert model.model_schema == bm.LEGACY_SCHEMA
         assert set(model.data.files) == bm.LEGACY_FIELD_NAMES
@@ -123,7 +129,7 @@ def test_independent_abstention_does_not_disable_other_target_or_touch_bf(target
     target_data[1] = 0
     target_data[2] = 1000
     reference = _frozen_gains()[0]
-    model, result = bm.fit_legacy(target_data, metadata(target_data), tmp_path / "model.npz")
+    model, result = fit_legacy(target_data, metadata(target_data), tmp_path / "model.npz")
     try:
         assert model.enabled == [True, False, False]
         np.testing.assert_allclose(model.gain_x[0], reference, rtol=1e-8, atol=1e-10)
@@ -138,7 +144,7 @@ def test_independent_abstention_does_not_disable_other_target_or_touch_bf(target
 
 def test_all_abstained_is_valid_disabled_model(tmp_path):
     raw = np.full((1, 16, 384), 1000, dtype=np.float32)
-    model, result = bm.fit_legacy(raw, one_metadata(raw), tmp_path / "identity.npz")
+    model, result = fit_legacy(raw, one_metadata(raw), tmp_path / "identity.npz")
     try:
         assert model.enabled == [False]
         assert result["supported_channel_axis_count"] == 0
@@ -168,7 +174,7 @@ def test_non_target_or_inconsistent_inputs_rejected_before_fit(target_data, tmp_
         meta["sizes"]["X"] += 32
     monkeypatch.setattr(bp, "fit_channel", lambda *_args, **_kwargs: pytest.fail("Invalid input reached fitting"))
     with pytest.raises(ValueError):
-        bm.fit_legacy(raw, meta, tmp_path / "bad.npz")
+        fit_legacy(raw, meta, tmp_path / "bad.npz")
     assert not list(tmp_path.iterdir())
 
 
@@ -182,7 +188,7 @@ def test_actual_partial_bin_means_and_native_interpolation(tmp_path):
     counts = np.minimum(32, height - ys)[:, None] * np.minimum(32, width - xs)[None, :]
     raw = (sums / counts)[None]
     assert raw[0, -1, -1] == pytest.approx(native[-29:, -25:].mean())
-    model, _ = bm.fit_legacy(raw, one_metadata(raw, native=(height, width)), tmp_path / "partial.npz")
+    model, _ = fit_legacy(raw, one_metadata(raw, native=(height, width)), tmp_path / "partial.npz")
     try:
         assert model.x_bin_centers[-1] == width - 13
         assert model.x_bin_centers[-1] != 15.5 + 32 * (raw.shape[-1] - 1)
@@ -265,7 +271,7 @@ def test_memory_guard_precedes_pixel_work(tmp_path, monkeypatch):
     raw = np.broadcast_to(np.float32(1000), (1, 4096, 4096))
     monkeypatch.setattr(bp, "fit_channel", lambda *_args, **_kwargs: pytest.fail("Budget refusal reached fitting"))
     with pytest.raises(bm.Unsupported, match="working_memory_budget_exceeded"):
-        bm.fit_legacy(raw, one_metadata(raw), tmp_path / "oversized.npz")
+        fit_legacy(raw, one_metadata(raw), tmp_path / "oversized.npz")
     assert not list(tmp_path.iterdir())
 
 
@@ -289,5 +295,5 @@ def test_cancellation_reaches_optimizer_without_output(target_data, tmp_path, mo
 
     monkeypatch.setattr(bp, "minimize_scalar", optimizer)
     with pytest.raises(Cancelled):
-        bm.fit_legacy(target_data, metadata(target_data), tmp_path / "cancelled.npz", check=check)
+        fit_legacy(target_data, metadata(target_data), tmp_path / "cancelled.npz", check=check)
     assert not list(tmp_path.iterdir())
