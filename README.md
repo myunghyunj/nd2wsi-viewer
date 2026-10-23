@@ -23,6 +23,7 @@
 - **Large JPGs:** open images up to 512 megapixels at their original resolution, subject to the memory check.
 - **Astromapper review:** select a numbered ROI, then use **← / →** to review adjacent regions at the same zoom.
 - **ROI import diagnostics:** identify invalid coordinates and a mismatched reference image while keeping existing annotations intact.
+- **Linked-view alignment:** Shift-drag adjusts one pane's offset; the illustrated guide explains corresponding histological landmarks.
 
 <p align="center">
   <img src="docs/overview-sdpc.png" alt="Brightfield SDPC slide with Slide Info in the light appearance" width="50%"><img src="docs/overview-nd2.png" alt="Fluorescence ND2 image with Channels &amp; LUTs in the dark appearance" width="50%">
@@ -76,11 +77,14 @@ values; smaller exports resample the image. [Export options](docs/user-guide.md#
 
 ### Link and compare
 
-![Linked H&E, Masson's trichrome and CD31 fluorescence views](docs/compare-serial-sections.jpg)
+![Linked immunofluorescence, Masson's trichrome and H&E serial sections](docs/compare-serial-sections-linked.png)
 
-Compare up to four images at the same physical scale. Link movement after manual
-alignment, then rotate, reflect or nudge each view. This supports visual comparison
-of serial sections; it does not establish cell-to-cell correspondence.
+Compare up to four images at the same physical scale. Match recognizable tissue
+features with **Align** to calibrate orientation and manually align serial sections.
+With **Link scale + frame**, hold **Shift** while dragging to adjust one view.
+Finish the drag, release Shift, then pan normally to resume linked movement with
+the new offset. This supports visual comparison of serial sections; it does not
+establish cell-to-cell correspondence.
 [Comparison controls](docs/user-guide.md#comparing-scans-and-serial-sections).
 
 ### Translucent viewer

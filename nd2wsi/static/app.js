@@ -1708,8 +1708,11 @@ function wireTools() {
   });
   stage.addEventListener("pointerdown", (ev) => {
     if (dragPointer !== null) return;
+    const frameLinked = state.viewportRelay?.compare?.enabled && state.viewportRelay.compare.frameLinked;
+    // In linked Compare, Shift-drag belongs to alignment even with Astromap
+    // open or armed. Do not turn a busy alignment gesture into a new ROI.
     const astromapDrag = ev.button === 0 && ev.pointerType !== "touch" && ev.shiftKey &&
-      !ev.metaKey && !ev.ctrlKey && !ev.altKey;
+      !ev.metaKey && !ev.ctrlKey && !ev.altKey && !frameLinked;
     if (!state.tool && !state.landmark.active && astromapDrag && !state.windows.astromap.isHidden() &&
         astromapReady()) setTool("astromap");
     if (state.landmark.active && !state.tool && ev.button === 0) {
@@ -4302,11 +4305,16 @@ function nudgeView(dxPx, dyPx, command = {}) {
 function beginAlignmentDrag(event) {
   const relay = state.viewportRelay;
   relay.suppressAlignmentDragEnd = false;
-  if (event.button !== 0 || !event.altKey || !spatialPaneReady() ||
-      !relay.compare?.frameLinked || relay.compare.nudgeBusy || state.tool || state.landmark.active) return;
+  const shiftPan = event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey &&
+    event.pointerType !== "touch";
+  if (event.button !== 0 || (!event.altKey && !shiftPan) || !spatialPaneReady() ||
+      !relay.compare?.frameLinked || relay.compare.nudgeBusy ||
+      (state.tool && !(shiftPan && state.tool === "astromap")) || state.landmark.active) return;
   clearTimeout(relay.timer);
   relay.timer = null;
   relay.suppressAlignmentDragEnd = true;
+  // Like Option-drag, Shift-drag keeps ownership until pointerup even if the
+  // modifier changes during the gesture. Commit its offset exactly once.
   relay.alignmentDrag = {
     ...spatialIdentity(), dragId: crypto.randomUUID(),
     committedRevision: relay.compare.committedRevision,

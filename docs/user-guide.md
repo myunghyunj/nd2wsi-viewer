@@ -163,7 +163,9 @@ QuPath ellipses, geometry collections, and annotations tied to a non-default cha
 
 Open **Astromapper** with the star or **⌘⇧A / Ctrl+Shift+A**.
 Expand the top tools first to reveal the star. Shift-drag to add a rectangle,
-or choose **Add current region**. Click an ROI number to centre it **without changing the current zoom**;
+or choose **Add current region**. In a **Link scale + frame** comparison,
+Shift-drag adjusts the pane's alignment; use **Add current region** to add an ROI.
+Click an ROI number to centre it **without changing the current zoom**;
 the selected region is yellow and the others are grey. While the panel is open,
 press **Left / Right** to select and centre the previous or next ROI in the list
 at the same zoom. Navigation stops at the first and last region. When editing a
@@ -220,9 +222,9 @@ The **Whole Slide** button selects the entire slide. In plate mode, **Full Field
 
 ## Comparing scans and serial sections
 
-![The same case linked three ways, H&E, Masson's trichrome, and CD31 immunofluorescence](compare-serial-sections.jpg)
+![Linked serial sections in immunofluorescence, Masson's trichrome and H&E](compare-serial-sections-linked.png)
 
-From left: H&E, Masson's trichrome, and CD31 immunofluorescence of the same case, linked. Moving any one pane moves the other two.
+From left: immunofluorescence (IF), Masson's trichrome (MT), and H&E serial sections. After manual alignment, **Link scale + frame** moves the three views together.
 
 Open two or more slides, press `⌘\`, and choose which slide to compare with the one in front. Then choose **Off**, **Link scale**, or **Link scale + frame**. Link scale matches micrometres per displayed pixel while letting you move each image independently; Link scale + frame also links movement using the alignment. Press `+` in the capsule to add more slides, up to four. Two slides share the screen, three take a column each, and four fill a grid. Physical linking requires valid pixel calibration in every image; incompatible pixel shapes or orientations show a reason instead of claiming equal scale. Zoom percentages may differ between scans because their pixel sizes differ. Here, frame means viewport position, not acquisition T/P/Z indices.
 
@@ -230,11 +232,17 @@ Scans taken through opposite sides of the glass may need a reflection, not just 
 
 The comparison toolbox's **×** only hides the tools: the linked panes and their alignment stay active. Use the **Show comparison tools** sliders button beside the tab-bar **Compare slides** button to reopen them. The tab-bar **Stop comparing slides** button (or `⌘\`) ends the comparison; the link button inside the toolbox opens the three linking choices without closing the panes. Hiding tools also preserves an in-progress landmark edit, which can be resumed by reopening the toolbox.
 
-To refine the alignment, press **Align** and click the same four structures on every image, in the same order. The viewer fits rotation, uniform scale and shift, preserving the current mirror state unless **Infer mirror** is selected. This is similarity alignment, not perspective or deformable registration. Landmark residuals are shown in micrometers when calibrated (relative units otherwise). **Done** commits a valid draft; **Cancel** preserves the previous alignment. **Clear Points** clears only the draft. A fitted image's orientation buttons and shortcuts remain protected until **Remove Fit** removes the committed fit. These are display transforms: source pixels, annotation coordinates, and raw exports remain unchanged.
+To calibrate orientation and manually align the sections, press **Align**. Choose four distinctive histological features that can be recognized across the sections, then click their corresponding locations in the same order on the reference and each linked image. Each linked image is fitted to the shared reference. **Done** applies the fits together once every image has four points and each fit is valid.
 
-Even a good alignment drifts by a few cells at high magnification. With **Link scale + frame**, the arrow keys move the linked slide by one screen pixel, Shift with an arrow by ten, and an Option-drag moves one pane alone. Each nudge becomes part of the alignment. Scale-only movement does not alter the saved alignment.
+<p align="center">
+  <img src="compare-align-if.png" alt="Immunofluorescence close-up with alignment landmarks 3 and 4" width="33%"><img src="compare-align-mt.png" alt="Masson's trichrome close-up with corresponding alignment landmarks 3 and 4" width="33%"><img src="compare-align-he.png" alt="H&amp;E close-up with corresponding alignment landmarks 3 and 4" width="33%">
+</p>
 
-This is a navigation and manual similarity-alignment aid, not automatic or deformable image registration. Matching orientation alone does not establish pixel correspondence. For serial sections it never claims that cells in sections separated in depth are the same cells.
+The close-ups show landmarks **3** and **4** on corresponding tissue features, in the same IF, MT, H&E order as the overview. These manually chosen landmarks establish the viewing alignment; they do not prove that individual cells correspond across serial sections.
+
+The viewer fits rotation, uniform scale and shift, preserving the current mirror state unless **Infer mirror** is selected. This is similarity alignment, not perspective or deformable registration. Landmark residuals are shown in micrometers when calibrated (relative units otherwise). **Cancel** preserves the previous alignment, and **Clear Points** clears only the draft. A fitted image's orientation buttons and shortcuts remain protected until **Remove Fit** removes the committed fit. These are display transforms: source pixels, annotation coordinates, and raw exports remain unchanged.
+
+Local offsets can remain at high magnification because serial sections differ in depth and shape. With **Link scale + frame**, hold **Shift** while dragging to adjust one pane while the others stay in place. Finish the drag, release Shift, then pan normally to resume linked movement. The adjusted offset remains. **Option/Alt-drag** also moves one pane alone. The arrow keys move the linked slide by one screen pixel, or ten with Shift. Each adjustment becomes part of the alignment. Scale-only movement does not alter the saved alignment.
 
 ## What the viewer writes on your disk
 
@@ -306,7 +314,8 @@ Shortcuts act on the image workspace. Image tools are ignored while typing in a 
 | `⌘\` | link slides |
 | `L` | choose Off, Link scale, or Link scale + frame |
 | `←` `→` `↑` `↓` | nudge the linked slide by a pixel, ten with Shift |
-| `⌥` drag | move one linked pane alone |
+| `Shift` drag | adjust one linked pane; finish the drag and release Shift before panning normally with the new offset |
+| `⌥ / Alt` drag | move one linked pane alone |
 
 `⌘T` and `⌘F` change the focused image when slides are unlinked. Annotations and ROI overlays follow the image; their saved source coordinates remain unchanged. In Compare, these shortcuts change the image selected in **Active linked slide**, while the reference stays fixed. They follow the same protections as the orientation buttons: choose **Remove Fit** before changing a fitted image, and open a site before orienting a plate image. They do not rotate or flip the plate grid.
 

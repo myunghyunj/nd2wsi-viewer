@@ -313,23 +313,63 @@ def test_keyboard_nudge_reports_actual_source_delta_and_captured_revision():
     }
 
 
-def test_option_drag_accumulates_only_real_drag_deltas_not_interleaved_zoom_center_changes():
+@pytest.mark.parametrize("modifier", ["altKey", "shiftKey"])
+def test_alignment_drag_captures_modifier_and_commits_only_real_drag_deltas_once(modifier):
     result = run_app(PAN_VIEW + """
       for(const name of ['beginAlignmentDrag','updateAlignmentDrag','finishAlignmentDrag'])loadProduction(name);
       receiveCompareLifecycle({...life(),linked:true,committedRevision:7});
-      beginAlignmentDrag({button:0,altKey:true});
+      beginAlignmentDrag({button:0,MODIFIER:true,pointerType:'mouse'});
       const first={delta:{x:2,y:4}};updateAlignmentDrag(first);
       center={x:9876,y:5432}; // an unrelated zoom changed center between actual drag events
-      const second={delta:{x:4,y:-2}};updateAlignmentDrag(second);
+      // Releasing the modifier does not split the captured pointer gesture.
+      const second={delta:{x:4,y:-2},originalEvent:{altKey:false,shiftKey:false}};updateAlignmentDrag(second);
+      finishAlignmentDrag();
       finishAlignmentDrag();
       const reply=outputs.at(-1);
       ({firstPrevented:first.preventDefaultAction,secondPrevented:second.preventDefaultAction,
-        delta:reply.nudgeDeltaPx,revision:reply.committedRevision,source:reply.nudgeSource});
-    """)
+        delta:reply.nudgeDeltaPx,revision:reply.committedRevision,source:reply.nudgeSource,
+        commits:outputs.filter(m=>m.nudgeSource==='drag').length,active:!!state.viewportRelay.alignmentDrag});
+    """.replace("MODIFIER", modifier))
     assert result == {
         "firstPrevented": True, "secondPrevented": True, "delta": {"x": -3, "y": -1},
-        "revision": 7, "source": "drag",
+        "revision": 7, "source": "drag", "commits": 1, "active": False,
     }
+
+
+@pytest.mark.parametrize("tool", [None, "astromap"])
+def test_linked_shift_pan_can_start_with_astromap_armed_without_changing_the_tool(tool):
+    result = run_app(PAN_VIEW + f"""
+      loadProduction('beginAlignmentDrag');
+      receiveCompareLifecycle({{...life(),linked:true,committedRevision:7}});
+      state.tool={json.dumps(tool)};
+      beginAlignmentDrag({{button:0,shiftKey:true,pointerType:'mouse'}});
+      ({{active:!!state.viewportRelay.alignmentDrag,tool:state.tool,
+        suppressEnd:state.viewportRelay.suppressAlignmentDragEnd}});
+    """)
+    assert result == {"active": True, "tool": tool, "suppressEnd": True}
+
+
+@pytest.mark.parametrize("setup,event", [
+    ("", {"button": 2}),
+    ("", {"shiftKey": False}),
+    ("", {"metaKey": True}),
+    ("", {"ctrlKey": True}),
+    ("", {"pointerType": "touch"}),
+    ("state.viewportRelay.compare.frameLinked=false;", {}),
+    ("state.viewportRelay.compare.nudgeBusy=true;", {}),
+    ("state.tool='box';", {}),
+    ("state.landmark.active=true;", {}),
+    ("state.tool='astromap';", {"shiftKey": False, "altKey": True}),
+])
+def test_shift_pan_respects_link_scope_and_existing_tool_modifier_guards(setup, event):
+    result = run_app(PAN_VIEW + f"""
+      loadProduction('beginAlignmentDrag');
+      receiveCompareLifecycle({{...life(),linked:true,committedRevision:7}});
+      {setup}
+      beginAlignmentDrag({{button:0,shiftKey:true,pointerType:'mouse',...{json.dumps(event)}}});
+      ({{active:!!state.viewportRelay.alignmentDrag,suppressEnd:state.viewportRelay.suppressAlignmentDragEnd}});
+    """)
+    assert result == {"active": False, "suppressEnd": False}
 
 
 def test_holding_option_without_drag_does_not_turn_zoom_into_alignment_change():

@@ -540,6 +540,111 @@ def test_cancelled_or_stale_drag_packet_never_writes_global_snapshot(cancelled, 
     assert result == {"accepted": False, "stateSame": True, "pairsSame": True}
 
 
+@pytest.mark.parametrize("dragged_sid", ["a", "b"])
+def test_drag_commit_keeps_peer_fixed_and_offset_survives_following_pan(dragged_sid):
+    result = run(f"const draggedSid='{dragged_sid}';\n" + """
+      compare.members=['b'];compare.pairs.delete('c');
+      // Both panes already have the same physical zoom before the gesture.
+      for(const sid of groupSids()) {
+        const st=compare.states.get(sid);
+        st.physicalScale={x:.125,y:.125,cosine:0};
+        st.spanPx={x:100/st.pixelSizeUm.x,y:75/st.pixelSizeUm.y};
+      }
+      const pair=compare.pairs.get('b'),angle=37*Math.PI/180;
+      pair.transform={a:1.7*Math.cos(angle),b:1.7*Math.sin(angle),
+        c:1.7*Math.sin(angle),d:-1.7*Math.cos(angle),tx:0,ty:0};
+      rematchTranslation('b');
+      const oldTransform={...pair.transform},oldScale=rendererForPair('b',pair).scale;
+      const oldSpans=JSON.stringify(groupSids().map(sid=>compare.states.get(sid).spanPx));
+      const peerSid=draggedSid==='a'?'b':'a';
+      const dragged=compare.states.get(draggedSid),peer=compare.states.get(peerSid);
+      const peerCenter={...peer.centerPx},delta={x:7,y:-9};
+      const movedCenter={x:dragged.centerPx.x+delta.x,y:dragged.centerPx.y+delta.y};
+      const revision=compare.committedRevision;
+      scheduleViewportRoute(peerSid,{...peer,centerPx:{x:99999,y:88888}});
+      const queuedBefore=compare.routeTimers.size;
+      const packet={...dragged,...spatialEnvelope(draggedSid),version:2,
+        seq:dragged.seq+1,reason:'user',nudge:true,nudgeSource:'drag',dragId:'completed-drag',
+        committedRevision:revision,nudgeDeltaPx:delta,centerPx:movedCenter};
+      const accepted=receiveViewportState(packet,draggedSid);
+      const committed={...pair.transform},committedRevision=compare.committedRevision;
+      const commitViews=messages.filter(m=>m.nd2wsi==='viewport-apply');
+      const persisted=JSON.stringify(committed)===
+          JSON.stringify(compare.committedGroup.pairs.get('b').transform) &&
+        JSON.stringify(committed)===JSON.stringify(compare.memory.get(pairKey('a','b')).pair.transform);
+      const queuedAfter=compare.routeTimers.size;
+      const messageCount=messages.length;
+      runTimers(48);
+      const staleRouteQuiet=messages.length===messageCount;
+      const duplicate=receiveViewportState(packet,draggedSid);
+      const duplicateQuiet=messages.length===messageCount &&
+        compare.committedRevision===committedRevision &&
+        JSON.stringify(pair.transform)===JSON.stringify(committed);
+      messages.length=0;
+      // Pan the other pane normally after releasing the alignment gesture.
+      const pan={x:11,y:5};
+      receiveViewportState({...peer,...spatialEnvelope(peerSid),version:2,
+        seq:peer.seq+1,reason:'user',
+        centerPx:{x:peerCenter.x+pan.x,y:peerCenter.y+pan.y}},peerSid);
+      runTimers(48);
+      const panViews=messages.filter(m=>m.nd2wsi==='viewport-apply');
+      ({accepted,queuedBefore,queuedAfter,staleRouteQuiet,duplicate,duplicateQuiet,
+        revisionDelta:committedRevision-revision,persisted,oldTransform,committed,
+        oldScale,newScale:rendererForPair('b',pair).scale,peerCenter,movedCenter,pan,
+        commitViews,panViews,
+        spanUnchanged:oldSpans===JSON.stringify(groupSids().map(sid=>compare.states.get(sid).spanPx)),
+        panKeepsAlignment:JSON.stringify(pair.transform)===JSON.stringify(committed) &&
+          compare.committedRevision===committedRevision});
+    """)
+    assert result["accepted"] is True
+    assert result["revisionDelta"] == 1
+    assert result["persisted"] is True
+    assert (result["queuedBefore"], result["queuedAfter"]) == (1, 0)
+    assert result["staleRouteQuiet"] is True
+    assert result["duplicate"] is False
+    assert result["duplicateQuiet"] is True
+    assert result["spanUnchanged"] is True
+    assert result["panKeepsAlignment"] is True
+    assert result["newScale"] == pytest.approx(result["oldScale"])
+    old = result["oldTransform"]
+    committed = result["committed"]
+    assert {key: committed[key] for key in "abcd"} == {key: old[key] for key in "abcd"}
+    if dragged_sid == "a":
+        delta_x, delta_y = 7 * .25, -9 * .25
+        expected_offset = {
+            "tx": old["tx"] - old["a"] * delta_x - old["b"] * delta_y,
+            "ty": old["ty"] - old["c"] * delta_x - old["d"] * delta_y,
+        }
+    else:
+        expected_offset = {"tx": old["tx"] + 7 * .66, "ty": old["ty"] - 9 * .66}
+    assert {key: committed[key] for key in ("tx", "ty")} == pytest.approx(expected_offset)
+    assert len(result["commitViews"]) == 1
+    assert result["commitViews"][0]["sid"] == ("b" if dragged_sid == "a" else "a")
+    assert result["commitViews"][0]["centerPx"] == pytest.approx(result["peerCenter"])
+    peer_pixel_size = .66 if dragged_sid == "a" else .25
+    assert result["commitViews"][0]["spanPx"] == pytest.approx({
+        "x": 100 / peer_pixel_size, "y": 75 / peer_pixel_size,
+    })
+    assert len(result["panViews"]) == 1
+    assert result["panViews"][0]["sid"] == dragged_sid
+    dragged_pixel_size = .25 if dragged_sid == "a" else .66
+    assert result["panViews"][0]["spanPx"] == pytest.approx({
+        "x": 100 / dragged_pixel_size, "y": 75 / dragged_pixel_size,
+    })
+    pan = result["pan"]
+    if dragged_sid == "a":
+        determinant = old["a"] * old["d"] - old["b"] * old["c"]
+        dx = (old["d"] * pan["x"] - old["b"] * pan["y"]) * .66 / determinant / .25
+        dy = (-old["c"] * pan["x"] + old["a"] * pan["y"]) * .66 / determinant / .25
+    else:
+        dx = (old["a"] * pan["x"] + old["b"] * pan["y"]) * .25 / .66
+        dy = (old["c"] * pan["x"] + old["d"] * pan["y"]) * .25 / .66
+    assert result["panViews"][0]["centerPx"] == pytest.approx({
+        "x": result["movedCenter"]["x"] + dx,
+        "y": result["movedCenter"]["y"] + dy,
+    })
+
+
 def test_restoring_different_anchor_set_is_marked_mismatched_not_silently_valid():
     result = run("""
       fitAll();

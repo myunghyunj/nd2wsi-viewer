@@ -2253,7 +2253,7 @@ function updateCompareControls() {
   deltaEl.textContent = delta;
   deltaEl.hidden = !delta;
   deltaEl.title = ShortcutRouter.formatShortcutText(delta
-    ? "Hand-tuned offset beyond matched centers. Arrow keys move it one screen pixel, Shift ten, Option-drag moves it freely."
+    ? "Hand-tuned offset beyond matched centers. Arrow keys move it one screen pixel, Shift ten. Shift-drag or Option-drag adjusts one view."
     : "");
 
   renderChips();

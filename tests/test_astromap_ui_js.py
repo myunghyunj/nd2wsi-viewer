@@ -1071,6 +1071,35 @@ process.stdout.write(JSON.stringify({added:f.added,tool:f.c.state.tool,navigatio
     assert out["plainDown"] == out["plainMove"] == out["plainUp"] == {"prevented": 0, "stopped": 0}
 
 
+@pytest.mark.parametrize("armed,busy", [(False, False), (True, False), (False, True), (True, True)])
+def test_frame_linked_shift_drag_never_creates_astromap_roi_even_when_alignment_is_busy(armed, busy):
+    out = _run(DRAG_SCRIPT + f"""
+const f=fixture();
+f.c.state.viewportRelay={{compare:{{enabled:true,frameLinked:true,nudgeBusy:{str(busy).lower()}}}}};
+if ({str(armed).lower()}) f.c.setTool('astromap');
+const events=['pointerdown','pointermove','pointerup'].map((kind,index)=>f.emit(kind,{{x:10+index*30,y:20+index*40}}));
+process.stdout.write(JSON.stringify({{events,added:f.added,tool:f.c.state.tool,
+  nav:f.c.state.viewer.isMouseNavEnabled(),captured:f.$('stage').captured.size}}));
+""")
+    assert out == {
+        "events": [{"prevented": 0, "stopped": 0}] * 3,
+        "added": [], "tool": "astromap" if armed else None, "nav": True, "captured": 0,
+    }
+
+
+@pytest.mark.parametrize("compare", [
+    {"enabled": False, "frameLinked": False},
+    {"enabled": True, "frameLinked": False, "linkMode": "scale"},
+])
+def test_unlinked_and_scale_only_compare_keep_astromap_shift_drawing(compare):
+    out = _run(DRAG_SCRIPT + f"""
+const f=fixture();f.c.state.viewportRelay={{compare:{json.dumps(compare)}}};
+f.emit('pointerdown');f.emit('pointermove',{{x:80,y:110}});f.emit('pointerup',{{x:80,y:110}});
+process.stdout.write(JSON.stringify({{added:f.added,tool:f.c.state.tool}}));
+""")
+    assert out == {"added": [{"x": 10, "y": 20, "w": 70, "h": 90}], "tool": None}
+
+
 def test_armed_astromap_passes_plain_drag_and_touch_to_navigation():
     out = _run(DRAG_SCRIPT + r"""
 const results=[];
