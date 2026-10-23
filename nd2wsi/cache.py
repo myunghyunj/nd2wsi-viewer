@@ -118,10 +118,6 @@ def managed_dir(slide: str | Path) -> Path:
     return Path(slide).parent / MANAGED_DIR
 
 
-def annotations_dir(slide: str | Path) -> Path:
-    return managed_dir(slide) / ANNOTATIONS_DIR
-
-
 def source_tag(slide: str | Path) -> str:
     """Filesystem-safe source name, including its extension.
 

@@ -99,11 +99,6 @@ def auto_workers(task_bytes: int | None = None) -> int:
     return min(cpu_target, memory_target, MAX_AUTO_WORKERS)
 
 
-def store_compressor() -> Any:
-    """Codec used by the default persistent storage backend."""
-    return DEFAULT_STORAGE.compressor()
-
-
 def _create_level_array(
     root: Any,
     path: str,
