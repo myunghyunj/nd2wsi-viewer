@@ -133,6 +133,16 @@ Every fluorescence channel has its own row in the Channels panel. Pick a color, 
 
 The standard viewer remembers each file's last-used minimum, maximum and gamma across app restarts. Saved LUTs take precedence over initial Auto; Reset restores the channel's metadata defaults and remembers that choice too. Preferences live in local application data, not in the image or its annotations. A moved, replaced or incompatible file uses normal defaults. The opt-in Metal viewer's independent controls are not persisted.
 
+### Translucent viewer — 2.5 beta
+
+Click the **cloud** at the right of the image toolbar to open the current fluorescence image in a separate, always-on-top tracing window. It keeps the current channels, LUTs, plane, orientation and image scale. The image is 55% opaque, so another app remains visible behind it. You can minimize the main viewer while using this window.
+
+Drag the image to pan and scroll or pinch to zoom. Drag the empty top edge, or Option/Alt-drag, to move the window. Drag an edge or corner to resize it: the image scale stays fixed and only the field of view changes. The white **lock** freezes image navigation and window placement; click it again to unlock. **×** closes the tracing window. The main viewer's source tab must remain open.
+
+Without imported coordinates, only lock and close are shown. With AstroMapper regions already imported in the current image, or after dropping the matching whole-image **JPG + TXT** pair into the tracing window, **‹ number ›** appears. Right-click the image or use **Cmd/Ctrl+O** to choose a pair; click the number to replace it. The arrows and Left/Right keys jump to each ROI's center while preserving the current scale. Imported coordinates use the same inclusive-pixel mapping as Astromapper. Use the matching uncropped JPG with the same orientation; the files do not encode a crop or registration transform. These navigation copies do not modify saved annotations.
+
+On macOS the image is translucent and the controls remain white. Windows uses native whole-window opacity, which also makes the controls translucent. The mode is available in the standard desktop viewer, including its small JPG/PNG tabs; a browser tab cannot float over other apps.
+
 The **Shading Correction** button in the tab strip estimates repeating illumination shading from a supported stitched ND2 scan's fluorescence. It corrects supported FITC and CY3 channels while keeping BF and DAPI unchanged; a BF channel is not required. The corrected `.nd2svs` viewing pyramid remains saved after closing and reopening the slide.
 
 The confirmation shows the saved-pyramid notice and estimated preparation time. Choose the green **Continue** button to begin or the red **Cancel** button to dismiss. Opening a slide alone does not start a correction. During preparation, a progress bar shows the stage and approximate remaining time; Cancel stops the work before the final replacement.
@@ -403,4 +413,4 @@ Alignment/Compare now keeps landmark drafts separate from committed geometry, re
 
 ## License
 
-MIT. The example acquisitions are CC0, described in `TESTDATA_LICENSE.md`. OpenSeadragon is included under its BSD-3-Clause license.
+MIT. The example acquisitions are CC0, described in `TESTDATA_LICENSE.md`. OpenSeadragon is included under its BSD-3-Clause license. Translucent-viewer icons are from [Icons8](https://icons8.com); their licenses and source links are included in `nd2wsi/static/vendor/icons8-win10/`.

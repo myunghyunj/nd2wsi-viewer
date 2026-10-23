@@ -22,7 +22,7 @@ RELEASES_API = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100
 MAX_METADATA_BYTES = 2 * 1024 * 1024
 _VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?(?:(a|b|rc)(\d+))?", re.I)
 _ASSET = re.compile(
-    r"nd2wsi-viewer-(\d+\.\d+\.\d+(?:rc\d+)?)-(macos|windows)-"
+    r"nd2wsi-viewer-(\d+\.\d+\.\d+(?:(?:b|rc)\d+)?)-(macos|windows)-"
     r"(arm64|x64|x86_64|universal2|universal)(\.dmg|\.zip|\.exe)"
 )
 _LEGACY_MAC_VERSIONS = {(1, 2, patch, 3, 0) for patch in range(2, 9)} | {(2, 0, 0, 3, 0)}
@@ -46,7 +46,16 @@ def installed_version() -> str:
 
 def channel_for_version(value: str) -> str:
     parsed = _version_key(value)
-    return "rc" if parsed is not None and parsed[3] == 2 else "stable"
+    return {1: "beta", 2: "rc"}.get(parsed[3], "stable") if parsed else "stable"
+
+
+def _effective_channel(platform_name: str, current_version: str, channel: str) -> str:
+    current = _version_key(current_version)
+    # Beta downloads require a prerelease installation. Preserve the legacy
+    # Windows stable boundary and the explicit macOS RC check.
+    if current and current[3] == 3 and (platform_name == "win32" or channel == "beta"):
+        return "stable"
+    return channel
 
 
 def normalize_machine(value: str) -> str | None:
@@ -91,17 +100,18 @@ def select_release_asset(releases, *, platform_name: str, machine: str,
                          current_version: str, channel: str = "stable") -> dict | None:
     """Select the newest strictly newer, compatible published asset.
 
-    Stable Windows builds never opt into a macOS-only RC channel. Unknown
+    Stable installations never enter beta; prerelease installations may advance
+    to the same or a more mature release channel. Unknown
     architectures, versions, names, hosts, drafts and invalid metadata fail
     closed. Within one version, a native binary wins over universal/emulation.
     """
     architecture = normalize_machine(machine)
     current = _version_key(current_version)
     if (platform_name not in ("darwin", "win32") or architecture is None
-            or current is None or channel not in ("stable", "rc")
+            or current is None or channel not in ("stable", "beta", "rc")
             or not isinstance(releases, list)):
         return None
-    effective_channel = "stable" if platform_name == "win32" else channel
+    effective_channel = _effective_channel(platform_name, current_version, channel)
     candidates = []
     for release in releases:
         if not isinstance(release, dict) or release.get("draft") is not False:
@@ -114,8 +124,11 @@ def select_release_asset(releases, *, platform_name: str, machine: str,
         if not isinstance(prerelease, bool):
             continue
         stable = parsed[3] == 3 and prerelease is False
+        beta = parsed[3] == 1 and prerelease is True
         rc = parsed[3] == 2 and prerelease is True
-        if not stable and not (effective_channel == "rc" and rc):
+        allowed_prerelease = (effective_channel == "beta" and (beta or rc)
+                              or effective_channel == "rc" and rc)
+        if not stable and not allowed_prerelease:
             continue
         assets = release.get("assets")
         if not isinstance(assets, list):
@@ -137,7 +150,7 @@ def select_release_asset(releases, *, platform_name: str, machine: str,
                       "release_url": f"https://github.com/{REPOSITORY}/releases/tag/{quote(tag, safe='')}",
                       "platform": platform_name, "architecture": architecture,
                       "download_architecture": download_arch, "emulated": emulated,
-                      "channel": "rc" if rc else "stable"}
+                      "channel": "beta" if beta else "rc" if rc else "stable"}
             candidates.append((parsed, priority, name, result))
     return max(candidates, key=lambda item: item[:3])[3] if candidates else None
 
@@ -174,14 +187,13 @@ def check_for_updates(*, platform_name: str | None = None, machine: str | None =
     machine = platform.machine() if machine is None else machine
     current_version = installed_version() if current_version is None else current_version
     selected_channel = channel_for_version(current_version) if channel is None else channel
-    if platform_name == "win32":
-        selected_channel = "stable"
+    selected_channel = _effective_channel(platform_name, current_version, selected_channel)
     result = {"ok": False, "available": False, "mode": "manual-download",
               "current_version": current_version, "platform": platform_name,
               "architecture": normalize_machine(machine), "channel": selected_channel}
     if platform_name not in ("darwin", "win32") or result["architecture"] is None:
         return {**result, "message": "No verified update package is available for this OS/CPU."}
-    if _version_key(current_version) is None or selected_channel not in ("stable", "rc"):
+    if _version_key(current_version) is None or selected_channel not in ("stable", "beta", "rc"):
         return {**result, "message": "Cannot determine this installation's update version/channel."}
     try:
         releases = fetch_releases()

@@ -15,6 +15,7 @@ qa/*
 !qa/check_native_astromap.py
 !qa/check_native_orientation.py
 !qa/check_native_final_beta.py
+!qa/check_native_translucent.py
 nd2wsi/metal/*.dylib
 nd2wsi/metal_viewport/*.dylib
 docs/*.nd2

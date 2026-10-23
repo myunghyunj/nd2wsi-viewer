@@ -78,6 +78,17 @@
 
 .tb-btn:hover { background: rgba(255, 255, 255, 0.075); }
 .tb-btn.active { background: rgba(255, 255, 255, 0.105); }
+
+.icon-cloud {
+  width: 20px;
+  height: 20px;
+  background: currentColor;
+  -webkit-mask: url("vendor/icons8-win10/cloud.png") center / contain no-repeat;
+  mask: url("vendor/icons8-win10/cloud.png") center / contain no-repeat;
+}
+
+.icon-credit { margin: 12px 0 0; font-size: 11px; color: var(--label-2); }
+.icon-credit a { color: inherit; }
 .tb-icon-only { width: 29px; padding: 0; justify-content: center; }
 :root.light .tb-btn:hover { background: rgba(0, 0, 0, 0.05); }
 :root.light .tb-btn.active { background: rgba(0, 0, 0, 0.085); }

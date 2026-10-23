@@ -104,6 +104,55 @@ let frameRequests = null;
 
 window.nd2CaptureViewState = () => window.Nd2ViewState.capture(state);
 
+// Copy display state and validated imported regions; never edit source annotations.
+function captureTranslucentView() {
+  if (state.quitPreparing) throw new Error("The viewer is closing");
+  if (!state.info || (state.info.rgb && !state.info.raster)) throw new Error("Open a fluorescence image first");
+  if (state.plate && !activeFrameParams()) throw new Error("Choose a site before opening the translucent viewer");
+  if (!spatialImageReady()) throw new Error("Wait for the image to finish opening");
+  const viewport = state.viewer.viewport;
+  const center = viewport.viewportToImageCoordinates(viewport.getCenter(true));
+  const snapshot = {
+    version: 1, query: tileQuery(), center: [center.x, center.y],
+    zoom: viewport.viewportToImageZoom(viewport.getZoom(true)),
+    rotation: viewport.getRotation(), flip: viewport.getFlip(),
+  };
+  const imported = state.annReady && annotationOwnerReady()
+    ? state.annotations.filter(item => item.type === "box" && item.astromap === true &&
+      Number.isSafeInteger(item.astromapImportIndex) && item.astromapImportIndex > 0) : [];
+  if (imported.length) {
+    snapshot.rois = imported.map((item, index) => ({ x: item.x, y: item.y, w: item.w, h: item.h,
+      index: index + 1, label: String(item.text || item.astromapImportIndex) }));
+    const selected = imported.findIndex(item => item.id === state.astromap.activeId);
+    if (selected >= 0) snapshot.roiIndex = selected;
+  }
+  return snapshot;
+}
+
+function wireTranslucentViewer() {
+  const button = $("tb-translucent");
+  let opening = false;
+  button.addEventListener("click", async () => {
+    if (opening) return;
+    opening = true;
+    button.disabled = true;
+    try {
+      const native = (window.parent !== window ? window.parent : window).pywebview?.api;
+      if (typeof native?.open_translucent_viewer !== "function") {
+        throw new Error("The translucent viewer is available in the desktop app");
+      }
+      const snapshot = captureTranslucentView();
+      const result = await native.open_translucent_viewer(currentSlideSid(), snapshot);
+      if (!result?.ok) throw new Error(result?.message || "Could not open the translucent viewer");
+    } catch (error) {
+      showToast(error.message || "Could not open the translucent viewer");
+    } finally {
+      opening = false;
+      button.disabled = false;
+    }
+  });
+}
+
 init().catch((e) => {
   $("boot").textContent = "failed to load: " + e.message;
 });
@@ -168,6 +217,7 @@ async function init() {
   buildChannelPanel();
   buildLevelLamps();
   buildViewer();
+  wireTranslucentViewer();
   buildPlate();
   if (state.plate) pollPlateStatus();
   wireCompareRelay();

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Apple-silicon release (stable or RC) with native rendering and the standard viewer.
+# Apple-silicon release (stable, beta or RC) with native rendering and the standard viewer.
 # Uses the existing locked worktree environment. Never installs or publishes.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -36,12 +36,15 @@ import plistlib, re, sys
 from importlib.metadata import version
 path = sys.argv[1]
 release = version('nd2wsi-viewer')
-match = re.fullmatch(r'(\d+\.\d+\.\d+)(?:rc(\d+))?', release)
+match = re.fullmatch(r'(\d+\.\d+\.\d+)(?:(b|rc)(\d+))?', release)
 if not match:
-    raise ValueError('This builder requires a stable or RC version')
+    raise ValueError('This builder requires a stable, beta or RC version')
 with open(path, 'rb') as f:
     info = plistlib.load(f)
-bundle_version = match[1] + (f'fc{match[2]}' if match[2] else '')
+stage, number = match.group(2, 3)
+if number is not None and not 1 <= int(number) <= 255:
+    raise ValueError(f'Info.plist prerelease build number must be 1–255: {release}')
+bundle_version = match[1] + (f"{'fc' if stage == 'rc' else 'b'}{int(number)}" if stage else '')
 info.update(CFBundleShortVersionString=match[1], CFBundleVersion=bundle_version,
             ND2WSIPackageVersion=release, LSMinimumSystemVersion='12.0',
             CFBundleDisplayName='nd2wsi-viewer', NSHighResolutionCapable=True,

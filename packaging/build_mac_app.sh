@@ -98,11 +98,14 @@ with open(path, "rb") as fh:
 # Finder's Get Info reads these; PyInstaller leaves them at 0.0.0
 pyproject = open(sys.argv[2]).read()
 version = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
-match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:rc(\d+))?", version)
+match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:(b|rc)(\d+))?", version)
 if not match:
     raise ValueError(f"unsupported package version for Info.plist: {version}")
 base = ".".join(match.group(1, 2, 3))
-bundle = base + (f"fc{match.group(4)}" if match.group(4) else "")
+stage, number = match.group(4, 5)
+if number is not None and not 1 <= int(number) <= 255:
+    raise ValueError(f"Info.plist prerelease build number must be 1–255: {version}")
+bundle = base + (f"{'fc' if stage == 'rc' else 'b'}{int(number)}" if stage else "")
 info["CFBundleShortVersionString"] = base
 info["CFBundleVersion"] = bundle
 info["ND2WSIPackageVersion"] = version

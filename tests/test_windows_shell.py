@@ -67,6 +67,9 @@ def fake_webview(monkeypatch):
     monkeypatch.setattr(app.sys, "platform", "win32")
     monkeypatch.delenv("ND2WSI_SMOKE_LUT_CLIPBOARD", raising=False)
     monkeypatch.setattr(app, "_wire_file_drop", Mock())
+    monkeypatch.setattr(
+        "nd2wsi.translucent_smoke.exercise_translucent_viewer", Mock(return_value={"ok": True}),
+    )
     return webview, window
 
 
@@ -134,6 +137,22 @@ def test_gui_smoke_fails_promptly_on_lut_asset_or_clipboard_error(fake_webview):
     assert report["ok"] is False
     assert report["error"] == "LUT clipboard paste failed: Read permission denied"
     assert window.evaluate_js.call_count == 1
+    window.destroy.assert_called_once()
+
+
+def test_gui_smoke_reports_translucent_failure_and_closes(fake_webview, monkeypatch):
+    _, window = fake_webview
+    window.evaluate_js.return_value = {
+        "bridge": True, "version": "test", "slide": True, "lut_toolbar": {"ok": True},
+    }
+    monkeypatch.setattr(
+        "nd2wsi.translucent_smoke.exercise_translucent_viewer",
+        Mock(return_value={"ok": False, "error": "Overlay did not preserve pixel scale"}),
+    )
+    report = app.gui_smoke(app.Api(None), window, expect_slide=True)
+    assert report["ok"] is False
+    assert report["phase"] == "translucent-viewer"
+    assert report["error"] == "Overlay did not preserve pixel scale"
     window.destroy.assert_called_once()
 
 

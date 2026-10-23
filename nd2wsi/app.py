@@ -436,6 +436,9 @@ class Api:
             window_session is not None and window_session.role == "agent"
         ))
         self._server_lock = threading.Lock()
+        self._translucent_lock = threading.RLock()
+        self._translucent_windows = {}
+        self._translucent_owner_closed = False
         if native_gesture_scopes is None:
             from .native_gestures import NativeGestureScopeCache
 
@@ -447,6 +450,56 @@ class Api:
         from .window_launch import launch_window
 
         return launch_window(role, app_name=APP_NAME)
+
+    def open_translucent_viewer(self, sid: str, payload: dict) -> dict:
+        """Open a display-only tracing window for this viewer's registered slide."""
+        if sys.platform not in ("darwin", "win32"):
+            return {"ok": False, "message": "The translucent viewer requires the macOS or Windows app."}
+        try:
+            from urllib.parse import quote
+
+            from .translucent_window import create_translucent_window, validate_context
+
+            with self._server_lock:
+                server = self._httpd
+                store = server.registry.get(sid) if server is not None and isinstance(sid, str) else None
+                if store is None:
+                    raise ValueError("Open a fluorescence slide before opening the translucent viewer")
+                base_url = _server_url(server).rstrip("/") + "/"
+                context = validate_context(store, payload, slide_url=base_url + "s/" + quote(sid, safe="") + "/")
+
+            with self._translucent_lock:
+                if self._translucent_owner_closed:
+                    raise ValueError("The source viewer is closing")
+                previous = self._translucent_windows.pop(sid, None)
+                if previous is not None:
+                    previous.close_translucent()
+
+                def remove(closed):
+                    with self._translucent_lock:
+                        if self._translucent_windows.get(sid) is closed:
+                            self._translucent_windows.pop(sid, None)
+
+                overlay = create_translucent_window(
+                    context, url=base_url + "static/translucent.html",
+                    title=APP_NAME + " — Translucent", logger=_dlog, on_closed=remove,
+                )
+                self._translucent_windows[sid] = overlay
+            return {"ok": True, "id": overlay._window.uid}
+        except Exception as exc:
+            _dlog(f"translucent viewer open failed: {exc!r}")
+            return {"ok": False, "message": f"Could not open translucent viewer: {exc}"}
+
+    def _close_translucent_windows(self, *_args):
+        with self._translucent_lock:
+            self._translucent_owner_closed = True
+            overlays = list(self._translucent_windows.values())
+            self._translucent_windows.clear()
+        for overlay in overlays:
+            try:
+                overlay.close_translucent()
+            except Exception as exc:
+                _dlog(f"translucent viewer close failed: {exc!r}")
 
     def open_in_metal(self, sid: str, view_state: dict, retry: bool = False) -> dict:
         """Open only a registered slide in a fresh process of this same role."""
@@ -617,6 +670,7 @@ class Api:
 
     def stop_server_for_update(self) -> None:
         """Synchronously release sockets, ND2 handles, and plate writers."""
+        self._close_translucent_windows()
         with self._server_lock:
             server, self._httpd = self._httpd, None
         if server is None:
@@ -1248,6 +1302,14 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                     if native_keyboard["status"] == "failed":
                         report.update(phase="native-keyboard", error=native_keyboard.get("error") or
                                       native_keyboard.get("cleanup_error"))
+                    elif expect_slide:
+                        from .translucent_smoke import exercise_translucent_viewer
+
+                        tracing = exercise_translucent_viewer(api, window)
+                        report["translucent_viewer"] = tracing
+                        if not tracing.get("ok"):
+                            report.update(ok=False, phase="translucent-viewer",
+                                          error=tracing.get("error", "Translucent viewer check failed"))
                     break
             except Exception as exc:
                 report["last_error"] = str(exc)
@@ -1447,6 +1509,7 @@ def create_app_window(initial: Path | None, window_session=None):
     )
     window.events.before_load += lambda *_args: api.clear_native_gesture_scopes()
     window.events.closed += lambda *_args: api.clear_native_gesture_scopes()
+    window.events.closed += api._close_translucent_windows
     _wire_file_drop(window)
     if sys.platform == "darwin":
         _inline_traffic_lights(window)

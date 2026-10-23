@@ -1,0 +1,42 @@
+:root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent !important; }
+body { user-select: none; -webkit-user-select: none; }
+#overlay { position: fixed; inset: 0; overflow: hidden; border-radius: 18px; isolation: isolate; }
+#translucent-stage { position: absolute; inset: 0; opacity: .55; background: transparent; cursor: grab; }
+#translucent-stage:active { cursor: grabbing; }
+#translucent-stage .openseadragon-container, #translucent-stage .openseadragon-canvas { background: transparent !important; outline: none; }
+#window-drag { position: absolute; top: 7px; left: 12px; right: 104px; height: 28px; cursor: move; touch-action: none; }
+[data-has-rois="true"] #window-drag { right: 216px; }
+#roi-controls { display: flex; gap: 4px; }
+#roi-controls[hidden] { display: none; }
+#window-controls { position: absolute; top: 9px; right: 9px; display: flex; gap: 4px; z-index: 3; }
+#window-controls button { display: grid; place-items: center; width: 36px; height: 36px; margin: 0; padding: 6px; border: 0; border-radius: 9px; color: #fff; background: none; cursor: pointer; opacity: .86; -webkit-tap-highlight-color: transparent; }
+#window-controls button:hover, #window-controls button:focus-visible { opacity: 1; }
+#window-controls button:active { opacity: .66; }
+#window-controls button:focus-visible { outline: 1px solid rgba(255,255,255,.9); outline-offset: -2px; }
+#window-controls button:disabled { cursor: default; opacity: .3; }
+#window-controls #roi-index { width: auto; min-width: 32px; padding-inline: 3px; font: 500 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+#window-controls #roi-previous, #window-controls #roi-next { width: 24px; padding: 0; }
+.roi-previous-glyph { --glyph: url("vendor/icons8-win10/chevron-left.svg"); }
+.roi-next-glyph { --glyph: url("vendor/icons8-win10/chevron-right.svg"); }
+#roi-previous .overlay-glyph, #roi-next .overlay-glyph { width: 20px; height: 20px; }
+.overlay-glyph { display: block; width: 24px; height: 24px; background: currentColor; mask: var(--glyph) center / contain no-repeat; -webkit-mask: var(--glyph) center / contain no-repeat; filter: drop-shadow(0 1px 2px rgba(0,0,0,.55)); }
+.lock-glyph { --glyph: url("vendor/icons8-win10/unlock-2.svg"); }
+[aria-pressed="true"] .lock-glyph { --glyph: url("vendor/icons8-win10/lock-2.svg"); }
+.close-glyph { --glyph: url("vendor/icons8-win10/close.svg"); width: 20px; height: 20px; }
+#overlay-status { position: absolute; left: 18px; right: 18px; top: 50%; transform: translateY(-50%); color: white; font-size: 13px; line-height: 1.45; text-align: center; text-shadow: 0 1px 4px #000, 0 0 8px #000; pointer-events: none; }
+#overlay-status[hidden] { display: none; }
+.resize-handle { position: absolute; z-index: 2; touch-action: none; }
+[data-edge="n"], [data-edge="s"] { height: 7px; left: 18px; right: 18px; cursor: ns-resize; }
+[data-edge="n"] { top: 0; } [data-edge="s"] { bottom: 0; }
+[data-edge="e"], [data-edge="w"] { width: 7px; top: 18px; bottom: 18px; cursor: ew-resize; }
+[data-edge="e"] { right: 0; } [data-edge="w"] { left: 0; }
+[data-edge="ne"], [data-edge="nw"], [data-edge="se"], [data-edge="sw"] { width: 18px; height: 18px; }
+[data-edge="ne"] { top: 0; right: 0; cursor: nesw-resize; }
+[data-edge="nw"] { top: 0; left: 0; cursor: nwse-resize; }
+[data-edge="se"] { bottom: 0; right: 0; cursor: nwse-resize; }
+[data-edge="sw"] { bottom: 0; left: 0; cursor: nesw-resize; }
+[data-locked="true"] .resize-handle, [data-locked="true"] #window-drag { pointer-events: none; }
+[data-locked="true"] #translucent-stage { cursor: default; }
+@media (prefers-reduced-motion: no-preference) { #window-controls button { transition: opacity 100ms ease; } }

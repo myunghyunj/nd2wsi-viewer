@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Translucent viewer</title>
+<link rel="stylesheet" href="translucent-v1.css" />
+</head>
+<body>
+<main id="overlay" aria-label="Translucent fluorescence viewer">
+  <div id="translucent-stage" aria-label="Drag to pan; scroll to zoom" title="Right-click or ⌘/Ctrl+O to open an AstroMapper JPG and TXT pair"></div>
+  <div id="window-drag" title="Drag to move window · Option/Alt-drag anywhere"></div>
+  <div id="window-controls">
+    <div id="roi-controls" hidden>
+    <button type="button" id="roi-previous" aria-label="Previous ROI" title="Previous ROI (←)" disabled><span class="overlay-glyph roi-previous-glyph" aria-hidden="true"></span></button>
+    <button type="button" id="roi-index" aria-label="Open AstroMapper JPG and TXT pair" title="Open AstroMapper JPG and TXT pair">—</button>
+    <button type="button" id="roi-next" aria-label="Next ROI" title="Next ROI (→)" disabled><span class="overlay-glyph roi-next-glyph" aria-hidden="true"></span></button>
+    </div>
+    <button type="button" id="overlay-lock" aria-label="Lock image and window" aria-pressed="false" title="Lock image and window (L)"><span class="overlay-glyph lock-glyph" aria-hidden="true"></span></button>
+    <button type="button" id="overlay-close" aria-label="Close translucent viewer" title="Close translucent viewer (Esc)"><span class="overlay-glyph close-glyph" aria-hidden="true"></span></button>
+  </div>
+  <div id="overlay-status" role="status" aria-live="polite">Opening image…</div>
+  <div class="resize-handle" data-edge="n" aria-hidden="true"></div>
+  <div class="resize-handle" data-edge="e" aria-hidden="true"></div>
+  <div class="resize-handle" data-edge="s" aria-hidden="true"></div>
+  <div class="resize-handle" data-edge="w" aria-hidden="true"></div>
+  <div class="resize-handle" data-edge="ne" aria-hidden="true"></div>
+  <div class="resize-handle" data-edge="se" aria-hidden="true"></div>
+  <div class="resize-handle" data-edge="sw" aria-hidden="true"></div>
+  <div class="resize-handle" data-edge="nw" aria-hidden="true"></div>
+</main>
+<script src="vendor/openseadragon/openseadragon.min.js"></script>
+<script src="astromap-import-v1.js"></script>
+<script src="translucent-v1.js"></script>
+</body>
+</html>

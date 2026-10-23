@@ -140,10 +140,79 @@ def test_equal_or_older_version_is_not_an_update(index):
 
 
 @pytest.mark.parametrize("value,channel", [("2.1.0rc1", "rc"), ("v2.1.0rc2", "rc"),
-                                            ("2.1.0", "stable"), ("2.1.0b3", "stable"),
+                                            ("2.1.0", "stable"), ("2.5.0b1", "beta"),
                                             ("development", "stable")])
 def test_channel_is_explicit_and_version_derived(value, channel):
     assert updates.channel_for_version(value) == channel
+
+
+@pytest.mark.parametrize("platform_name,machine,suffix", [
+    ("darwin", "arm64", "macos-arm64.dmg"),
+    ("win32", "AMD64", "windows-x64.zip"),
+    ("win32", "ARM64", "windows-x64.zip"),
+])
+@pytest.mark.parametrize("target,channel", [
+    ("2.5.0b2", "beta"), ("2.5.0rc1", "rc"), ("2.5.0", "stable"),
+])
+def test_beta_can_advance_on_its_verified_platform(platform_name, machine, suffix, target, channel):
+    item = release(f"v{target}", f"nd2wsi-viewer-{target}-{suffix}",
+                   prerelease=channel != "stable")
+    selected = updates.select_release_asset([item], platform_name=platform_name, machine=machine,
+                                             current_version="2.5.0b1", channel="beta")
+    assert selected["version"] == target
+    assert selected["channel"] == channel
+    assert selected["platform"] == platform_name
+    assert selected["emulated"] == (platform_name == "win32" and machine == "ARM64")
+
+
+@pytest.mark.parametrize("platform_name,machine,suffix", [
+    ("darwin", "arm64", "macos-arm64.dmg"),
+    ("win32", "AMD64", "windows-x64.zip"),
+])
+@pytest.mark.parametrize("channel", ["stable", "beta"])
+def test_stable_installation_never_enters_beta(platform_name, machine, suffix, channel):
+    item = release("v2.5.0b1", f"nd2wsi-viewer-2.5.0b1-{suffix}", prerelease=True)
+    assert updates.select_release_asset([item], platform_name=platform_name, machine=machine,
+                                        current_version="2.4.1", channel=channel) is None
+
+
+@pytest.mark.parametrize("target,prerelease,suffix", [
+    ("2.5.0b1", True, "macos-arm64.dmg"),
+    ("2.5.0a2", True, "macos-arm64.dmg"),
+    ("2.5.0b2", False, "macos-arm64.dmg"),
+    ("2.5.0b2", True, "windows-x64.zip"),
+    ("2.5.0b2", True, "macos-x86_64.dmg"),
+])
+def test_beta_rejects_old_inconsistent_and_incompatible_assets(target, prerelease, suffix):
+    item = release(f"v{target}", f"nd2wsi-viewer-{target}-{suffix}", prerelease=prerelease)
+    assert updates.select_release_asset([item], platform_name="darwin", machine="arm64",
+                                        current_version="2.5.0b1", channel="beta") is None
+
+
+@pytest.mark.parametrize("current,channel", [("2.5.0b1", "beta"), ("2.5.0rc1", "rc")])
+def test_windows_prerelease_check_derives_channel_and_can_reach_final(monkeypatch, current, channel):
+    item = release("v2.5.0", "nd2wsi-viewer-2.5.0-windows-x64.zip")
+    monkeypatch.setattr(updates, "fetch_releases", lambda: [item])
+    opened = Mock()
+    monkeypatch.setattr(updates.webbrowser, "open", opened)
+    result = updates.check_for_updates(platform_name="win32", machine="AMD64",
+                                       current_version=current, open_download=False)
+    assert updates.channel_for_version(current) == channel
+    assert result["ok"] and result["available"] and not result["opened"]
+    assert result["version"] == "2.5.0" and result["channel"] == "stable"
+    opened.assert_not_called()
+
+
+def test_beta_check_selects_newer_beta_without_installing(monkeypatch):
+    item = release("v2.5.0b2", "nd2wsi-viewer-2.5.0b2-windows-x64.zip", prerelease=True)
+    monkeypatch.setattr(updates, "fetch_releases", lambda: [item])
+    opened = Mock()
+    monkeypatch.setattr(updates.webbrowser, "open", opened)
+    result = updates.check_for_updates(platform_name="win32", machine="AMD64",
+                                       current_version="2.5.0b1", open_download=False)
+    assert result["ok"] and result["available"] and result["channel"] == "beta"
+    assert result["asset_name"] == "nd2wsi-viewer-2.5.0b2-windows-x64.zip"
+    opened.assert_not_called()
 
 
 def test_check_opens_only_selected_asset_on_user_request(monkeypatch, index):
