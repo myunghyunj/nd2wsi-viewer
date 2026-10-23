@@ -107,13 +107,18 @@ def make_ffmpeg(source: Path, arguments: list[str], jobs: int,
 def build_pyav(source: Path, prefix: Path, python: str, wheel_dir: Path,
                jobs: int, env: dict[str, str], *, windows: bool) -> None:
     build_options = ["build_ext", f"-j{jobs}"]
+    wheel_options = ["bdist_wheel", "--dist-dir", str(wheel_dir)]
     if windows:
         # FFmpeg's MSVC install puts its .lib import libraries beside the DLLs
         # in bin; PyAV's --ffmpeg-dir searches only lib. Keep the upstream layout
         # and add bin to the linker search path without changing either source.
         build_options.append(f"--library-dirs={prefix / 'bin'}")
+    else:
+        # python.org's universal2 interpreter otherwise labels this wheel as
+        # universal2 even though ARCHFLAGS and FFmpeg select native arm64.
+        wheel_options += ["--plat-name", f"macosx_{MACOS_TARGET.replace('.', '_')}_arm64"]
     run([python, "setup.py", f"--ffmpeg-dir={prefix}", *build_options,
-         "bdist_wheel", "--dist-dir", str(wheel_dir)], cwd=source, env=env)
+         *wheel_options], cwd=source, env=env)
 
 
 def main() -> None:

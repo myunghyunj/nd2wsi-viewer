@@ -138,7 +138,7 @@ def test_windows_workflow_passes_action_managed_msys_bash():
 
 
 @pytest.mark.parametrize("windows", [False, True])
-def test_pyav_build_adds_msvc_import_library_directory_only_on_windows(tmp_path, monkeypatch, windows):
+def test_pyav_build_uses_platform_library_path_and_wheel_tag(tmp_path, monkeypatch, windows):
     builder = load_script("build_sdpc_codec")
     source = tmp_path / "PyAV source"
     prefix = tmp_path / "FFmpeg install"
@@ -148,7 +148,10 @@ def test_pyav_build_adds_msvc_import_library_directory_only_on_windows(tmp_path,
     monkeypatch.setattr(builder, "run", lambda command, **kwargs: calls.append((command, kwargs)))
     builder.build_pyav(source, prefix, "python", wheel_dir, 6, env, windows=windows)
     build_options = ["build_ext", "-j6"]
+    wheel_options = ["bdist_wheel", "--dist-dir", str(wheel_dir)]
     if windows:
         build_options.append(f"--library-dirs={prefix / 'bin'}")
+    else:
+        wheel_options += ["--plat-name", "macosx_12_0_arm64"]
     assert calls == [(["python", "setup.py", f"--ffmpeg-dir={prefix}", *build_options,
-                      "bdist_wheel", "--dist-dir", str(wheel_dir)], {"cwd": source, "env": env})]
+                      *wheel_options], {"cwd": source, "env": env})]

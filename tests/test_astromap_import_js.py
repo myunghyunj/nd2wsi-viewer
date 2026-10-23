@@ -17,7 +17,7 @@ HEADER = "INDEX\tX1\tY1\tX2\tY2\tNOTE\n"
 def run(script):
     code = "const api=require(process.argv[1]);\n" + script
     result = subprocess.run([NODE, "-e", code, str(STATIC / "astromap-import-v1.js")],
-                            check=True, capture_output=True, text=True, timeout=20)
+                            check=True, capture_output=True, text=True, encoding="utf-8", timeout=20)
     return json.loads(result.stdout)
 
 

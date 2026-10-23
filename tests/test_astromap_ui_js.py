@@ -22,6 +22,7 @@ def _run(script):
         [NODE, "-e", script, str(MODULE)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=20,
     )
     assert result.returncode == 0, result.stderr
