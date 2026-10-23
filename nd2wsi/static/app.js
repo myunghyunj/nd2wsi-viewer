@@ -570,59 +570,26 @@ function tileQuery() {
 }
 
 function makeTileSource() {
-  const info = state.info;
-  // server levels: index 0 = full resolution; OSD wants level 0 = smallest.
-  const lv = info.levels.slice().reverse();
-  return {
-    width: info.width,
-    height: info.height,
-    tileSize: info.tileSize,
-    tileOverlap: 0,
-    minLevel: 0,
-    maxLevel: lv.length - 1,
-    getLevelScale: function (l) {
-      return lv[l].width / info.width;
-    },
-    getNumTiles: function (l) {
-      // exact integer tile counts (float drift in scale*width could otherwise
-      // request one tile past the edge on odd-sized levels)
-      return new OpenSeadragon.Point(
-        Math.ceil(lv[l].width / info.tileSize),
-        Math.ceil(lv[l].height / info.tileSize)
-      );
-    },
-    getTileUrl: function (l, x, y) {
-      // read the query at request time so a tile refresh (LUT, channel
-      // switch, frame change) picks up the current settings without a reopen
-      return "api/tile/" + lv[l].path + "/" + x + "/" + y + ".jpg" + tileQuery();
-    },
-  };
+  // tileQuery is read per tile request so a tile refresh (LUT, channel
+  // switch, frame change) picks up the current settings without a reopen
+  return window.Nd2ViewerGeometry.makeTileSource({
+    info: state.info, OSD: OpenSeadragon, query: tileQuery,
+  });
 }
 
 function flipAwareViewerElementPoint(point) {
-  const p = new OpenSeadragon.Point(Number(point.x), Number(point.y));
-  const viewport = state.viewer?.viewport;
-  if (viewport?.getFlip()) {
-    p.x = viewport.getContainerSize().x - p.x;
-  }
-  return p;
+  return window.Nd2ViewerGeometry.flipAwareElementPoint(
+    state.viewer?.viewport, point, OpenSeadragon);
 }
 
 function viewerElementToImagePoint(point) {
-  return state.viewer.viewport.viewerElementToImageCoordinates(
-    flipAwareViewerElementPoint(point)
-  );
+  return window.Nd2ViewerGeometry.viewerElementToImagePoint(
+    state.viewer.viewport, point, OpenSeadragon);
 }
 
 function imageToViewerElementPoint(point) {
-  const viewport = state.viewer.viewport;
-  const p = viewport.imageToViewerElementCoordinates(
-    new OpenSeadragon.Point(Number(point.x), Number(point.y))
-  );
-  if (viewport.getFlip()) {
-    p.x = viewport.getContainerSize().x - p.x;
-  }
-  return p;
+  return window.Nd2ViewerGeometry.imageToViewerElementPoint(
+    state.viewer.viewport, point, OpenSeadragon);
 }
 
 function buildViewer() {
@@ -1909,13 +1876,10 @@ function wireAstromapKeys() {
 }
 
 function panToAstromapRoi(item) {
-  const viewport = state.viewer.viewport;
-  const center = viewport.imageToViewportCoordinates(
-    new OpenSeadragon.Point(item.x + item.w / 2, item.y + item.h / 2));
   // Retain the displayed scale even if a previous zoom is still animating.
   // This changes only the camera center; ROI size never determines zoom.
-  viewport.zoomTo(viewport.getZoom(true), null, true);
-  viewport.panTo(center, true);
+  window.Nd2ViewerGeometry.centerOnPreservingZoom(state.viewer.viewport,
+    { x: item.x + item.w / 2, y: item.y + item.h / 2 }, OpenSeadragon);
 }
 
 function postAstromapState() {
