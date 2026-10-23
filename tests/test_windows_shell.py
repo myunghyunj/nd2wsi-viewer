@@ -505,7 +505,7 @@ const hidden={annot:true,channels:false,region:true,info:true};
 const panels=Object.fromEntries(Object.keys(hidden).map(id=>[id,{
   isHidden:()=>hidden[id],open:()=>hidden[id]=false,close:()=>hidden[id]=true,
 }]));
-const buttons=Object.fromEntries(Object.keys(hidden).map(id=>['tb-'+id,{
+const buttons=Object.fromEntries(['annot','channels','region'].map(id=>['tb-'+id,{
   addEventListener:(_,callback)=>handlers[id]=callback,
   removeEventListener:()=>delete handlers[id],
 }]));
@@ -527,9 +527,13 @@ const before=probe.prepare(false,'a');
 handlers.annot();hidden.annot=false;
 events.keydown({key:'a',code:'KeyA',repeat:false,isTrusted:true,target:toolbar});
 const after=probe.snapshot();
+panels.info.open();
+const infoOpened=probe.snapshot();
+panels.info.close();
+const infoClosed=probe.snapshot();
 const editable=probe.prepare(true,'a');
 probe.cleanup();
-process.stdout.write(JSON.stringify({before,after,editable,restored:hidden,focused:document.activeElement.id,
+process.stdout.write(JSON.stringify({before,after,infoOpened,infoClosed,editable,restored:hidden,focused:document.activeElement.id,
   handlers:Object.keys(handlers),inputs:inputs.length,events:Object.keys(events),probe:!!window.__nd2wsiNativeKeyboardSmoke}));
 """
     result = subprocess.run([NODE, "-e", harness], input=json.dumps(app._GUI_SMOKE_KEYBOARD_SETUP),
@@ -538,6 +542,8 @@ process.stdout.write(JSON.stringify({before,after,editable,restored:hidden,focus
     assert out["before"]["focused"] == "newtab"
     assert out["before"]["counts"]["annot"] == 0 and out["after"]["counts"]["annot"] == 1
     assert out["before"]["hidden"]["annot"] is True and out["after"]["hidden"]["annot"] is False
+    assert out["infoOpened"]["counts"]["info"] == 1 and out["infoOpened"]["hidden"]["info"] is False
+    assert out["infoClosed"]["counts"]["info"] == 2 and out["infoClosed"]["hidden"]["info"] is True
     assert out["after"]["events"] == [{"key": "a", "code": "KeyA", "repeat": False, "trusted": True, "target": "newtab"}]
     assert out["editable"]["value"] == "native smoke" and out["editable"]["selection"] == [0, 0]
     assert out["restored"] == out["before"]["hidden"] and out["focused"] == "original"

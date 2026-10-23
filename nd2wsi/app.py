@@ -952,21 +952,27 @@ _GUI_SMOKE_KEYBOARD_SETUP = """(() => {
   const frame = document.querySelector('#frames iframe.active');
   const view = frame && frame.contentWindow, page = frame && frame.contentDocument;
   const toolbar = document.getElementById('newtab');
-  const ids = {annot:'tb-annot', channels:'tb-channels', region:'tb-region', info:'tb-info'};
+  const ids = {annot:'tb-annot', channels:'tb-channels', region:'tb-region'};
+  const panelNames = [...Object.keys(ids), 'info'];
   if (!page || !toolbar || Object.values(ids).some(id => !page.getElementById(id)))
     throw new Error('Native keyboard smoke controls are unavailable');
   const panels = view.eval('state.windows');
-  const original = Object.fromEntries(Object.keys(ids).map(id => [id, panels[id].isHidden()]));
+  const original = Object.fromEntries(panelNames.map(id => [id, panels[id].isHidden()]));
   const focused = document.activeElement;
   const input = document.createElement('input');
   input.id = 'nd2wsi-native-keyboard-smoke-input'; input.type = 'text';
   input.style.cssText = 'position:fixed;bottom:0;left:0;width:180px;z-index:99999';
   document.body.appendChild(input);
-  const counts = Object.fromEntries(Object.keys(ids).map(id => [id, 0]));
+  const counts = Object.fromEntries(panelNames.map(id => [id, 0]));
   const listeners = Object.entries(ids).map(([id, button]) => {
     const element = page.getElementById(button), listener = () => { counts[id]++; };
     element.addEventListener('click', listener); return [element, listener];
   });
+  // Info lives in the shell tools row; its pane action has no proxy button.
+  const infoActions = Object.fromEntries(['open', 'close'].map(action => [action, panels.info[action]]));
+  for (const [action, originalAction] of Object.entries(infoActions)) {
+    panels.info[action] = function(...args) { counts.info++; return originalAction.apply(this, args); };
+  }
   let events = [];
   const observe = event => { events.push({key:event.key, code:event.code, repeat:event.repeat,
     trusted:event.isTrusted, target:event.target.id || event.target.tagName}); };
@@ -983,12 +989,13 @@ _GUI_SMOKE_KEYBOARD_SETUP = """(() => {
       return this.snapshot();
     },
     snapshot() { return {counts:{...counts},
-      hidden:Object.fromEntries(Object.keys(ids).map(id => [id, panels[id].isHidden()])),
+      hidden:Object.fromEntries(panelNames.map(id => [id, panels[id].isHidden()])),
       events:[...events], focused:document.activeElement.id, value:input.value,
       selection:[input.selectionStart, input.selectionEnd]}; },
     cleanup() {
       window.removeEventListener('keydown', observe, true);
       for (const [element, listener] of listeners) element.removeEventListener('click', listener);
+      Object.assign(panels.info, infoActions);
       for (const [id, hidden] of Object.entries(original)) {
         if (panels[id].isHidden() !== hidden) panels[id][hidden ? 'close' : 'open']();
       }

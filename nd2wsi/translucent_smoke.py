@@ -55,6 +55,28 @@ def pane_eval(parent, expression):
     )
 
 
+def click_shell_cloud(parent, *, timeout=30):
+    """Use the visible shell disclosure and cloud controls, as a user would."""
+    wait_for(lambda: parent.evaluate_js("""(() => {
+      const group=document.getElementById('shell-tools');
+      const toggle=document.getElementById('shell-tools-toggle');
+      const cloud=document.getElementById('translucent-toggle');
+      return !!(group && toggle && cloud && !cloud.disabled);
+    })()"""), timeout=timeout, description="shell cloud control")
+    parent.evaluate_js("""(() => {
+      if(document.getElementById('shell-tools').hidden)
+        document.getElementById('shell-tools-toggle').click();
+      return true;
+    })()""")
+    wait_for(lambda: parent.evaluate_js("""(() => {
+      const group=document.getElementById('shell-tools');
+      const button=document.getElementById('translucent-toggle');
+      const r=button.getBoundingClientRect();
+      return !group.hidden && r.width>0 && r.height>0 && !button.disabled;
+    })()"""), timeout=timeout, description="expanded shell cloud control")
+    parent.evaluate_js("document.getElementById('translucent-toggle').click(); true")
+
+
 def native_call(window, operation, *, timeout=30):
     complete, result = threading.Event(), {}
 
@@ -144,11 +166,10 @@ def drag_image(window):
     })()""")
 
 
-def snapshot_cocoa(window, path, *, timeout=30):
-    """Snapshot this WKWebView, then inspect real PNG alpha and glyph pixels."""
+def save_cocoa_snapshot(window, path, *, timeout=30):
+    """Save only the supplied WKWebView, without capturing another app."""
     from AppKit import NSBitmapImageFileTypePNG, NSBitmapImageRep
     from Foundation import NSOperationQueue
-    from PIL import Image
     from webview.platforms.cocoa import BrowserView
 
     complete, errors = threading.Event(), []
@@ -160,7 +181,7 @@ def snapshot_cocoa(window, path, *, timeout=30):
                 raise RuntimeError(str(error))
             bitmap = NSBitmapImageRep.imageRepWithData_(native_image.TIFFRepresentation())
             saved = bitmap.representationUsingType_properties_(NSBitmapImageFileTypePNG, {}).writeToFile_atomically_(str(path), True)
-            _check(saved, "Could not save overlay snapshot")
+            _check(saved, "Could not save native snapshot")
         except Exception as exc:
             errors.append(exc)
         finally:
@@ -169,9 +190,17 @@ def snapshot_cocoa(window, path, *, timeout=30):
     NSOperationQueue.mainQueue().addOperationWithBlock_(
         lambda: BrowserView.instances[window.uid].webview.takeSnapshotWithConfiguration_completionHandler_(None, finish)
     )
-    _check(complete.wait(timeout), "overlay snapshot timed out")
+    _check(complete.wait(timeout), "native snapshot timed out")
     if errors:
         raise errors[0]
+    return path
+
+
+def snapshot_cocoa(window, path, *, timeout=30):
+    """Snapshot this WKWebView, then inspect real PNG alpha and glyph pixels."""
+    from PIL import Image
+
+    path = save_cocoa_snapshot(window, path, timeout=timeout)
     geometry = window.evaluate_js("""(() => {
       const r=document.getElementById('overlay-lock').getBoundingClientRect();
       return {width:innerWidth,height:innerHeight,lock:[r.x,r.y,r.width,r.height]};
@@ -205,7 +234,7 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
         result["source"] = source
         previous = set(api._translucent_windows)
         _check(not previous, "Smoke check requires a parent without existing overlays")
-        pane_eval(parent, "document.getElementById('tb-translucent').click(); true")
+        click_shell_cloud(parent, timeout=timeout)
         overlay = wait_for(lambda: next(iter(api._translucent_windows.values()), None),
                            timeout=timeout, description="cloud button overlay")
         child = overlay._window

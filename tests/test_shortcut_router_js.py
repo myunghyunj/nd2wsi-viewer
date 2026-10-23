@@ -360,7 +360,8 @@ def test_production_pages_use_the_router_and_document_the_same_shortcuts():
     assert 'id="tb-channels" title="Show or hide Channels &amp; LUTs (C)" aria-keyshortcuts="C"' in index
     assert 'id="tb-region" title="Show or hide Export (E)" aria-keyshortcuts="E"' in index
     assert 'id="tb-annot" title="Show or hide Annotations (A)" aria-keyshortcuts="A"' in index
-    info_button = index.split('id="tb-info"', 1)[1].split('</button>', 1)[0]
+    info_button = shell_html.split('id="info-toggle"', 1)[1].split('</button>', 1)[0]
+    assert 'id="tb-info"' not in index
     assert 'aria-label="Slide Info"' in info_button and 'aria-keyshortcuts="Meta+I"' in info_button
     assert '<span>Info</span>' not in info_button
     assert '<span class="win-title">Export</span>' in index

@@ -2,6 +2,7 @@
 
 This prerelease adds a translucent tracing window to the standard desktop viewer, on top of the 2.4.1 release.
 
+- **Collapsible top tools:** expand with **‹** to show cloud, Astromapper, Shading Correction, Compare slides and Slide Info; collapse with **›**. Channels uses a three-slider icon, and Compare slides uses a split rectangle.
 - **Cloud button:** open the current fluorescence image above other apps, using the same channels, LUTs, selected plane, rotation and scale. The main viewer can be minimized while the tracing window remains visible.
 - **Fixed scale when resizing:** changing the window size changes only the field of view. Drag the image to pan; wheel, trackpad or pinch to zoom. Drag the empty top edge or Option/Alt-drag to move the window.
 - **Minimal controls:** white, backgroundless lock and close icons. Lock freezes the image, ROI navigation, movement and resizing; unlock and close remain available.

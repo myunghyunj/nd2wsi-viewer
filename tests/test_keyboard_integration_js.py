@@ -40,7 +40,7 @@ const dispatchEnd=vendor.indexOf(',keyup:function',dispatchAt);
 if(actionAt<0 || actionStart<0 || actionEnd<0 || dispatchAt<0 || dispatchEnd<0) {
   throw Error('Bundled OSD keyboard structure changed; inspect the real handlers');
 }
-const out={clicks:[],tools:[],messages:[],toasts:[],applied:[],orientationCalls:[],
+const out={clicks:[],panels:[],translucent:0,tools:[],messages:[],toasts:[],applied:[],orientationCalls:[],
   osdRotations:[],osdFlips:0,pans:[],zooms:[],homes:0,autofocus:[],
   targetDeliveries:0,osdKeydowns:0,events:[]};
 const listeners=new Map(), elements=new Map(), viewerHandlers=new Map();
@@ -65,6 +65,12 @@ const state={
     displayRotation:config.degrees || 0,displayFlipped:!!config.flipped,
     reopening:false,contextChanging:false},
 };
+let infoHidden=true;
+state.windows={info:config.disabled?.includes('info') ? null : {
+  isHidden:()=>infoHidden,
+  open(){infoHidden=false;out.panels.push({panel:'info',open:true});},
+  close(){infoHidden=true;out.panels.push({panel:'info',open:false});},
+}};
 let rotation=config.degrees || 0, flipped=!!config.flipped;
 const viewport={
   getRotation:()=>rotation,getFlip:()=>flipped,
@@ -95,6 +101,7 @@ const context=vm.createContext({
   renderAnnotations(){},updateAlignmentDrag(){},debounceToast:()=>()=>{},
   refreshSpatialContext(){},postSpatialReadiness(){},currentSlideSid:()=> 'test',
   showToast:message=>out.toasts.push(message),
+  openTranslucentViewer(){out.translucent++;},
   setTool:tool=>{state.tool=tool;out.tools.push(tool);},togglePixelInspector(){},
   setPlateAuto:value=>{state.plate.auto=value;out.autofocus.push(value);},
   stepPlateZ(){},setPlateT(){},setPlatePlaying(){},setPlateFocus(){},
@@ -390,12 +397,13 @@ def test_plain_panels_run_once_before_osd_in_both_keyboard_layouts(platform, let
 
 
 @pytest.mark.parametrize("letter,button", [("C", "tb-channels"), ("A", "tb-annot"),
-                                          ("I", "tb-info")])
+                                          ("I", "info")])
 @pytest.mark.parametrize("platform,modifier", [("MacIntel", "metaKey"), ("Win32", "ctrlKey")])
 def test_command_panels_run_once_before_osd(letter, button, platform, modifier):
     out = pane([key(letter, **{modifier: True}),
                 key(letter, repeat=True, **{modifier: True})], platform=platform)
-    assert out["clicks"] == [button]
+    assert out["clicks"] == ([] if button == "info" else [button])
+    assert out["panels"] == ([{"panel": "info", "open": True}] if button == "info" else [])
     assert out["events"] == [{"prevented": True, "stopped": True}] * 2
     assert out["targetDeliveries"] == out["osdKeydowns"] == 0
     assert out["osdRotations"] == out["pans"] == []
@@ -509,7 +517,7 @@ def test_shell_panel_forwarding_also_works_without_compare_or_a_ready_image():
 
 
 @pytest.mark.parametrize("panel,button", [("channels", "tb-channels"), ("annot", "tb-annot"),
-                                        ("region", "tb-region"), ("info", "tb-info")])
+                                        ("region", "tb-region"), ("info", "info")])
 @pytest.mark.parametrize("config,accepted", [
     ({}, True), ({"compare": {"enabled": True, "linked": True}}, True),
     ({"plate": True, "grid": True}, True), ({"changeContext": True}, False),
@@ -524,7 +532,8 @@ def test_shell_panel_message_reaches_only_its_current_trusted_pane(panel, button
     config = dict(config)
     message = {"nd2wsi": "pane-panel-shortcut", "panel": panel, **config.pop("message", {})}
     out = pane(iframe=True, message=message, **config)
-    assert out["clicks"] == ([button] if accepted else [])
+    assert out["clicks"] == ([button] if accepted and panel != "info" else [])
+    assert out["panels"] == ([{"panel": "info", "open": True}] if accepted and panel == "info" else [])
 
 
 @pytest.mark.parametrize("panel", ["unknown", "toString", "__proto__", None])
@@ -549,7 +558,7 @@ def test_selected_read_only_text_keeps_native_copy_and_select_all(letter, platfo
 
 
 @pytest.mark.parametrize("letter,button", [("C", "tb-channels"), ("A", "tb-annot"),
-                                          ("I", "tb-info")])
+                                          ("I", "info")])
 def test_disabled_command_panel_stays_reserved_without_toggling(letter, button):
     out = pane([key(letter, metaKey=True)], disabled=[button])
     assert out["clicks"] == []
@@ -696,3 +705,25 @@ def test_shell_without_compare_captures_active_pane_identity_for_forwarding():
                       "action": "flip-horizontal", "paneInstanceId": "pane-c",
                       "contextEpoch": 1, "spatialContextKey": "context-c"}],
     }
+
+
+def test_info_shortcut_opens_and_closes_the_inspector_without_proxy_button():
+    out = pane([key("I", metaKey=True), key("I", metaKey=True)])
+    assert out["clicks"] == []
+    assert out["panels"] == [{"panel": "info", "open": True}, {"panel": "info", "open": False}]
+
+
+@pytest.mark.parametrize("config,accepted", [
+    ({}, True), ({"changeContext": True}, False),
+    ({"message": {"paneInstanceId": "old-pane"}}, False),
+    ({"message": {"contextEpoch": 0}}, False),
+    ({"message": {"spatialContextKey": "old-site"}}, False),
+    ({"message": {"sid": "different-slide"}}, False),
+    ({"message": {"version": 1}}, False),
+    ({"messageOrigin": "http://other.invalid"}, False), ({"foreignSource": True}, False),
+])
+def test_cloud_command_reaches_only_the_current_trusted_pane(config, accepted):
+    config = dict(config)
+    message = {"nd2wsi": "pane-translucent-open", "sid": "test", **config.pop("message", {})}
+    out = pane(iframe=True, message=message, **config)
+    assert out["translucent"] == int(accepted)

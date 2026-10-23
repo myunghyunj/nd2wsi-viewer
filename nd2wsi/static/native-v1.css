@@ -79,14 +79,6 @@
 .tb-btn:hover { background: rgba(255, 255, 255, 0.075); }
 .tb-btn.active { background: rgba(255, 255, 255, 0.105); }
 
-.icon-cloud {
-  width: 20px;
-  height: 20px;
-  background: currentColor;
-  -webkit-mask: url("vendor/icons8-win10/cloud.png") center / contain no-repeat;
-  mask: url("vendor/icons8-win10/cloud.png") center / contain no-repeat;
-}
-
 .icon-credit { margin: 12px 0 0; font-size: 11px; color: var(--label-2); }
 .icon-credit a { color: inherit; }
 .tb-icon-only { width: 29px; padding: 0; justify-content: center; }
@@ -118,24 +110,12 @@
   stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
 }
 
-.icon-sliders::before {
-  content: "";
-  width: 12px;
-  height: 10px;
-  background:
-    linear-gradient(currentColor, currentColor) 1px 1px / 10px 1px no-repeat,
-    linear-gradient(currentColor, currentColor) 1px 5px / 10px 1px no-repeat,
-    linear-gradient(currentColor, currentColor) 1px 9px / 10px 1px no-repeat;
-  opacity: 0.85;
-}
-.icon-sliders::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background:
-    radial-gradient(circle at 4px 2px, currentColor 0 1.4px, transparent 1.6px),
-    radial-gradient(circle at 9px 6px, currentColor 0 1.4px, transparent 1.6px),
-    radial-gradient(circle at 6px 10px, currentColor 0 1.4px, transparent 1.6px);
+.icon-sliders {
+  width: 16px;
+  height: 16px;
+  background: currentColor;
+  -webkit-mask: url("vendor/icons8-win10/channels-sliders.svg") center / contain no-repeat;
+  mask: url("vendor/icons8-win10/channels-sliders.svg") center / contain no-repeat;
 }
 
 .mac-window {

@@ -135,7 +135,7 @@ The standard viewer remembers each file's last-used minimum, maximum and gamma a
 
 ### Translucent viewer — 2.5 beta
 
-Click the **cloud** at the right of the image toolbar to open the current fluorescence image in a separate, always-on-top tracing window. It keeps the current channels, LUTs, plane, orientation and image scale. The image is 55% opaque, so another app remains visible behind it. You can minimize the main viewer while using this window.
+Click **‹** at the right of the top tab strip to expand its tools: **cloud**, **Astromapper**, **Shading Correction**, **Compare slides**, and **Slide Info**. **›** collapses them again. The cloud opens the current fluorescence image in a separate, always-on-top tracing window. It keeps the current channels, LUTs, plane, orientation and image scale. The image is 55% opaque, so another app remains visible behind it. You can minimize the main viewer while using this window.
 
 Drag the image to pan and scroll or pinch to zoom. Drag the empty top edge, or Option/Alt-drag, to move the window. Drag an edge or corner to resize it: the image scale stays fixed and only the field of view changes. The white **lock** freezes image navigation and window placement; click it again to unlock. **×** closes the tracing window. The main viewer's source tab must remain open.
 

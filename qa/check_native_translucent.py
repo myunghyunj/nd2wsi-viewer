@@ -25,8 +25,10 @@ from nd2wsi.translucent_smoke import (  # noqa: E402
     bridge_result,
     camera,
     check_camera,
+    click_shell_cloud,
     exercise_translucent_viewer,
     pane_eval,
+    save_cocoa_snapshot,
     wait_for,
 )
 from nd2wsi.window_sessions import create_window_session  # noqa: E402
@@ -77,6 +79,74 @@ def synthetic_store():
         group.create_array(str(index), data=data, chunks=(1, 256, 256))
     group.attrs.update(attrs)
     return store
+
+
+def shell_toolbar_checks():
+    """Check the real shell controls and save both native disclosure states."""
+    state_script = """(() => {
+      const group=document.getElementById('shell-tools');
+      const toggle=document.getElementById('shell-tools-toggle');
+      const chevron=toggle?.querySelector('.tools-chevron');
+      if(!group || !toggle || !chevron) return null;
+      const ids=['astromap-toggle','shading-correction','compare-toggle',
+        'translucent-toggle','info-toggle'];
+      return {hidden:group.hidden,expanded:toggle.getAttribute('aria-expanded'),
+        chevron:getComputedStyle(chevron).maskImage || getComputedStyle(chevron).webkitMaskImage,
+        active:document.querySelector('#frames iframe.active')?.src,
+        buttons:ids.map(id=>{const b=document.getElementById(id),r=b.getBoundingClientRect();
+          return {id,inGroup:group.contains(b),disabled:b.disabled,
+            rect:[r.x,r.y,r.width,r.height]};})};
+    })()"""
+
+    def capture(name):
+        bridge_result(parent, "new Promise(resolve => requestAnimationFrame(() => "
+                              "requestAnimationFrame(() => resolve(true))))")
+        time.sleep(.2)
+        path = save_cocoa_snapshot(parent, session.exports_root / f"toolbar-{name}-native.png")
+        geometry = parent.evaluate_js("({width:innerWidth,bar:document.getElementById('tabbar').getBoundingClientRect().bottom})")
+        top_path = session.exports_root / f"toolbar-{name}-top.png"
+        with Image.open(path) as image:
+            scale = image.width / geometry["width"]
+            image.crop((0, 0, image.width, min(image.height, round((geometry["bar"] + 105) * scale)))).save(top_path)
+            return {"path": str(path), "top": str(top_path), "size": [image.width, image.height]}
+
+    initial = wait_for(lambda: parent.evaluate_js(state_script), description="shell tool disclosure")
+    check(initial["hidden"] and initial["expanded"] == "false", "Top tools are not initially collapsed")
+    check("angle-left.svg" in initial["chevron"], f"Collapsed disclosure is not the requested angle-left: {initial}")
+    check(all(button["rect"][2] == 0 for button in initial["buttons"]),
+          "Collapsed group still occupies visible button space")
+    check(pane_eval(parent, "!document.getElementById('tb-translucent') && !document.getElementById('tb-info')"),
+          "Cloud or Info remains in the lower toolbar")
+    wait_for(lambda: pane_eval(parent, "state.viewer.world.getItemAt(0).getFullyLoaded()"), description="parent screenshot tiles")
+    collapsed_snapshot = capture("collapsed")
+    parent.evaluate_js("document.getElementById('shell-tools-toggle').click(); true")
+    expanded = wait_for(lambda: (value if not value["hidden"] and value["expanded"] == "true" else None)
+                        if (value := parent.evaluate_js(state_script)) else None,
+                        description="expanded shell tools")
+    check("angle-right.svg" in expanded["chevron"], f"Expanded disclosure is not the requested angle-right: {expanded}")
+    check(all(button["inGroup"] and button["rect"][2] > 0 and button["rect"][3] > 0
+              for button in expanded["buttons"]), "A top control is missing from the expanded group")
+    centers = [button["rect"][1] + button["rect"][3] / 2 for button in expanded["buttons"]]
+    check(max(centers) - min(centers) < 2, "Top controls do not share one horizontal line")
+    check(not any(button["disabled"] for button in expanded["buttons"]
+                  if button["id"] in {"translucent-toggle", "info-toggle"}),
+          "Cloud or Info remains disabled after source load")
+    expanded_snapshot = capture("expanded")
+    check(pane_eval(parent, "state.windows.info.isHidden()"), "Info should initially be closed")
+    parent.evaluate_js("document.getElementById('info-toggle').click(); true")
+    wait_for(lambda: pane_eval(parent, "!state.windows.info.isHidden()"), description="shell Info open")
+    check(parent.evaluate_js("document.querySelector('#frames iframe.active').src") == expanded["active"],
+          "Info changed the active pane")
+    info_snapshot = capture("info-open")
+    parent.evaluate_js("document.getElementById('info-toggle').click(); true")
+    wait_for(lambda: pane_eval(parent, "state.windows.info.isHidden()"), description="shell Info close")
+    parent.evaluate_js("document.getElementById('shell-tools-toggle').click(); true")
+    wait_for(lambda: parent.evaluate_js("document.getElementById('shell-tools').hidden && "
+                                       "document.getElementById('shell-tools-toggle').getAttribute('aria-expanded')==='false'"),
+             description="shell tools collapse roundtrip")
+    return {"collapsed": initial, "expanded": expanded, "lower_cloud_info_absent": True,
+            "info_active_pane_open_close": True, "collapse_roundtrip": True,
+            "snapshots": {"collapsed": collapsed_snapshot, "expanded": expanded_snapshot, "info_open": info_snapshot}}
 
 
 def pair_checks(overlay, child):
@@ -138,7 +208,7 @@ def hydrate_checks():
     expected = pane_eval(parent, "captureTranslucentView()")
     check(expected.get("roiIndex") == 1 and len(expected.get("rois", [])) == 2,
           "Source imported ROI snapshot is missing")
-    pane_eval(parent, "document.getElementById('tb-translucent').click(); true")
+    click_shell_cloud(parent)
     overlay = wait_for(lambda: next(iter(api._translucent_windows.values()), None), description="hydrated overlay")
     child = overlay._window
     try:
@@ -171,6 +241,9 @@ def run():
         parent.load_url(url)
         wait_for(lambda: pane_eval(parent, "!!(state.info && state.annReady && state.viewer.isOpen())"),
                  description="private synthetic fluorescence source")
+        report["shell_toolbar"] = shell_toolbar_checks()
+        report["native_keyboard"] = app._gui_smoke_native_keyboard(api, parent, slide=True)
+        check(report["native_keyboard"]["status"] == "passed", "Native keyboard smoke failed")
         pane_eval(parent, """state.channels=[1]; state.luts=[null,{lo:100,hi:3500,gamma:.7}];
           const p=state.viewer.viewport; p.setRotation(90,true); p.setFlip(true);
           p.zoomTo(p.imageToViewportZoom(.8),null,true);

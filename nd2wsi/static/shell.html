@@ -21,6 +21,11 @@
       <span id="window-action-status" role="status" aria-live="polite"></span>
     </div>
   </details>
+  <div id="shell-tools" role="toolbar" aria-label="Slide tools" hidden>
+  <button id="translucent-toggle" class="shell-icon-button" type="button" disabled
+          title="Open translucent viewer" aria-label="Open translucent viewer">
+    <span class="cloud-icon" aria-hidden="true"></span>
+  </button>
   <button id="astromap-toggle" class="shell-icon-button" type="button" disabled
    title="Astromap (⌘⇧A)" aria-label="Astromap" aria-keyshortcuts="Meta+Shift+A" aria-pressed="false">
     <span class="astromap-icon" aria-hidden="true"></span>
@@ -52,12 +57,17 @@
           title="Compare slides (⌘\)" aria-label="Compare slides"
           aria-haspopup="menu" aria-expanded="false"
           aria-controls="compare-picker-list" disabled>
-    <svg class="hotspot-icon" viewBox="0 0 28 18" aria-hidden="true">
-      <path d="M11.2 4.2H8.5a4.8 4.8 0 0 0 0 9.6h2.7" />
-      <path d="M16.8 4.2h2.7a4.8 4.8 0 0 1 0 9.6h-2.7" />
-      <path d="M9.7 9h8.6" />
-    </svg>
+    <span class="columns-icon" aria-hidden="true"></span>
   </button>
+  <button id="info-toggle" class="shell-icon-button" type="button" disabled
+          title="Show or hide Slide Info (⌘I)" aria-label="Slide Info"
+          aria-keyshortcuts="Meta+I" aria-pressed="false">
+    <svg class="shell-info-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+  </button>
+  </div>
+  <button id="shell-tools-toggle" class="shell-icon-button" type="button"
+          title="Show slide tools" aria-label="Show slide tools" aria-expanded="false"
+          aria-controls="shell-tools"><span class="tools-chevron" aria-hidden="true"></span></button>
   <section id="compare-picker" aria-labelledby="compare-picker-title" hidden>
     <div class="compare-picker-head">
       <div class="compare-picker-heading">

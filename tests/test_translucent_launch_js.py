@@ -21,8 +21,7 @@ def launch(**options):
       if(start<0) throw Error('Missing function '+name);
       return source.slice(start,source.indexOf('\n}',start)+2);
     }
-    const out={calls:[],toasts:[]}; let click;
-    const button={disabled:false,addEventListener:(name,fn)=>{click=fn;}};
+    const out={calls:[],toasts:[]};
     const viewport={getCenter:()=>({x:0.4,y:0.3}),
       viewportToImageCoordinates:()=>({x:123.5,y:240.25}),getZoom:()=>2,
       viewportToImageZoom:()=>0.75,getRotation:()=>90,getFlip:()=>true};
@@ -38,16 +37,15 @@ def launch(**options):
     const window={};window.parent=config.standalone?window:{pywebview:{api:native}};
     if(config.standalone) window.pywebview={api:native};
     if(config.browser) {window.parent=window;delete window.pywebview;}
-    const context={state,window,$:()=>button,showToast:m=>out.toasts.push(m),
+    const context={state,window,postViewportState(){},showToast:m=>out.toasts.push(m),
       spatialImageReady:()=>config.ready!==false,
       activeFrameParams:()=>config.grid?null:{t:3,p:2,z:4},
       annotationOwnerReady:()=>config.ownerReady!==false,
       tileQuery:()=>'?c=1&win=3%2C100%2C0.25&g=fixture&t=3&p=2&z=4',
       currentSlideSid:()=> '1234abcd'};
     vm.createContext(context);
-    vm.runInContext(production('captureTranslucentView')+'\n'+production('wireTranslucentViewer')+
-      '\nwireTranslucentViewer();',context);
-    (async()=>{await Promise.all([click(),click()]);out.disabled=button.disabled;
+    vm.runInContext(production('captureTranslucentView')+'\n'+production('openTranslucentViewer'),context);
+    (async()=>{await Promise.all([context.openTranslucentViewer(),context.openTranslucentViewer()]);out.opening=!!state.translucentOpening;
       out.roi=state.roi;out.annotations=state.annotations;
       process.stdout.write(JSON.stringify(out));})();
     """
@@ -67,7 +65,7 @@ def test_opens_once_with_current_camera_lut_and_plane_without_roi(options):
     }}
     assert result["roi"] == {"x": 1, "y": 2, "w": 3, "h": 4}
     assert result["annotations"] == [{"id": "must-not-copy"}]
-    assert not result["disabled"] and not result["toasts"]
+    assert not result["opening"] and not result["toasts"]
 
 
 @pytest.mark.parametrize("options,reason", [
@@ -81,15 +79,15 @@ def test_invalid_launch_does_not_open_a_window(options, reason):
     result = launch(**options)
     assert result["calls"] == []
     assert reason in result["toasts"][0]
-    assert not result["disabled"]
+    assert not result["opening"]
 
 
 @pytest.mark.parametrize("options,reason", [({"error": True}, "Not supported"),
                                            ({"reject": True}, "Window unavailable")])
-def test_native_failure_is_visible_and_button_is_reenabled(options, reason):
+def test_native_failure_is_visible_and_launch_guard_is_released(options, reason):
     result = launch(**options)
     assert result["toasts"] == [reason]
-    assert not result["disabled"]
+    assert not result["opening"]
 
 
 def test_only_current_frame_imported_roi_snapshot_is_passed_without_mutation():

@@ -90,6 +90,51 @@ const compare = {
   routeLatest: new Map(),
 };
 
+function setShellToolsExpanded(expanded) {
+  const tools = $("shell-tools"), toggle = $("shell-tools-toggle");
+  const show = expanded === true;
+  const focusedInside = tools.contains(document.activeElement);
+  tools.hidden = !show;
+  toggle.setAttribute("aria-expanded", String(show));
+  toggle.title = show ? "Hide slide tools" : "Show slide tools";
+  toggle.setAttribute("aria-label", toggle.title);
+  if (!show && pairPicker.open) closePairPicker(false);
+  if (!show && focusedInside) toggle.focus({ preventScroll: true });
+  return show;
+}
+
+function refreshShellToolButtons() {
+  const state = compare.states.get(active);
+  const ready = readyFrames.has(active) && !!state?.paneInstanceId && !quitPreparation && !pairPicker.open;
+  const info = $("info-toggle");
+  info.disabled = !ready;
+  info.classList.toggle("active", ready && !!state.infoOpen);
+  info.setAttribute("aria-pressed", String(ready && !!state.infoOpen));
+  const cloud = $("translucent-toggle");
+  const native = typeof window.pywebview?.api?.open_translucent_viewer === "function";
+  cloud.disabled = !native || !ready || !state.imageReady || state.plateGrid ||
+    !state.translucentAvailable || state.translucentOpening;
+  cloud.title = !native ? "The translucent viewer is available in the desktop app" :
+    !ready ? "Open an image to use the translucent viewer" : state.plateGrid ?
+    "Choose a site before opening the translucent viewer" : !state.translucentAvailable ?
+    "Open a fluorescence image to use the translucent viewer" : state.translucentOpening ?
+    "Opening translucent viewer…" : "Open translucent viewer · Right-click its image to load an AstroMapper JPG and TXT pair";
+}
+
+function openActiveTranslucent() {
+  refreshShellToolButtons();
+  if ($("translucent-toggle").disabled) return false;
+  const sid = active, identity = localIdentity(compare.states.get(sid));
+  return postToSlide(sid, { nd2wsi: "pane-translucent-open", version: VIEWPORT_PROTOCOL_VERSION,
+    sid, ...identity });
+}
+
+$("shell-tools-toggle").onclick = () => setShellToolsExpanded($("shell-tools").hidden);
+$("translucent-toggle").onclick = () => openActiveTranslucent();
+$("info-toggle").onclick = () => panelShortcut("info");
+setShellToolsExpanded(false);
+window.addEventListener("pywebviewready", refreshShellToolButtons);
+
 function refreshAstromapButton() {
   const button = $("astromap-toggle");
   if (!button) return;
@@ -426,6 +471,7 @@ function slideName(sid) {
 }
 
 function render() {
+  refreshShellToolButtons();
   refreshShadingButton();
   refreshAstromapButton();
   const bar = $("tabbar");
@@ -547,6 +593,7 @@ function focusActivePane(deferred = false) {
 
 function paneCameUp(sid) {
   sendTabShortcutState(sid);
+  refreshShellToolButtons();
   refreshShadingButton();
   refreshAstromapButton();
   if (sid === active) focusActivePane(true);
@@ -1021,6 +1068,8 @@ function normalizeViewportState(data, sid) {
     physicalScale: data.physicalScale ? {...data.physicalScale} : null,
     containerPx: finitePoint(data.containerPx, true) || {x: 1, y: 1},
     plateGrid: data.plateGrid === true, imageReady: data.imageReady === true,
+    translucentAvailable: data.translucentAvailable === true,
+    translucentOpening: data.translucentOpening === true, infoOpen: data.infoOpen === true,
     paneInstanceId: data.paneInstanceId, contextEpoch: data.contextEpoch,
     spatialContext: data.spatialContext?.key ? {...data.spatialContext} : null,
     groupSessionId: data.groupSessionId, groupEpoch: data.groupEpoch,
@@ -1618,6 +1667,7 @@ function receiveViewportState(data, sid) {
   if (data.nd2wsi !== "viewport-ready") {
     if (!same || (inGroup(sid) && !currentEnvelope(data, sid))) return;
     compare.states.set(sid, state);
+    if (sid === active) refreshShellToolButtons();
   } else {
     if (!adoptSpatialIdentity(sid, state)) return;
     if (inGroup(sid) && previous?.imageReady && !state.imageReady) {

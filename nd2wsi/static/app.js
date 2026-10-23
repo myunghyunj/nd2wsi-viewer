@@ -129,13 +129,11 @@ function captureTranslucentView() {
   return snapshot;
 }
 
-function wireTranslucentViewer() {
-  const button = $("tb-translucent");
-  let opening = false;
-  button.addEventListener("click", async () => {
-    if (opening) return;
-    opening = true;
-    button.disabled = true;
+function openTranslucentViewer() {
+  if (state.translucentOpening) return Promise.resolve(false);
+  state.translucentOpening = true;
+  postViewportState("tools");
+  return (async () => {
     try {
       const native = (window.parent !== window ? window.parent : window).pywebview?.api;
       if (typeof native?.open_translucent_viewer !== "function") {
@@ -144,13 +142,27 @@ function wireTranslucentViewer() {
       const snapshot = captureTranslucentView();
       const result = await native.open_translucent_viewer(currentSlideSid(), snapshot);
       if (!result?.ok) throw new Error(result?.message || "Could not open the translucent viewer");
+      return true;
     } catch (error) {
       showToast(error.message || "Could not open the translucent viewer");
+      return false;
     } finally {
-      opening = false;
-      button.disabled = false;
+      state.translucentOpening = false;
+      postViewportState("tools");
     }
+  })();
+}
+
+function wireShellToolState() {
+  let wasHidden = state.windows.info.isHidden();
+  const observer = new MutationObserver(() => {
+    const hidden = state.windows.info.isHidden();
+    if (wasHidden === hidden) return;
+    wasHidden = hidden;
+    postViewportState("tools");
   });
+  observer.observe($("win-info"), { attributes: true, attributeFilter: ["class"] });
+  window.addEventListener("pagehide", () => observer.disconnect(), { once: true });
 }
 
 init().catch((e) => {
@@ -217,7 +229,7 @@ async function init() {
   buildChannelPanel();
   buildLevelLamps();
   buildViewer();
-  wireTranslucentViewer();
+  wireShellToolState();
   buildPlate();
   if (state.plate) pollPlateStatus();
   wireCompareRelay();
@@ -4078,6 +4090,9 @@ function viewportSnapshot() {
   const identity = {
     ...spatialIdentity(), imageReady: spatialImageReady(),
     imagePx: { x: state.info?.width, y: state.info?.height },
+    translucentAvailable: !!state.info && (!state.info.rgb || !!state.info.raster),
+    translucentOpening: !!state.translucentOpening,
+    infoOpen: !!state.windows?.info && !state.windows.info.isHidden(),
     plateGrid: Boolean(state.plate && state.plate.focus === null),
     pixelSizeUm: calibrated ? { x: Number(pixelSize[1]), y: Number(pixelSize[0]) } : null,
   };
@@ -4275,6 +4290,10 @@ function wireCompareRelay() {
       receiveCompareLifecycle(event.data);
     } else if (event.data.nd2wsi === "tab-shortcut-state") {
       state.tabCount = Math.max(0, Math.floor(Number(event.data.count) || 0));
+    } else if (event.data.nd2wsi === "pane-translucent-open") {
+      refreshSpatialContext();
+      if (event.data.sid === currentSlideSid() &&
+          state.viewportRelay.commandGate.matchesLocal(event.data)) openTranslucentViewer();
     } else if (event.data.nd2wsi === "pane-panel-shortcut") {
       refreshSpatialContext();
       // A shell key belongs to the pane/site selected when it was pressed,
@@ -4525,7 +4544,6 @@ function buildWindows() {
       minH: 220,
       maxW: 720,
       zoomW: 560,
-      toolbarBtn: $("tb-info"),
       startClosed: true,
       onOpen: () => loadSlideInspector(),
     }),
@@ -5414,7 +5432,14 @@ function applyOrientationShortcut(action) {
 
 function togglePanelForShortcut(panel) {
   if (state.quitPreparing) return false;
-  const buttons = { channels: "tb-channels", region: "tb-region", annot: "tb-annot", info: "tb-info" };
+  if (panel === "info") {
+    const inspector = state.windows?.info;
+    if (!inspector) return false;
+    if (inspector.isHidden()) inspector.open();
+    else inspector.close(false);
+    return true;
+  }
+  const buttons = { channels: "tb-channels", region: "tb-region", annot: "tb-annot" };
   const button = Object.hasOwn(buttons, panel) ? $(buttons[panel]) : null;
   if (!button || button.disabled) return false;
   button.click();
