@@ -97,6 +97,9 @@ window-role and JavaScript suites, with additional tests in:
 - `tests/test_annotation_site_transitions_js.py`: save ordering across plate-site
   switches, A -> B -> A recovery, 409 drafts and explicit acceptance, flush before
   update or close, and stale load rejection, through the store module's API.
+- `tests/test_annotation_render_js.py`: one delegated pointer listener for every
+  annotation mark, the translate-only pan path and every drawn input that forces a
+  full annotation render.
 
 Run `python -m pytest tests -q` in the locked test environment, with Node.js
 available. `scripts/fetch_testdata.py` supplies the checksummed public ND2
