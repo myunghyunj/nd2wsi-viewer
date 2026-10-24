@@ -3,6 +3,23 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.5.4</title>
+            <pubDate>Sun, 25 Oct 2026 02:18:23 +0900</pubDate>
+            <sparkle:version>2.5.4</sparkle:version>
+            <sparkle:shortVersionString>2.5.4</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Safer Windows close, faster display and export</h2>
+<ul>
+<li>Windows now waits for annotation, LUT and export work to be saved before a window closes, as macOS does; an unresponsive viewer can still be closed after an explicit confirmation.</li>
+<li>Tile compositing is 4–5 times faster with bit-identical colours.</li>
+<li>Panning over thousands of annotations stays smooth.</li>
+<li>Native TIFF export from reduced levels reads each channel once; files are byte-identical.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.4/nd2wsi-viewer-2.5.4-macos-arm64.dmg" length="126313097" type="application/octet-stream" sparkle:edSignature="313fR5pJjUWVsADoBL1nOyWbeO6zPnv5cIW0kVbBIX1/NnwGjtqaD1hh4iDJLicpmbWrdT3EaUgsY1fiX1bWCw=="/>
+        </item>
+        <item>
             <title>2.5.3</title>
             <pubDate>Sat, 24 Oct 2026 15:02:23 +0900</pubDate>
             <sparkle:version>2.5.3</sparkle:version>
