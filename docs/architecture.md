@@ -52,9 +52,11 @@ fingerprint checks before and after reading.
 | `static/lut-controls-v1.js` | Histogram/curve drawing, full/auto/manual axes, pointer/native scrolling and live-update cadence | Channel, DOM, theme, clock and change/flush/shift callbacks |
 | `static/frame-data-v1.js` | Histogram and pixel requests, coalescing, cancellation and retry | Request state, frame identity, fetch, clock and render callbacks |
 | `static/floating-windows-v1.js` | Panel focus, geometry, drag/resize, collapse and persistence | Stage, document and storage |
+| `static/viewer-geometry-v1.js` | Tile source construction, flip-aware image/element point conversion, rect corners and centre-only camera moves shared by the pane and `translucent-v1.js` | Slide info, viewport and the OpenSeadragon namespace, passed per call; no shared state |
 | `static/annotation-store-v1.js` | Annotation sidecar saves: debounce, serialized queue, revision/context guards, 409 recovery drafts and plate-site owner switches | Pane state, fetch, clock, lock/frame queries and status/render/notice callbacks |
 
-`index.html` loads each controller before `app.js`. The same controller modules
+`index.html` loads each controller before `app.js`; `translucent.html` loads
+`viewer-geometry-v1.js` before `translucent-v1.js`. The same controller modules
 are loaded directly by the JavaScript regression harness; tests no longer need
 to extract the LUT widget implementation from the application file. All
 channels share one live-update scheduler so a shift-drag batches the tile
