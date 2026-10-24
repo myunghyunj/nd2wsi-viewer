@@ -54,6 +54,7 @@ fingerprint checks before and after reading.
 | `static/floating-windows-v1.js` | Panel focus, geometry, drag/resize, collapse and persistence | Stage, document and storage |
 | `static/viewer-geometry-v1.js` | Tile source construction, flip-aware image/element point conversion, rect corners and centre-only camera moves shared by the pane and `translucent-v1.js` | Slide info, viewport and the OpenSeadragon namespace, passed per call; no shared state |
 | `static/annotation-store-v1.js` | Annotation sidecar saves: debounce, serialized queue, revision/context guards, 409 recovery drafts and plate-site owner switches | Pane state, fetch, clock, lock/frame queries and status/render/notice callbacks |
+| `static/save-status-v1.js` | Auto-save indicator: merges the save-state events of the annotation and LUT channels by precedence (conflict, failed, saving, dirty, saved), the "N s ago" and retry-countdown texts and the one-second ticker | Clock, interval timers and a render callback; no DOM |
 
 `index.html` loads each controller before `app.js`; `translucent.html` loads
 `viewer-geometry-v1.js` before `translucent-v1.js`. The same controller modules

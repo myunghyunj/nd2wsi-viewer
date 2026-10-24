@@ -71,6 +71,7 @@ def test_browser_modules_load_before_application_without_commonjs_or_dom_side_ef
         "frame-data-v1.js": "Nd2FrameData",
         "floating-windows-v1.js": "Nd2FloatingWindows",
         "annotation-store-v1.js": "Nd2AnnotationStore",
+        "save-status-v1.js": "Nd2SaveStatus",
     }
     for filename in modules:
         assert index.index(filename) < index.index("app.js")

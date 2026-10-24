@@ -12,6 +12,18 @@
     return p ? String(p).split("/").pop() : "";
   }
 
+  // The Fetch spec lets a page keep at most 64 KiB of keepalive request bodies
+  // in flight; a larger keepalive request rejects at once, which would record
+  // a bogus failed entry. Stay under it with headroom for the LUT request the
+  // same pagehide sends (lut-persistence-v1.js keeps the same limit); a bigger
+  // snapshot goes out as a plain request, whose failed entry, if any, waits
+  // for the next edit or minute retry.
+  const KEEPALIVE_BODY_LIMIT = 60 * 1024;
+
+  function keepaliveFits(body) {
+    return new TextEncoder().encode(body).length <= KEEPALIVE_BODY_LIMIT;
+  }
+
   // The store keeps its fields on the pane state it is given, so the pane's
   // existing readers (annotation owner checks, file import, the Astromap
   // panel) keep reading state.ann* as before; only the store writes them:
@@ -42,6 +54,8 @@
     onScope = () => {},
     onEditorReset = () => {},
     onRecoveryNotice = () => {},
+    onSaveState = () => {},
+    now = () => Date.now(),
     setTimer = setTimeout,
     clearTimer = clearTimeout,
     debounceMs = 800,
@@ -57,6 +71,9 @@
     // the timer argument is deliberately not forwarded: save() with no site
     // saves the current owner
     let timer = null;
+    // the snapshot last handed to the queue, so the minute retry can tell a
+    // save that is still in flight (or was queued meanwhile) from one it owes
+    let queuedRevision = null, queuedContext = null;
 
     function scheduleSave() {
       clearTimer(timer);
@@ -72,6 +89,36 @@
       state.annRevision += 1;
       state.annDirty = true;
       state.annAcceptedDrafts?.clear();
+      emitSaveState("dirty");
+    }
+
+    /* ---- save events ------------------------------------------------------- */
+
+    // Structured transitions for the pane's auto-save indicator. The onStatus
+    // strings stay the Annotations panel's text; this adds, never replaces.
+    function emitSaveState(saveState, extra) {
+      try {
+        onSaveState({ channel: "annotations", state: saveState, at: now(), ...extra });
+      } catch (_) { /* an indicator failure cannot break persistence */ }
+    }
+
+    // The channel after a request settled: an older site's conflict or failed
+    // snapshot still outranks a clean reply for the current one.
+    function settledSaveState() {
+      const entries = failedSaves();
+      if (entries.some((entry) => entry.conflict)) return "conflict";
+      if (entries.length) return "failed";
+      return state.annDirty ? "dirty" : "saved";
+    }
+
+    function emitSettledSaveState(message) {
+      const settled = settledSaveState();
+      const detail = message !== undefined ? message
+        : failedSaves().find((entry) => entry.conflict === (settled === "conflict"))?.error;
+      emitSaveState(settled, {
+        conflict: settled === "conflict",
+        ...(detail ? { message: detail } : {}),
+      });
     }
 
     /* ---- site routing ------------------------------------------------------ */
@@ -116,10 +163,18 @@
       return [...state.annFailedSaves.values()];
     }
 
+    // A 409 whose recovery draft already holds this exact body: sending the
+    // body again would only make the server write another draft. The minute
+    // retry and the pagehide flush skip the current snapshot on this one rule
+    // (the quit flush adds the user's explicit acceptance, see draftAccepted);
+    // a newer edit changes the body and goes out as usual.
+    function draftHolds(entry, body) {
+      return !!(entry?.conflict && entry.draftPath && entry.draftBody === body);
+    }
+
     function recoveryDrafts() {
       const entries = failedSaves();
-      if (!entries.length || entries.some((entry) => !entry.conflict || !entry.draftPath ||
-          entry.draftBody !== entry.body)) return null;
+      if (!entries.length || entries.some((entry) => !draftHolds(entry, entry.body))) return null;
       if (state.annDirty) {
         const current = saveEntry();
         if (!current || !entries.some((entry) => entry.url === current.url &&
@@ -129,8 +184,7 @@
     }
 
     function draftAccepted(entry) {
-      return !!(entry?.conflict && entry.draftPath && entry.draftBody === entry.body &&
-        state.annAcceptedDrafts?.get(entry.url) === entry.draftBody);
+      return draftHolds(entry, entry.body) && state.annAcceptedDrafts?.get(entry.url) === entry.draftBody;
     }
 
     function acceptRecoveryDrafts() {
@@ -147,11 +201,14 @@
 
     /* ---- save queue -------------------------------------------------------- */
 
-    function queueSave(entry) {
+    function queueSave(entry, { keepalive = false } = {}) {
       if (!entry || !entry.url) {
         return Promise.resolve({ ok: false, error: "choose a plate site first" });
       }
+      queuedRevision = entry.revision;
+      queuedContext = entry.context;
       const run = state.annSaveTail.then(async () => {
+        emitSaveState("saving");
         try {
           // A newer local snapshot may have queued behind our own successful
           // save. Advance only from this window's committed revision, never a
@@ -166,11 +223,16 @@
           entry.conflict = false;
           entry.draftPath = null;
           entry.draftBody = null;
-          const response = await fetch(entry.url, {
+          entry.error = null;
+          const init = {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: entry.body,
-          });
+          };
+          // pagehide: the browser keeps the request alive after the page is
+          // gone, for a body within the keepalive budget
+          if (keepalive && keepaliveFits(entry.body)) init.keepalive = true;
+          const response = await fetch(entry.url, init);
           if (response.status === 409) {
             let conflict = {};
             try { conflict = await response.json(); } catch (_) { /* keep local draft */ }
@@ -198,8 +260,11 @@
             onStatus("Saved · " + basename(data.path));
           }
           onRecoveryNotice();
+          emitSaveState("saved");
+          if (settledSaveState() !== "saved") emitSettledSaveState();
           return { ok: true };
         } catch (error) {
+          entry.error = error.message;
           const failed = state.annFailedSaves.get(entry.url);
           if (!failed || failed.revision <= entry.revision) {
             state.annFailedSaves.set(entry.url, entry);
@@ -209,6 +274,7 @@
             onStatus("Save failed: " + error.message);
           }
           onRecoveryNotice();
+          emitSettledSaveState(error.message);
           return { ok: false, error: error.message };
         }
       });
@@ -218,7 +284,7 @@
       return run;
     }
 
-    function save(site) {
+    function save(site, options = {}) {
       if (isLocked()) {
         onStatus("Not saved: annotation is locked in this degraded view");
         return Promise.resolve({ ok: false, error: "annotation is locked" });
@@ -228,7 +294,55 @@
         onStatus("Not saved: choose a plate site first");
         return Promise.resolve({ ok: false, error: "choose a plate site first" });
       }
-      return queueSave(entry);
+      return queueSave(entry, options);
+    }
+
+    // The once-a-minute safety net: re-queue transient failures (any site)
+    // and a dirty snapshot whose debounce is not pending. A 409 whose recovery
+    // draft already holds the snapshot is never retried here; only the user's
+    // explicit recovery-draft acceptance resolves it (a 409 that got no draft
+    // is sent again, so the server can try the draft once more). Locked panes
+    // and a missing plate site are skipped like save(), silently: this path
+    // owns no status text.
+    async function retryFailed(options = {}) {
+      if (isLocked()) return { ok: false, error: "annotation is locked", retried: 0 };
+      // Once the debounce fired, the dirty flag stays set until the request
+      // succeeds: wait for the tail, as flushForUpdate does, so a slow request
+      // is not queued a second time. A save queued meanwhile, behind the tail
+      // this waited for, shows as the current snapshot already being queued.
+      await state.annSaveTail;
+      const runs = [], superseded = new Set();
+      const queued = state.annRevision === queuedRevision && state.annContext === queuedContext;
+      if (state.annDirty && timer === null && !queued) {
+        const current = saveEntry();
+        if (current && !draftHolds(state.annFailedSaves.get(current.url), current.body)) {
+          // one request per sidecar: the current snapshot replaces an older
+          // failed one for the same site
+          superseded.add(current.url);
+          runs.push(queueSave(current, options));
+        }
+      }
+      for (const entry of failedSaves()) {
+        if (draftHolds(entry, entry.body) || superseded.has(entry.url)) continue;
+        runs.push(queueSave(entry, options));
+      }
+      const results = await Promise.all(runs);
+      return { ok: results.every((result) => result.ok), retried: results.length };
+    }
+
+    // Browser mode's tab close or reload (app.js, pagehide): hand the pending
+    // snapshot to the browser with keepalive. Nothing is sent when the site's
+    // recovery draft already holds this body, and the debounce is called off
+    // only when a save is issued. Locked panes and a missing site are skipped
+    // silently, as in retryFailed().
+    function flushOnPagehide({ keepalive = true } = {}) {
+      if (isLocked()) return Promise.resolve({ ok: false, error: "annotation is locked", sent: false });
+      const current = timer !== null || state.annDirty ? saveEntry() : null;
+      if (!current || draftHolds(state.annFailedSaves.get(current.url), current.body)) {
+        return Promise.resolve({ ok: true, sent: false });
+      }
+      cancelScheduledSave();
+      return queueSave(current, { keepalive }).then((result) => ({ ...result, sent: true }));
     }
 
     // Save-before-update/close: every dirty snapshot of every site must reach
@@ -250,8 +364,7 @@
       // Capture every older plate site's failed snapshot too. Do not short-circuit
       // at the first conflict, leaving another site's unsaved marks unchecked.
       for (const entry of failedSaves()) {
-        if (!draftAccepted(entry) && (!entry.conflict || !entry.draftPath ||
-            entry.draftBody !== entry.body)) await queueSave(entry);
+        if (!draftHolds(entry, entry.body)) await queueSave(entry);
       }
       await state.annSaveTail;
       if (state.annDirty || state.annFailedSaves.size) {
@@ -402,6 +515,8 @@
       cancelScheduledSave,
       queueSave,
       save,
+      retryFailed,
+      flushOnPagehide,
       flushForUpdate,
       // loads and owner transitions
       load,
@@ -425,5 +540,5 @@
     };
   }
 
-  return { createStore };
+  return { createStore, KEEPALIVE_BODY_LIMIT };
 });
