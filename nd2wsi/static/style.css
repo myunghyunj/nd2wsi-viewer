@@ -21,6 +21,10 @@
   --label: rgba(255, 255, 255, 0.85);
   --label-2: rgba(255, 255, 255, 0.55);
   --label-3: rgba(255, 255, 255, 0.28);
+  /* auto-save icon: Apple system green / orange / red, dark appearance */
+  --save-ok: rgb(48, 209, 88);
+  --save-warn: rgb(255, 159, 10);
+  --save-bad: rgb(255, 69, 58);
   /* the installed SF Pro faces first, then the system alias (also SF on macOS) */
   --font-text: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont,
     "Helvetica Neue", "Segoe UI", sans-serif;
@@ -44,6 +48,9 @@
   --label: rgba(0, 0, 0, 0.85);
   --label-2: rgba(0, 0, 0, 0.55);
   --label-3: rgba(0, 0, 0, 0.32);
+  --save-ok: rgb(52, 199, 89);
+  --save-warn: rgb(255, 149, 0);
+  --save-bad: rgb(255, 59, 48);
   --window-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.85),
     inset 0 -1px 0 rgba(0, 0, 0, 0.03),
@@ -617,6 +624,35 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 #scalebar-wrap { display: flex; align-items: center; gap: 7px; }
 #scalebar { height: 4px; border: 1px solid var(--label-2); border-top: none; width: 80px; }
 #scalebar-label { font-family: var(--font-mono); color: var(--label-2); }
+
+/* auto-save icon: a translucent filled circle with a check, right of the scale
+   bar; the fill carries the state colour, the glyph never changes size */
+.save-status {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; padding: 0; margin: 0;
+  appearance: none; -webkit-appearance: none; border: 0; border-radius: 50%;
+  background: none; box-shadow: none; cursor: default;
+  color: var(--label-2); opacity: .55; transition: opacity .15s ease, color .15s ease;
+}
+.save-status[hidden] { display: none; }
+.save-status:hover, .save-status:focus-visible { opacity: .9; }
+.save-status:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.save-glyph { display: block; width: 16px; height: 16px; }
+.save-glyph circle { fill: currentColor; }
+.save-glyph path { fill: none; stroke: rgba(255, 255, 255, .9); stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round; }
+.save-status[data-state="saved"] { color: var(--save-ok); }
+/* grey, pending: --label-3 under the .55 opacity is near invisible in light mode */
+.save-status[data-state="dirty"], .save-status[data-state="saving"] { color: var(--label-2); }
+.save-status[data-state="failed"] { color: var(--save-warn); }
+.save-status[data-state="conflict"] { color: var(--save-bad); }
+@media (prefers-reduced-motion: no-preference) {
+  .save-status[data-state="saving"] { animation: save-status-pulse 1.6s ease-in-out infinite; }
+  /* the hover/focus opacity wins: the focus ring never sits on a dimming glyph */
+  .save-status[data-state="saving"]:hover, .save-status[data-state="saving"]:focus-visible { animation: none; }
+  @keyframes save-status-pulse { 0%, 100% { opacity: .55; } 50% { opacity: .22; } }
+}
+#save-status-tooltip { white-space: pre-line; text-align: center; }
 
 /* ---- toast / boot ---------------------------------------------------------- */
 #toast {
