@@ -501,13 +501,25 @@ def test_overlay_label_chip_selects_astromap_roi_before_opening_editor():
     out = _run_export(r"""
 const f=fixture(),c=f.c,events=[];
 c.state.annotations=[{id:'two',type:'box',astromap:true},{id:'normal',type:'box'}];
-c.svgEl=()=>({insertBefore(){},addEventListener(kind,handler){this[kind]=handler;}});
+function node(){
+  return {attrs:{},children:[],parentNode:null,listeners:{},
+    setAttribute(k,v){this.attrs[k]=String(v);},getAttribute(k){return k in this.attrs?this.attrs[k]:null;},
+    append(...items){for(const item of items){item.parentNode=this;this.children.push(item);}},
+    insertBefore(item,before){item.parentNode=this;this.children.splice(this.children.indexOf(before),0,item);},
+    addEventListener(kind,handler){this.listeners[kind]=handler;},
+    contains(other){for(;other;other=other.parentNode)if(other===this)return true;return false;},
+    closest(selector){for(let n=this;n;n=n.parentNode)if('data-ann-id' in n.attrs)return n;return null;}};
+}
+const layer=node();f.nodes.set('ann-layer',layer);
+c.SVG_NS='http://www.w3.org/2000/svg';c.document.createElementNS=()=>node();
 c.selectAstromapRoi=(id,locate)=>events.push(['select',id,locate]);
 c.openEditor=id=>events.push(['editor',id]);
-vm.runInContext(production('chip'),c);
-const event={stopPropagation(){events.push(['stop']);}};
-c.chip({},0,0,'2: note','two').pointerdown(event);
-c.chip({},0,0,'ordinary','normal').pointerdown(event);
+vm.runInContext(production('svgEl')+'\n'+production('chip')+'\n'+production('wireAnnotationPointer'),c);
+c.wireAnnotationPointer();
+// The label's text and its pill both open the region through the layer's one listener.
+const press=target=>layer.listeners.pointerdown({target,stopPropagation(){events.push(['stop']);}});
+press(c.chip(layer,0,0,'2: note','two').children[1]);
+press(c.chip(layer,0,0,'ordinary','normal').children[0]);
 return events;
 """)
     assert out == [["stop"], ["select", "two", False], ["editor", "two"],
@@ -524,8 +536,8 @@ c.state.annotations=[{id:'one',type:'box',astromap:true,x:0,y:0,w:10,h:10},
   {id:'normal',type:'box',x:60,y:60,w:10,h:10}];
 c.astromapItems=()=>c.state.annotations.filter(a=>a.astromap);
 c.toEl=(x,y)=>({x,y});c.annColor=()=> '#123456';c.hexAlpha=()=> 'ordinary-fill';
-c.svgEl=(tag,attrs)=>{if(tag==='polygon')polygons.push(attrs);return {addEventListener(){}};};
-c.chip=()=>{};c.renderLandmarks=()=>{};c.panToAstromapRoi=a=>located.push(a.id);
+c.svgEl=(tag,attrs)=>{if(tag==='polygon')polygons.push(attrs);return {};};
+c.chip=()=>{};c.renderLandmarks=()=>{};c.rememberAnnotationFrame=()=>{};c.panToAstromapRoi=a=>located.push(a.id);
 c.$('ann-layer').replaceChildren=()=>{polygons.length=0;};
 c.annotationsChanged=()=>c.renderAnnotations();
 vm.runInContext(production('renderAnnotations')+'\n'+production('selectAstromapRoi')+'\n'+production('removeAnnotation'),c);
@@ -588,7 +600,7 @@ c.state.annotations=[
 ];
 const before=JSON.stringify(c.state.annotations);
 c.toEl=(x,y)=>({x,y});c.annColor=()=> '#123456';c.hexAlpha=()=> 'ordinary-fill';
-c.svgEl=()=>({addEventListener(){}});c.renderLandmarks=()=>{};
+c.svgEl=()=>({});c.renderLandmarks=()=>{};c.rememberAnnotationFrame=()=>{};
 c.chip=(layer,x,y,text,id)=>labels.push({id,text});
 c.$('ann-layer').replaceChildren=()=>{labels.length=0;};
 vm.runInContext(production('renderAnnotations'),c);
