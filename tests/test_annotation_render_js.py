@@ -21,7 +21,8 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 SETUP = r"""
 const fs = require('fs'), vm = require('vm'), path = require('path');
 const STATIC = process.argv[1];
-const source = fs.readFileSync(path.join(STATIC, 'app.js'), 'utf8');
+// Windows checkouts may use CRLF; the slice markers below assume LF.
+const source = fs.readFileSync(path.join(STATIC, 'app.js'), 'utf8').replace(/\r\n/g, '\n');
 function section(start, end) {
   const i = source.indexOf(start), j = source.indexOf(end, i);
   if (i < 0 || j < 0) throw new Error('production source not found: ' + start);
