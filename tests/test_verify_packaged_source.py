@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -91,7 +92,7 @@ def test_stale_module_is_detected(verifier, compiled, app):
 def test_changed_static_asset_is_detected(verifier, compiled, app):
     asset = app / "Contents/Resources" / STATIC_ASSETS[0]
     asset.write_bytes(asset.read_bytes() + b"\n")
-    with pytest.raises(AssertionError, match=STATIC_ASSETS[0]):
+    with pytest.raises(AssertionError, match=re.escape(STATIC_ASSETS[0])):
         check(verifier, FakeArchive(compiled), app, release_info())
 
 
