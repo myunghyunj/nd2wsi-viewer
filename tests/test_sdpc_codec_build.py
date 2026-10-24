@@ -1,8 +1,11 @@
 """Fail-closed provenance checks, independent of native build tools."""
 import hashlib
 import importlib.util
+import io
 import json
+import re
 import shlex
+import urllib.error
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +67,67 @@ def test_cached_sources_are_verified_before_extraction(tmp_path):
     path.write_bytes(b"changed source")
     with pytest.raises(RuntimeError, match="checksum mismatch"):
         builder.download(source, tmp_path)
+
+
+class _Response(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def test_download_retries_transient_network_errors_then_verifies(tmp_path, monkeypatch):
+    builder = load_script("build_sdpc_codec")
+    payload = b"pinned source bytes"
+    source = {"filename": "src.tar.xz", "url": "https://example.invalid/src.tar.xz",
+              "sha256": hashlib.sha256(payload).hexdigest()}
+    calls, sleeps = [], []
+
+    def flaky(url, timeout):
+        calls.append((url, timeout))
+        if len(calls) < 3:
+            raise urllib.error.URLError(TimeoutError("WinError 10060"))
+        return _Response(payload)
+
+    monkeypatch.setattr(builder.urllib.request, "urlopen", flaky)
+    path = builder.download(source, tmp_path, sleep=sleeps.append)
+    assert path.read_bytes() == payload
+    assert len(calls) == 3 and sleeps == list(builder.DOWNLOAD_BACKOFF[:2])
+    assert not path.with_name(path.name + ".partial").exists()
+
+
+def test_download_gives_up_after_bounded_attempts_without_leaving_files(tmp_path, monkeypatch):
+    builder = load_script("build_sdpc_codec")
+    source = {"filename": "src.tar.xz", "url": "https://example.invalid/src.tar.xz", "sha256": "0" * 64}
+    attempts = []
+
+    def down(url, timeout):
+        attempts.append(url)
+        raise urllib.error.URLError(TimeoutError("WinError 10060"))
+
+    monkeypatch.setattr(builder.urllib.request, "urlopen", down)
+    with pytest.raises(RuntimeError, match=re.escape("after 5 attempts")):
+        builder.download(source, tmp_path, sleep=lambda _s: None)
+    assert len(attempts) == builder.DOWNLOAD_ATTEMPTS
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_interrupted_transfer_is_not_mistaken_for_the_cached_source(tmp_path, monkeypatch):
+    builder = load_script("build_sdpc_codec")
+    payload = b"complete source"
+    source = {"filename": "src.tar.xz", "url": "https://example.invalid/src.tar.xz",
+              "sha256": hashlib.sha256(payload).hexdigest()}
+
+    class Broken(_Response):
+        def read(self, *args):
+            raise ConnectionResetError("reset mid-transfer")
+
+    responses = [Broken(b"partial"), _Response(payload)]
+    monkeypatch.setattr(builder.urllib.request, "urlopen", lambda url, timeout: responses.pop(0))
+    path = builder.download(source, tmp_path, sleep=lambda _s: None)
+    assert path.read_bytes() == payload
 
 
 def test_native_manifest_hashes_actual_wheel_binaries_only(tmp_path):
