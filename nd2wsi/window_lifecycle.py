@@ -18,6 +18,14 @@ from collections.abc import Callable
 from typing import Protocol
 
 
+class _ViewerNotAnswering(RuntimeError):
+    """The viewer never ran the save handshake or never replied in time.
+
+    Distinct from a definite refusal (an unresolved conflict, a slide still
+    opening, an export still running), which the user resolves in the viewer.
+    """
+
+
 class LifecycleApi(Protocol):
     """The window-owned server state needed to guard resource teardown."""
 
@@ -262,7 +270,7 @@ class UpdateShutdownCoordinator:
         if started is None:  # cancelled, or an earlier script is still stuck in this viewer
             if cancelled.is_set():
                 return None
-            return {"ok": False, "error": "the viewer did not confirm its saved state"}
+            return {"ok": False, "unanswered": True, "error": "the viewer did not confirm its saved state"}
         with self._lock:
             # Recovery cancels the last preparation the viewer was actually sent.
             if self._request_id == request_id:
@@ -276,7 +284,7 @@ class UpdateShutdownCoordinator:
             if errors:
                 raise errors[0]  # for example, the page bridge never became ready
             if time.monotonic() >= deadline:
-                return {"ok": False, "error": "the viewer did not confirm its saved state"}
+                return {"ok": False, "unanswered": True, "error": "the viewer did not confirm its saved state"}
         return results[0]
 
     def _missing_flush_result(self) -> str:
@@ -381,8 +389,10 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
     A viewer that cannot answer (hung, crashed or never initialised) must not
     make the window impossible to close: a page whose bridge never became
     ready while no slide is open has nothing to save and closes at once, and a
-    close that follows a failed handshake and fails again asks the user
-    natively whether to close without confirmed saves.
+    close whose handshake goes unanswered right after another unanswered one
+    asks the user natively whether to close without confirmed saves. A viewer
+    that answers with a refusal (conflict, slide opening, export running)
+    keeps the existing behaviour: the window stays open with a notice.
     """
 
     _DRAIN_TIMEOUT = 30.0
@@ -392,7 +402,7 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
         super().__init__(api, window, logger=logger)
         self._approved = False
         self._forced = False
-        self._failed_closes = 0  # failed handshakes since the last approved close
+        self._failed_closes = 0  # consecutive handshakes the viewer did not answer
         self._close_listeners: list[Callable[[], None]] = []
 
     def approve_close(self, reason: str) -> None:
@@ -485,11 +495,16 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
         Returns False when the request was cancelled or superseded, and raises
         when the viewer did not confirm its saved state in time.
         """
-        result = self._flush_panes(request_id, cancelled)
+        try:
+            result = self._flush_panes(request_id, cancelled)
+        except Exception as exc:  # the browser call itself failed (bridge never ready, crash)
+            raise _ViewerNotAnswering(str(exc) or "the viewer did not confirm its saved state") from exc
         if not self._is_current(request_id, cancelled):
             return False
         if not isinstance(result, dict) or not result.get("ok"):
             reason = result.get("error") if isinstance(result, dict) else None
+            if isinstance(result, dict) and result.get("unanswered"):
+                raise _ViewerNotAnswering(reason or "the viewer did not confirm its saved state")
             raise RuntimeError(reason or "annotations were not confirmed saved")
         deadline = time.monotonic() + self._DRAIN_TIMEOUT
         while self._is_current(request_id, cancelled):
@@ -515,7 +530,7 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
             return False
         message = (
             f"{self._UNCONFIRMED_CLOSE_TITLE}\n\n"
-            f"The viewer could not confirm that this window's annotations and settings are saved: {reason}\n\n"
+            f"The viewer is not responding, so this window's annotations and settings could not be confirmed as saved ({reason}).\n\n"
             "Choose OK to close the window anyway. Changes that were not saved, and any export "
             "still running, will be lost. Choose Cancel to keep it open."
         )
@@ -533,10 +548,13 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
                 if not self._confirm_saved(request_id, cancelled):
                     return
             except Exception as exc:
-                # A repeated close whose handshake fails again is the user's way
-                # out of a viewer that cannot answer; never offered to the
-                # first attempt, so automation that closes once never sees it.
-                if not (ask_to_force and self._is_current(request_id, cancelled)
+                # The user's way out of a viewer that cannot answer: offered only
+                # when this handshake went unanswered right after another one did.
+                # A definite refusal (conflict, slide opening, export running) is
+                # resolved in the viewer and never offers to discard work; a first
+                # attempt never asks, so automation that closes once never sees it.
+                if not (isinstance(exc, _ViewerNotAnswering) and ask_to_force
+                        and self._is_current(request_id, cancelled)
                         and self._ask_to_close_unconfirmed(exc)):
                     raise
                 self._log(f"Closing without confirmed saves at the user's request: {exc}")
@@ -580,7 +598,8 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
         except Exception as exc:
             message = f"Window remains open: {exc}"
             with self._lock:
-                self._failed_closes += 1
+                # Count consecutive unanswered handshakes only; any answer resets.
+                self._failed_closes = self._failed_closes + 1 if isinstance(exc, _ViewerNotAnswering) else 0
             self.api._status = message
             self._log(message)
             self._notice(message)

@@ -339,6 +339,46 @@ def test_repeated_close_succeeds_without_asking_once_the_viewer_confirms(winform
     assert w.guard._failed_closes == 0
 
 
+@pytest.mark.parametrize("failure", ["conflict", "opening", "export"])
+def test_repeated_definite_refusals_never_offer_to_discard_work(winforms, failure):
+    # The viewer answered every time; the user resolves these in the viewer, so
+    # closing again must keep the macOS behaviour (stay open with a notice).
+    w = winforms
+    if failure == "conflict":
+        w.window.flush_reply = {"ok": False, "error": "annotation conflict: draft preserved"}
+    elif failure == "opening":
+        w.window.flush_reply = {"ok": False, "error": "a slide is still opening"}
+    else:
+        w.api.update_block_reason.return_value = "Waiting for 1 export to finish…"
+    w.window.dialog_answer = True
+    for _ in range(3):
+        w.window.user_close()
+        until(lambda: not w.guard._running)
+    w.window.create_confirmation_dialog.assert_not_called()
+    assert not w.window.is_closed and w.guard._failed_closes == 0
+    assert w.window.close_results == ["cancelled"] * 3
+
+
+def test_an_answered_refusal_resets_the_unanswered_count(winforms):
+    w = winforms
+    w.guard._FLUSH_TIMEOUT = 0.05
+    w.window.dialog_answer = True
+    w.window.auto_reply = False  # 1: unanswered
+    w.window.user_close()
+    until(lambda: not w.guard._running)
+    assert w.guard._failed_closes == 1
+    w.window.auto_reply = True  # 2: the viewer answers with a refusal
+    w.window.flush_reply = {"ok": False, "error": "annotation conflict: draft preserved"}
+    w.window.user_close()
+    until(lambda: not w.guard._running)
+    assert w.guard._failed_closes == 0
+    w.window.auto_reply = False  # 3: unanswered again, but only once in a row
+    w.window.user_close()
+    until(lambda: not w.guard._running)
+    w.window.create_confirmation_dialog.assert_not_called()
+    assert not w.window.is_closed and w.guard._failed_closes == 1
+
+
 def test_update_preparation_retries_a_hung_viewer_without_piling_up_calls_and_recovers_it():
     released = threading.Event()
     scripts = []
