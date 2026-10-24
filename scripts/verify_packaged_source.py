@@ -22,7 +22,7 @@ def normalized(code):
 
 
 def project_version(root=ROOT):
-    return tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    return tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
 
 def open_archive(app, executable):
@@ -53,7 +53,7 @@ def verify(toc, extract, resources, info, *, expected_version, bundle_name="nd2w
             parts.pop()
         module = ".".join(parts)
         actual = normalized(extract(module))
-        expected = normalized(compile(source.read_text(), "<source>", "exec"))
+        expected = normalized(compile(source.read_text(encoding="utf-8"), "<source>", "exec"))
         # Compare code structurally: marshal bytes contain irrelevant object
         # reference/interner differences after archive decoding.
         assert actual == expected, f"stale packaged module: {module}"
