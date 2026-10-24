@@ -13,6 +13,9 @@ ROI export comes in two flavors:
 from __future__ import annotations
 
 import io
+import struct
+import threading
+from collections import OrderedDict
 from collections.abc import Iterator
 from typing import Any
 
@@ -93,6 +96,85 @@ def _read_region(root: Any, level_path: str, x: int, y: int, w: int, h: int) -> 
     return np.asarray(arr[:, y0:y1, x0:x1])
 
 
+# Gamma lookup tables for 8/16-bit channels. A table holds, for every code the
+# dtype can represent, the value the per-pixel path computes for that code
+# (_windowed on np.arange of the same dtype, kept in the dtype it produces), so
+# indexing it reproduces the per-pixel result bit for bit. Only exact Python
+# int/float windows and gammas qualify: NumPy scalars are not "weak" under
+# NEP 50 and would change the arithmetic precision.
+_GAMMA_LUT_DTYPES = (np.dtype(np.uint8), np.dtype(np.uint16))
+_GAMMA_LUT_CAPACITY = 32  # at most 32 x 256 KiB float32 uint16 tables = 8 MiB
+_GAMMA_LUT_BUILD_RATIO = 4  # build only when the region has >= codes / 4 pixels
+_PY_REALS = (int, float)
+# Python windows strictly inside this bound stay finite in float32 working math.
+_FLOAT32_SAFE_BOUND = 3e38
+_gamma_luts: OrderedDict[tuple, tuple[np.ndarray, bool]] = OrderedDict()
+_gamma_lut_lock = threading.Lock()
+
+
+def _windowed(values: np.ndarray, lo, hi, gamma, floating: bool, working_dtype) -> np.ndarray:
+    """Window, clip and gamma one channel plane: the per-pixel display math."""
+    span = (hi - lo if hi > lo else 1.0) if floating else max(hi - lo, 1e-6)
+    v = (values.astype(working_dtype) - lo) / span
+    np.clip(v, 0, 1, out=v)
+    if gamma != 1.0:
+        v **= 1.0 / gamma
+    return v
+
+
+def _lut_key_part(x: int | float) -> int | bytes:
+    # Floats key on their exact bits so -0.0/0.0 and NaN payloads never alias,
+    # and an int never shares a table with the equal float.
+    return struct.pack("<d", x) if type(x) is float else x
+
+
+def _gamma_lut(dtype: np.dtype, lo, hi, gamma, build: bool) -> tuple[np.ndarray, bool] | None:
+    """Cached ``(table, all_finite)`` for one window, or None when not cached
+    and ``build`` is false. Keyed on values, never on channel index."""
+    key = (dtype.str, _lut_key_part(lo), _lut_key_part(hi), _lut_key_part(gamma))
+    with _gamma_lut_lock:
+        entry = _gamma_luts.get(key)
+        if entry is not None:
+            _gamma_luts.move_to_end(key)
+            return entry
+    if not build:
+        return None
+    # Built outside the lock; a racing duplicate build is identical and harmless.
+    codes = np.arange(np.iinfo(dtype).max + 1, dtype=dtype)
+    table = _windowed(codes, lo, hi, gamma, False, np.float32)
+    table.setflags(write=False)
+    entry = (table, bool(np.isfinite(table).all()))
+    with _gamma_lut_lock:
+        _gamma_luts[key] = entry
+        _gamma_luts.move_to_end(key)
+        while len(_gamma_luts) > _GAMMA_LUT_CAPACITY:
+            _gamma_luts.popitem(last=False)
+    return entry
+
+
+def _clear_gamma_lut_cache() -> None:
+    with _gamma_lut_lock:
+        _gamma_luts.clear()
+
+
+def _bounded_real(x) -> bool:
+    return type(x) in _PY_REALS and -_FLOAT32_SAFE_BOUND < x < _FLOAT32_SAFE_BOUND
+
+
+def _dense(planes: list[np.ndarray | None], h: int, w: int) -> np.ndarray:
+    """Interleave planar accumulators into the (h, w, 3) float32 layout;
+    components that never received a contribution stay 0. The planes are
+    released from ``planes`` as they are copied so they do not stay alive
+    through the final clip/scale/cast."""
+    out = np.zeros((h, w, 3), dtype=np.float32)
+    for k in range(3):
+        plane, planes[k] = planes[k], None
+        if plane is not None:
+            out[..., k] = plane
+        del plane
+    return out
+
+
 def composite(
     region: np.ndarray,
     channels: list[int],
@@ -131,17 +213,76 @@ def composite(
             out[..., ci] = (v * 255).astype(np.uint8)
         return out
 
-    out = np.zeros((h, w, 3), dtype=np.float32)
+    # Additive pseudocolour, accumulated per output component in planar (h, w)
+    # float32 planes instead of one (h, w, 3) broadcast, then interleaved and
+    # finished with the same clip/scale/cast. Each plane receives the same
+    # products in the same channel order as the dense accumulator did, so it
+    # holds the same floats; the only possible difference is the sign of an
+    # exact zero (a plane starts from its first product, not 0.0 + product),
+    # which the uint8 cast maps to 0 either way. A zero colour component is
+    # skipped only when every windowed value of the channel is finite: v * 0
+    # is then +-0 and leaves the sum unchanged, while NaN or inf would add NaN.
+    # Only exact ndarrays and exact (h, w) windowed planes take the planar/LUT
+    # path. Subclasses (np.ma.MaskedArray restores operand data under its mask
+    # inside every ufunc, so a skipped component or a table lookup would
+    # differ) and planes with extra unit dimensions (the dense += refuses to
+    # broadcast them, a planar setitem would silently drop them) run the dense
+    # accumulation, the pre-planar code, unchanged. Every production caller
+    # passes an exact ndarray.
+    exact = type(region) is np.ndarray
+    lut_dtype = exact and region.dtype in _GAMMA_LUT_DTYPES
+    lut_build = lut_dtype and h * w * _GAMMA_LUT_BUILD_RATIO >= np.iinfo(region.dtype).max + 1
+    integer = region.dtype.kind in "biu"
+    planes: list[np.ndarray | None] = [None, None, None]
+    dense = None if exact else np.zeros((h, w, 3), dtype=np.float32)
     for ci in channels:
         lo, hi = windows[ci]
-        span = (hi - lo if hi > lo else 1.0) if floating else max(hi - lo, 1e-6)
-        v = (region[ci].astype(working_dtype) - lo) / span
-        np.clip(v, 0, 1, out=v)
-        if gammas[ci] != 1.0:
-            v **= 1.0 / gammas[ci]
+        gamma = gammas[ci]
+        python_scalars = type(lo) in _PY_REALS and type(hi) in _PY_REALS and type(gamma) in _PY_REALS
+        entry = None
+        if lut_dtype and python_scalars and gamma != 1.0:
+            entry = _gamma_lut(region.dtype, lo, hi, gamma, lut_build)
+        if entry is not None:
+            table, finite = entry
+            v = table[region[ci]]
+        else:
+            v = _windowed(region[ci], lo, hi, gamma, floating, working_dtype)
+            # Integer codes are finite in float32; with no gamma, bounded
+            # Python windows keep (code - lo) / span NaN-free and clip bounds
+            # it to [0, 1]. Anything else is checked when it matters.
+            known = integer and python_scalars and gamma == 1.0
+            finite = (known and _bounded_real(lo) and _bounded_real(hi)) or None
         col = np.asarray(colors[ci], dtype=np.float32) / 255.0
-        out += v[..., None] * col
-    return (np.clip(out, 0, 1) * 255).astype(np.uint8)
+        if dense is None and (
+            type(v) is not np.ndarray
+            or v.shape != (h, w)
+            or v.dtype not in (np.float32, np.float64)
+            or col.shape != (3,)
+        ):
+            dense = _dense(planes, h, w)
+        if dense is not None:
+            # Subclasses, unusual plane or colour shapes and working dtypes:
+            # the dense accumulation.
+            dense += v[..., None] * col
+            continue
+        for k in range(3):
+            ck = col[k]
+            if ck == 0:
+                if finite is None:
+                    finite = bool(np.isfinite(v).all())
+                if finite:
+                    continue
+            if planes[k] is None:
+                planes[k] = (v * ck).astype(np.float32, copy=False)
+            else:
+                planes[k] += v * ck
+    if dense is None:
+        dense = _dense(planes, h, w)
+    # Same clip/scale/cast as np.clip(dense, 0, 1) * 255 (float32 throughout),
+    # done in place so only dense and the uint8 result are alive at the end.
+    np.clip(dense, 0, 1, out=dense)
+    dense *= 255
+    return dense.astype(np.uint8)
 
 
 def encode_image(img: np.ndarray, fmt: str, quality: int = 87) -> bytes:
