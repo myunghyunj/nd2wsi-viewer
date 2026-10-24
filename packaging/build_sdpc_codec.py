@@ -16,6 +16,8 @@ import shlex
 import shutil
 import subprocess
 import tarfile
+import time
+import urllib.error
 import urllib.request
 import venv
 import zipfile
@@ -58,12 +60,40 @@ def python_at(directory: Path) -> Path:
     return directory / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def download(source: dict[str, str], directory: Path) -> Path:
+DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_BACKOFF = (10, 30, 60, 120)  # seconds before attempts 2..5
+
+
+def download(source: dict[str, str], directory: Path, *, sleep=time.sleep) -> Path:
+    """Fetch a pinned source once, verify its checksum, reuse it afterwards.
+
+    CI runners intermittently fail to connect to ffmpeg.org (WinError 10060),
+    so transient network errors are retried with backoff. Each attempt writes
+    to a private partial file that is renamed only after a complete transfer,
+    so an interrupted download can never be mistaken for the cached source.
+    The checksum check is unchanged and still decides acceptance.
+    """
     path = directory / source["filename"]
     if not path.exists():
-        print(f"Downloading pinned source: {source['filename']}", flush=True)
-        with urllib.request.urlopen(source["url"], timeout=120) as response, path.open("xb") as output:
-            shutil.copyfileobj(response, output)
+        partial = path.with_name(path.name + ".partial")
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            print(f"Downloading pinned source: {source['filename']} (attempt {attempt})", flush=True)
+            partial.unlink(missing_ok=True)
+            try:
+                with urllib.request.urlopen(source["url"], timeout=120) as response, \
+                        partial.open("xb") as output:
+                    shutil.copyfileobj(response, output)
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                partial.unlink(missing_ok=True)
+                if attempt == DOWNLOAD_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Could not download {source['url']} after {attempt} attempts: {exc}") from exc
+                delay = DOWNLOAD_BACKOFF[min(attempt - 1, len(DOWNLOAD_BACKOFF) - 1)]
+                print(f"Download failed ({exc}); retrying in {delay} s", flush=True)
+                sleep(delay)
+                continue
+            partial.replace(path)
+            break
     if sha256(path) != source["sha256"]:
         raise RuntimeError(f"Source checksum mismatch: {path}")
     return path
