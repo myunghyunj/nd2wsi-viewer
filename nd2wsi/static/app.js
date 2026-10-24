@@ -116,6 +116,7 @@ const annotationStore = window.Nd2AnnotationStore.createStore({
   onScope: () => syncFrameScopedControls(),
   onEditorReset: () => { $("ann-editor").hidden = true; },
   onRecoveryNotice: () => updateAnnotationRecoveryNotice(),
+  onSaveState: (event) => state.saveStatus?.report(event.channel, event),
 });
 
 let frameRequests = null;
@@ -195,6 +196,9 @@ async function init() {
   state.channels = info.channels.map((_, i) => i);
   state.luts = info.channels.map(() => null);
   state.lutWidgets = [];
+  // before the persistence controllers register their pagehide disposers, so
+  // the keepalive flush in wireAutoSave() runs ahead of them
+  wireAutoSave();
   await initializeDisplayLuts();
   const LatestRequestGate = window.Nd2LatestRequest && window.Nd2LatestRequest.LatestRequestGate;
   if (!LatestRequestGate) throw new Error("latest-request helper did not load");
@@ -373,6 +377,7 @@ async function initializeDisplayLuts() {
     readLuts: () => state.luts,
     fetch: (...args) => fetch(...args),
     reportError: (message) => showToast(String(message)),
+    onSaveState: (event) => state.saveStatus?.report(event.channel, event),
   });
   const saved = await state.lutPersistence.load();
   if (saved) state.luts = saved;
@@ -2353,6 +2358,166 @@ function loadAnnotations(site) {
 
 function setAnnStatus(msg) {
   $("ann-status").textContent = msg || "";
+}
+
+/* ---- auto-save status: icon, tooltip, periodic retry and pagehide flush ----
+   Both persistence controllers already auto-save (annotations 800 ms, LUTs
+   250 ms after an edit). They report each transition to one tracker
+   (save-status-v1.js) that drives the check icon beside the scale bar. */
+
+const AUTO_SAVE_RETRY_MS = 60000; // the user allowed a once-a-minute safety retry
+const SAVE_STATUS_HOVER_MS = 600;
+// The icon's accessible name follows the tracker state only; the per-second
+// "N s ago" count lives in the tooltip, so assistive technology is not told
+// about every tick for a minute after each save.
+const SAVE_STATUS_LABELS = {
+  saved: "Auto-save: saved",
+  saving: "Auto-save: saving",
+  dirty: "Auto-save: unsaved changes",
+  failed: "Auto-save: not saved",
+  conflict: "Auto-save: conflict",
+};
+
+function wireAutoSave() {
+  const tracker = window.Nd2SaveStatus.createTracker({ onRender: renderSaveStatus });
+  state.saveStatus = tracker;
+  const tooltip = wireSaveStatusTooltip(tracker);
+  tracker.start();
+  tracker.scheduleRetry(AUTO_SAVE_RETRY_MS);
+  state.autoSaveRetry = setInterval(() => {
+    tracker.scheduleRetry(AUTO_SAVE_RETRY_MS);
+    retryAutoSave();
+  }, AUTO_SAVE_RETRY_MS);
+  // One listener: flush first, then stop the retry and the ticker. The
+  // controllers' own dispose listeners were registered later and run after.
+  window.addEventListener("pagehide", () => {
+    flushAutoSaveOnPagehide();
+    clearInterval(state.autoSaveRetry);
+    state.autoSaveRetry = null;
+    tooltip.dispose();
+    tracker.dispose();
+  }, { once: true });
+}
+
+// Once a minute: re-queue transient annotation failures, save a dirty snapshot
+// whose debounce is idle and flush unsaved LUT edits. A 409 conflict is left
+// to the recovery notice; nothing runs while the native shell is quitting.
+function retryAutoSave() {
+  if (state.quitPreparing) return Promise.resolve([]);
+  const retries = [annotationStore.retryFailed()];
+  const lut = state.lutPersistence;
+  if (lut && lut.isDirty()) retries.push(lut.flush().catch(() => {}));
+  return Promise.all(retries);
+}
+
+// Browser mode (nd2wsi view / reload) has no save-before-close handshake, so a
+// tab close or reload hands the pending snapshot to the browser with
+// keepalive; the store skips a snapshot its 409 recovery draft already holds.
+// The native path (flushAnnotationsForUpdate + lutPersistence.flush) stays
+// the authority: while the shell is preparing to quit, nothing happens here.
+function flushAutoSaveOnPagehide() {
+  if (state.quitPreparing) return;
+  annotationStore.flushOnPagehide({ keepalive: true });
+  const lut = state.lutPersistence;
+  if (lut && lut.isDirty()) lut.flush({ keepalive: true }).catch(() => {});
+}
+
+function saveStatusTooltipText(status) {
+  return status.details ? status.text + "\n" + status.details : status.text;
+}
+
+// The tracker calls this when its state or text changes (every second while a
+// "N s ago" count is showing). Only the tooltip follows the text; the button's
+// attributes are written when the state changes. The #ann-status hint text is
+// not touched.
+function renderSaveStatus(status) {
+  const button = $("save-status");
+  if (!button) return;
+  const dataState = status.visible ? status.state : null;
+  if (button.getAttribute("data-state") !== dataState) {
+    button.hidden = !status.visible;
+    if (dataState) button.setAttribute("data-state", dataState);
+    else button.removeAttribute("data-state");
+    button.setAttribute("aria-label", dataState ? SAVE_STATUS_LABELS[dataState] : "Auto-save");
+  }
+  button.saveStatusTooltip?.render(status);
+}
+
+// A sibling of the LUT toolbar tooltips: shown after a short hover or on
+// keyboard focus, hidden on leave, blur or Escape, placed above the icon and
+// kept inside the window. Its text comes from the tracker on every render.
+function wireSaveStatusTooltip(tracker) {
+  const button = $("save-status");
+  const tooltip = $("save-status-tooltip");
+  let hovered = false, hoverReady = false, focused = false, dismissed = false, disposed = false;
+  let hoverTimer = null;
+  const cancelHover = () => {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+  };
+  const render = (status = tracker.current()) => {
+    tooltip.hidden = disposed || dismissed || !status.visible || !(hoverReady || focused);
+    if (tooltip.hidden) return;
+    tooltip.textContent = saveStatusTooltipText(status);
+    const anchor = button.getBoundingClientRect();
+    const tip = tooltip.getBoundingClientRect();
+    const left = Math.max(8, Math.min(anchor.left + (anchor.width - tip.width) / 2,
+      window.innerWidth - tip.width - 8));
+    const top = anchor.top - tip.height - 8;
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${Math.max(8, Math.min(top >= 8 ? top : anchor.bottom + 8,
+      window.innerHeight - tip.height - 8))}px`;
+  };
+  const handlers = {
+    pointerenter() {
+      if (disposed) return;
+      cancelHover();
+      hovered = true;
+      dismissed = false;
+      hoverReady = focused;
+      if (!focused) hoverTimer = setTimeout(() => {
+        hoverTimer = null;
+        hoverReady = hovered;
+        render();
+      }, SAVE_STATUS_HOVER_MS);
+      render();
+    },
+    pointerleave() { cancelHover(); hovered = hoverReady = false; render(); },
+    focus() {
+      if (disposed) return;
+      cancelHover();
+      focused = true;
+      dismissed = false;
+      render();
+    },
+    blur() { focused = false; render(); },
+  };
+  for (const [event, handler] of Object.entries(handlers)) button.addEventListener(event, handler);
+  const dismiss = (event) => {
+    if (event.key !== "Escape") return;
+    cancelHover();
+    hoverReady = false;
+    dismissed = true;
+    render();
+  };
+  const reposition = () => render();
+  document.addEventListener("keydown", dismiss, true);
+  window.addEventListener("resize", reposition);
+  window.addEventListener("scroll", reposition, true);
+  const controller = {
+    render,
+    dispose() {
+      disposed = true;
+      cancelHover();
+      render();
+      for (const [event, handler] of Object.entries(handlers)) button.removeEventListener(event, handler);
+      document.removeEventListener("keydown", dismiss, true);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    },
+  };
+  button.saveStatusTooltip = controller;
+  return controller;
 }
 
 function pixelSize() {

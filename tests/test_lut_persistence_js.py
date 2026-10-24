@@ -21,18 +21,20 @@ const settle=async()=>{for(let i=0;i<30;i++)await Promise.resolve()};
 const rejected=async promise=>{try{await promise;return null}catch(error){return error.message}};
 function setup(options={}) {
   let now=0,id=0,luts=options.luts||[null];
-  const timers=new Map(),calls=[],warnings=[];
+  const timers=new Map(),calls=[],warnings=[],events=[];
   const fetch=options.fetch|| (async(url,opts)=>opts.method==='POST'?ok({ok:true}):loaded(null));
   const controller=createController({info:options.info||{dtype:'uint16',channels:[channel()]},
     readLuts:()=>luts,fetch:(url,opts={})=>{calls.push({url,...opts});return fetch(url,opts)},
     reportError:text=>warnings.push(text),endpoint:options.endpoint||'api/lut-settings',
+    onSaveState:event=>events.push(event),now:()=>now,
     setTimeout:(fn,ms)=>{const key=++id;timers.set(key,{fn,due:now+ms});return key},
     clearTimeout:key=>timers.delete(key)});
   const advance=async ms=>{const end=now+ms;while(true){
     const next=[...timers].filter(([,v])=>v.due<=end).sort((a,b)=>a[1].due-b[1].due)[0];
     if(!next)break;now=next[1].due;timers.delete(next[0]);next[1].fn();await settle();
   }now=end;await settle()};
-  return {controller,calls,warnings,timers,advance,set:value=>{luts=value},
+  return {controller,calls,warnings,timers,events,advance,set:value=>{luts=value},
+    states:()=>events.map(event=>event.state),
     posts:()=>calls.filter(call=>call.method==='POST').map(call=>JSON.parse(call.body))};
 }
 """
@@ -296,3 +298,100 @@ await h.controller.flush();return {failed,posts:h.posts()};
 """)
     assert out["failed"] and len(out["posts"]) == 1
     assert out["posts"][0]["luts"][0]["lo"] == 5
+
+
+def test_save_state_events_follow_dirty_saving_saved_with_the_injected_clock():
+    out = run("""
+const h=setup();await h.controller.load();h.set([lut()]);h.controller.changed();
+const afterEdit=h.events.map(event=>[event.channel,event.state,event.at]);
+await h.advance(250);
+h.set([lut()]);h.controller.changed();await h.advance(250);
+return {afterEdit,events:h.events,dirty:h.controller.isDirty(),status:h.controller.status()};
+""")
+    assert out["afterEdit"] == [["lut", "dirty", 0]]
+    assert [e["state"] for e in out["events"]] == ["dirty", "saving", "saved", "idle"]
+    assert all(e["channel"] == "lut" for e in out["events"])
+    assert [e["at"] for e in out["events"]][1:3] == [250, 250]
+    assert out["dirty"] is False and out["status"] == "ready"
+
+
+def test_flush_forwards_keepalive_to_the_post_and_plain_flushes_do_not():
+    out = run("""
+const h=setup();await h.controller.load();h.set([lut(1,100)]);h.controller.changed();
+await h.controller.flush({keepalive:true});
+h.set([lut(2,100)]);h.controller.changed();await h.controller.flush();
+return h.calls.filter(call=>call.method==='POST').map(call=>call.keepalive===true?'keepalive':typeof call.keepalive);
+""")
+    assert out == ["keepalive", "undefined"]
+
+
+def test_flush_drops_keepalive_for_a_body_over_the_limit_shared_with_the_annotation_store():
+    out = run("""
+const path=require('path');
+const {KEEPALIVE_BODY_LIMIT}=require(process.argv[1]);
+const store=require(path.join(path.dirname(process.argv[1]),'annotation-store-v1.js'));
+const h=setup();await h.controller.load();h.set([lut(1,100)]);h.controller.changed();
+// a real LUT body stays far below the limit (at most 512 channels), so the
+// encoder is stubbed to prove the guard is consulted
+const Encoder=globalThis.TextEncoder;
+globalThis.TextEncoder=class{encode(){return new Uint8Array(KEEPALIVE_BODY_LIMIT+1)}};
+try{await h.controller.flush({keepalive:true})}finally{globalThis.TextEncoder=Encoder}
+h.set([lut(2,100)]);h.controller.changed();await h.controller.flush({keepalive:true});
+return {limit:KEEPALIVE_BODY_LIMIT,shared:store.KEEPALIVE_BODY_LIMIT===KEEPALIVE_BODY_LIMIT,
+  modes:h.calls.filter(call=>call.method==='POST').map(call=>call.keepalive===true?'keepalive':typeof call.keepalive)};
+""")
+    assert out == {"limit": 60 * 1024, "shared": True, "modes": ["undefined", "keepalive"]}
+
+
+def test_is_dirty_and_status_expose_what_the_periodic_retry_may_flush():
+    out = run("""
+const h=setup();const before=[h.controller.isDirty(),h.controller.status()];
+await h.controller.load();const loaded=[h.controller.isDirty(),h.controller.status()];
+h.set([lut()]);h.controller.changed();const edited=[h.controller.isDirty(),h.controller.status()];
+await h.controller.flush();const flushed=[h.controller.isDirty(),h.controller.status()];
+h.set([lut(10,9)]);h.controller.changed();const invalid=[h.controller.isDirty(),h.controller.status()];
+const invalidEvent=h.events[h.events.length-1];
+h.controller.dispose();
+const u=setup({fetch:async()=>ok({ok:true,available:false,settings:null,warning:'no store here'})});
+await u.controller.load();u.controller.changed();
+return {before,loaded,edited,flushed,invalid,invalidEvent,disposed:h.controller.isDirty(),
+  unavailable:[u.controller.isDirty(),u.controller.status()],unavailableEvents:u.events};
+""")
+    assert out["before"] == [False, "unloaded"] and out["loaded"] == [False, "ready"]
+    assert out["edited"] == [True, "ready"] and out["flushed"] == [False, "ready"]
+    # a validation failure is unsaved but not retried: isDirty() stays false
+    assert out["invalid"] == [False, "ready"]
+    assert out["invalidEvent"]["state"] == "dirty" and "LUT values are invalid" in out["invalidEvent"]["message"]
+    assert out["disposed"] is False
+    assert out["unavailable"] == [False, "unavailable"]
+    assert out["unavailableEvents"] == [{"channel": "lut", "state": "unavailable", "at": 0, "message": "no store here"}]
+
+
+def test_periodic_flush_after_a_transient_failure_succeeds_and_emits_saved():
+    out = run("""
+let attempts=0;const h=setup({fetch:async(url,opts)=>{
+  if(opts.method!=='POST')return loaded(null);if(++attempts===1)throw new Error('offline');return ok({ok:true})}});
+await h.controller.load();h.set([lut()]);h.controller.changed();await h.advance(250);
+const failed={states:h.states(),dirty:h.controller.isDirty(),status:h.controller.status(),
+  message:h.events[h.events.length-1].message};
+await h.advance(60000); // nothing retries on its own
+const idle=h.posts().length;
+if(h.controller.isDirty())await h.controller.flush().catch(()=>{});
+return {failed,idle,states:h.states(),dirty:h.controller.isDirty(),posts:h.posts().length};
+""")
+    assert out["failed"]["states"] == ["dirty", "saving", "failed"]
+    assert out["failed"]["dirty"] is True and out["failed"]["status"] == "ready"
+    assert "offline" in out["failed"]["message"]
+    assert out["idle"] == 1
+    assert out["states"] == ["dirty", "saving", "failed", "saving", "saved"]
+    assert out["dirty"] is False and out["posts"] == 2
+
+
+def test_an_edit_back_to_the_saved_values_reports_idle_not_a_fresh_save():
+    out = run("""
+const h=setup({fetch:async(url,opts)=>opts.method==='POST'?ok({ok:true}):loaded([lut()])});
+const restored=await h.controller.load();h.set([lut(5,50)]);h.controller.changed();
+const dirty=h.states();h.set(restored);h.controller.changed();await h.advance(250);
+return {dirty,states:h.states(),posts:h.posts()};
+""")
+    assert out["dirty"] == ["dirty"] and out["states"] == ["dirty", "idle"] and out["posts"] == []
