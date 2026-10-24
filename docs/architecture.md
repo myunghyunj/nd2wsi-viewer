@@ -83,6 +83,8 @@ so the rest of `app.js` reads them unchanged; only the store writes them.
 Behavioral coverage lives in the existing export, annotations, cache, updater,
 window-role and JavaScript suites, with additional tests in:
 
+- `tests/test_tiff_channel_reads.py`: native TIFF export reads each channel once
+  per tile (read counts), byte-identical to the previous iterator.
 - `tests/test_region_export_service.py`: streaming lifetime, disconnect/failure
   cleanup, lifecycle lease, scope and HTTP rejection contracts.
 - `tests/test_window_chrome.py`: owned-window drop/menu routing, Unicode paths,
