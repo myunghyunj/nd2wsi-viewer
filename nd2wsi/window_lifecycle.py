@@ -1,14 +1,16 @@
 """Coordinate saved browser state with native window and updater shutdown.
 
 The shell supplies a bridge, a window, and a logger. This module owns request
-identity, cancellation, annotation acknowledgements, and the worker/main-thread
-ordering shared by native Close and Sparkle. It does not create windows or
-import the app entry point; native frameworks are loaded only at dispatch time.
+identity, cancellation, annotation acknowledgements, and the worker/UI-thread
+ordering shared by native Close (AppKit and WinForms) and Sparkle. It does not
+create windows or import the app entry point; native frameworks (Foundation on
+macOS, pythonnet's System on Windows) are loaded only at dispatch time.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 import uuid
@@ -31,6 +33,8 @@ class LifecycleApi(Protocol):
 class LifecycleWindow(Protocol):
     """The pywebview operations used by save-before-close coordination."""
 
+    native: object  # NSWindow on macOS, the WinForms Form on Windows
+
     def evaluate_js(self, script: str, callback: Callable | None = None) -> object: ...
 
     def destroy(self) -> None: ...
@@ -42,6 +46,9 @@ class UpdateShutdownCoordinator:
     _FLUSH_TIMEOUT = 30.0
     _RETRY_DELAY = 5.0
     _DRAIN_POLL = 0.5
+    # Notices and editing recovery are tiny scripts; a viewer that cannot run
+    # one this quickly is not answering, and the worker must move on.
+    _BROWSER_CALL_TIMEOUT = 5.0
 
     def __init__(self, api: LifecycleApi, window: LifecycleWindow, *, logger: Callable[[str], None]):
         self.api = api
@@ -54,6 +61,7 @@ class UpdateShutdownCoordinator:
         self._wire_request_id = ""
         self._teardown_started = False
         self._install_guard = None
+        self._browser_tail: threading.Event | None = None  # the latest browser call's completion
 
     def prepare_for_update(self, completion, failure) -> bool:
         with self._lock:
@@ -89,8 +97,98 @@ class UpdateShutdownCoordinator:
         """Invalidate retries and queued completions after Sparkle aborts."""
         with self._lock:
             self._cancelled.set()
-        # Only the worker releases ownership, after any in-flight teardown and
-        # browser recovery finish. A new installer must not overtake old I/O.
+        # Only the worker releases ownership, after any in-flight teardown
+        # finishes and browser recovery has been sent (and answered, unless the
+        # viewer is not responding). A new installer must not overtake old I/O.
+
+    def _dispatch_to_ui(self, operation: Callable[[], None]) -> None:
+        """Queue ``operation`` on the native UI thread that owns the window.
+
+        Workers never call native window or Sparkle APIs themselves: AppKit
+        work goes to the main operation queue, WinForms work to the Form's
+        message loop. Native frameworks are imported only here.
+        """
+        def guarded():
+            # Never let a Python error escape into the native event loop.
+            try:
+                operation()
+            except Exception as exc:
+                self._log(f"native UI operation failed: {exc!r}")
+
+        if sys.platform == "darwin":
+            from Foundation import NSOperationQueue
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(guarded)
+        elif sys.platform == "win32":
+            from System import Action
+
+            native = self.window.native
+            if native.InvokeRequired:
+                native.BeginInvoke(Action(guarded))
+            else:
+                guarded()
+        else:
+            raise RuntimeError(f"No native UI thread is available on {sys.platform}")
+
+    def _start_browser_call(self, script: str, callback: Callable | None = None, *, wait: float = 0.0,
+                            cancelled: threading.Event | None = None, queue: bool = False):
+        """Run ``window.evaluate_js`` on its own daemon thread, after the last call.
+
+        pywebview's evaluate_js waits without a deadline: WinForms for its
+        ExecuteScriptAsync continuation, Cocoa for a main-queue block, and
+        every backend first up to 20 s for the page bridge, then raises. A
+        hung, crashed or never-initialised viewer must cost the worker a
+        bounded wait, never the request it owns.
+
+        Calls reach the viewer one at a time and in order: each starts only
+        once the previous one returned. A ``queue``d call (editing recovery)
+        is always issued and waits on its own thread, so a viewer that
+        recovers still runs it after the script it undoes. Any other call is
+        dropped if the previous one is still waiting after ``wait`` seconds
+        (or once ``cancelled`` is set), so a hung viewer strands one thread
+        rather than one per retry. Returns the call's ``done`` event and the
+        list its exception is appended to, or None when it was dropped.
+        """
+        with self._lock:
+            previous = self._browser_tail
+        if previous is not None and not queue:
+            deadline = time.monotonic() + wait
+            while not previous.wait(min(0.05, max(0.0, deadline - time.monotonic()))):
+                if (cancelled is not None and cancelled.is_set()) or time.monotonic() >= deadline:
+                    return None
+        done = threading.Event()
+        errors: list[Exception] = []
+
+        def call():
+            try:
+                if queue and previous is not None:
+                    previous.wait()
+                if callback is None:
+                    self.window.evaluate_js(script)
+                else:
+                    self.window.evaluate_js(script, callback=callback)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=call, name="window-evaluate-js", daemon=True).start()
+        with self._lock:
+            self._browser_tail = done
+        return done, errors
+
+    def _browser_call(self, script: str, what: str, *, queue: bool = False) -> None:
+        """Run a fire-and-forget script, waiting at most _BROWSER_CALL_TIMEOUT."""
+        deadline = time.monotonic() + self._BROWSER_CALL_TIMEOUT
+        try:
+            started = self._start_browser_call(script, wait=self._BROWSER_CALL_TIMEOUT, queue=queue)
+        except Exception as exc:
+            self._log(f"{what} failed: {exc!r}")
+            return
+        if started is None or not started[0].wait(max(0.0, deadline - time.monotonic())):
+            self._log(f"{what} failed: the viewer did not answer within {self._BROWSER_CALL_TIMEOUT:g} seconds")
+        elif started[1]:
+            self._log(f"{what} failed: {started[1][0]!r}")
 
     def _is_current(self, request_id, cancelled) -> bool:
         with self._lock:
@@ -111,22 +209,23 @@ class UpdateShutdownCoordinator:
             after_teardown = self._teardown_started
         if not wire_id:
             return
-        try:
-            self.window.evaluate_js(
-                "window.nd2wsiCancelUpdate && window.nd2wsiCancelUpdate("
-                f"{json.dumps(wire_id)}, {json.dumps(after_teardown)})"
-            )
-        except Exception as exc:
-            self._log(f"update cancellation recovery failed: {exc!r}")
+        # Queued behind any script the viewer has not finished, so it unlocks
+        # editing even if the viewer recovers later. The shell ignores a
+        # cancellation whose wire id is no longer current, so one that arrives
+        # late cannot unlock a newer request.
+        self._browser_call(
+            "window.nd2wsiCancelUpdate && window.nd2wsiCancelUpdate("
+            f"{json.dumps(wire_id)}, {json.dumps(after_teardown)})",
+            "update cancellation recovery",
+            queue=True,
+        )
 
     def _notice(self, message: str) -> None:
-        try:
-            payload = json.dumps(str(message))
-            self.window.evaluate_js(
-                f"window.nd2wsiUpdateNotice && window.nd2wsiUpdateNotice({payload})"
-            )
-        except Exception as exc:
-            self._log(f"update notice failed: {exc!r}")
+        payload = json.dumps(str(message))
+        self._browser_call(
+            f"window.nd2wsiUpdateNotice && window.nd2wsiUpdateNotice({payload})",
+            "update notice",
+        )
 
     def _report_wait(self, message: str, failure) -> None:
         self._notice(message)
@@ -139,7 +238,6 @@ class UpdateShutdownCoordinator:
         with self._lock:
             if self._request_id != request_id or cancelled.is_set():
                 return None
-            self._wire_request_id = wire_id
         request = json.dumps(wire_id)
         script = (
             "typeof window.nd2wsiPrepareForUpdate === 'function' "
@@ -157,12 +255,27 @@ class UpdateShutdownCoordinator:
                 results.append(result)
                 answered.set()
 
-        self.window.evaluate_js(script, callback=after_flush)
+        # The deadline covers the browser call itself: a viewer that never
+        # runs the script is as unconfirmed as one that never replies.
         deadline = time.monotonic() + self._FLUSH_TIMEOUT
+        started = self._start_browser_call(script, after_flush, wait=self._FLUSH_TIMEOUT, cancelled=cancelled)
+        if started is None:  # cancelled, or an earlier script is still stuck in this viewer
+            if cancelled.is_set():
+                return None
+            return {"ok": False, "error": "the viewer did not confirm its saved state"}
+        with self._lock:
+            # Recovery cancels the last preparation the viewer was actually sent.
+            if self._request_id == request_id:
+                self._wire_request_id = wire_id
+        _, errors = started
         while not answered.is_set():
             if cancelled.wait(min(0.05, max(0, deadline - time.monotonic()))):
                 return None
-            if not answered.is_set() and time.monotonic() >= deadline:
+            if answered.is_set():
+                break
+            if errors:
+                raise errors[0]  # for example, the page bridge never became ready
+            if time.monotonic() >= deadline:
                 return {"ok": False, "error": "the viewer did not confirm its saved state"}
         return results[0]
 
@@ -195,8 +308,6 @@ class UpdateShutdownCoordinator:
             self._log("Sparkle shutdown: annotations saved")
             if not self._drain_and_close(request_id, cancelled):
                 return
-            from Foundation import NSOperationQueue
-
             def finish():
                 if not self._is_current(request_id, cancelled):
                     return
@@ -209,7 +320,7 @@ class UpdateShutdownCoordinator:
                     completed.set()
 
             # Never fall back to invoking Sparkle on a worker thread.
-            NSOperationQueue.mainQueue().addOperationWithBlock_(finish)
+            self._dispatch_to_ui(finish)
             while not completed.wait(0.05):
                 if cancelled.is_set():
                     return
@@ -261,30 +372,84 @@ class UpdateShutdownCoordinator:
 class WindowCloseCoordinator(UpdateShutdownCoordinator):
     """Veto native close until this window confirms saved annotations.
 
-    Cocoa invokes closing on its main thread; no browser call can block there.
-    The existing save protocol freezes editing while a worker awaits acknowledg-
-    ments and active exports. Failure restores editing and leaves the window open.
+    pywebview raises closing on the toolkit's UI thread (AppKit's
+    windowShouldClose:, WinForms' FormClosing); no browser call can block
+    there. The existing save protocol freezes editing while a worker awaits
+    acknowledgements and active exports, then hands the approved close back to
+    the UI thread. Failure restores editing and leaves the window open.
+
+    A viewer that cannot answer (hung, crashed or never initialised) must not
+    make the window impossible to close: a page whose bridge never became
+    ready while no slide is open has nothing to save and closes at once, and a
+    close that follows a failed handshake and fails again asks the user
+    natively whether to close without confirmed saves.
     """
 
     _DRAIN_TIMEOUT = 30.0
+    _UNCONFIRMED_CLOSE_TITLE = "Close without confirmed saves?"
 
     def __init__(self, api: LifecycleApi, window: LifecycleWindow, *, logger: Callable[[str], None]):
         super().__init__(api, window, logger=logger)
         self._approved = False
+        self._forced = False
+        self._failed_closes = 0  # failed handshakes since the last approved close
+        self._close_listeners: list[Callable[[], None]] = []
+
+    def approve_close(self, reason: str) -> None:
+        """Let native close proceed without the save handshake.
+
+        Only for automated diagnostics: a GUI smoke that failed, or whose viewer
+        never became ready, cannot answer the save protocol and must not hang
+        on the veto. A running request is cancelled; its worker then releases
+        ownership without touching the closing browser.
+        """
+        with self._lock:
+            self._forced = True
+            self._cancelled.set()
+        self._log(f"Native close approved without save confirmation: {reason}")
+
+    def add_close_listener(self, listener: Callable[[], None]) -> None:
+        """Run ``listener`` on the UI thread after a confirmed close is handed
+        to the window, before the GUI loop can return."""
+        with self._lock:
+            self._close_listeners.append(listener)
+
+    def request_native_close(self) -> None:
+        """Start the close a title-bar button would, so the veto runs.
+
+        pywebview's Cocoa destroy() is NSWindow.close, which skips
+        windowShouldClose:; performClose: is the close button's own action.
+        Its WinForms destroy() is Form.Close, which raises FormClosing exactly
+        like the title-bar X, Alt+F4 or a taskbar close.
+        """
+        if sys.platform == "darwin":
+            self._dispatch_to_ui(lambda: self.window.native.performClose_(None))
+        else:
+            self.window.destroy()
 
     def on_closing(self) -> bool:
+        # Runs on the UI thread; reads plain attributes only, never blocks.
+        idle_page = self._page_never_ready_without_slides()
         with self._lock:
-            if self._approved:
+            if self._approved or self._forced:
                 return True
             if self._running:
                 return False
-            self._running = True
-            request_id = self._request_id = uuid.uuid4().hex
-            cancelled = self._cancelled = threading.Event()
-            self._wire_request_id = ""
-            self._teardown_started = False
+            if idle_page:
+                approved = True
+            else:
+                approved = False
+                self._running = True
+                request_id = self._request_id = uuid.uuid4().hex
+                cancelled = self._cancelled = threading.Event()
+                self._wire_request_id = ""
+                self._teardown_started = False
+                ask_to_force = self._failed_closes > 0
+        if approved:
+            self._log("Native close allowed: the page never became ready and no slide is open")
+            return True
         try:
-            threading.Thread(target=self._close_worker, args=(request_id, cancelled),
+            threading.Thread(target=self._close_worker, args=(request_id, cancelled, ask_to_force),
                              name="window-safe-close", daemon=True).start()
         except Exception as exc:
             self._finish_request(request_id)
@@ -292,52 +457,121 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
             self._log(self.api._status)
         return False
 
-    def _missing_flush_result(self) -> str:
+    def _holds_no_slides(self) -> bool:
         server = self.api._httpd
         slides = getattr(getattr(server, "registry", None), "slides", None)
-        if self.api._frac < 0 and (server is None or slides is not None and not slides):
+        return self.api._frac < 0 and (server is None or slides is not None and not slides)
+
+    def _page_never_ready_without_slides(self) -> bool:
+        """True while pywebview's page bridge is not ready and no slide is open.
+
+        Edits belong to open slides, so nothing can be unsaved. This is also
+        the state a failed WebView2 initialisation leaves behind, where every
+        browser call would wait 20 s and then fail. A window without that
+        pywebview event is treated as ready, so the handshake still runs.
+        """
+        ready = getattr(getattr(self.window, "events", None), "_pywebviewready", None)
+        is_set = getattr(ready, "is_set", None)
+        return callable(is_set) and is_set() is False and self._holds_no_slides()
+
+    def _missing_flush_result(self) -> str:
+        if self._holds_no_slides():
             return "{ok:true, panes:0}"
         return "{ok:false, error:'the viewer is not ready to confirm saved annotations'}"
 
-    def _close_worker(self, request_id, cancelled) -> None:
+    def _confirm_saved(self, request_id, cancelled) -> bool:
+        """Flush the panes and drain active exports.
+
+        Returns False when the request was cancelled or superseded, and raises
+        when the viewer did not confirm its saved state in time.
+        """
+        result = self._flush_panes(request_id, cancelled)
+        if not self._is_current(request_id, cancelled):
+            return False
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = result.get("error") if isinstance(result, dict) else None
+            raise RuntimeError(reason or "annotations were not confirmed saved")
+        deadline = time.monotonic() + self._DRAIN_TIMEOUT
+        while self._is_current(request_id, cancelled):
+            reason = self.api.update_block_reason()
+            if reason is None:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(reason + " Close was cancelled; try again when it finishes.")
+            if cancelled.wait(min(self._DRAIN_POLL, max(0, deadline - time.monotonic()))):
+                return False
+        return self._is_current(request_id, cancelled)
+
+    def _ask_to_close_unconfirmed(self, reason) -> bool:
+        """Ask natively, from this worker, whether to close without confirmed saves.
+
+        pywebview shows the dialog itself (a MessageBox on WinForms, an NSAlert
+        through the main queue on Cocoa) and blocks only this worker until it
+        is answered; it needs no response from the viewer. Only an explicit OK
+        counts; a missing or failing dialog keeps the window open.
+        """
+        ask = getattr(self.window, "create_confirmation_dialog", None)
+        if not callable(ask):
+            return False
+        message = (
+            f"{self._UNCONFIRMED_CLOSE_TITLE}\n\n"
+            f"The viewer could not confirm that this window's annotations and settings are saved: {reason}\n\n"
+            "Choose OK to close the window anyway. Changes that were not saved, and any export "
+            "still running, will be lost. Choose Cancel to keep it open."
+        )
+        try:
+            return ask(self._UNCONFIRMED_CLOSE_TITLE, message) is True
+        except Exception as exc:
+            self._log(f"close confirmation dialog failed: {exc!r}")
+            return False
+
+    def _close_worker(self, request_id, cancelled, ask_to_force=False) -> None:
         closing = threading.Event()
         failures = []
         try:
-            result = self._flush_panes(request_id, cancelled)
-            if not self._is_current(request_id, cancelled):
-                return
-            if not isinstance(result, dict) or not result.get("ok"):
-                reason = result.get("error") if isinstance(result, dict) else None
-                raise RuntimeError(reason or "annotations were not confirmed saved")
-            deadline = time.monotonic() + self._DRAIN_TIMEOUT
-            while self._is_current(request_id, cancelled):
-                reason = self.api.update_block_reason()
-                if reason is None:
-                    break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(reason + " Close was cancelled; try again when it finishes.")
-                if cancelled.wait(min(self._DRAIN_POLL, max(0, deadline - time.monotonic()))):
+            try:
+                if not self._confirm_saved(request_id, cancelled):
                     return
-            if not self._is_current(request_id, cancelled):
-                return
-            from Foundation import NSOperationQueue
+            except Exception as exc:
+                # A repeated close whose handshake fails again is the user's way
+                # out of a viewer that cannot answer; never offered to the
+                # first attempt, so automation that closes once never sees it.
+                if not (ask_to_force and self._is_current(request_id, cancelled)
+                        and self._ask_to_close_unconfirmed(exc)):
+                    raise
+                self._log(f"Closing without confirmed saves at the user's request: {exc}")
+                if not self._is_current(request_id, cancelled):
+                    return
 
             def finish():
-                if not self._is_current(request_id, cancelled):
+                # Runs on the UI thread. Identity and approval are decided under
+                # one lock, so a cancelled or superseded request never approves.
+                with self._lock:
+                    current = self._request_id == request_id and not cancelled.is_set()
+                    if current:
+                        self._approved = True
+                        self._failed_closes = 0
+                        listeners = list(self._close_listeners)
+                if not current:
                     closing.set()
                     return
                 try:
-                    with self._lock:
-                        self._approved = True
+                    # WinForms re-raises FormClosing here; it is now approved.
                     self.window.destroy()
                 except Exception as exc:
                     with self._lock:
                         self._approved = False
                     failures.append(exc)
+                else:
+                    for listener in listeners:
+                        try:
+                            listener()
+                        except Exception as exc:
+                            self._log(f"close listener failed: {exc!r}")
                 finally:
                     closing.set()
 
-            NSOperationQueue.mainQueue().addOperationWithBlock_(finish)
+            self._dispatch_to_ui(finish)
             while not closing.wait(0.05):
                 if cancelled.is_set():
                     return
@@ -345,10 +579,12 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
                 raise failures[0]
         except Exception as exc:
             message = f"Window remains open: {exc}"
+            with self._lock:
+                self._failed_closes += 1
             self.api._status = message
             self._log(message)
             self._notice(message)
         finally:
-            if not self._approved:
+            if not (self._approved or self._forced):
                 self._recover_browser(request_id)
             self._finish_request(request_id)
