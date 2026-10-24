@@ -3,6 +3,23 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.5.3</title>
+            <pubDate>Sat, 24 Oct 2026 15:02:23 +0900</pubDate>
+            <sparkle:version>2.5.3</sparkle:version>
+            <sparkle:shortVersionString>2.5.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Auto-save status and consolidated viewer internals</h2>
+<ul>
+<li>A green check beside the scale bar shows that your marks and LUT edits were written; hover it for the time since the last save. Failed saves retry every minute, and conflicts still use the recovery notice.</li>
+<li>Closing or reloading a browser-mode tab now flushes pending saves first.</li>
+<li>Annotation saving, viewer coordinate calculations and pyramid reduction are consolidated into shared modules with fixed reference values; stored annotation, correction and LUT formats and pixel rounding are unchanged.</li>
+<li>Legacy BF-free models remain readable, covered by a frozen compatibility fixture; historical beta build recipes moved under packaging/legacy.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.3/nd2wsi-viewer-2.5.3-macos-arm64.dmg" length="139031553" type="application/octet-stream" sparkle:edSignature="mgcPA/ESwyR+4i9x+5ilSsvWWG7N4lGeQc3CsP6JH8R4877G6R6CRjiEr9BrDMbKxAjRz1uZSliHIfenxrdFDA=="/>
+        </item>
+        <item>
             <title>2.5.2</title>
             <pubDate>Fri, 23 Oct 2026 22:40:53 +0000</pubDate>
             <sparkle:version>2.5.2</sparkle:version>
