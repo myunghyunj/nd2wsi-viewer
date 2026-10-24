@@ -386,6 +386,17 @@ class WindowCloseCoordinator(_window_lifecycle.WindowCloseCoordinator):
         super().__init__(api, window, logger=lambda message: _dlog(message))
 
 
+def _guard_native_close(api: Api, window) -> None:
+    """Veto this process's main-window close until its saves are confirmed.
+
+    Translucent overlays are display-only and close at once; every
+    independent window is its own process with its own guard.
+    """
+    api._close_coordinator = WindowCloseCoordinator(api, window)
+    window.events.closing += api._close_coordinator.on_closing
+    window.events.closed += api._close_coordinator.cancel_preparation
+
+
 def _install_window_menu(api: Api, window) -> None:
     _window_chrome.install_window_menu(api, window, logger=_dlog)
 
@@ -1077,7 +1088,73 @@ def _gui_smoke_native_keyboard(api: Api, window, *, slide: bool) -> dict:
     return report
 
 
-def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 90) -> dict:
+def _gui_smoke_close(api: Api, window, report: dict, *, timeout: float) -> None:
+    """Close the smoke window and settle ``report`` before the GUI loop returns.
+
+    main() writes ``api._gui_smoke_report`` as soon as ``webview.start``
+    returns, which can be the moment the window closes. So every outcome is
+    recorded before the close that ends the loop: by this thread before a
+    direct or forced destroy, or by the coordinator's UI-thread listener after
+    its approved destroy was requested and before the loop can return.
+    """
+    api._gui_smoke_report = report
+    coordinator = getattr(api, "_close_coordinator", None)
+    if coordinator is None:
+        report["close"] = {"path": "direct"}
+        window.destroy()
+        return
+    if not report.get("ok"):
+        # A failed or unready viewer cannot answer the save protocol; never
+        # let the veto turn a failure report into a CI timeout.
+        reason = f"GUI smoke failed in phase {report.get('phase')}"
+        report["close"] = {"path": "forced", "reason": reason}
+        coordinator.approve_close(reason)
+        window.destroy()
+        return
+
+    started = time.monotonic()
+    phase = report.get("phase")
+    lock = threading.Lock()
+    outcome = []
+    confirmed = threading.Event()
+
+    def saved_close():
+        with lock:
+            if outcome:
+                return
+            outcome.append("coordinated")
+            report.pop("error", None)
+            report.update(ok=True, phase=phase, close={
+                "path": "coordinated", "seconds": round(time.monotonic() - started, 2)})
+        confirmed.set()
+
+    # Exercise the real veto -> acknowledged flush -> UI-thread approval ->
+    # destroy path once. Until it confirms, a closed window is a failure.
+    report.update(ok=False, phase="close", error="The window closed without the save handshake",
+                  close={"path": "coordinated", "confirmed": False})
+    coordinator.add_close_listener(saved_close)
+    try:
+        coordinator.request_native_close()
+    except Exception as exc:
+        failure = f"Could not start the native close: {exc}"
+    else:
+        if confirmed.wait(timeout):
+            return
+        failure = f"Native close did not complete the save handshake within {timeout:g} seconds"
+    with lock:
+        if outcome:
+            return
+        outcome.append("forced")
+        if api._status:
+            failure += f" (last status: {api._status})"
+        report.update(ok=False, phase="close", error=failure, close={
+            "path": "forced", "reason": failure, "seconds": round(time.monotonic() - started, 2)})
+    coordinator.approve_close(failure)
+    window.destroy()
+
+
+def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 90,
+              close_timeout: float = 30) -> dict:
     """Exercise the real renderer, bridge and slide DOM, then close the app."""
     started = time.monotonic()
     report = {"ok": False, "platform": sys.platform, "renderer": None, "phase": "app-loading"}
@@ -1346,10 +1423,62 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
         report["error"] = str(exc)
     finally:
         report["elapsed_seconds"] = round(time.monotonic() - started, 2)
-        # Set the result before destroy; the GUI's main loop can return at once.
-        api._gui_smoke_report = report
-        window.destroy()
+        # The GUI's main loop can return as soon as the window closes.
+        _gui_smoke_close(api, window, report, timeout=close_timeout)
     return report
+
+
+class _PywebviewDaemonThread(threading.Thread):
+    """``threading.Thread`` for pywebview's bridge, always a daemon."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["daemon"] = True
+        super().__init__(*args, **kwargs)
+
+
+def _daemonize_pywebview_bridge_threads(webview) -> None:
+    """Run pywebview's JS-bridge threads as daemons so a closed app can exit.
+
+    ``webview.util`` starts every JavaScript-to-Python call on a fresh
+    non-daemon thread whose reply goes back through ``window.evaluate_js``,
+    and that waits without a deadline: Cocoa for a main-queue block, WinForms
+    for an ExecuteScriptAsync continuation lost once ``Application.Exit`` has
+    run. A call racing the close (the shell's gesture-scope update scheduled
+    by every save handshake, for one) then never returns, and interpreter
+    shutdown joins that thread forever: the window is gone, a GUI smoke has
+    written its report, and the process still holds the source memory map.
+    Nothing that must outlive the window runs there: saves and exports are
+    confirmed before a close is approved, and an unfinished cache build is
+    staged and cleaned up like any interrupted one.
+    """
+    util = getattr(webview, "util", None)
+    if util is not None and isinstance(getattr(util, "Thread", None), type):
+        util.Thread = _PywebviewDaemonThread
+
+
+_DIAGNOSTIC_RUN_FLAGS = ("--gui-smoke", "--handoff-check-report", "--browser-replay-report")
+
+
+def run(argv: list[str] | None = None) -> int:
+    """Process entry point: ``main()``, then end a diagnostic run at once.
+
+    When ``main()`` returns from a GUI smoke or another diagnostic run, its
+    report is written and its server and window session are closed. Exiting
+    with ``os._exit`` then means no thread that is still waiting (see
+    ``_daemonize_pywebview_bridge_threads``) can turn a finished run into a
+    CI timeout. Interactive runs return normally; ``main()`` itself always
+    returns, so callers and tests can inspect its result.
+    """
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    result = main(arguments)
+    if any(argument.split("=", 1)[0] in _DIAGNOSTIC_RUN_FLAGS for argument in arguments):
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(result)
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1428,6 +1557,7 @@ def main(argv: list[str] | None = None) -> int:
         kwargs = {"gui": "edgechromium"} if sys.platform == "win32" else {}
         if window_session is not None:
             kwargs["private_mode"] = True
+        _daemonize_pywebview_bridge_threads(webview)
         if args.browser_replay_report:
             from .viewport_benchmark import run_browser_replay
 
@@ -1441,7 +1571,8 @@ def main(argv: list[str] | None = None) -> int:
             webview.start(**kwargs)
         if api._startup_error:
             raise RuntimeError(api._startup_error)
-        report = getattr(api, "_gui_smoke_report", {"ok": False, "error": "GUI closed before verification"})
+        # Snapshot: the smoke records its close outcome before the loop returns.
+        report = dict(getattr(api, "_gui_smoke_report", {"ok": False, "error": "GUI closed before verification"}))
         result = 0 if not args.gui_smoke or report["ok"] else 4
         if args.browser_replay_report:
             report = getattr(api, "_browser_replay_report", {"ok": False, "error": "Replay did not complete"})
@@ -1542,9 +1673,7 @@ def create_app_window(initial: Path | None, window_session=None):
         api._titlebar_drag = _window_chrome.NativeTitlebarDrag(window, logger=_dlog)
         _install_open_files_handler()
         window.events.shown += lambda: _install_window_menu(api, window)
-        api._close_coordinator = WindowCloseCoordinator(api, window)
-        window.events.closing += api._close_coordinator.on_closing
-        window.events.closed += api._close_coordinator.cancel_preparation
+        _guard_native_close(api, window)
         if not api._updates_disabled:
             window.events.shown += lambda: _install_app_updater(api, window)
     elif sys.platform == "win32":
@@ -1560,8 +1689,9 @@ def create_app_window(initial: Path | None, window_session=None):
             return True
 
         window.events.initialized += require_webview2
+        _guard_native_close(api, window)
     return api, window
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

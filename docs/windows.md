@@ -244,6 +244,15 @@ Windows locks use kernel byte-range locking and safe process-liveness checks.
 Cache removal captures file identities and deletes through Windows handles;
 directory junctions and symlinks are never traversed during deletion.
 
+Closing the window with the title-bar X, Alt+F4 or the taskbar now waits, as on
+macOS, until pending annotation and LUT changes are confirmed saved and active
+exports finish. If saving fails (for example an annotation conflict that keeps a
+recovery draft), the window stays open with the reason, and editing resumes.
+If the viewer itself stops responding, the close gives up within about 40
+seconds. Closing again retries the save and, if that fails too, asks whether to
+close without confirmed saves. A window whose WebView2 page never loaded and
+has no slide open closes at once.
+
 Logs are stored in `%LOCALAPPDATA%\nd2wsi-viewer\logs`. WebView2 runs in
 private mode with temporary browser data. Windows uses Ctrl/Alt shortcuts
 and Explorer's reveal command. For a portable copy, install updates by

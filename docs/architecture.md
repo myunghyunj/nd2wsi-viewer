@@ -10,7 +10,7 @@ import their entry point or create a second copy of its state.
 | Module | Responsibility | Boundary |
 | --- | --- | --- |
 | `app.py` | Launch options, native bridge, window roles, server startup and platform selection | Creates one API and native window per session; retains compatibility entry points |
-| `window_lifecycle.py` | Save-before-close and save-before-update state machines | Receives the window, lifecycle API and logger; owns request identities, cancellation and worker/main-thread ordering |
+| `window_lifecycle.py` | Save-before-close (macOS and Windows) and save-before-update (Sparkle) state machines | Receives the window, lifecycle API and logger; owns request identities, cancellation and worker/UI-thread ordering (AppKit main queue or WinForms `BeginInvoke`) |
 | `window_chrome.py` | macOS chrome/menu adapters and native file-drop delivery | Receives the owning window/API; imports native frameworks at the point of use |
 
 Browser state must acknowledge saved annotations before shutdown can release
@@ -18,7 +18,18 @@ its server resources. Cancellation belongs to the original request until its
 worker has finished; a late callback cannot authorize a later close or update.
 Native actions retain their owning window/API rather than selecting whichever
 window happens to be first or frontmost. Windows keeps its WebView2 renderer
-and standard native frame.
+and standard native frame. Native close of each process's main window is
+vetoed on both platforms until that handshake and active exports finish; the
+packaged GUI smoke exercises this path once and records it as `close` in its
+report. Workers bound every browser call, since pywebview's `evaluate_js`
+waits without a deadline: a viewer that cannot answer fails the handshake
+instead of wedging it. Calls reach the viewer one at a time, so a stuck viewer
+is sent nothing more except editing recovery, which waits behind the script it
+undoes. A page whose bridge never became ready while no slide
+is open closes at once, and a close that fails again after a failed handshake
+asks natively whether to close without confirmed saves. pywebview's bridge
+threads run as daemons so a reply stranded by the close cannot keep the
+process alive, and `run()` ends a finished diagnostic run with `os._exit`.
 
 ## HTTP and scientific I/O
 
@@ -100,6 +111,10 @@ window-role and JavaScript suites, with additional tests in:
 - `tests/test_annotation_render_js.py`: one delegated pointer listener for every
   annotation mark, the translate-only pan path and every drawn input that forces a
   full annotation render.
+- `tests/test_window_close_native.py`: the save veto on a fake WinForms UI thread,
+  UI-thread approval, hung and never-ready viewers, and the GUI smoke's close.
+- `tests/test_process_exit.py`: a stranded pywebview bridge reply cannot keep a
+  closed process alive, and diagnostic runs end once their report is written.
 
 Run `python -m pytest tests -q` in the locked test environment, with Node.js
 available. `scripts/fetch_testdata.py` supplies the checksummed public ND2
