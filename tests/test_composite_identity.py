@@ -614,6 +614,10 @@ def test_small_regions_reuse_but_do_not_build_tables():
     assert len(render._gamma_luts) == 1
 
 
+# warnings.catch_warnings() is process-global and not thread-safe before
+# Python 3.14, so workers only use the thread-local np.errstate and the test
+# installs its warning filter once, before any thread starts.
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
 def test_concurrent_composites_match_serial_reference(monkeypatch):
     # A small capacity forces evictions and duplicate builds while threads race.
     monkeypatch.setattr(render, "_GAMMA_LUT_CAPACITY", 3)
@@ -638,7 +642,9 @@ def test_concurrent_composites_match_serial_reference(monkeypatch):
             for rep in range(3):
                 for index in range(slot + rep, len(jobs) + slot + rep):
                     job = jobs[index % len(jobs)]
-                    results[slot].append((index % len(jobs), _quiet(render.composite, *job)))
+                    with np.errstate(all="ignore"):
+                        image = render.composite(*job)
+                    results[slot].append((index % len(jobs), image))
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
 
@@ -653,3 +659,47 @@ def test_concurrent_composites_match_serial_reference(monkeypatch):
         for index, image in slot_results:
             np.testing.assert_array_equal(image, expected[index])
     assert len(render._gamma_luts) <= 3
+
+
+def _per_pixel_v(values, lo, hi, gamma):
+    """The v2.5.3 per-pixel statements for integer input, written out here so the
+    oracle does not share code with render._windowed."""
+    span = max(hi - lo, 1e-6)
+    v = (values.astype(np.float32) - lo) / span
+    np.clip(v, 0, 1, out=v)
+    if gamma != 1.0:
+        v **= 1.0 / gamma
+    return v
+
+
+TABLE_WINDOWS = [(0, 65535), (100.0, 4000.0), (1000.0, 1001.0), (0.5, 3000.25),
+                 (-50.0, 200.0), (65000.0, 70000.0)]
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+@pytest.mark.parametrize("gamma", [0.1, 0.25, 0.5, 0.7, 1.6, 2.2, 3.0, 4.0, 10.0])
+def test_gamma_table_bits_match_per_pixel_float32(dtype, gamma):
+    # uint8 truncation hides almost every 1-ulp difference in v, so the image
+    # comparisons above could pass even if a 65536-entry table build rounded
+    # differently from a tile on some CPU (e.g. a SIMD power kernel on Windows
+    # x86_64). Compare the float32 values themselves, bit for bit, across tile
+    # layouts: contiguous, permuted, strided, misaligned, short and odd-sized.
+    n = np.iinfo(dtype).max + 1
+    codes = np.arange(n, dtype=dtype)
+    rng = np.random.default_rng(7)
+    perm = rng.permutation(codes)
+    strided = np.zeros(2 * n, dtype)
+    strided[::2] = perm
+    offset = np.empty(n + 1, dtype)
+    offset[1:] = perm
+    tiles = [codes, rng.permutation(np.tile(codes, 4)).reshape(-1, 512), strided[::2],
+             offset[1:], perm[:7].reshape(1, 7), rng.integers(0, n, (3, 513)).astype(dtype)]
+    for lo, hi in TABLE_WINDOWS:
+        render._clear_gamma_lut_cache()
+        table, finite = render._gamma_lut(np.dtype(dtype), lo, hi, gamma, True)
+        assert table.dtype == np.float32 and finite
+        for tile in tiles:
+            want = _per_pixel_v(tile, lo, hi, gamma)
+            got = table[tile]
+            assert got.shape == want.shape
+            assert np.array_equal(got.view(np.uint32), want.view(np.uint32)), (lo, hi, tile.shape)
