@@ -7,11 +7,13 @@ import runpy
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from winforms_fake import FAKE_SYSTEM, FakeWinFormsWindow
 
 from nd2wsi import app
 
@@ -44,26 +46,17 @@ def test_windows_launcher_uses_utf8_with_inherited_legacy_streams(tmp_path, monk
         inherited.close()
 
 
-class Event:
-    def __init__(self):
-        self.handlers = []
-
-    def __iadd__(self, callback):
-        self.handlers.append(callback)
-        return self
-
 @pytest.fixture()
 def fake_webview(monkeypatch, tmp_path):
-    window = SimpleNamespace(
-        events=SimpleNamespace(**{name: Event() for name in (
-            "before_load", "closed", "loaded", "shown", "initialized",
-        )}),
-        evaluate_js=Mock(), destroy=Mock(),
-    )
+    # destroy() re-raises FormClosing and BeginInvoke runs on a UI thread, as
+    # pywebview's WinForms backend does; Cocoa must never be imported.
+    window = FakeWinFormsWindow()
     webview = SimpleNamespace(
         create_window=Mock(return_value=window), settings={}, renderer="edgechromium",
     )
     monkeypatch.setitem(sys.modules, "webview", webview)
+    monkeypatch.setitem(sys.modules, "System", FAKE_SYSTEM)
+    monkeypatch.setitem(sys.modules, "Foundation", None)
     monkeypatch.setattr(app.sys, "platform", "win32")
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path / "sessions"))
     monkeypatch.delenv("ND2WSI_SMOKE_LUT_CLIPBOARD", raising=False)
@@ -74,7 +67,9 @@ def fake_webview(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "nd2wsi.window_smoke.exercise_independent_window", Mock(return_value={"ok": True}),
     )
-    return webview, window
+    yield webview, window
+    window.native.exit_loop()
+    assert window.native.errors == []
 
 
 def test_windows_preserves_native_window_controls_and_rejects_mshtml(fake_webview, monkeypatch):
@@ -88,12 +83,18 @@ def test_windows_preserves_native_window_controls_and_rejects_mshtml(fake_webvie
     assert webview.settings["ALLOW_DOWNLOADS"] is True
     assert "DRAG_REGION_SELECTOR" not in webview.settings
     assert app._wire_file_drop.call_count == 1
+    # No AppKit menu or Sparkle updater is installed on Windows.
     assert window.events.shown.handlers == []
     guard, = window.events.initialized.handlers
     assert guard("edgechromium") is True
     assert guard("mshtml") is False
     assert "WebView2 Runtime is required" in api._startup_error
     assert api.title_bar_double_click() == "none"
+    # Native close (title-bar X, Alt+F4, taskbar) uses the same save veto as macOS.
+    assert isinstance(api._close_coordinator, app.WindowCloseCoordinator)
+    assert window.events.closing.handlers == [api._close_coordinator.on_closing]
+    assert window.events.closed.handlers[-1] == api._close_coordinator.cancel_preparation
+    assert api._close_translucent_windows in window.events.closed.handlers
 
 
 def test_windows_updates_open_release_downloads_without_sparkle(fake_webview, monkeypatch):
@@ -643,11 +644,22 @@ def test_macos_lut_clipboard_api_keeps_original_call_contract(fake_webview, monk
 def test_main_passes_edge_renderer_and_writes_gui_report(fake_webview, monkeypatch, tmp_path):
     webview, window = fake_webview
     window.evaluate_js.return_value = {"bridge": True, "version": "test", "boot": True}
-    webview.start = Mock(side_effect=lambda callback, **_kwargs: callback())
+    webview.util = SimpleNamespace(Thread=threading.Thread)
+    bridge_threads = []
+    webview.start = Mock(side_effect=lambda callback, **_kwargs: (
+        bridge_threads.append(webview.util.Thread), callback()))
     path = tmp_path / "gui-smoke.json"
     assert app.main(["--gui-smoke", "--smoke-report", str(path)]) == 0
+    # pywebview's bridge threads are daemons before the GUI loop starts, so a
+    # reply stranded by the close cannot keep the finished process alive.
+    assert bridge_threads == [app._PywebviewDaemonThread]
     assert webview.start.call_args.kwargs == {"gui": "edgechromium", "private_mode": True}
-    assert json.loads(path.read_text(encoding="utf-8"))["ok"] is True
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert report["ok"] is True and report["phase"] == "complete"
+    # The packaged smoke closes through the real WinForms veto and handshake.
+    assert report["close"]["path"] == "coordinated"
+    assert window.is_closed and window.close_attempts == 2
+    assert any("nd2wsiPrepareForUpdate" in script for script in window.scripts)
 
 
 def test_main_reports_missing_webview2_without_blocking_ci(fake_webview, monkeypatch, tmp_path):

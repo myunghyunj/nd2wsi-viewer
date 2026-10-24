@@ -148,6 +148,8 @@ def driver(monkeypatch):
     api = Api(trace)
     logs, failures, completions = [], [], []
     monkeypatch.setattr(app, "_dlog", logs.append)
+    # Sparkle hand-off is AppKit-only; Windows CI runs this suite too.
+    monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setitem(sys.modules, "Foundation", SimpleNamespace(
         NSOperationQueue=SimpleNamespace(mainQueue=lambda: main),
     ))

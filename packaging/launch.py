@@ -30,7 +30,8 @@ if sys.platform == "win32":
     sys.stdout = stream
     sys.stderr = stream
 
-from nd2wsi.app import main  # noqa: E402 - freeze support must run before app imports
+# run() ends a finished --gui-smoke at once, so no lingering thread can hold it.
+from nd2wsi.app import run  # noqa: E402 - freeze support must run before app imports
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())
