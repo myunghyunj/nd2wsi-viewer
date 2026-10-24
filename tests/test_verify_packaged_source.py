@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 STATIC_ASSETS = sorted(str(path.relative_to(ROOT))
                        for path in (ROOT / "nd2wsi/static").rglob("*") if path.is_file())
 
@@ -35,7 +35,7 @@ def compiled():
         if parts[-1] == "__init__":
             parts.pop()
         # A frozen module carries the build machine's filename, never "<source>".
-        code[".".join(parts)] = compile(source.read_text(), str(source), "exec")
+        code[".".join(parts)] = compile(source.read_text(encoding="utf-8"), str(source), "exec")
     return code
 
 
@@ -82,7 +82,7 @@ def test_release_bundle_passes_with_defaults(verifier, compiled, app):
 
 def test_stale_module_is_detected(verifier, compiled, app):
     stale = dict(compiled)
-    source = (ROOT / "nd2wsi/__init__.py").read_text() + "\nSTALE_BUILD = True\n"
+    source = (ROOT / "nd2wsi/__init__.py").read_text(encoding="utf-8") + "\nSTALE_BUILD = True\n"
     stale["nd2wsi"] = compile(source, "<source>", "exec")
     with pytest.raises(AssertionError, match=r"stale packaged module: nd2wsi$"):
         check(verifier, FakeArchive(stale), app, release_info())
@@ -160,7 +160,7 @@ def test_cli_defaults_verify_the_release_bundle_and_write_the_report(
     output = app.parent / "packaged-source.json"
     verifier.main(["--app", str(app), "--output", str(output)])
     assert opened == [(app, "nd2wsi-viewer")]
-    report = json.loads(output.read_text())
+    report = json.loads(output.read_text(encoding="utf-8"))
     assert list(report) == ["ok", "version", "python_modules", "static_assets", "comparison"]
     assert report["ok"] is True and report["version"] == VERSION
     assert json.loads(capsys.readouterr().out) == {
@@ -195,11 +195,11 @@ def test_cli_beta_parameters_match_the_legacy_astromap_bundle(verifier, compiled
         argv += ["--require-module", module]
     verifier.main(argv)
     assert opened[-1] == name
-    assert json.loads(output.read_text())["version"] == "2.4.0b1"
+    assert json.loads(output.read_text(encoding="utf-8"))["version"] == "2.4.0b1"
 
 
 def test_legacy_astromap_recipe_calls_the_shared_verifier():
-    text = (ROOT / "packaging/legacy/build_astromap_beta.sh").read_text()
+    text = (ROOT / "packaging/legacy/build_astromap_beta.sh").read_text(encoding="utf-8")
     assert "CArchiveReader" not in text
     assert '"$REPO/scripts/verify_packaged_source.py"' in text
     assert '--output "$STAGE/packaged-source.json"' in text
@@ -217,7 +217,7 @@ def test_legacy_astromap_recipe_calls_the_shared_verifier():
 ])
 def test_legacy_plist_heredoc_takes_the_version_from_argv(tmp_path, builder, name, version, short):
     """Execute only the pure plist writer of each frozen recipe, never the build."""
-    text = (ROOT / "packaging/legacy" / builder).read_text()
+    text = (ROOT / "packaging/legacy" / builder).read_text(encoding="utf-8")
     assert f'VERSION="{version}"' in text, "one VERSION variable at the top"
     assert f"'{version}'" not in text and f'"{version}"' not in text.replace(f'VERSION="{version}"', "")
     source = text.split('"$APP/Contents/Info.plist"', 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
