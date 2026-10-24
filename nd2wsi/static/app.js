@@ -251,6 +251,7 @@ async function init() {
   buildChannelPanel();
   buildLevelLamps();
   buildViewer();
+  wireAnnotationPointer();
   wireAstromapKeys();
   wireShellToolState();
   buildPlate();
@@ -677,7 +678,7 @@ function buildViewer() {
     scheduleViewportState();
   });
   viewer.addHandler("update-viewport", () => {
-    renderAnnotations();
+    refreshAnnotationsForViewport();
     moveRoiOverlay();
     updateScalebar(state.plate && state.plate.focus === null ? plateCellZoom() : null);
     scheduleViewportState();
@@ -2572,7 +2573,9 @@ function svgEl(tag, attrs, parent) {
 }
 
 function chip(parent, x, y, text, id) {
-  const g = svgEl("g", { class: id ? "hit" : "" }, parent);
+  // An annotation's own label opens it through wireAnnotationPointer(); the
+  // live ruler's label has no id and stays inert.
+  const g = svgEl("g", id ? { class: "hit", "data-ann-id": id } : { class: "" }, parent);
   const t = svgEl("text", {
     x: x + 7, y: y + 12.5,
     fill: "rgba(255,255,255,0.9)",
@@ -2589,19 +2592,115 @@ function chip(parent, x, y, text, id) {
     }),
     t
   );
-  if (id) g.addEventListener("pointerdown", (ev) => {
-    ev.stopPropagation();
-    if (state.annotations.some(a => a.id === id && a.type === "box" && a.astromap === true))
-      selectAstromapRoi(id, false);
-    openEditor(id);
-  });
   return g;
+}
+
+/* ---- annotation layer: one pointer listener and translate-only pans --------
+   renderAnnotations() draws every mark into one root group of #ann-layer and
+   remembers what it drew from. OpenSeadragon raises update-viewport on every
+   animation frame. When only the camera centre has moved since that full
+   render, the whole picture (screen-fixed labels, end ticks, pins and stroke
+   widths included) moves by one screen-space offset under any rotation or
+   flip, so refreshAnnotationsForViewport() translates the root group instead
+   of rebuilding thousands of nodes. */
+
+let annotationFrame = null; // the last full render: root group, signatures, mapping probes
+
+const ANNOTATION_PROBE_SPAN = 1024; // image px between the mapping probes
+
+// The camera inputs other than its centre.
+function annotationViewSignature() {
+  const viewport = state.viewer.viewport, size = viewport.getContainerSize();
+  return [
+    state.viewer, viewport, viewport.getZoom(true), viewport.getRotation(true),
+    viewport.getFlip(), size.x, size.y,
+  ];
+}
+
+// Everything else renderAnnotations() draws from. Annotation edits go through
+// annotationsChanged(), which bumps annRevision; the identities catch replaced
+// arrays and each new live-ruler position.
+function annotationContentSignature() {
+  const landmark = state.landmark;
+  return [
+    state.annotations, state.annotations.length, state.annRevision, state.annContext,
+    state.annSite, state.astromap?.activeId, state.editingId, state.tempLine,
+    landmark.points, landmark.points.length, landmark.pointRevision,
+    state.plate?.focus, state.info, pixelSize(),
+  ];
+}
+
+// Where image (0, 0) lands, and the element-space image axes. A pure pan moves
+// the origin and leaves the axes unchanged up to float rounding.
+function annotationMapping() {
+  const span = ANNOTATION_PROBE_SPAN;
+  const origin = toEl(0, 0), ex = toEl(span, 0), ey = toEl(0, span);
+  return {
+    origin: { x: origin.x, y: origin.y },
+    axes: [ex.x - origin.x, ex.y - origin.y, ey.x - origin.x, ey.y - origin.y],
+  };
+}
+
+function rememberAnnotationFrame(root) {
+  annotationFrame = {
+    root, view: annotationViewSignature(), content: annotationContentSignature(),
+    ...annotationMapping(), transform: "",
+  };
+}
+
+function sameAnnotationSignature(a, b) {
+  return a.length === b.length && a.every((value, i) => value === b[i]);
+}
+
+// For the update-viewport handler only; every other caller changed what is
+// drawn and calls renderAnnotations() for a full render.
+function refreshAnnotationsForViewport() {
+  const frame = annotationFrame;
+  if (!frame || !state.viewer || frame.root.parentNode !== $("ann-layer") ||
+      !sameAnnotationSignature(frame.view, annotationViewSignature()) ||
+      !sameAnnotationSignature(frame.content, annotationContentSignature())) {
+    renderAnnotations();
+    return;
+  }
+  const { origin, axes } = annotationMapping();
+  const dx = origin.x - frame.origin.x, dy = origin.y - frame.origin.y;
+  const scale = Math.max(Math.hypot(frame.axes[0], frame.axes[1]), Math.hypot(frame.axes[2], frame.axes[3]));
+  // Rounding-level differences only; anything larger is not a pure pan.
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) ||
+      axes.some((value, i) => !(Math.abs(value - frame.axes[i]) <= scale * 1e-9))) {
+    renderAnnotations();
+    return;
+  }
+  const transform = `translate(${dx} ${dy})`;
+  if (transform === frame.transform) return;
+  frame.root.setAttribute("transform", transform);
+  frame.transform = transform;
+}
+
+// One pointerdown listener serves every annotation mark. Box, pin and GeoJSON
+// shapes and their labels carry data-ann-id; the layer itself takes no pointer
+// events (style.css), so presses on empty space, landmarks, measurement lines
+// and the live ruler fall through to OpenSeadragon.
+function wireAnnotationPointer() {
+  const layer = $("ann-layer");
+  layer.addEventListener("pointerdown", (ev) => {
+    const hit = ev.target?.closest?.("[data-ann-id]");
+    if (!hit || !layer.contains(hit)) return;
+    ev.stopPropagation();
+    const id = hit.getAttribute("data-ann-id");
+    const a = state.annotations.find((item) => String(item.id) === id);
+    if (!a) return;
+    if (a.type === "box" && a.astromap === true) selectAstromapRoi(a.id, false);
+    openEditor(a.id);
+  });
 }
 
 function renderAnnotations() {
   const layer = $("ann-layer");
   if (!state.viewer) return;
   layer.replaceChildren();
+  // A fresh root carries no pan translation (refreshAnnotationsForViewport).
+  const root = svgEl("g", { "data-ann-root": "" }, layer);
   if (state.astromap && !state.annotations.some((a) => a.type === "box" && a.astromap === true && a.id === state.astromap.activeId))
     state.astromap.activeId = state.annotations.find((a) => a.type === "box" && a.astromap === true)?.id || null;
 
@@ -2609,7 +2708,7 @@ function renderAnnotations() {
     const col = annColor(a);
     const p1 = toEl(a.x1, a.y1);
     const p2 = toEl(a.x2, a.y2);
-    const g = svgEl("g", {}, layer);
+    const g = svgEl("g", {}, root);
     svgEl("line", {
       x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
       stroke: col, "stroke-width": 1.5,
@@ -2627,7 +2726,7 @@ function renderAnnotations() {
     const label = lineLengthLabel(a) + (a.text ? " · " + a.text : "");
     const mx = (p1.x + p2.x) / 2 + (-dy / len) * 14 - 20;
     const my = (p1.y + p2.y) / 2 + (dx / len) * 14 - 9;
-    chip(layer, mx, my, label, isTemp ? null : a.id);
+    chip(root, mx, my, label, isTemp ? null : a.id);
   };
 
   let astromapNumber = 0;
@@ -2641,7 +2740,7 @@ function renderAnnotations() {
       ];
       const left = Math.min(...corners.map((c) => c.x));
       const top = Math.min(...corners.map((c) => c.y));
-      const g = svgEl("g", { class: "hit" }, layer);
+      const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, root);
       const active = a.astromap === true && a.id === state.astromap.activeId;
       svgEl("polygon", {
         points: corners.map((c) => c.x + "," + c.y).join(" "),
@@ -2649,34 +2748,29 @@ function renderAnnotations() {
         stroke: a.astromap === true ? active ? "#ffd966" : "#a0a6ae" : annColor(a), "stroke-width": 1.5,
         "stroke-linejoin": "round",
       }, g);
-      g.addEventListener("pointerdown", (ev) => {
-        ev.stopPropagation();
-        if (a.astromap === true) selectAstromapRoi(a.id, false);
-        openEditor(a.id);
-      });
       const note = a.astromap === true ? astromapDisplayNote(a) : a.text;
-      chip(layer, left, top - 22, a.astromap === true
+      chip(root, left, top - 22, a.astromap === true
         ? `${astromapNumber}${note ? " · " + note : ""}` : a.text || "Box", a.id);
     } else if (a.type === "geojson") {
-      renderImportedGeoJSON(a, layer);
+      renderImportedGeoJSON(a, root);
     } else if (a.type === "pin") {
       const p = toEl(a.x, a.y);
-      const g = svgEl("g", { class: "hit" }, layer);
+      const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, root);
       svgEl("circle", { cx: p.x, cy: p.y, r: 6, fill: annColor(a), stroke: "#fff", "stroke-width": 1.5 }, g);
       svgEl("circle", { cx: p.x, cy: p.y, r: 1.8, fill: "#fff" }, g);
-      g.addEventListener("pointerdown", (ev) => { ev.stopPropagation(); openEditor(a.id); });
-      if (a.text) chip(layer, p.x + 10, p.y - 9, a.text, a.id);
+      if (a.text) chip(root, p.x + 10, p.y - 9, a.text, a.id);
     }
   }
   if (state.tempLine) drawLine({ ...state.tempLine, text: "" }, true);
-  renderLandmarks(layer);
+  renderLandmarks(root);
+  rememberAnnotationFrame(root);
 }
 
 function renderImportedGeoJSON(item, layer) {
   const api = window.Nd2AnnotationGeoJSON;
   try {
     const parts = api.displayParts(item.geojson.geometry, toEl);
-    const group = svgEl("g", { class: "hit" }, layer);
+    const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, layer);
     for (const path of parts.paths) svgEl("path", {
       d: path.d, fill: path.closed ? hexAlpha(annColor(item), .08) : "none",
       "fill-rule": "evenodd", stroke: annColor(item), "stroke-width": 1.5,
@@ -2685,7 +2779,6 @@ function renderImportedGeoJSON(item, layer) {
     for (const point of parts.points) svgEl("circle", {
       cx: point.x, cy: point.y, r: 6, fill: annColor(item), stroke: "#fff", "stroke-width": 1.5,
     }, group);
-    group.addEventListener("pointerdown", event => { event.stopPropagation(); openEditor(item.id); });
     const rect = api.bounds(item.geojson.geometry), anchor = toEl(rect.x, rect.y);
     chip(layer, anchor.x, anchor.y - 22, api.label(item), item.id);
   } catch (_) { /* Invalid legacy sidecar geometry must not break other annotations. */ }
