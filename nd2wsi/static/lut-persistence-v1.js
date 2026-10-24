@@ -9,8 +9,16 @@
   const FORMAT = "nd2wsi-lut-settings/1";
   const MAX_CHANNELS = 512;
   const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
+  // The Fetch spec lets a page keep at most 64 KiB of keepalive request bodies
+  // in flight; a larger keepalive request rejects at once. The same limit as
+  // annotation-store-v1.js, with headroom for both requests of one pagehide;
+  // a LUT body (at most 512 channels) never reaches it, the rule just stays in
+  // one shape.
+  const KEEPALIVE_BODY_LIMIT = 60 * 1024;
+  const keepaliveFits = body => new TextEncoder().encode(body).length <= KEEPALIVE_BODY_LIMIT;
 
   function createController({ info, readLuts, fetch, reportError = () => {},
+    onSaveState = () => {}, now = () => Date.now(),
     setTimeout: setTimer = setTimeout, clearTimeout: clearTimer = clearTimeout,
     transfer = defaultTransfer, endpoint = "api/lut-settings" } = {}) {
     let status = "unloaded", disposed = false;
@@ -24,6 +32,15 @@
       if (disposed || message === lastWarning) return;
       lastWarning = message;
       try { reportError(message); } catch (_) { /* A notification cannot break persistence. */ }
+    }
+
+    // Structured transitions for the pane's auto-save indicator; "idle" means
+    // nothing is pending any more (an edit returned to the saved values).
+    function emit(saveState, message) {
+      if (disposed) return;
+      const event = { channel: "lut", state: saveState, at: now() };
+      if (message) event.message = String(message);
+      try { onSaveState(event); } catch (_) { /* An indicator cannot break persistence. */ }
     }
 
     function metadata() {
@@ -99,6 +116,8 @@
             savedRevision = revision;
             cancelTimer();
             if (typeof payload.warning === "string" && payload.warning) warn(payload.warning);
+            emit("unavailable", typeof payload.warning === "string" && payload.warning
+              ? payload.warning : "LUT settings are not saved for this source.");
             return null;
           }
           metadata();
@@ -144,17 +163,26 @@
         pendingError = error;
         cancelTimer();
         warn("LUT changes are not saved. " + error.message);
+        // unsaved, but not a transient failure: nothing retries it until the
+        // next valid edit, so the indicator shows it as pending, not failed
+        emit("dirty", error.message);
         return;
       }
-      if (body === pendingBody && !pendingError) { schedule(); return; }
+      if (body === pendingBody && !pendingError) {
+        schedule();
+        emit(dirty() ? "dirty" : "idle");
+        return;
+      }
       revision++;
       pendingBody = body;
       pendingError = null;
       if (!saving && body === lastSavedBody) savedRevision = revision;
       schedule();
+      emit(dirty() ? "dirty" : "idle");
     }
 
-    async function saveLatest() {
+    async function saveLatest({ keepalive = false } = {}) {
+      let posted = false;
       try {
         if (status !== "ready") await load();
         if (status === "unavailable") return;
@@ -163,30 +191,39 @@
           if (pendingError) throw pendingError;
           const body = pendingBody, writingRevision = revision;
           if (body !== lastSavedBody) {
-            await responseJson(await fetch(endpoint, { method: "POST", cache: "no-store",
-              headers: { "Content-Type": "application/json" }, body }));
+            emit("saving");
+            const init = { method: "POST", cache: "no-store",
+              headers: { "Content-Type": "application/json" }, body };
+            // pagehide: the browser keeps the request alive after the page is
+            // gone, for a body within the keepalive budget
+            if (keepalive && keepaliveFits(body)) init.keepalive = true;
+            await responseJson(await fetch(endpoint, init));
             lastSavedBody = body;
+            posted = true;
           }
           savedRevision = writingRevision;
           lastWarning = null;
+          if (posted) emit("saved");
           // A completed older request never clears a newer dirty snapshot.
         }
         if (dirty()) throw new Error("LUT changes remain unsaved after the controller was disposed.");
+        if (!posted) emit("idle"); // the pending edit matched the saved values
       } catch (error) {
         warn("LUT changes are not saved. " + error.message);
+        emit(error === pendingError ? "dirty" : "failed", error.message);
         throw error;
       }
     }
 
-    function flush() {
+    function flush(options = {}) {
       cancelTimer();
       if (!dirty() || status === "unavailable") return Promise.resolve();
       if (disposed) return Promise.reject(new Error("LUT changes remain unsaved after the controller was disposed."));
       if (!saving) {
-        saving = saveLatest().then(value => { saving = null; return value; },
+        saving = saveLatest(options).then(value => { saving = null; return value; },
           error => { saving = null; throw error; });
       }
-      return saving.then(() => dirty() ? flush() : undefined);
+      return saving.then(() => dirty() ? flush(options) : undefined);
     }
 
     function dispose() {
@@ -194,8 +231,12 @@
       cancelTimer();
     }
 
-    return { load, changed, flush, dispose };
+    // Read-only views for the pane's periodic retry and pagehide flush: a
+    // validation failure (pendingError) is not retried, only a new edit is.
+    const isDirty = () => !disposed && status !== "unavailable" && dirty() && !pendingError;
+
+    return { load, changed, flush, dispose, isDirty, status: () => status };
   }
 
-  return { createController, FORMAT };
+  return { createController, FORMAT, KEEPALIVE_BODY_LIMIT };
 });
