@@ -433,6 +433,24 @@ def display_params(
 # --------------------------------------------------------------------------
 
 
+def _read_channel_region(
+    root: Any, level_path: str, ci: int, x: int, y: int, w: int, h: int
+) -> np.ndarray:
+    """(h, w) region of channel ``ci`` from one pyramid level, clipped to bounds.
+
+    Equal to ``_read_region(...)[ci]`` but asks the level for that channel
+    alone, so a per-plane caller fetches (and, for reduced or corrected
+    levels, decodes or recomputes) each channel once instead of all of them.
+    """
+    arr = root[level_path]
+    _, H, W = arr.shape
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + w), min(H, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return np.zeros((0, 0), dtype=arr.dtype)
+    return np.asarray(arr[ci, y0:y1, x0:x1])
+
+
 def _roi_tile_iter(
     root: Any,
     level_path: str,
@@ -453,7 +471,7 @@ def _roi_tile_iter(
             th = min(tile, h - ty0)
             for tx0 in range(0, w, tile):
                 tw = min(tile, w - tx0)
-                block = _read_region(root, level_path, x + tx0, y + ty0, tw, th)[ci]
+                block = _read_channel_region(root, level_path, ci, x + tx0, y + ty0, tw, th)
                 if th < tile or tw < tile:
                     pad = np.zeros((tile, tile), dtype=block.dtype)
                     pad[:th, :tw] = block
