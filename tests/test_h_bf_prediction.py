@@ -34,7 +34,7 @@ def test_bf_prediction_bound_holds_out_each_cell_and_never_reads_c(monkeypatch):
                             if all(cell is not item for item in remaining)))
         return np.full((1, 3, 25), 2.0), {}
 
-    monkeypatch.setattr(adaptive, "build_m5_adaptive_hybrid_nodes", predict)
+    monkeypatch.setattr(adaptive, "build_coupled_subcell_amplitude_nodes", predict)
     result = adaptive.calibrate_channel_prediction_bound(
         observed, (0, 0), (1, 12), np.ones(256), adaptive.DEFAULT_JUSTIFIED_CRITERIA,
     )
@@ -47,7 +47,7 @@ def test_bf_prediction_bound_holds_out_each_cell_and_never_reads_c(monkeypatch):
 
 
 def test_prediction_bound_cannot_increase_correction(monkeypatch):
-    monkeypatch.setattr(adaptive, "build_m5_adaptive_hybrid_nodes",
+    monkeypatch.setattr(adaptive, "build_coupled_subcell_amplitude_nodes",
                         lambda *a, **kw: (np.ones((1, 3, 25)), {}))
     result = adaptive.calibrate_channel_prediction_bound(
         cells(amplitude=2.0), (0, 0), (1, 12), np.ones(256), adaptive.DEFAULT_JUSTIFIED_CRITERIA,
@@ -56,7 +56,7 @@ def test_prediction_bound_cannot_increase_correction(monkeypatch):
 
 
 def test_prediction_bound_requires_enough_independent_cells(monkeypatch):
-    monkeypatch.setattr(adaptive, "build_m5_adaptive_hybrid_nodes",
+    monkeypatch.setattr(adaptive, "build_coupled_subcell_amplitude_nodes",
                         lambda *a, **kw: (np.ones((1, 3, 25)), {}))
     with pytest.raises(Unsupported, match="insufficient_BF_predictive_calibration"):
         adaptive.calibrate_channel_prediction_bound(
@@ -65,7 +65,7 @@ def test_prediction_bound_requires_enough_independent_cells(monkeypatch):
 
 
 def test_prediction_bound_honors_configured_reliability_threshold(monkeypatch):
-    monkeypatch.setattr(adaptive, "build_m5_adaptive_hybrid_nodes",
+    monkeypatch.setattr(adaptive, "build_coupled_subcell_amplitude_nodes",
                         lambda *a, **kw: pytest.fail("unreliable cells must not be used"))
     criteria = deepcopy(adaptive.DEFAULT_JUSTIFIED_CRITERIA)
     criteria["reduced_resolution_gates"]["active_band_cell_definition"]["min_raw_block_c_shape_r2"] = 0.99
@@ -74,7 +74,7 @@ def test_prediction_bound_honors_configured_reliability_threshold(monkeypatch):
 
 
 def test_prediction_bound_cancellation_precedes_refitting(monkeypatch):
-    monkeypatch.setattr(adaptive, "build_m5_adaptive_hybrid_nodes",
+    monkeypatch.setattr(adaptive, "build_coupled_subcell_amplitude_nodes",
                         lambda *a, **kw: pytest.fail("cancelled calibration must not refit"))
 
     def cancel():
@@ -124,7 +124,7 @@ def test_one_channel_candidate_rejection_keeps_other_channels_eligible(failure, 
             return original_calibration(*args, **kwargs)
         monkeypatch.setattr(adaptive, 'calibrate_channel_prediction_bound', unavailable)
     else:
-        # Inject after local bounds: an excessive preliminary M5 estimate is
+        # Inject after local bounds: an excessive preliminary coupled-node estimate is
         # now legitimately constrained before final candidate preflight.
         original = adaptive.build_local_trough_bound_nodes
         monkeypatch.setattr(adaptive, 'calibrate_channel_prediction_bound',
@@ -168,7 +168,7 @@ def test_channel_bound_uses_own_observations_and_coupling(channel, monkeypatch):
         assert names == [channel] and gammas == {channel: 1.25}
         return np.full((1, 3, 25), 2.), {}
 
-    monkeypatch.setattr(adaptive, 'build_m5_adaptive_hybrid_nodes', predict)
+    monkeypatch.setattr(adaptive, 'build_coupled_subcell_amplitude_nodes', predict)
     record = adaptive.calibrate_channel_prediction_bound(
         observed, (0, 0), (1, 12), np.ones(256), adaptive.DEFAULT_JUSTIFIED_CRITERIA,
         channel=channel, gamma=1.25,
@@ -192,7 +192,7 @@ def test_prediction_bound_withholds_immediate_spatial_neighbors(monkeypatch):
         calls.append(centre)
         return np.full((1, 9, 9), 2.), {}
 
-    monkeypatch.setattr(adaptive, 'build_m5_adaptive_hybrid_nodes', predict)
+    monkeypatch.setattr(adaptive, 'build_coupled_subcell_amplitude_nodes', predict)
     result = adaptive.calibrate_channel_prediction_bound(
         observed, (0, 0), (4, 4), np.ones(256), adaptive.DEFAULT_JUSTIFIED_CRITERIA,
     )

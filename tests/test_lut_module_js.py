@@ -66,9 +66,11 @@ def test_real_app_adapter_freezes_channels_routes_native_scroll_and_batches_shif
 def test_browser_modules_load_before_application_without_commonjs_or_dom_side_effects():
     index = (STATIC / "index.html").read_text(encoding="utf-8")
     modules = {
+        "viewer-geometry-v1.js": "Nd2ViewerGeometry",
         "lut-controls-v1.js": "Nd2LutControls",
         "frame-data-v1.js": "Nd2FrameData",
         "floating-windows-v1.js": "Nd2FloatingWindows",
+        "annotation-store-v1.js": "Nd2AnnotationStore",
     }
     for filename in modules:
         assert index.index(filename) < index.index("app.js")

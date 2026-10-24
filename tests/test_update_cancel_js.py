@@ -16,6 +16,7 @@ const fs = require('fs'), vm = require('vm');
 const root = process.argv[1], origin = 'http://qa.invalid';
 const appSource = fs.readFileSync(root + '/app.js', 'utf8');
 const shellSource = fs.readFileSync(root + '/shell-v1.js', 'utf8');
+const { createStore } = require(root + '/annotation-store-v1.js');
 function production(source, name) {
   const match = new RegExp('^(?:async )?function ' + name + '\\(', 'm').exec(source);
   if (!match) throw Error('Missing production function: ' + name);
@@ -117,14 +118,25 @@ for (const sid of ['a', 'b']) {
       else finish();
     }),
   });
-  for (const name of ['debounce', 'annotationsChanged', 'normalizeAnnotationSite',
+  // The production wrappers delegate to the real annotation store, built on
+  // this pane's state with the harness's fetch, timers and elements.
+  context.annotationStore = createStore({
+    state, fetch:(url, options) => context.fetch(url, options),
+    setTimer:setTimeout, clearTimer:clearTimeout,
+    isLocked:() => context.annLocked(), activeFrame:() => null,
+    onStatus:message => statuses.push(message),
+    onRender() { context.renderAnnotations(); context.rebuildAnnList(); },
+    onEditorReset() { element('ann-editor').hidden = true; },
+    onRecoveryNotice:() => context.updateAnnotationRecoveryNotice(),
+  });
+  for (const name of ['scheduleAnnSave', 'annotationsChanged', 'normalizeAnnotationSite',
     'annotationsUrl', 'annotationSaveEntry', 'annotationRecoveryDrafts', 'annotationDraftAccepted',
     'acceptAnnotationRecoveryDrafts', 'updateAnnotationRecoveryNotice', 'queueAnnotationSave', 'saveAnnotations',
     'flushAnnotationsForUpdate', 'acknowledgeUpdatePreparation', 'cancelUpdatePreparation',
     'closeEditor', 'wireCompareRelay']) {
     vm.runInContext(production(appSource, name), context);
   }
-  vm.runInContext('const scheduleAnnSave = debounce(saveAnnotations, 800); wireCompareRelay();', context);
+  vm.runInContext('wireCompareRelay();', context);
   pane.api = context;
   pane.acceptDrafts = () => context.acceptAnnotationRecoveryDrafts();
   pane.edit = text => {

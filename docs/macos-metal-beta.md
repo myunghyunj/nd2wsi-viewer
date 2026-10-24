@@ -129,9 +129,10 @@ PYTHONPATH=. .venv/bin/python scripts/benchmark_metal_pyramid.py \
   --source /absolute/path/to/scan.nd2 --output /absolute/new/benchmark-directory
 ```
 
-Packaging additionally needs PyInstaller 6.22.2 and hooks 2026.7. Run
-`packaging/build_metal_beta.sh` with a new absolute output directory and
-`ND2WSI_SMOKE_FILE` set to a copied public example. No step publishes a release.
+Packaging additionally needs PyInstaller 6.22.2 and hooks 2026.7. Run the
+frozen historical recipe `packaging/legacy/build_metal_beta.sh` with a new
+absolute output directory and `ND2WSI_SMOKE_FILE` set to a copied public
+example. No step publishes a release.
 
 ## Sources
 

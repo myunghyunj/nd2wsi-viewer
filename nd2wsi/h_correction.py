@@ -356,7 +356,7 @@ def _prepare_bffree_inputs(state, directory, mapping, read_native, check, progre
         raise
 
 
-class HCorrectionController:
+class ShadingCorrectionController:
     """One asynchronous, source-bound cache transaction for an open slide."""
 
     def __init__(self, state):

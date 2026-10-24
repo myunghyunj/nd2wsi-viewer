@@ -35,10 +35,7 @@ from scipy.optimize import minimize
 
 from . import h_model as base
 
-ADAPTIVE_SCHEMA = "H_adaptive_hybrid_subcell/1"
-POLY2_SCHEMA = "H_poly2_envelope_x/1"
-BF_COUPLED_SCHEMA = "H_bf_coupled_smooth_x/1"
-GLOBAL_X_SCHEMA = "H_vertical_supported/1"
+ADAPTIVE_SCHEMA = base.Model.ADAPTIVE_SCHEMA
 
 DEFAULT_JUSTIFIED_CRITERIA = {
     "reduced_resolution_gates": {
@@ -587,7 +584,7 @@ def compute_train_channel_coupling(
     return gammas
 
 
-def build_m5_adaptive_hybrid_nodes(
+def build_coupled_subcell_amplitude_nodes(
     cells: list[dict[str, Any]],
     names: list[str],
     origin_rc: tuple[int, int],
@@ -597,6 +594,13 @@ def build_m5_adaptive_hybrid_nodes(
     sigma_nodes: float = 0.75,
     check=lambda: None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    """Per-channel amplitude node lattices from A/B sub-cell observations, coupled to BF.
+
+    Own A/B amplitudes are fused with, and capped by, the BF amplitude scaled by the
+    channel coupling ``gamma``; the (2R+1)x(2K+1) node field is then damped and
+    smoothed with ``sigma_nodes``.
+    Formerly build_m5_adaptive_hybrid_nodes (experiment M5).
+    """
     R, K = extent_rc
     nodes = np.zeros((len(names), 2 * R + 1, 2 * K + 1), dtype=np.float64)
 
@@ -703,7 +707,7 @@ def calibrate_channel_prediction_bound(
             abs(other["row"] - cell["row"]) > 1
             or abs(other["column"] - cell["column"]) > 1
         )]
-        predicted_nodes, _ = build_m5_adaptive_hybrid_nodes(
+        predicted_nodes, _ = build_coupled_subcell_amplitude_nodes(
             remaining, [channel], origin_rc, extent_rc, {channel: gamma},
             damping=damping, sigma_nodes=sigma_nodes, check=check,
         )
@@ -812,7 +816,7 @@ def local_trough_amplitude_cap(profile, template, check=lambda: None):
 
 def build_local_trough_bound_nodes(
     cells, names, origin_rc, extent_rc, gammas, calibrations, *,
-    templates, mapping, fit_indices, m5_nodes=None, damping=0.84,
+    templates, mapping, fit_indices, coupled_nodes=None, damping=0.84,
     sigma_nodes=0.75, check=lambda: None,
 ):
     """Restore supported local amplitudes, with local trough and missing-data bounds.
@@ -823,12 +827,12 @@ def build_local_trough_bound_nodes(
     """
     check()
     local_damping = 0.95
-    if m5_nodes is None:
-        m5_nodes, _ = build_m5_adaptive_hybrid_nodes(
+    if coupled_nodes is None:
+        coupled_nodes, _ = build_coupled_subcell_amplitude_nodes(
             cells, names, origin_rc, extent_rc, gammas,
             damping=damping, sigma_nodes=sigma_nodes, check=check,
         )
-    result = np.zeros_like(m5_nodes)
+    result = np.zeros_like(coupled_nodes)
     finite_support = finite_node_support(cells, origin_rc, extent_rc, check=check)
     metadata = {
         "schema": "local_trough_prediction_bound/1",
@@ -866,7 +870,7 @@ def build_local_trough_bound_nodes(
         if scale is None:
             metadata["channels"][name] = {"status": "unchanged_no_admitted_prediction_calibration"}
             continue
-        original = m5_nodes[channel_i]
+        original = coupled_nodes[channel_i]
         fallback = original * scale
         support = np.zeros_like(original)
 
@@ -1290,7 +1294,7 @@ def fit_adaptive_from_config(
     gammas = compute_train_channel_coupling(cells, all_names, check=check)
     damping = float(ac.get("damping", 0.84))
     sigma_nodes = float(ac.get("sigma_nodes", 0.75))
-    m5_nodes_all, _ = build_m5_adaptive_hybrid_nodes(
+    coupled_nodes_all, _ = build_coupled_subcell_amplitude_nodes(
         cells, all_names, origin_rc, extent_rc, gammas, damping=damping, sigma_nodes=sigma_nodes, check=check
     )
 
@@ -1332,7 +1336,7 @@ def fit_adaptive_from_config(
     target_nodes, local_calibration = build_local_trough_bound_nodes(
         cells, target_names, origin_rc, extent_rc, gammas, calibrations,
         templates=templates_dict, mapping=mapping, fit_indices=fit_indices,
-        m5_nodes=np.asarray([m5_nodes_all[all_names.index(n)] for n in target_names]),
+        coupled_nodes=np.asarray([coupled_nodes_all[all_names.index(n)] for n in target_names]),
         damping=damping, sigma_nodes=sigma_nodes, check=check,
     )
 
