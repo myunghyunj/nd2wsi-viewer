@@ -193,9 +193,35 @@ def test_mac_window_title_and_close_binding(monkeypatch, tmp_path):
     assert "Agent" in webview.create_window.call_args.args[0]
     assert session.id in webview.create_window.call_args.args[0]
     assert window.events.closing.handlers == [api._close_coordinator.on_closing]
+    assert window.events.closed.handlers[-1] == api._close_coordinator.cancel_preparation
     for callback in window.events.shown.handlers:
         callback()
     menu.assert_called_once_with(api, window)
+
+
+def test_windows_main_window_gets_the_same_close_guard_without_cocoa(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "platform", "win32")
+    session = create_window_session("user", tmp_path)
+    window = SimpleNamespace(events=SimpleNamespace(**{name: Event() for name in (
+        "before_load", "closed", "loaded", "shown", "closing", "initialized",
+    )}))
+    webview = SimpleNamespace(create_window=Mock(return_value=window), settings={})
+    monkeypatch.setitem(sys.modules, "webview", webview)
+    monkeypatch.setattr(app, "_wire_file_drop", Mock())
+    cocoa = Mock(side_effect=AssertionError("Cocoa must not be loaded on Windows"))
+    for name in ("_inline_traffic_lights", "_install_open_files_handler", "_install_window_menu",
+                 "_install_app_updater"):
+        monkeypatch.setattr(app, name, cocoa)
+    monkeypatch.setattr("nd2wsi.native_gestures.wire_native_trackpad_bridge", Mock())
+    api, actual = app.create_app_window(None, window_session=session)
+    assert actual is window
+    assert isinstance(api._close_coordinator, app.WindowCloseCoordinator)
+    assert api._close_coordinator.window is window
+    assert window.events.closing.handlers == [api._close_coordinator.on_closing]
+    assert window.events.closed.handlers[-1] == api._close_coordinator.cancel_preparation
+    # No Sparkle updater or AppKit menu on Windows; only the WebView2 guard.
+    assert window.events.shown.handlers == []
+    assert len(window.events.initialized.handlers) == 1
 
 
 @pytest.mark.parametrize("argv,role", [([], "user"), (["--new-window"], "user"), (["--agent-window"], "agent")])
@@ -239,6 +265,8 @@ class MainQueue:
 
 @pytest.fixture()
 def close_fixture(monkeypatch):
+    # The AppKit dispatch is chosen by platform; Windows CI runs this suite too.
+    monkeypatch.setattr(sys, "platform", "darwin")
     main = MainQueue()
     monkeypatch.setitem(sys.modules, "Foundation", SimpleNamespace(
         NSOperationQueue=SimpleNamespace(mainQueue=lambda: main),
@@ -291,6 +319,20 @@ def test_native_close_failure_preserves_window_and_recovers_editing(close_fixtur
         window.destroy.assert_not_called()
     assert "Window remains open" in api._status
     assert any("nd2wsiCancelUpdate" in call for call in calls)
+
+
+def test_mac_diagnostic_close_uses_the_close_button_action_and_the_veto(close_fixture):
+    main, calls, _, window, _, guard = close_fixture
+    # pywebview's Cocoa destroy() is NSWindow.close, which skips windowShouldClose:.
+    window.native = Mock()
+    window.native.performClose_.side_effect = lambda _sender: guard.on_closing()
+    guard.request_native_close()
+    window.native.performClose_.assert_not_called()
+    window.destroy.assert_not_called()
+    main.until(lambda: window.destroy.called and not guard._running)
+    window.native.performClose_.assert_called_once_with(None)
+    assert "nd2wsiPrepareForUpdate" in calls[0]
+    assert guard.on_closing() is True
 
 
 def test_close_missing_bridge_is_allowed_only_for_empty_bootstrap(close_fixture):

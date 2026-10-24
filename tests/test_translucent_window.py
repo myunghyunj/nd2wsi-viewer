@@ -433,10 +433,11 @@ def test_single_dropped_txt_rejects_ambiguous_reference_jpg(cocoa_api, monkeypat
     load.assert_not_called()
 
 
-def test_creation_uses_hidden_independent_window_and_waits_for_content(monkeypatch):
-    monkeypatch.setattr(sys, "platform", "darwin")
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_creation_uses_hidden_independent_window_and_waits_for_content(monkeypatch, platform):
+    monkeypatch.setattr(sys, "platform", platform)
     window = SimpleNamespace(events=SimpleNamespace(**{
-        name: Event() for name in ("shown", "closed", "before_load", "loaded")
+        name: Event() for name in ("shown", "closed", "closing", "before_load", "loaded")
     }))
     create = Mock(return_value=window)
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=create))
@@ -444,11 +445,14 @@ def test_creation_uses_hidden_independent_window_and_waits_for_content(monkeypat
                                             title="Overlay", logger=Mock(), on_closed=Mock())
     options = create.call_args.kwargs
     assert options["js_api"] is api
-    assert options["hidden"] and options["transparent"] and options["on_top"]
+    assert options["hidden"] and options["on_top"]
+    assert options["transparent"] is (platform == "darwin")
     assert options["frameless"]
     assert not options["resizable"] and not options["easy_drag"]
     assert "parent" not in options
     assert len(window.events.loaded.handlers) == 2
+    # A display-only overlay closes at once; only the viewer window has a save veto.
+    assert window.events.closing.handlers == []
 
 
 def test_parent_registry_owns_overlay_and_cleans_up_without_touching_source(store, payload, monkeypatch):
