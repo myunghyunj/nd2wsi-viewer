@@ -10,11 +10,17 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 
-from nd2wsi import render
+# Run from a checkout without relying on the editable install: on iCloud-synced
+# folders macOS can mark the venv's .pth files hidden, and Python 3.13 skips them.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nd2wsi import render  # noqa: E402
 
 
 def reference_composite(region, channels, windows, colors, rgb, gammas=None):
