@@ -1238,14 +1238,6 @@ function spaceToPx(point, st, mode) {
     : { x: point.x * st.imagePx.x, y: point.y * st.imagePx.x };
 }
 
-function widthPxToSpace(width, st, mode) {
-  return mode === "physical" ? width * st.pixelSizeUm.x : width / st.imagePx.x;
-}
-
-function widthSpaceToPx(width, st, mode) {
-  return mode === "physical" ? width / st.pixelSizeUm.x : width * st.imagePx.x;
-}
-
 function imageCenterSpace(st, mode) {
   return pxToSpace({ x: st.imagePx.x / 2, y: st.imagePx.y / 2 }, st, mode);
 }
@@ -1921,10 +1913,6 @@ function alignmentDeltaLabel() {
   const dx = pair.transform.tx - base.tx, dy = pair.transform.ty - base.ty;
   if (pair.mode === "physical") return "Δ " + formatDeltaUm(dx) + ", " + formatDeltaUm(dy);
   return "Δ " + (dx * 100).toFixed(2) + "%, " + (dy * 100).toFixed(2) + "%";
-}
-
-function movingSids() {
-  return compare.members;
 }
 
 function broadcastCompareState() {

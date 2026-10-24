@@ -641,6 +641,7 @@ def test_clear_all_removes_only_astromap_regions_with_one_revision_render_and_sa
     assert re.search(r'id="astromap-clear-all"[^>]*>Clear all</button>', pane)
     out = _run_export(r"""
 const f=fixture(),c=f.c,counts={render:0,list:0,panel:0,recovery:0,save:0,cancel:0},closed=[];
+c.annotationStore=require(path.join(path.dirname(process.argv[1]),'annotation-store-v1.js')).createStore({state:c.state});
 const manual=[{id:'manual-box',type:'box',x:1,y:2,w:3,h:4,text:'manual'},
   {id:'measurement',type:'line',x1:1,y1:2,x2:3,y2:4,text:'length'},
   {id:'pin',type:'pin',x:1,y:2,text:'landmark'}];

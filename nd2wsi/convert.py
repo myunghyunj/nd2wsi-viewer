@@ -99,11 +99,6 @@ def auto_workers(task_bytes: int | None = None) -> int:
     return min(cpu_target, memory_target, MAX_AUTO_WORKERS)
 
 
-def store_compressor() -> Any:
-    """Codec used by the default persistent storage backend."""
-    return DEFAULT_STORAGE.compressor()
-
-
 def _create_level_array(
     root: Any,
     path: str,
@@ -213,7 +208,6 @@ def _downsample_into(
     _, nh, nw = next_arr.shape
     _, pt, _ = pcs
     _, nt, _ = ncs
-    integer = np.issubdtype(dtype, np.integer)
     bw = _batch_cols(nt, pdtype.itemsize)
 
     def one_batch(ci: int, ty: int, x0: int, x1: int) -> None:
@@ -241,13 +235,12 @@ def _downsample_into(
             src[ry - sy0 :] = src[ry - sy0 - 1 : ry - sy0]
         if rx < sx1:
             src[:, rx - sx0 :] = src[:, rx - sx0 - 1 : rx - sx0]
-        h2, w2 = y1 - y0, x1 - x0
-        from .metal import reduce2x
+        h2 = y1 - y0
+        from .metal import reduce2x_or_cpu
 
-        row = reduce2x(src)
-        if row is None:
-            mean = src.reshape(h2, 2, w2, 2).mean(axis=(1, 3), dtype=np.float32)
-            row = np.rint(mean).astype(dtype) if integer else mean.astype(dtype)
+        # GPU kernel first when enabled, else the exact CPU box mean; both
+        # round to the target dtype only when it is an integer type.
+        row = reduce2x_or_cpu(src, dtype)
         for tx in range(x0 // nt, -(-x1 // nt)):
             cx0, cx1 = tx * nt - x0, min((tx + 1) * nt, nw) - x0
             if not row[:, cx0:cx1].any():  # all-zero chunk stays unwritten

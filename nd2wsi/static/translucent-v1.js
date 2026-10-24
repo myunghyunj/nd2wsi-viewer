@@ -1,9 +1,13 @@
 /* Independent tiled tracing window. Source display is a read-only snapshot. */
 (function (root, factory) {
-  const api = factory();
-  if (typeof module === "object" && module.exports) module.exports = api;
-  else { root.Nd2Translucent = api; api.boot(root); }
-})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+  if (typeof module === "object" && module.exports) {
+    module.exports = factory(require("./viewer-geometry-v1.js"));
+  } else {
+    const api = factory(root.Nd2ViewerGeometry);
+    root.Nd2Translucent = api;
+    api.boot(root);
+  }
+})(typeof globalThis !== "undefined" ? globalThis : this, function (geometry) {
   "use strict";
 
   function validateContext(value, pageUrl) {
@@ -34,17 +38,9 @@
     if (requestedGeneration && requestedGeneration !== info.generation) {
       throw new Error("The source changed. Reopen the translucent viewer.");
     }
-    const levels = info.levels.slice().reverse();
-    const suffix = context.query ? "?" + context.query : "";
-    return {
-      width: info.width, height: info.height, tileSize: info.tileSize, tileOverlap: 0,
-      minLevel: 0, maxLevel: levels.length - 1,
-      getLevelScale: level => levels[level].width / info.width,
-      getNumTiles: level => new OSD.Point(Math.ceil(levels[level].width / info.tileSize),
-        Math.ceil(levels[level].height / info.tileSize)),
-      getTileUrl: (level, x, y) => context.slide_url + "api/tile/" + levels[level].path +
-        "/" + x + "/" + y + ".jpg" + suffix,
-    };
+    // This window shows one fixed rendering, so the tile query never changes.
+    return geometry.makeTileSource({ info, OSD, baseUrl: context.slide_url,
+      query: context.query ? "?" + context.query : "" });
   }
 
   function camera(viewer) {
@@ -113,26 +109,20 @@
     const bounds = roiBounds(rect, info);
     // AstroMapper rectangles identify a location, often only a few pixels wide.
     // Re-fitting them would lose the user's tracing scale; only the center moves.
-    const viewport = viewer.viewport;
-    const point = viewport.imageToViewportCoordinates(bounds.x + bounds.width / 2,
-      bounds.y + bounds.height / 2);
-    const saved = camera(viewer);
-    restoreCamera(viewer, { center: point, zoom: saved.zoom });
+    geometry.centerOnPreservingZoom(viewer.viewport,
+      { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 });
+    viewer.forceRedraw();
     return true;
   }
 
   function roiElementPoints(viewer, rect, info, OSD) {
-    const bounds = roiBounds(rect, info), viewport = viewer.viewport;
-    // Match the main viewer's imageToViewerElementPoint: OSD includes rotation
-    // in this conversion; its horizontal display flip is applied separately.
-    return [[bounds.x, bounds.y], [bounds.x + bounds.width, bounds.y],
-      [bounds.x + bounds.width, bounds.y + bounds.height], [bounds.x, bounds.y + bounds.height]]
-      .map(([x, y]) => {
-        const point = viewport.imageToViewerElementCoordinates(new OSD.Point(x, y));
-        const px = viewport.getFlip() ? viewport.getContainerSize().x - point.x : point.x;
-        if (!Number.isFinite(px) || !Number.isFinite(point.y)) throw new Error("Invalid ROI display coordinates");
-        return { x: px, y: point.y };
-      });
+    const bounds = roiBounds(rect, info);
+    // The main viewer's projection: OSD includes rotation in this conversion;
+    // its horizontal display flip is applied separately.
+    return geometry.rectCornersToElementPoints(viewer.viewport, bounds, OSD).map(point => {
+      if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new Error("Invalid ROI display coordinates");
+      return { x: point.x, y: point.y };
+    });
   }
 
   function requireSuccess(result, message) {

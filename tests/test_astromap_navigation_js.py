@@ -62,7 +62,8 @@ const state={viewer:{viewport,world:{getItemCount:()=>1}},
   astromap:{activeId:config.keyboard ? 'previous' : null,rows:new Map()},
   windows:{astromap:{isHidden:()=>false}},landmark:{active:false},viewportRelay:{}};
 Object.assign(context,{state,renderAnnotations(){},refreshAstromapPanel(){},
-  window:{Nd2ShortcutRouter:require(root+'/shortcut-router-v1.js')},
+  window:{Nd2ShortcutRouter:require(root+'/shortcut-router-v1.js'),
+    Nd2ViewerGeometry:require(root+'/viewer-geometry-v1.js')},
   activeFrameContext:()=>({}),annotationOwnerReady:()=>true});
 for(const name of ['astromapItems','selectAstromapRoi','panToAstromapRoi','imageToViewerElementPoint',
   'navigateAstromapKey','spatialImageReady'])

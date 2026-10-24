@@ -100,6 +100,24 @@ const {
   fmtPeriodWords, fmtInt, paintPlate, plateFrameChanged,
 });
 
+// Sidecar persistence: the debounced save, the serialized save queue,
+// revision/context guards, failed-save recovery drafts and plate-site owner
+// transitions live in annotation-store-v1.js. The store keeps its fields on
+// `state` (state.ann*), so the rest of the pane reads them as before; only
+// the store writes them. DOM and rendering stay here as callbacks, and the
+// wrappers in the annotations section keep the historical function names.
+const annotationStore = window.Nd2AnnotationStore.createStore({
+  state,
+  fetch: (url, init) => fetch(url, init),
+  isLocked: () => annLocked(),
+  activeFrame: () => activeFrameParams(),
+  onStatus: (message) => setAnnStatus(message),
+  onRender: () => { renderAnnotations(); rebuildAnnList(); },
+  onScope: () => syncFrameScopedControls(),
+  onEditorReset: () => { $("ann-editor").hidden = true; },
+  onRecoveryNotice: () => updateAnnotationRecoveryNotice(),
+});
+
 let frameRequests = null;
 
 window.nd2CaptureViewState = () => window.Nd2ViewState.capture(state);
@@ -570,59 +588,26 @@ function tileQuery() {
 }
 
 function makeTileSource() {
-  const info = state.info;
-  // server levels: index 0 = full resolution; OSD wants level 0 = smallest.
-  const lv = info.levels.slice().reverse();
-  return {
-    width: info.width,
-    height: info.height,
-    tileSize: info.tileSize,
-    tileOverlap: 0,
-    minLevel: 0,
-    maxLevel: lv.length - 1,
-    getLevelScale: function (l) {
-      return lv[l].width / info.width;
-    },
-    getNumTiles: function (l) {
-      // exact integer tile counts (float drift in scale*width could otherwise
-      // request one tile past the edge on odd-sized levels)
-      return new OpenSeadragon.Point(
-        Math.ceil(lv[l].width / info.tileSize),
-        Math.ceil(lv[l].height / info.tileSize)
-      );
-    },
-    getTileUrl: function (l, x, y) {
-      // read the query at request time so a tile refresh (LUT, channel
-      // switch, frame change) picks up the current settings without a reopen
-      return "api/tile/" + lv[l].path + "/" + x + "/" + y + ".jpg" + tileQuery();
-    },
-  };
+  // tileQuery is read per tile request so a tile refresh (LUT, channel
+  // switch, frame change) picks up the current settings without a reopen
+  return window.Nd2ViewerGeometry.makeTileSource({
+    info: state.info, OSD: OpenSeadragon, query: tileQuery,
+  });
 }
 
 function flipAwareViewerElementPoint(point) {
-  const p = new OpenSeadragon.Point(Number(point.x), Number(point.y));
-  const viewport = state.viewer?.viewport;
-  if (viewport?.getFlip()) {
-    p.x = viewport.getContainerSize().x - p.x;
-  }
-  return p;
+  return window.Nd2ViewerGeometry.flipAwareElementPoint(
+    state.viewer?.viewport, point, OpenSeadragon);
 }
 
 function viewerElementToImagePoint(point) {
-  return state.viewer.viewport.viewerElementToImageCoordinates(
-    flipAwareViewerElementPoint(point)
-  );
+  return window.Nd2ViewerGeometry.viewerElementToImagePoint(
+    state.viewer.viewport, point, OpenSeadragon);
 }
 
 function imageToViewerElementPoint(point) {
-  const viewport = state.viewer.viewport;
-  const p = viewport.imageToViewerElementCoordinates(
-    new OpenSeadragon.Point(Number(point.x), Number(point.y))
-  );
-  if (viewport.getFlip()) {
-    p.x = viewport.getContainerSize().x - p.x;
-  }
-  return p;
+  return window.Nd2ViewerGeometry.imageToViewerElementPoint(
+    state.viewer.viewport, point, OpenSeadragon);
 }
 
 function buildViewer() {
@@ -1909,13 +1894,10 @@ function wireAstromapKeys() {
 }
 
 function panToAstromapRoi(item) {
-  const viewport = state.viewer.viewport;
-  const center = viewport.imageToViewportCoordinates(
-    new OpenSeadragon.Point(item.x + item.w / 2, item.y + item.h / 2));
   // Retain the displayed scale even if a previous zoom is still animating.
   // This changes only the camera center; ROI size never determines zoom.
-  viewport.zoomTo(viewport.getZoom(true), null, true);
-  viewport.panTo(center, true);
+  window.Nd2ViewerGeometry.centerOnPreservingZoom(state.viewer.viewport,
+    { x: item.x + item.w / 2, y: item.y + item.h / 2 }, OpenSeadragon);
 }
 
 function postAstromapState() {
@@ -2255,9 +2237,7 @@ function removeAnnotation(id) {
 
 function annotationsChanged() {
   if (state.quitPreparing) return;
-  state.annRevision += 1;
-  state.annDirty = true;
-  state.annAcceptedDrafts?.clear();
+  annotationStore.markDirty();
   renderAnnotations();
   rebuildAnnList();
   refreshAstromapPanel();
@@ -2265,76 +2245,43 @@ function annotationsChanged() {
   scheduleAnnSave();
 }
 
-const scheduleAnnSave = debounce(saveAnnotations, 800);
+function scheduleAnnSave() {
+  annotationStore.scheduleSave();
+}
+
+// The functions below keep their historical names and delegate to the store
+// created next to the plate controller; see annotation-store-v1.js.
 
 function normalizeAnnotationSite(site) {
-  if (
-    site === null || site === undefined ||
-    (typeof site === "string" && site.trim() === "")
-  ) return null;
-  const p = Number(site);
-  if (!Number.isInteger(p) || p < 0 || p >= state.info.plate.P) return null;
-  return p;
+  return annotationStore.normalizeSite(site);
 }
 
 function annotationsUrl(site) {
-  // a plate keeps one sidecar per site, shared across time and z; the
-  // coordinates inside are level-0 pixels of the frame, as for any slide
-  if (!state.plate) return "api/annotations";
-  const p = normalizeAnnotationSite(site === undefined ? state.annSite : site);
-  if (p === null) return null;
-  return "api/annotations?p=" + p;
+  return annotationStore.urlFor(site);
 }
 
 function annotationSaveEntry(site) {
-  const url = annotationsUrl(site);
-  if (!url) return null;
-  const payload = { items: state.annotations };
-  if (typeof state.annServerRevision === "string") {
-    payload.expected_revision = state.annServerRevision;
-  }
-  return {
-    url,
-    body: JSON.stringify(payload),
-    revision: state.annRevision,
-    context: state.annContext,
-  };
+  return annotationStore.saveEntry(site);
 }
 
 function annotationRecoveryDrafts() {
-  const entries = [...state.annFailedSaves.values()];
-  if (!entries.length || entries.some((entry) => !entry.conflict || !entry.draftPath ||
-      entry.draftBody !== entry.body)) return null;
-  if (state.annDirty) {
-    const current = annotationSaveEntry();
-    if (!current || !entries.some((entry) => entry.url === current.url &&
-        entry.draftBody === current.body)) return null;
-  }
-  return entries;
+  return annotationStore.recoveryDrafts();
 }
 
 function annotationDraftAccepted(entry) {
-  return !!(entry?.conflict && entry.draftPath && entry.draftBody === entry.body &&
-    state.annAcceptedDrafts?.get(entry.url) === entry.draftBody);
+  return annotationStore.draftAccepted(entry);
 }
 
 function acceptAnnotationRecoveryDrafts() {
   if (state.quitPreparing) return false;
   if (!$('ann-editor').hidden) closeEditor(true);
-  const entries = annotationRecoveryDrafts();
-  if (!entries) {
-    updateAnnotationRecoveryNotice();
-    return false;
-  }
-  state.annAcceptedDrafts = new Map(entries.map((entry) => [entry.url, entry.draftBody]));
-  updateAnnotationRecoveryNotice();
-  return true;
+  return annotationStore.acceptRecoveryDrafts();
 }
 
 function updateAnnotationRecoveryNotice() {
   const notice = $('ann-recovery');
   if (!notice) return;
-  const failed = [...state.annFailedSaves.values()];
+  const failed = annotationStore.failedSaves();
   notice.hidden = !failed.some((entry) => entry.conflict);
   if (notice.hidden) return;
   const entries = annotationRecoveryDrafts();
@@ -2353,120 +2300,17 @@ function updateAnnotationRecoveryNotice() {
 }
 
 function queueAnnotationSave(entry) {
-  if (!entry || !entry.url) {
-    return Promise.resolve({ ok: false, error: "choose a plate site first" });
-  }
-  const run = state.annSaveTail.then(async () => {
-    try {
-      // A newer local snapshot may have queued behind our own successful
-      // save. Advance only from this window's committed revision, never a
-      // revision reported by a conflicting writer.
-      const payload = JSON.parse(entry.body);
-      const revisions = state.annServerRevisions || (state.annServerRevisions = new Map());
-      if (typeof payload.expected_revision === "string" && revisions.has(entry.url)) {
-        payload.expected_revision = revisions.get(entry.url);
-      }
-      entry.body = JSON.stringify(payload);
-      // A previous draft cannot authorize a later failed or changed request.
-      entry.conflict = false;
-      entry.draftPath = null;
-      entry.draftBody = null;
-      const response = await fetch(entry.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: entry.body,
-      });
-      if (response.status === 409) {
-        let conflict = {};
-        try { conflict = await response.json(); } catch (_) { /* keep local draft */ }
-        entry.conflict = true;
-        entry.draftPath = typeof conflict.draft_path === "string" && !conflict.draft_error
-          ? conflict.draft_path : null;
-        entry.draftBody = entry.draftPath ? entry.body : null;
-        throw new Error("Conflict: another window changed this sidecar. Your edits remain unsaved; no overwrite or merge." +
-          (entry.draftPath ? " Recovery draft: " + entry.draftPath : " Keep this window open and export your annotations."));
-      }
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      const data = await response.json();
-      if (typeof data.revision === "string") {
-        revisions.set(entry.url, data.revision);
-        if (state.annContext === entry.context) state.annServerRevision = data.revision;
-      }
-      const failed = state.annFailedSaves.get(entry.url);
-      if (!failed || failed.revision <= entry.revision) {
-        state.annFailedSaves.delete(entry.url);
-      }
-      if (state.annContext === entry.context && state.annRevision === entry.revision) {
-        state.annDirty = false;
-      }
-      if (state.annContext === entry.context) {
-        setAnnStatus("Saved · " + basename(data.path));
-      }
-      updateAnnotationRecoveryNotice();
-      return { ok: true };
-    } catch (error) {
-      const failed = state.annFailedSaves.get(entry.url);
-      if (!failed || failed.revision <= entry.revision) {
-        state.annFailedSaves.set(entry.url, entry);
-      }
-      if (state.annContext === entry.context) {
-        state.annDirty = true;
-        setAnnStatus("Save failed: " + error.message);
-      }
-      updateAnnotationRecoveryNotice();
-      return { ok: false, error: error.message };
-    }
-  });
-  // Always resolve the tail so one failed request cannot suppress a newer
-  // captured snapshot.  Callers inspect the individual result instead.
-  state.annSaveTail = run.then(() => undefined);
-  return run;
+  return annotationStore.queueSave(entry);
 }
 
 function saveAnnotations(site) {
-  if (annLocked()) {
-    setAnnStatus("Not saved: annotation is locked in this degraded view");
-    return Promise.resolve({ ok: false, error: "annotation is locked" });
-  }
-  const entry = annotationSaveEntry(site);
-  if (!entry) {
-    setAnnStatus("Not saved: choose a plate site first");
-    return Promise.resolve({ ok: false, error: "choose a plate site first" });
-  }
-  return queueAnnotationSave(entry);
+  return annotationStore.save(site);
 }
 
 async function flushAnnotationsForUpdate() {
   if (!$('ann-editor').hidden) closeEditor(true);
   state.quitPreparing = true;
-  scheduleAnnSave.cancel();
-  await state.annSaveTail;
-
-  if (state.annDirty) {
-    const current = annotationSaveEntry();
-    const failed = current && state.annFailedSaves.get(current.url);
-    if (!failed || failed.body !== current.body || !annotationDraftAccepted(failed)) {
-      await saveAnnotations();
-    }
-  }
-  await state.annSaveTail;
-
-  // Capture every older plate site's failed snapshot too. Do not short-circuit
-  // at the first conflict, leaving another site's unsaved marks unchecked.
-  for (const entry of [...state.annFailedSaves.values()]) {
-    if (!annotationDraftAccepted(entry) && (!entry.conflict || !entry.draftPath ||
-        entry.draftBody !== entry.body)) await queueAnnotationSave(entry);
-  }
-  await state.annSaveTail;
-  if (state.annDirty || state.annFailedSaves.size) {
-    const drafts = annotationRecoveryDrafts();
-    if (!drafts || !drafts.every(annotationDraftAccepted)) {
-      updateAnnotationRecoveryNotice();
-      throw new Error(drafts
-        ? "Annotations conflict. Review the recovery notice and choose Keep recovery drafts for closing, then close again."
-        : "Some annotations are not safely preserved. Keep this window open and retry saving or export your annotations.");
-    }
-  }
+  await annotationStore.flushForUpdate();
 }
 
 async function acknowledgeUpdatePreparation(requestId) {
@@ -2504,93 +2348,7 @@ function cancelUpdatePreparation(requestId) {
 }
 
 function loadAnnotations(site) {
-  // switching sites twice in a row leaves two loads in flight; the older
-  // one must not install its items over the newer site's
-  const seq = ++state.annLoadSeq;
-  const frame = activeFrameParams();
-  const targetSite = state.plate
-    ? normalizeAnnotationSite(site === undefined ? (frame ? frame.p : null) : site)
-    : null;
-  const context = state.annContext;
-  const revision = state.annRevision;
-  const url = annotationsUrl(targetSite);
-  state.annSite = Number.isInteger(targetSite) ? targetSite : null;
-  state.annReady = false;
-  state.annPath = null;
-  state.annServerRevision = null;
-  state.annotations = [];
-  state.editingId = null;
-  $("ann-editor").hidden = true;
-  renderAnnotations();
-  rebuildAnnList();
-  syncFrameScopedControls();
-  if (!url) {
-    setAnnStatus(state.plate ? "Choose a site to view its annotations" : "");
-    return Promise.resolve();
-  }
-  const stillCurrent = () => {
-    const currentFrame = activeFrameParams();
-    return !!(
-      seq === state.annLoadSeq && context === state.annContext &&
-      (!state.plate || (currentFrame && currentFrame.p === targetSite && state.annSite === targetSite))
-    );
-  };
-  // A fast A -> B -> A transition must not GET A before the captured A save
-  // reaches disk, or the UI would reinstall the older sidecar contents.
-  return state.annSaveTail.then(() => {
-    if (!stillCurrent()) return null;
-    const failed = state.annFailedSaves.get(url);
-    if (failed) {
-      // Never replace a failed in-memory snapshot with the older sidecar on
-      // disk when the user returns to this site. The next edit, site change,
-      // or update preparation will retry this exact recovered snapshot.
-      const captured = JSON.parse(failed.body);
-      if (captured && Array.isArray(captured.items)) {
-        return { data: captured, recovered: true, conflict: !!failed.conflict, draftPath: failed.draftPath };
-      }
-    }
-    return fetch(url).then((r) => r.ok
-      ? r.json().then((data) => ({ data, recovered: false }))
-      : Promise.reject(new Error("HTTP " + r.status)));
-  })
-    .then((result) => {
-      if (result === null || !stillCurrent() || revision !== state.annRevision) return;
-      const { data: d, recovered, conflict, draftPath } = result;
-      state.annotations = Array.isArray(d.items) ? d.items : [];
-      state.annPath = recovered ? null : d.path;
-      state.annReady = true;
-      state.annDirty = recovered;
-      const rev = recovered ? d.expected_revision : d.revision;
-      state.annServerRevision = typeof rev === "string" ? rev : null;
-      const revisions = state.annServerRevisions || (state.annServerRevisions = new Map());
-      if (!recovered && typeof rev === "string") revisions.set(url, rev);
-      // a skipped legacy-sidecar import must not be silent: the server
-      // leaves a note explaining why old annotations are not shown here
-      const skipped = ((state.info && state.info.notes) || []).find((n) =>
-        n.includes("annotation sidecar")
-      );
-      setAnnStatus(
-        conflict
-          ? "Conflict: unsaved annotations recovered; no overwrite or merge." + (draftPath ? " Recovery draft: " + draftPath : " Export these annotations before closing.")
-          : recovered
-          ? "Recovered unsaved annotations · save will retry"
-          : skipped
-          ? skipped
-          : state.annotations.length
-          ? "Loaded " + state.annotations.length + " from " + basename(d.path)
-          : "Sidecar: " + basename(d.path)
-      );
-      updateAnnotationRecoveryNotice();
-      renderAnnotations();
-      rebuildAnnList();
-      syncFrameScopedControls();
-    })
-    .catch(() => {
-      if (!stillCurrent()) return;
-      state.annReady = false;
-      setAnnStatus("Could not load annotations for this site");
-      syncFrameScopedControls();
-    });
+  return annotationStore.load(site);
 }
 
 function setAnnStatus(msg) {
@@ -5261,25 +5019,14 @@ function setPlateFocus(p) {
     ? 0
     : numeric === null ? null : clamp(numeric, 0, info.P - 1);
   if (next === pl.focus) return;
-  const departingSite = state.annSite;
   // an open text edit belongs to the site being left, so it is committed
   // first. The debounced save is then called off, because it would fire
   // after the switch and write these marks into the next site's sidecar
   if (state.editingId) closeEditor(true);
-  scheduleAnnSave.cancel();
-  if (state.annDirty) {
-    if (!Number.isInteger(departingSite)) {
-      setAnnStatus("Not saved: annotation owner is unknown");
-      return;
-    }
-    saveAnnotations(departingSite);
-  }
+  if (!annotationStore.saveDeparting()) return;
   if (state.tool) setTool(state.tool); // every tool belongs to the site being left
   if (state.roi) clearRoi();
-  state.annContext += 1;
-  state.annDirty = false;
-  state.annReady = false;
-  state.annSite = null;
+  annotationStore.resetOwner();
   state.viewportRelay.contextChanging = true;
   pl.focus = next;
   refreshSpatialContext(); // invalidate old P commands before any asynchronous work

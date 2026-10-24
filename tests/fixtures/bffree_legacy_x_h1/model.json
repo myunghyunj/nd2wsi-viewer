@@ -1,0 +1,143 @@
+{
+  "schema": "BF_free_periodic_x1/1",
+  "experimental": true,
+  "production_eligible": false,
+  "uses_bf": false,
+  "BF_modified": false,
+  "DAPI_modified": false,
+  "temporal_normalization": false,
+  "config": {
+    "family": "periodic_independent",
+    "candidate_id": "periodic_independent_x_h1",
+    "parameters": {
+      "axes": [
+        "x"
+      ],
+      "period_min_px": 12.0,
+      "period_max_px": 128.0,
+      "min_repeats": 6.0,
+      "harmonics": 1,
+      "peak_ratio": 8.0,
+      "min_modulation": 0.005,
+      "frequency_tolerance": 0.1,
+      "split_correlation": 0.65,
+      "gain_min": 0.5,
+      "gain_max": 2.0,
+      "min_valid_fraction": 0.7,
+      "min_images": 5,
+      "smooth_sigma_px": 12.0,
+      "multiimage_split_rmse": 0.15
+    },
+    "downsample": 32,
+    "preparation": "actual mean of each 32x32 bin, including partial final bins",
+    "interpolation": "linear in native x on actual mean-bin centres; nearest endpoints"
+  },
+  "selected": [
+    {
+      "channel": "CY3",
+      "channel_index": 0,
+      "input_row": 0,
+      "model": "periodic_independent_x_h1",
+      "outcome": "fitted",
+      "reason": null,
+      "enabled": true,
+      "axes": [
+        {
+          "axis": "x",
+          "status": "fitted",
+          "frequency": 0.038910754121048725,
+          "period_px": 25.699836011634922,
+          "peak_ratio": 2768614.5180388824,
+          "split_frequencies": [
+            0.03890977287593892,
+            0.03891228833346584
+          ],
+          "split_peak_ratios": [
+            1544575.7116297598,
+            1131929.675088495
+          ],
+          "applied_frequency": 0.038910754121048725,
+          "split_wave_correlation": 0.9999999967246288,
+          "split_amplitude_ratio": 0.9998718257558288,
+          "positive_target_fraction": 1.0
+        }
+      ],
+      "gain_min": 0.920563363766771,
+      "gain_max": 1.0800469958777545
+    },
+    {
+      "channel": "DAPI",
+      "channel_index": 2,
+      "input_row": 1,
+      "model": null,
+      "outcome": "unchanged",
+      "reason": "weak_periodic_evidence",
+      "enabled": false,
+      "axes": [
+        {
+          "axis": "x",
+          "status": "abstained",
+          "reason": "weak_periodic_evidence"
+        }
+      ],
+      "gain_min": 1.0,
+      "gain_max": 1.0
+    },
+    {
+      "channel": "FITC",
+      "channel_index": 3,
+      "input_row": 2,
+      "model": "periodic_independent_x_h1",
+      "outcome": "fitted",
+      "reason": null,
+      "enabled": true,
+      "axes": [
+        {
+          "axis": "x",
+          "status": "fitted",
+          "frequency": 0.034246585633125874,
+          "period_px": 29.19999122577419,
+          "peak_ratio": 3113170.820793396,
+          "split_frequencies": [
+            0.034246324032000695,
+            0.03424680448903508
+          ],
+          "split_peak_ratios": [
+            383742.70037869277,
+            172750.9893605349
+          ],
+          "applied_frequency": 0.034246585633125874,
+          "split_wave_correlation": 0.9999999458340453,
+          "split_amplitude_ratio": 0.999903705450501,
+          "positive_target_fraction": 1.0
+        }
+      ],
+      "gain_min": 0.8819209680451565,
+      "gain_max": 1.1219482460688068
+    }
+  ],
+  "target_channels": [
+    "CY3",
+    "DAPI",
+    "FITC"
+  ],
+  "supported_channel_axis_count": 2,
+  "working_memory": {
+    "scope": "additional_fitting_workspace_excluding_inputs_decoder_and_process_overhead",
+    "limit_bytes": 1073741824,
+    "estimated_peak_bytes": 35151872,
+    "channel_order": "one target channel at a time",
+    "input_maps_excluded": true
+  },
+  "native_shape_yx": [
+    512,
+    16384
+  ],
+  "input_shape_cyx": [
+    3,
+    16,
+    512
+  ],
+  "abstention_policy": "independent target channels; no supported channel produces a valid disabled identity model",
+  "limitation": "Within-acquisition periodic consistency cannot distinguish illumination from repeating specimen structures; no scientific admission."
+}
