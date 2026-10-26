@@ -13,6 +13,7 @@ import json
 import math
 import secrets
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -103,6 +104,16 @@ class _LocalServer(HTTPServer):
                     connection.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
+                if sys.platform == "win32":
+                    # Windows does not wake a recv() blocked in the worker thread on
+                    # shutdown, so a stalled client would hold close() for the whole
+                    # request timeout. Closing the OS socket aborts that recv. The
+                    # handler's makefile() objects keep socket.close() from doing so,
+                    # hence the base close; the later close_request() is then a no-op.
+                    try:
+                        socket.socket.__base__.close(connection)
+                    except OSError:
+                        pass
         self.shutdown()
         self.server_close()
 

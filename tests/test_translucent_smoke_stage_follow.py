@@ -342,21 +342,23 @@ def test_one_delta_moves_the_overlay_by_delta_over_pixel_size(follow_run, mirror
 
 
 def test_heartbeats_keep_the_receiver_following_through_slow_checks(follow_run, monkeypatch):
-    # A receiver that pauses after 0.3 s without contact, and an ROI check that takes longer.
+    # A receiver that pauses after 1 s without contact, and an ROI check that takes longer.
+    # (Windows CI runners can stall a thread or a first loopback connection for a few
+    # hundred milliseconds, so the margins are generous; the packaged smoke uses 3 s.)
     monkeypatch.setattr(stage_follow, "StageFollowReceiver",
-                        functools.partial(stage_follow.StageFollowReceiver, stale_timeout=.3))
+                        functools.partial(stage_follow.StageFollowReceiver, stale_timeout=1.0))
 
     def slow(page):
         original = page.evaluate_js
 
         def evaluate_js(script):
             if script == smoke.ROI_STATE and page.follow["seq"]:
-                time.sleep(.6)
+                time.sleep(1.6)
             return original(script)
 
         page.evaluate_js = evaluate_js
 
-    run = follow_run(page_setup=slow, heartbeat_interval=.05)
+    run = follow_run(page_setup=slow, heartbeat_interval=.1)
     assert run.result["ok"] is True, run.result.get("error")
     assert run.result["heartbeats"] >= 3
 
