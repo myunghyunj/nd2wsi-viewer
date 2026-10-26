@@ -415,6 +415,7 @@ def test_verifier_exercises_the_windows_10_folder_permission_step_on_the_extract
     assert "GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])" in verifier
     assert ".Translate(" not in verifier
     assert "[System.Security.AccessControl.PropagationFlags]::InheritOnly" in verifier
+    assert "$_.AccessControlType -eq 'Deny'" in verifier and 'A deny rule blocks' in verifier
     assert "Assert-AppContainerAccess -Folder $runtimeRoot" in verifier
     for sid in ("S-1-15-2-1", "S-1-15-2-2"):
         assert sid in verifier

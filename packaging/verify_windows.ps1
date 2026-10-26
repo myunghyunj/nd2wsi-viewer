@@ -68,6 +68,12 @@ function Assert-AppContainerAccess {
     # Read the rules as SIDs: Windows cannot translate the names of these two
     # groups ('APPLICATION PACKAGE AUTHORITY\...') back to SIDs.
     $rules = @((Get-Acl -LiteralPath $Folder).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    # Windows checks deny entries first: any deny overlapping read/execute blocks the sandbox.
+    $denied = @($rules | Where-Object {
+        $_.IdentityReference.Value -in @('S-1-15-2-1', 'S-1-15-2-2') -and $_.AccessControlType -eq 'Deny' -and
+            ($_.FileSystemRights -band $needed) -ne 0
+    })
+    if ($denied.Count -gt 0) { throw 'A deny rule blocks the app-sandbox groups on the bundled WebView2 runtime folder.' }
     foreach ($sid in @('S-1-15-2-1', 'S-1-15-2-2')) {
         $match = @($rules | Where-Object {
             $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq 'Allow' -and

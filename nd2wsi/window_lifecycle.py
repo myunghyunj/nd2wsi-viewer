@@ -408,9 +408,10 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
     def approve_close(self, reason: str) -> None:
         """Let native close proceed without the save handshake.
 
-        Only for automated diagnostics: a GUI smoke that failed, or whose viewer
-        never became ready, cannot answer the save protocol and must not hang
-        on the veto. A running request is cancelled; its worker then releases
+        Only for automated diagnostics, or a window whose WebView2 never started:
+        a GUI smoke that failed, or whose viewer never became ready, cannot answer
+        the save protocol and must not hang on the veto; a page that never loaded
+        holds no unsaved work. A running request is cancelled; its worker then releases
         ownership without touching the closing browser.
         """
         with self._lock:

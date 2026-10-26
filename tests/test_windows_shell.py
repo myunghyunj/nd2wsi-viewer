@@ -856,11 +856,16 @@ def test_main_reports_a_webview2_that_failed_to_start_once_the_blank_window_clos
         return True
 
     monkeypatch.setattr("nd2wsi.webview2_runtime.watch_initialization", watch)
+    dismiss = Mock()
+    monkeypatch.setattr(app, "_dismiss_failed_webview2_window", dismiss)
     webview.start = Mock(side_effect=lambda *_args, **_kwargs: watched["record"](False, "0x8007 access denied"))
     dialog = Mock()
     monkeypatch.setattr(app, "_startup_error", dialog)
     assert app.main([]) == 4
     assert watched["window"] is window
+    # The blank window closes by itself instead of waiting for the user.
+    dismiss.assert_called_once()
+    assert dismiss.call_args.args[1] is window
     assert dialog.call_args.args[0] == ("Could not start nd2wsi-viewer: Microsoft Edge WebView2 (system runtime) "
                                         "could not start: 0x8007 access denied")
     assert dialog.call_args.kwargs["show_dialog"] is True
@@ -879,11 +884,14 @@ def test_main_smoke_reports_a_webview2_start_failure_in_its_own_report(fake_webv
     webview.start = Mock(side_effect=start)
     dialog = Mock()
     monkeypatch.setattr(app, "_startup_error", dialog)
+    dismiss = Mock()
+    monkeypatch.setattr(app, "_dismiss_failed_webview2_window", dismiss)
     path = tmp_path / "gui-smoke.json"
     assert app.main(["--gui-smoke", "--smoke-report", str(path)]) == 4
     report = json.loads(path.read_text(encoding="utf-8"))
     assert report["ok"] is False and report["error"] == "WebView2 failed to start: 0x8007 access denied"
     window.evaluate_js.assert_not_called()
+    dismiss.assert_not_called()  # the smoke closes its own window
 
 
 @pytest.mark.parametrize("kind, smoke_flag, expected_force", [("bundled", None, False), ("bundled", "1", True),
@@ -926,6 +934,7 @@ def test_a_failed_folder_permission_step_is_named_in_the_startup_error(fake_webv
     watched = {}
     monkeypatch.setattr("nd2wsi.webview2_runtime.watch_initialization",
                         lambda target, record: watched.update(record=record) or True)
+    monkeypatch.setattr(app, "_dismiss_failed_webview2_window", Mock())
     webview.start = Mock(side_effect=lambda *_args, **_kwargs: watched["record"](False, "0x80070005"))
     dialog = Mock()
     monkeypatch.setattr(app, "_startup_error", dialog)
@@ -933,3 +942,22 @@ def test_a_failed_folder_permission_step_is_named_in_the_startup_error(fake_webv
     assert dialog.call_args.args[0] == (
         "Could not start nd2wsi-viewer: Microsoft Edge WebView2 (bundled runtime) could not start: 0x80070005 "
         "(folder permission step failed: icacls exit 5: Access is denied.)")
+
+
+
+class _RunNow:
+    def __init__(self, *, target, name, daemon):
+        assert daemon is True and name == "webview2-failed-close"
+        self.target = target
+
+    def start(self):
+        self.target()
+
+
+def test_a_window_whose_webview2_never_started_closes_without_the_save_handshake(fake_webview):
+    _, window = fake_webview
+    api, _ = app.create_app_window(None)
+    app._dismiss_failed_webview2_window(api, window, spawn=_RunNow)
+    # Closed through the real WinForms veto, approved because the page never loaded.
+    assert window.is_closed
+    assert not any("nd2wsiPrepareForUpdate" in script for script in window.scripts)

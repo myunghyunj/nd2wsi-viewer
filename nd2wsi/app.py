@@ -903,6 +903,20 @@ def smoke(nd2_path: Path) -> int:
     return run(nd2_path)
 
 
+def _dismiss_failed_webview2_window(api, window, *, spawn=None) -> None:
+    """Close a window whose WebView2 never started, so its error shows at once.
+
+    The page never loaded, so the window holds no unsaved work and the close is
+    approved without the save handshake. destroy() runs on its own thread, not
+    inside the WebView2 completion callback (on the UI thread) that reported the
+    failure; pywebview marshals it back to the UI thread.
+    """
+    coordinator = getattr(api, "_close_coordinator", None)
+    if coordinator is not None:
+        coordinator.approve_close("WebView2 failed to start, so the page never loaded")
+    (spawn or threading.Thread)(target=window.destroy, name="webview2-failed-close", daemon=True).start()
+
+
 def _startup_error(message: str, *, show_dialog: bool = True) -> None:
     _dlog(message)
     print(message, file=sys.stderr)
@@ -1620,6 +1634,8 @@ def main(argv: list[str] | None = None) -> int:
                         hint = f" (folder permission step {access})" if access.startswith("failed") else ""
                         api._startup_error = (f"Microsoft Edge WebView2 ({runtime.get('kind', 'system')} runtime) "
                                               f"could not start: {detail}{hint}")
+                    if not diagnostic:
+                        _dismiss_failed_webview2_window(api, window)
 
             watch_initialization(window, webview2_started)
         if window_session is not None:

@@ -556,7 +556,8 @@ def _grant_harness(*, before=False, after=True, returncode=0, stdout="", stderr=
         state = next(states)
         if isinstance(state, Exception):
             raise state
-        return state
+        # True/False read as appcontainer_state's "allowed"/"missing".
+        return {True: "allowed", False: "missing"}.get(state, state)
 
     def run(command, **kwargs):
         calls.append((command, kwargs))
@@ -601,7 +602,7 @@ def test_the_ci_diagnostic_forces_the_grant_on_windows_11(tmp_path):
     (dict(returncode=2, stdout=""), "failed: icacls exit 2"),
     (dict(raises=FileNotFoundError("icacls.exe")), "failed: icacls.exe"),
     (dict(raises=subprocess.TimeoutExpired("icacls", 120)), "failed: Command 'icacls' timed out after 120 seconds"),
-    (dict(after=False), "failed: icacls succeeded but the folder still lacks the grant"),
+    (dict(after=False), "failed: icacls succeeded but the folder is still missing"),
     (dict(after=OSError("unreadable")), "granted (could not re-check: unreadable)"),
 ])
 def test_grant_failures_are_reported_never_raised(tmp_path, harness, expected):
@@ -675,3 +676,56 @@ def test_the_bundled_copy_on_a_mapped_network_drive_is_refused(monkeypatch):
     monkeypatch.setattr(rt, "_drive_type", lambda root: 4)
     with pytest.raises(RuntimeError, match="network folder"):
         rt.choose_runtime("auto", bundled=Path("Z:\\apps\\_internal\\webview2-runtime"), system_version=None)
+
+
+# DACL decision (pure; the Windows reader only collects these tuples) --------
+ALLOW, DENY = 0, 1
+OI_CI, INHERITED, INHERIT_ONLY = 0x3, 0x10, 0x8
+RX, GR_GE = 0x1200A9, 0xA0000000
+
+
+@pytest.mark.parametrize("aces, expected", [
+    # icacls /grant *S-1-15-2-1:(OI)(CI)(RX) *S-1-15-2-2:(OI)(CI)(RX)
+    ([(ALLOW, OI_CI, RX, 0), (ALLOW, OI_CI, RX, 1)], "allowed"),
+    # Program Files: an effective inherited (I)(RX) plus an inherit-only (I)(OI)(CI)(IO)(GR,GE) per group
+    ([(ALLOW, INHERITED, RX, 0), (ALLOW, INHERITED | OI_CI | INHERIT_ONLY, GR_GE, 0),
+      (ALLOW, INHERITED, RX, 1), (ALLOW, INHERITED | OI_CI | INHERIT_ONLY, GR_GE, 1)], "allowed"),
+    ([(ALLOW, OI_CI, RX, 0)], "missing"),  # only one group
+    ([(ALLOW, 0, RX, 0), (ALLOW, 0, RX, 1)], "missing"),  # not passed on to the files inside
+    ([(ALLOW, OI_CI | INHERIT_ONLY, RX, 0), (ALLOW, OI_CI | INHERIT_ONLY, RX, 1)], "missing"),  # not the folder
+    ([(ALLOW, OI_CI, 0x120089, 0), (ALLOW, OI_CI, 0x120089, 1)], "missing"),  # read without execute
+    ([(ALLOW, OI_CI, 0x1F01FF, None)], "missing"),  # someone else's full control
+    # An explicit deny for a group wins over every allow, wherever it sits.
+    ([(DENY, OI_CI, RX, 0), (ALLOW, INHERITED | OI_CI, RX, 0), (ALLOW, INHERITED | OI_CI, RX, 1)], "denied"),
+    ([(ALLOW, OI_CI, RX, 0), (ALLOW, OI_CI, RX, 1), (DENY, INHERITED, 0x20, 1)], "denied"),  # execute denied
+    ([(ALLOW, OI_CI, RX, 0), (ALLOW, OI_CI, RX, 1), (DENY, 0, 0x40000, 1)], "allowed"),  # WRITE_DAC deny only
+    ([(DENY, OI_CI, RX, None), (ALLOW, OI_CI, RX, 0), (ALLOW, OI_CI, RX, 1)], "allowed"),  # another SID's deny
+])
+def test_appcontainer_decision(aces, expected):
+    assert rt.appcontainer_decision(aces) == expected
+
+
+def test_a_deny_rule_is_reported_and_never_overridden_by_a_grant(tmp_path):
+    calls = []
+    state = rt.ensure_appcontainer_access(tmp_path, build=19045, check=lambda folder: "denied",
+                                          run=lambda *args, **kwargs: calls.append(args))
+    assert state == "failed: a deny rule blocks the app-sandbox groups; the folder was left unchanged"
+    assert calls == []
+
+
+def test_appcontainer_access_reads_the_state_as_a_boolean(monkeypatch, tmp_path):
+    for state, expected in (("allowed", True), ("missing", False), ("denied", False), (None, None)):
+        monkeypatch.setattr(rt, "appcontainer_state", lambda folder, state=state: state)
+        assert rt.appcontainer_access(tmp_path) is expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows ACLs and icacls")
+def test_real_deny_rule_is_detected_and_left_in_place(tmp_path):
+    folder = tmp_path / "webview2-runtime"
+    folder.mkdir()
+    icacls = os.path.join(os.environ["SystemRoot"], "System32", "icacls.exe")
+    assert rt.ensure_appcontainer_access(folder, force=True) == "granted"
+    subprocess.run([icacls, str(folder), "/deny", "*S-1-15-2-1:(OI)(CI)(RX)", "/Q"], check=True, capture_output=True)
+    assert rt.appcontainer_state(folder) == "denied"
+    assert rt.ensure_appcontainer_access(folder, force=True).startswith("failed: a deny rule blocks")
+    assert rt.appcontainer_state(folder) == "denied"  # never removed by the app

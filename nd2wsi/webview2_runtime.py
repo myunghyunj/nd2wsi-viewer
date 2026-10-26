@@ -427,10 +427,51 @@ def _file_rights(mask: int) -> int:
     return mask
 
 
+_READ_EXECUTE_BITS = 0xA9  # FILE_READ_DATA | FILE_READ_EA | FILE_EXECUTE | FILE_READ_ATTRIBUTES
+
+
+def appcontainer_decision(aces, groups: int = len(APPCONTAINER_SIDS)) -> str:
+    """Decide from a DACL's ACEs, in order: "allowed", "missing" or "denied".
+
+    ``aces`` holds ``(ace_type, flags, mask, group)``; ``group`` is the index of the
+    matching AppContainer SID or None. An explicit deny that overlaps read or
+    execute for either group wins over any allow (Windows checks access-denied
+    entries first), so it is reported, never papered over by adding a grant.
+    Allowed needs, per group, some allow ACE that gives read/execute on the folder
+    itself (not inherit-only) and some that passes it on (OI|CI); icacls
+    (OI)(CI)(RX) is one ACE doing both, while an inherited grant under Program
+    Files is split into an effective and an inherit-only ACE.
+    """
+    applies, inherits = set(), set()
+    for ace_type, flags, mask, group in aces:
+        if group is None:
+            continue
+        rights = _file_rights(mask)
+        if ace_type == 1 and rights & _READ_EXECUTE_BITS:  # ACCESS_DENIED_ACE
+            return "denied"
+        if ace_type != 0 or rights & _READ_EXECUTE != _READ_EXECUTE:  # ACCESS_ALLOWED_ACE only
+            continue
+        if not flags & _INHERIT_ONLY:
+            applies.add(group)
+        if flags & _INHERITABLE == _INHERITABLE:
+            inherits.add(group)
+    everyone = set(range(groups))
+    return "allowed" if applies == everyone and inherits == everyone else "missing"
+
+
 def appcontainer_access(folder) -> bool | None:
-    """Whether both AppContainer groups hold inheritable read/execute on ``folder``.
+    """Whether both AppContainer groups can read the folder and what it holds.
 
     None off Windows. Raises OSError when the folder's DACL cannot be read.
+    """
+    state = appcontainer_state(folder)
+    return None if state is None else state == "allowed"
+
+
+def appcontainer_state(folder) -> str | None:
+    """``appcontainer_decision`` for ``folder``'s DACL; None off Windows.
+
+    Raises OSError when the folder's DACL cannot be read.
     """
     if sys.platform != "win32":
         return None
@@ -472,29 +513,20 @@ def appcontainer_access(folder) -> bool | None:
                 raise ctypes.WinError(ctypes.get_last_error())
             targets.append(sid)
         if not dacl.value:
-            return True  # a NULL DACL grants everyone full access
-        # Per group, two facts: some ACE gives read/execute on the folder itself
-        # (not inherit-only), and some ACE passes it on to files and folders
-        # (OI|CI). icacls (OI)(CI)(RX) is one ACE doing both; an inherited grant
-        # under Program Files is split into an effective and an inherit-only ACE.
-        applies, inherits = set(), set()
+            return "allowed"  # a NULL DACL grants everyone full access
+        aces = []
         for index in range(Acl.from_address(dacl.value).count):
             ace = ctypes.c_void_p()
             if not advapi.GetAce(dacl, index, ctypes.byref(ace)):
                 continue
             header = AceHeader.from_address(ace.value)
-            if header.type != 0:  # ACCESS_ALLOWED_ACE: header, access mask, then the SID
+            if header.type not in (0, 1):  # ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE: header, mask, SID
                 continue
-            if _file_rights(wintypes.DWORD.from_address(ace.value + 4).value) & _READ_EXECUTE != _READ_EXECUTE:
-                continue
-            for position, target in enumerate(targets):
-                if advapi.EqualSid(ctypes.c_void_p(ace.value + 8), target):
-                    if not header.flags & _INHERIT_ONLY:
-                        applies.add(position)
-                    if header.flags & _INHERITABLE == _INHERITABLE:
-                        inherits.add(position)
-        everyone = set(range(len(targets)))
-        return applies == everyone and inherits == everyone
+            mask = wintypes.DWORD.from_address(ace.value + 4).value
+            group = next((position for position, target in enumerate(targets)
+                          if advapi.EqualSid(ctypes.c_void_p(ace.value + 8), target)), None)
+            aces.append((header.type, header.flags, mask, group))
+        return appcontainer_decision(aces, len(targets))
     finally:
         for sid in targets:
             kernel.LocalFree(sid)
@@ -502,21 +534,25 @@ def appcontainer_access(folder) -> bool | None:
             kernel.LocalFree(descriptor)
 
 
-def ensure_appcontainer_access(folder, *, force=False, build=None, check=appcontainer_access,
-                               run=subprocess.run) -> str:
+def ensure_appcontainer_access(folder, *, force=False, build=None, check=None, run=subprocess.run) -> str:
     """Grant the AppContainer groups read/execute on ``folder`` where Windows needs it.
 
     Returns "not-needed", "present", "granted" or "failed: <reason>"; never raises.
     The grant is inheritable, so Windows applies it to the files inside. Changing
-    a folder the user extracted needs no administrator rights.
+    a folder the user extracted needs no administrator rights. ``check`` returns
+    an ``appcontainer_state`` value. A deny rule is reported and left alone.
     """
+    check = appcontainer_state if check is None else check
     if not force and not needs_appcontainer_grant(build):
         return "not-needed"
     try:
-        if check(folder):
-            return "present"
+        state = check(folder)
     except Exception:  # an unreadable DACL: the grant below reports its own error
-        pass
+        state = None
+    if state == "allowed":
+        return "present"
+    if state == "denied":
+        return "failed: a deny rule blocks the app-sandbox groups; the folder was left unchanged"
     icacls = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "icacls.exe")
     command = [icacls, str(folder), "/grant", *(f"*{sid}:(OI)(CI)(RX)" for sid in APPCONTAINER_SIDS), "/Q"]
     try:
@@ -528,8 +564,9 @@ def ensure_appcontainer_access(folder, *, force=False, build=None, check=appcont
         lines = (result.stderr or result.stdout or "").strip().splitlines()
         return f"failed: icacls exit {result.returncode}" + (f": {lines[-1].strip()}" if lines else "")
     try:
-        if check(folder) is False:
-            return "failed: icacls succeeded but the folder still lacks the grant"
+        after = check(folder)
     except Exception as exc:
         return f"granted (could not re-check: {exc})"
+    if after not in ("allowed", None):
+        return f"failed: icacls succeeded but the folder is still {after}"
     return "granted"
