@@ -124,6 +124,16 @@ button { color:inherit; font:inherit; }
 .shading-confirm-actions button:focus-visible { outline:2px solid var(--label); outline-offset:3px; }
 #shading-correction.preparing .shading-icon { animation:shading-pulse 1s ease-in-out infinite alternate; }
 #shading-status, #shading-confirm-title { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+#slacs-offer { position:fixed; right:16px; bottom:16px; z-index:160; width:min(340px,calc(100vw - 32px)); padding:16px; border:1px solid var(--hairline); border-radius:12px; color:var(--label); background:var(--control-bg); box-shadow:var(--window-shadow); backdrop-filter:blur(24px); -webkit-backdrop-filter:blur(24px); }
+#slacs-offer[hidden] { display:none; }
+#slacs-offer h2 { margin:0 0 6px; font-size:13px; font-weight:600; }
+#slacs-offer p { margin:0; color:var(--label-2); font-size:12px; line-height:1.5; }
+.slacs-offer-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; margin-top:14px; }
+.slacs-offer-actions button { min-height:30px; padding:5px 10px; border:1px solid var(--hairline); border-radius:7px; background:transparent; font-size:12px; }
+#slacs-offer-open { border-color:transparent; color:#fff; background:var(--accent); }
+.slacs-offer-actions button:disabled { opacity:.45; }
+.slacs-offer-actions button:hover:not(:disabled) { filter:brightness(1.12); }
+.slacs-offer-actions button:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
 #compare-picker { position:absolute; top:calc(100% + 6px); right:8px; z-index:180; width:min(360px,calc(100vw - 16px)); max-height:min(520px,calc(100vh - 56px)); padding:10px; overflow:auto; border:1px solid var(--hairline); border-radius:13px; color:var(--label); background:var(--control-bg); box-shadow:0 18px 46px rgba(0,0,0,.32), var(--shadow); backdrop-filter:blur(24px) saturate(165%); -webkit-backdrop-filter:blur(24px) saturate(165%); }
 #compare-picker[hidden] { display:none; }
 .compare-picker-head { display:flex; align-items:flex-start; gap:10px; padding:2px 2px 9px 4px; }

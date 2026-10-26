@@ -32,6 +32,9 @@ def make_overlay(pixels=PIXELS_YX, mirror=True):
                           "flip": False, "mirror_scan": mirror}, logger=Mock(), on_closed=Mock())
     api._window = Mock()
     api._dispatch = lambda operation: None
+    # These unit tests exercise injection and the receiver, never OS discovery.
+    api._discovery = Mock()
+    api._discovery.stop.return_value = True
     return api
 
 
@@ -101,17 +104,20 @@ class FakePage:
 
     def evaluate_js(self, script):
         self.scripts.append(script)
+        if script == smoke.SLACS_DISCOVERY_STATE:
+            return self.overlay.slacs_discovery_state()
         if script == smoke.CAMERA:
             self.poll()
             return copy.deepcopy(self.view)
         if script == smoke.STAGE_FOLLOW_STATE:
             self.poll()
             follow = self.follow
+            detected = self.overlay.slacs_discovery_state()["available"]
             return {"enabled": follow["enabled"], "pending": False, "status": follow["status"], "seq": follow["seq"],
                     "session": follow["session"], "message": follow["message"], "locked": self.locked,
                     "mirror": self.mirror, "disabled": self.disabled,
                     "pressed": "true" if follow["enabled"] else "false",
-                    "title": self.title, "visible": self.visible, "hit": self.hit}
+                    "title": self.title, "visible": self.visible and detected, "hit": self.hit and detected}
         if script == smoke.STAGE_FOLLOW_CLICK:
             self.click_follow()
             return True
@@ -141,6 +147,21 @@ def follow_run(monkeypatch):
 
     def run(*, mirror=True, mode="correct", pixels=PIXELS_YX, page_setup=None, **kwargs):
         overlay = make_overlay(pixels, mirror)
+        discovery_events = []
+
+        def stop_discovery():
+            discovery_events.append(("stop", None))
+            change_discovery({"available": False, "session_id": None, "status": "stopped"})
+            return True
+
+        overlay._discovery.stop.side_effect = stop_discovery
+        change_discovery = overlay._on_slacs_change
+
+        def record_discovery(snapshot):
+            discovery_events.append(("change", dict(snapshot)))
+            change_discovery(snapshot)
+
+        overlay._on_slacs_change = record_discovery
         page = FakePage(overlay, mirror=mirror, mode=mode)
         if page_setup is not None:
             page_setup(page)
@@ -155,11 +176,91 @@ def follow_run(monkeypatch):
         options = {"follow_timeout": 2, "settle": .1, "heartbeat_interval": .1, "expect_locked": True, **kwargs}
         result = smoke.exercise_stage_follow(overlay, page, **options)
         made.append(overlay)
-        return SimpleNamespace(result=result, overlay=overlay, page=page, roi_checks=roi_checks, posts=posts)
+        return SimpleNamespace(result=result, overlay=overlay, page=page, roi_checks=roi_checks, posts=posts,
+                               discovery_events=discovery_events)
 
     yield run
     for overlay in made:
         overlay.stop_stage_follow()
+
+
+@pytest.mark.parametrize("mode, succeeds", [("correct", True), ("frozen", False)])
+def test_smoke_injects_only_after_stopping_discovery_and_restores_on_success_or_failure(follow_run, mode, succeeds):
+    run = follow_run(mode=mode)
+    assert run.result["ok"] is succeeds
+    assert run.result["discovery"] == {
+        "source": "synthetic GUI-smoke session", "process_detection_verified": False,
+        "monitor_stopped": True, "frontend_session_verified": True, "state_restored": True,
+    }
+    prior = {"available": False, "session_id": None, "status": "waiting"}
+    assert run.discovery_events == [
+        ("stop", None),
+        ("change", {"available": True, "session_id": "gui-smoke", "status": "running"}),
+        ("change", prior),
+    ]
+    assert run.overlay.slacs_discovery_state() == prior
+    run.overlay._discovery.stop.assert_called_once_with()
+    run.overlay._discovery.start.assert_not_called()
+    assert run.overlay._stage_follow is None
+
+
+def test_a_monitor_that_does_not_stop_prevents_diagnostic_injection(follow_run):
+    def fail_stop(page):
+        page.overlay._discovery.stop.side_effect = RuntimeError("monitor did not stop")
+
+    run = follow_run(page_setup=fail_stop)
+    assert run.result["ok"] is False and "monitor did not stop" in run.result["error"]
+    assert run.discovery_events == [] and run.posts == []
+    assert run.overlay._slacs_snapshot["available"] is False
+    assert run.overlay._stage_follow is None
+
+
+def test_a_monitor_still_joining_prevents_diagnostic_injection(follow_run):
+    def keep_running(page):
+        page.overlay._discovery.stop.side_effect = None
+        page.overlay._discovery.stop.return_value = False
+
+    run = follow_run(page_setup=keep_running)
+    assert run.result["ok"] is False and "monitor did not stop before diagnostic injection" in run.result["error"]
+    assert run.discovery_events == [] and run.posts == []
+    assert run.overlay._slacs_snapshot["available"] is False
+    assert run.overlay._stage_follow is None
+
+
+def test_a_page_that_has_not_observed_the_synthetic_session_cannot_start_follow(follow_run):
+    def stale_discovery(page):
+        evaluate = page.evaluate_js
+
+        def evaluate_without_injection(script):
+            if script == smoke.SLACS_DISCOVERY_STATE:
+                return {"available": True, "session_id": "another-session", "status": "running"}
+            return evaluate(script)
+
+        page.evaluate_js = evaluate_without_injection
+
+    run = follow_run(page_setup=stale_discovery, follow_timeout=.1)
+    assert run.result["ok"] is False and "synthetic SLACS session in the overlay page" in run.result["error"]
+    assert run.result["discovery"]["frontend_session_verified"] is False
+    assert run.result["discovery"]["state_restored"] is True
+    assert run.posts == [] and smoke.STAGE_FOLLOW_CLICK not in run.page.scripts
+
+
+def test_failed_restoration_cannot_report_a_successful_diagnostic(follow_run):
+    def fail_restore(page):
+        change = page.overlay._on_slacs_change
+
+        def change_or_fail(snapshot):
+            if snapshot["available"] is not True:
+                raise RuntimeError("restore failed")
+            change(snapshot)
+
+        page.overlay._on_slacs_change = change_or_fail
+
+    run = follow_run(page_setup=fail_restore)
+    assert run.result["ok"] is False
+    assert run.result["discovery"]["state_restored"] is False
+    assert "restore failed" in run.result["discovery_cleanup_error"]
+    assert run.overlay._stage_follow is None
 
 
 # Mirror-aware display orientation --------------------------------------------
@@ -564,6 +665,7 @@ def test_smoke_expressions_drive_the_real_overlay_page_follow_path():
     body = """
       const h=followHarness({initialContext:{mirror_scan:undefined,rois:[{x:390,y:240,w:20,h:20}],roiIndex:0}});
       const m=h.mounted,button=h.element('stage-follow');
+      await m.pollSlacsDiscovery();
       // Browser behaviour the fake DOM lacks: attributes and click() on a button.
       button.getAttribute=function(name){return this.attributes[name]??null;};
       button.click=function(){if(!this.disabled)this.listeners.click({});};

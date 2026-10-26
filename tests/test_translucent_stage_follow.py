@@ -16,7 +16,37 @@ def make_overlay():
                          logger=Mock(), on_closed=Mock())
     api._window = Mock()
     api._dispatch = lambda operation: None
+    api._on_slacs_change({'available': True, 'session_id': 'test-process', 'status': 'running'})
     return api
+
+
+def test_process_detection_gates_follow_and_loss_stops_receiver():
+    api = make_overlay()
+    api._discovery = Mock()  # Drive lifecycle deterministically without enumerating this machine.
+    api._on_slacs_change({'available': False, 'session_id': None, 'status': 'not_running'})
+    assert api.slacs_discovery_state()['available'] is False
+    assert not api.start_stage_follow()['ok']
+    assert api._stage_follow is None
+    api._on_slacs_change({'available': True, 'session_id': 'process-one', 'status': 'running'})
+    first = api.start_stage_follow()
+    assert first['ok']
+    old_receiver = api._stage_follow
+    try:
+        api._on_slacs_change({'available': False, 'session_id': None, 'status': 'error'})
+        assert not old_receiver.snapshot()['enabled']
+        assert api._stage_follow is None
+        assert api.stage_follow_state()['status'] == 'paused'
+        assert not api.start_stage_follow()['ok']
+        api._on_slacs_change({'available': True, 'session_id': 'process-two', 'status': 'running'})
+        assert api._stage_follow is None  # No automatic resume, even for a new process.
+        second = api.start_stage_follow()
+        assert second['ok'] and second['session_id'] != first['session_id']
+        current = api._stage_follow
+        api._on_slacs_change({'available': True, 'session_id': 'process-three', 'status': 'running'})
+        assert api._stage_follow is None and not current.snapshot()['enabled']
+        assert api.stage_follow_state()['status'] == 'paused'
+    finally:
+        api.close_translucent()
 
 
 def test_mirror_defaults_to_opposite_surface_without_changing_stage_calibration():

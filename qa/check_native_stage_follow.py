@@ -43,10 +43,18 @@ app._dlog = lambda message: None
 api, parent = app.create_app_window(None, window_session=session)
 report = {'ok': False, 'session': session.as_dict(), 'source': str(source),
           'module': nd2wsi.__file__, 'platform': sys.platform, 'cases': [],
-          'scope': 'normalized-command receiver through real native viewport; no live ACS capture'}
+          'scope': 'synthetic process session and normalized commands through real native UI; no real discovery or ACS capture'}
 heartbeat_stop = threading.Event()
 heartbeat_thread = None
 descriptor = None
+
+class SyntheticDiscovery:
+    def __init__(self):
+        self.state = {'available': True, 'session_id': 'native-qa', 'status': 'running'}
+    def snapshot(self):
+        return dict(self.state)
+    def stop(self):
+        return True
 
 def send(route, **event):
     body = {'version': 1, 'session_id': descriptor['session_id'], **event}
@@ -83,6 +91,14 @@ def run():
         parent.load_url(url)
         wait_for(lambda: pane_eval(parent,'!!(state.info && state.annReady && state.viewer.isOpen())'),
                  timeout=45,description='ITO source image')
+        assert parent.evaluate_js("document.getElementById('slacs-offer').hidden"), 'Offer visible without detection'
+        if api._slacs_discovery is not None:
+            assert api._slacs_discovery.stop() is True
+        synthetic = SyntheticDiscovery()
+        api._slacs_discovery = synthetic
+        wait_for(lambda: parent.evaluate_js("!document.getElementById('slacs-offer').hidden"),
+                 description='synthetic process offer')
+        report['synthetic_main_offer_verified'] = True
         sid,store=next(iter(api._httpd.registry.slides.items()))
         with urllib.request.urlopen(url.rstrip('/')+'/s/'+sid+'/api/info') as response:
             info=json.load(response)
@@ -94,6 +110,32 @@ def run():
         assert result['ok'],result
         overlay=api._translucent_windows[sid]; child=overlay._window
         wait_for(lambda: child.evaluate_js('!!window.nd2Translucent?.state.ready'),description='translucent ready')
+        assert child.evaluate_js("document.getElementById('stage-follow-control').hidden"), 'Follow visible without detection'
+        overlay.slacs_discovery_state()
+        assert overlay._discovery.stop() is True
+        overlay._on_slacs_change(synthetic.snapshot())
+        wait_for(lambda: child.evaluate_js("nd2Translucent.state.slacs.session_id === 'native-qa' && !document.getElementById('stage-follow-control').hidden"),
+                 description='synthetic process overlay controls')
+        report['synthetic_overlay_visibility_verified'] = True
+        if os.environ.get('ND2WSI_SLACS_VISIBILITY_ONLY') == '1':
+            # Verify native UI/lifecycle without moving the shared mouse or keyboard.
+            assert bridge_result(child, 'nd2Translucent.startStageFollow()')
+            receiver = overlay._stage_follow
+            synthetic.state = {'available': False, 'session_id': None, 'status': 'not_running'}
+            overlay._on_slacs_change(synthetic.snapshot())
+            wait_for(lambda: child.evaluate_js("document.getElementById('stage-follow-control').hidden && !document.getElementById('stage-follow-disconnected').hidden"),
+                     description='process loss hides controls and explains stopped follow')
+            wait_for(lambda: parent.evaluate_js("document.getElementById('slacs-offer').hidden"),
+                     description='process loss hides main offer')
+            assert not receiver.snapshot()['enabled']
+            synthetic.state = {'available': True, 'session_id': 'native-qa-new', 'status': 'running'}
+            overlay._on_slacs_change(synthetic.snapshot())
+            wait_for(lambda: child.evaluate_js("nd2Translucent.state.slacs.session_id === 'native-qa-new' && !document.getElementById('stage-follow-control').hidden"),
+                     description='new synthetic process session')
+            assert not child.evaluate_js('nd2Translucent.state.follow.enabled')
+            report['synthetic_loss_and_no_auto_resume_verified'] = True
+            report['ok'] = True
+            return
         wait_for(lambda: child.evaluate_js('nd2Translucent.viewer.world.getItemAt(0).getFullyLoaded()'),
                  timeout=45,description='real ITO tiles')
         native_before=native_state(child)
@@ -161,6 +203,20 @@ def run():
         wait_for(lambda: child.evaluate_js('nd2Translucent.state.follow.status')=='paused',description='gap pause')
         assert close_enough(camera(child)['center'],oriented),'Gap moved image'
         report['gap_paused_without_pan']=True
+        old_receiver = overlay._stage_follow
+        synthetic.state = {'available': False, 'session_id': None, 'status': 'not_running'}
+        overlay._on_slacs_change(synthetic.snapshot())
+        wait_for(lambda: child.evaluate_js("document.getElementById('stage-follow-control').hidden && !document.getElementById('stage-follow-disconnected').hidden"),
+                 description='process loss hides controls and explains stopped follow')
+        wait_for(lambda: parent.evaluate_js("document.getElementById('slacs-offer').hidden"),
+                 description='process loss hides main offer')
+        assert not old_receiver.snapshot()['enabled']
+        synthetic.state = {'available': True, 'session_id': 'native-qa-new', 'status': 'running'}
+        overlay._on_slacs_change(synthetic.snapshot())
+        wait_for(lambda: child.evaluate_js("nd2Translucent.state.slacs.session_id === 'native-qa-new' && !document.getElementById('stage-follow-control').hidden"),
+                 description='new synthetic process session')
+        assert not child.evaluate_js('nd2Translucent.state.follow.enabled')
+        report['synthetic_loss_and_no_auto_resume_verified'] = True
         assert all(report[k] for k in ('roi_coordinates_unchanged','roi_screen_moved','native_frame_preserved',
                                       'opacity_preserved','render_query_preserved'))
         report['ok']=True

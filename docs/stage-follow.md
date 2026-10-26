@@ -121,9 +121,8 @@ motion handling independent of the rendering host, and adapt the receiver and
 viewport bridge to the chosen Windows host. Do not change the legacy SLACS Python
 environment to satisfy viewer dependencies.
 
-Ordinary users must not see SLACS connection controls. The current prototype's
-always-visible Follow/settings UI is therefore not the final delivery behavior.
-On Windows, discover the running SLACS program by its actual Python command line:
+Ordinary users must not see SLACS connection controls when the program is absent.
+On Windows, discovery checks the running program's actual Python command line:
 the script is `SniperCellSorterGUIv3.1.py` (a Python file, not a shortcut or a
 filename ending in `.py.`). The supplied shortcut previously identified
 `C:\Python27\Scripts\SniperCellSorterGUIv3.1.py` as its target. Detect the script
@@ -139,8 +138,20 @@ it. Loss of that process/stream must stop tracking and leave an explicit status
 in an already active connection panel; do not silently resume with stale offsets.
 The normal interface remains free of SLACS controls when no session is detected.
 
-Automatic discovery, conditional UI and integration with the replacement Windows
-renderer remain to be implemented and tested on the instrument's Windows setup.
-These requirements do not turn the current prototype into a live hardware-ready
-release. Default mirroring, locked command following and unlocked manual alignment
-remain the intended behavior after discovery.
+The main window offers the connection once for each detected process session;
+the overlay reveals Follow controls only while detection succeeds. Follow is
+opt-in. Process loss, replacement, ambiguous detection or a discovery error stops
+an active receiver; a new process does not automatically resume it. Detection
+identifies the program, not controller readiness or a validated motion stream.
+Detection uses a hidden, bounded local PowerShell/CIM process-metadata query,
+shared between viewer windows for two seconds. It checks the interpreter's
+actual script argument and identifies a session by process ID and creation
+time. It does not execute or import the legacy script. Detection is polled, so
+appearance and disappearance are not instantaneous; unavailable process
+metadata fails closed instead of guessing.
+
+The implementation has not yet been verified on the instrument's Windows setup
+or integrated into the separate replacement-renderer branch. It does not decode
+ACS traffic, verify ownership of TCP `10.0.0.100:701`, or turn this prototype into
+a live hardware-ready release. Default mirroring, locked command following and
+unlocked manual alignment remain the intended behavior after discovery.

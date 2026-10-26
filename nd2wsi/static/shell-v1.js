@@ -17,6 +17,10 @@ let quitPreparation = null;
 let quitPreparationRequestId = "";
 const quitPreparedPanes = new Map(); // sid -> most recent full preparation id
 const pairPicker = { open: false, mode: "start", replaceSid: null };
+const slacsDiscovery = {
+  snapshot: null, offeredSession: null, shownSessions: new Set(),
+  running: false, epoch: 0, timer: null, pending: null,
+};
 
 let metalOpening = false;
 window.nd2OpenActiveInMetal = async function (retry = false) {
@@ -134,6 +138,101 @@ $("translucent-toggle").onclick = () => openActiveTranslucent();
 $("info-toggle").onclick = () => panelShortcut("info");
 setShellToolsExpanded(false);
 window.addEventListener("pywebviewready", refreshShellToolButtons);
+
+function refreshSlacsOffer() {
+  const offer = $("slacs-offer");
+  const visible = !!slacsDiscovery.snapshot &&
+    slacsDiscovery.offeredSession === slacsDiscovery.snapshot.session_id;
+  offer.hidden = !visible;
+  if (!visible) return;
+  refreshShellToolButtons();
+  const cloud = $("translucent-toggle");
+  const state = compare.states.get(active);
+  const needsImage = !readyFrames.has(active) || !state?.imageReady || !state.translucentAvailable;
+  $("slacs-offer-open").disabled = cloud.disabled;
+  $("slacs-offer-message").textContent = cloud.disabled ?
+    (needsImage ?
+      "Open a fluorescence image with +, then choose Open SLACS view." : cloud.title) :
+    "Sniper Cell Sorter is running. Open a translucent view to set up stage following.";
+}
+
+function receiveSlacsDiscovery(snapshot) {
+  const session = snapshot?.available === true && snapshot.status === "running" &&
+    typeof snapshot.session_id === "string" && snapshot.session_id.trim() ? snapshot.session_id : null;
+  slacsDiscovery.snapshot = session ? { available: true, status: "running", session_id: session } : null;
+  if (!session) slacsDiscovery.offeredSession = null;
+  else if (!slacsDiscovery.shownSessions.has(session)) {
+    slacsDiscovery.shownSessions.add(session);
+    slacsDiscovery.offeredSession = session;
+  } else if (slacsDiscovery.offeredSession !== session) {
+    slacsDiscovery.offeredSession = null;
+  }
+  refreshSlacsOffer();
+}
+
+function dismissSlacsOffer() {
+  slacsDiscovery.offeredSession = null;
+  refreshSlacsOffer();
+}
+
+function openSlacsOffer() {
+  if (!slacsDiscovery.snapshot ||
+      slacsDiscovery.offeredSession !== slacsDiscovery.snapshot.session_id) return false;
+  if (!openActiveTranslucent()) {
+    refreshSlacsOffer();
+    return false;
+  }
+  dismissSlacsOffer();
+  return true;
+}
+
+function pollSlacsDiscovery(epoch) {
+  const current = () => slacsDiscovery.running && slacsDiscovery.epoch === epoch;
+  if (!current()) return Promise.resolve();
+  return new Promise(resolve => {
+    const request = { done: false, timeout: null, cancel: () => finish(null) };
+    const finish = snapshot => {
+      if (request.done) return;
+      request.done = true;
+      clearTimeout(request.timeout);
+      if (slacsDiscovery.pending === request) slacsDiscovery.pending = null;
+      if (current()) {
+        receiveSlacsDiscovery(snapshot);
+        slacsDiscovery.timer = setTimeout(() => pollSlacsDiscovery(epoch), 1000);
+      }
+      resolve();
+    };
+    slacsDiscovery.pending = request;
+    request.timeout = setTimeout(request.cancel, 3000);
+    Promise.resolve().then(() => window.pywebview?.api?.slacs_discovery_state?.())
+      .then(finish, request.cancel);
+  });
+}
+
+function startSlacsDiscovery() {
+  if (slacsDiscovery.running || typeof window.pywebview?.api?.slacs_discovery_state !== "function") return;
+  slacsDiscovery.running = true;
+  return pollSlacsDiscovery(++slacsDiscovery.epoch);
+}
+
+function stopSlacsDiscovery() {
+  slacsDiscovery.running = false;
+  slacsDiscovery.epoch++;
+  clearTimeout(slacsDiscovery.timer);
+  slacsDiscovery.timer = null;
+  slacsDiscovery.pending?.cancel();
+  receiveSlacsDiscovery(null);
+}
+
+function bindSlacsDiscovery() {
+  $("slacs-offer-open").onclick = openSlacsOffer;
+  $("slacs-offer-dismiss").onclick = dismissSlacsOffer;
+  window.addEventListener("pywebviewready", startSlacsDiscovery);
+  window.addEventListener("pageshow", startSlacsDiscovery);
+  window.addEventListener("pagehide", stopSlacsDiscovery);
+  refreshSlacsOffer();
+  startSlacsDiscovery();
+}
 
 function refreshAstromapButton() {
   const button = $("astromap-toggle");
@@ -2886,3 +2985,4 @@ window.addEventListener("message", (event) => {
 });
 
 refresh();
+bindSlacsDiscovery();

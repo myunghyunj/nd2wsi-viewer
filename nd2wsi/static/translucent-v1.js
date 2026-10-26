@@ -161,6 +161,8 @@
     const opacitySlider = doc.getElementById("overlay-opacity");
     const opacityValue = doc.getElementById("opacity-value");
     const followButton = doc.getElementById("stage-follow");
+    const followControl = doc.getElementById("stage-follow-control");
+    const followDisconnected = doc.getElementById("stage-follow-disconnected");
     const followStatus = doc.getElementById("stage-follow-status");
     const followSettings = doc.getElementById("stage-follow-settings");
     const followAngle = doc.getElementById("stage-follow-angle");
@@ -178,7 +180,9 @@
     const follow = state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
       seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "",
       alignment: { angle: 0, flipX: false, flipY: false } };
+    state.slacs = { available: false, session_id: null, status: "checking" };
     let followEpoch = 0, followTimer = null, followInFlight = false, disposed = false;
+    let discoveryTask = null, discoveryInterval = null, discoveryGeneration = 0, disconnected = "";
     let followLifecycle = Promise.resolve();
     const showStatus = message => { status.textContent = message; status.hidden = !message; };
     let opacityTask = null, opacityError = "";
@@ -305,14 +309,21 @@
     };
     const paintFollow = () => {
       if (disposed) return;
+      followControl.hidden = !state.slacs.available;
+      if (!state.slacs.available) {
+        followSettings.hidden = true;
+        doc.getElementById("stage-follow-options").setAttribute("aria-expanded", "false");
+      }
+      followDisconnected.hidden = !disconnected;
+      followDisconnected.textContent = disconnected;
       const available = typeof api.start_stage_follow === "function" && typeof api.stage_follow_state === "function" &&
         typeof api.stop_stage_follow === "function";
-      followButton.disabled = follow.pending || !state.ready || !pixelSize || !available;
+      followButton.disabled = follow.pending || !state.ready || !pixelSize || !available || !state.slacs.available;
       followButton.setAttribute("aria-pressed", String(follow.enabled));
       followButton.title = !pixelSize ? "Follow needs a calibrated image pixel size" : !available ? "Stage follow is unavailable" :
         follow.enabled ? "Stop following stage commands" : "Follow stage commands";
       followStatus.textContent = follow.pending ? "Connecting…" : follow.status === "following" ? "Following commands" :
-        follow.status === "waiting" ? "Waiting for stage" : follow.status === "paused" ? "Paused" : "Off";
+        follow.status === "waiting" ? "Waiting for motion source" : follow.status === "paused" ? "Paused" : "Program detected · not connected";
       followStatus.dataset.status = follow.status;
       followStatus.title = follow.message;
       const editable = !state.locked && !state.pending;
@@ -400,10 +411,13 @@
       followTimer = win.setTimeout(pollStageFollow, 50);
     };
     const startStageFollow = async () => {
+      if (!state.slacs.available && discoveryTask) await discoveryTask;
       if (disposed || follow.enabled || follow.pending || !state.ready || !pixelSize ||
+          !state.slacs.available ||
           typeof api.start_stage_follow !== "function" || typeof api.stage_follow_state !== "function" ||
           typeof api.stop_stage_follow !== "function") return false;
       const epoch = ++followEpoch;
+      disconnected = "";
       follow.pending = true; follow.message = ""; paintFollow();
       // Serialize native starts/stops, including a close during a pending start.
       const task = followLifecycle.catch(() => {}).then(async () => {
@@ -442,6 +456,40 @@
         if (epoch === followEpoch && !disposed) { follow.pending = false; paintLock(); }
       });
       followLifecycle = task;
+      return task;
+    };
+    const pollSlacsDiscovery = () => {
+      if (disposed) return Promise.resolve(false);
+      if (discoveryTask) return discoveryTask;
+      const generation = ++discoveryGeneration;
+      const task = (async () => {
+        let watchdog;
+        let next = { available: false, session_id: null, status: "error" };
+        try {
+          if (typeof api.slacs_discovery_state !== "function") throw new Error("Discovery unavailable");
+          const timeout = new Promise((_, reject) => {
+            watchdog = win.setTimeout(() => reject(new Error("Discovery timed out")), 3000);
+          });
+          const value = await Promise.race([Promise.resolve(api.slacs_discovery_state()), timeout]);
+          if (value?.available === true && value.status === "running" && typeof value.session_id === "string" && value.session_id) {
+            next = { available: true, session_id: value.session_id, status: String(value.status || "running") };
+          } else next.status = String(value?.status || "not_running");
+        } catch (_) { /* Fail closed if process metadata is unavailable. */ }
+        finally { if (watchdog !== undefined) win.clearTimeout(watchdog); }
+        if (disposed || generation !== discoveryGeneration) return false;
+        const previous = state.slacs;
+        state.slacs = next;
+        if (previous.available && (!next.available || next.session_id !== previous.session_id) &&
+            (follow.enabled || follow.pending)) {
+          stopStageFollow();
+          follow.status = "paused";
+          disconnected = "SLACS program stopped or changed. Follow stopped; reconnect manually.";
+        }
+        paintFollow();
+        return next.available;
+      })();
+      discoveryTask = task;
+      task.finally(() => { if (discoveryTask === task) discoveryTask = null; });
       return task;
     };
     const setStageAlignment = alignment => {
@@ -681,10 +729,14 @@
     doc.addEventListener("wheel", event => { if (event.ctrlKey || state.locked) event.preventDefault(); }, { passive: false });
     win.addEventListener("pagehide", () => {
       stopStageFollow(); disposed = true;
+      discoveryGeneration++;
+      if (discoveryInterval !== null) win.clearInterval(discoveryInterval);
       cancelGesture(); observer?.disconnect(); viewer.destroy();
     }, { once: true });
+    pollSlacsDiscovery();
+    discoveryInterval = win.setInterval(pollSlacsDiscovery, 1000);
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
-      startStageFollow, stopStageFollow, pollStageFollow, setStageAlignment, setMirrorScan };
+      startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, setStageAlignment, setMirrorScan };
   }
 
   async function boot(win) {

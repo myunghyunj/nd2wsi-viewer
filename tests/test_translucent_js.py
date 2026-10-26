@@ -58,15 +58,18 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
   const documentListeners={};
   const doc={getElementById:element,createElementNS(namespace,name){return newElement(name);},
     querySelectorAll(){return [];},addEventListener(name,cb){documentListeners[name]=cb;}};
-  const windowListeners={},timers=new Map();let timerIndex=0;
+  const windowListeners={},timers=new Map(),intervals=new Map();let timerIndex=0;
   const win={innerWidth:800,innerHeight:500,addEventListener(name,fn){windowListeners[name]=fn;},
     setTimeout(fn,delay){const id=++timerIndex;timers.set(id,{fn,delay});return id;},
-    clearTimeout(id){timers.delete(id);}};
+    clearTimeout(id){timers.delete(id);},
+    setInterval(fn,delay){const id=++timerIndex;intervals.set(id,{fn,delay});return id;},
+    clearInterval(id){intervals.delete(id);}};
   const viewer=fakeViewer();
   let osdOptions;
   const OSD=options=>{osdOptions=options;return viewer;};OSD.Point=Point;
   const nativeCalls=[];
-  const bridge={async set_translucent_locked(value){nativeCalls.push(['lock',value]);
+  const bridge={async slacs_discovery_state(){return {available:true,session_id:'test-process',status:'running'};},
+    async set_translucent_locked(value){nativeCalls.push(['lock',value]);
       return failLock?{ok:false,error:'lock unavailable'}:{ok:true,locked:value};},
     async set_translucent_opacity(value){nativeCalls.push(['opacity',value]);
       return failOpacity?{ok:false,message:'opacity unavailable'}:{ok:true,opacity:opacityResult??value};},
@@ -77,7 +80,7 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
   const mounted=api.mount({window:win,document:doc,api:bridge,OSD,context:{...context,...initialContext},
     info:{...info,...infoOverrides},importer});
   viewer.handlers.open();
-  return {mounted,viewer,element,win,nativeCalls,osdOptions,documentListeners,windowListeners,timers};
+  return {mounted,viewer,element,win,nativeCalls,osdOptions,documentListeners,windowListeners,timers,intervals};
 }
 function followHarness(options={}){
   const snapshot={enabled:true,session_id:'session-one',seq:0,displacement_um:[0,0],status:'waiting'};
@@ -498,7 +501,7 @@ def test_invalid_roi_replacement_keeps_existing_boxes_and_nonfinite_projection_i
 def test_stage_follow_is_opt_in_and_locked_commands_pan_image_and_existing_roi_together():
     result = run("""
       const rois=[{x:390,y:240,w:20,h:20}],h=followHarness({initialContext:{rois,roiIndex:0}}),m=h.mounted;
-      const initial={enabled:m.state.follow.enabled,calls:h.followCalls.slice(),timers:h.timers.size};
+      const initial={enabled:m.state.follow.enabled,calls:h.followCalls.slice(),timers:[...h.timers.values()].filter(t=>t.delay===50).length};
       await m.startStageFollow();await m.toggleLock();
       const before={camera:api.camera(h.viewer),source:JSON.stringify(m.state.rois),
         points:h.element('roi-overlay').children[0].attributes.points,opacity:m.state.opacity};
@@ -627,12 +630,86 @@ def test_stage_close_during_start_orders_native_stop_and_discards_late_session()
       let finish;const calls=[];
       const h=followHarness({bridgeOverrides:{start_stage_follow(){calls.push('start');return new Promise(resolve=>finish=resolve);},
         async stop_stage_follow(){calls.push('stop');return {ok:true};}}}),m=h.mounted;
+      await m.pollSlacsDiscovery();
       const starting=m.startStageFollow();await Promise.resolve();await Promise.resolve();
       h.windowListeners.pagehide();finish({ok:true,session_id:'late-session'});await starting;
       for(let i=0;i<10;i++)await Promise.resolve();
       return {calls,enabled:m.state.follow.enabled,timers:h.timers.size};
     """)
     assert result == {"calls": ["start", "stop"], "enabled": False, "timers": 0}
+
+
+def test_slacs_controls_follow_process_lifetime_without_auto_restart():
+    result = run("""
+      let process={available:false,session_id:null,status:'not_running'};
+      const h=followHarness({bridgeOverrides:{async slacs_discovery_state(){return {...process};}}}),m=h.mounted;
+      await m.pollSlacsDiscovery();
+      const absent={hidden:h.element('stage-follow-control').hidden,started:await m.startStageFollow()};
+      process={available:true,session_id:'one',status:'running'};await m.pollSlacsDiscovery();
+      const found={hidden:h.element('stage-follow-control').hidden,enabled:m.state.follow.enabled};
+      await m.startStageFollow();
+      process={available:false,session_id:null,status:'error'};await m.pollSlacsDiscovery();
+      for(let i=0;i<8;i++)await Promise.resolve();
+      const lost={hidden:h.element('stage-follow-control').hidden,notice:h.element('stage-follow-disconnected').textContent,
+        noticeHidden:h.element('stage-follow-disconnected').hidden,enabled:m.state.follow.enabled,calls:h.followCalls.slice()};
+      process={available:true,session_id:'two',status:'running'};await m.pollSlacsDiscovery();
+      return {absent,found,lost,again:{hidden:h.element('stage-follow-control').hidden,
+        enabled:m.state.follow.enabled,calls:h.followCalls.slice()}};
+    """)
+    assert result['absent'] == {'hidden': True, 'started': False}
+    assert result['found'] == {'hidden': False, 'enabled': False}
+    assert result['lost']['hidden'] and not result['lost']['enabled']
+    assert not result['lost']['noticeHidden'] and 'Follow stopped' in result['lost']['notice']
+    assert result['lost']['calls'].count('stop') == 1
+    assert result['again']['hidden'] is False and result['again']['enabled'] is False
+    assert result['again']['calls'].count('start') == 1
+
+
+def test_slacs_loss_during_pending_start_cancels_late_session():
+    result = run("""
+      let process={available:true,session_id:'one',status:'running'},finish;const calls=[];
+      const h=followHarness({bridgeOverrides:{async slacs_discovery_state(){return {...process};},
+        start_stage_follow(){calls.push('start');return new Promise(resolve=>finish=resolve);},
+        async stop_stage_follow(){calls.push('stop');return {ok:true};}}}),m=h.mounted;
+      await m.pollSlacsDiscovery();const starting=m.startStageFollow();
+      for(let i=0;i<4;i++)await Promise.resolve();
+      process={available:false,session_id:null,status:'not_running'};await m.pollSlacsDiscovery();
+      finish({ok:true,session_id:'late'});await starting;
+      for(let i=0;i<8;i++)await Promise.resolve();
+      return {calls,enabled:m.state.follow.enabled,hidden:h.element('stage-follow-control').hidden};
+    """)
+    assert result == {'calls': ['start', 'stop'], 'enabled': False, 'hidden': True}
+
+
+def test_slacs_invalid_or_failed_discovery_is_hidden():
+    result = run("""
+      let reply={available:true,session_id:'one',status:'error'};
+      const h=followHarness({bridgeOverrides:{async slacs_discovery_state(){return reply;}}}),m=h.mounted;
+      await m.pollSlacsDiscovery();
+      const malformed=h.element('stage-follow-control').hidden;
+      reply={available:true,session_id:'',status:'running'};await m.pollSlacsDiscovery();
+      const missingId=h.element('stage-follow-control').hidden;
+      h.windowListeners.pagehide();
+      return {malformed,missingId,intervals:h.intervals.size};
+    """)
+    assert result == {'malformed': True, 'missingId': True, 'intervals': 0}
+
+
+def test_slacs_discovery_timeout_hides_controls_and_ignores_late_reply():
+    result = run("""
+      let reply,calls=0;
+      const h=followHarness({bridgeOverrides:{slacs_discovery_state(){
+        calls++;return calls===1?new Promise(resolve=>reply=resolve):
+          Promise.resolve({available:true,session_id:'new',status:'running'});}}}),m=h.mounted;
+      const first=m.pollSlacsDiscovery();
+      [...h.timers.values()].find(timer=>timer.delay===3000).fn();await first;
+      const hiddenAfterTimeout=h.element('stage-follow-control').hidden;
+      await m.pollSlacsDiscovery();
+      reply({available:true,session_id:'old',status:'running'});
+      for(let i=0;i<5;i++)await Promise.resolve();
+      return {hiddenAfterTimeout,session:m.state.slacs.session_id,hidden:h.element('stage-follow-control').hidden,calls};
+    """)
+    assert result == {'hiddenAfterTimeout': True, 'session': 'new', 'hidden': False, 'calls': 2}
 
 
 @pytest.mark.parametrize("failure", ["session", "rejection", "watchdog"])

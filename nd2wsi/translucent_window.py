@@ -183,6 +183,43 @@ class TranslucentApi:
         self._epoch = 0
         self._lock = threading.RLock()
         self._stage_follow = None
+        self._stage_follow_session = None
+        self._stage_follow_lost = ""
+        self._slacs_snapshot = {"available": False, "session_id": None, "status": "waiting"}
+        self._discovery = None
+
+    def _ensure_slacs_discovery(self):
+        from .slacs_discovery import SlacsDiscovery
+
+        with self._lock:
+            if not self._closed and self._discovery is None:
+                self._discovery = SlacsDiscovery(on_change=self._on_slacs_change)
+                self._slacs_snapshot = self._discovery.snapshot()
+            return self._discovery
+
+    def _on_slacs_change(self, snapshot):
+        """Stop an active receiver as soon as its detected process is lost or replaced."""
+        receiver = None
+        with self._lock:
+            if self._closed:
+                return
+            available = (snapshot.get("available") is True and snapshot.get("status") == "running"
+                         and isinstance(snapshot.get("session_id"), str) and bool(snapshot["session_id"]))
+            session = snapshot.get("session_id") if available else None
+            self._slacs_snapshot = {"available": available, "session_id": session,
+                                    "status": snapshot.get("status", "unavailable")}
+            if self._stage_follow is not None and session != self._stage_follow_session:
+                receiver, self._stage_follow = self._stage_follow, None
+                self._stage_follow_session = None
+                self._stage_follow_lost = "SLACS program stopped or changed. Follow stopped; reconnect manually."
+        if receiver is not None:
+            receiver.close()
+
+    def slacs_discovery_state(self):
+        """Report program detection; this does not establish a motion connection."""
+        self._ensure_slacs_discovery()
+        with self._lock:
+            return dict(self._slacs_snapshot)
 
     def translucent_context(self):
         with self._lock:
@@ -195,6 +232,8 @@ class TranslucentApi:
         with self._lock:
             if self._closed:
                 return {"ok": False, "message": "This translucent viewer is closed."}
+            if not self._slacs_snapshot["available"]:
+                return {"ok": False, "message": "The SLACS program is not running or cannot be detected."}
             pixels = self._context.get("pixel_size_um")
             if (not isinstance(pixels, (list, tuple)) or len(pixels) != 2
                     or any(isinstance(v, bool) or not isinstance(v, (float, int))
@@ -208,6 +247,8 @@ class TranslucentApi:
                     receiver.close()
                     return {"ok": False, "message": "Could not start the local motion receiver: " + str(exc)}
                 self._stage_follow = receiver
+                self._stage_follow_session = self._slacs_snapshot["session_id"]
+                self._stage_follow_lost = ""
             else:
                 descriptor = self._stage_follow.start()
             return {"ok": True, **descriptor}
@@ -216,12 +257,16 @@ class TranslucentApi:
         with self._lock:
             receiver = self._stage_follow
             if self._closed or receiver is None:
+                if not self._closed and self._stage_follow_lost:
+                    return {"enabled": False, "status": "paused", "message": self._stage_follow_lost}
                 return {"enabled": False, "status": "off", "message": "Stage follow is off."}
             return receiver.snapshot()
 
     def stop_stage_follow(self):
         with self._lock:
             receiver, self._stage_follow = self._stage_follow, None
+            self._stage_follow_session = None
+            self._stage_follow_lost = ""
         if receiver is not None:
             receiver.close()
         return {"ok": True}
@@ -581,6 +626,8 @@ class TranslucentApi:
             self._closed = True
             self._epoch += 1
         self.stop_stage_follow()
+        if self._discovery is not None:
+            self._discovery.stop()
         if self._window is not None:
             self._window.destroy()
         self._on_closed(self)
@@ -591,6 +638,8 @@ class TranslucentApi:
             self._closed = True
             self._epoch += 1
         self.stop_stage_follow()
+        if self._discovery is not None:
+            self._discovery.stop()
         self._on_closed(self)
 
 

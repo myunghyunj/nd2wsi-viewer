@@ -462,6 +462,7 @@ class Api:
         self._translucent_lock = threading.RLock()
         self._translucent_windows = {}
         self._translucent_owner_closed = False
+        self._slacs_discovery = None
         if native_gesture_scopes is None:
             from .native_gestures import NativeGestureScopeCache
 
@@ -473,6 +474,18 @@ class Api:
         from .window_launch import launch_window
 
         return launch_window(role, app_name=APP_NAME)
+
+    def slacs_discovery_state(self) -> dict:
+        """Read-only detection for the main-window connection offer."""
+        from .slacs_discovery import SlacsDiscovery
+
+        with self._translucent_lock:
+            if self._translucent_owner_closed:
+                return {"available": False, "session_id": None, "status": "closed"}
+            if self._slacs_discovery is None:
+                self._slacs_discovery = SlacsDiscovery()
+            detector = self._slacs_discovery
+        return detector.snapshot()
 
     def open_translucent_viewer(self, sid: str, payload: dict) -> dict:
         """Open a display-only tracing window for this viewer's registered slide."""
@@ -518,6 +531,12 @@ class Api:
             self._translucent_owner_closed = True
             overlays = list(self._translucent_windows.values())
             self._translucent_windows.clear()
+            detector, self._slacs_discovery = self._slacs_discovery, None
+        if detector is not None:
+            try:
+                detector.stop()
+            except Exception as exc:
+                _dlog(f"SLACS discovery close failed: {exc!r}")
         for overlay in overlays:
             try:
                 overlay.close_translucent()
