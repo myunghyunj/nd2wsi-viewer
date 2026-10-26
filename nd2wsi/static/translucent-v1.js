@@ -130,6 +130,22 @@
     return result;
   }
 
+  function stagePixelSize(info) {
+    const size = info.pixelSizeUm; // Metadata is [Y, X], not [X, Y].
+    return Array.isArray(size) && size.length === 2 && size.every(value => Number.isFinite(value) && value > 0)
+      ? { x: size[1], y: size[0] } : null;
+  }
+
+  function stageImageDelta(displacement, pixelSize, alignment) {
+    // Register physical stage axes to canonical image axes. Display rotation and
+    // display flip remain entirely within OSD, so they must not be applied here.
+    const radians = alignment.angle * Math.PI / 180;
+    const x = displacement[0] * (alignment.flipX ? -1 : 1);
+    const y = displacement[1] * (alignment.flipY ? -1 : 1);
+    return { x: (x * Math.cos(radians) - y * Math.sin(radians)) / pixelSize.x,
+      y: (x * Math.sin(radians) + y * Math.cos(radians)) / pixelSize.y };
+  }
+
   function mount(options) {
     const { window: win, document: doc, api, OSD, context, info } = options;
     const importer = options.importer || win.Nd2AstromapImport;
@@ -144,11 +160,26 @@
     const opacityControl = doc.getElementById("opacity-control");
     const opacitySlider = doc.getElementById("overlay-opacity");
     const opacityValue = doc.getElementById("opacity-value");
+    const followButton = doc.getElementById("stage-follow");
+    const followStatus = doc.getElementById("stage-follow-status");
+    const followSettings = doc.getElementById("stage-follow-settings");
+    const followAngle = doc.getElementById("stage-follow-angle");
+    const followFlipX = doc.getElementById("stage-follow-flip-x");
+    const followFlipY = doc.getElementById("stage-follow-flip-y");
+    const followSave = doc.getElementById("stage-follow-save");
+    const mirrorControl = doc.getElementById("overlay-mirror");
+    const pixelSize = stagePixelSize(info);
     const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
     const initialOpacity = validOpacity(context.opacity) ? context.opacity : .55;
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
       rois: [], roiIndex: -1, roiName: "", loadingRois: false,
+      mirrorScan: context.mirror_scan !== false,
       opacity: initialOpacity, confirmedOpacity: initialOpacity };
+    const follow = state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
+      seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "",
+      alignment: { angle: 0, flipX: false, flipY: false } };
+    let followEpoch = 0, followTimer = null, followInFlight = false, disposed = false;
+    let followLifecycle = Promise.resolve();
     const showStatus = message => { status.textContent = message; status.hidden = !message; };
     let opacityTask = null, opacityError = "";
     const paintOpacity = () => {
@@ -262,13 +293,206 @@
     const paintLock = () => {
       overlay.dataset.locked = String(state.locked);
       lock.setAttribute("aria-pressed", String(state.locked));
-      lock.setAttribute("aria-label", state.locked ? "Unlock image and window" : "Lock image and window");
-      lock.title = (state.locked ? "Unlock" : "Lock") + " image and window (L)";
+      const lockLabel = follow.enabled ? (state.locked ? "Unlock for manual alignment" : "Lock manual image and window controls") :
+        (state.locked ? "Unlock image and window" : "Lock image and window");
+      lock.setAttribute("aria-label", lockLabel);
+      lock.title = lockLabel + " (L)" + (follow.enabled ? " · Stage commands still move the image" : "");
       lock.disabled = state.pending;
       viewer.setMouseNavEnabled(!state.locked && !state.pending);
       paintOpacity();
       paintRois();
+      paintFollow();
     };
+    const paintFollow = () => {
+      if (disposed) return;
+      const available = typeof api.start_stage_follow === "function" && typeof api.stage_follow_state === "function" &&
+        typeof api.stop_stage_follow === "function";
+      followButton.disabled = follow.pending || !state.ready || !pixelSize || !available;
+      followButton.setAttribute("aria-pressed", String(follow.enabled));
+      followButton.title = !pixelSize ? "Follow needs a calibrated image pixel size" : !available ? "Stage follow is unavailable" :
+        follow.enabled ? "Stop following stage commands" : "Follow stage commands";
+      followStatus.textContent = follow.pending ? "Connecting…" : follow.status === "following" ? "Following commands" :
+        follow.status === "waiting" ? "Waiting for stage" : follow.status === "paused" ? "Paused" : "Off";
+      followStatus.dataset.status = follow.status;
+      followStatus.title = follow.message;
+      const editable = !state.locked && !state.pending;
+      mirrorControl.checked = state.mirrorScan;
+      mirrorControl.disabled = !editable || !state.ready;
+      followAngle.disabled = followFlipX.disabled = followFlipY.disabled = !editable;
+      followAngle.value = String(follow.alignment.angle);
+      followFlipX.checked = follow.alignment.flipX;
+      followFlipY.checked = follow.alignment.flipY;
+      followSave.disabled = !follow.enabled || follow.pending || typeof api.save_stage_follow_connection !== "function";
+      doc.getElementById("stage-follow-message").textContent = follow.message ||
+        (!pixelSize ? "A calibrated pixel size is needed." : "Commanded motion · alignment not verified");
+      doc.getElementById("stage-follow-delta").textContent = "Last image move: " +
+        follow.lastDelta.x.toFixed(3) + ", " + follow.lastDelta.y.toFixed(3) + " px";
+      doc.getElementById("stage-follow-scale").textContent = pixelSize ?
+        "Pixel size: X " + pixelSize.x.toFixed(3) + " · Y " + pixelSize.y.toFixed(3) + " µm/px" : "Pixel size unavailable";
+    };
+    const clearFollowTimer = () => {
+      if (followTimer !== null) win.clearTimeout(followTimer);
+      followTimer = null;
+    };
+    const pauseFollow = message => {
+      clearFollowTimer();
+      follow.status = "paused";
+      follow.message = message + " Turn Follow off and on to reconnect.";
+      paintFollow();
+    };
+    const consumeStageState = result => {
+      if (!follow.enabled || follow.status === "paused" || disposed) return false;
+      if (result?.enabled !== true || result.session_id !== follow.sessionId) {
+        pauseFollow("Stage connection changed."); return false;
+      }
+      if (result.status === "paused") { pauseFollow(result.message || "Stage updates stopped."); return false; }
+      const cumulative = result.displacement_um;
+      if (!["waiting", "following"].includes(result.status) || !Number.isSafeInteger(result.seq) || result.seq < follow.seq ||
+          !Array.isArray(cumulative) || cumulative.length !== 2 || !cumulative.every(Number.isFinite)) {
+        pauseFollow("Stage update could not be read."); return false;
+      }
+      const delta = [cumulative[0] - follow.displacement[0], cumulative[1] - follow.displacement[1]];
+      if (result.seq === follow.seq && (delta[0] || delta[1])) {
+        pauseFollow("Stage update changed unexpectedly."); return false;
+      }
+      if (result.status === "following" && (delta[0] || delta[1])) {
+        const imageDelta = stageImageDelta(delta, pixelSize, follow.alignment);
+        const center = viewer.viewport.viewportToImageCoordinates(viewer.viewport.getCenter(true));
+        const target = { x: center.x + imageDelta.x, y: center.y + imageDelta.y };
+        if (![target.x, target.y, imageDelta.x, imageDelta.y].every(Number.isFinite)) {
+          pauseFollow("Stage movement is outside the image coordinate range."); return false;
+        }
+        // Always add to the current camera: manual alignment while unlocked is
+        // retained by the next command. Lock intentionally does not gate this.
+        geometry.centerOnPreservingZoom(viewer.viewport, target, OSD);
+        viewer.forceRedraw();
+        renderRoiBoxes();
+        follow.lastDelta = imageDelta;
+      }
+      follow.displacement = cumulative.slice();
+      follow.seq = result.seq;
+      follow.status = result.status;
+      follow.message = "";
+      paintFollow();
+      return true;
+    };
+    const pollStageFollow = async () => {
+      if (disposed || !follow.enabled || follow.status === "paused" || followInFlight) return;
+      clearFollowTimer();
+      const epoch = followEpoch;
+      followInFlight = true;
+      const watchdog = win.setTimeout(() => {
+        if (epoch === followEpoch && follow.enabled && !disposed) pauseFollow("Stage connection is not responding.");
+      }, 3000);
+      try {
+        const result = await api.stage_follow_state();
+        if (epoch === followEpoch && !disposed) consumeStageState(result);
+      } catch (_) {
+        if (epoch === followEpoch && follow.enabled && !disposed) pauseFollow("Stage connection was lost.");
+      } finally {
+        win.clearTimeout(watchdog);
+        followInFlight = false;
+        if (!disposed && follow.enabled && follow.status !== "paused") scheduleStagePoll();
+      }
+    };
+    const scheduleStagePoll = () => {
+      clearFollowTimer();
+      followTimer = win.setTimeout(pollStageFollow, 50);
+    };
+    const startStageFollow = async () => {
+      if (disposed || follow.enabled || follow.pending || !state.ready || !pixelSize ||
+          typeof api.start_stage_follow !== "function" || typeof api.stage_follow_state !== "function" ||
+          typeof api.stop_stage_follow !== "function") return false;
+      const epoch = ++followEpoch;
+      follow.pending = true; follow.message = ""; paintFollow();
+      // Serialize native starts/stops, including a close during a pending start.
+      const task = followLifecycle.catch(() => {}).then(async () => {
+        if (epoch !== followEpoch || disposed) return false;
+        const result = requireSuccess(await api.start_stage_follow(), "Could not connect to the stage");
+        if (epoch !== followEpoch || disposed) return false;
+        if (typeof result?.session_id !== "string" || !result.session_id) throw new Error("Stage session is unavailable");
+        follow.enabled = true; follow.sessionId = result.session_id; follow.status = "waiting";
+        follow.seq = 0; follow.displacement = [0, 0]; follow.lastDelta = { x: 0, y: 0 };
+        scheduleStagePoll();
+        return true;
+      }).catch(error => {
+        if (epoch === followEpoch && !disposed) { follow.status = "off"; follow.message = error.message || "Could not connect to the stage"; }
+        return false;
+      }).finally(() => {
+        if (epoch === followEpoch && !disposed) { follow.pending = false; paintLock(); }
+      });
+      followLifecycle = task;
+      return task;
+    };
+    const stopStageFollow = () => {
+      const wasActive = follow.enabled || follow.pending;
+      const epoch = ++followEpoch;
+      clearFollowTimer();
+      follow.enabled = false; follow.status = "off"; follow.sessionId = ""; follow.message = "";
+      follow.pending = wasActive;
+      if (!disposed) paintLock();
+      if (!wasActive) return Promise.resolve(true);
+      const task = followLifecycle.catch(() => {}).then(async () => {
+        requireSuccess(await api.stop_stage_follow(), "Could not stop stage follow");
+        return true;
+      }).catch(error => {
+        if (epoch === followEpoch && !disposed) follow.message = error.message || "Could not stop stage follow";
+        return false;
+      }).finally(() => {
+        if (epoch === followEpoch && !disposed) { follow.pending = false; paintLock(); }
+      });
+      followLifecycle = task;
+      return task;
+    };
+    const setStageAlignment = alignment => {
+      if (state.locked || state.pending || disposed || !Number.isFinite(alignment.angle) || Math.abs(alignment.angle) > 360) {
+        paintFollow(); return false;
+      }
+      follow.alignment = { angle: alignment.angle, flipX: alignment.flipX === true, flipY: alignment.flipY === true };
+      paintFollow(); return true;
+    };
+    const setMirrorScan = value => {
+      if (state.locked || state.pending || !state.ready || disposed || typeof value !== "boolean") {
+        paintFollow(); return false;
+      }
+      state.mirrorScan = value;
+      const saved = camera(viewer);
+      // The scan was viewed from above; SLACS views it from below. This extra
+      // horizontal display mirror composes with, and never rewrites, the source
+      // handoff's flip. Physical stage registration remains independent.
+      viewer.viewport.setFlip((context.flip === true) !== state.mirrorScan);
+      restoreCamera(viewer, saved);
+      renderRoiBoxes(); paintFollow();
+      return true;
+    };
+    mirrorControl.addEventListener("change", () => setMirrorScan(mirrorControl.checked));
+    followButton.addEventListener("click", () => follow.enabled ? stopStageFollow() : startStageFollow());
+    doc.getElementById("stage-follow-options").addEventListener("click", () => {
+      followSettings.hidden = !followSettings.hidden;
+      doc.getElementById("stage-follow-options").setAttribute("aria-expanded", String(!followSettings.hidden));
+    });
+    for (const control of [followAngle, followFlipX, followFlipY]) {
+      control.addEventListener("change", () => setStageAlignment({ angle: Number(followAngle.value),
+        flipX: followFlipX.checked, flipY: followFlipY.checked }));
+    }
+    followSave.addEventListener("click", async () => {
+      if (!follow.enabled || follow.pending) return;
+      const epoch = followEpoch;
+      try {
+        const result = requireSuccess(await api.save_stage_follow_connection(), "Could not save the connection");
+        if (epoch === followEpoch && !disposed && !result?.cancelled) {
+          follow.message = "Connection saved. Open it in the stage sender."; paintFollow();
+        }
+      } catch (error) {
+        if (epoch === followEpoch && !disposed) { follow.message = error.message || "Could not save the connection"; paintFollow(); }
+      }
+    });
+    for (const id of ["stage-follow-control", "stage-follow-settings"]) {
+      const control = doc.getElementById(id);
+      for (const name of ["pointerdown", "pointermove", "pointerup", "pointercancel", "wheel"]) {
+        control.addEventListener(name, event => event.stopPropagation());
+      }
+    }
     const cancelGesture = () => {
       if (state.gesture) state.gesture.cancelled = true;
       state.gesture = null;
@@ -292,6 +516,7 @@
       } finally { state.pending = false; paintLock(); }
     };
     const close = async () => {
+      stopStageFollow();
       try { requireSuccess(await api.close_translucent(), "Could not close this window"); }
       catch (error) { showStatus(error.message || "Could not close this window"); }
     };
@@ -347,12 +572,13 @@
     viewer.addHandler("open", () => {
       const viewport = viewer.viewport;
       viewport.setRotation(context.rotation || 0, true);
-      viewport.setFlip(context.flip === true);
+      viewport.setFlip((context.flip === true) !== state.mirrorScan);
       restoreCamera(viewer, { zoom: context.zoom,
         center: viewport.imageToViewportCoordinates(new OSD.Point(...context.center)) });
       state.ready = true;
       showStatus("");
       paintRois();
+      paintFollow();
       resize();
       if (Array.isArray(context.rois) && context.rois.length) {
         setRois({ rois: context.rois, name: context.roiName || "" },
@@ -419,7 +645,7 @@
     };
     doc.getElementById("window-drag").addEventListener("pointerdown", event => startGesture(event));
     overlay.addEventListener("pointerdown", event => {
-      if (event.altKey && !event.target.closest("button, input, #opacity-control, .resize-handle")) startGesture(event);
+      if (event.altKey && !event.target.closest("button, input, #opacity-control, #stage-follow-control, #stage-follow-settings, .resize-handle")) startGesture(event);
     }, true);
     for (const handle of doc.querySelectorAll(".resize-handle")) {
       handle.addEventListener("pointerdown", event => startGesture(event, handle.dataset.edge));
@@ -440,6 +666,7 @@
     overlay.addEventListener("pointercancel", cancelGesture);
     doc.addEventListener("keydown", event => {
       if (event.repeat || event.altKey) return;
+      if (event.target?.closest?.("#stage-follow-control, #stage-follow-settings") && event.key !== "Escape") return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o") {
         event.preventDefault(); chooseRois(); return;
       }
@@ -452,8 +679,12 @@
     }, true);
     // Keep the embedded page itself at 100%; zoom belongs to the image.
     doc.addEventListener("wheel", event => { if (event.ctrlKey || state.locked) event.preventDefault(); }, { passive: false });
-    win.addEventListener("pagehide", () => { cancelGesture(); observer?.disconnect(); viewer.destroy(); }, { once: true });
-    return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity };
+    win.addEventListener("pagehide", () => {
+      stopStageFollow(); disposed = true;
+      cancelGesture(); observer?.disconnect(); viewer.destroy();
+    }, { once: true });
+    return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
+      startStageFollow, stopStageFollow, pollStageFollow, setStageAlignment, setMirrorScan };
   }
 
   async function boot(win) {
@@ -481,5 +712,5 @@
   }
 
   return { validateContext, makeTileSource, camera, restoreCamera, resizePreservingScale,
-    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, mount, boot };
+    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, stagePixelSize, stageImageDelta, mount, boot };
 });

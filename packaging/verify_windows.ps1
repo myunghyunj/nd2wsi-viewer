@@ -166,6 +166,7 @@ $webview2Translucent = $null
 $webview2Child = $null
 $webview2System = $null
 $webview2NegativeControl = $null
+$stageFollowVerified = $false
 # Each run: its evidence name, the app flag, and an optional WebView2 mode override.
 $plan = @(
     @{ name = 'smoke'; flag = '--smoke'; webview2 = $null },
@@ -245,6 +246,17 @@ try {
                 Write-Host "Windows 10 folder-permission step: $webview2Grant; both AppContainer groups can read the bundled runtime."
                 Write-Host "Bundled WebView2 $webview2Version rendered every window (system Evergreen: $webview2System)."
             }
+            # The translucent overlay must also have followed one real loopback stage delta;
+            # a skipped or missing check cannot pass silently.
+            $stageFollow = Get-JsonMember $gui @('translucent_viewer', 'stage_follow')
+            if ((Get-JsonMember $stageFollow @('ok')) -ne $true) {
+                $stageFollowError = [string](Get-JsonMember $stageFollow @('error'))
+                throw "Packaged GUI smoke did not prove stage follow in the translucent viewer (translucent_viewer.stage_follow.ok): $stageFollowError"
+            }
+            $stageFollowVerified = $true
+            $stageFollowObserved = @(Get-JsonMember $stageFollow @('observed_px')) -join ', '
+            $stageFollowExpected = @(Get-JsonMember $stageFollow @('expected_px')) -join ', '
+            Write-Host "Stage follow: one authenticated loopback delta moved the translucent overlay by ($stageFollowObserved) px; expected ($stageFollowExpected)."
         }
         elseif (-not (Test-Path -LiteralPath $log) -or (Get-Content -LiteralPath $log -Raw -Encoding UTF8) -notmatch 'smoke ok: SDPC') {
             throw "Packaged $mode did not record successful SDPC decoder and ROI checks."
@@ -281,6 +293,7 @@ try {
         webview2_system_version = $webview2System
         webview2_negative_control_browser_executable = $webview2NegativeControl
         webview2_appcontainer_access = $webview2Grant
+        stage_follow_verified = $stageFollowVerified
         runs = $runs
     }
     $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidencePath 'verification.json') -Encoding utf8

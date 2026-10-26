@@ -10,7 +10,9 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -66,6 +68,9 @@ def validate_context(store, payload, *, slide_url):
     flip = payload.get("flip", False)
     if type(flip) is not bool:
         raise ValueError("Flip must be boolean")
+    mirror_scan = payload.get("mirror_scan", True)
+    if type(mirror_scan) is not bool:
+        raise ValueError("Mirror image must be boolean")
     query = payload.get("query", "")
     if not isinstance(query, str) or len(query) > 16384:
         raise ValueError("Invalid display settings")
@@ -110,7 +115,10 @@ def validate_context(store, payload, *, slide_url):
     cleaned = urllib.parse.urlencode(pairs)
     context = {"version": 1, "slide_url": slide_url, "query": "?" + cleaned if cleaned else "",
                "center": center, "zoom": zoom, "rotation": rotation, "flip": flip,
+               "mirror_scan": mirror_scan,
                "dimensions": [width, height],
+               "pixel_size_um": copy.deepcopy(meta.get("pixel_size_um")),
+               "image_name": Path(str(getattr(store, "source_path", "") or "image")).name,
                "opacity": OPACITY, "opacity_mode": "native" if sys.platform == "win32" else "layer",
                "locked": False}
     if payload.get("roi") is not None:
@@ -174,10 +182,86 @@ class TranslucentApi:
         self._drop_document = None
         self._epoch = 0
         self._lock = threading.RLock()
+        self._stage_follow = None
 
     def translucent_context(self):
         with self._lock:
             return {**copy.deepcopy(self._context), "locked": self._locked}
+
+    def start_stage_follow(self):
+        """Opt in to this overlay's receiver; never connect to a controller."""
+        from .stage_follow import StageFollowReceiver
+
+        with self._lock:
+            if self._closed:
+                return {"ok": False, "message": "This translucent viewer is closed."}
+            pixels = self._context.get("pixel_size_um")
+            if (not isinstance(pixels, (list, tuple)) or len(pixels) != 2
+                    or any(isinstance(v, bool) or not isinstance(v, (float, int))
+                           or not math.isfinite(v) or v <= 0 for v in pixels)):
+                return {"ok": False, "message": "Stage follow requires a calibrated image."}
+            if self._stage_follow is None:
+                receiver = StageFollowReceiver()
+                try:
+                    descriptor = receiver.start()
+                except (OSError, RuntimeError) as exc:
+                    receiver.close()
+                    return {"ok": False, "message": "Could not start the local motion receiver: " + str(exc)}
+                self._stage_follow = receiver
+            else:
+                descriptor = self._stage_follow.start()
+            return {"ok": True, **descriptor}
+
+    def stage_follow_state(self):
+        with self._lock:
+            receiver = self._stage_follow
+            if self._closed or receiver is None:
+                return {"enabled": False, "status": "off", "message": "Stage follow is off."}
+            return receiver.snapshot()
+
+    def stop_stage_follow(self):
+        with self._lock:
+            receiver, self._stage_follow = self._stage_follow, None
+        if receiver is not None:
+            receiver.close()
+        return {"ok": True}
+
+    def save_stage_follow_connection(self):
+        """Export only an explicitly chosen local bridge connection file."""
+        import webview
+
+        with self._lock:
+            receiver = self._stage_follow
+            if self._closed or receiver is None:
+                return {"ok": False, "message": "Enable stage follow first."}
+            descriptor = {**receiver.start(), "version": 1,
+                          "image_name": self._context.get("image_name", "image"),
+                          "dimensions": self._context.get("dimensions"),
+                          "pixel_size_um_yx": self._context.get("pixel_size_um"),
+                          "motion_source": "commanded", "units": "um"}
+        selected = self._window.create_file_dialog(
+            webview.SAVE_DIALOG, save_filename="stage-follow-connection.json",
+            file_types=("Stage follow connection (*.json)",),
+        )
+        if not selected:
+            return {"ok": True, "cancelled": True}
+        target = Path(selected if isinstance(selected, str) else selected[0])
+        temporary = None
+        try:
+            with self._lock:
+                if self._closed or self._stage_follow is not receiver:
+                    return {"ok": False, "message": "The motion connection changed. Save it again."}
+                fd, temporary = tempfile.mkstemp(prefix=".stage-follow-", dir=target.parent)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(descriptor, stream, ensure_ascii=False, indent=2, allow_nan=False)
+                    stream.write("\n")
+                os.replace(temporary, target)
+            return {"ok": True}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "message": "Could not save the motion connection: " + str(exc)}
+        finally:
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
 
     def choose_roi_file(self):
         """Choose a coordinate-reference JPG and its AstroMapper TXT together."""
@@ -496,6 +580,7 @@ class TranslucentApi:
                 return True
             self._closed = True
             self._epoch += 1
+        self.stop_stage_follow()
         if self._window is not None:
             self._window.destroy()
         self._on_closed(self)
@@ -505,6 +590,7 @@ class TranslucentApi:
         with self._lock:
             self._closed = True
             self._epoch += 1
+        self.stop_stage_follow()
         self._on_closed(self)
 
 

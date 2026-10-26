@@ -19,7 +19,7 @@ const info = {width:1000,height:500,tileSize:256,rgb:false,generation:'original'
   levels:[{width:1000,height:500,path:'0'},{width:501,height:251,path:'1'}]};
 const context={version:1,slide_url:'http://localhost:9876/token/s/abc/',
   query:'c=0%2C2&win=10%3A300%3A0.25%2C%2C2%3A150&g=original&t=2&p=4&z=1',
-  center:[400,250],zoom:2,rotation:90,flip:true,opacity:.55};
+  center:[400,250],zoom:2,rotation:90,flip:true,mirror_scan:false,opacity:.55};
 const Point=class {constructor(x,y){this.x=x;this.y=y;}};
 function fakeViewer(){
   let width=800,height=500,zoom=2.5,center=new Point(.4,.25),rotation=0,flipped=false;
@@ -31,6 +31,7 @@ function fakeViewer(){
     imageToViewportZoom(z){return z*info.width/width;},
     imageToViewportCoordinates(x,y){return typeof x==='object'
       ? new Point(x.x/info.width,x.y/info.width):new Point(x/info.width,y/info.width);},
+    viewportToImageCoordinates(point){return new Point(point.x*info.width,point.y*info.width);},
     imageToViewerElementCoordinates(point){
       const scale=zoom*width/info.width,angle=rotation*Math.PI/180;
       const dx=(point.x-center.x*info.width)*scale,dy=(point.y-center.y*info.width)*scale;
@@ -44,7 +45,7 @@ function fakeViewer(){
   return {viewport,calls,handlers,nav:true,addHandler(name,cb){handlers[name]=cb;},
     forceRedraw(){},setMouseNavEnabled(value){this.nav=value;},destroy(){}};
 }
-function harness({failLock=false,failOpacity=false,opacityResult,initialContext={},bridgeOverrides={}}={}){
+function harness({failLock=false,failOpacity=false,opacityResult,initialContext={},bridgeOverrides={},infoOverrides={}}={}){
   const elements=new Map();
   function newElement(id){return {id,style:{},dataset:{},attributes:{},children:[],
     listeners:{},clientWidth:800,clientHeight:500,disabled:false,hidden:false,
@@ -57,7 +58,10 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
   const documentListeners={};
   const doc={getElementById:element,createElementNS(namespace,name){return newElement(name);},
     querySelectorAll(){return [];},addEventListener(name,cb){documentListeners[name]=cb;}};
-  const win={innerWidth:800,innerHeight:500,addEventListener(){}};
+  const windowListeners={},timers=new Map();let timerIndex=0;
+  const win={innerWidth:800,innerHeight:500,addEventListener(name,fn){windowListeners[name]=fn;},
+    setTimeout(fn,delay){const id=++timerIndex;timers.set(id,{fn,delay});return id;},
+    clearTimeout(id){timers.delete(id);}};
   const viewer=fakeViewer();
   let osdOptions;
   const OSD=options=>{osdOptions=options;return viewer;};OSD.Point=Point;
@@ -70,9 +74,21 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
     async choose_roi_file(){nativeCalls.push(['choose']);return {ok:true,name:'test.txt',
       text:'INDEX\tX1\tY1\tX2\tY2\tNOTE\n1\t0\t0\t3\t3\t',coordinateSize:{width:1000,height:500}};}};
   Object.assign(bridge,bridgeOverrides);
-  const mounted=api.mount({window:win,document:doc,api:bridge,OSD,context:{...context,...initialContext},info,importer});
+  const mounted=api.mount({window:win,document:doc,api:bridge,OSD,context:{...context,...initialContext},
+    info:{...info,...infoOverrides},importer});
   viewer.handlers.open();
-  return {mounted,viewer,element,win,nativeCalls,osdOptions,documentListeners};
+  return {mounted,viewer,element,win,nativeCalls,osdOptions,documentListeners,windowListeners,timers};
+}
+function followHarness(options={}){
+  const snapshot={enabled:true,session_id:'session-one',seq:0,displacement_um:[0,0],status:'waiting'};
+  const calls=[];
+  const h=harness({...options,infoOverrides:{pixelSizeUm:[2,.5],...options.infoOverrides},
+    bridgeOverrides:{async start_stage_follow(){calls.push('start');return {ok:true,session_id:'session-one',
+        token:'never-display-this',url:'http://127.0.0.1:1234/motion',protocol:'test'};},
+      async stage_follow_state(){calls.push('poll');return {...snapshot};},
+      async stop_stage_follow(){calls.push('stop');return {ok:true};},
+      async save_stage_follow_connection(){calls.push('save');return {ok:true};},...options.bridgeOverrides}});
+  return {...h,snapshot,followCalls:calls};
 }
 """
 
@@ -477,3 +493,262 @@ def test_invalid_roi_replacement_keeps_existing_boxes_and_nonfinite_projection_i
     """)
     assert result == {"rejected": False, "unchanged": True, "display": "none",
                       "source": {"x": 390, "y": 240, "w": 20, "h": 10, "label": ""}, "count": 1}
+
+
+def test_stage_follow_is_opt_in_and_locked_commands_pan_image_and_existing_roi_together():
+    result = run("""
+      const rois=[{x:390,y:240,w:20,h:20}],h=followHarness({initialContext:{rois,roiIndex:0}}),m=h.mounted;
+      const initial={enabled:m.state.follow.enabled,calls:h.followCalls.slice(),timers:h.timers.size};
+      await m.startStageFollow();await m.toggleLock();
+      const before={camera:api.camera(h.viewer),source:JSON.stringify(m.state.rois),
+        points:h.element('roi-overlay').children[0].attributes.points,opacity:m.state.opacity};
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});
+      await m.pollStageFollow();
+      return {initial,before,after:api.camera(h.viewer),
+        roiMoved:before.points!==h.element('roi-overlay').children[0].attributes.points,
+        sourceUnchanged:before.source===JSON.stringify(m.state.rois),
+        rotation:h.viewer.viewport.getRotation(),flip:h.viewer.viewport.getFlip(),opacity:m.state.opacity,
+        mouse:h.viewer.nav,manualRoi:m.selectRoi(0),lockTitle:h.element('overlay-lock').title,
+        status:h.element('stage-follow-status').textContent,
+        delta:h.element('stage-follow-delta').textContent,scale:h.element('stage-follow-scale').textContent};
+    """)
+    assert result["initial"] == {"enabled": False, "calls": [], "timers": 0}
+    assert result["after"]["center"] == pytest.approx({"x": .42, "y": .26})
+    assert result["after"]["zoom"] == result["before"]["camera"]["zoom"]
+    assert result["roiMoved"] and result["sourceUnchanged"]
+    assert result["rotation"] == 90 and result["flip"] is True
+    assert result["opacity"] == result["before"]["opacity"] == .55
+    assert result["mouse"] is False and result["manualRoi"] is False
+    assert "Stage commands still move the image" in result["lockTitle"]
+    assert result["status"] == "Following commands"
+    assert result["delta"] == "Last image move: 20.000, 10.000 px"
+    assert result["scale"] == "Pixel size: X 0.500 · Y 2.000 µm/px"
+
+
+def test_unlocked_manual_alignment_is_retained_by_next_cumulative_stage_command():
+    result = run("""
+      const h=followHarness(),m=h.mounted;
+      await m.startStageFollow();await m.toggleLock();
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
+      await m.toggleLock();const manualEnabled=h.viewer.nav;
+      h.viewer.viewport.panTo(new Point(.6,.3));
+      Object.assign(h.snapshot,{seq:2,displacement_um:[15,30]});await m.pollStageFollow();
+      return {manualEnabled,camera:api.camera(h.viewer),locked:m.state.locked};
+    """)
+    assert result == {"manualEnabled": True, "camera": {"center": {"x": .61, "y": .305}, "zoom": 2}, "locked": False}
+
+
+def test_stage_poll_can_skip_events_without_losing_displacement_or_reapplying_duplicates():
+    result = run("""
+      const h=followHarness(),m=h.mounted;await m.startStageFollow();
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[1.25,2.5]});await m.pollStageFollow();
+      Object.assign(h.snapshot,{seq:10,displacement_um:[4.75,8.5]});await m.pollStageFollow();
+      const before=h.viewer.calls.filter(c=>c[0]==='pan').length;
+      await m.pollStageFollow();
+      return {camera:api.camera(h.viewer),delta:m.state.follow.lastDelta,
+        duplicateDidNotPan:before===h.viewer.calls.filter(c=>c[0]==='pan').length,
+        timerDelays:[...h.timers.values()].map(timer=>timer.delay)};
+    """)
+    assert result["camera"]["center"] == pytest.approx({"x": .4095, "y": .25425})
+    assert result["delta"] == pytest.approx({"x": 7, "y": 3})
+    assert result["duplicateDidNotPan"] and result["timerDelays"] == [50]
+
+
+def test_stage_next_roi_sized_delta_moves_outlines_without_selecting_or_editing_rois():
+    result = run("""
+      const rois=[{x:390,y:240,w:20,h:20},{x:450,y:250,w:20,h:20}];
+      const h=followHarness({initialContext:{rotation:0,flip:false,rois,roiIndex:0}}),m=h.mounted;
+      const source=JSON.stringify(m.state.rois),original=JSON.stringify(rois);
+      const boxes=()=>h.element('roi-overlay').children.map(b=>({...b.attributes}));
+      const before=boxes();await m.startStageFollow();await m.toggleLock();
+      Object.assign(h.snapshot,{seq:2,status:'following',displacement_um:[30,20]});await m.pollStageFollow();
+      return {before,after:boxes(),sourceUnchanged:source===JSON.stringify(m.state.rois),
+        inputUnchanged:original===JSON.stringify(rois),selected:m.state.roiIndex};
+    """)
+    boxes = {box["data-roi-index"]: box for box in result["after"]}
+    assert boxes["1"]["points"] == "380,230 420,230 420,270 380,270"
+    assert boxes["0"]["points"] == "260,210 300,210 300,250 260,250"
+    assert result["sourceUnchanged"] and result["inputUnchanged"]
+    assert result["selected"] == 0
+
+
+def test_stage_axis_alignment_is_separate_from_display_rotation_and_lock_gated():
+    result = run("""
+      const h=followHarness(),m=h.mounted;
+      const accepted=m.setStageAlignment({angle:90,flipX:true,flipY:false});
+      await m.startStageFollow();await m.toggleLock();
+      const rejected=m.setStageAlignment({angle:0,flipX:false,flipY:true});
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
+      return {accepted,rejected,alignment:m.state.follow.alignment,center:api.camera(h.viewer).center,
+        rotation:h.viewer.viewport.getRotation(),flip:h.viewer.viewport.getFlip(),
+        disabled:h.element('stage-follow-angle').disabled,message:h.element('stage-follow-message').textContent};
+    """)
+    assert result["accepted"] is True and result["rejected"] is False
+    assert result["alignment"] == {"angle": 90, "flipX": True, "flipY": False}
+    assert result["center"] == pytest.approx({"x": .36, "y": .245})
+    assert result["rotation"] == 90 and result["flip"] is True and result["disabled"] is True
+    assert "alignment not verified" in result["message"]
+
+
+def test_stage_pause_latches_and_stop_leaves_unlocked_manual_navigation_available():
+    result = run("""
+      const h=followHarness(),m=h.mounted;await m.startStageFollow();const before=api.camera(h.viewer);
+      Object.assign(h.snapshot,{seq:4,status:'paused',displacement_um:[50,50],message:'Missing stage update.'});
+      await m.pollStageFollow();
+      const paused={status:h.element('stage-follow-status').textContent,message:h.element('stage-follow-message').textContent,
+        timers:h.timers.size};
+      Object.assign(h.snapshot,{seq:5,status:'following',displacement_um:[70,70]});await m.pollStageFollow();
+      const calls=h.followCalls.slice();await m.stopStageFollow();await m.pollStageFollow();
+      return {paused,calls,finalCalls:h.followCalls,enabled:m.state.follow.enabled,mouse:h.viewer.nav,
+        unchanged:JSON.stringify(before)===JSON.stringify(api.camera(h.viewer)),timers:h.timers.size};
+    """)
+    assert result["paused"]["status"] == "Paused" and result["paused"]["timers"] == 0
+    assert "off and on" in result["paused"]["message"]
+    assert result["calls"] == ["start", "poll"]
+    assert result["finalCalls"] == ["start", "poll", "stop"]
+    assert result["unchanged"] and result["mouse"] and not result["enabled"] and result["timers"] == 0
+
+
+def test_stage_poll_serializes_requests_and_ignores_late_response_after_stop():
+    result = run("""
+      let finish,polls=0;
+      const h=followHarness({bridgeOverrides:{stage_follow_state(){polls++;return new Promise(resolve=>finish=resolve);}}}),m=h.mounted;
+      await m.startStageFollow();const before=api.camera(h.viewer),poll=m.pollStageFollow();
+      await m.pollStageFollow();await m.stopStageFollow();
+      finish({enabled:true,session_id:'session-one',seq:1,status:'following',displacement_um:[10,20]});await poll;
+      return {polls,unchanged:JSON.stringify(before)===JSON.stringify(api.camera(h.viewer)),
+        timers:h.timers.size,enabled:m.state.follow.enabled};
+    """)
+    assert result == {"polls": 1, "unchanged": True, "timers": 0, "enabled": False}
+
+
+def test_stage_close_during_start_orders_native_stop_and_discards_late_session():
+    result = run("""
+      let finish;const calls=[];
+      const h=followHarness({bridgeOverrides:{start_stage_follow(){calls.push('start');return new Promise(resolve=>finish=resolve);},
+        async stop_stage_follow(){calls.push('stop');return {ok:true};}}}),m=h.mounted;
+      const starting=m.startStageFollow();await Promise.resolve();await Promise.resolve();
+      h.windowListeners.pagehide();finish({ok:true,session_id:'late-session'});await starting;
+      for(let i=0;i<10;i++)await Promise.resolve();
+      return {calls,enabled:m.state.follow.enabled,timers:h.timers.size};
+    """)
+    assert result == {"calls": ["start", "stop"], "enabled": False, "timers": 0}
+
+
+@pytest.mark.parametrize("failure", ["session", "rejection", "watchdog"])
+def test_stage_connection_failures_pause_without_any_pan(failure):
+    result = run(f"""
+      let finish;const failure={json.dumps(failure)};
+      const h=followHarness({{bridgeOverrides:{{stage_follow_state(){{
+        if(failure==='rejection')return Promise.reject(new Error('connection lost'));
+        if(failure==='watchdog')return new Promise(resolve=>finish=resolve);
+        return Promise.resolve({{enabled:true,session_id:'different',seq:1,status:'following',displacement_um:[10,20]}});
+      }}}}}}),m=h.mounted;
+      await m.startStageFollow();const before=api.camera(h.viewer),poll=m.pollStageFollow();
+      if(failure==='watchdog'){{
+        [...h.timers.values()].find(timer=>timer.delay===3000).fn();
+        finish({{enabled:true,session_id:'session-one',seq:1,status:'following',displacement_um:[10,20]}});
+      }}
+      await poll;
+      return {{status:m.state.follow.status,unchanged:JSON.stringify(before)===JSON.stringify(api.camera(h.viewer)),timers:h.timers.size}};
+    """)
+    assert result == {"status": "paused", "unchanged": True, "timers": 0}
+
+
+@pytest.mark.parametrize("pixel_size", [None, [], [1], [0, 1], [1, -1], ["1", 1]])
+def test_stage_follow_requires_positive_numeric_y_x_pixel_size(pixel_size):
+    result = run(f"""
+      const h=followHarness({{infoOverrides:{{pixelSizeUm:{json.dumps(pixel_size)}}}}});
+      return {{accepted:await h.mounted.startStageFollow(),disabled:h.element('stage-follow').disabled,
+        calls:h.followCalls,message:h.element('stage-follow-message').textContent}};
+    """)
+    assert result == {"accepted": False, "disabled": True, "calls": [],
+                      "message": "A calibrated pixel size is needed."}
+
+
+def test_stage_settings_editors_keep_keyboard_input_without_roi_or_window_shortcuts():
+    result = run("""
+      const h=followHarness({initialContext:{rois:[{x:100,y:100,w:4,h:4},
+        {x:200,y:100,w:4,h:4},{x:300,y:100,w:4,h:4}],roiIndex:1}}),m=h.mounted;
+      const before=api.camera(h.viewer);let prevented=0,editor;
+      for(const tagName of ['INPUT','SELECT','TEXTAREA','DIV']){
+        editor={tagName,isContentEditable:tagName==='DIV',closest(selector){
+          return selector.includes('#stage-follow-settings')?h.element('stage-follow-settings'):null;}};
+        for(const key of ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','l','o']){
+          h.documentListeners.keydown({key,target:editor,ctrlKey:key==='o',preventDefault(){prevented++;}});
+        }
+      }
+      const editing={prevented,native:h.nativeCalls.slice(),roi:m.state.roiIndex,locked:m.state.locked,
+        cameraUnchanged:JSON.stringify(before)===JSON.stringify(api.camera(h.viewer))};
+      h.documentListeners.keydown({key:'Escape',target:editor,preventDefault(){prevented++;}});
+      await Promise.resolve();
+      return {editing,prevented,native:h.nativeCalls};
+    """)
+    assert result == {"editing": {"prevented": 0, "native": [], "roi": 1,
+                                  "locked": False, "cameraUnchanged": True},
+                      "prevented": 1, "native": [["close"]]}
+
+
+@pytest.mark.parametrize("source_flip,mirror,effective", [
+    (False, "undefined", True), (True, "undefined", False),
+    (False, "true", True), (True, "true", False),
+    (False, "false", False), (True, "false", True),
+])
+def test_translucent_defaults_to_extra_display_mirror_composed_with_source_flip(source_flip, mirror, effective):
+    result = run(f"""
+      const original={{...context,flip:{str(source_flip).lower()},mirror_scan:{mirror}}};
+      const before=JSON.stringify(original),h=harness({{initialContext:original}});
+      return {{mirror:h.mounted.state.mirrorScan,checked:h.element('overlay-mirror').checked,
+        effective:h.viewer.viewport.getFlip(),sourceUnchanged:before===JSON.stringify(original),
+        camera:api.camera(h.viewer),rotation:h.viewer.viewport.getRotation()}};
+    """)
+    assert result["mirror"] is (mirror != "false")
+    assert result["checked"] is result["mirror"]
+    assert result["effective"] is effective
+    assert result["sourceUnchanged"] is True
+    assert result["camera"] == {"center": {"x": .4, "y": .25}, "zoom": 2}
+    assert result["rotation"] == 90
+
+
+def test_mirror_checkbox_reflects_existing_roi_display_without_changing_source_or_camera_and_respects_lock():
+    result = run("""
+      const rois=[{x:440,y:240,w:20,h:10}];
+      const h=followHarness({initialContext:{mirror_scan:undefined,rotation:30,flip:false,rois,roiIndex:0}}),m=h.mounted;
+      const points=()=>h.element('roi-overlay').children[0].attributes.points.split(' ').map(p=>p.split(',').map(Number));
+      const before={points:points(),camera:api.camera(h.viewer),source:JSON.stringify(m.state.rois)};
+      h.element('overlay-mirror').checked=false;
+      const accepted=h.element('overlay-mirror').listeners.change(),after=points();
+      await m.toggleLock();h.element('overlay-mirror').checked=true;
+      const rejected=h.element('overlay-mirror').listeners.change();
+      return {accepted,rejected,before,after,camera:api.camera(h.viewer),
+        sourceUnchanged:before.source===JSON.stringify(m.state.rois),inputUnchanged:rois,
+        mirror:m.state.mirrorScan,checked:h.element('overlay-mirror').checked,
+        disabled:h.element('overlay-mirror').disabled,rotation:h.viewer.viewport.getRotation(),
+        opacity:m.state.opacity,lockedPoints:points()};
+    """)
+    assert result["accepted"] is True and result["rejected"] is False
+    for before, after in zip(result["before"]["points"], result["after"], strict=True):
+        assert after == pytest.approx([800 - before[0], before[1]])
+    assert result["camera"] == result["before"]["camera"]
+    assert result["sourceUnchanged"] and result["lockedPoints"] == result["after"]
+    assert result["inputUnchanged"] == [{"x": 440, "y": 240, "w": 20, "h": 10}]
+    assert result["mirror"] is False and result["checked"] is False and result["disabled"] is True
+    assert result["rotation"] == 30 and result["opacity"] == .55
+
+
+def test_display_mirror_does_not_reverse_or_modify_physical_stage_registration():
+    result = run("""
+      const h=followHarness({initialContext:{mirror_scan:undefined,flip:false}}),m=h.mounted;
+      await m.startStageFollow();
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
+      const mirrored={camera:api.camera(h.viewer),delta:{...m.state.follow.lastDelta},flip:h.viewer.viewport.getFlip()};
+      m.setMirrorScan(false);
+      Object.assign(h.snapshot,{seq:2,displacement_um:[20,40]});await m.pollStageFollow();
+      return {mirrored,after:{camera:api.camera(h.viewer),delta:m.state.follow.lastDelta,flip:h.viewer.viewport.getFlip()},
+        alignment:m.state.follow.alignment};
+    """)
+    assert result["mirrored"]["delta"] == result["after"]["delta"] == {"x": 20, "y": 10}
+    assert result["mirrored"]["camera"]["center"] == pytest.approx({"x": .42, "y": .26})
+    assert result["after"]["camera"]["center"] == pytest.approx({"x": .44, "y": .27})
+    assert result["mirrored"]["flip"] is True and result["after"]["flip"] is False
+    assert result["alignment"] == {"angle": 0, "flipX": False, "flipY": False}

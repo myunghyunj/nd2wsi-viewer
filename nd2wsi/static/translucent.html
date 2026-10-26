@@ -20,6 +20,26 @@
     <button type="button" id="overlay-lock" aria-label="Lock image and window" aria-pressed="false" title="Lock image and window (L)"><span class="overlay-glyph lock-glyph" aria-hidden="true"></span></button>
     <button type="button" id="overlay-close" aria-label="Close translucent viewer" title="Close translucent viewer (Esc)"><span class="overlay-glyph close-glyph" aria-hidden="true"></span></button>
   </div>
+  <div id="stage-follow-control">
+    <button type="button" id="stage-follow" aria-pressed="false" disabled>Follow</button>
+    <span id="stage-follow-status" role="status" aria-live="polite">Off</span>
+    <button type="button" id="stage-follow-options" aria-label="Stage follow settings" aria-expanded="false" title="Stage follow settings">⋯</button>
+  </div>
+  <div id="stage-follow-settings" hidden>
+    <label class="mirror-image-control"><input id="overlay-mirror" type="checkbox" checked /> Mirror image</label>
+    <p class="stage-follow-hint">For viewing the sample from below.</p>
+    <p>Stage → image alignment</p>
+    <label>Rotation <input id="stage-follow-angle" type="number" min="-360" max="360" step="0.1" value="0" /> °</label>
+    <div class="stage-follow-flips">
+      <label><input id="stage-follow-flip-x" type="checkbox" /> Flip stage X</label>
+      <label><input id="stage-follow-flip-y" type="checkbox" /> Flip stage Y</label>
+    </div>
+    <p class="stage-follow-hint">Unlock to adjust alignment. Manual image panning is kept for the next move.</p>
+    <output id="stage-follow-scale"></output>
+    <output id="stage-follow-delta">Last image move: 0.000, 0.000 px</output>
+    <button type="button" id="stage-follow-save" disabled>Save connection…</button>
+    <p id="stage-follow-message" role="status">Commanded motion · alignment not verified</p>
+  </div>
   <div id="opacity-control">
     <input type="range" id="overlay-opacity" min="10" max="100" step="1" value="55" aria-label="Opacity" aria-valuetext="55%" />
     <output id="opacity-value" for="overlay-opacity" aria-hidden="true">55%</output>

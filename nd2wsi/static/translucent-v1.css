@@ -41,6 +41,24 @@ body { user-select: none; -webkit-user-select: none; }
 [data-locked="true"] #opacity-control { opacity: .3; }
 #overlay-status { position: absolute; left: 18px; right: 18px; top: 50%; transform: translateY(-50%); color: white; font-size: 13px; line-height: 1.45; text-align: center; text-shadow: 0 1px 4px #000, 0 0 8px #000; pointer-events: none; }
 #overlay-status[hidden] { display: none; }
+#stage-follow-control { position: absolute; top: 50px; left: 12px; z-index: 3; display: flex; align-items: center; gap: 7px; max-width: calc(100% - 24px); padding: 3px 5px; border-radius: 8px; background: rgba(25,28,33,.8); color: #fff; font-size: 11px; }
+#stage-follow-control button, #stage-follow-settings button { border: 0; border-radius: 5px; padding: 5px 7px; color: inherit; background: rgba(255,255,255,.1); font: inherit; cursor: pointer; }
+#stage-follow[aria-pressed="true"] { background: #285572; }
+#stage-follow-control button:disabled, #stage-follow-settings button:disabled { opacity: .4; cursor: default; }
+#stage-follow-control button:focus-visible, #stage-follow-settings :focus-visible { outline: 1px solid #fff; outline-offset: 2px; }
+#stage-follow-status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+#stage-follow-status[data-status="paused"] { color: #ffd966; }
+#stage-follow-settings { position: absolute; top: 85px; left: 12px; z-index: 4; width: min(275px, calc(100% - 24px)); max-height: calc(100% - 130px); overflow-y: auto; padding: 10px 12px; border-radius: 9px; background: rgba(25,28,33,.94); color: #fff; font-size: 11px; line-height: 1.5; }
+#stage-follow-settings[hidden] { display: none; }
+#stage-follow-settings p { margin: 0 0 8px; }
+#stage-follow-settings label { display: inline-flex; align-items: center; gap: 4px; }
+#stage-follow-settings .mirror-image-control { margin-bottom: 4px; }
+#stage-follow-settings input[type="number"] { width: 70px; padding: 3px 5px; border: 1px solid rgba(255,255,255,.25); border-radius: 4px; background: rgba(0,0,0,.2); color: #fff; font: inherit; }
+.stage-follow-flips { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0; }
+#stage-follow-settings .stage-follow-hint { color: #c9cdd3; }
+#stage-follow-settings output { display: block; font-variant-numeric: tabular-nums; margin-bottom: 5px; }
+#stage-follow-settings #stage-follow-save { margin: 5px 0 8px; }
+#stage-follow-settings #stage-follow-message { margin: 0; color: #c9cdd3; }
 .resize-handle { position: absolute; z-index: 2; touch-action: none; }
 [data-edge="n"], [data-edge="s"] { height: 7px; left: 18px; right: 18px; cursor: ns-resize; }
 [data-edge="n"] { top: 0; } [data-edge="s"] { bottom: 0; }
