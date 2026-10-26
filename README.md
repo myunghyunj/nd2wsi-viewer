@@ -34,7 +34,10 @@
 | Platform | Download · 2.5.4 | Requirements |
 | --- | --- | --- |
 | macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.4/nd2wsi-viewer-2.5.4-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.4/nd2wsi-viewer-2.5.4-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.4/nd2wsi-viewer-2.5.4-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 Runtime |
+
+Windows builds after 2.5.4 include the Microsoft Edge WebView2 Runtime, so WebView2
+no longer has to be installed separately. The 2.5.4 ZIP above still needs it on the PC.
 
 On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
 and keep `_internal` beside `nd2wsi-viewer.exe`. See the

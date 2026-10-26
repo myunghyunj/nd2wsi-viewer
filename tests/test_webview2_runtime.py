@@ -530,3 +530,148 @@ def test_watch_initialization_reports_when_it_cannot_attach():
 def test_watch_initialization_needs_a_before_show_event():
     assert rt.watch_initialization(SimpleNamespace(), lambda *_: None) is False
     assert rt.watch_initialization(SimpleNamespace(events=SimpleNamespace()), lambda *_: None) is False
+
+
+# Windows 10 folder permission for the bundled runtime -----------------------
+
+@pytest.mark.parametrize("build, needed", [(19045, True), (17763, True), (21999, True), (22000, False),
+                                           (26100, False)])
+def test_only_windows_10_builds_need_the_appcontainer_grant(build, needed):
+    assert rt.needs_appcontainer_grant(build) is needed
+
+
+def test_the_grant_is_not_needed_off_windows_or_without_a_windows_version(monkeypatch):
+    monkeypatch.setattr(rt.sys, "platform", "darwin")
+    assert rt.needs_appcontainer_grant() is False
+    monkeypatch.setattr(rt.sys, "platform", "win32")
+    monkeypatch.delattr(rt.sys, "getwindowsversion", raising=False)
+    assert rt.needs_appcontainer_grant() is False
+
+
+def _grant_harness(*, before=False, after=True, returncode=0, stdout="", stderr="", raises=None):
+    states = iter([before, after])
+    calls = []
+
+    def check(folder):
+        state = next(states)
+        if isinstance(state, Exception):
+            raise state
+        return state
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if raises:
+            raise raises
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    return check, run, calls
+
+
+def test_windows_11_skips_the_grant_without_touching_the_folder(tmp_path):
+    check, run, calls = _grant_harness()
+    assert rt.ensure_appcontainer_access(tmp_path, build=26100, check=check, run=run) == "not-needed"
+    assert calls == []
+
+
+def test_an_existing_grant_is_left_alone(tmp_path):
+    check, run, calls = _grant_harness(before=True)
+    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, run=run) == "present"
+    assert calls == []
+
+
+def test_windows_10_grants_inheritable_read_execute_to_both_appcontainer_groups(tmp_path, monkeypatch):
+    monkeypatch.setenv("SystemRoot", "C:\\Windows")
+    check, run, calls = _grant_harness()
+    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, run=run) == "granted"
+    [(command, kwargs)] = calls
+    # The system icacls, never one found on PATH.
+    assert command == [os.path.join("C:\\Windows", "System32", "icacls.exe"), str(tmp_path), "/grant",
+                       "*S-1-15-2-1:(OI)(CI)(RX)", "*S-1-15-2-2:(OI)(CI)(RX)", "/Q"]
+    assert kwargs["stdin"] is subprocess.DEVNULL and kwargs["capture_output"] and kwargs["timeout"] == 120
+
+
+def test_the_ci_diagnostic_forces_the_grant_on_windows_11(tmp_path):
+    check, run, calls = _grant_harness()
+    assert rt.ensure_appcontainer_access(tmp_path, force=True, build=26100, check=check, run=run) == "granted"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("harness, expected", [
+    (dict(returncode=5, stderr="Access is denied.\r\n"), "failed: icacls exit 5: Access is denied."),
+    (dict(returncode=2, stdout=""), "failed: icacls exit 2"),
+    (dict(raises=FileNotFoundError("icacls.exe")), "failed: icacls.exe"),
+    (dict(raises=subprocess.TimeoutExpired("icacls", 120)), "failed: Command 'icacls' timed out after 120 seconds"),
+    (dict(after=False), "failed: icacls succeeded but the folder still lacks the grant"),
+    (dict(after=OSError("unreadable")), "granted (could not re-check: unreadable)"),
+])
+def test_grant_failures_are_reported_never_raised(tmp_path, harness, expected):
+    check, run, _calls = _grant_harness(**harness)
+    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, run=run) == expected
+
+
+def test_an_unreadable_folder_still_attempts_the_grant(tmp_path):
+    check, run, calls = _grant_harness(before=OSError("denied"))
+    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, run=run) == "granted"
+    assert len(calls) == 1
+
+
+def test_appcontainer_access_is_unknown_off_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(rt.sys, "platform", "darwin")
+    assert rt.appcontainer_access(tmp_path) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows ACLs and icacls")
+def test_real_grant_reaches_the_folder_and_its_children(tmp_path):
+    folder = tmp_path / "webview2-runtime"
+    (folder / "EBWebView" / "x64").mkdir(parents=True)
+    (folder / "msedgewebview2.exe").write_bytes(b"MZ")
+    icacls = os.path.join(os.environ["SystemRoot"], "System32", "icacls.exe")
+    # Start from no explicit AppContainer grant; the user's temp folder does not give one.
+    subprocess.run([icacls, str(folder), "/remove", "*S-1-15-2-1", "*S-1-15-2-2", "/Q"], check=True,
+                   capture_output=True)
+    assert rt.appcontainer_access(folder) is False
+    assert rt.ensure_appcontainer_access(folder, force=True) == "granted"
+    assert rt.appcontainer_access(folder) is True
+    # Inherited by the folders below, which the sandboxed WebView2 processes read.
+    assert rt.appcontainer_access(folder / "EBWebView" / "x64") is True
+    assert rt.ensure_appcontainer_access(folder, force=True) == "present"
+
+
+@pytest.mark.parametrize("mask, readable", [
+    (0x1200A9, True), (0x1F01FF, True), (0xA0000000, True),  # RX, full control, GR|GE
+    (0x10000000, True), (0x80000000, False), (0x120089, False),  # GA; GR alone; read without execute
+])
+def test_generic_rights_are_mapped_like_windows_does_for_files(mask, readable):
+    assert (rt._file_rights(mask) & rt._READ_EXECUTE == rt._READ_EXECUTE) is readable
+
+
+@pytest.mark.parametrize("path, drive_type, network", [
+    ("\\\\server\\share\\app\\_internal\\webview2-runtime", 3, True),
+    ("Z:\\apps\\nd2wsi-viewer\\_internal\\webview2-runtime", 4, True),  # mapped network drive
+    ("C:\\Users\\lab\\nd2wsi-viewer\\_internal\\webview2-runtime", 3, False),
+    ("relative\\webview2-runtime", 4, False),
+])
+def test_network_locations_include_mapped_drives(monkeypatch, path, drive_type, network):
+    monkeypatch.setattr(rt.sys, "platform", "win32")
+    roots = []
+    monkeypatch.setattr(rt, "_drive_type", lambda root: roots.append(root) or drive_type)
+    assert rt._is_network_path(path) is network
+    if path[1:2] == ":":
+        assert roots == [path[:2] + "\\"]
+
+
+def test_a_failed_drive_lookup_is_not_treated_as_a_network_drive(monkeypatch):
+    monkeypatch.setattr(rt.sys, "platform", "win32")
+
+    def broken(root):
+        raise OSError("no kernel32")
+
+    monkeypatch.setattr(rt, "_drive_type", broken)
+    assert rt._is_network_path("C:\\app") is False
+
+
+def test_the_bundled_copy_on_a_mapped_network_drive_is_refused(monkeypatch):
+    monkeypatch.setattr(rt.sys, "platform", "win32")
+    monkeypatch.setattr(rt, "_drive_type", lambda root: 4)
+    with pytest.raises(RuntimeError, match="network folder"):
+        rt.choose_runtime("auto", bundled=Path("Z:\\apps\\_internal\\webview2-runtime"), system_version=None)

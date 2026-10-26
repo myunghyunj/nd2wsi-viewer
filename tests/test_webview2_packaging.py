@@ -401,3 +401,54 @@ def test_bundled_smoke_rejects_a_same_file_link_outside_the_staged_runtime(monke
         report = bundled_report(bundled_browser)
         report["webview2_runtime"]["main"]["browser_executable"] = str(outside)
         run_bundled_smoke(module, monkeypatch, tmp_path, report)
+
+
+def test_verifier_exercises_the_windows_10_folder_permission_step_on_the_extracted_runtime():
+    verifier = (ROOT / "packaging/verify_windows.ps1").read_text(encoding="utf-8")
+    # Only the bundled GUI run is asked to grant; the previous value is restored afterwards.
+    assert ("if ($RequireBundledWebView2 -and $mode -eq 'gui-smoke') { $env:ND2WSI_SMOKE_WEBVIEW2_ACL = '1' }"
+            in verifier)
+    assert "$env:ND2WSI_SMOKE_WEBVIEW2_ACL = $previousWebView2Grant" in verifier
+    assert "@('webview2_runtime', 'selection', 'appcontainer_access')" in verifier
+    assert "$webview2Grant -cne 'granted'" in verifier
+    # Get-Acl's names for these groups cannot be translated back; rules are read as SIDs.
+    assert "GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])" in verifier
+    assert ".Translate(" not in verifier
+    assert "[System.Security.AccessControl.PropagationFlags]::InheritOnly" in verifier
+    assert "Assert-AppContainerAccess -Folder $runtimeRoot" in verifier
+    for sid in ("S-1-15-2-1", "S-1-15-2-2"):
+        assert sid in verifier
+    assert "[System.Security.AccessControl.FileSystemRights]::ReadAndExecute" in verifier
+    assert "webview2_appcontainer_access = $webview2Grant" in verifier
+
+
+def test_the_ci_grant_switch_matches_the_app():
+    from nd2wsi import webview2_runtime
+
+    verifier = (ROOT / "packaging/verify_windows.ps1").read_text(encoding="utf-8")
+    assert f"$env:{webview2_runtime.GRANT_SMOKE_ENV}" in verifier
+    assert webview2_runtime.APPCONTAINER_SIDS == ("S-1-15-2-1", "S-1-15-2-2")
+
+
+def test_read_me_matches_whether_the_runtime_is_bundled():
+    module = windows_builder()
+    source = (ROOT / "packaging/WINDOWS-README.txt").read_text(encoding="utf-8")
+    assert module.readme_text(bundled=True) == source
+    assert "Microsoft Edge WebView2 Runtime is included in _internal\\webview2-runtime" in source
+    assert "*S-1-15-2-1:(OI)(CI)(RX) *S-1-15-2-2:(OI)(CI)(RX)" in source
+    unbundled = module.readme_text(bundled=False)
+    # A build without --webview2-fixed-runtime must not claim the runtime is included.
+    assert "is included in _internal\\webview2-runtime" not in unbundled
+    assert "WEBVIEW2-RUNTIME-NOTICE.txt" not in unbundled
+    assert "install the runtime from:\nhttps://developer.microsoft.com/microsoft-edge/webview2/" in unbundled
+    # Everything else is the same text.
+    assert unbundled.replace(module.SYSTEM_WEBVIEW2_README.rstrip("\n"), "") == source.replace(
+        source[source.index(module.BUNDLED_README_START):source.index("files inside _internal\\webview2-runtime.")
+               + len("files inside _internal\\webview2-runtime.")], "")
+
+
+def test_notice_describes_the_windows_10_step_for_the_copy_actually_used():
+    module = windows_builder()
+    notice = module.WEBVIEW2_NOTICE.format(version="156.0.4314.42", architecture="x64")
+    assert "the first time nd2wsi-viewer uses this copy" in notice
+    assert "ALL RESTRICTED APPLICATION" in notice and "network share" in notice

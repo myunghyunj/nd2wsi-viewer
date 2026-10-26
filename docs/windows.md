@@ -10,8 +10,10 @@
 | 2.5 Beta1 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.0b1/nd2wsi-viewer-2.5.0b1-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.5.0b1) |
 
 Extract the entire ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
-The archive includes Python and the scientific libraries. Install Microsoft
-Edge WebView2 Runtime separately if it is missing. The app also requires .NET
+The archive includes Python and the scientific libraries. Builds after 2.5.4
+also include the Microsoft Edge WebView2 Runtime (see
+[Bundled WebView2 runtime](#bundled-webview2-runtime)); with 2.5.4 and earlier,
+install WebView2 separately if it is missing. The app also requires .NET
 Framework 4.6.2 or later.
 
 The x64 app targets Windows 10 version 1709 or later and Windows 11 on
@@ -35,6 +37,38 @@ the whole floating window, including its controls and ROI outlines. See the
 [2.5 Beta1 notes](release-notes-2.5.0b1.md).
 
 Older validation records below apply only to the versions named in them.
+
+## Bundled WebView2 runtime
+
+Builds after 2.5.4 ship Microsoft's WebView2 Runtime (Fixed Version, pinned in
+`packaging/webview2-fixed-runtime.json`) unmodified in
+`_internal\webview2-runtime`, so a PC without WebView2 can still open the viewer.
+At startup the app uses an installed (registered) WebView2 Runtime when pywebview
+can use it, because it updates itself, and otherwise the bundled copy. It does
+not probe the installed runtime, so set `ND2WSI_WEBVIEW2_RUNTIME` to `bundled`
+(or `system`) to force one of them.
+
+- The bundled copy is not updated automatically; its security updates arrive
+  with new app releases.
+- On Windows 10, Microsoft requires the Fixed Version folder to be readable by
+  the app-sandbox groups ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION
+  PACKAGES. The app grants this with `icacls` the first time it uses the bundled
+  copy there; no administrator rights are needed for a folder the user
+  extracted. For a folder an administrator prepared, they run once:
+  `icacls "<app>\_internal\webview2-runtime" /grant *S-1-15-2-1:(OI)(CI)(RX) *S-1-15-2-2:(OI)(CI)(RX)`.
+- The Fixed Version cannot run from a network location, so the app refuses to
+  start its bundled copy from a UNC path or a mapped network drive.
+- `WEBVIEW2-RUNTIME-NOTICE.txt` beside the executable describes the included
+  runtime; Microsoft's license files stay inside `_internal\webview2-runtime`.
+- A build made without `--webview2-fixed-runtime` contains no runtime, and its
+  READ-ME keeps the earlier instruction to install WebView2.
+
+Windows CI proves the bundled copy rendered the main window, the translucent
+viewer and an independent window by checking each WebView2 browser process's
+executable path, runs the same GUI check on the system runtime as a negative
+control, and performs the Windows 10 folder-permission step on the extracted
+runtime. The CI hosts are Windows Server 2025 and Windows 11, so behaviour on
+a real Windows 10 PC is not yet verified.
 
 ## Historical v2.1.4 download
 
@@ -140,6 +174,8 @@ removal to stop before changing files. `-KeepInstalled` finishes with a tested
 installation in the default user directory. Verification results describe only
 the Windows machines on which that script was actually run.
 
+The Setup tooling predates the bundled WebView2 runtime and still treats the
+Evergreen runtime as a prerequisite; its README does not describe the bundled copy.
 The installer checks the .NET Framework 4.6.2 minimum and checks for WebView2.
 Windows 10 Education 22H2 already includes .NET Framework 4.8. It uses Microsoft's bundled, signed
 bootstrapper if the runtime is missing. That prerequisite step needs Internet
@@ -177,6 +213,12 @@ uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --
 .venv/Scripts/python.exe -m pytest tests -q
 .venv/Scripts/python.exe packaging/build_windows.py --smoke-file docs/example_cell.nd2
 ```
+
+To bundle the WebView2 runtime as CI does, download the cab pinned in
+`packaging/webview2-fixed-runtime.json`, check its SHA-256, expand it with
+`expand.exe <cab> -F:* <folder>`, and add
+`--webview2-fixed-runtime <folder>\Microsoft.WebView2.FixedVersionRuntime.<version>.x64`
+to the build command.
 
 For the current source, the expected output is
 `dist/windows/nd2wsi-viewer-2.5.0b1-windows-x64.zip` and its `.sha256`.

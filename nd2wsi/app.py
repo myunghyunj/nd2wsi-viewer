@@ -1599,6 +1599,13 @@ def main(argv: list[str] | None = None) -> int:
             # WinForms backend, so choose before any start. A forced bundled
             # copy that is missing fails startup here, never silently falls back.
             api._webview2_runtime = select_runtime(webview).report()
+            if api._webview2_runtime.get("kind") == "bundled" and api._webview2_runtime.get("path"):
+                from .webview2_runtime import GRANT_SMOKE_ENV, ensure_appcontainer_access
+
+                # Windows 10 only (or a CI diagnostic): the sandboxed WebView2
+                # processes need read access to the bundled runtime folder.
+                api._webview2_runtime["appcontainer_access"] = ensure_appcontainer_access(
+                    Path(api._webview2_runtime["path"]), force=os.environ.get(GRANT_SMOKE_ENV) == "1")
             _dlog(f"WebView2 runtime: {api._webview2_runtime}")
             from .webview2_runtime import watch_initialization
 
@@ -1608,8 +1615,11 @@ def main(argv: list[str] | None = None) -> int:
                     _dlog(f"WebView2 initialization failed: {detail}")
                     if not diagnostic and not api._startup_error:
                         # Shown after the blank window closes; the smoke reports it itself.
-                        kind = (api._webview2_runtime or {}).get("kind", "system")
-                        api._startup_error = f"Microsoft Edge WebView2 ({kind} runtime) could not start: {detail}"
+                        runtime = api._webview2_runtime or {}
+                        access = str(runtime.get("appcontainer_access") or "")
+                        hint = f" (folder permission step {access})" if access.startswith("failed") else ""
+                        api._startup_error = (f"Microsoft Edge WebView2 ({runtime.get('kind', 'system')} runtime) "
+                                              f"could not start: {detail}{hint}")
 
             watch_initialization(window, webview2_started)
         if window_session is not None:

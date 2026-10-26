@@ -20,8 +20,9 @@ Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
 silicon, it uses Windows x64 emulation. See the
 [release notes](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) for the
 exact source commit, archive checksums, and platform verification results.
-.NET Framework 4.6.2 or later and Microsoft Edge WebView2 Runtime are required;
-install WebView2 separately if it is missing.
+.NET Framework 4.6.2 or later is required. Builds after 2.5.4 include the
+Microsoft Edge WebView2 Runtime; with 2.5.4 and earlier, install WebView2
+separately if it is missing.
 
 Use **Ctrl** in place of the Mac **⌘** shortcuts below, and **Alt** for
 **Option**. Open files using `+`, drag and drop, or pass a file to the executable.

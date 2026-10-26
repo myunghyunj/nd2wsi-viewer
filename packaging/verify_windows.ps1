@@ -58,6 +58,26 @@ function Assert-BundledWebView2Evidence {
     return $executable
 }
 
+# Windows 10 needs ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION
+# PACKAGES to read the Fixed Version folder; require inheritable ReadAndExecute.
+function Assert-AppContainerAccess {
+    param([string]$Folder)
+    $needed = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
+    # Read the rules as SIDs: Windows cannot translate the names of these two
+    # groups ('APPLICATION PACKAGE AUTHORITY\...') back to SIDs.
+    $rules = @((Get-Acl -LiteralPath $Folder).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    foreach ($sid in @('S-1-15-2-1', 'S-1-15-2-2')) {
+        $match = @($rules | Where-Object {
+            $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq 'Allow' -and
+                ($_.FileSystemRights -band $needed) -eq $needed -and ($_.InheritanceFlags -band $inherit) -eq $inherit -and
+                ($_.PropagationFlags -band $inheritOnly) -eq 0
+        })
+        if ($match.Count -eq 0) { throw "The bundled WebView2 runtime folder does not give $sid inheritable ReadAndExecute." }
+    }
+}
+
 $expected = ((Get-Content -LiteralPath "$archivePath.sha256" -Raw).Trim() -split '\s+')[0]
 $actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($expected -ne $actual) { throw 'The distributable ZIP checksum does not match.' }
@@ -133,6 +153,8 @@ if ($RequireBundledWebView2) {
 $runs = @()
 $previousLog = $env:ND2WSI_LOG_FILE
 $previousWebView2Mode = $env:ND2WSI_WEBVIEW2_RUNTIME
+$previousWebView2Grant = $env:ND2WSI_SMOKE_WEBVIEW2_ACL
+$webview2Grant = $null
 $webview2Main = $null
 $webview2Translucent = $null
 $webview2Child = $null
@@ -153,6 +175,10 @@ try {
         $mode = $step.name
         if ($null -ne $step.webview2) { $env:ND2WSI_WEBVIEW2_RUNTIME = $step.webview2 }
         elseif ($RequireBundledWebView2) { $env:ND2WSI_WEBVIEW2_RUNTIME = 'bundled' }
+        # CI hosts are not Windows 10, so ask the bundled GUI run to perform the
+        # Windows 10 folder-permission step anyway, on the real extracted runtime.
+        if ($RequireBundledWebView2 -and $mode -eq 'gui-smoke') { $env:ND2WSI_SMOKE_WEBVIEW2_ACL = '1' }
+        else { $env:ND2WSI_SMOKE_WEBVIEW2_ACL = $previousWebView2Grant }
         $log = Join-Path $evidencePath "$mode.log"
         Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
         $env:ND2WSI_LOG_FILE = $log
@@ -204,6 +230,13 @@ try {
                 $webview2Translucent = Assert-BundledWebView2Evidence -Report $gui -Label 'translucent viewer' -Path @('webview2_runtime', 'translucent') -RunId $runId -Version $webview2Version
                 $webview2Child = Assert-BundledWebView2Evidence -Report $gui -Label 'independent window' -Path @('independent_window', 'child_gui', 'webview2_runtime', 'main') -RunId $runId -Version $webview2Version
                 $webview2System = Get-JsonMember $gui @('webview2_runtime', 'main', 'system_version')
+                $webview2Grant = [string](Get-JsonMember $gui @('webview2_runtime', 'selection', 'appcontainer_access'))
+                # A fresh extraction lacks the grant, so the forced step must have run icacls.
+                if ($webview2Grant -cne 'granted') {
+                    throw "The Windows 10 folder-permission step did not grant access on the fresh bundled runtime: $webview2Grant"
+                }
+                Assert-AppContainerAccess -Folder $runtimeRoot
+                Write-Host "Windows 10 folder-permission step: $webview2Grant; both AppContainer groups can read the bundled runtime."
                 Write-Host "Bundled WebView2 $webview2Version rendered every window (system Evergreen: $webview2System)."
             }
         }
@@ -241,6 +274,7 @@ try {
         webview2_child_browser_executable = $webview2Child
         webview2_system_version = $webview2System
         webview2_negative_control_browser_executable = $webview2NegativeControl
+        webview2_appcontainer_access = $webview2Grant
         runs = $runs
     }
     $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidencePath 'verification.json') -Encoding utf8
@@ -249,6 +283,7 @@ try {
 finally {
     $env:ND2WSI_LOG_FILE = $previousLog
     $env:ND2WSI_WEBVIEW2_RUNTIME = $previousWebView2Mode
+    $env:ND2WSI_SMOKE_WEBVIEW2_ACL = $previousWebView2Grant
     # Only this invocation's private fixture/extraction directory is disposable.
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

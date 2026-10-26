@@ -1,5 +1,6 @@
 # Prepare the official system prerequisite on clean Windows CI runners.
-# Windows 11 normally already has this runtime. It is not part of the ZIP.
+# Windows 11 normally already has this runtime. CI builds also bundle a Fixed
+# Version copy; keeping Evergreen installed lets the smoke prove the copy wins.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 

@@ -884,3 +884,52 @@ def test_main_smoke_reports_a_webview2_start_failure_in_its_own_report(fake_webv
     report = json.loads(path.read_text(encoding="utf-8"))
     assert report["ok"] is False and report["error"] == "WebView2 failed to start: 0x8007 access denied"
     window.evaluate_js.assert_not_called()
+
+
+@pytest.mark.parametrize("kind, smoke_flag, expected_force", [("bundled", None, False), ("bundled", "1", True),
+                                                               ("system", "1", None)])
+def test_main_runs_the_folder_permission_step_only_for_the_bundled_copy(fake_webview, monkeypatch, tmp_path,
+                                                                        kind, smoke_flag, expected_force):
+    webview, window = fake_webview
+    window.evaluate_js.return_value = {"bridge": True, "version": "test", "boot": True}
+    if smoke_flag:
+        monkeypatch.setenv("ND2WSI_SMOKE_WEBVIEW2_ACL", smoke_flag)
+    else:
+        monkeypatch.delenv("ND2WSI_SMOKE_WEBVIEW2_ACL", raising=False)
+    runtime = "C:\\app\\_internal\\webview2-runtime" if kind == "bundled" else None
+    selection = {"kind": kind, "mode": "auto", "path": runtime, "system_version": None, "reason": "test"}
+    monkeypatch.setattr("nd2wsi.webview2_runtime.select_runtime",
+                        Mock(return_value=SimpleNamespace(report=lambda: dict(selection))))
+    grant = Mock(return_value="granted")
+    monkeypatch.setattr("nd2wsi.webview2_runtime.ensure_appcontainer_access", grant)
+    webview.util = SimpleNamespace(Thread=threading.Thread)
+    webview.start = Mock(side_effect=lambda callback, **_kwargs: callback())
+    path = tmp_path / "gui-smoke.json"
+    assert app.main(["--gui-smoke", "--smoke-report", str(path)]) == 0
+    recorded = json.loads(path.read_text(encoding="utf-8"))["webview2_runtime"]["selection"]
+    if expected_force is None:
+        grant.assert_not_called()
+        assert "appcontainer_access" not in recorded
+    else:
+        grant.assert_called_once_with(Path(runtime), force=expected_force)
+        assert recorded["appcontainer_access"] == "granted"
+
+
+def test_a_failed_folder_permission_step_is_named_in_the_startup_error(fake_webview, monkeypatch):
+    webview, _ = fake_webview
+    selection = {"kind": "bundled", "mode": "auto", "path": "C:\\app\\_internal\\webview2-runtime",
+                 "system_version": None, "reason": "test"}
+    monkeypatch.setattr("nd2wsi.webview2_runtime.select_runtime",
+                        Mock(return_value=SimpleNamespace(report=lambda: dict(selection))))
+    monkeypatch.setattr("nd2wsi.webview2_runtime.ensure_appcontainer_access",
+                        Mock(return_value="failed: icacls exit 5: Access is denied."))
+    watched = {}
+    monkeypatch.setattr("nd2wsi.webview2_runtime.watch_initialization",
+                        lambda target, record: watched.update(record=record) or True)
+    webview.start = Mock(side_effect=lambda *_args, **_kwargs: watched["record"](False, "0x80070005"))
+    dialog = Mock()
+    monkeypatch.setattr(app, "_startup_error", dialog)
+    assert app.main([]) == 4
+    assert dialog.call_args.args[0] == (
+        "Could not start nd2wsi-viewer: Microsoft Edge WebView2 (bundled runtime) could not start: 0x80070005 "
+        "(folder permission step failed: icacls exit 5: Access is denied.)")

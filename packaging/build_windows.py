@@ -32,6 +32,29 @@ WEBVIEW2_PIN = REPO / "packaging" / "webview2-fixed-runtime.json"
 WEBVIEW2_BROWSER = "msedgewebview2.exe"
 WEBVIEW2_BUNDLE_PATH = "_internal/webview2-runtime"
 PE_MACHINE_AMD64 = 0x8664
+# READ-ME.txt describes the bundled runtime; a build without it (no
+# --webview2-fixed-runtime) ships the earlier system-prerequisite paragraph.
+BUNDLED_README_START = "Microsoft Edge WebView2 Runtime is included"
+SYSTEM_WEBVIEW2_README = """\
+The app uses Microsoft Edge WebView2 Evergreen Runtime, normally included
+with Windows 11. If your organization removed it, install the runtime from:
+https://developer.microsoft.com/microsoft-edge/webview2/
+Select the runtime for your operating system (ARM64 on an ARM64 PC).
+"""
+
+
+def readme_text(*, bundled: bool) -> str:
+    text = (REPO / "packaging" / "WINDOWS-README.txt").read_text(encoding="utf-8")
+    if bundled:
+        return text
+    paragraphs = text.split("\n\n")
+    matches = [index for index, paragraph in enumerate(paragraphs) if paragraph.startswith(BUNDLED_README_START)]
+    if len(matches) != 1:
+        raise RuntimeError("WINDOWS-README.txt has no single bundled WebView2 paragraph to replace")
+    paragraphs[matches[0]] = SYSTEM_WEBVIEW2_README.rstrip("\n")
+    return "\n\n".join(paragraphs)
+
+
 WEBVIEW2_NOTICE = """\
 Microsoft Edge WebView2 Runtime (Fixed Version) {version} ({architecture})
 (c) Microsoft Corporation. All rights reserved.
@@ -42,7 +65,16 @@ Microsoft's WebView2 Runtime license terms, and Microsoft's own notices inside
 that folder are left in place.
 
 This copy is not updated automatically. Security and other updates to it
-arrive only with new nd2wsi-viewer releases.
+arrive only with new nd2wsi-viewer releases. If a working WebView2 Runtime is
+already installed on the PC, nd2wsi-viewer uses that one instead, because it
+updates itself.
+
+On Windows 10, the first time nd2wsi-viewer uses this copy it gives Windows'
+app-sandbox groups (ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION
+PACKAGES) read access to the webview2-runtime folder, as Microsoft requires
+for the Fixed Version. This needs no administrator rights for a folder you
+extracted yourself; otherwise an administrator can grant it once with icacls
+(see READ-ME.txt).
 
 The WebView2 Runtime (Fixed Version) must not be run from a network share or
 UNC path. Extract nd2wsi-viewer to a local drive.
@@ -407,7 +439,8 @@ def main() -> int:
     }
     (bundle / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     shutil.copy2(REPO / "LICENSE", bundle / "LICENSE.txt")
-    shutil.copy2(REPO / "packaging" / "WINDOWS-README.txt", bundle / "READ-ME.txt")
+    # Bytes, not text mode: keep the repository file's line endings.
+    (bundle / "READ-ME.txt").write_bytes(readme_text(bundled=webview2_info is not None).encode("utf-8"))
     if webview2_info is not None:
         (bundle / "WEBVIEW2-RUNTIME-NOTICE.txt").write_text(
             WEBVIEW2_NOTICE.format(version=webview2_info["version"],

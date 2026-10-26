@@ -18,6 +18,7 @@ when an empty per-user value hides a valid per-machine install.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -186,9 +187,29 @@ def choose_runtime(mode: str, *, bundled: Path | None, system_version: str | Non
     return RuntimeChoice("system", mode, None, None, "no system or bundled runtime found")
 
 
+def _drive_type(root: str) -> int:
+    import ctypes
+
+    return int(ctypes.windll.kernel32.GetDriveTypeW(root))
+
+
+def _is_network_path(path) -> bool:
+    """A UNC path, or a drive letter Windows reports as remote (a mapped share)."""
+    text = str(path)
+    if text.startswith("\\\\"):
+        return True
+    if sys.platform != "win32" or len(text) < 2 or text[1] != ":":
+        return False
+    try:
+        return _drive_type(text[:2] + "\\") == 4  # DRIVE_REMOTE
+    except Exception:
+        return False
+
+
 def _bundled(mode, path, system_version, reason) -> RuntimeChoice:
-    if str(path).startswith("\\\\"):
-        # Microsoft: a Fixed Version runtime cannot run from a network or UNC path.
+    if _is_network_path(path):
+        # Microsoft (Fixed Version known issues): it cannot run from a network
+        # location or UNC path.
         raise RuntimeError(
             "nd2wsi-viewer cannot start its bundled WebView2 runtime from a network folder. "
             "Copy the app folder to this PC and open it there."
@@ -371,3 +392,144 @@ def window_evidence(window, call, *, timeout=30, image_path=process_image_path,
                                and _same_file(evidence["requested_folder"], expected))
     evidence["error"] = "; ".join(errors) or None
     return evidence
+
+
+# Windows 10 folder permission for the Fixed Version runtime -----------------
+# Microsoft's WebView2 distribution docs ("The Fixed Version runtime distribution
+# mode", step 6): on Windows 10, unpackaged apps using Fixed Version 120 or later
+# must give the AppContainer
+# groups read and execute access to the runtime folder, or its sandboxed
+# processes cannot start. Windows 11 (build 22000 and later) does not need it.
+APPCONTAINER_SIDS = ("S-1-15-2-1", "S-1-15-2-2")  # ALL [RESTRICTED] APPLICATION PACKAGES
+WINDOWS_11_BUILD = 22000
+GRANT_SMOKE_ENV = "ND2WSI_SMOKE_WEBVIEW2_ACL"  # CI only: run the grant where Windows does not need it
+_READ_EXECUTE = 0x1200A9  # FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+# Generic rights as Windows maps them for files: inherited grants are often
+# stored with generic bits (for example GR,GE under Program Files).
+_GENERIC_FILE_RIGHTS = ((0x80000000, 0x120089), (0x20000000, 0x1200A0), (0x10000000, 0x1F01FF))
+_INHERITABLE = 0x3  # OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+_INHERIT_ONLY = 0x8
+
+
+def needs_appcontainer_grant(build=None) -> bool:
+    if build is None:
+        version = getattr(sys, "getwindowsversion", None)
+        if sys.platform != "win32" or version is None:
+            return False
+        build = version().build
+    return build < WINDOWS_11_BUILD
+
+
+def _file_rights(mask: int) -> int:
+    for generic, specific in _GENERIC_FILE_RIGHTS:
+        if mask & generic:
+            mask |= specific
+    return mask
+
+
+def appcontainer_access(folder) -> bool | None:
+    """Whether both AppContainer groups hold inheritable read/execute on ``folder``.
+
+    None off Windows. Raises OSError when the folder's DACL cannot be read.
+    """
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.POINTER(ctypes.c_void_p)
+    advapi.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+                                             pointer, pointer, pointer, pointer, pointer]
+    advapi.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, pointer]
+    advapi.GetAce.restype = wintypes.BOOL
+    advapi.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, pointer]
+    advapi.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    advapi.EqualSid.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+
+    class Acl(ctypes.Structure):
+        _fields_ = [("revision", ctypes.c_ubyte), ("sbz1", ctypes.c_ubyte), ("size", wintypes.WORD),
+                    ("count", wintypes.WORD), ("sbz2", wintypes.WORD)]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ubyte), ("flags", ctypes.c_ubyte), ("size", wintypes.WORD)]
+
+    dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    status = advapi.GetNamedSecurityInfoW(str(folder), 1, 4,  # SE_FILE_OBJECT, DACL_SECURITY_INFORMATION
+                                          None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    if status != 0:
+        raise OSError(status, "Could not read the folder's permissions", str(folder))
+    targets = []
+    try:
+        for text in APPCONTAINER_SIDS:
+            sid = ctypes.c_void_p()
+            if not advapi.ConvertStringSidToSidW(text, ctypes.byref(sid)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            targets.append(sid)
+        if not dacl.value:
+            return True  # a NULL DACL grants everyone full access
+        # Per group, two facts: some ACE gives read/execute on the folder itself
+        # (not inherit-only), and some ACE passes it on to files and folders
+        # (OI|CI). icacls (OI)(CI)(RX) is one ACE doing both; an inherited grant
+        # under Program Files is split into an effective and an inherit-only ACE.
+        applies, inherits = set(), set()
+        for index in range(Acl.from_address(dacl.value).count):
+            ace = ctypes.c_void_p()
+            if not advapi.GetAce(dacl, index, ctypes.byref(ace)):
+                continue
+            header = AceHeader.from_address(ace.value)
+            if header.type != 0:  # ACCESS_ALLOWED_ACE: header, access mask, then the SID
+                continue
+            if _file_rights(wintypes.DWORD.from_address(ace.value + 4).value) & _READ_EXECUTE != _READ_EXECUTE:
+                continue
+            for position, target in enumerate(targets):
+                if advapi.EqualSid(ctypes.c_void_p(ace.value + 8), target):
+                    if not header.flags & _INHERIT_ONLY:
+                        applies.add(position)
+                    if header.flags & _INHERITABLE == _INHERITABLE:
+                        inherits.add(position)
+        everyone = set(range(len(targets)))
+        return applies == everyone and inherits == everyone
+    finally:
+        for sid in targets:
+            kernel.LocalFree(sid)
+        if descriptor.value:
+            kernel.LocalFree(descriptor)
+
+
+def ensure_appcontainer_access(folder, *, force=False, build=None, check=appcontainer_access,
+                               run=subprocess.run) -> str:
+    """Grant the AppContainer groups read/execute on ``folder`` where Windows needs it.
+
+    Returns "not-needed", "present", "granted" or "failed: <reason>"; never raises.
+    The grant is inheritable, so Windows applies it to the files inside. Changing
+    a folder the user extracted needs no administrator rights.
+    """
+    if not force and not needs_appcontainer_grant(build):
+        return "not-needed"
+    try:
+        if check(folder):
+            return "present"
+    except Exception:  # an unreadable DACL: the grant below reports its own error
+        pass
+    icacls = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "icacls.exe")
+    command = [icacls, str(folder), "/grant", *(f"*{sid}:(OI)(CI)(RX)" for sid in APPCONTAINER_SIDS), "/Q"]
+    try:
+        result = run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                     timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"failed: {exc}"
+    if result.returncode != 0:
+        lines = (result.stderr or result.stdout or "").strip().splitlines()
+        return f"failed: icacls exit {result.returncode}" + (f": {lines[-1].strip()}" if lines else "")
+    try:
+        if check(folder) is False:
+            return "failed: icacls succeeded but the folder still lacks the grant"
+    except Exception as exc:
+        return f"granted (could not re-check: {exc})"
+    return "granted"
