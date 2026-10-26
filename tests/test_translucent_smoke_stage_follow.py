@@ -77,6 +77,8 @@ class FakePage:
                 dx = -dx
             elif self.mode == "swapped":
                 dx, dy = delta[0] / self.pixel["y"], delta[1] / self.pixel["x"]
+            elif self.mode == "reset-rotation":
+                self.view["rotation"] = 0  # a Follow bug that resets the display angle
             elif self.mode == "rotation-applied" and self.view["rotation"] % 360:
                 angle = math.radians(self.view["rotation"])
                 dx, dy = dx * math.cos(angle) - dy * math.sin(angle), dx * math.sin(angle) + dy * math.cos(angle)
@@ -747,3 +749,28 @@ def test_windows_verifier_requires_the_overlay_stage_follow_proof():
     assert (gui < verifier.index("Assert-AppContainerAccess -Folder $runtimeRoot") < verifier.index(proof)
             < verifier.index("$stageFollowVerified = $true")
             < verifier.index("elseif (-not (Test-Path -LiteralPath $log)"))
+
+
+def test_a_follow_that_resets_the_display_rotation_fails_before_any_restore(follow_run):
+    # The Codex SLACS chat's reproduction: a page that resets rotation whenever it
+    # consumes a delta must not pass because the smoke later restores the angle.
+    run = follow_run(mode="reset-rotation")
+    assert run.result["ok"] is False
+    assert "changed the display rotation, mirror or zoom" in run.result["error"]
+
+
+def test_a_rotation_reset_only_at_the_rotated_view_fails(follow_run):
+    def reset_on_second(page):
+        original_poll = page.poll
+
+        def poll():
+            before_seq = page.follow["seq"]
+            original_poll()
+            if before_seq < 2 <= page.follow["seq"]:
+                page.view["rotation"] = 0
+
+        page.poll = poll
+
+    run = follow_run(page_setup=reset_on_second)
+    assert run.result["ok"] is False
+    assert "rotated-view delta changed the display rotation" in run.result["error"]

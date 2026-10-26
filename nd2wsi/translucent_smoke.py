@@ -525,6 +525,12 @@ def stage_follow_post(descriptor, route, body, *, timeout=5):
         return exc.code, reply
 
 
+def _same_orientation(after, before):
+    """Display rotation, mirror and zoom unchanged (the center may move)."""
+    return (after["rotation"] == before["rotation"] and after["flip"] == before["flip"]
+            and math.isclose(after["zoom"], before["zoom"], rel_tol=1e-9))
+
+
 def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, settle=.3, heartbeat_interval=.5,
                           expect_locked=None, pixels=STAGE_FOLLOW_PIXELS, tolerance=STAGE_FOLLOW_TOLERANCE_PX):
     """Follow one authenticated loopback ``delta`` through this overlay's own receiver.
@@ -625,6 +631,9 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
                                      or not state["enabled"] else None)(follow_state()),
                             timeout=follow_timeout, description="overlay page following the delta")
         moved = camera(child)
+        # Judge orientation from this snapshot, before anything restores it.
+        _check(_same_orientation(moved, before),
+               f"Following the delta changed the display rotation, mirror or zoom: {moved}")
         observed = [moved["center"][0] - before["center"][0], moved["center"][1] - before["center"][1]]
         result.update(observed_px=observed, frontend_seq=consumed["seq"], frontend_status=consumed["status"],
                       error_px=max(abs(a - b) for a, b in zip(observed, expected_px)))
@@ -639,7 +648,8 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
         _check(result["duplicate_rejected"], f"Duplicate seq was not rejected: HTTP {status} {result['duplicate_result']}")
         time.sleep(settle)  # Several 50 ms polls of the overlay page.
         after_duplicate, duplicate_state = camera(child), follow_state()
-        result["duplicate_moved"] = max(abs(a - b) for a, b in zip(after_duplicate["center"], moved["center"])) > tolerance
+        result["duplicate_moved"] = (max(abs(a - b) for a, b in zip(after_duplicate["center"], moved["center"])) > tolerance
+                                     or not _same_orientation(after_duplicate, moved))
         _check(not result["duplicate_moved"] and duplicate_state["seq"] == 1
                and duplicate_state["status"] == "following", "Duplicate seq moved the overlay or changed its follow state")
 
@@ -660,6 +670,8 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
                                           or not state["enabled"] else None)(follow_state()),
                                  timeout=follow_timeout, description="overlay page following the rotated-view delta")
             moved2 = camera(child)
+            _check(_same_orientation(moved2, rotated),
+                   f"Following the rotated-view delta changed the display rotation, mirror or zoom: {moved2}")
             observed2 = [moved2["center"][0] - rotated["center"][0], moved2["center"][1] - rotated["center"][1]]
             result.update(rotated_observed_px=observed2,
                           rotated_error_px=max(abs(a - b) for a, b in zip(observed2, expected_px)))

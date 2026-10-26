@@ -12,6 +12,7 @@ import hmac
 import json
 import math
 import secrets
+import select
 import socket
 import sys
 import threading
@@ -77,6 +78,7 @@ class _LocalServer(HTTPServer):
         self._connection_lock = threading.Lock()
         self._active_connection = None
         self._stopping = False
+        self._stalled_reads = 0  # diagnostics/tests: waits that found no data yet
         super().__init__(("127.0.0.1", 0), _Handler)
 
     def get_request(self):
@@ -99,21 +101,17 @@ class _LocalServer(HTTPServer):
         with self._connection_lock:
             self._stopping = True
             connection = self._active_connection
-            if connection is not None:
+            # The worker's reads wait in short select() steps and end once
+            # _stopping is set (_CancellableReader), so the worker leaves its own
+            # socket call before anything closes the socket. On Windows nothing
+            # here touches that socket: Winsock forbids calls such as closesocket
+            # concurrent with another call on the same socket. Elsewhere shutdown
+            # also wakes the worker at once, as before.
+            if connection is not None and sys.platform != "win32":
                 try:
                     connection.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
-                if sys.platform == "win32":
-                    # Windows does not wake a recv() blocked in the worker thread on
-                    # shutdown, so a stalled client would hold close() for the whole
-                    # request timeout. Closing the OS socket aborts that recv. The
-                    # handler's makefile() objects keep socket.close() from doing so,
-                    # hence the base close; the later close_request() is then a no-op.
-                    try:
-                        socket.socket.__base__.close(connection)
-                    except OSError:
-                        pass
         self.shutdown()
         self.server_close()
 
@@ -123,8 +121,78 @@ class _LocalServer(HTTPServer):
         return
 
 
+class _CancellableReader:
+    """Buffered request reader whose waits end when the receiver stops.
+
+    Each wait for data runs in short ``select`` steps, checking the server's stop
+    flag, and still ends after ``timeout`` seconds without data, as the socket
+    timeout did before. The buffer is this object's own, so an empty step never
+    leaves a partly read line behind (a timed-out ``makefile()`` reader can).
+    Provides the ``readline``/``read`` subset ``BaseHTTPRequestHandler`` and
+    ``do_POST`` use.
+    """
+
+    STEP = 0.05
+
+    def __init__(self, connection, server, timeout: float):
+        self._connection, self._server, self._timeout = connection, server, timeout
+        self._buffer = bytearray()
+
+    def _fill(self) -> bool:
+        """Read more bytes; False at end of stream."""
+        deadline = time.monotonic() + self._timeout
+        stalled = False
+        while True:
+            if self._server._stopping:
+                raise ConnectionAbortedError("Receiver is closing")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Request timed out")
+            readable, _, _ = select.select([self._connection], [], [], min(self.STEP, remaining))
+            if not readable:
+                if not stalled:
+                    stalled = True
+                    self._server._stalled_reads += 1
+                continue
+            chunk = self._connection.recv(65536)
+            if not chunk:
+                return False
+            self._buffer += chunk
+            return True
+
+    def _take(self, count: int) -> bytes:
+        data = bytes(self._buffer[:count])
+        del self._buffer[:count]
+        return data
+
+    def readline(self, limit: int = -1) -> bytes:
+        while True:
+            end = self._buffer.find(b"\n")
+            if end >= 0:
+                return self._take(end + 1 if limit < 0 else min(end + 1, limit))
+            if 0 <= limit <= len(self._buffer):
+                return self._take(limit)
+            if not self._fill():
+                return self._take(len(self._buffer))
+
+    def read(self, size: int = -1) -> bytes:
+        while size < 0 or len(self._buffer) < size:
+            if not self._fill():
+                break
+        return self._take(len(self._buffer) if size < 0 else min(size, len(self._buffer)))
+
+    def close(self):
+        self._buffer.clear()
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+
+    def setup(self):
+        super().setup()
+        # Read through the cancellable reader instead of the makefile() one.
+        self.rfile.close()
+        self.rfile = _CancellableReader(self.connection, self.server, self.server.receiver.request_timeout)
     server_version = "StageFollow"
     sys_version = ""
 
