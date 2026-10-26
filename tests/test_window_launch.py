@@ -41,11 +41,14 @@ def test_child_environment_resets_pyinstaller_without_mutating_parent(monkeypatc
     monkeypatch.setenv("PYINSTALLER_RESET_ENVIRONMENT", "0")
     monkeypatch.setenv("ND2WSI_GPU_PYRAMID", "1")
     monkeypatch.delenv("ND2WSI_WINDOW_CHILD", raising=False)
+    monkeypatch.setenv("ND2WSI_WEBVIEW2_RUNTIME", "bundled")
     environment = window_launch.child_environment(app_name="Metal Beta")
     assert environment["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
     assert environment["ND2WSI_WINDOW_CHILD"] == "1"
     assert environment["ND2WSI_APP_NAME"] == "Metal Beta"
     assert environment["ND2WSI_GPU_PYRAMID"] == "1"
+    # A child window renders with the same WebView2 runtime mode as its parent.
+    assert environment["ND2WSI_WEBVIEW2_RUNTIME"] == "bundled"
     assert os.environ["PYINSTALLER_RESET_ENVIRONMENT"] == "0"
     assert "ND2WSI_WINDOW_CHILD" not in os.environ
 
@@ -229,9 +232,14 @@ def test_windows_main_window_gets_the_same_close_guard_without_cocoa(monkeypatch
 def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monkeypatch, tmp_path, argv, role, platform):
     monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path))
+    # Independent of the runner: no registry module, no bundled copy, default mode.
+    monkeypatch.delenv("ND2WSI_WEBVIEW2_RUNTIME", raising=False)
+    monkeypatch.setitem(sys.modules, "winreg", None)
+    monkeypatch.setattr("nd2wsi.webview2_runtime.default_app_root", lambda: tmp_path / "app-root")
     api = SimpleNamespace(_startup_error=None, stop_server_for_update=Mock())
     create = Mock(return_value=(api, object()))
     monkeypatch.setattr(app, "create_app_window", create)
+    # No settings attribute: the system runtime choice must never write one.
     webview = SimpleNamespace(start=Mock())
     monkeypatch.setitem(sys.modules, "webview", webview)
     assert app.main(argv) == 0
@@ -241,6 +249,10 @@ def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monk
     expected = {"private_mode": True}
     if platform == "win32":
         expected["gui"] = "edgechromium"
+        assert api._webview2_runtime == {"kind": "system", "mode": "auto", "path": None, "system_version": None,
+                                         "reason": "no system or bundled runtime found"}
+    else:
+        assert not hasattr(api, "_webview2_runtime")
     webview.start.assert_called_once_with(**expected)
     api.stop_server_for_update.assert_called_once()
 

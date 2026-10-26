@@ -79,6 +79,13 @@ def exercise_independent_window(api, *, timeout=100):
                     or context.get("pid") != result["pid"] or result["pid"] != child.pid
                     or child_root.parent != sessions.resolve() or child_root.name != context.get("id")):
                 raise ValueError("Child did not verify a fresh blank Agent window")
+            from .webview2_runtime import required as webview2_required
+
+            # The child inherits the runtime mode, but its separate browser
+            # process needs its own proof from its own report.
+            child_runtime = (evidence.get("webview2_runtime") or {}).get("main") or {}
+            if webview2_required() and child_runtime.get("bundled") is not True:
+                raise ValueError("Child did not render with the bundled WebView2 runtime")
             record = json.loads((child_root / "session.json").read_text(encoding="utf-8"))
             if (record.get("id") != context["id"] or record.get("role") != "agent"
                     or record.get("pid") != context.get("pid") or record.get("state") != "closed"):

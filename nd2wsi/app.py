@@ -445,6 +445,8 @@ class Api:
         self._httpd = None
         self._updater = None
         self._startup_error = None
+        self._webview2_runtime = None  # RuntimeChoice.report() once main() selects one on Windows
+        self._webview2_init = None  # {"ok", "error"} once the main window's WebView2 starts
         self._window_session = window_session
         self._handoff_state = None
         self._handoff_source = None
@@ -1174,9 +1176,22 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
         report["renderer"] = webview.renderer
         if sys.platform == "win32" and webview.renderer != "edgechromium":
             raise RuntimeError("GUI smoke requires the Edge WebView2 renderer")
+        if sys.platform == "win32":
+            from .webview2_runtime import required as webview2_required
+
+            # The renderer name cannot tell the bundled copy from the system
+            # runtime; the per-window evidence below can.
+            report["webview2_runtime"] = {"selection": getattr(api, "_webview2_runtime", None),
+                                          "required": webview2_required()}
         while time.monotonic() - started < timeout:
             if api._status.startswith("could not open"):
                 raise RuntimeError(api._status)
+            started_webview2 = getattr(api, "_webview2_init", None)
+            if started_webview2 is not None and "webview2_runtime" in report:
+                report["webview2_runtime"]["initialization"] = started_webview2
+            if started_webview2 is not None and not started_webview2.get("ok"):
+                # Fail fast: a WebView2 that cannot start leaves a blank window.
+                raise RuntimeError(f"WebView2 failed to start: {started_webview2.get('error')}")
             result = None
             try:
                 result = window.evaluate_js("""(() => {
@@ -1391,6 +1406,19 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         report.update(result)
                         if not matches_view_state(expected, result.get("observed_display")):
                             raise ValueError("Actual browser display state differs from the requested handoff")
+                    if sys.platform == "win32":
+                        from .translucent_smoke import native_call
+                        from .webview2_runtime import window_evidence
+
+                        # The bridge answered, so CoreWebView2 exists. This
+                        # thread is not the UI thread, which native_call needs.
+                        evidence = window_evidence(window, native_call)
+                        report["webview2_runtime"]["main"] = evidence
+                        if report["webview2_runtime"]["required"] and not evidence.get("bundled"):
+                            report.update(result, ok=False, phase="webview2-runtime",
+                                          error=evidence.get("error") or
+                                          "Main window was not rendered by the bundled WebView2 runtime")
+                            break
                     native_keyboard = _gui_smoke_native_keyboard(api, window, slide=bool(result.get("slide")))
                     report.update(result, native_keyboard=native_keyboard,
                                   ok=native_keyboard["status"] != "failed", phase="complete")
@@ -1402,13 +1430,22 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
 
                         tracing = exercise_translucent_viewer(api, window)
                         report["translucent_viewer"] = tracing
+                        if sys.platform == "win32":
+                            report["webview2_runtime"]["translucent"] = tracing.get("webview2_runtime")
                         if not tracing.get("ok"):
                             report.update(ok=False, phase="translucent-viewer",
                                           error=tracing.get("error", "Translucent viewer check failed"))
+                        elif (sys.platform == "win32" and report["webview2_runtime"]["required"]
+                              and not (tracing.get("webview2_runtime") or {}).get("bundled")):
+                            # Also catches an overlay check that skipped the proof.
+                            report.update(ok=False, phase="translucent-viewer",
+                                          error="Translucent overlay was not rendered by the bundled WebView2 runtime")
                     if report["ok"] and expect_slide and sys.platform == "win32":
                         from .window_smoke import exercise_independent_window
 
-                        independent = exercise_independent_window(api)
+                        # A forced bundled child starts its own cold Fixed Version runtime.
+                        child_timeout = 240 if report.get("webview2_runtime", {}).get("required") else 100
+                        independent = exercise_independent_window(api, timeout=child_timeout)
                         report["independent_window"] = independent
                         if not independent.get("ok"):
                             report.update(ok=False, phase="independent-window",
@@ -1555,6 +1592,26 @@ def main(argv: list[str] | None = None) -> int:
             api._requested_handoff = api._handoff_state
             api._handoff_source = initial.resolve()
         kwargs = {"gui": "edgechromium"} if sys.platform == "win32" else {}
+        if sys.platform == "win32":
+            from .webview2_runtime import select_runtime
+
+            # pywebview reads the runtime folder when webview.start imports its
+            # WinForms backend, so choose before any start. A forced bundled
+            # copy that is missing fails startup here, never silently falls back.
+            api._webview2_runtime = select_runtime(webview).report()
+            _dlog(f"WebView2 runtime: {api._webview2_runtime}")
+            from .webview2_runtime import watch_initialization
+
+            def webview2_started(ok, detail, *, diagnostic=bool(args.gui_smoke)):
+                api._webview2_init = {"ok": ok, "error": detail}
+                if not ok:
+                    _dlog(f"WebView2 initialization failed: {detail}")
+                    if not diagnostic and not api._startup_error:
+                        # Shown after the blank window closes; the smoke reports it itself.
+                        kind = (api._webview2_runtime or {}).get("kind", "system")
+                        api._startup_error = f"Microsoft Edge WebView2 ({kind} runtime) could not start: {detail}"
+
+            watch_initialization(window, webview2_started)
         if window_session is not None:
             kwargs["private_mode"] = True
         _daemonize_pywebview_bridge_threads(webview)
@@ -1566,7 +1623,13 @@ def main(argv: list[str] | None = None) -> int:
             webview.start(lambda: run_browser_replay(api, window, args.browser_replay_report,
                                                     args.benchmark_context, args.benchmark_test_root), **kwargs)
         elif args.gui_smoke:
-            webview.start(lambda: gui_smoke(api, window, expect_slide=initial is not None), **kwargs)
+            # A forced bundled Fixed Version starts cold (and is scanned on first
+            # launch), so the readiness budget grows with the outer limits.
+            from .webview2_runtime import required as webview2_required
+
+            readiness = 180 if sys.platform == "win32" and webview2_required() else 90
+            webview.start(lambda: gui_smoke(api, window, expect_slide=initial is not None,
+                                            timeout=readiness), **kwargs)
         else:
             webview.start(**kwargs)
         if api._startup_error:

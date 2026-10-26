@@ -12,10 +12,16 @@ import pytest
 from nd2wsi import app, window_launch, window_smoke
 from nd2wsi.window_sessions import create_window_session
 
+RUNTIME_CASES = ("bundled-runtime", "system-runtime", "missing-runtime")
 
-@pytest.mark.parametrize("failure", [None, "unclosed", "reused-identity", "wrong-pid", "timeout"])
+
+@pytest.mark.parametrize("failure", [None, "unclosed", "reused-identity", "wrong-pid", "timeout", *RUNTIME_CASES])
 def test_independent_smoke_uses_real_bridge_launch_and_only_owns_its_child(monkeypatch, tmp_path, failure):
     monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("ND2WSI_WEBVIEW2_RUNTIME", raising=False)
+    if failure in RUNTIME_CASES:
+        # The child inherits this mode and must prove it in its own report.
+        monkeypatch.setenv("ND2WSI_WEBVIEW2_RUNTIME", "bundled")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 8, raising=False)
     monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 512, raising=False)
@@ -38,8 +44,11 @@ def test_independent_smoke_uses_real_bridge_launch_and_only_owns_its_child(monke
             context["pid"] += 1
         record = {**context, "state": "ready" if failure == "unclosed" else "closed"}
         (child_root / "session.json").write_text(json.dumps(record), encoding="utf-8")
-        Path(command[4]).write_text(json.dumps({"ok": True, "boot": True, "slide": False,
-                                              "window_context": context}), encoding="utf-8")
+        evidence = {"ok": True, "boot": True, "slide": False, "window_context": context}
+        if failure in ("bundled-runtime", "system-runtime"):
+            evidence["webview2_runtime"] = {"selection": {"kind": "bundled"}, "required": True,
+                                            "main": {"bundled": failure == "bundled-runtime"}}
+        Path(command[4]).write_text(json.dumps(evidence), encoding="utf-8")
         child.wait.side_effect = [subprocess.TimeoutExpired(command, 1), -15] if failure == "timeout" else None
         child.wait.return_value = 0
         return child
@@ -48,15 +57,18 @@ def test_independent_smoke_uses_real_bridge_launch_and_only_owns_its_child(monke
     monkeypatch.setattr(subprocess, "Popen", real_popen)
     try:
         result = window_smoke.exercise_independent_window(api, timeout=1)
-        assert result["ok"] is (failure is None)
+        assert result["ok"] is (failure in (None, "bundled-runtime"))
         assert window_launch.subprocess.Popen is real_popen
         real_popen.assert_called_once()
         assert result["launch"]["command"] == [sys.executable, "--agent-window"]
         assert result["launch"]["creationflags"] == 520
         assert result["launch"]["independent_runtime"] is True
-        if failure is None:
+        if failure in (None, "bundled-runtime"):
             assert result["child_closed"] and result["distinct_process_and_session"]
             assert result["child_session"]["state"] == "closed"
+        if failure in ("system-runtime", "missing-runtime"):
+            assert result["error"] == "Child did not render with the bundled WebView2 runtime"
+            assert "child_gui" not in result
         if failure == "timeout":
             child.terminate.assert_called_once()
             assert result["owned_child_cleanup"] is True

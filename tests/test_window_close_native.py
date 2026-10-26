@@ -430,6 +430,10 @@ def smoke(monkeypatch, tmp_path, win32):
     monkeypatch.setattr(app, "_dlog", Mock())
     monkeypatch.setattr("nd2wsi.translucent_smoke.exercise_translucent_viewer", Mock(return_value={"ok": True}))
     monkeypatch.setattr("nd2wsi.window_smoke.exercise_independent_window", Mock(return_value={"ok": True}))
+    # The fake form has no CoreWebView2; the runtime proof is only required when asked for.
+    monkeypatch.delenv("ND2WSI_WEBVIEW2_RUNTIME", raising=False)
+    monkeypatch.setattr("nd2wsi.webview2_runtime.window_evidence",
+                        Mock(return_value={"bundled": False, "error": "fake"}))
     api, _ = app.create_app_window(None)
     api._close_coordinator._FLUSH_TIMEOUT = 2.0
     return SimpleNamespace(api=api, window=window)
@@ -445,6 +449,21 @@ def test_failed_gui_smoke_force_approves_and_closes_without_waiting(smoke, failu
     report = app.gui_smoke(smoke.api, window, expect_slide=True, timeout=0 if failure == "never-ready" else 90)
     assert time.monotonic() - started < 2
     assert report["ok"] is False
+    assert report["close"]["path"] == "forced"
+    assert window.is_closed and window.close_results == ["closed"]
+    assert not any("nd2wsiPrepareForUpdate" in script for script in window.scripts)
+
+
+def test_unproven_required_webview2_runtime_fails_the_smoke_and_force_closes(smoke, monkeypatch):
+    window = smoke.window
+    window.evaluate_js.return_value = BOOT
+    monkeypatch.setenv("ND2WSI_WEBVIEW2_RUNTIME", "bundled")
+    started = time.monotonic()
+    report = app.gui_smoke(smoke.api, window)
+    assert time.monotonic() - started < 2
+    assert report["ok"] is False and report["phase"] == "webview2-runtime"
+    assert report["error"] == "fake"
+    assert report["webview2_runtime"]["main"] == {"bundled": False, "error": "fake"}
     assert report["close"]["path"] == "forced"
     assert window.is_closed and window.close_results == ["closed"]
     assert not any("nd2wsiPrepareForUpdate" in script for script in window.scripts)

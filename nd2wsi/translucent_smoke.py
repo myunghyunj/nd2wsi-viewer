@@ -459,6 +459,14 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
         _check(camera(child)["rotation"] == source["rotation"] and camera(child)["flip"] == source["flip"],
                "Image orientation was not preserved")
         result["native_initial"] = native_state(child, timeout=timeout)
+        if sys.platform == "win32":
+            from .webview2_runtime import required as webview2_required
+            from .webview2_runtime import window_evidence
+
+            # The overlay is its own WebView2 control: prove its browser process too.
+            result["webview2_runtime"] = window_evidence(child, native_call, timeout=timeout)
+            _check(not webview2_required() or result["webview2_runtime"].get("bundled"),
+                   "Overlay was not rendered by the bundled WebView2 runtime")
         _check(result["native_initial"]["topmost"] and not result["native_initial"]["has_parent"],
                "Overlay is not an independent topmost native window")
         if sys.platform == "darwin":

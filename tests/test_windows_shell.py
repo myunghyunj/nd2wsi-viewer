@@ -67,6 +67,11 @@ def fake_webview(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "nd2wsi.window_smoke.exercise_independent_window", Mock(return_value={"ok": True}),
     )
+    # The WebView2 runtime proof needs a real CoreWebView2; nothing is required by default.
+    monkeypatch.delenv("ND2WSI_WEBVIEW2_RUNTIME", raising=False)
+    monkeypatch.setattr("nd2wsi.webview2_runtime.window_evidence",
+                        Mock(return_value={"bundled": False, "error": "fake"}))
+    monkeypatch.setattr("nd2wsi.webview2_runtime.default_app_root", lambda: tmp_path / "no-bundled-runtime")
     yield webview, window
     window.native.exit_loop()
     assert window.native.errors == []
@@ -130,6 +135,94 @@ def test_gui_smoke_requires_slide_readiness_and_always_closes(fake_webview):
     assert window.evaluate_js.call_count == 3
     window.destroy.assert_called_once()
     assert api._gui_smoke_report is report
+    # Evidence is recorded even when the bundled runtime is not required.
+    assert report["webview2_runtime"] == {"selection": None, "required": False,
+                                          "main": {"bundled": False, "error": "fake"}, "translucent": None}
+
+
+SLIDE_READY = {"bridge": True, "version": "test", "slide": True, "lut_toolbar": {"ok": True}}
+BUNDLED = {"bundled": True, "browser_executable": "C:\\app\\_internal\\webview2-runtime\\msedgewebview2.exe",
+           "browser_version": "156.0.4314.42", "error": None}
+SYSTEM = {"bundled": False, "browser_executable":
+          "C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\156.0.4314.42\\msedgewebview2.exe",
+          "browser_version": "156.0.4314.42", "error": None}
+
+
+@pytest.mark.parametrize("evidence, error", [
+    (SYSTEM, "Main window was not rendered by the bundled WebView2 runtime"),
+    ({**SYSTEM, "error": "WebView2 probe failed: CoreWebView2 is None"}, "WebView2 probe failed: CoreWebView2 is None"),
+])
+def test_gui_smoke_fails_when_the_required_bundled_runtime_did_not_render_the_main_window(
+        fake_webview, monkeypatch, evidence, error):
+    from nd2wsi import translucent_smoke, webview2_runtime
+
+    _, window = fake_webview
+    monkeypatch.setenv("ND2WSI_WEBVIEW2_RUNTIME", "bundled")
+    webview2_runtime.window_evidence.return_value = evidence
+    window.evaluate_js.return_value = SLIDE_READY
+    native_keyboard = Mock(return_value={"status": "not_assessed"})
+    monkeypatch.setattr(app, "_gui_smoke_native_keyboard", native_keyboard)
+    api, _ = app.create_app_window(None)
+    report = app.gui_smoke(api, window, expect_slide=True)
+    assert report["ok"] is False and report["phase"] == "webview2-runtime"
+    assert report["error"] == error
+    assert report["webview2_runtime"]["required"] is True
+    assert report["webview2_runtime"]["main"] == evidence
+    assert "translucent" not in report["webview2_runtime"]
+    # The probe runs off the UI thread through the WinForms dispatcher, once.
+    webview2_runtime.window_evidence.assert_called_once_with(window, translucent_smoke.native_call)
+    native_keyboard.assert_not_called()
+    translucent_smoke.exercise_translucent_viewer.assert_not_called()
+    # A failed smoke never waits on the save handshake.
+    assert report["close"]["path"] == "forced"
+    window.destroy.assert_called_once()
+    assert window.is_closed
+
+
+def test_gui_smoke_passes_when_main_and_overlay_render_with_the_bundled_runtime(fake_webview, monkeypatch):
+    from nd2wsi import translucent_smoke, webview2_runtime, window_smoke
+
+    _, window = fake_webview
+    monkeypatch.setenv("ND2WSI_WEBVIEW2_RUNTIME", "bundled")
+    webview2_runtime.window_evidence.return_value = BUNDLED
+    overlay = {**BUNDLED, "browser_process_id": 7}
+    monkeypatch.setattr(translucent_smoke, "exercise_translucent_viewer",
+                        Mock(return_value={"ok": True, "webview2_runtime": overlay}))
+    window.evaluate_js.return_value = SLIDE_READY
+    api = app.Api(None)
+    api._webview2_runtime = {"kind": "bundled", "mode": "bundled", "path": "C:\\app\\_internal\\webview2-runtime",
+                             "system_version": "156.0.4314.42", "reason": "bundled runtime requested"}
+    report = app.gui_smoke(api, window, expect_slide=True)
+    assert report["ok"] is True and report["phase"] == "complete"
+    assert report["webview2_runtime"] == {"selection": api._webview2_runtime, "required": True,
+                                          "main": BUNDLED, "translucent": overlay}
+    window_smoke.exercise_independent_window.assert_called_once()
+    json.dumps(report)
+
+
+@pytest.mark.parametrize("tracing, error", [
+    ({"ok": True}, "Translucent overlay was not rendered by the bundled WebView2 runtime"),
+    ({"ok": True, "webview2_runtime": SYSTEM}, "Translucent overlay was not rendered by the bundled WebView2 runtime"),
+    # The overlay's own failure is never hidden behind the runtime message.
+    ({"ok": False, "error": "Overlay was not rendered by the bundled WebView2 runtime", "webview2_runtime": SYSTEM},
+     "Overlay was not rendered by the bundled WebView2 runtime"),
+])
+def test_gui_smoke_fails_when_the_required_overlay_proof_is_missing_or_not_bundled(
+        fake_webview, monkeypatch, tracing, error):
+    from nd2wsi import translucent_smoke, webview2_runtime, window_smoke
+
+    _, window = fake_webview
+    monkeypatch.setenv("ND2WSI_WEBVIEW2_RUNTIME", "bundled")
+    webview2_runtime.window_evidence.return_value = BUNDLED
+    monkeypatch.setattr(translucent_smoke, "exercise_translucent_viewer", Mock(return_value=tracing))
+    window.evaluate_js.return_value = SLIDE_READY
+    report = app.gui_smoke(app.Api(None), window, expect_slide=True)
+    assert report["ok"] is False and report["phase"] == "translucent-viewer"
+    assert report["error"] == error
+    assert report["webview2_runtime"]["main"] == BUNDLED
+    assert report["webview2_runtime"]["translucent"] == tracing.get("webview2_runtime")
+    window_smoke.exercise_independent_window.assert_not_called()
+    window.destroy.assert_called_once()
 
 
 def test_gui_smoke_fails_promptly_on_lut_asset_or_clipboard_error(fake_webview):
@@ -656,6 +749,11 @@ def test_main_passes_edge_renderer_and_writes_gui_report(fake_webview, monkeypat
     assert webview.start.call_args.kwargs == {"gui": "edgechromium", "private_mode": True}
     report = json.loads(path.read_text(encoding="utf-8"))
     assert report["ok"] is True and report["phase"] == "complete"
+    # Without a bundled copy the default auto mode keeps the system runtime
+    # and never writes pywebview's runtime setting.
+    assert report["webview2_runtime"]["selection"]["kind"] == "system"
+    assert report["webview2_runtime"]["required"] is False
+    assert "WEBVIEW2_RUNTIME_PATH" not in webview.settings
     # The packaged smoke closes through the real WinForms veto and handshake.
     assert report["close"]["path"] == "coordinated"
     assert window.is_closed and window.close_attempts == 2
@@ -672,3 +770,117 @@ def test_main_reports_missing_webview2_without_blocking_ci(fake_webview, monkeyp
     assert json.loads(path.read_text(encoding="utf-8"))["ok"] is False
     assert "WebView2" in dialog.call_args.args[0]
     assert dialog.call_args.kwargs["show_dialog"] is False
+
+
+def test_main_selects_the_webview2_runtime_before_starting_the_gui(fake_webview, monkeypatch, tmp_path):
+    webview, window = fake_webview
+    window.evaluate_js.return_value = {"bridge": True, "version": "test", "boot": True}
+    order = []
+    selection = {"kind": "bundled", "mode": "auto", "path": "C:\\app\\_internal\\webview2-runtime",
+                 "system_version": None, "reason": "no valid system runtime; using the bundled copy"}
+    select = Mock(side_effect=lambda module: (order.append("select"), SimpleNamespace(report=lambda: selection))[1])
+    monkeypatch.setattr("nd2wsi.webview2_runtime.select_runtime", select)
+    webview.util = SimpleNamespace(Thread=threading.Thread)
+    webview.start = Mock(side_effect=lambda callback, **_kwargs: (order.append("start"), callback()))
+    path = tmp_path / "gui-smoke.json"
+    assert app.main(["--gui-smoke", "--smoke-report", str(path)]) == 0
+    # pywebview reads the runtime folder when start imports its WinForms backend.
+    assert order == ["select", "start"]
+    select.assert_called_once_with(webview)
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert report["ok"] is True
+    assert report["webview2_runtime"]["selection"] == selection
+    assert report["webview2_runtime"]["main"] == {"bundled": False, "error": "fake"}
+
+
+def test_main_reports_an_unusable_bundled_runtime_without_blocking_ci(fake_webview, monkeypatch, tmp_path):
+    webview, _ = fake_webview
+    monkeypatch.setenv("ND2WSI_WEBVIEW2_RUNTIME", "bundled")  # this source tree has no bundled copy
+    webview.start = Mock()
+    dialog = Mock()
+    monkeypatch.setattr(app, "_startup_error", dialog)
+    path = tmp_path / "gui-smoke.json"
+    assert app.main(["--gui-smoke", "--smoke-report", str(path)]) == 4
+    webview.start.assert_not_called()
+    assert "WEBVIEW2_RUNTIME_PATH" not in webview.settings
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert report["ok"] is False
+    assert "does not contain the bundled Microsoft Edge WebView2 runtime" in report["error"]
+    assert "does not contain the bundled" in dialog.call_args.args[0]
+    assert dialog.call_args.kwargs["show_dialog"] is False
+
+
+def test_gui_smoke_fails_fast_when_webview2_cannot_start(fake_webview):
+    _, window = fake_webview
+    api = app.Api(None)
+    api._webview2_init = {"ok": False, "error": "0x80070002 runtime files not found"}
+    window.evaluate_js.return_value = SLIDE_READY
+    report = app.gui_smoke(api, window, expect_slide=True)
+    # A WebView2 that cannot start leaves a blank window: report it, never wait out the timeout.
+    assert report["ok"] is False
+    assert report["error"] == "WebView2 failed to start: 0x80070002 runtime files not found"
+    assert report["webview2_runtime"]["initialization"] == api._webview2_init
+    window.evaluate_js.assert_not_called()
+    window.destroy.assert_called_once()
+
+
+@pytest.mark.parametrize("mode, readiness", [(None, 90), ("bundled", 180)])
+def test_main_gives_a_forced_bundled_smoke_a_longer_readiness_budget(fake_webview, monkeypatch, tmp_path,
+                                                                    mode, readiness):
+    webview, _ = fake_webview
+    if mode:
+        monkeypatch.setenv("ND2WSI_WEBVIEW2_RUNTIME", mode)
+    selection = {"kind": "bundled" if mode else "system", "mode": mode or "auto", "path": None,
+                 "system_version": None, "reason": "test"}
+    monkeypatch.setattr("nd2wsi.webview2_runtime.select_runtime",
+                        Mock(return_value=SimpleNamespace(report=lambda: selection)))
+    seen = {}
+
+    def fake_smoke(api, window, *, expect_slide, timeout):
+        seen["timeout"] = timeout
+        api._gui_smoke_report = {"ok": True}
+        return api._gui_smoke_report
+
+    monkeypatch.setattr(app, "gui_smoke", fake_smoke)
+    webview.start = Mock(side_effect=lambda callback, **_kwargs: callback())
+    assert app.main(["--gui-smoke", "--smoke-report", str(tmp_path / "gui-smoke.json")]) == 0
+    assert seen["timeout"] == readiness
+
+
+def test_main_reports_a_webview2_that_failed_to_start_once_the_blank_window_closes(fake_webview, monkeypatch):
+    webview, window = fake_webview
+    watched = {}
+
+    def watch(target, record):
+        watched.update(window=target, record=record)
+        return True
+
+    monkeypatch.setattr("nd2wsi.webview2_runtime.watch_initialization", watch)
+    webview.start = Mock(side_effect=lambda *_args, **_kwargs: watched["record"](False, "0x8007 access denied"))
+    dialog = Mock()
+    monkeypatch.setattr(app, "_startup_error", dialog)
+    assert app.main([]) == 4
+    assert watched["window"] is window
+    assert dialog.call_args.args[0] == ("Could not start nd2wsi-viewer: Microsoft Edge WebView2 (system runtime) "
+                                        "could not start: 0x8007 access denied")
+    assert dialog.call_args.kwargs["show_dialog"] is True
+
+
+def test_main_smoke_reports_a_webview2_start_failure_in_its_own_report(fake_webview, monkeypatch, tmp_path):
+    webview, window = fake_webview
+    watched = {}
+    monkeypatch.setattr("nd2wsi.webview2_runtime.watch_initialization",
+                        lambda target, record: watched.update(record=record) or True)
+
+    def start(callback, **_kwargs):
+        watched["record"](False, "0x8007 access denied")
+        callback()
+
+    webview.start = Mock(side_effect=start)
+    dialog = Mock()
+    monkeypatch.setattr(app, "_startup_error", dialog)
+    path = tmp_path / "gui-smoke.json"
+    assert app.main(["--gui-smoke", "--smoke-report", str(path)]) == 4
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert report["ok"] is False and report["error"] == "WebView2 failed to start: 0x8007 access denied"
+    window.evaluate_js.assert_not_called()

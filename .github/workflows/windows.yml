@@ -18,7 +18,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-2025
-    timeout-minutes: 60
+    timeout-minutes: 80
     env:
       ND2WSI_SMOKE_LUT_CLIPBOARD: '1'
     steps:
@@ -57,6 +57,8 @@ jobs:
         run: .venv/Scripts/python.exe scripts/fetch_testdata.py
       - name: Windows real-data tests
         run: .venv/Scripts/python.exe -m pytest tests -q -m realdata
+      # The system Evergreen runtime must be present so the packaged smoke
+      # proves that the bundled Fixed Version copy wins over it.
       - name: Prepare Microsoft WebView2
         shell: pwsh
         run: ./packaging/ensure_webview2.ps1
@@ -88,8 +90,112 @@ jobs:
           .venv/Scripts/python.exe packaging/verify_sdpc_codec.py --manifest $codecManifest
           if ($LASTEXITCODE -ne 0) { throw 'Installed SDPC runtime failed verification' }
           "ND2WSI_SDPC_CODEC_MANIFEST=$codecManifest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      # Microsoft offers only the latest builds of two majors, so keep our own
+      # copy of the pinned cab. A restored cab is re-hashed before use.
+      - name: Restore the pinned WebView2 Fixed Version cab
+        id: webview2-cab
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/webview2-fixed/cab
+          key: webview2-fixed-${{ hashFiles('packaging/webview2-fixed-runtime.json') }}
+      - name: Fetch and verify the pinned WebView2 Fixed Version runtime
+        shell: pwsh
+        timeout-minutes: 25
+        env:
+          # Must equal packaging/webview2-fixed-runtime.json, which build_windows.py also reads.
+          WEBVIEW2_VERSION: '156.0.4314.42'
+          WEBVIEW2_URL: https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/074c0930-36ad-4756-9d04-dfe0e503bd94/Microsoft.WebView2.FixedVersionRuntime.156.0.4314.42.x64.cab
+          WEBVIEW2_BYTES: '310135141'
+          WEBVIEW2_SHA256: cb4612ce79a62a0be094301a72f73cf91bb250f5e83dc51886f66a083fc0694f
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $pin = Get-Content -LiteralPath packaging/webview2-fixed-runtime.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($pin.version -cne $env:WEBVIEW2_VERSION -or $pin.url -cne $env:WEBVIEW2_URL -or
+              [string]$pin.bytes -cne $env:WEBVIEW2_BYTES -or $pin.sha256 -cne $env:WEBVIEW2_SHA256) {
+            throw 'windows.yml and packaging/webview2-fixed-runtime.json pin different WebView2 runtimes'
+          }
+          if ($pin.architecture -cne 'x64') { throw 'Only the x64 WebView2 Fixed Version runtime is supported' }
+          $root = Join-Path $env:RUNNER_TEMP 'webview2-fixed'
+          $cabDir = Join-Path $root 'cab'
+          New-Item -ItemType Directory -Force -Path $cabDir | Out-Null
+          $cab = Join-Path $cabDir "$($pin.folder).cab"
+          $cached = (Test-Path -LiteralPath $cab) -and ((Get-Item -LiteralPath $cab).Length -eq [long]$pin.bytes) -and
+            ((Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $pin.sha256)
+          if ($cached) {
+            Write-Host 'Using the cached WebView2 runtime cab (size and SHA-256 match the pin).'
+          }
+          else {
+            if (Test-Path -LiteralPath $cab) { Remove-Item -LiteralPath $cab -Force }
+            $curl = "$env:SystemRoot\System32\curl.exe"
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+              if ((Test-Path -LiteralPath $cab) -and (Get-Item -LiteralPath $cab).Length -gt [long]$pin.bytes) {
+                Remove-Item -LiteralPath $cab -Force
+              }
+              # A stalled transfer (under 100 KB/s for 60 s) or a 20-minute attempt
+              # ends with exit 28 and keeps the partial file, so the next try resumes.
+              & $curl --fail --location --silent --show-error --connect-timeout 30 --speed-limit 102400 --speed-time 60 --max-time 1200 --continue-at - --output $cab $pin.url
+              $curlExit = $LASTEXITCODE
+              if ((Test-Path -LiteralPath $cab) -and (Get-Item -LiteralPath $cab).Length -eq [long]$pin.bytes) { break }
+              Write-Host "WebView2 runtime download attempt $attempt ended with curl exit $curlExit"
+              # 33: the server refused to resume, so restart from the first byte.
+              if ($curlExit -eq 33) { Remove-Item -LiteralPath $cab -Force -ErrorAction SilentlyContinue }
+              if ($attempt -lt 5) { Start-Sleep -Seconds (15 * $attempt) }
+            }
+          }
+          if (-not (Test-Path -LiteralPath $cab)) { throw 'The WebView2 runtime cab was not downloaded' }
+          $length = (Get-Item -LiteralPath $cab).Length
+          if ($length -ne [long]$pin.bytes) { throw "The WebView2 runtime cab is $length bytes, expected $($pin.bytes)" }
+          $hash = (Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -cne $pin.sha256) { throw "The WebView2 runtime cab SHA-256 $hash does not match the pin" }
+          $cabSignature = Get-AuthenticodeSignature -LiteralPath $cab
+          $cabSigner = if ($cabSignature.SignerCertificate) { $cabSignature.SignerCertificate.Subject } else { 'no signer' }
+          Write-Host "Cab Authenticode (logged, not enforced): $($cabSignature.Status); $($cabSignature.StatusMessage); $cabSigner"
+          $dest = Join-Path $root 'expanded'
+          if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+          New-Item -ItemType Directory -Path $dest | Out-Null
+          & "$env:SystemRoot\System32\expand.exe" $cab '-F:*' $dest | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "expand.exe failed with exit $LASTEXITCODE" }
+          $runtime = Join-Path $dest $pin.folder
+          $browser = Join-Path $runtime 'msedgewebview2.exe'
+          if (-not (Test-Path -LiteralPath $browser -PathType Leaf)) { throw "The expanded cab has no $browser" }
+          $versionInfo = (Get-Item -LiteralPath $browser).VersionInfo
+          if ("$($versionInfo.FileVersion)".Trim() -cne $pin.version -or "$($versionInfo.ProductVersion)".Trim() -cne $pin.version) {
+            throw "msedgewebview2.exe is $($versionInfo.FileVersion) / $($versionInfo.ProductVersion), expected $($pin.version)"
+          }
+          foreach ($name in @('msedgewebview2.exe', 'msedge.dll')) {
+            $path = Join-Path $runtime $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "The WebView2 runtime has no $name" }
+            $signature = Get-AuthenticodeSignature -LiteralPath $path
+            if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or
+                $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
+              throw "$name does not have a valid Microsoft Corporation Authenticode signature ($($signature.Status))"
+            }
+            Write-Host "${name}: $($signature.Status); $($signature.SignerCertificate.Subject)"
+          }
+          $files = @(Get-ChildItem -LiteralPath $runtime -Recurse -File -Force)
+          $otherImages = @($files | Where-Object { $_.Extension -in @('.exe', '.dll') -and $_.Name -notin @('msedgewebview2.exe', 'msedge.dll') })
+          $notValid = @($otherImages | Where-Object { (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status -ne 'Valid' })
+          Write-Host "Runtime files: $($files.Count); other exe/dll: $($otherImages.Count); not Valid (logged, not enforced): $($notValid.Count)"
+          foreach ($item in $notValid) { Write-Host "  not Valid: $([IO.Path]::GetRelativePath($runtime, $item.FullName))" }
+          $notices = @($files | Where-Object { $_.Name -match 'license|notice|eula' })
+          Write-Host "Runtime license/notice/EULA files: $($notices.Count)"
+          foreach ($item in $notices) { Write-Host "  $([IO.Path]::GetRelativePath($runtime, $item.FullName))" }
+          "ND2WSI_WEBVIEW2_FIXED_RUNTIME=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Save the pinned WebView2 Fixed Version cab
+        if: steps.webview2-cab.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/webview2-fixed/cab
+          key: webview2-fixed-${{ hashFiles('packaging/webview2-fixed-runtime.json') }}
       - name: Build executable and require packaged headless and GUI smoke
-        run: .venv/Scripts/python.exe packaging/build_windows.py --smoke-file docs/example_cell.nd2
+        shell: pwsh
+        # Step level only: the pytest steps above must not inherit the forced mode.
+        env:
+          ND2WSI_WEBVIEW2_RUNTIME: bundled
+        run: |
+          .venv/Scripts/python.exe packaging/build_windows.py --smoke-file docs/example_cell.nd2 --webview2-fixed-runtime "$env:ND2WSI_WEBVIEW2_FIXED_RUNTIME"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows build or packaged smoke failed' }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-portable
@@ -98,6 +204,8 @@ jobs:
             dist/windows/nd2wsi-viewer-*-windows-x64.zip.sha256
           if-no-files-found: error
           retention-days: 30
+          # The ZIP is already deflated.
+          compression-level: 0
       - uses: actions/upload-artifact@v4
         with:
           name: sdpc-codec-sources-windows-x64
@@ -132,7 +240,8 @@ jobs:
           - runner: windows-11-arm
             platform: arm64-emulation
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    # Three packaged runs: headless, bundled GUI and the system-runtime negative control.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -145,15 +254,19 @@ jobs:
         with:
           name: windows-smoke-fixture
           path: testdata
+      # The system Evergreen runtime must be present so the verification
+      # proves that the bundled Fixed Version copy wins over it.
       - name: Prepare Microsoft WebView2
         shell: pwsh
         run: ./packaging/ensure_webview2.ps1
       - name: Verify the shipped EXE with Korean and space-containing paths
         shell: pwsh
+        env:
+          ND2WSI_WEBVIEW2_RUNTIME: bundled
         run: |
           $archive = @(Get-ChildItem -LiteralPath dist/windows -Filter '*.zip')
           if ($archive.Count -ne 1) { throw 'Expected exactly one portable ZIP' }
-          ./packaging/verify_windows.ps1 -Archive $archive[0].FullName -SmokeFile testdata/example_cell.nd2
+          ./packaging/verify_windows.ps1 -Archive $archive[0].FullName -SmokeFile testdata/example_cell.nd2 -RequireBundledWebView2
       - uses: actions/upload-artifact@v4
         if: always()
         with:
