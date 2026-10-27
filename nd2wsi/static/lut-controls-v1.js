@@ -38,6 +38,31 @@
     return request;
   }
 
+  // One native-trackpad listener per pane: it hit-tests once and hands the
+  // event to the channel canvas under the pointer, rather than every channel
+  // widget hit-testing each message itself.
+  const nativeScrollRoutes = new WeakMap(); // window -> WeakMap(canvas -> handler)
+
+  function routeNativeScroll({ window, document, protocolVersion }, canvas, handler) {
+    let routes = nativeScrollRoutes.get(window);
+    if (!routes) {
+      routes = new WeakMap();
+      nativeScrollRoutes.set(window, routes);
+      const onNativeLutScroll = (ev) => {
+        if (ev.origin !== window.location.origin || ev.source !== window.parent) return;
+        const data = ev.data;
+        if (data?.nd2wsi !== "native-trackpad" || data.version !== protocolVersion) return;
+        routes.get(document.elementFromPoint(data.clientX, data.clientY))?.(data);
+      };
+      window.addEventListener("message", onNativeLutScroll);
+      window.addEventListener("pagehide", () => {
+        window.removeEventListener("message", onNativeLutScroll);
+        nativeScrollRoutes.delete(window);
+      }, { once: true });
+    }
+    routes.set(canvas, handler);
+  }
+
   function createWidget({
     channel: ch, dtype, initialLut = null, autoRange: initialAutoRange = false,
     label: winLabel, width, document, window, protocolVersion,
@@ -326,16 +351,10 @@
       ev.preventDefault();
       ev.stopPropagation();
     });
-    const onNativeLutScroll = (ev) => {
-      if (ev.origin !== window.location.origin || ev.source !== window.parent) return;
-      const data = ev.data;
-      if (data?.nd2wsi !== "native-trackpad" || data.version !== protocolVersion) return;
-      if (document.elementFromPoint(data.clientX, data.clientY) !== canvas) return;
+    routeNativeScroll({ window, document, protocolVersion }, canvas, (data) => {
       // AppKit scrollingDeltaX has the opposite sign from DOM WheelEvent.
       navigateWheel(-Number(data.deltaX || 0), 0, data.clientX - canvas.getBoundingClientRect().left);
-    };
-    window.addEventListener("message", onNativeLutScroll);
-    window.addEventListener("pagehide", () => window.removeEventListener("message", onNativeLutScroll), { once: true });
+    });
 
     function drag(ev) {
       const p = pt(ev);

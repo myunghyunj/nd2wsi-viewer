@@ -113,3 +113,56 @@ def test_scalebar_refreshes_on_rotation_flip_resize_and_viewport_changes():
     viewport = source[source.index('viewer.addHandler("update-viewport"'):
                       source.index('viewer.addHandler("open", renderAnnotations)')]
     assert "updateScalebar(" in viewport
+
+
+WRITES = r"""
+const fs = require('fs'), vm = require('vm');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const writes = [];
+function watched(name, target, keys) {
+  const values = {};
+  for (const key of keys) Object.defineProperty(target, key, {
+    get: () => values[key] ?? '', set: v => { writes.push(name + '.' + key); values[key] = String(v); }});
+  return target;
+}
+const nodes = {scalebar: {style: watched('bar', {}, ['display', 'width'])},
+  'scalebar-label': watched('label', {}, ['textContent'])};
+let zoom = 1, pixelSize = [0.5, 0.5];
+const context = {
+  window: {devicePixelRatio: 2}, $: id => nodes[id], pixelSize: () => pixelSize,
+  state: {viewer: {viewport: {getContainerSize: () => ({x: 800, y: 600})}}, plate: null},
+  viewerElementToImagePoint: p => ({x: p.x / zoom, y: p.y / zoom}),
+};
+vm.createContext(context);
+const start = source.indexOf('function screenHorizontalUmPerCssPixel(');
+vm.runInContext(source.slice(start, source.indexOf('/* ---- tools: ROI select', start)), context);
+const step = change => { change(); writes.length = 0; context.updateScalebar(zoom); return writes.slice(); };
+process.stdout.write(JSON.stringify({
+  first: step(() => {}), pan: step(() => {}), zoom: step(() => { zoom = 1.01; }),
+  label: step(() => { zoom = 4; }), hidden: step(() => { pixelSize = null; }),
+  stillHidden: step(() => {}), restored: step(() => { pixelSize = [0.5, 0.5]; }),
+}));
+"""
+
+
+def test_scalebar_writes_only_what_changed_between_frames():
+    result = subprocess.run([NODE, "-e", WRITES, str(APP)], check=True, capture_output=True,
+                            text=True, encoding="utf-8", timeout=20)
+    out = json.loads(result.stdout)
+    assert out["first"] == ["bar.display", "bar.width", "label.textContent"]
+    # a pan redraws every frame at the same scale and writes nothing
+    assert out["pan"] == []
+    assert out["zoom"] == ["bar.width"]
+    assert out["label"] == ["bar.width", "label.textContent"]
+    assert out["hidden"] == ["bar.display", "label.textContent"]
+    assert out["stillHidden"] == []
+    assert out["restored"] == ["bar.display", "label.textContent"]
+
+
+def test_animation_frames_leave_the_scalebar_to_the_update_viewport_handler():
+    source = APP.read_text(encoding="utf-8")
+    for event in ("animation", "animation-finish"):
+        start = source.index(f'viewer.addHandler("{event}", () => {{')
+        handler = source[start:source.index("\n  });", start)]
+        assert "updateReadout({ scalebar: false })" in handler
+        assert "updateScalebar(" not in handler

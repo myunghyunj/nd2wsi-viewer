@@ -63,6 +63,45 @@ def test_real_app_adapter_freezes_channels_routes_native_scroll_and_batches_shif
     assert out["listeners"] == 0
 
 
+DELEGATED = r"""
+const path=require('path');
+const L=require(path.join(process.argv[1],'lut-controls-v1.js'));
+const context2d=new Proxy({},{get:(o,k)=>o[k]||(()=>{})});
+const handlers={message:[],pagehide:[]};let hits=0,target=null;
+function node(tag){return {tag,style:{},attrs:{},children:[],append(...xs){this.children.push(...xs)},
+  setAttribute(k,v){this.attrs[k]=v},addEventListener(){},getContext:()=>context2d,
+  getBoundingClientRect:()=>({left:0,top:0})};}
+const parent={};
+const window={devicePixelRatio:1,location:{origin:'https://viewer.test'},parent,
+  addEventListener:(type,fn)=>handlers[type].push(fn),
+  removeEventListener:(type,fn)=>handlers[type]=handlers[type].filter(f=>f!==fn)};
+const document={createElement:node,elementFromPoint:()=>{hits++;return target;}};
+const scrolled=[];
+const widgets=[0,1,2,3].map(i=>L.createWidget({channel:{window:{min:0,max:4095,start:0,end:4095}},
+  dtype:'uint16',label:{textContent:''},width:240,document,window,protocolVersion:2,inkColor:()=>'',currentTheme:()=>'dark',
+  fmtInt:String,onChange(){},onFlush(){},onManualAxis:()=>scrolled.push(i)}));
+const canvases=widgets.map(w=>w.element.children[0]);
+const send=data=>handlers.message.forEach(fn=>fn({origin:'https://viewer.test',source:parent,
+  data:{nd2wsi:'native-trackpad',version:2,clientX:120,clientY:40,deltaX:-30,...data}}));
+const listeners=handlers.message.length;
+target=canvases[2];send({});const one={hits,scrolled:[...scrolled]};
+target=null;send({});const outside={hits,scrolled:[...scrolled]};
+handlers.pagehide.forEach(fn=>fn());
+process.stdout.write(JSON.stringify({listeners,one,outside,after:handlers.message.length}));
+"""
+
+
+def test_native_trackpad_events_hit_test_once_for_every_channel_widget():
+    result = subprocess.run([NODE, "-e", DELEGATED, str(STATIC)], check=True,
+                            capture_output=True, text=True, timeout=20)
+    out = json.loads(result.stdout)
+    # four channel widgets share one listener and one hit test per message
+    assert out["listeners"] == 1
+    assert out["one"] == {"hits": 1, "scrolled": [2]}
+    assert out["outside"] == {"hits": 2, "scrolled": [2]}
+    assert out["after"] == 0
+
+
 def test_browser_modules_load_before_application_without_commonjs_or_dom_side_effects():
     index = (STATIC / "index.html").read_text(encoding="utf-8")
     modules = {

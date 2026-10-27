@@ -687,12 +687,14 @@ function buildViewer() {
     if (!state.viewportRelay.reopening) postViewportState("user");
     refreshAstromapPanel();
   });
+  // OpenSeadragon raises update-viewport in the same frame as both of these,
+  // and that handler redraws the scale bar.
   viewer.addHandler("animation", () => {
-    updateReadout();
+    updateReadout({ scalebar: false });
     scheduleViewportState();
   });
   viewer.addHandler("animation-finish", () => {
-    updateReadout();
+    updateReadout({ scalebar: false });
     scheduleViewportState();
   });
   viewer.addHandler("update-viewport", () => {
@@ -1274,32 +1276,38 @@ function activeLevel() {
   return levelForDensity(deviceZoom());
 }
 
-function updateReadout() {
+// Text written on every animation frame is written only when it changes:
+// an unchanged write still replaces the text node and invalidates style.
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function updateReadout({ scalebar = true } = {}) {
   if (state.plate && state.plate.focus === null) {
-    updateGridReadout();
+    updateGridReadout(scalebar);
     return;
   }
   const dz = deviceZoom();
-  $("zoom-val").textContent =
-    (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %" + (Math.abs(dz - 1) < 0.005 ? " · 1:1" : "");
+  setText($("zoom-val"),
+    (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %" + (Math.abs(dz - 1) < 0.005 ? " · 1:1" : ""));
   const act = activeLevel();
   state.info.levels.forEach((lv, k) => {
     $("lamp-" + lv.path).classList.toggle("active", k === act);
   });
-  updateScalebar(currentImageZoom());
+  if (scalebar) updateScalebar(currentImageZoom());
 }
 
-function updateGridReadout() {
+function updateGridReadout(scalebar = true) {
   // in grid mode the readouts describe a site cell, not the hidden viewer
   const iz = plateCellZoom();
   if (!iz) return;
   const dz = iz * (window.devicePixelRatio || 1);
-  $("zoom-val").textContent = (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %";
+  setText($("zoom-val"), (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %");
   const act = levelForDensity(dz);
   state.info.levels.forEach((lv, k) => {
     $("lamp-" + lv.path).classList.toggle("active", k === act);
   });
-  updateScalebar(iz);
+  if (scalebar) updateScalebar(iz);
 }
 
 function updateCursor(img, elementPt) {
@@ -1472,6 +1480,10 @@ function screenHorizontalUmPerCssPixel() {
   return Number.isFinite(length) && length > 0 ? length / cssLength : null;
 }
 
+// What the scale bar shows. A pan redraws every frame at an unchanged scale;
+// the browser normalizes a written width, so the last value is kept here.
+const scalebarShown = { display: null, width: null, label: null };
+
 function updateScalebar(iz) {
   const ps = pixelSize();
   // The plate grid is unrotated <img> cells, not the hidden OSD viewport.
@@ -1479,16 +1491,20 @@ function updateScalebar(iz) {
     ? ps && ps.every((value) => Number.isFinite(value) && value > 0) && iz > 0
       ? ps[1] / iz : null
     : screenHorizontalUmPerCssPixel();
-  if (!(umPerScreenPx > 0)) {
-    $("scalebar").style.display = "none";
-    $("scalebar-label").textContent = "";
-    return;
+  let shown = { display: "none", width: scalebarShown.width, label: "" };
+  if (umPerScreenPx > 0) {
+    const target = 110 * umPerScreenPx; // aim for a ~110 px bar
+    const nice = niceLength(target);
+    shown = {
+      display: "", width: nice / umPerScreenPx + "px",
+      label: nice >= 1000 ? nice / 1000 + " mm" : nice + " µm",
+    };
   }
-  const target = 110 * umPerScreenPx; // aim for a ~110 px bar
-  const nice = niceLength(target);
-  $("scalebar").style.display = "";
-  $("scalebar").style.width = nice / umPerScreenPx + "px";
-  $("scalebar-label").textContent = nice >= 1000 ? nice / 1000 + " mm" : nice + " µm";
+  const bar = $("scalebar");
+  if (shown.display !== scalebarShown.display) bar.style.display = shown.display;
+  if (shown.width !== scalebarShown.width) bar.style.width = shown.width;
+  if (shown.label !== scalebarShown.label) $("scalebar-label").textContent = shown.label;
+  Object.assign(scalebarShown, shown);
 }
 
 function niceLength(um) {
@@ -5208,9 +5224,12 @@ function buildPlate() {
   renderPlateAuto();
   if (info.Z > 1) loadPlateFocus();
 
-  window.addEventListener("resize", layoutPlate);
+  // #plate is inset in the stage, so its observer sees every window resize
+  // too; the window listener is only the fallback, not a second layout pass.
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(() => layoutPlate()).observe($("plate"));
+  } else {
+    window.addEventListener("resize", layoutPlate);
   }
   layoutPlate();
   paintPlate();
