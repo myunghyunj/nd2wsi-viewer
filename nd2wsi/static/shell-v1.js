@@ -20,7 +20,9 @@ const pairPicker = { open: false, mode: "start", replaceSid: null };
 
 /* Script errors in the shell and its slide panes are kept in the desktop app's
    session log. Reporting never throws, sends at most 20 reports a minute and
-   holds a few until the pywebview bridge is ready; a browser shell drops them. */
+   holds a few until the pywebview bridge is ready; a browser shell drops them.
+   Errors from the scripts loaded before this one were held by
+   early-errors-v1.js and are relayed first. */
 const clientErrors = { sent: [], pending: [], limit: 20, periodMs: 60000, maxPending: 10 };
 
 function clientErrorText(value, limit) {
@@ -78,6 +80,9 @@ window.addEventListener("error", (event) => {
 window.addEventListener("unhandledrejection", (event) => {
   relayClientError({ source: "shell", ...describeClientError("unhandledrejection", event.reason) });
 });
+for (const early of window.Nd2EarlyErrors?.drain() || []) {
+  relayClientError({ source: "shell", ...describeClientError(early.kind, early.error, early.event) });
+}
 window.addEventListener("pywebviewready", () => {
   for (const payload of clientErrors.pending.splice(0)) {
     try {

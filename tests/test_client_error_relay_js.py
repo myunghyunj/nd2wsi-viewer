@@ -16,6 +16,7 @@ const fs = require('fs'), vm = require('vm');
 const root = process.argv[1], origin = 'http://127.0.0.1:5123';
 const shellSource = fs.readFileSync(root + '/shell-v1.js', 'utf8');
 const appSource = fs.readFileSync(root + '/app.js', 'utf8');
+const earlySource = fs.readFileSync(root + '/early-errors-v1.js', 'utf8');
 function between(source, start, end) {
   const from = source.indexOf(start), to = source.indexOf(end, from);
   if (from < 0 || to < 0) throw Error('Missing production code: ' + start);
@@ -35,8 +36,10 @@ function fakeWindow(extra = {}) {
   return {listeners, ...extra, addEventListener(kind, callback) {
     if (!listeners.has(kind)) listeners.set(kind, []);
     listeners.get(kind).push(callback);
+  }, removeEventListener(kind, callback) {
+    listeners.set(kind, (listeners.get(kind) || []).filter(item => item !== callback));
   }, emit(kind, event) {
-    for (const callback of listeners.get(kind) || []) callback(event);
+    for (const callback of [...(listeners.get(kind) || [])]) callback(event);
   }};
 }
 
@@ -46,13 +49,19 @@ const bridge = {log_client_event(payload) { calls.push(payload); return Promise.
 const frames = new Map();
 const shell = vm.createContext({window:shellWindow, location:{origin}, frames, Date:FakeDate,
   VIEWPORT_PROTOCOL_VERSION:2});
+// A prelude runs while only early-errors-v1.js has loaded, as the shell's
+// controllers do before shell-v1.js.
+if (process.argv[3]) {
+  vm.runInContext(earlySource, shell);
+  vm.runInContext('(()=>{' + process.argv[3] + '})()', vm.createContext({shellWindow, origin, Error, TypeError}));
+}
 vm.runInContext(between(shellSource, 'const clientErrors = {', 'let metalOpening = false;'), shell);
 vm.runInContext(production(shellSource, 'frameSidForSource'), shell);
 const message = shellSource.indexOf('window.addEventListener("message", (event) => {');
 vm.runInContext(shellSource.slice(message, shellSource.indexOf('\n});', message) + 4), shell);
 
 const posted = [];
-function makePane(sid, {standalone = false, failPost = false} = {}) {
+function makePane(sid, {standalone = false, failPost = false, early = null} = {}) {
   const pane = fakeWindow();
   pane.parent = standalone ? pane : {postMessage(data, target) {
     if (failPost) throw Error('detached frame');
@@ -61,6 +70,10 @@ function makePane(sid, {standalone = false, failPost = false} = {}) {
   }};
   if (!standalone) frames.set(sid, {contentWindow:pane});
   const context = vm.createContext({window:pane, location:{origin}, Date:FakeDate});
+  if (early) {
+    vm.runInContext(earlySource, context);
+    early(pane);
+  }
   vm.runInContext(between(appSource, 'const paneErrorsSent = [];',
     'window.Nd2ShortcutRouter?.localizeLabels(document);'), context);
   return {pane, context};
@@ -78,8 +91,8 @@ Promise.resolve(vm.runInContext('(async()=>{' + process.argv[2] + '})()', vm.cre
 """
 
 
-def run(body):
-    result = subprocess.run([NODE, "-e", SCRIPT, str(STATIC), body],
+def run(body, prelude=""):
+    result = subprocess.run([NODE, "-e", SCRIPT, str(STATIC), body, prelude],
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -186,3 +199,59 @@ def test_panes_rate_limit_and_never_throw_or_report_when_standalone():
     assert result["total"] == 21 and result["last"] == "pane later"
     assert result["sources"] == ["a"]
     assert result["relayed"] is False
+
+
+def test_pane_errors_raised_before_app_js_loads_are_held_and_sent_first():
+    out = run("""
+      shellWindow.pywebview = {api: bridge};
+      const {pane} = makePane('a', {early(pane) {
+        // A controller script fails while it loads, before app.js exists.
+        pane.emit('error', {message:'Uncaught ReferenceError: ResizeObserver is not defined',
+          error:new ReferenceError('ResizeObserver is not defined'),
+          filename:origin + '/token/static/floating-windows-v1.js', lineno:41, colno:5});
+        pane.emit('unhandledrejection', {reason:new Error('early rejection')});
+        for (let index = 0; index < 12; index++) pane.emit('error', {message:'early ' + index, error:null});
+      }});
+      pane.emit('error', errorEvent('after load', null));
+      return {posted:posted.map(item => item.data.message), first:calls[0],
+        listeners:pane.listeners.get('error').length, rejections:pane.listeners.get('unhandledrejection').length};
+    """)
+    result = out["result"]
+    # Ten are held; app.js sends them before anything it sees itself.
+    assert result["posted"] == ["Uncaught ReferenceError: ResizeObserver is not defined", "early rejection",
+                                *[f"early {index}" for index in range(8)], "after load"]
+    assert result["first"]["source"] == "pane"
+    assert result["first"]["where"] == "http://127.0.0.1:5123/token/static/floating-windows-v1.js:41:5"
+    assert "ResizeObserver" in result["first"]["stack"]
+    # Draining removes the early listeners, so nothing is reported twice.
+    assert result["listeners"] == 1 and result["rejections"] == 1
+
+
+def test_shell_errors_raised_before_shell_v1_loads_reach_the_bridge_once_it_is_ready():
+    out = run("""
+      const early = calls.length;
+      shellWindow.pywebview = {api: bridge};
+      shellWindow.emit('pywebviewready', {});
+      shellWindow.emit('error', {message:'later', error:null});
+      return {early, calls:calls.map(call => [call.source, call.kind, call.message, call.where]),
+        listeners:shellWindow.listeners.get('error').length};
+    """, prelude="""
+      shellWindow.emit('error', {message:'Uncaught TypeError: align failed', error:new TypeError('align failed'),
+        filename:origin + '/token/static/align-v1.js', lineno:3, colno:9});
+      shellWindow.emit('unhandledrejection', {reason:'no bridge yet'});
+    """)
+    result = out["result"]
+    assert out["unhandled"] == 0 and result["early"] == 0
+    assert result["calls"] == [
+        ["shell", "error", "Uncaught TypeError: align failed", "http://127.0.0.1:5123/token/static/align-v1.js:3:9"],
+        ["shell", "unhandledrejection", "no bridge yet", ""],
+        ["shell", "error", "later", ""],
+    ]
+    assert result["listeners"] == 1
+
+
+def test_pages_load_the_early_error_holder_before_any_other_script():
+    for page in ("index.html", "shell.html"):
+        html = (STATIC / page).read_text(encoding="utf-8")
+        first = html.index("<script")
+        assert html.index("early-errors-v1.js") < html.index(">", first) + 1, page

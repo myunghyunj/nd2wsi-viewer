@@ -2,7 +2,9 @@
 "use strict";
 
 /* Script errors in this pane go to the shell, which keeps them in the desktop
-   app's session log. Reporting never throws and sends at most 20 a minute. */
+   app's session log. Reporting never throws and sends at most 20 a minute;
+   errors from the scripts loaded before this one were held by
+   early-errors-v1.js and are sent first. */
 const paneErrorsSent = [];
 function relayPaneError(kind, error, event = null) {
   try {
@@ -32,6 +34,7 @@ function relayPaneError(kind, error, event = null) {
 }
 window.addEventListener("error", (event) => relayPaneError("error", event.error, event));
 window.addEventListener("unhandledrejection", (event) => relayPaneError("unhandledrejection", event.reason));
+for (const early of window.Nd2EarlyErrors?.drain() || []) relayPaneError(early.kind, early.error, early.event);
 
 window.Nd2ShortcutRouter?.localizeLabels(document);
 
