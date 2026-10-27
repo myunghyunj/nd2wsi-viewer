@@ -25,6 +25,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PROTOCOL = "nd2wsi-stage-follow/1"
 MAX_BODY_BYTES = 4096
+# How long an error reply waits for the rest of a body it rejected unread. Closing
+# a socket with unread input resets the connection on Windows, which can discard
+# the reply before the client reads it.
+ERROR_DRAIN_SECONDS = 0.5
+# The most an error reply takes in when the body's length cannot be trusted.
+UNKNOWN_BODY_DRAIN_BYTES = 65536
 MAX_SEQUENCE = 2**53 - 1
 
 
@@ -183,6 +189,34 @@ class _CancellableReader:
                 break
         return self._take(len(self._buffer) if size < 0 else min(size, len(self._buffer)))
 
+    def discard(self, size: int, seconds: float, *, until_quiet: bool = False) -> None:
+        """Drop up to ``size`` request bytes that arrive within ``seconds``; never raises.
+
+        One deadline bounds the whole wait, so a trickling client cannot hold the
+        single worker, and the wait ends within one step once the receiver stops.
+        With ``until_quiet`` (a body of unknown length) it also ends at the first
+        step in which nothing arrives.
+        """
+        deadline = time.monotonic() + seconds
+        dropped = min(size, len(self._buffer))
+        del self._buffer[:dropped]
+        while dropped < size and not self._server._stopping:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                readable, _, _ = select.select([self._connection], [], [], min(self.STEP, remaining))
+                if not readable:
+                    if until_quiet:
+                        return
+                    continue
+                chunk = self._connection.recv(min(65536, size - dropped))
+            except OSError:
+                return
+            if not chunk:
+                return
+            dropped += len(chunk)
+
     def close(self):
         self._buffer.clear()
 
@@ -216,8 +250,19 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _discard_unread_body(self):
+        # A single, well-formed Content-Length is the only body size worth trusting.
+        lengths = self.headers.get_all("Content-Length", [])
+        if (len(lengths) == 1 and not self.headers.get_all("Transfer-Encoding")
+                and lengths[0].isascii() and lengths[0].isdecimal() and len(lengths[0]) <= 5):
+            self.rfile.discard(int(lengths[0]), ERROR_DRAIN_SECONDS)
+        else:
+            # Chunked, duplicate or invalid lengths: take in what the client has sent.
+            self.rfile.discard(UNKNOWN_BODY_DRAIN_BYTES, ERROR_DRAIN_SECONDS, until_quiet=True)
+
     def do_POST(self):
         receiver = self.server.receiver
+        body_read = False
         try:
             if self.headers.get_all("Origin"):
                 raise _RequestError(403, "Browser origins are not allowed")
@@ -244,6 +289,7 @@ class _Handler(BaseHTTPRequestHandler):
                     or content_types[0].split(";", 1)[0].strip().lower() != "application/json"):
                 raise _RequestError(415, "Expected application/json")
             raw = self.rfile.read(length)
+            body_read = True
             if len(raw) != length:
                 raise _RequestError(400, "Incomplete request body")
             try:
@@ -258,6 +304,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(200, result)
         except _RequestError as exc:
             self._reply(exc.status, {"error": str(exc)})
+            # Reply first, then take in the rejected body so closing sends FIN, not RST.
+            if not body_read:
+                self._discard_unread_body()
         except (TimeoutError, OSError):
             self._reply(408, {"error": "Request timed out"})
 

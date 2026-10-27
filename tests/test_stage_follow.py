@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import http.client
 import json
+import select
 import socket
 import time
 from urllib.parse import urlsplit
 
 import pytest
 
+from nd2wsi import stage_follow
 from nd2wsi.stage_follow import MAX_BODY_BYTES, MAX_SEQUENCE, StageFollowReceiver
 
 
@@ -238,6 +240,106 @@ def test_close_releases_listener_and_receiver_cannot_restart():
     url = urlsplit(descriptor["url"])
     with pytest.raises(OSError):
         socket.create_connection((url.hostname, url.port), timeout=0.5)
+
+
+def _rejected_request(descriptor, body_length):
+    """Raw headers of a wrong-token POST whose body has not been sent yet."""
+    url = urlsplit(descriptor["url"])
+    connection = socket.create_connection((url.hostname, url.port), timeout=2)
+    connection.sendall((f"POST /heartbeat HTTP/1.0\r\nHost: {url.netloc}\r\n"
+                        "Authorization: Bearer wrong\r\nContent-Type: application/json\r\n"
+                        f"Content-Length: {body_length}\r\n\r\n").encode())
+    return connection
+
+
+def _read_reply(connection):
+    response = http.client.HTTPResponse(connection)
+    response.begin()
+    reply = response.status, json.loads(response.read())
+    response.close()
+    return reply
+
+
+def _closed_within(connection, seconds):
+    """True once the peer has closed (EOF) within ``seconds``."""
+    readable, _, _ = select.select([connection], [], [], seconds)
+    return bool(readable) and connection.recv(1) == b""
+
+
+def test_error_reply_takes_in_the_rejected_body_before_closing(monkeypatch):
+    # Closing with the body still unread makes Windows reset the connection, which
+    # can discard the 401 before the client reads it (WinError 10053).
+    monkeypatch.setattr(stage_follow, "ERROR_DRAIN_SECONDS", 5)
+    receiver = StageFollowReceiver()
+    descriptor = receiver.start()
+    body = json.dumps(heartbeat(descriptor)).encode()
+    connection = _rejected_request(descriptor, len(body))
+    try:
+        status, reply = _read_reply(connection)
+        assert status == 401 and "token" in reply["error"]
+        # The reply came first; the connection stays open for the body ...
+        assert not _closed_within(connection, 0.2)
+        connection.sendall(body)
+        # ... and closes as soon as it arrives, long before the deadline.
+        assert _closed_within(connection, 2)
+    finally:
+        connection.close()
+        receiver.close()
+
+
+def test_error_reply_takes_in_a_body_of_unknown_length(monkeypatch):
+    # A chunked body has no trusted length; the reply still waits for what the
+    # client sends, ending at the first step in which nothing arrives.
+    monkeypatch.setattr(stage_follow, "ERROR_DRAIN_SECONDS", 5)
+    monkeypatch.setattr(stage_follow._CancellableReader, "STEP", 0.5)
+    receiver = StageFollowReceiver()
+    descriptor = receiver.start()
+    url = urlsplit(descriptor["url"])
+    connection = socket.create_connection((url.hostname, url.port), timeout=2)
+    try:
+        connection.sendall((f"POST /heartbeat HTTP/1.0\r\nHost: {url.netloc}\r\n"
+                            f"Authorization: Bearer {descriptor['token']}\r\n"
+                            "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n").encode())
+        status, reply = _read_reply(connection)
+        assert status == 400 and "Transfer-Encoding" in reply["error"]
+        assert not _closed_within(connection, 0.2)
+        connection.sendall(json.dumps(heartbeat(descriptor)).encode())
+        assert _closed_within(connection, 3)
+    finally:
+        connection.close()
+        receiver.close()
+
+
+def test_a_rejected_body_that_never_arrives_is_dropped_at_the_deadline(monkeypatch):
+    monkeypatch.setattr(stage_follow, "ERROR_DRAIN_SECONDS", 0.2)
+    receiver = StageFollowReceiver()
+    descriptor = receiver.start()
+    connection = _rejected_request(descriptor, MAX_BODY_BYTES)
+    try:
+        assert _read_reply(connection)[0] == 401
+        assert _closed_within(connection, 2)
+        # The single worker is free again.
+        assert request(descriptor, heartbeat(descriptor), path="/heartbeat")[0] == 200
+    finally:
+        connection.close()
+        receiver.close()
+
+
+def test_close_interrupts_an_error_reply_waiting_for_its_body(monkeypatch):
+    monkeypatch.setattr(stage_follow, "ERROR_DRAIN_SECONDS", 30)
+    receiver = StageFollowReceiver()
+    descriptor = receiver.start()
+    worker = receiver._thread
+    connection = _rejected_request(descriptor, MAX_BODY_BYTES)
+    try:
+        assert _read_reply(connection)[0] == 401
+        started = time.monotonic()
+        receiver.close()
+        assert time.monotonic() - started < 1
+        assert not worker.is_alive()
+    finally:
+        connection.close()
+        receiver.close()
 
 
 def test_close_interrupts_client_stalled_mid_body():
