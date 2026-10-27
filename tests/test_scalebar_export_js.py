@@ -17,7 +17,7 @@ const fs=require('fs'), vm=require('vm');
 const src=fs.readFileSync(process.argv[1], 'utf8'), cfg=JSON.parse(process.argv[2]);
 const downloads=[], toasts=[], controls={};
 const context={URLSearchParams, Number, Math,
-  state:{roi:cfg.roi||{x:110,y:220,w:800,h:776}, channels:[1],
+  state:{roi:cfg.roi||{x:110,y:220,w:800,h:776}, channels:cfg.channels||[1],
     info:{channels:[0,1], levels:[{path:'3',downsample:8}], maxRenderMpx:400,generation:cfg.generation}},
   activeFrameContext:()=>cfg.hasFrame===false?null:{frame:{t:2,p:3,z:4}},
   frameOwnsRoi:()=>cfg.hasRoi!==false && cfg.hasFrame!==false,
@@ -33,6 +33,9 @@ const context={URLSearchParams, Number, Math,
 vm.createContext(context);
 const start=src.indexOf('function scaleBarExportIssue('),end=src.indexOf('let exportTimer',start);
 vm.runInContext(src.slice(start,end),context);
+// the real channel and render query helpers; lutParam above is the fixture's
+const queryStart=src.indexOf('function channelQuery('),queryEnd=src.indexOf('function activeFrameParams(',queryStart);
+vm.runInContext(src.slice(queryStart,queryEnd),context);
 context.syncScaleBarExportControls();
 for(const format of cfg.formats||['svg','jpg'])context.downloadRoi(format,['svg','jpg'].includes(format));
 process.stdout.write(JSON.stringify({downloads,toasts,controls}));
@@ -105,3 +108,20 @@ def test_invalid_export_is_disabled_and_no_download_can_be_started(config, reaso
     out = run(config)
     assert out["downloads"] == []
     assert all(button["disabled"] and reason in button["title"] for button in out["controls"].values())
+
+
+@pytest.mark.parametrize("fmt", ["nd2", "tiff", "png", "jpg", "svg"])
+def test_every_format_refuses_when_no_channel_is_visible(fmt):
+    out = run({"channels": [], "formats": [fmt]})
+    assert out["downloads"] == []
+    assert out["toasts"] == ["Turn on at least one channel to export"]
+
+
+def test_all_visible_channels_omit_the_set_and_rendered_only_params_stay_off_raw_urls():
+    out = run({"channels": [0, 1], "generation": "g7", "formats": ["nd2", "tiff", "png", "jpg"]})
+    queries = [parse_qs(urlparse(url).query) for url in out["downloads"]]
+    assert [q["format"][0] for q in queries] == ["nd2", "tiff", "png", "jpg"]
+    for q in queries:
+        assert "c" not in q
+        rendered = q["format"][0] in {"png", "jpg"}
+        assert ("win" in q) == rendered and ("g" in q) == rendered

@@ -520,11 +520,20 @@ function lutParam() {
     .join(",");
 }
 
-function renderParams(q) {
-  // the channel set, the LUT windows and the cache generation, shared by
-  // tiles, plate frames and rendered exports
+function channelQuery(q) {
+  // the visible channel set, the one rule for every request that names it:
+  // omitted when every channel shows, "none" when none does. Tiles and
+  // previews then draw black, as the screen does; exports refuse that case
+  // before they build a URL (downloadRoi)
   if (state.channels.length !== state.info.channels.length)
     q.set("c", state.channels.length ? state.channels.join(",") : "none");
+  return q;
+}
+
+function renderParams(q) {
+  // the channel set, the LUT windows and the cache generation, shared by
+  // tiles, plate frames, rendered exports and the export-scale previews
+  channelQuery(q);
   const win = lutParam();
   if (win) q.set("win", win);
   // the cache generation makes tile URLs immutable: the browser may keep
@@ -3471,13 +3480,7 @@ function updateScaleStrip() {
     return;
   }
   const sel = roiScale();
-  const extra = new URLSearchParams();
-  const win = lutParam();
-  if (win) extra.set("win", win);
-  if (state.channels.length !== state.info.channels.length) {
-    extra.set("c", state.channels.join(","));
-  }
-  if (state.info.generation) extra.set("g", state.info.generation);
+  const extra = renderParams(new URLSearchParams());
   appendFrameParams(extra, context.frame);
   const winQ = extra.toString() ? "&" + extra.toString() : "";
   // one shared field, sized to the coarsest scale so every patch is honest
@@ -3622,6 +3625,12 @@ function downloadRoi(fmt, scaleBar = false) {
     showToast("Choose a site and mark a region before exporting");
     return;
   }
+  // The screen shows no channel. An omitted channel set would mean all of
+  // them, so no format may silently export what is not on screen.
+  if (!state.channels.length) {
+    showToast("Turn on at least one channel to export");
+    return;
+  }
   scaleBar = scaleBar || fmt === "svg";
   if (scaleBar) {
     const issue = scaleBarExportIssue();
@@ -3631,7 +3640,8 @@ function downloadRoi(fmt, scaleBar = false) {
   // Rendered images use the same selection, bounded by the raster limit.
   let level = 0;
   let d = 1;
-  if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
+  const rendered = fmt === "png" || fmt === "jpg" || fmt === "svg";
+  if (rendered) {
     const sel = roiScale();
     if (!sel) {
       showToast(
@@ -3657,13 +3667,10 @@ function downloadRoi(fmt, scaleBar = false) {
     h: Math.max(1, Math.floor(r.h / d)),
     format: fmt,
   });
-  const all = state.channels.length === state.info.channels.length;
-  if (!all) q.set("c", state.channels.join(","));
-  if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
-    const win = lutParam();
-    if (win) q.set("win", win); // rendered exports match the screen LUTs
-    if (state.info.generation) q.set("g", state.info.generation);
-  }
+  // Rendered exports match the screen LUTs and name the committed pyramid;
+  // ND2 and TIFF carry the channel set alone and keep the source values.
+  if (rendered) renderParams(q);
+  else channelQuery(q);
   if (scaleBar) q.set("scalebar", "1");
   appendFrameParams(q, context.frame); // explicit active frame; never hidden P0
   let job = null;
