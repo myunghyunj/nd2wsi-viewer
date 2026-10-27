@@ -327,7 +327,10 @@ and whether it started, window open and close (including save-before-close
 outcomes), the full paths of files opened and whether they opened, translucent
 viewer and Follow events, update checks, script errors from the viewer pages,
 caught errors, uncaught exceptions with tracebacks, and a memory and thread
-sample every 30 seconds. While Follow observes the stage keys, each accepted
+sample every 30 seconds. Each change in SLACS detection is recorded with its
+status, whether SLACS was found and its session id, from the main window and
+from each translucent window, so a detection that fails on the instrument PC
+can be diagnosed afterwards. While Follow observes the stage keys, each accepted
 W/A/S/D jog is recorded with its letter, sequence number and step; W/A/S/D
 pressed while another program is in front are only counted. No other keys
 and no typed text are recorded.

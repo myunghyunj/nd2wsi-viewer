@@ -1,7 +1,9 @@
 # Stage follow: viewer contract and ACS adapter boundary
 
 The translucent viewer can follow normalized sample-stage command observations.
-Follow is opt-in and requires calibrated image pixels. The implementation consists
+Follow is opt-in, requires calibrated image pixels, appears only while the SLACS
+program is detected, and moves the image only while the overlay is locked. The
+implementation consists
 of `nd2wsi/stage_follow.py`, the owned receiver in `translucent_window.py`, and the
 camera updates in `static/translucent-v1.js`. It does not connect to SLACS or decode
 ACS packets. Legacy SLACS files are unchanged.
@@ -18,9 +20,12 @@ On non-Windows the default source stays the in-process/HTTP adapter.
 
 **How it works.** A hidden message-only window registers a Raw Input keyboard
 *sink* (`RIDEV_INPUTSINK`) on a daemon thread. Each W/A/S/D key-down (autorepeat
-included) becomes one commanded `delta` of `step_um` micrometres — W/S on +Y/-Y,
-A/D on -X/+X — submitted to the receiver, plus a heartbeat about once a second so
-the receiver does not go stale. Presses are counted only while SLACS owns the
+included) becomes one commanded `delta` of `step_um` micrometres in a screen
+direction — W moves the overlay's view up, S down, A left and D right, as
+displayed — submitted to the receiver, plus a heartbeat about once a second so
+the receiver does not go stale. Only these key presses are followed: the source
+registers the keyboard alone, so mouse clicks, mouse jogs and other input are
+never seen or counted. Presses are counted only while SLACS owns the
 foreground window, identified from the process command line's Python script
 operand (`SniperCellSorterGUIv3.1.py`), cached per process and failing closed.
 A jog key pressed with Ctrl, Alt or a Windows key held is a shortcut and is not
@@ -47,36 +52,47 @@ start/stop and errors — never other keys.
   then drifts from the physical stage until Follow is turned off and on.
 - Stage moves made without W/A/S/D (mouse jog, scripted moves, absolute goto) are
   not seen.
-- The keys carry no orientation; stage-to-image direction is corrected with the
-  Rotation and Flip X/Y controls, exactly as for the adapter source. There is no
-  per-key mapping UI.
+- The keys carry no orientation of their own; W/A/S/D move the overlay in the
+  directions shown on screen. Match the orientation in the main viewer (rotate,
+  or ⌘/Ctrl+F to flip) before opening the translucent window; the window has no
+  direction settings and no per-key mapping UI. If, on the instrument, the
+  overlay moves opposite to SLACS's live image, `KEY_VIEW_SIGN` in
+  `nd2wsi/stage_keys.py` is the single value that reverses all four keys; it is
+  deliberately not a user setting.
 - The step must match SLACS's Roughness, or the overlay moves by the wrong
   distance per press. When SLACS loses the foreground the status shows "SLACS not
   in front" without pausing; following resumes when it returns.
 
-With Follow enabled, stage observations move the image even while the manual
-controls are locked; the lock label states this behavior. Unlocking permits manual
-alignment. Each new displacement is added to the current image center, retaining
-that manual adjustment. The native window position, zoom, display orientation,
-LUT, and ROI source geometry remain unchanged. ROI outlines are redrawn with the
-camera; their dimensions are not recalculated from stage motion.
+Follow moves the image only while the overlay is locked. Unlocked, the user
+aligns the overlay by hand and nothing moves it: follow replies are still
+consumed, so key presses made meanwhile are discarded and never replayed after
+locking, and the status reads "Unlocked: align by hand, lock to follow" without
+stopping Follow. After locking, each new displacement is added to the current
+image center, so following continues from wherever the view was left. The
+native window position, zoom, display orientation, LUT, and ROI source geometry
+remain unchanged. ROI outlines are redrawn with the camera; their dimensions
+are not recalculated from stage motion.
 
-Nikon Ti/Aperio views from above and SLACS from underneath in the supplied context.
-The translucent display defaults to horizontal mirroring
-(`mirror_scan: true`). **Mirror image** is editable while unlocked. Its effective
-OSD flip is the original handoff flip XOR `mirrorScan`; toggling it mirrors both
-image and ROI outlines without changing ROI source geometry. This display default
-follows the user's viewing context, not a measured orientation calibration.
+The translucent window shows exactly the rotation and flip of the main viewer
+at handoff and has no direction settings of its own: the earlier **Mirror
+image** control, its default mirroring, and Follow's Rotation, Flip stage X and
+Flip stage Y settings are gone, and an older context's `mirror_scan` key is
+ignored. Nikon Ti/Aperio views from above and SLACS from underneath in the
+supplied context, so flip the image in the main viewer first when SLACS shows
+it mirrored.
 
-Physical stage XY is first mapped through the separate stage alignment controls
-(X/Y sign and angle), then divided by the active image's `pixelSizeUm`, stored as
-`[Y, X]` in micrometres per displayed-base pixel. Camera movement uses canonical
-image coordinates and `centerOnPreservingZoom`. OSD handles display rotation and
-mirror; applying them again to the physical displacement would double-transform
-it. Mirror image does not also invert a physical stage axis. The independent
-default stage angle of zero and unflipped axes are placeholders, not a
-verified SLACS-to-image registration. Use the active image metadata, including
-any reduced-base calibration, rather than a hard-coded ND2 scale.
+A displacement `(dx, dy)` in micrometres moves the view centre `dx` to the
+right and `dy` down on screen, as displayed (`screenImageDelta` in
+`translucent-v1.js`). The screen axes are converted to image-pixel directions
+the way OpenSeadragon 5.0.1 converts a mouse drag: its point conversions undo
+the display rotation but not the flip, so x is negated on a flipped view first.
+Each screen axis then spans its micrometres at the active image's `pixelSizeUm`
+(stored as `[Y, X]` micrometres per displayed-base pixel) along that direction,
+so non-square pixels are handled, and the camera moves in canonical image
+coordinates with `centerOnPreservingZoom`. A step therefore moves the content
+the same way on screen at any rotation or flip. This is a display convention,
+not a verified SLACS-to-image registration. Use the active image metadata,
+including any reduced-base calibration, rather than a hard-coded ND2 scale.
 
 **Observed source and calibration.** In the supplied copy of the instrument's
 SLACS Python source:
@@ -122,7 +138,8 @@ Treat the token as a local credential. Use the returned loopback URL and
 
 Every body contains integer `version: 1` and the descriptor's `session_id`.
 `POST /motion` additionally requires consecutive integer `seq` values starting
-at 1, one `type`, and the corresponding XY field:
+at 1, one `type`, and the corresponding XY field. X is screen right and Y screen
+down as the overlay displays the image, the same meaning as the key source:
 
 | Type | XY field, in µm | Meaning |
 | --- | --- | --- |
@@ -148,15 +165,16 @@ framing, reassemble TCP sequence/retransmissions, correlate command outcomes,
 filter axes 0/1, and reject lost streams or controller resets. No additional
 hardware queries or driver installation are part of this work.
 
-Verification passed 35 backend, 81 window/integration and 56 frontend tests
-(172 focused tests; unchanged checks were reused), plus a native Agent-window
-check using the ITO image. The native check verified default mirroring, a
-1 µm command moving the mirrored image by 1.514770953715 CSS pixels at image
-zoom 1, locked following, retained manual adjustment, absolute ROI-sized moves,
-ROI/zoom preservation, duplicates and gaps. The original ND2, cache, annotations,
-context and SLACS module hashes were unchanged. No ACS capture
-adapter, Windows device validation, physical precision validation, or installed-app
-replacement has been completed.
+An earlier native Agent-window check using the ITO image verified the previous
+design (default mirroring, following while locked or unlocked, a 1 µm command
+moving the image by 1.514770953715 CSS pixels at image zoom 1, retained manual
+adjustment, absolute ROI-sized moves, ROI/zoom preservation, duplicates and
+gaps) with the original ND2, cache, annotations, context and SLACS module hashes
+unchanged. `qa/check_native_stage_follow.py` now checks the main viewer's
+orientation, screen-direction moves, presses ignored while unlocked and the
+absence of direction settings; it has not been re-run for this behavior, which
+the synthetic suite covers. No ACS capture adapter, Windows device validation,
+physical precision validation, or installed-app replacement has been completed.
 
 ## Windows delivery and automatic discovery requirements — 2026-10-26
 
@@ -197,16 +215,20 @@ restarted SLACS process is a new session and is offered again. Claims older than
 seven days are pruned, except the claim of the session currently running. If
 the folder cannot be written, each window offers once on its own.
 
-Detection never hides or disables Follow (a user decision, 2026-10-27, so a
-detection failure on the instrument PC cannot block a demo); the W/A/S/D source
-checks on its own that SLACS is in front. Follow is opt-in. A Follow started
-while SLACS was detected is bound to that process: its loss, replacement,
-ambiguous detection or a discovery error stops the receiver and the key
-observer, and a new process does not automatically resume it. A Follow started
-without detection is not bound and is never stopped by detection. When a bound
-Follow stops, the backend closes the receiver, so every later follow reply
-reports the loss and carries no movement, and it pushes a revocation to the
-overlay page. The page drops every follow reply that arrives after the
+The Follow control appears only while SLACS is detected (a user decision,
+2026-10-27, replacing the demo line's earlier choice never to hide it); its
+settings panel closes when detection is lost. Follow is opt-in, and the page
+and the backend both refuse to start it without a detected session, so every
+Follow is bound to the detected process: its loss, replacement, ambiguous
+detection or a discovery error stops the receiver and the key observer, hides
+the control while leaving the loss notice visible, and a new process does not
+automatically resume it. The W/A/S/D source still checks on its own that SLACS
+is in front. Each detection change (status, availability and session id) is
+recorded in the session log as `slacs_detection`, from the main window and from
+each translucent window, so a detection that fails on the instrument PC can be
+diagnosed afterwards. When a Follow stops on a loss, the backend closes the
+receiver, so every later follow reply reports the loss and carries no
+movement, and it pushes a revocation to the overlay page. The page drops every follow reply that arrives after the
 revocation, including one computed just before the loss, and treats SLACS as
 undetected until a fresh discovery reply arrives. A reply that reaches the page before the
 revocation was computed before the loss and can apply that earlier movement once;
@@ -222,5 +244,6 @@ metadata fails closed instead of guessing.
 The implementation has not yet been verified on the instrument's Windows setup
 or integrated into the separate replacement-renderer branch. It does not decode
 ACS traffic, verify ownership of TCP `10.0.0.100:701`, or turn this prototype into
-a live hardware-ready release. Default mirroring, locked command following and
-unlocked manual alignment remain the intended behavior after discovery.
+a live hardware-ready release. The main viewer's orientation, key following
+only while locked, and unlocked manual alignment are the intended behavior
+after discovery.
