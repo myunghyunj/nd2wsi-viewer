@@ -463,6 +463,9 @@ class Api:
         self._translucent_windows = {}
         self._translucent_owner_closed = False
         self._slacs_discovery = None
+        self._slacs_offer_lock = threading.Lock()
+        self._slacs_offer_claims = None
+        self._slacs_offers = {}  # session_id -> whether this window shows its offer
         if native_gesture_scopes is None:
             from .native_gestures import NativeGestureScopeCache
 
@@ -475,17 +478,44 @@ class Api:
 
         return launch_window(role, app_name=APP_NAME)
 
-    def slacs_discovery_state(self) -> dict:
-        """Read-only detection for the main-window connection offer."""
+    def slacs_discovery_state(self, claim_offer: bool = False) -> dict:
+        """Read-only detection for the main-window connection offer.
+
+        ``offer`` is True only in the one viewer window of this role that first
+        claimed the detected process, so the offer appears once across windows.
+        The shell asks to claim only while the user is looking at that window.
+        """
         from .slacs_discovery import SlacsDiscovery
 
         with self._translucent_lock:
             if self._translucent_owner_closed:
-                return {"available": False, "session_id": None, "status": "closed"}
+                return {"available": False, "session_id": None, "status": "closed", "offer": False}
             if self._slacs_discovery is None:
                 self._slacs_discovery = SlacsDiscovery()
             detector = self._slacs_discovery
-        return detector.snapshot()
+        snapshot = detector.snapshot()
+        snapshot["offer"] = self._claim_slacs_offer(snapshot, claim_offer is True)
+        return snapshot
+
+    def _claim_slacs_offer(self, snapshot, claim: bool) -> bool:
+        from .slacs_discovery import SlacsOfferClaims
+
+        session = snapshot.get("session_id")
+        if snapshot.get("available") is not True or snapshot.get("status") != "running" or not isinstance(session, str):
+            return False
+        with self._slacs_offer_lock:
+            if session not in self._slacs_offers:
+                if not claim:
+                    return False  # a background window neither claims nor gives up the offer
+                if self._window_session is None:
+                    self._slacs_offers[session] = True  # no shared window identity: this is the only window
+                else:
+                    if self._slacs_offer_claims is None:
+                        self._slacs_offer_claims = SlacsOfferClaims(
+                            self._window_session.root.parent / "slacs-offers" / self._window_session.role,
+                            claimant=self._window_session.id)
+                    self._slacs_offers[session] = self._slacs_offer_claims.claim(session)
+            return self._slacs_offers[session]
 
     def open_translucent_viewer(self, sid: str, payload: dict) -> dict:
         """Open a display-only tracing window for this viewer's registered slide."""

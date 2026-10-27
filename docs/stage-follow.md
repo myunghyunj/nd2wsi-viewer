@@ -138,11 +138,28 @@ it. Loss of that process/stream must stop tracking and leave an explicit status
 in an already active connection panel; do not silently resume with stale offsets.
 The normal interface remains free of SLACS controls when no session is detected.
 
-The main window offers the connection once for each detected process session;
-the overlay reveals Follow controls only while detection succeeds. Follow is
+The main window offers the connection once for each detected process session,
+across all of this user's viewer windows: each window is its own process, so the
+first window to see a session while the user is looking at it (visible and
+focused) claims it with an exclusive file in a `slacs-offers` folder beside the
+window sessions, and only that window shows the offer. Background windows
+neither claim nor give it up. Agent windows claim separately, so automation
+never takes a User window's offer. A viewer opened later does not repeat it; a
+restarted SLACS process is a new session and is offered again. Claims older than
+seven days are pruned, except the claim of the session currently running. If
+the folder cannot be written, each window offers once on its own.
+
+The overlay reveals Follow controls only while detection succeeds. Follow is
 opt-in. Process loss, replacement, ambiguous detection or a discovery error stops
-an active receiver; a new process does not automatically resume it. Detection
-identifies the program, not controller readiness or a validated motion stream.
+an active receiver; a new process does not automatically resume it. At that
+moment the backend closes the receiver, so every later follow reply reports the
+loss and carries no movement, and it pushes a revocation to the overlay page.
+The page drops every follow reply that arrives after the revocation, including
+one computed just before the loss, and hides Follow until a fresh discovery
+reply arrives. A reply that reaches the page before the
+revocation was computed before the loss and can apply that earlier movement once;
+the page cannot see a loss before any message reports it. Detection identifies
+the program, not controller readiness or a validated motion stream.
 Detection uses a hidden, bounded local PowerShell/CIM process-metadata query,
 shared between viewer windows for two seconds. It checks the interpreter's
 actual script argument and identifies a session by process ID and creation

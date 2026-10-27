@@ -712,6 +712,120 @@ def test_slacs_discovery_timeout_hides_controls_and_ignores_late_reply():
     assert result == {'hiddenAfterTimeout': True, 'session': 'new', 'hidden': False, 'calls': 2}
 
 
+LATE_FOLLOW = """
+  let process={available:true,session_id:'one',status:'running'};const replies=[];
+  const h=followHarness({bridgeOverrides:{async slacs_discovery_state(){return {...process};},
+    stage_follow_state(){return new Promise(resolve=>replies.push(resolve));}}}),m=h.mounted;
+  await m.pollSlacsDiscovery();await m.startStageFollow();
+  const lost='SLACS program stopped or changed. Follow stopped; reconnect manually.';
+  const reply=(seq,dx,dy)=>({enabled:true,session_id:'session-one',seq,status:'following',displacement_um:[dx,dy]});
+  const settle=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+  const camera=()=>JSON.stringify(api.camera(h.viewer));
+  const pollTimers=()=>[...h.timers.values()].filter(timer=>timer.delay===50).length;
+"""
+
+
+def test_follow_reply_computed_before_loss_is_dropped_once_the_revocation_arrives():
+    """Reviewer's interleaving: the reply was computed before the backend saw the loss."""
+    result = run(LATE_FOLLOW + """
+      const before=camera(),pending=m.pollStageFollow();
+      process={available:false,session_id:null,status:'not_running'};
+      const revoked=h.win.nd2TranslucentRevokeFollow({session_id:'session-one',message:lost});
+      replies[0](reply(1,10,20));await pending;await settle();
+      const afterReply=camera();
+      await m.pollSlacsDiscovery();await settle();
+      return {revoked,movedByLateReply:afterReply!==before,movedLater:camera()!==before,
+        enabled:m.state.follow.enabled,status:m.state.follow.status,pollTimers:pollTimers(),
+        notice:h.element('stage-follow-disconnected').textContent,
+        noticeHidden:h.element('stage-follow-disconnected').hidden,calls:h.followCalls};
+    """)
+    assert result == {"revoked": True, "movedByLateReply": False, "movedLater": False,
+                      "enabled": False, "status": "paused", "pollTimers": 0,
+                      "notice": "SLACS program stopped or changed. Follow stopped; reconnect manually.",
+                      "noticeHidden": False, "calls": ["start", "stop"]}
+
+
+def test_reply_delivered_before_the_revocation_moves_once_and_nothing_after_it_does():
+    """The boundary: a reply that reaches the page first carries motion from before the loss."""
+    result = run(LATE_FOLLOW + """
+      const before=camera(),first=m.pollStageFollow();
+      replies[0](reply(1,10,20));await first;await settle();
+      const afterFirst=camera();
+      const second=[...h.timers.values()].find(timer=>timer.delay===50).fn();
+      await settle();
+      h.win.nd2TranslucentRevokeFollow({session_id:'session-one',message:lost});
+      replies[1](reply(2,30,40));await second;await settle();
+      return {firstMoved:afterFirst!==before,movedAfterRevocation:camera()!==afterFirst,
+        polls:replies.length,enabled:m.state.follow.enabled,pollTimers:pollTimers()};
+    """)
+    assert result == {"firstMoved": True, "movedAfterRevocation": False, "polls": 2,
+                      "enabled": False, "pollTimers": 0}
+
+
+def test_revocation_for_an_older_receiver_leaves_the_current_follow_running():
+    result = run(LATE_FOLLOW + """
+      const ignored=h.win.nd2TranslucentRevokeFollow({session_id:'session-zero',message:lost});
+      const before=camera(),pending=m.pollStageFollow();
+      replies[0](reply(1,10,20));await pending;await settle();
+      return {ignored,moved:camera()!==before,enabled:m.state.follow.enabled,
+        status:m.state.follow.status,noticeHidden:h.element('stage-follow-disconnected').hidden,calls:h.followCalls};
+    """)
+    assert result == {"ignored": False, "moved": True, "enabled": True, "status": "following",
+                      "noticeHidden": True, "calls": ["start"]}
+
+
+def test_revocation_during_a_pending_start_discards_the_late_session():
+    result = run("""
+      let finish;const calls=[];
+      const h=followHarness({bridgeOverrides:{start_stage_follow(){calls.push('start');return new Promise(resolve=>finish=resolve);},
+        async stop_stage_follow(){calls.push('stop');return {ok:true};}}}),m=h.mounted;
+      await m.pollSlacsDiscovery();
+      const starting=m.startStageFollow();for(let i=0;i<4;i++)await Promise.resolve();
+      const revoked=h.win.nd2TranslucentRevokeFollow({session_id:'session-one',message:'lost'});
+      finish({ok:true,session_id:'session-one'});await starting;
+      for(let i=0;i<10;i++)await Promise.resolve();
+      return {revoked,calls,enabled:m.state.follow.enabled,status:m.state.follow.status,
+        pollTimers:[...h.timers.values()].filter(timer=>timer.delay===50).length};
+    """)
+    assert result == {"revoked": True, "calls": ["start", "stop"], "enabled": False,
+                      "status": "paused", "pollTimers": 0}
+
+
+def test_revocation_forgets_detection_until_a_fresh_discovery_reply():
+    result = run("""
+      let process={available:true,session_id:'one',status:'running'},stale;let discoveryCalls=0;
+      const h=followHarness({bridgeOverrides:{slacs_discovery_state(){discoveryCalls++;
+        if(discoveryCalls===2)return new Promise(resolve=>stale=resolve);return Promise.resolve({...process});}}}),m=h.mounted;
+      await m.pollSlacsDiscovery();await m.startStageFollow();
+      const inFlight=m.pollSlacsDiscovery();  // discovery reply computed before the loss, still on its way
+      process={available:true,session_id:'two',status:'running'};
+      h.win.nd2TranslucentRevokeFollow({session_id:'session-one',message:'lost'});
+      const right={hidden:h.element('stage-follow-control').hidden,button:h.element('stage-follow').disabled};
+      for(let i=0;i<10;i++)await Promise.resolve();
+      stale({available:true,session_id:'one',status:'running'});await inFlight;
+      for(let i=0;i<10;i++)await Promise.resolve();
+      return {right,session:m.state.slacs.session_id,hidden:h.element('stage-follow-control').hidden,
+        enabled:m.state.follow.enabled,stops:h.followCalls.filter(call=>call==='stop').length,discoveryCalls};
+    """)
+    assert result == {"right": {"hidden": True, "button": True}, "session": "two", "hidden": False,
+                      "enabled": False, "stops": 1, "discoveryCalls": 3}
+
+
+def test_revocation_without_an_active_follow_or_after_close_changes_nothing():
+    result = run("""
+      const h=followHarness(),m=h.mounted;await m.pollSlacsDiscovery();
+      const idle=h.win.nd2TranslucentRevokeFollow({session_id:'session-one',message:'lost'});
+      const idleState={status:m.state.follow.status,noticeHidden:h.element('stage-follow-disconnected').hidden};
+      await m.startStageFollow();h.windowListeners.pagehide();
+      for(let i=0;i<10;i++)await Promise.resolve();
+      const calls=h.followCalls.slice();
+      const closed=h.win.nd2TranslucentRevokeFollow({session_id:'session-one',message:'lost'});
+      return {idle,idleState,closed,callsAfterClose:h.followCalls.length===calls.length};
+    """)
+    assert result == {"idle": False, "idleState": {"status": "off", "noticeHidden": True},
+                      "closed": False, "callsAfterClose": True}
+
+
 @pytest.mark.parametrize("failure", ["session", "rejection", "watchdog"])
 def test_stage_connection_failures_pause_without_any_pan(failure):
     result = run(f"""

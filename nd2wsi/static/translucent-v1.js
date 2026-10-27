@@ -492,6 +492,25 @@
       task.finally(() => { if (discoveryTask === task) discoveryTask = null; });
       return task;
     };
+    // The backend pushes this as soon as discovery reports the program lost or
+    // replaced. stopStageFollow bumps followEpoch, so a follow reply that arrives
+    // after the revocation, even one computed before the loss, never moves the image.
+    const revokeStageFollow = revocation => {
+      if (disposed || (!follow.enabled && !follow.pending)) return false;
+      const sessionId = typeof revocation?.session_id === "string" ? revocation.session_id : "";
+      if (sessionId && follow.sessionId && sessionId !== follow.sessionId) return false;
+      stopStageFollow();
+      follow.status = "paused";
+      disconnected = typeof revocation?.message === "string" && revocation.message ? revocation.message :
+        "SLACS program stopped or changed. Follow stopped; reconnect manually.";
+      // Forget the lost detection; a discovery reply already in flight is from before the loss.
+      state.slacs = { available: false, session_id: null, status: "checking" };
+      discoveryTask = null;
+      paintFollow();
+      pollSlacsDiscovery();
+      return true;
+    };
+    win.nd2TranslucentRevokeFollow = revokeStageFollow;
     const setStageAlignment = alignment => {
       if (state.locked || state.pending || disposed || !Number.isFinite(alignment.angle) || Math.abs(alignment.angle) > 360) {
         paintFollow(); return false;
@@ -736,7 +755,8 @@
     pollSlacsDiscovery();
     discoveryInterval = win.setInterval(pollSlacsDiscovery, 1000);
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
-      startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, setStageAlignment, setMirrorScan };
+      startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, revokeStageFollow,
+      setStageAlignment, setMirrorScan };
   }
 
   async function boot(win) {

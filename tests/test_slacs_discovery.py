@@ -2,6 +2,7 @@
 
 import json
 import ntpath
+import os
 import subprocess
 import sys
 import threading
@@ -266,3 +267,108 @@ def test_windows_cim_identifies_only_our_harmless_temporary_script_and_its_exit(
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=5)
+
+
+SESSION_A, SESSION_B = "slacs-" + "a" * 32, "slacs-" + "b" * 32
+
+
+def test_offer_claim_has_one_winner_across_windows_and_stays_with_it(tmp_path):
+    folder = tmp_path / "offers" / "user"
+    first, second = discovery.SlacsOfferClaims(folder, "window-1"), discovery.SlacsOfferClaims(folder, "window-2")
+    assert first.claim(SESSION_A) is True
+    assert second.claim(SESSION_A) is False
+    assert first.claim(SESSION_A) is True  # the claimant keeps its offer on every poll
+    assert second.claim(SESSION_B) is True  # a restarted SLACS process is offered again
+    assert first.claim(SESSION_B) is False
+    assert discovery.SlacsOfferClaims(folder, "window-3").claim(SESSION_A) is False  # later windows stay quiet
+
+
+def test_concurrent_offer_claims_have_exactly_one_winner(tmp_path):
+    folder, barrier, results = tmp_path / "offers", threading.Barrier(8), []
+
+    def race(index):
+        claims = discovery.SlacsOfferClaims(folder, f"window-{index}")
+        barrier.wait()
+        results.append(claims.claim(SESSION_A))
+
+    threads = [threading.Thread(target=race, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert sorted(results) == [False] * 7 + [True]
+
+
+def test_expired_offer_claims_are_pruned_and_only_our_files_are_removed(tmp_path):
+    folder, now = tmp_path / "offers", [1_000_000.0]
+    old = discovery.SlacsOfferClaims(folder, "window-1", lifetime=60, clock=lambda: now[0])
+    assert old.claim(SESSION_A) is True
+    stale = folder / f"{SESSION_A}.claim"
+    os.utime(stale, (now[0] - 120, now[0] - 120))
+    keep = [folder / "notes.txt", folder / ("slacs-" + "c" * 32 + ".claim.bak")]
+    for path in keep:
+        path.write_text("not ours")
+        os.utime(path, (0, 0))
+    (folder / ("slacs-" + "d" * 32 + ".claim")).mkdir()
+    os.utime(folder / ("slacs-" + "d" * 32 + ".claim"), (0, 0))
+    newcomer = discovery.SlacsOfferClaims(folder, "window-2", lifetime=60, clock=lambda: now[0])
+    assert newcomer.claim(SESSION_B) is True  # pruning runs before each claim
+    assert not stale.exists()
+    assert all(path.exists() for path in keep)
+    assert (folder / ("slacs-" + "d" * 32 + ".claim")).is_dir()
+    assert newcomer.claim(SESSION_A) is True  # an expired claim no longer blocks an offer
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs a privilege on Windows")
+def test_offer_claims_never_follow_or_remove_symlinks(tmp_path):
+    folder, target = tmp_path / "offers", tmp_path / "elsewhere.json"
+    folder.mkdir()
+    target.write_text(json.dumps({"claimant": "window-1"}))
+    os.utime(target, (0, 0))  # old enough that pruning through the link would remove it
+    link = folder / f"{SESSION_B}.claim"
+    link.symlink_to(target)
+    os.utime(link, (0, 0), follow_symlinks=False)
+    own = folder / f"{SESSION_A}.claim"
+    own.symlink_to(target)
+    claims = discovery.SlacsOfferClaims(folder, "window-1", lifetime=60)
+    assert claims.claim(SESSION_A) is False  # a link is never read as this window's claim
+    assert link.is_symlink() and own.is_symlink() and target.exists()
+
+
+@pytest.mark.parametrize("session", [None, 7, "", "slacs-", "slacs-" + "A" * 32, "../" + SESSION_A,
+                                     SESSION_A + "/x", "process-one"])
+def test_offer_claims_refuse_anything_but_a_discovery_session_id(tmp_path, session):
+    folder = tmp_path / "offers"
+    assert discovery.SlacsOfferClaims(folder, "window-1").claim(session) is False
+    assert not folder.exists()
+
+
+def test_unwritable_offer_folder_falls_back_to_one_offer_per_window(tmp_path):
+    blocked = tmp_path / "offers"
+    blocked.write_text("a file where the folder should be")
+    assert discovery.SlacsOfferClaims(blocked / "user", "window-1").claim(SESSION_A) is True
+    assert discovery.SlacsOfferClaims(blocked / "user", "window-2").claim(SESSION_A) is True
+
+
+def test_a_still_running_session_keeps_its_claim_past_the_lifetime(tmp_path):
+    folder, now = tmp_path / "offers", [1_000_000.0]
+    first = discovery.SlacsOfferClaims(folder, "window-1", lifetime=60, clock=lambda: now[0])
+    assert first.claim(SESSION_A) is True
+    claim = folder / f"{SESSION_A}.claim"
+    os.utime(claim, (now[0] - 600, now[0] - 600))  # SLACS has run longer than the lifetime
+    later = discovery.SlacsOfferClaims(folder, "window-2", lifetime=60, clock=lambda: now[0])
+    assert later.claim(SESSION_A) is False  # still offered only once
+    assert claim.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0,
+                    reason="POSIX permissions; root ignores them")
+def test_a_read_only_offer_folder_falls_back_to_one_offer_per_window(tmp_path):
+    folder = tmp_path / "offers"
+    folder.mkdir()
+    folder.chmod(0o500)
+    try:
+        assert discovery.SlacsOfferClaims(folder, "window-1").claim(SESSION_A) is True
+        assert discovery.SlacsOfferClaims(folder, "window-2").claim(SESSION_A) is True
+    finally:
+        folder.chmod(0o700)

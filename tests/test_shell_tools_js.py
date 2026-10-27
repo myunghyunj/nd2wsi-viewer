@@ -153,7 +153,7 @@ Promise.resolve(vm.runInContext(process.argv[2],context))
     return json.loads(result.stdout)
 
 
-DETECTED = "{available:true,status:'running',session_id:'sniper-1'}"
+DETECTED = "{available:true,status:'running',session_id:'sniper-1',offer:true}"
 
 
 def test_slacs_offer_is_initially_hidden_nonmodal_and_does_not_gate_normal_translucent():
@@ -179,6 +179,8 @@ def test_slacs_offer_is_initially_hidden_nonmodal_and_does_not_gate_normal_trans
     "{available:true,status:'error',session_id:'a'}",
     "{available:true,status:'running',session_id:null}",
     "{available:true,status:'running',session_id:' '}",
+    "{available:true,status:'running',session_id:'a'}",
+    "{available:true,status:'running',session_id:'a',offer:false}",
 ])
 def test_slacs_offer_requires_a_confirmed_running_session(snapshot):
     result = run_slacs(CLOUD_SETUP + f"""
@@ -291,3 +293,106 @@ def test_main_discovery_timeout_hides_offer_retries_and_ignores_late_bridge_repl
     """.replace("DETECTED", DETECTED))
     assert result == {"initiallyHidden": False, "timedOut": {"hidden": True, "timers": 1},
                       "hidden": False, "session": "sniper-2", "timers": 1, "messages": []}
+
+
+def _offer_windows(tmp_path, monkeypatch, sessions):
+    """Real Api objects for separate viewer windows, sharing one session folder."""
+    from unittest.mock import Mock
+
+    from nd2wsi import slacs_discovery
+    from nd2wsi.app import Api
+    from nd2wsi.window_sessions import create_window_session
+
+    detected = {"available": True, "status": "running", "session_id": "slacs-" + "a" * 32}
+    detector = Mock()
+    detector.snapshot.side_effect = lambda: dict(detected)
+    monkeypatch.setattr(slacs_discovery, "SlacsDiscovery", Mock(return_value=detector))
+    windows = []
+    for role in sessions:
+        session = create_window_session(role, tmp_path / "sessions")
+        windows.append((session, Api(None, window_session=session)))
+    return detected, windows
+
+
+def _shell_window(snapshots):
+    """One independent shell process: feed each backend snapshot, record visibility."""
+    return run_slacs(CLOUD_SETUP + """
+      const visible=[];
+      for(const snapshot of SNAPSHOTS){
+        if(snapshot==='dismiss')$('slacs-offer-dismiss').onclick();else receiveSlacsDiscovery(snapshot);
+        visible.push(!$('slacs-offer').hidden);
+      }
+      ({visible,messages});
+    """.replace("SNAPSHOTS", json.dumps(snapshots)))
+
+
+def test_slacs_offer_appears_once_across_independent_viewer_windows(tmp_path, monkeypatch):
+    detected, windows = _offer_windows(tmp_path, monkeypatch, ["user", "user", "agent"])
+    (_, first), (_, second), (_, agent) = windows
+    try:
+        background = second.slacs_discovery_state(False)  # polled first, but nobody is looking at it
+        first_seen = [first.slacs_discovery_state(True) for _ in range(2)]  # the focused window
+        second_seen = [second.slacs_discovery_state(True), second.slacs_discovery_state(False)]
+        agent_seen = agent.slacs_discovery_state(True)
+        detected["session_id"] = "slacs-" + "b" * 32  # SLACS restarted: a new process identity
+        restarted = [second.slacs_discovery_state(True), first.slacs_discovery_state(True)]
+        later = _late_window(tmp_path)  # a viewer window opened after the claim
+        reopened = later.slacs_discovery_state(True)
+    finally:
+        for session, _ in windows:
+            session.mark_closed()
+    assert background["offer"] is False
+    assert [s["offer"] for s in first_seen] == [True, True]
+    assert [s["offer"] for s in second_seen] == [False, False]
+    assert agent_seen["offer"] is True  # Agent automation never consumes the User offer
+    assert [s["offer"] for s in restarted] == [True, False]
+    assert reopened["offer"] is False
+    one = _shell_window([first_seen[0], first_seen[1], "dismiss", first_seen[1], restarted[1]])
+    two = _shell_window([background, second_seen[0], second_seen[1], restarted[0], restarted[0]])
+    assert one == {"visible": [True, True, False, False, False], "messages": []}
+    assert two == {"visible": [False, False, False, True, True], "messages": []}
+
+
+def _late_window(tmp_path):
+    from nd2wsi.app import Api
+    from nd2wsi.window_sessions import create_window_session
+
+    session = create_window_session("user", tmp_path / "sessions")
+    session.mark_closed()  # releases the lifetime lock; claims do not depend on it
+    return Api(None, window_session=session)
+
+
+@pytest.mark.parametrize("visibility,focused,expected", [
+    ("visible", True, True), ("visible", False, False), ("hidden", True, False)])
+def test_shell_claims_the_offer_only_while_the_user_is_looking_at_it(visibility, focused, expected):
+    result = run_slacs(f"""
+      (async()=>{{
+        const asked=[];
+        document.visibilityState='{visibility}';document.hasFocus=()=>{str(focused).lower()};
+        window.pywebview={{api:{{slacs_discovery_state(claim){{asked.push(claim);return DETECTED;}}}}}};
+        await lifecycle('pywebviewready');
+        return {{asked,hidden:$('slacs-offer').hidden}};
+      }})();
+    """.replace("DETECTED", DETECTED))
+    assert result["asked"] == [expected]
+
+
+def test_background_window_neither_claims_nor_caches_and_a_later_focus_claims(tmp_path, monkeypatch):
+    detected, windows = _offer_windows(tmp_path, monkeypatch, ["user", "user"])
+    (_, first), (_, second) = windows
+    folder = tmp_path / "sessions" / "slacs-offers" / "user"
+    try:
+        unfocused = [first.slacs_discovery_state(False) for _ in range(3)]
+        claimed_nothing = not folder.exists() or not any(folder.iterdir())
+        focused = first.slacs_discovery_state(True)
+        for claim in folder.iterdir():  # the claim file vanishes; each window keeps its answer
+            claim.unlink()
+        cached = [first.slacs_discovery_state(True), second.slacs_discovery_state(True)]
+        refused = second.slacs_discovery_state(True)
+    finally:
+        for session, _ in windows:
+            session.mark_closed()
+    assert [s["offer"] for s in unfocused] == [False, False, False] and claimed_nothing
+    assert focused["offer"] is True
+    assert [s["offer"] for s in cached] == [True, True]  # second claims afresh: the file was gone
+    assert refused["offer"] is True  # and keeps that answer from its own cache

@@ -12,11 +12,14 @@ import json
 import math
 import ntpath
 import os
+import re
+import stat
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 SCRIPT_NAME = "SniperCellSorterGUIv3.1.py"
 _PYTHON_NAMES = frozenset(("python.exe", "pythonw.exe"))
@@ -289,3 +292,79 @@ class SlacsDiscovery:
         if changed:
             self._notify(stopped)
         return thread is None or not thread.is_alive()
+
+
+_SESSION_ID = re.compile(r"slacs-[0-9a-f]{32}")
+_CLAIM_NAME = re.compile(r"slacs-[0-9a-f]{32}\.claim")
+OFFER_CLAIM_LIFETIME = 7 * 24 * 3600.0
+
+
+class SlacsOfferClaims:
+    """Offer each detected SLACS process once across this user's viewer windows.
+
+    Every viewer window is its own OS process, so a claim is an exclusive file
+    create in a folder those windows share; callers keep one folder per window
+    role so an Agent window never takes a User window's offer. The window that
+    created a claim keeps getting True for that session, and every other window,
+    including ones opened later, gets False. A restarted SLACS process has a new
+    session identity and is offered again. Claims older than ``lifetime`` are
+    pruned, except the session being claimed, which is running right now;
+    only regular files with this class's own names are removed. If the
+    folder cannot be written, ``claim`` returns True: one offer per window.
+    """
+
+    def __init__(self, folder, claimant, *, lifetime=OFFER_CLAIM_LIFETIME, clock=time.time):
+        self._folder = Path(folder)
+        self._claimant = str(claimant)
+        self._lifetime = float(lifetime)
+        self._clock = clock
+
+    def claim(self, session_id) -> bool:
+        if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+            return False
+        path = self._folder / f"{session_id}.claim"
+        try:
+            self._folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError:
+            return True
+        self._prune(keep=path.name)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        except FileExistsError:
+            return self._claimant_of(path) == self._claimant
+        except OSError:
+            return True
+        record = {"format": "nd2wsi-slacs-offer/1", "session_id": session_id, "claimant": self._claimant}
+        try:
+            os.write(fd, json.dumps(record).encode("utf-8"))
+        except OSError:
+            pass  # the empty claim still keeps other windows from offering it
+        finally:
+            os.close(fd)
+        return True
+
+    def _claimant_of(self, path):
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                return None
+            with open(path, "rb") as handle:
+                record = json.loads(handle.read(4096).decode("utf-8"))
+        except (OSError, ValueError):
+            return None
+        return record.get("claimant") if isinstance(record, dict) else None
+
+    def _prune(self, keep):
+        cutoff = self._clock() - self._lifetime
+        try:
+            entries = list(os.scandir(self._folder))
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name == keep or not _CLAIM_NAME.fullmatch(entry.name):
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                    os.unlink(entry.path)
+            except OSError:
+                pass

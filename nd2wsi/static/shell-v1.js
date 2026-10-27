@@ -161,7 +161,9 @@ function receiveSlacsDiscovery(snapshot) {
     typeof snapshot.session_id === "string" && snapshot.session_id.trim() ? snapshot.session_id : null;
   slacsDiscovery.snapshot = session ? { available: true, status: "running", session_id: session } : null;
   if (!session) slacsDiscovery.offeredSession = null;
-  else if (!slacsDiscovery.shownSessions.has(session)) {
+  // The backend grants each detected process to one viewer window (offer: true);
+  // every other window stays quiet, so the offer appears once across windows.
+  else if (snapshot.offer === true && !slacsDiscovery.shownSessions.has(session)) {
     slacsDiscovery.shownSessions.add(session);
     slacsDiscovery.offeredSession = session;
   } else if (slacsDiscovery.offeredSession !== session) {
@@ -186,6 +188,12 @@ function openSlacsOffer() {
   return true;
 }
 
+// Only the window the user is looking at may claim the single offer for a process.
+function slacsMayClaimOffer() {
+  return document.visibilityState !== "hidden" &&
+    (typeof document.hasFocus !== "function" || document.hasFocus());
+}
+
 function pollSlacsDiscovery(epoch) {
   const current = () => slacsDiscovery.running && slacsDiscovery.epoch === epoch;
   if (!current()) return Promise.resolve();
@@ -204,7 +212,7 @@ function pollSlacsDiscovery(epoch) {
     };
     slacsDiscovery.pending = request;
     request.timeout = setTimeout(request.cancel, 3000);
-    Promise.resolve().then(() => window.pywebview?.api?.slacs_discovery_state?.())
+    Promise.resolve().then(() => window.pywebview?.api?.slacs_discovery_state?.(slacsMayClaimOffer()))
       .then(finish, request.cancel);
   });
 }
