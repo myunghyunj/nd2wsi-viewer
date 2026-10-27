@@ -2,7 +2,11 @@
 
 The user jogs the sample stage from the legacy SLACS program with W/A/S/D. This
 module watches those keystrokes and moves the translucent overlay to match, using
-the same commanded-displacement path as the HTTP receiver. It is a strict
+the same commanded-displacement path as the HTTP receiver. W/A/S/D move the
+overlay in the directions shown on screen: up, left, down and right, whatever
+rotation or flip the main viewer handed to the overlay (orientation is matched in
+the main viewer before the overlay opens). Only these key presses are followed;
+mouse clicks and other stage moves are never observed. It is a strict
 observer: on Windows it uses Raw Input (``RIDEV_INPUTSINK``), which never consumes,
 delays, alters, or blocks a keystroke, and it never calls into SLACS or the ACS
 controller. SLACS's own keystrokes and its commands to the stage are untouched.
@@ -35,14 +39,19 @@ from .slacs_identity import SCRIPT_NAME, command_line_is_slacs
 
 # SLACS's exact jog bindings are still being confirmed by another team, so the
 # whole policy lives in one place that is easy to change: which virtual key is
-# which jog letter, and the unit stage step each produces (scaled by step_um).
-# W/S move in +Y/-Y, A/D in -X/+X, matching the receiver's commanded axes.
+# which jog letter, and the unit screen direction it moves the overlay's view
+# (scaled by step_um). Directions are screen right (+x) and screen down (+y) as
+# displayed, the receiver's commanded axes: W moves the view up, S down, A left
+# and D right.
 KEY_BINDINGS: dict[int, tuple[str, tuple[float, float]]] = {
-    0x57: ("W", (0.0, 1.0)),
-    0x53: ("S", (0.0, -1.0)),
+    0x57: ("W", (0.0, -1.0)),
+    0x53: ("S", (0.0, 1.0)),
     0x41: ("A", (-1.0, 0.0)),
     0x44: ("D", (1.0, 0.0)),
 }
+# The one value to change if, on the instrument, the overlay moves opposite to
+# SLACS's live image: -1 reverses all four keys at once. Not a user setting.
+KEY_VIEW_SIGN = 1
 # A jog key held together with any of these is a shortcut, not a stage jog.
 BLOCKING_MODIFIERS = frozenset(("ctrl", "alt", "win"))
 MAX_STEP_UM = 10000.0
@@ -203,7 +212,7 @@ class SlacsKeyFollower:
             with self._lock:
                 self._ignored_not_slacs += 1
             return  # counted only in aggregate; the individual key is never recorded
-        delta = [unit_x * step, unit_y * step]
+        delta = [KEY_VIEW_SIGN * unit_x * step, KEY_VIEW_SIGN * unit_y * step]
         with self._lock:
             if not self._running:
                 return
@@ -857,5 +866,5 @@ def _windows_process_is_slacs(pid, created=None) -> bool:
     return command_line_is_slacs(command_line)
 
 
-__all__ = ["SlacsKeyFollower", "KEY_BINDINGS", "BLOCKING_MODIFIERS", "MAX_STEP_UM",
+__all__ = ["SlacsKeyFollower", "KEY_BINDINGS", "KEY_VIEW_SIGN", "BLOCKING_MODIFIERS", "MAX_STEP_UM",
            "SCRIPT_NAME"]

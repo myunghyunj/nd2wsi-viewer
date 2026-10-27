@@ -143,14 +143,40 @@
       ? { x: size[1], y: size[0] } : null;
   }
 
-  function stageImageDelta(displacement, pixelSize, alignment) {
-    // Register physical stage axes to canonical image axes. Display rotation and
-    // display flip remain entirely within OSD, so they must not be applied here.
-    const radians = alignment.angle * Math.PI / 180;
-    const x = displacement[0] * (alignment.flipX ? -1 : 1);
-    const y = displacement[1] * (alignment.flipY ? -1 : 1);
-    return { x: (x * Math.cos(radians) - y * Math.sin(radians)) / pixelSize.x,
-      y: (x * Math.sin(radians) + y * Math.cos(radians)) / pixelSize.y };
+  // Quarter turns are exact, as in OSD's Point.rotate, so 90° views stay exact.
+  function rotationTerms(degrees) {
+    const turn = ((degrees % 360) + 360) % 360;
+    if (turn === 0) return { cos: 1, sin: 0 };
+    if (turn === 90) return { cos: 0, sin: 1 };
+    if (turn === 180) return { cos: -1, sin: 0 };
+    if (turn === 270) return { cos: 0, sin: -1 };
+    const radians = degrees * Math.PI / 180;
+    return { cos: Math.cos(radians), sin: Math.sin(radians) };
+  }
+
+  // A Follow displacement [dx, dy] in micrometres moves the view centre dx to
+  // the right and dy down on screen, as displayed: the overlay moves in the
+  // directions the user sees, whatever rotation or flip the main viewer handed
+  // over. Returns the canonical image-pixel move of the centre. Screen axes are
+  // converted as OpenSeadragon 5.0.1 converts a mouse drag: its point
+  // conversions undo the rotation but not the flip, so x is negated on a
+  // flipped viewport first. Each screen axis then spans its micrometres at the
+  // image's pixel size along that direction, which differs per axis when the
+  // pixels are not square.
+  function screenImageDelta(displacementUm, pixelSize, rotationDegrees, flipped) {
+    const { cos, sin } = rotationTerms(rotationDegrees);
+    const sign = flipped ? -1 : 1;
+    // Unit image-pixel directions of screen right and screen down.
+    const axes = [{ x: sign * cos, y: -sign * sin }, { x: sin, y: cos }];
+    let x = 0, y = 0;
+    axes.forEach((axis, index) => {
+      const um = displacementUm[index];
+      if (!um) return;
+      const umPerPixel = Math.hypot(axis.x * pixelSize.x, axis.y * pixelSize.y);
+      x += um * axis.x / umPerPixel;
+      y += um * axis.y / umPerPixel;
+    });
+    return { x, y };
   }
 
   function mount(options) {
@@ -172,13 +198,9 @@
     const followDisconnected = doc.getElementById("stage-follow-disconnected");
     const followStatus = doc.getElementById("stage-follow-status");
     const followSettings = doc.getElementById("stage-follow-settings");
-    const followAngle = doc.getElementById("stage-follow-angle");
-    const followFlipX = doc.getElementById("stage-follow-flip-x");
-    const followFlipY = doc.getElementById("stage-follow-flip-y");
     const followSave = doc.getElementById("stage-follow-save");
     const followStep = doc.getElementById("stage-follow-step");
     const followCount = doc.getElementById("stage-follow-count");
-    const mirrorControl = doc.getElementById("overlay-mirror");
     const pixelSize = stagePixelSize(info);
     const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
     const initialOpacity = validOpacity(context.opacity) ? context.opacity : .55;
@@ -190,12 +212,10 @@
       return DEFAULT_STEP_UM;
     };
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
-      rois: [], roiIndex: -1, roiName: "", loadingRois: false,
-      mirrorScan: context.mirror_scan !== false, stepUm: loadStep(),
+      rois: [], roiIndex: -1, roiName: "", loadingRois: false, stepUm: loadStep(),
       opacity: initialOpacity, confirmedOpacity: initialOpacity };
     const follow = state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
-      seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "",
-      alignment: { angle: 0, flipX: false, flipY: false } };
+      seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "" };
     state.slacs = { available: false, session_id: null, status: "checking" };
     let followEpoch = 0, followTimer = null, followInFlight = false, disposed = false;
     let discoveryTask = null, discoveryInterval = null, discoveryGeneration = 0, disconnected = "";
@@ -348,13 +368,6 @@
       followStatus.dataset.status = follow.pending ? follow.status : unlocked ? "unlocked" :
         notInFront ? "not-in-front" : follow.status;
       followStatus.title = follow.message;
-      const editable = !state.locked && !state.pending;
-      mirrorControl.checked = state.mirrorScan;
-      mirrorControl.disabled = !editable || !state.ready;
-      followAngle.disabled = followFlipX.disabled = followFlipY.disabled = !editable;
-      followAngle.value = String(follow.alignment.angle);
-      followFlipX.checked = follow.alignment.flipX;
-      followFlipY.checked = follow.alignment.flipY;
       if (followStep) {
         followStep.value = String(state.stepUm);
         // The step is fixed for a run: changing it mid-follow would desync counts.
@@ -366,7 +379,7 @@
       }
       followSave.disabled = !follow.enabled || follow.pending || typeof api.save_stage_follow_connection !== "function";
       doc.getElementById("stage-follow-message").textContent = follow.message ||
-        (!pixelSize ? "A calibrated pixel size is needed." : "Commanded motion · alignment not verified");
+        (!pixelSize ? "A calibrated pixel size is needed." : "Commanded motion · moves in on-screen directions");
       doc.getElementById("stage-follow-delta").textContent = "Last image move: " +
         follow.lastDelta.x.toFixed(3) + ", " + follow.lastDelta.y.toFixed(3) + " px";
       doc.getElementById("stage-follow-scale").textContent = pixelSize ?
@@ -401,7 +414,10 @@
       // the reply is still consumed below, so presses made meanwhile are
       // discarded rather than replayed after locking.
       if (state.locked && result.status === "following" && (delta[0] || delta[1])) {
-        const imageDelta = stageImageDelta(delta, pixelSize, follow.alignment);
+        // Orientation is the main viewer's, shown unchanged; the target rotation
+        // is the one OSD's own drag conversion uses.
+        const imageDelta = screenImageDelta(delta, pixelSize, viewer.viewport.getRotation(),
+          viewer.viewport.getFlip());
         const center = viewer.viewport.viewportToImageCoordinates(viewer.viewport.getCenter(true));
         const target = { x: center.x + imageDelta.x, y: center.y + imageDelta.y };
         if (![target.x, target.y, imageDelta.x, imageDelta.y].every(Number.isFinite)) {
@@ -548,37 +564,11 @@
       return true;
     };
     win.nd2TranslucentRevokeFollow = revokeStageFollow;
-    const setStageAlignment = alignment => {
-      if (state.locked || state.pending || disposed || !Number.isFinite(alignment.angle) || Math.abs(alignment.angle) > 360) {
-        paintFollow(); return false;
-      }
-      follow.alignment = { angle: alignment.angle, flipX: alignment.flipX === true, flipY: alignment.flipY === true };
-      paintFollow(); return true;
-    };
-    const setMirrorScan = value => {
-      if (state.locked || state.pending || !state.ready || disposed || typeof value !== "boolean") {
-        paintFollow(); return false;
-      }
-      state.mirrorScan = value;
-      const saved = camera(viewer);
-      // The scan was viewed from above; SLACS views it from below. This extra
-      // horizontal display mirror composes with, and never rewrites, the source
-      // handoff's flip. Physical stage registration remains independent.
-      viewer.viewport.setFlip((context.flip === true) !== state.mirrorScan);
-      restoreCamera(viewer, saved);
-      renderRoiBoxes(); paintFollow();
-      return true;
-    };
-    mirrorControl.addEventListener("change", () => setMirrorScan(mirrorControl.checked));
     followButton.addEventListener("click", () => follow.enabled ? stopStageFollow() : startStageFollow());
     doc.getElementById("stage-follow-options").addEventListener("click", () => {
       followSettings.hidden = !followSettings.hidden;
       doc.getElementById("stage-follow-options").setAttribute("aria-expanded", String(!followSettings.hidden));
     });
-    for (const control of [followAngle, followFlipX, followFlipY]) {
-      control.addEventListener("change", () => setStageAlignment({ angle: Number(followAngle.value),
-        flipX: followFlipX.checked, flipY: followFlipY.checked }));
-    }
     const setStepUm = value => {
       const next = clampStep(value);
       if (next === null || follow.enabled || follow.pending) { paintFollow(); return false; }
@@ -685,8 +675,10 @@
 
     viewer.addHandler("open", () => {
       const viewport = viewer.viewport;
+      // Exactly the main viewer's orientation; this window has no direction
+      // settings of its own (an older handoff's mirror_scan is ignored).
       viewport.setRotation(context.rotation || 0, true);
-      viewport.setFlip((context.flip === true) !== state.mirrorScan);
+      viewport.setFlip(context.flip === true);
       restoreCamera(viewer, { zoom: context.zoom,
         center: viewport.imageToViewportCoordinates(new OSD.Point(...context.center)) });
       state.ready = true;
@@ -827,7 +819,7 @@
     discoveryInterval = win.setInterval(pollSlacsDiscovery, 1000);
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
       startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, revokeStageFollow,
-      setStageAlignment, setMirrorScan, setStepUm, forwardClientError };
+      setStepUm, forwardClientError };
   }
 
   async function boot(win) {
@@ -855,5 +847,5 @@
   }
 
   return { validateContext, makeTileSource, camera, restoreCamera, resizePreservingScale,
-    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, stagePixelSize, stageImageDelta, mount, boot };
+    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, stagePixelSize, screenImageDelta, mount, boot };
 });

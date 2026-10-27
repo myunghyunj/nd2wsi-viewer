@@ -139,8 +139,9 @@ def run():
         wait_for(lambda: child.evaluate_js('nd2Translucent.viewer.world.getItemAt(0).getFullyLoaded()'),
                  timeout=45,description='real ITO tiles')
         native_before=native_state(child)
-        assert camera(child)['flip'] is True, 'Default mirror image is not active'
-        report['default_mirror_verified']=True
+        # Exactly the main viewer's orientation (unrotated, unflipped here); no mirror of its own.
+        assert camera(child)['flip'] is False and camera(child)['rotation']==0, 'Overlay changed the main viewer orientation'
+        report['main_viewer_orientation_verified']=True
         roi_before=child.evaluate_js('JSON.stringify(nd2Translucent.state.rois)')
         roi_screen_before=child.evaluate_js("document.querySelector('#roi-overlay polygon').getAttribute('points')")
         marker_before=child.evaluate_js('Nd2ViewerGeometry.imageToViewerElementPoint(nd2Translucent.viewer.viewport,{x:1000,y:1000},OpenSeadragon)')
@@ -150,11 +151,13 @@ def run():
         bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
         assert child.evaluate_js('nd2Translucent.state.locked')
         motion(child,1,origin,type='reference',position_um=[10000,5000])
+        # 1 um right on screen: the view moves right, so the image content moves left.
         step=[origin[0]+1/mpp[1],origin[1]]
         motion(child,2,step,type='delta',delta_um=[1,0])
         marker_after=child.evaluate_js('Nd2ViewerGeometry.imageToViewerElementPoint(nd2Translucent.viewer.viewport,{x:1000,y:1000},OpenSeadragon)')
-        assert math.isclose(marker_after['x']-marker_before['x'],1/mpp[1],abs_tol=1e-6)
-        report['mirrored_screen_delta_css_px']=[marker_after['x']-marker_before['x'],marker_after['y']-marker_before['y']]
+        assert math.isclose(marker_after['x']-marker_before['x'],-1/mpp[1],abs_tol=1e-6)
+        assert math.isclose(marker_after['y'],marker_before['y'],abs_tol=1e-6)
+        report['content_screen_delta_css_px']=[marker_after['x']-marker_before['x'],marker_after['y']-marker_before['y']]
         roi_screen_after=child.evaluate_js("document.querySelector('#roi-overlay polygon').getAttribute('points')")
         assert roi_screen_before!=roi_screen_after
         assert child.evaluate_js('JSON.stringify(nd2Translucent.state.rois)')==roi_before
@@ -178,11 +181,10 @@ def run():
         # Locked again: only the next press moves, from the manual position.
         manual_next=[manual[0]+10/mpp[1],manual[1]]
         motion(child,5,manual_next,type='delta',delta_um=[10,0])
-        bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
-        assert child.evaluate_js('nd2Translucent.setMirrorScan(false)')
+        # A rotated view (as the main viewer may hand over): 10 um left on screen
+        # runs along image +Y at 90 degrees.
         child.evaluate_js('nd2Translucent.viewer.viewport.setRotation(90,true); true')
-        bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
-        oriented=[manual_next[0]-10/mpp[1],manual_next[1]]
+        oriented=[manual_next[0],manual_next[1]+10/mpp[0]]
         motion(child,6,oriented,type='delta',delta_um=[-10,0])
         assert camera(child)['rotation']==90 and camera(child)['flip'] is False
         assert math.isclose(camera(child)['zoom'],1,abs_tol=1e-9)
@@ -198,11 +200,11 @@ def run():
         report['native_frame_preserved']=native_state(child)['frame']==native_before['frame']
         report['opacity_preserved']=child.evaluate_js('nd2Translucent.state.opacity')==.55
         report['render_query_preserved']=overlay.translucent_context()['query']=='?c=0%2C1&g='+info['generation']
-        bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
-        assert child.evaluate_js('nd2Translucent.setMirrorScan(true)')
         child.evaluate_js('nd2Translucent.viewer.viewport.setRotation(0,true); true')
-        bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
         child.evaluate_js("document.getElementById('stage-follow-options').click(); true")
+        assert child.evaluate_js("!document.getElementById('overlay-mirror') && !document.getElementById('stage-follow-angle')"), \
+            'The overlay shows direction settings of its own'
+        report['no_overlay_direction_settings']=True
         report['snapshot']=str(save_cocoa_snapshot(child,session.exports_root/'stage-follow-native.png'))
         try: send('/motion',seq=8,type='delta',delta_um=[100,0])
         except urllib.error.HTTPError as exc: assert exc.code==409

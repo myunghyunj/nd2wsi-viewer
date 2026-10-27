@@ -27,22 +27,15 @@
   </div>
   <p id="stage-follow-disconnected" role="status" aria-live="polite" hidden></p>
   <div id="stage-follow-settings" hidden>
-    <label class="mirror-image-control"><input id="overlay-mirror" type="checkbox" checked /> Mirror image</label>
-    <p class="stage-follow-hint">For viewing the sample from below.</p>
     <label class="stage-follow-step-control">Step per key press <input id="stage-follow-step" type="number" min="0.001" max="10000" step="0.1" value="10" /> µm</label>
     <p class="stage-follow-hint">Set this to SLACS's Roughness (1 Roughness ≈ 1 µm). Counts W/A/S/D only while SLACS is in front.</p>
     <output id="stage-follow-count">Key presses: 0</output>
-    <p>Stage → image alignment</p>
-    <label>Rotation <input id="stage-follow-angle" type="number" min="-360" max="360" step="0.1" value="0" /> °</label>
-    <div class="stage-follow-flips">
-      <label><input id="stage-follow-flip-x" type="checkbox" /> Flip stage X</label>
-      <label><input id="stage-follow-flip-y" type="checkbox" /> Flip stage Y</label>
-    </div>
+    <p class="stage-follow-hint">W/A/S/D move the image in the directions shown on screen. Set rotation and flip in the main viewer before opening this window.</p>
     <p class="stage-follow-hint">Follows only while locked. Unlock to align by hand; key presses are ignored until you lock again.</p>
     <output id="stage-follow-scale"></output>
     <output id="stage-follow-delta">Last image move: 0.000, 0.000 px</output>
     <button type="button" id="stage-follow-save" disabled>Save connection…</button>
-    <p id="stage-follow-message" role="status">Commanded motion · alignment not verified</p>
+    <p id="stage-follow-message" role="status">Commanded motion · moves in on-screen directions</p>
   </div>
   <div id="opacity-control">
     <input type="range" id="overlay-opacity" min="10" max="100" step="1" value="55" aria-label="Opacity" aria-valuetext="55%" />

@@ -409,8 +409,8 @@ def overlay_smoke(monkeypatch):
     monkeypatch.setattr(translucent_smoke, "click_shell_cloud",
                         lambda *_args, **_kwargs: api._translucent_windows.update(one=overlay))
     monkeypatch.setattr(translucent_smoke, "bridge_result", lambda *_args, **_kwargs: {"query": "c=0"})
-    # Default mirror_scan: the overlay shows the unflipped source mirrored.
-    monkeypatch.setattr(translucent_smoke, "camera", lambda _child: {"rotation": 0, "flip": True})
+    # The overlay shows exactly the main viewer's (unflipped) orientation.
+    monkeypatch.setattr(translucent_smoke, "camera", lambda _child: {"rotation": 0, "flip": False})
     monkeypatch.setattr(translucent_smoke, "check_camera", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(translucent_smoke, "native_state", lambda *_args, **_kwargs: {
         "topmost": True, "has_parent": False, "opacity": .55, "opaque": False, "background_alpha": 0})

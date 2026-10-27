@@ -57,18 +57,20 @@ def test_detection_never_blocks_follow_and_ends_only_a_follow_bound_to_a_lost_pr
         api.close_translucent()
 
 
-def test_mirror_defaults_to_opposite_surface_without_changing_stage_calibration():
+@pytest.mark.parametrize('flip', [False, True])
+def test_context_carries_the_main_viewer_orientation_and_ignores_an_old_mirror_setting(flip):
     store = SimpleNamespace(attrs={'nd2wsi': {'levels': [{'width': 2048, 'height': 2048}],
                                              'pixel_size_um': [.660165814209375] * 2},
                                    'omero': {'channels': [{}]}}, generation='pixels', plate=None)
-    payload = {'version': 1, 'center': [1000, 1000], 'zoom': 1, 'flip': False, 'query': 'g=pixels'}
+    payload = {'version': 1, 'center': [1000, 1000], 'zoom': 1, 'rotation': 450, 'flip': flip, 'query': 'g=pixels'}
     context = validate_context(store, payload, slide_url='http://local/s/ito/')
-    assert context['mirror_scan'] is True
-    assert context['flip'] is False
+    assert context['flip'] is flip and context['rotation'] == 90
+    assert 'mirror_scan' not in context
     assert context['pixel_size_um'] == store.attrs['nd2wsi']['pixel_size_um']
-    assert validate_context(store, {**payload, 'mirror_scan': False}, slide_url='http://local/s/ito/')['mirror_scan'] is False
-    with pytest.raises(ValueError, match='Mirror image'):
-        validate_context(store, {**payload, 'mirror_scan': 'true'}, slide_url='http://local/s/ito/')
+    # Older code may still send its own mirror setting; it never changes the orientation.
+    for mirror in (True, False, 'true', None):
+        older = validate_context(store, {**payload, 'mirror_scan': mirror}, slide_url='http://local/s/ito/')
+        assert older == context
 
 
 def test_receivers_are_owned_isolated_and_lock_does_not_stop_observation():

@@ -246,7 +246,7 @@ def test_real_wasd_follows_only_while_slacs_is_in_front(tmp_path):
         for vk in (VK_D, VK_D, VK_D, VK_W):
             _press(vk)
             time.sleep(0.05)
-        expected = [3 * STEP_UM, 1 * STEP_UM]
+        expected = [3 * STEP_UM, -1 * STEP_UM]  # D moves the view right, W up
         displacement = _wait_for_displacement(receiver, expected)
         assert displacement == expected, (displacement, follower.snapshot(), _foreground_description())
         assert follower.snapshot()["counted"] == 4
@@ -255,7 +255,7 @@ def test_real_wasd_follows_only_while_slacs_is_in_front(tmp_path):
         _send_keys([(VK_CONTROL, False), (VK_D, False), (VK_D, True), (VK_CONTROL, True)])
         time.sleep(0.3)
         _press(VK_D)
-        expected = [4 * STEP_UM, 1 * STEP_UM]
+        expected = [4 * STEP_UM, -1 * STEP_UM]
         displacement = _wait_for_displacement(receiver, expected)
         assert displacement == expected, (displacement, follower.snapshot())
         counted = follower.snapshot()["counted"]

@@ -19,7 +19,7 @@ const info = {width:1000,height:500,tileSize:256,rgb:false,generation:'original'
   levels:[{width:1000,height:500,path:'0'},{width:501,height:251,path:'1'}]};
 const context={version:1,slide_url:'http://localhost:9876/token/s/abc/',
   query:'c=0%2C2&win=10%3A300%3A0.25%2C%2C2%3A150&g=original&t=2&p=4&z=1',
-  center:[400,250],zoom:2,rotation:90,flip:true,mirror_scan:false,opacity:.55};
+  center:[400,250],zoom:2,rotation:90,flip:true,opacity:.55};
 const Point=class {constructor(x,y){this.x=x;this.y=y;}};
 function fakeViewer(){
   let width=800,height=500,zoom=2.5,center=new Point(.4,.25),rotation=0,flipped=false;
@@ -519,7 +519,9 @@ def test_stage_follow_is_opt_in_and_locked_commands_pan_image_and_existing_roi_t
         delta:h.element('stage-follow-delta').textContent,scale:h.element('stage-follow-scale').textContent};
     """)
     assert result["initial"] == {"enabled": False, "calls": [], "timers": 0}
-    assert result["after"]["center"] == pytest.approx({"x": .42, "y": .26})
+    # At the handed-over 90 degree flipped view, 10 um right is +5 image Y px
+    # (at 2 um/px) and 20 um down is +40 image X px (at .5 um/px).
+    assert result["after"]["center"] == pytest.approx({"x": .44, "y": .255})
     assert result["after"]["zoom"] == result["before"]["camera"]["zoom"]
     assert result["roiMoved"] and result["sourceUnchanged"]
     assert result["rotation"] == 90 and result["flip"] is True
@@ -527,7 +529,7 @@ def test_stage_follow_is_opt_in_and_locked_commands_pan_image_and_existing_roi_t
     assert result["mouse"] is False and result["manualRoi"] is False
     assert result["lockTitle"] == "Unlock to align by hand (L) · Key presses move the image only while locked"
     assert result["status"] == "Following SLACS keys"
-    assert result["delta"] == "Last image move: 20.000, 10.000 px"
+    assert result["delta"] == "Last image move: 40.000, 5.000 px"
     assert result["scale"] == "Pixel size: X 0.500 · Y 2.000 µm/px"
 
 
@@ -553,7 +555,7 @@ def test_unlocked_manual_alignment_is_kept_as_the_base_once_locked_again():
                                   "status": "Unlocked: align by hand, lock to follow", "data": "unlocked",
                                   "enabled": True, "lockLabel": "Lock to follow SLACS keys"}
     # Locked again, only the newest press moves, from the manual position.
-    assert result["camera"] == {"center": pytest.approx({"x": .61, "y": .305}), "zoom": 2}
+    assert result["camera"] == {"center": pytest.approx({"x": .62, "y": .3025}), "zoom": 2}
     assert result["locked"] is True and result["status"] == "Following SLACS keys"
 
 
@@ -573,8 +575,9 @@ def test_presses_while_unlocked_never_move_and_are_not_replayed_after_locking():
     assert result["unlocked"] == {"camera": result["before"], "pans": 0, "seq": 2, "displacement": [30, 60],
                                   "delta": "Last image move: 0.000, 0.000 px"}
     assert result["relocked"] == {"camera": result["before"], "pans": 0}
-    # Only seq 3's (5, 10) um moves the view: 10 and 5 image px at [Y, X] = [2, .5] um/px.
-    assert result["after"]["center"] == pytest.approx({"x": .41, "y": .255})
+    # Only seq 3's (5, 10) um moves the view: 20 image X px and 2.5 image Y px
+    # at the 90 degree flipped view and [Y, X] = [2, .5] um/px.
+    assert result["after"]["center"] == pytest.approx({"x": .42, "y": .2525})
     assert result["status"] == "following"
 
 
@@ -589,8 +592,8 @@ def test_stage_poll_can_skip_events_without_losing_displacement_or_reapplying_du
         duplicateDidNotPan:before===h.viewer.calls.filter(c=>c[0]==='pan').length,
         timerDelays:[...h.timers.values()].map(timer=>timer.delay)};
     """)
-    assert result["camera"]["center"] == pytest.approx({"x": .4095, "y": .25425})
-    assert result["delta"] == pytest.approx({"x": 7, "y": 3})
+    assert result["camera"]["center"] == pytest.approx({"x": .417, "y": .252375})
+    assert result["delta"] == pytest.approx({"x": 12, "y": 1.75})
     assert result["duplicateDidNotPan"] and result["timerDelays"] == [50]
 
 
@@ -612,22 +615,70 @@ def test_stage_next_roi_sized_delta_moves_outlines_without_selecting_or_editing_
     assert result["selected"] == 0
 
 
-def test_stage_axis_alignment_is_separate_from_display_rotation_and_lock_gated():
-    result = run("""
-      const h=followHarness(),m=h.mounted;
-      const accepted=m.setStageAlignment({angle:90,flipX:true,flipY:false});
-      await m.startStageFollow();await m.toggleLock();
-      const rejected=m.setStageAlignment({angle:0,flipX:false,flipY:true});
-      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
-      return {accepted,rejected,alignment:m.state.follow.alignment,center:api.camera(h.viewer).center,
-        rotation:h.viewer.viewport.getRotation(),flip:h.viewer.viewport.getFlip(),
-        disabled:h.element('stage-follow-angle').disabled,message:h.element('stage-follow-message').textContent};
+# The forward projection OSD draws with, and the smoke's check_roi_boxes checks:
+# rotate the image-pixel move, then mirror x when the view is flipped.
+PROJECT = """
+  const project=(d,rotation,flipped)=>{const a=rotation*Math.PI/180;
+    const x=d.x*Math.cos(a)-d.y*Math.sin(a),y=d.x*Math.sin(a)+d.y*Math.cos(a);return {x:flipped?-x:x,y};};
+"""
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270, 37, -90, 450])
+@pytest.mark.parametrize("flipped", [False, True])
+def test_screen_image_delta_moves_the_view_in_the_screen_direction_at_any_orientation(rotation, flipped):
+    result = run(PROJECT + f"""
+      const rotation={rotation},flipped={str(flipped).lower()},out={{}};
+      for(const [key,um] of Object.entries({{W:[0,-10],A:[-10,0],S:[0,10],D:[10,0]}})){{
+        const square=api.screenImageDelta(um,{{x:.5,y:.5}},rotation,flipped);
+        const cells=api.screenImageDelta(um,{{x:.8,y:.5}},rotation,flipped);
+        out[key]={{square:project(square,rotation,flipped),cells:project(cells,rotation,flipped),
+          physical:Math.hypot(cells.x*.8,cells.y*.5)}};
+      }}
+      return out;
     """)
-    assert result["accepted"] is True and result["rejected"] is False
-    assert result["alignment"] == {"angle": 90, "flipX": True, "flipY": False}
-    assert result["center"] == pytest.approx({"x": .36, "y": .245})
-    assert result["rotation"] == 90 and result["flip"] is True and result["disabled"] is True
-    assert "alignment not verified" in result["message"]
+    for key, (x, y) in {"W": (0, -1), "A": (-1, 0), "S": (0, 1), "D": (1, 0)}.items():
+        # Square pixels: 10 um is 20 image px straight along the key's screen direction.
+        assert result[key]["square"] == pytest.approx({"x": 20 * x, "y": 20 * y}, abs=1e-9)
+        # Non-square pixels keep the screen direction and span exactly 10 um.
+        cells = result[key]["cells"]
+        assert abs(cells["x" if y else "y"]) < 1e-9 and (cells["x"] * x + cells["y"] * y) > 0
+        assert result[key]["physical"] == pytest.approx(10)
+
+
+@pytest.mark.parametrize("rotation, flipped, expected", [
+    (0, False, (5, 3)), (0, True, (-5, 3)), (90, False, (1.875, -8)), (90, True, (1.875, 8)),
+    (180, False, (-5, -3)), (180, True, (5, -3)), (270, False, (-1.875, 8)), (270, True, (-1.875, -8)),
+])
+def test_screen_image_delta_is_exact_at_quarter_turns_with_anisotropic_pixels(rotation, flipped, expected):
+    result = run(f"return api.screenImageDelta([4,1.5],{{x:.8,y:.5}},{rotation},{str(flipped).lower()});")
+    assert result == {"x": expected[0], "y": expected[1]}
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270, 37])
+@pytest.mark.parametrize("flip", [False, True])
+def test_each_key_step_moves_the_image_the_same_way_on_screen_at_any_main_viewer_orientation(rotation, flip):
+    from nd2wsi.stage_keys import KEY_BINDINGS, KEY_VIEW_SIGN
+
+    steps = [[letter, [KEY_VIEW_SIGN * x * 10, KEY_VIEW_SIGN * y * 10]]
+             for letter, (x, y) in sorted(KEY_BINDINGS.values())]
+    result = run(f"""
+      const h=followHarness({{initialContext:{{rotation:{rotation},flip:{str(flip).lower()},
+        rois:[{{x:390,y:240,w:20,h:20}}],roiIndex:0}},infoOverrides:{{pixelSizeUm:[.5,.5]}}}}),m=h.mounted;
+      await m.startStageFollow();await m.toggleLock();
+      const corner=()=>h.element('roi-overlay').children[0].attributes.points.split(' ')[0].split(',').map(Number);
+      const moves={{}};let seq=0,total=[0,0];
+      for(const [key,step] of {json.dumps(steps)}){{
+        const before=corner();total=[total[0]+step[0],total[1]+step[1]];
+        Object.assign(h.snapshot,{{seq:++seq,status:'following',displacement_um:total.slice()}});await m.pollStageFollow();
+        const after=corner();moves[key]=[after[0]-before[0],after[1]-before[1]];
+      }}
+      return {{moves,rotation:h.viewer.viewport.getRotation(),flip:h.viewer.viewport.getFlip()}};
+    """)
+    assert result["rotation"] == rotation and result["flip"] is flip
+    # 10 um at .5 um/px and image zoom 2 is 40 CSS px; the view moves with the
+    # key, so the image content moves the opposite way on screen.
+    for key, expected in {"W": (0, 40), "A": (40, 0), "S": (0, -40), "D": (-40, 0)}.items():
+        assert result["moves"][key] == pytest.approx(list(expected), abs=1e-9)
 
 
 def test_stage_pause_latches_and_stop_leaves_unlocked_manual_navigation_available():
@@ -923,69 +974,51 @@ def test_stage_settings_editors_keep_keyboard_input_without_roi_or_window_shortc
                       "prevented": 1, "native": [["close"]]}
 
 
-@pytest.mark.parametrize("source_flip,mirror,effective", [
-    (False, "undefined", True), (True, "undefined", False),
-    (False, "true", True), (True, "true", False),
-    (False, "false", False), (True, "false", True),
-])
-def test_translucent_defaults_to_extra_display_mirror_composed_with_source_flip(source_flip, mirror, effective):
+@pytest.mark.parametrize("source_flip", [False, True])
+@pytest.mark.parametrize("mirror", ["undefined", "true", "false", "'yes'"])
+def test_overlay_shows_exactly_the_main_viewer_orientation_and_ignores_an_old_mirror_setting(source_flip, mirror):
     result = run(f"""
       const original={{...context,flip:{str(source_flip).lower()},mirror_scan:{mirror}}};
       const before=JSON.stringify(original),h=harness({{initialContext:original}});
-      return {{mirror:h.mounted.state.mirrorScan,checked:h.element('overlay-mirror').checked,
-        effective:h.viewer.viewport.getFlip(),sourceUnchanged:before===JSON.stringify(original),
+      return {{effective:h.viewer.viewport.getFlip(),sourceUnchanged:before===JSON.stringify(original),
         camera:api.camera(h.viewer),rotation:h.viewer.viewport.getRotation()}};
     """)
-    assert result["mirror"] is (mirror != "false")
-    assert result["checked"] is result["mirror"]
-    assert result["effective"] is effective
+    assert result["effective"] is source_flip
     assert result["sourceUnchanged"] is True
     assert result["camera"] == {"center": {"x": .4, "y": .25}, "zoom": 2}
     assert result["rotation"] == 90
 
 
-def test_mirror_checkbox_reflects_existing_roi_display_without_changing_source_or_camera_and_respects_lock():
+def test_the_overlay_has_no_direction_settings_of_its_own():
+    page = (MODULE.parent / "translucent.html").read_text(encoding="utf-8")
+    for removed in ("overlay-mirror", "Mirror image", "stage-follow-angle", "stage-follow-flip-x",
+                    "stage-follow-flip-y", "Flip stage", "Stage → image alignment"):
+        assert removed not in page
+    assert 'id="stage-follow-step"' in page and "Step per key press" in page
+    assert "directions shown on screen" in page and "main viewer" in page
     result = run("""
-      const rois=[{x:440,y:240,w:20,h:10}];
-      const h=followHarness({initialContext:{mirror_scan:undefined,rotation:30,flip:false,rois,roiIndex:0}}),m=h.mounted;
-      const points=()=>h.element('roi-overlay').children[0].attributes.points.split(' ').map(p=>p.split(',').map(Number));
-      const before={points:points(),camera:api.camera(h.viewer),source:JSON.stringify(m.state.rois)};
-      h.element('overlay-mirror').checked=false;
-      const accepted=h.element('overlay-mirror').listeners.change(),after=points();
-      await m.toggleLock();h.element('overlay-mirror').checked=true;
-      const rejected=h.element('overlay-mirror').listeners.change();
-      return {accepted,rejected,before,after,camera:api.camera(h.viewer),
-        sourceUnchanged:before.source===JSON.stringify(m.state.rois),inputUnchanged:rois,
-        mirror:m.state.mirrorScan,checked:h.element('overlay-mirror').checked,
-        disabled:h.element('overlay-mirror').disabled,rotation:h.viewer.viewport.getRotation(),
-        opacity:m.state.opacity,lockedPoints:points()};
+      const m=followHarness().mounted;
+      return {mirror:'mirrorScan' in m.state,alignment:'alignment' in m.state.follow,
+        setters:['setMirrorScan','setStageAlignment'].filter(name=>name in m),pure:typeof api.screenImageDelta,
+        old:typeof api.stageImageDelta};
     """)
-    assert result["accepted"] is True and result["rejected"] is False
-    for before, after in zip(result["before"]["points"], result["after"], strict=True):
-        assert after == pytest.approx([800 - before[0], before[1]])
-    assert result["camera"] == result["before"]["camera"]
-    assert result["sourceUnchanged"] and result["lockedPoints"] == result["after"]
-    assert result["inputUnchanged"] == [{"x": 440, "y": 240, "w": 20, "h": 10}]
-    assert result["mirror"] is False and result["checked"] is False and result["disabled"] is True
-    assert result["rotation"] == 30 and result["opacity"] == .55
+    assert result == {"mirror": False, "alignment": False, "setters": [], "pure": "function", "old": "undefined"}
 
 
-def test_display_mirror_does_not_reverse_or_modify_physical_stage_registration():
+def test_rotating_the_view_after_handoff_changes_follow_to_match_what_is_shown():
     result = run("""
-      const h=followHarness({initialContext:{mirror_scan:undefined,flip:false}}),m=h.mounted;
+      const h=followHarness({initialContext:{rotation:0,flip:false}}),m=h.mounted;
       await m.startStageFollow();await m.toggleLock();
       Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
-      const mirrored={camera:api.camera(h.viewer),delta:{...m.state.follow.lastDelta},flip:h.viewer.viewport.getFlip()};
-      await m.toggleLock();m.setMirrorScan(false);await m.toggleLock();
+      const upright={...m.state.follow.lastDelta};
+      h.viewer.viewport.setRotation(90);h.viewer.viewport.setFlip(true);
       Object.assign(h.snapshot,{seq:2,displacement_um:[20,40]});await m.pollStageFollow();
-      return {mirrored,after:{camera:api.camera(h.viewer),delta:m.state.follow.lastDelta,flip:h.viewer.viewport.getFlip()},
-        alignment:m.state.follow.alignment};
+      return {upright,turned:m.state.follow.lastDelta};
     """)
-    assert result["mirrored"]["delta"] == result["after"]["delta"] == {"x": 20, "y": 10}
-    assert result["mirrored"]["camera"]["center"] == pytest.approx({"x": .42, "y": .26})
-    assert result["after"]["camera"]["center"] == pytest.approx({"x": .44, "y": .27})
-    assert result["mirrored"]["flip"] is True and result["after"]["flip"] is False
-    assert result["alignment"] == {"angle": 0, "flipX": False, "flipY": False}
+    # [Y, X] = [2, .5] um/px: unrotated, 10 um right is 20 X px and 20 um down is 10 Y px.
+    assert result["upright"] == {"x": 20, "y": 10}
+    # Turned 90 degrees and flipped, the same screen move runs along the other image axes.
+    assert result["turned"] == {"x": 40, "y": 5}
 
 
 def test_step_input_defaults_to_ten_and_is_shown_in_the_settings():

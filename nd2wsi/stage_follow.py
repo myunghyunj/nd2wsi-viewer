@@ -2,7 +2,9 @@
 
 This module never connects to a controller or interprets its wire protocol. A
 separate, validated observer supplies XY values in micrometres. They describe
-commanded motion, not measured stage feedback. Sequence gaps or lost contact
+commanded motion, not measured stage feedback. X moves the overlay's view to the
+right and Y moves it down, in screen directions as the overlay displays the
+image (translucent-v1.js screenImageDelta). Sequence gaps or lost contact
 require a fresh receiver and viewer anchor before following can resume.
 """
 

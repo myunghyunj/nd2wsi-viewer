@@ -1,4 +1,4 @@
-"""Packaged GUI smoke: mirror-aware overlay orientation and a real stage-follow round trip.
+"""Packaged GUI smoke: the main viewer's overlay orientation and a real stage-follow round trip.
 
 The overlay page is a fake that mirrors translucent-v1.js's Follow logic; the
 receiver, its loopback HTTP server and the overlay bridge object are real.
@@ -27,9 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 PIXELS_YX = [.5, .8]
 
 
-def make_overlay(pixels=PIXELS_YX, mirror=True):
+def make_overlay(pixels=PIXELS_YX, flip=False):
     api = TranslucentApi({"pixel_size_um": pixels, "dimensions": [2048, 2048], "image_name": "fixture.nd2",
-                          "flip": False, "mirror_scan": mirror}, logger=Mock(), on_closed=Mock())
+                          "flip": flip}, logger=Mock(), on_closed=Mock())
     api._window = Mock()
     api._dispatch = lambda operation: None
     # These unit tests exercise injection and the receiver, never OS discovery.
@@ -41,18 +41,21 @@ def make_overlay(pixels=PIXELS_YX, mirror=True):
 class FakePage:
     """translucent-v1.js Follow behaviour, polled whenever the smoke reads the page.
 
-    ``mode`` breaks it on purpose: "frozen" consumes without moving, "never"
-    stops polling, "mirror-inverts-x" wrongly inverts physical X when mirrored,
-    "swapped" divides by the wrong pixel axis, "rotation-applied" wrongly turns
-    the physical delta by the display rotation. ``rotatable=False`` models a
+    A displacement moves the view right and down on screen; the page finds the
+    image-pixel move by inverting check_roi_boxes's projection, independently
+    of the smoke's own formula. ``mode`` breaks it on purpose: "frozen"
+    consumes without moving, "never" stops polling, "mirror-ignored" ignores a
+    flipped view, "rotation-ignored" ignores the display rotation (the old
+    canonical-axis behaviour), "swapped" uses the wrong pixel axis,
+    "reset-rotation" resets the display angle. ``rotatable=False`` models a
     locked page that keeps its rotation.
     """
 
-    def __init__(self, overlay, *, mirror=True, locked=True, mode="correct", pixels=PIXELS_YX):
-        self.overlay, self.mode, self.mirror, self.locked = overlay, mode, mirror, locked
+    def __init__(self, overlay, *, flip=False, rotation=0, locked=True, mode="correct", pixels=PIXELS_YX):
+        self.overlay, self.mode, self.locked = overlay, mode, locked
         self.pixel = {"x": pixels[1], "y": pixels[0]}
-        # Source flip false: the displayed flip is the mirror setting.
-        self.view = {"center": [1000.0, 800.0], "zoom": 1.5, "rotation": 30, "flip": mirror, "size": [744, 528]}
+        # The main viewer's orientation, shown unchanged.
+        self.view = {"center": [1000.0, 800.0], "zoom": 1.5, "rotation": rotation, "flip": flip, "size": [744, 528]}
         self.follow = {"enabled": False, "status": "off", "seq": 0, "session": "", "message": "",
                        "displacement": [0, 0]}
         self.disabled = False
@@ -73,20 +76,30 @@ class FakePage:
             return
         delta = [a - b for a, b in zip(state["displacement_um"], follow["displacement"])]
         if state["status"] == "following" and any(delta):
-            dx, dy = delta[0] / self.pixel["x"], delta[1] / self.pixel["y"]
+            dx, dy = self.image_delta(delta)
             if self.mode == "frozen":
                 dx = dy = 0
-            elif self.mode == "mirror-inverts-x" and self.view["flip"]:
-                dx = -dx
-            elif self.mode == "swapped":
-                dx, dy = delta[0] / self.pixel["y"], delta[1] / self.pixel["x"]
             elif self.mode == "reset-rotation":
                 self.view["rotation"] = 0  # a Follow bug that resets the display angle
-            elif self.mode == "rotation-applied" and self.view["rotation"] % 360:
-                angle = math.radians(self.view["rotation"])
-                dx, dy = dx * math.cos(angle) - dy * math.sin(angle), dx * math.sin(angle) + dy * math.cos(angle)
             self.view["center"] = [self.view["center"][0] + dx, self.view["center"][1] + dy]
         follow.update(displacement=list(state["displacement_um"]), seq=state["seq"], status=state["status"])
+
+    def image_delta(self, um):
+        rotation = 0 if self.mode == "rotation-ignored" else self.view["rotation"]
+        flip = False if self.mode == "mirror-ignored" else self.view["flip"]
+        theta, sign = math.radians(rotation), -1 if flip else 1
+        # check_roi_boxes: screen = mirror(rotate(image)); invert that 2x2 map.
+        a, b, c, d = sign * math.cos(theta), -sign * math.sin(theta), math.sin(theta), math.cos(theta)
+        det = a * d - b * c
+        columns = ((d / det, -c / det), (-b / det, a / det))  # image move per screen right, per screen down
+        pixel_x, pixel_y = self.pixel["x"], self.pixel["y"]
+        if self.mode == "swapped":
+            pixel_x, pixel_y = pixel_y, pixel_x
+        moved = [0.0, 0.0]
+        for value, (x, y) in zip(um, columns):
+            length = math.hypot(x * pixel_x, y * pixel_y)
+            moved = [moved[0] + value * x / length, moved[1] + value * y / length]
+        return moved
 
     def click_follow(self):
         if self.disabled:
@@ -115,7 +128,7 @@ class FakePage:
             detected = self.overlay.slacs_discovery_state()["available"]
             return {"enabled": follow["enabled"], "pending": False, "status": follow["status"], "seq": follow["seq"],
                     "session": follow["session"], "message": follow["message"], "locked": self.locked,
-                    "mirror": self.mirror, "disabled": self.disabled,
+                    "disabled": self.disabled,
                     "pressed": "true" if follow["enabled"] else "false",
                     "title": self.title, "visible": self.visible and detected, "hit": self.hit and detected}
         if script == smoke.STAGE_FOLLOW_CLICK:
@@ -145,8 +158,8 @@ def follow_run(monkeypatch):
 
     monkeypatch.setattr(smoke, "stage_follow_post", recording_post)
 
-    def run(*, mirror=True, mode="correct", pixels=PIXELS_YX, page_setup=None, **kwargs):
-        overlay = make_overlay(pixels, mirror)
+    def run(*, flip=False, rotation=0, mode="correct", pixels=PIXELS_YX, page_setup=None, **kwargs):
+        overlay = make_overlay(pixels, flip)
         discovery_events = []
 
         def stop_discovery():
@@ -162,7 +175,7 @@ def follow_run(monkeypatch):
             change_discovery(snapshot)
 
         overlay._on_slacs_change = record_discovery
-        page = FakePage(overlay, mirror=mirror, mode=mode)
+        page = FakePage(overlay, flip=flip, rotation=rotation, mode=mode)
         if page_setup is not None:
             page_setup(page)
         roi_checks = []
@@ -263,30 +276,21 @@ def test_failed_restoration_cannot_report_a_successful_diagnostic(follow_run):
     assert run.overlay._stage_follow is None
 
 
-# Mirror-aware display orientation --------------------------------------------
+# The main viewer's display orientation -----------------------------------------
 
-@pytest.mark.parametrize("source_flip, mirror, expected", [
-    (False, True, True), (True, True, False), (False, False, False), (True, False, True),
-])
-def test_overlay_flip_is_the_source_flip_xor_mirror_scan(source_flip, mirror, expected):
-    context = {"flip": source_flip, "mirror_scan": mirror}
-    assert smoke.expected_overlay_flip(context, source_flip) is expected
-
-
-def test_overlay_flip_defaults_to_mirrored_like_the_page():
-    # translucent-v1.js: mirrorScan = context.mirror_scan !== false.
-    assert smoke.expected_overlay_flip({}, False) is True
-    assert smoke.expected_overlay_flip({}, True) is False
+@pytest.mark.parametrize("source_flip", [False, True])
+@pytest.mark.parametrize("old_mirror", ["absent", True, False, "true", None])
+def test_overlay_flip_is_exactly_the_source_flip(source_flip, old_mirror):
+    context = {"flip": source_flip}
+    if old_mirror != "absent":
+        context["mirror_scan"] = old_mirror  # an older context's own setting is ignored
+    assert smoke.expected_overlay_flip(context, source_flip) is source_flip
+    assert smoke.expected_overlay_flip({}, source_flip) is source_flip
 
 
-@pytest.mark.parametrize("context, message", [
-    ({"mirror_scan": "true"}, "invalid mirror_scan"),
-    ({"mirror_scan": None}, "invalid mirror_scan"),
-    ({"mirror_scan": True, "flip": True}, "changed the source handoff flip"),
-])
-def test_overlay_flip_rejects_an_invalid_context(context, message):
-    with pytest.raises(AssertionError, match=message):
-        smoke.expected_overlay_flip(context, False)
+def test_overlay_flip_rejects_a_context_that_changed_the_source_flip():
+    with pytest.raises(AssertionError, match="changed the source handoff flip"):
+        smoke.expected_overlay_flip({"flip": True}, False)
 
 
 @pytest.fixture()
@@ -294,13 +298,13 @@ def handoff(monkeypatch):
     """exercise_translucent_viewer up to its first DOM style read (macOS path)."""
     monkeypatch.setattr(sys, "platform", "darwin")
 
-    def run(*, source_flip, mirror, displayed_flip):
+    def run(*, source_flip, displayed_flip):
         api = SimpleNamespace(_translucent_windows={})
         parent = SimpleNamespace(_js_api=api)
         child = SimpleNamespace(uid="overlay", evaluate_js=Mock(side_effect=[True, RuntimeError("stop after setup")]))
         overlay = SimpleNamespace(_window=child, _configured=True, _closed=False, close_translucent=Mock())
         source = {"query": "c=0", "rotation": 30, "flip": source_flip}
-        context = {"query": "c=0", "flip": source_flip, "mirror_scan": mirror}
+        context = {"query": "c=0", "flip": source_flip}
         monkeypatch.setattr(smoke, "pane_eval", lambda _parent, expression:
                             source if expression == "captureTranslucentView()" else True)
         monkeypatch.setattr(smoke, "click_shell_cloud",
@@ -316,20 +320,17 @@ def handoff(monkeypatch):
 
 
 @pytest.mark.parametrize("source_flip", [False, True])
-@pytest.mark.parametrize("mirror", [True, False])
-def test_initial_handoff_expects_the_mirror_aware_flip(handoff, source_flip, mirror):
-    expected = source_flip != mirror
-    result = handoff(source_flip=source_flip, mirror=mirror, displayed_flip=expected)
+def test_initial_handoff_expects_the_main_viewer_flip(handoff, source_flip):
+    result = handoff(source_flip=source_flip, displayed_flip=source_flip)
     # Orientation passed; the fake stops the check at the next DOM read.
     assert "stop after setup" in result["error"]
-    assert result["display_orientation"] == {"source_flip": source_flip, "mirror_scan": mirror,
-                                             "expected_flip": expected, "flip": expected, "rotation": 30}
+    assert result["display_orientation"] == {"source_flip": source_flip, "expected_flip": source_flip,
+                                             "flip": source_flip, "rotation": 30}
 
 
-@pytest.mark.parametrize("mirror", [True, False])
-def test_initial_handoff_rejects_an_overlay_that_ignores_its_mirror_setting(handoff, mirror):
-    # Showing the opposite flip fails, whichever way mirror_scan is set.
-    result = handoff(source_flip=False, mirror=mirror, displayed_flip=not mirror)
+@pytest.mark.parametrize("source_flip", [False, True])
+def test_initial_handoff_rejects_an_overlay_that_mirrors_the_main_viewer(handoff, source_flip):
+    result = handoff(source_flip=source_flip, displayed_flip=not source_flip)
     assert result["ok"] is False
     assert "Image orientation was not preserved" in result["error"]
 
@@ -411,30 +412,38 @@ def test_roi_exercise_expects_the_overlay_flip_before_and_after_its_explicit_fli
 
 # Stage-follow round trip -----------------------------------------------------
 
-@pytest.mark.parametrize("mirror", [True, False])
-def test_one_delta_moves_the_overlay_by_delta_over_pixel_size(follow_run, mirror):
-    run = follow_run(mirror=mirror)
+@pytest.mark.parametrize("rotation, flip, expected_px, expected_screen", [
+    # [Y, X] = [.5, .8] um/px; 4.0 um right and 1.5 um down. Screen right runs
+    # along image X at 0/180 degrees (.8 um/px) and along image Y at 90 (.5 um/px).
+    (0, False, [5.0, 3.0], [7.5, 4.5]), (0, True, [-5.0, 3.0], [7.5, 4.5]),
+    (90, False, [1.875, -8.0], [12.0, 2.8125]), (90, True, [1.875, 8.0], [12.0, 2.8125]),
+    (180, False, [-5.0, -3.0], [7.5, 4.5]),
+])
+def test_one_delta_moves_the_view_right_and_down_on_screen(follow_run, rotation, flip, expected_px, expected_screen):
+    run = follow_run(rotation=rotation, flip=flip)
     result = run.result
     assert result["ok"] is True, result.get("error")
-    # [Y, X] calibration: 5 px * 0.8 um in X, 3 px * 0.5 um in Y; mirror does not invert X.
+    # [Y, X] calibration: 5 px * 0.8 um in X, 3 px * 0.5 um in Y.
     assert result["delta_um"] == [4.0, 1.5]
     assert result["pixel_size_um_yx"] == PIXELS_YX
-    assert result["expected_px"] == [5.0, 3.0]
-    assert max(abs(a - b) for a, b in zip(result["observed_px"], [5.0, 3.0])) <= result["tolerance"]
+    assert result["expected_px"] == pytest.approx(expected_px, abs=1e-12)
+    assert max(abs(a - b) for a, b in zip(result["observed_px"], expected_px)) <= result["tolerance"]
+    # At zoom 1.5 the view moves right and down on screen, whatever the orientation.
+    assert result["observed_screen_px"] == pytest.approx(expected_screen, abs=1e-6)
     assert result["protocol"] == stage_follow.PROTOCOL
     assert result["accepted"] == "accepted" and result["frontend_seq"] == 1
     assert result["duplicate_rejected"] is True and result["duplicate_result"] == "duplicate_or_stale"
     assert result["duplicate_moved"] is False
     assert result["roi_unchanged"] is True and result["native_unchanged"] is True
-    assert result["camera_unchanged"] == {"zoom": 1.5, "rotation": 30, "flip": mirror}
-    assert result["mirror_scan"] is mirror and result["display_flip"] is mirror and result["locked"] is True
+    assert result["camera_unchanged"] == {"zoom": 1.5, "rotation": rotation, "flip": flip}
+    assert result["display_rotation"] == rotation and result["display_flip"] is flip and result["locked"] is True
     assert result["status_before_stop"] == "following" and result["stopped"] is True
     # Follow was started and stopped with the visible control; the receiver is gone.
     assert run.page.scripts.count(smoke.STAGE_FOLLOW_CLICK) == 2
     assert run.overlay._stage_follow is None and run.page.follow["enabled"] is False
     assert run.overlay.stage_follow_state()["status"] == "off"
     # The projected outlines were checked against the unchanged source boxes and flip.
-    assert run.roi_checks == [{"expected_rois": run.page.rois, "expected_index": 0, "expected_flip": mirror,
+    assert run.roi_checks == [{"expected_rois": run.page.rois, "expected_index": 0, "expected_flip": flip,
                                "timeout": 30, "description": "stage-followed ROI"}]
     # One delta, one duplicate with the same seq, then only seq-free heartbeats and the stop probe.
     # seq 1, its duplicate, then seq 2 at the rotated view.
@@ -442,6 +451,18 @@ def test_one_delta_moves_the_overlay_by_delta_over_pixel_size(follow_run, mirror
     assert {post["route"] for post in run.posts} == {"/motion", "/heartbeat"}
     serialized = json.dumps(result)
     assert run.posts[0]["token"] not in serialized and run.posts[0]["session_id"] not in serialized
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270, 37, -90])
+@pytest.mark.parametrize("flipped", [False, True])
+def test_expected_pixels_project_back_onto_the_screen_axes(rotation, flipped):
+    view = {"rotation": rotation, "flip": flipped, "zoom": 2.0}
+    for delta_um, axis in (([3.0, 0.0], 0), ([0.0, 3.0], 1), ([-3.0, 0.0], 0), ([0.0, -3.0], 1)):
+        image_px = smoke.stage_follow_expected_px(delta_um, PIXELS_YX, rotation, flipped)
+        screen = smoke.stage_follow_screen_px(image_px, view)
+        assert abs(screen[1 - axis]) < 1e-9 and screen[axis] * delta_um[axis] > 0
+        # The move spans exactly the commanded micrometres at the image's pixel size.
+        assert math.hypot(image_px[0] * PIXELS_YX[1], image_px[1] * PIXELS_YX[0]) == pytest.approx(3.0)
 
 
 def test_heartbeats_keep_the_receiver_following_through_slow_checks(follow_run, monkeypatch):
@@ -466,16 +487,16 @@ def test_heartbeats_keep_the_receiver_following_through_slow_checks(follow_run, 
     assert run.result["heartbeats"] >= 3
 
 
-@pytest.mark.parametrize("mode, message", [
-    ("frozen", "Overlay camera moved [0.0, 0.0] image px"),
-    ("mirror-inverts-x", "Overlay camera moved [-5.0, 3.0] image px"),
-    ("swapped", "Overlay camera moved [8.0, 1.875] image px"),
+@pytest.mark.parametrize("mode, flip, message, expected", [
+    ("frozen", False, "Overlay camera moved [0.0, 0.0] image px", [5.0, 3.0]),
+    ("mirror-ignored", True, "Overlay camera moved [5.0, 3.0] image px", [-5.0, 3.0]),
+    ("swapped", False, "Overlay camera moved [8.0, 1.875] image px", [5.0, 3.0]),
 ])
-def test_a_wrong_or_missing_camera_move_fails(follow_run, mode, message):
-    run = follow_run(mode=mode)
+def test_a_wrong_or_missing_camera_move_fails(follow_run, mode, flip, message, expected):
+    run = follow_run(mode=mode, flip=flip)
     assert run.result["ok"] is False
     assert message in run.result["error"]
-    assert run.result["expected_px"] == [5.0, 3.0]
+    assert run.result["expected_px"] == expected
     assert "duplicate_rejected" not in run.result
     # The receiver never outlives a failed check.
     assert run.overlay._stage_follow is None
@@ -488,9 +509,9 @@ def test_an_overlay_page_that_never_follows_times_out(follow_run):
     assert run.overlay._stage_follow is None
 
 
-def test_a_mirror_bug_cannot_hide_when_the_scan_is_not_mirrored(follow_run):
-    # Inverting X only while mirrored passes unmirrored; the mirrored run above fails.
-    assert follow_run(mirror=False, mode="mirror-inverts-x").result["ok"] is True
+def test_a_flip_bug_shows_only_on_a_flipped_main_viewer(follow_run):
+    # Ignoring the flip passes on an unflipped view; the flipped run above fails.
+    assert follow_run(flip=False, mode="mirror-ignored").result["ok"] is True
 
 
 def test_an_accepted_duplicate_fails(follow_run, monkeypatch):
@@ -561,17 +582,28 @@ def test_hit_testing_is_recorded_but_not_required(follow_run):
     assert run.result["control_visible"] is True and run.result["control_hit_test"] is False
 
 
-def test_the_rotated_view_check_follows_the_same_canonical_delta(follow_run):
-    run = follow_run()
-    assert run.result["ok"] is True and run.result["rotation_checked"] is True
-    assert run.result["rotated_observed_px"] == pytest.approx(list(smoke.STAGE_FOLLOW_PIXELS))
+@pytest.mark.parametrize("flip", [False, True])
+def test_the_rotated_view_check_follows_the_on_screen_direction(follow_run, flip):
+    run = follow_run(rotation=30, flip=flip)
+    result = run.result
+    assert result["ok"] is True and result["rotation_checked"] is True
+    angle = math.radians(smoke.STAGE_FOLLOW_ROTATION_DEGREES)
+    # Screen right and down at 37 degrees, in image pixels, as the page's drag would map them.
+    right = ((-1 if flip else 1) * math.cos(angle), -(-1 if flip else 1) * math.sin(angle))
+    down = (math.sin(angle), math.cos(angle))
+    lengths = [math.hypot(x * PIXELS_YX[1], y * PIXELS_YX[0]) for x, y in (right, down)]
+    expected = [4.0 * right[0] / lengths[0] + 1.5 * down[0] / lengths[1],
+                4.0 * right[1] / lengths[0] + 1.5 * down[1] / lengths[1]]
+    assert result["rotated_expected_px"] == pytest.approx(expected)
+    assert result["rotated_observed_px"] == pytest.approx(expected)
+    assert result["rotated_observed_screen_px"] == pytest.approx([1.5 * 4.0 / lengths[0], 1.5 * 1.5 / lengths[1]])
     assert run.page.view["rotation"] == 30  # restored
 
 
-def test_rotation_applied_to_the_physical_delta_fails(follow_run):
+def test_a_follow_that_ignores_the_display_rotation_fails(follow_run):
     # Start unrotated so the first delta passes and only the rotated view exposes the bug.
-    run = follow_run(mode="rotation-applied", page_setup=lambda page: page.view.update(rotation=0))
-    assert run.result["ok"] is False and "display rotation was applied to the physical delta" in run.result["error"]
+    run = follow_run(mode="rotation-ignored")
+    assert run.result["ok"] is False and "did not follow the on-screen direction" in run.result["error"]
 
 
 def test_a_locked_page_that_keeps_its_rotation_is_recorded(follow_run):
@@ -658,12 +690,12 @@ def test_requests_go_only_to_the_loopback_receiver(monkeypatch):
 
 @pytest.mark.skipif(js_harness.NODE is None, reason="node is not installed")
 def test_smoke_expressions_drive_the_real_overlay_page_follow_path():
-    # followHarness calibration is [Y, X] = [2, .5]; the source flip is true and
-    # mirror_scan is left out, so the page mirrors by default.
+    # followHarness calibration is [Y, X] = [2, .5]; the main viewer handed over
+    # a 90 degree, flipped view, which the overlay shows unchanged.
     pixel_y, pixel_x = 2.0, .5
     delta_um = [smoke.STAGE_FOLLOW_PIXELS[0] * pixel_x, smoke.STAGE_FOLLOW_PIXELS[1] * pixel_y]
     body = """
-      const h=followHarness({initialContext:{mirror_scan:undefined,rois:[{x:390,y:240,w:20,h:20}],roiIndex:0}});
+      const h=followHarness({initialContext:{rois:[{x:390,y:240,w:20,h:20}],roiIndex:0}});
       const m=h.mounted,button=h.element('stage-follow');
       await m.pollSlacsDiscovery();await m.toggleLock();  // aligned and locked, as at the instrument
       // Browser behaviour the fake DOM lacks: attributes and click() on a button.
@@ -691,7 +723,7 @@ def test_smoke_expressions_drive_the_real_overlay_page_follow_path():
     for key in ("off", "on", "followed", "stopped"):
         state = result[key]
         assert isinstance(state.pop("title"), str) and state.pop("visible") is False and state.pop("hit") is False
-    common = {"pending": False, "message": "", "locked": True, "mirror": True, "disabled": False}
+    common = {"pending": False, "message": "", "locked": True, "disabled": False}
     assert result["off"] == {**common, "enabled": False, "status": "off", "seq": 0, "session": "", "pressed": "false"}
     assert result["on"] == {**common, "enabled": True, "status": "waiting", "seq": 0, "session": "session-one",
                             "pressed": "true"}
@@ -699,10 +731,14 @@ def test_smoke_expressions_drive_the_real_overlay_page_follow_path():
     # Stopped: off again (the page keeps the last seq until the next start resets it).
     assert result["stopped"] == {**result["off"], "seq": 1}
     assert result["calls"][0] == "start" and result["calls"][-1] == "stop"
-    # delta / pixel size in canonical image pixels; the default mirror leaves the physical axis alone.
+    # The smoke's own expectation matches the real page: 2.5 um right is 1.25 image Y px
+    # and 6 um down is 12 image X px at this 90 degree flipped view.
     observed = [a - b for a, b in zip(result["moved"]["center"], result["before"]["center"])]
-    assert observed == pytest.approx(list(smoke.STAGE_FOLLOW_PIXELS), abs=smoke.STAGE_FOLLOW_TOLERANCE_PX)
-    assert result["moved"]["flip"] is smoke.expected_overlay_flip({"flip": True}, True) is False
+    expected = smoke.stage_follow_expected_px(delta_um, (pixel_y, pixel_x), 90, True)
+    assert expected == pytest.approx([12.0, 1.25])
+    assert observed == pytest.approx(expected, abs=smoke.STAGE_FOLLOW_TOLERANCE_PX)
+    assert result["moved"]["rotation"] == 90
+    assert result["moved"]["flip"] is smoke.expected_overlay_flip({"flip": True}, True) is True
     assert {key: result["moved"][key] for key in ("zoom", "rotation", "flip", "size")} == {
         key: result["before"][key] for key in ("zoom", "rotation", "flip", "size")}
     assert result["roisAfter"] == result["roisBefore"]
@@ -722,7 +758,7 @@ class OverlayRun:
         self.parent = SimpleNamespace(_js_api=self.api, minimize=lambda: setattr(self, "parent_minimized", True),
                                       restore=lambda: setattr(self, "parent_minimized", False))
         self.locked = False
-        self.view = {"center": [100.0, 80.0], "zoom": 1.0, "rotation": 0, "flip": True, "size": [744, 528]}
+        self.view = {"center": [100.0, 80.0], "zoom": 1.0, "rotation": 0, "flip": False, "size": [744, 528]}
         self.frame = [10, 20, 744, 528]
         self.child = SimpleNamespace(uid="overlay", evaluate_js=self.evaluate_js)
         self.overlay = SimpleNamespace(_window=self.child, _configured=True, _closed=False, close_translucent=Mock())
@@ -751,6 +787,7 @@ class OverlayRun:
 
     def bridge(self, _window, expression, timeout=30):
         if "translucent_context" in expression:
+            # An older context's own mirror setting is ignored.
             return {"query": "c=0", "flip": False, "mirror_scan": True, "opacity": .55}
         if "resize_window" in expression:
             return {"ok": not self.locked}
@@ -810,7 +847,7 @@ def test_windows_overlay_smoke_follows_the_stage_while_locked_before_closing(mon
     result = run.run()
     assert result["ok"] is True, result.get("error")
     assert result["stage_follow"] == evidence
-    assert result["display_orientation"]["expected_flip"] is True
+    assert result["display_orientation"]["expected_flip"] is False
     [call] = run.follow_calls
     assert call["overlay"] is run.overlay and call["child"] is run.child
     assert call["timeout"] == 3 and call["expect_locked"] is True
@@ -856,7 +893,7 @@ def test_windows_verifier_requires_the_overlay_stage_follow_proof():
 def test_a_follow_that_resets_the_display_rotation_fails_before_any_restore(follow_run):
     # The Codex SLACS chat's reproduction: a page that resets rotation whenever it
     # consumes a delta must not pass because the smoke later restores the angle.
-    run = follow_run(mode="reset-rotation")
+    run = follow_run(mode="reset-rotation", rotation=30)
     assert run.result["ok"] is False
     assert "changed the display rotation, mirror or zoom" in run.result["error"]
 

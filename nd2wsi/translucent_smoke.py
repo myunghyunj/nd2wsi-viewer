@@ -25,16 +25,13 @@ def _check(value, message):
 
 
 def expected_overlay_flip(context, source_flip):
-    """The overlay's display flip: the source handoff flip XOR its ``mirror_scan``.
+    """The overlay's display flip: exactly the main viewer's (source handoff) flip.
 
-    The overlay mirrors the scan by default (``mirror_scan`` absent means true,
-    as in the page itself), so its flip equals the source flip only when the
-    context turns mirroring off.
+    The overlay has no direction settings of its own; an older context's
+    ``mirror_scan`` key is ignored, as in the page itself.
     """
-    mirror = context.get("mirror_scan", True)
-    _check(type(mirror) is bool, f"Overlay context has an invalid mirror_scan: {mirror!r}")
     _check(context.get("flip", source_flip) == source_flip, "Overlay context changed the source handoff flip")
-    return (source_flip is True) != mirror
+    return source_flip is True
 
 
 def wait_for(operation, *, timeout=30, description="condition"):
@@ -301,7 +298,7 @@ def check_roi_boxes(child, *, expected_rois=None, expected_index=None, expected_
     """Compare rendered corners with an independent image-to-screen calculation.
 
     The projection uses the camera's actual display flip; ``expected_flip``
-    additionally pins that flip (the mirror-aware overlay orientation).
+    additionally pins that flip (the main viewer's orientation).
     """
     def inspect():
         value = child.evaluate_js("""(() => {
@@ -395,9 +392,9 @@ def snapshot_roi_boxes(child, path, geometry, *, timeout=30):
 def exercise_roi_boxes(child, *, timeout=30, screenshot_path=None, expected_flip=None):
     """Add temporary diagnostic boxes only to the newly owned overlay.
 
-    ``expected_flip`` is the overlay's own mirror-aware display flip; the
-    rotated/flipped steps set their flips explicitly and the camera is
-    restored to that orientation afterwards.
+    ``expected_flip`` is the overlay's display flip, handed over by the main
+    viewer; the rotated/flipped steps set their flips explicitly and the camera
+    is restored to that orientation afterwards.
     """
     before = camera(child)
     if expected_flip is not None:
@@ -470,7 +467,7 @@ SLACS_DISCOVERY_STATE = "window.nd2Translucent.state.slacs"
 STAGE_FOLLOW_STATE = """(() => {
   const view=window.nd2Translucent,follow=view.state.follow,button=document.getElementById('stage-follow');
   return {enabled:follow.enabled,pending:follow.pending,status:follow.status,seq:follow.seq,
-    session:follow.sessionId,message:follow.message,locked:view.state.locked,mirror:view.state.mirrorScan,
+    session:follow.sessionId,message:follow.message,locked:view.state.locked,
     disabled:button.disabled,pressed:button.getAttribute('aria-pressed'),title:button.title,
     visible:(()=>{const r=button.getBoundingClientRect?button.getBoundingClientRect():null,
       css=window.getComputedStyle?getComputedStyle(button):null;
@@ -485,8 +482,9 @@ STAGE_FOLLOW_ROTATE = ("nd2Translucent.viewer.viewport.setRotation(__DEGREES__,t
 STAGE_FOLLOW_ROTATION_DEGREES = 37
 STAGE_FOLLOW_CLICK = "document.getElementById('stage-follow').click(); true"
 ROI_STATE = "JSON.stringify({rois:nd2Translucent.state.rois,index:nd2Translucent.state.roiIndex})"
-# Requested canonical image displacement (X, Y) in source pixels: a few pixels,
-# different per axis so a swapped or mirrored axis cannot pass.
+# The commanded screen displacement (right, down), as source pixels of an
+# unrotated, unflipped view: a few pixels, different per axis so a swapped or
+# mirrored axis cannot pass.
 STAGE_FOLLOW_PIXELS = (5.0, 3.0)
 STAGE_FOLLOW_TOLERANCE_PX = 1e-3
 
@@ -497,6 +495,41 @@ def stage_follow_calibration(context):
     valid = (isinstance(size, (list, tuple)) and len(size) == 2
              and all(type(value) in (int, float) and math.isfinite(value) and value > 0 for value in size))
     return (float(size[0]), float(size[1])) if valid else None
+
+
+def _rotation_terms(degrees):
+    turn = degrees % 360
+    exact = {0: (1.0, 0.0), 90: (0.0, 1.0), 180: (-1.0, 0.0), 270: (0.0, -1.0)}
+    if turn in exact:
+        return exact[turn]
+    radians = math.radians(degrees)
+    return math.cos(radians), math.sin(radians)
+
+
+def stage_follow_expected_px(delta_um, calibration, rotation, flipped):
+    """Canonical image pixels the view centre moves for a Follow displacement.
+
+    ``delta_um`` (dx, dy) moves the view dx to the right and dy down on screen as
+    displayed. The image-to-screen projection is ``check_roi_boxes``'s: rotate,
+    then mirror x when flipped; this inverts it for each screen axis and spans
+    that axis's micrometres at the image's (Y, X) ``calibration`` along it.
+    """
+    pixel_y, pixel_x = calibration
+    cosine, sine = _rotation_terms(rotation)
+    sign = -1.0 if flipped else 1.0
+    moved = [0.0, 0.0]
+    for um, (x, y) in zip(delta_um, ((sign * cosine, -sign * sine), (sine, cosine))):
+        um_per_pixel = math.hypot(x * pixel_x, y * pixel_y)
+        moved = [moved[0] + um * x / um_per_pixel, moved[1] + um * y / um_per_pixel]
+    return moved
+
+
+def stage_follow_screen_px(image_px, view):
+    """Screen CSS pixels the view centre moved, projected as ``check_roi_boxes`` does."""
+    cosine, sine = _rotation_terms(view["rotation"])
+    dx, dy = image_px[0] * view["zoom"], image_px[1] * view["zoom"]
+    x, y = dx * cosine - dy * sine, dx * sine + dy * cosine
+    return [-x if view["flip"] else x, y]
 
 
 def stage_follow_post(descriptor, route, body, *, timeout=5):
@@ -537,10 +570,11 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
     """Follow one authenticated loopback ``delta`` through this overlay's own receiver.
 
     Follow is switched on and off with the overlay's visible control, as a user
-    would. The descriptor is taken privately from the overlay's receiver; one
-    ``delta`` in micrometres must move the camera by delta / pixel size in
-    canonical image pixels (default alignment: no axis flip, angle 0; display
-    rotation and mirror are OSD's and must not change the physical axis).
+    would, and moves the image only while the overlay is locked. The descriptor
+    is taken privately from the overlay's receiver; one ``delta`` in
+    micrometres must move the view in screen directions (X right, Y down, as
+    displayed) by exactly ``stage_follow_expected_px`` canonical image pixels,
+    at the overlay's own orientation and again at a rotated view.
     The diagnostic stops this overlay's process monitor and injects a synthetic
     detection through its private callback. This tests the gated controls and
     receiver, not actual SLACS discovery or hardware. The prior detection state
@@ -613,14 +647,14 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
             return result
         pixel_y, pixel_x = calibration
         delta_um = [round(pixels[0] * pixel_x, 6), round(pixels[1] * pixel_y, 6)]
-        expected_px = [delta_um[0] / pixel_x, delta_um[1] / pixel_y]
-        result.update(pixel_size_um_yx=[pixel_y, pixel_x], delta_um=delta_um, expected_px=expected_px)
-        _check(min(abs(value) for value in expected_px) > 100 * tolerance, "Stage follow delta is too small to measure")
         before = camera(child)
+        expected_px = stage_follow_expected_px(delta_um, calibration, before["rotation"], before["flip"])
+        result.update(pixel_size_um_yx=[pixel_y, pixel_x], delta_um=delta_um, expected_px=expected_px)
+        _check(math.hypot(*expected_px) > 100 * tolerance, "Stage follow delta is too small to measure")
         before_native = native_state(child, timeout=timeout)
         before_rois = json.loads(child.evaluate_js(ROI_STATE))
         initial = follow_state()
-        result.update(mirror_scan=initial["mirror"], display_flip=before["flip"], locked=initial["locked"])
+        result.update(display_rotation=before["rotation"], display_flip=before["flip"], locked=initial["locked"])
         _check(not initial["enabled"] and initial["status"] == "off", f"Follow was not off before the check: {initial}")
         if expect_locked is not None:
             _check(initial["locked"] is expect_locked, f"Follow check expected locked={expect_locked}")
@@ -656,7 +690,8 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
         _check(_same_orientation(moved, before),
                f"Following the delta changed the display rotation, mirror or zoom: {moved}")
         observed = [moved["center"][0] - before["center"][0], moved["center"][1] - before["center"][1]]
-        result.update(observed_px=observed, frontend_seq=consumed["seq"], frontend_status=consumed["status"],
+        result.update(observed_px=observed, observed_screen_px=stage_follow_screen_px(observed, before),
+                      frontend_seq=consumed["seq"], frontend_status=consumed["status"],
                       error_px=max(abs(a - b) for a, b in zip(observed, expected_px)))
         _check(consumed["seq"] == 1 and consumed["status"] == "following",
                f"Overlay page did not follow the delta: {consumed['status']} {consumed['message']}")
@@ -675,8 +710,8 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
                and duplicate_state["status"] == "following", "Duplicate seq moved the overlay or changed its follow state")
 
         last_seq = 1
-        # Display rotation belongs to OSD: at a rotated view the same physical delta
-        # must still move the canonical camera by the same image pixels.
+        # At a rotated view the same delta still moves the view right and down on
+        # screen, so it moves the canonical camera along rotated image axes.
         child.evaluate_js(STAGE_FOLLOW_ROTATE.replace("__DEGREES__", str(STAGE_FOLLOW_ROTATION_DEGREES)))
         rotated = camera(child)
         result["rotation_checked"] = rotated["rotation"] == STAGE_FOLLOW_ROTATION_DEGREES
@@ -694,13 +729,15 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
             _check(_same_orientation(moved2, rotated),
                    f"Following the rotated-view delta changed the display rotation, mirror or zoom: {moved2}")
             observed2 = [moved2["center"][0] - rotated["center"][0], moved2["center"][1] - rotated["center"][1]]
-            result.update(rotated_observed_px=observed2,
-                          rotated_error_px=max(abs(a - b) for a, b in zip(observed2, expected_px)))
+            expected2 = stage_follow_expected_px(delta_um, calibration, rotated["rotation"], rotated["flip"])
+            result.update(rotated_observed_px=observed2, rotated_expected_px=expected2,
+                          rotated_observed_screen_px=stage_follow_screen_px(observed2, rotated),
+                          rotated_error_px=max(abs(a - b) for a, b in zip(observed2, expected2)))
             _check(consumed2["seq"] == 2 and consumed2["status"] == "following",
                    f"Overlay page did not follow the rotated-view delta: {consumed2['status']}")
             _check(result["rotated_error_px"] <= tolerance,
                    f"At rotation {STAGE_FOLLOW_ROTATION_DEGREES} the camera moved {observed2} image px, "
-                   f"expected {expected_px}: display rotation was applied to the physical delta")
+                   f"expected {expected2}: the delta did not follow the on-screen direction")
             last_seq = 2
         child.evaluate_js(STAGE_FOLLOW_ROTATE.replace("__DEGREES__", repr(before["rotation"])))
         _check(camera(child)["rotation"] == before["rotation"], "Display rotation was not restored after the check")
@@ -797,12 +834,11 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
         context = bridge_result(child, "pywebview.api.translucent_context()", timeout=timeout)
         _check(context["query"] == source["query"], "Overlay changed the source channel/LUT/plane query")
         check_camera(camera(child), source, description="initial handoff")
-        # The overlay mirrors the scan by default: its flip is the source flip XOR mirror_scan.
+        # The overlay shows exactly the main viewer's orientation.
         expected_flip = expected_overlay_flip(context, source["flip"])
         initial = camera(child)
-        result["display_orientation"] = {"source_flip": source["flip"], "mirror_scan": context.get("mirror_scan", True),
-                                         "expected_flip": expected_flip, "flip": initial["flip"],
-                                         "rotation": initial["rotation"]}
+        result["display_orientation"] = {"source_flip": source["flip"], "expected_flip": expected_flip,
+                                         "flip": initial["flip"], "rotation": initial["rotation"]}
         _check(initial["rotation"] == source["rotation"] and initial["flip"] == expected_flip,
                f"Image orientation was not preserved: {result['display_orientation']}")
         result["native_initial"] = native_state(child, timeout=timeout)
@@ -895,7 +931,7 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
         _check(native_state(child, timeout=timeout)["frame"] == before_native["frame"], "Locked native frame moved")
         result["lock_blocks_image_and_window"] = True
         if sys.platform == "win32":
-            # Aligned and locked, as at the instrument: stage commands still move the image.
+            # Aligned and locked, as at the instrument: only a locked overlay follows.
             follow = result["stage_follow"] = exercise_stage_follow(overlay, child, timeout=timeout, expect_locked=True)
             # An uncalibrated image correctly disables Follow; CI's verifier still
             # requires a full round trip on its calibrated fixture.

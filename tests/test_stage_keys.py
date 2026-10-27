@@ -81,7 +81,7 @@ def test_each_wasd_key_down_submits_one_commanded_delta(log_events):
     for vk in (VK_D, VK_D, VK_D, VK_W):
         observer.send(vk)
     deltas = [p["delta_um"] for p in receiver.submissions]
-    assert deltas == [[10.0, 0.0], [10.0, 0.0], [10.0, 0.0], [0.0, 10.0]]
+    assert deltas == [[10.0, 0.0], [10.0, 0.0], [10.0, 0.0], [0.0, -10.0]]
     assert [p["seq"] for p in receiver.submissions] == [1, 2, 3, 4]
     snapshot = follower.snapshot()
     assert snapshot["counted"] == 4 and snapshot["last_key"] == "W"
@@ -90,14 +90,28 @@ def test_each_wasd_key_down_submits_one_commanded_delta(log_events):
     follower.stop()
 
 
-def test_direction_table_maps_all_four_keys(log_events):
+def test_direction_table_maps_all_four_keys_to_screen_directions(log_events):
+    # Screen right is +x and screen down is +y: W moves the view up, S down, A left, D right.
     receiver = RecordingReceiver()
     follower, observer = make_follower(receiver, in_front=[True], step_um=2)
     follower.start()
     for vk in (VK_W, VK_S, VK_A, VK_D):
         observer.send(vk)
     assert [p["delta_um"] for p in receiver.submissions] == [
-        [0.0, 2.0], [0.0, -2.0], [-2.0, 0.0], [2.0, 0.0]]
+        [0.0, -2.0], [0.0, 2.0], [-2.0, 0.0], [2.0, 0.0]]
+    follower.stop()
+
+
+def test_one_sign_reverses_all_four_keys_at_once(log_events, monkeypatch):
+    assert stage_keys.KEY_VIEW_SIGN == 1
+    monkeypatch.setattr(stage_keys, "KEY_VIEW_SIGN", -1)
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], step_um=2)
+    follower.start()
+    for vk in (VK_W, VK_S, VK_A, VK_D):
+        observer.send(vk)
+    assert [p["delta_um"] for p in receiver.submissions] == [
+        [0.0, 2.0], [0.0, -2.0], [2.0, 0.0], [-2.0, 0.0]]
     follower.stop()
 
 
@@ -310,7 +324,7 @@ def test_integration_with_real_receiver_accumulates_displacement():
         for vk in (VK_D, VK_D, VK_D, VK_W):
             observer.send(vk)
         snapshot = receiver.snapshot()
-        assert snapshot["displacement_um"] == [12.0, 4.0] and snapshot["seq"] == 4
+        assert snapshot["displacement_um"] == [12.0, -4.0] and snapshot["seq"] == 4
         assert snapshot["status"] == "following"
     finally:
         follower.stop()
@@ -481,7 +495,7 @@ def test_two_followers_share_the_hub_and_both_count(log_events):
     followers[0].stop()
     native.on_event(VK_W, True, ())
     assert [p["delta_um"] for p in receivers[0].submissions] == [[2.0, 0.0]]
-    assert [p["delta_um"] for p in receivers[1].submissions] == [[2.0, 0.0], [0.0, 2.0]]
+    assert [p["delta_um"] for p in receivers[1].submissions] == [[2.0, 0.0], [0.0, -2.0]]
     followers[1].stop()
     assert native.stops == 1
 

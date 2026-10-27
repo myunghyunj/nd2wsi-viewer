@@ -76,9 +76,8 @@ def validate_context(store, payload, *, slide_url):
     flip = payload.get("flip", False)
     if type(flip) is not bool:
         raise ValueError("Flip must be boolean")
-    mirror_scan = payload.get("mirror_scan", True)
-    if type(mirror_scan) is not bool:
-        raise ValueError("Mirror image must be boolean")
+    # The overlay shows exactly the main viewer's rotation and flip; it has no
+    # direction settings of its own. An older handoff's "mirror_scan" is ignored.
     query = payload.get("query", "")
     if not isinstance(query, str) or len(query) > 16384:
         raise ValueError("Invalid display settings")
@@ -123,7 +122,6 @@ def validate_context(store, payload, *, slide_url):
     cleaned = urllib.parse.urlencode(pairs)
     context = {"version": 1, "slide_url": slide_url, "query": "?" + cleaned if cleaned else "",
                "center": center, "zoom": zoom, "rotation": rotation, "flip": flip,
-               "mirror_scan": mirror_scan,
                "dimensions": [width, height],
                "pixel_size_um": copy.deepcopy(meta.get("pixel_size_um")),
                "image_name": Path(str(getattr(store, "source_path", "") or "image")).name,
