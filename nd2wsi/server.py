@@ -170,8 +170,10 @@ class ViewerState:
         # close, replacement and trash drain it before any handle goes away.
         self.busy = _Lifecycle()
         # Only real exports (streamed ROI files, large renders, AstroMap)
-        # enter this, always inside busy. Close and update wait for these,
-        # never for tile reads or export previews.
+        # enter this, inside busy, except the AstroMap zip download: it reads
+        # the window's own file, holds only this, and AstromapDownloads keeps
+        # that file until the reader is done. Close and update wait for
+        # these, never for tile reads or export previews.
         self.exports = _Lifecycle()
         # zarr reads are thread-safe; this lock is kept for attrs, the LUT
         # store's one-time setup and browser-mode annotation writes
@@ -1413,9 +1415,12 @@ class SlideRegistry:
 
     def get(self, sid: str | None) -> ViewerState | None:
         if sid is not None:
-            # One dict lookup is atomic and writers still serialise under
-            # _lock; the busy lease gates every use of the state. Skipping the
-            # lock keeps open slides serving while another slide opens.
+            # Writers still serialise under _lock and one dict lookup is
+            # atomic. A caller may get a state that is about to be replaced
+            # or removed, as it always could once the lock was released. The
+            # busy lease guards slide reads only, not info, LUT or annotation
+            # requests. Skipping the lock keeps open slides serving while
+            # another slide opens.
             return self.slides.get(sid) if sid else None
         with self._lock:  # iterating can race a resize, so keep the lock
             sid = next(iter(self.slides), None)

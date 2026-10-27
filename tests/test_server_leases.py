@@ -114,6 +114,58 @@ def test_mid_stream_failure_writes_no_second_response(monkeypatch, error):
     assert second.writes and second.writes[0].startswith(b"HTTP/1.1 404")
 
 
+class _ResetAfterHeaders:
+    """Lets the header block through, then fails like a reset socket.
+
+    Unlike _Wire it records failed writes too, so a 500 tried on the dead
+    socket shows up as another attempt.
+    """
+
+    def __init__(self, error):
+        self.error = error
+        self.attempts = []
+
+    def write(self, data):
+        self.attempts.append(bytes(data))
+        if len(self.attempts) > 1:
+            raise self.error
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+@pytest.mark.parametrize("error", [
+    ConnectionResetError("reset by peer"),
+    ConnectionAbortedError("aborted by the host"),
+    BrokenPipeError("broken pipe"),
+])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_disconnect_during_a_plain_reply_closes_without_a_500(monkeypatch, method, error):
+    st = state()
+    registry = window_registry(st)
+    wire = _ResetAfterHeaders(error)
+    if method == "GET":
+        monkeypatch.setattr(render, "render_tile", lambda *args: b"tile")
+        handler = socket_handler(registry, f"/s/{SID}/api/tile/0/0/0.jpg", wire)
+        handler.do_GET()
+    else:
+        idle = {"state": "idle"}
+        st._shading = SimpleNamespace(status=lambda: {"generation": "g1"}, cancel=lambda: idle,
+                                      revoke=lambda: idle, close=lambda: None)
+        handler = socket_handler(registry, f"/s/{SID}/api/shading/cancel", wire)
+        handler.command = "POST"
+        handler.headers["Content-Type"] = "application/json"
+        handler._body_json = lambda limit: {"generation": "g1"}
+        handler.do_POST()
+    head, *rest = wire.attempts
+    assert head.startswith(b"HTTP/1.1 200")
+    assert len(rest) == 1 and b"HTTP/1.1" not in rest[0]  # the failed body, no 500
+    assert handler.close_connection is True  # the keep-alive loop stops here
+    assert not getattr(handler, "_headers_buffer", [])  # no half-sent reply left behind
+    assert st.busy.active == 0
+
+
 def test_streamed_roi_download_carries_the_security_headers(monkeypatch):
     def write(root, attrs, destination, *args, **kwargs):
         Path(destination).write_bytes(b"pixels")
