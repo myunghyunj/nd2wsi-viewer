@@ -827,6 +827,24 @@ def test_status_shows_slacs_not_in_front_without_pausing():
     assert result["timers"] == 1
 
 
+def test_pause_after_slacs_not_in_front_shows_paused():
+    result = run("""
+      const h=followHarness(),m=h.mounted;
+      await m.startStageFollow();
+      Object.assign(h.snapshot,{seq:0,status:'waiting',displacement_um:[0,0],keys:{counted:0,slacs_in_front:false}});
+      await m.pollStageFollow();
+      const before=h.element('stage-follow-status').textContent;
+      Object.assign(h.snapshot,{status:'paused',message:'Stage observations stopped.'});
+      await m.pollStageFollow();
+      return {before,status:h.element('stage-follow-status').textContent,
+        data:h.element('stage-follow-status').dataset.status,
+        followStatus:m.state.follow.status,timers:h.timers.size};
+    """)
+    # Polling stops on a pause, so a stale "not in front" hint must not mask it.
+    assert result =={"before": "SLACS not in front", "status": "Paused", "data": "paused",
+                      "followStatus": "paused", "timers": 0}
+
+
 def test_client_errors_are_forwarded_rate_limited_and_never_throw():
     result = run("""
       const logged=[];

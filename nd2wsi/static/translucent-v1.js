@@ -328,7 +328,9 @@
       followButton.title = !pixelSize ? "Follow needs a calibrated image pixel size" : !available ? "Stage follow is unavailable" :
         follow.enabled ? "Stop following SLACS keys" : "Follow SLACS W/A/S/D keys";
       // SLACS can lose the foreground without pausing; surface that without stopping.
-      const notInFront = follow.enabled && !!follow.keys && follow.keys.slacs_in_front === false;
+      // A pause stops polling, so it must not hide behind this stale hint.
+      const notInFront = follow.enabled && ["waiting", "following"].includes(follow.status) &&
+        !!follow.keys && follow.keys.slacs_in_front === false;
       followStatus.textContent = follow.pending ? "Connecting…" : notInFront ? "SLACS not in front" :
         follow.status === "following" ? "Following SLACS keys" :
         follow.status === "waiting" ? "Waiting for W/A/S/D in SLACS" :
