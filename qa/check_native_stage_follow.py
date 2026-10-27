@@ -166,21 +166,27 @@ def run():
         wait_for(lambda: not close_enough(camera(child)['center'],target),description='unlocked manual pan')
         time.sleep(.25)
         manual=camera(child)['center']
-        manual_next=[manual[0]+10/mpp[1],manual[1]]
-        motion(child,4,manual_next,type='delta',delta_um=[10,0])
+        # Unlocked: the press is consumed without moving the hand-aligned view.
+        motion(child,4,manual,type='delta',delta_um=[10,0])
+        assert child.evaluate_js("document.getElementById('stage-follow-status').textContent")==\
+            'Unlocked: align by hand, lock to follow'
+        report['unlocked_press_ignored']=True
         bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
         drag_image(child)
         time.sleep(.2)
-        assert close_enough(camera(child)['center'],manual_next),'Locked manual gesture moved image'
+        assert close_enough(camera(child)['center'],manual),'Locked manual gesture moved image'
+        # Locked again: only the next press moves, from the manual position.
+        manual_next=[manual[0]+10/mpp[1],manual[1]]
+        motion(child,5,manual_next,type='delta',delta_um=[10,0])
         bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
         assert child.evaluate_js('nd2Translucent.setMirrorScan(false)')
         child.evaluate_js('nd2Translucent.viewer.viewport.setRotation(90,true); true')
         bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
         oriented=[manual_next[0]-10/mpp[1],manual_next[1]]
-        motion(child,5,oriented,type='delta',delta_um=[-10,0])
+        motion(child,6,oriented,type='delta',delta_um=[-10,0])
         assert camera(child)['rotation']==90 and camera(child)['flip'] is False
         assert math.isclose(camera(child)['zoom'],1,abs_tol=1e-9)
-        send('/motion',seq=5,type='delta',delta_um=[-10,0])
+        send('/motion',seq=6,type='delta',delta_um=[-10,0])
         time.sleep(.15)
         assert close_enough(camera(child)['center'],oriented),'Duplicate command applied twice'
         report['pixel_size_um_yx']=mpp
@@ -198,7 +204,7 @@ def run():
         bridge_result(child,'nd2Translucent.toggleLock().then(()=>true)')
         child.evaluate_js("document.getElementById('stage-follow-options').click(); true")
         report['snapshot']=str(save_cocoa_snapshot(child,session.exports_root/'stage-follow-native.png'))
-        try: send('/motion',seq=7,type='delta',delta_um=[100,0])
+        try: send('/motion',seq=8,type='delta',delta_um=[100,0])
         except urllib.error.HTTPError as exc: assert exc.code==409
         wait_for(lambda: child.evaluate_js('nd2Translucent.state.follow.status')=='paused',description='gap pause')
         assert close_enough(camera(child)['center'],oriented),'Gap moved image'

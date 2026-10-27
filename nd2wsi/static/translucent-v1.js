@@ -313,10 +313,10 @@
     const paintLock = () => {
       overlay.dataset.locked = String(state.locked);
       lock.setAttribute("aria-pressed", String(state.locked));
-      const lockLabel = follow.enabled ? (state.locked ? "Unlock for manual alignment" : "Lock manual image and window controls") :
+      const lockLabel = follow.enabled ? (state.locked ? "Unlock to align by hand" : "Lock to follow SLACS keys") :
         (state.locked ? "Unlock image and window" : "Lock image and window");
       lock.setAttribute("aria-label", lockLabel);
-      lock.title = lockLabel + " (L)" + (follow.enabled ? " · Stage commands still move the image" : "");
+      lock.title = lockLabel + " (L)" + (follow.enabled ? " · Key presses move the image only while locked" : "");
       lock.disabled = state.pending;
       viewer.setMouseNavEnabled(!state.locked && !state.pending);
       paintOpacity();
@@ -335,15 +335,18 @@
       followButton.setAttribute("aria-pressed", String(follow.enabled));
       followButton.title = !pixelSize ? "Follow needs a calibrated image pixel size" : !available ? "Stage follow is unavailable" :
         follow.enabled ? "Stop following SLACS keys" : "Follow SLACS W/A/S/D keys";
-      // SLACS can lose the foreground without pausing; surface that without stopping.
-      // A pause stops polling, so it must not hide behind this stale hint.
-      const notInFront = follow.enabled && ["waiting", "following"].includes(follow.status) &&
-        !!follow.keys && follow.keys.slacs_in_front === false;
-      followStatus.textContent = follow.pending ? "Connecting…" : notInFront ? "SLACS not in front" :
+      // Unlocked and SLACS losing the foreground are hints that never stop Follow.
+      // A pause stops polling, so it must not hide behind either stale hint.
+      const live = follow.enabled && ["waiting", "following"].includes(follow.status);
+      const unlocked = live && !state.locked;
+      const notInFront = live && !!follow.keys && follow.keys.slacs_in_front === false;
+      followStatus.textContent = follow.pending ? "Connecting…" :
+        unlocked ? "Unlocked: align by hand, lock to follow" : notInFront ? "SLACS not in front" :
         follow.status === "following" ? "Following SLACS keys" :
         follow.status === "waiting" ? "Waiting for W/A/S/D in SLACS" :
         follow.status === "paused" ? "Paused" : "Off";
-      followStatus.dataset.status = notInFront ? "not-in-front" : follow.status;
+      followStatus.dataset.status = follow.pending ? follow.status : unlocked ? "unlocked" :
+        notInFront ? "not-in-front" : follow.status;
       followStatus.title = follow.message;
       const editable = !state.locked && !state.pending;
       mirrorControl.checked = state.mirrorScan;
@@ -394,15 +397,18 @@
       if (result.seq === follow.seq && (delta[0] || delta[1])) {
         pauseFollow("Stage update changed unexpectedly."); return false;
       }
-      if (result.status === "following" && (delta[0] || delta[1])) {
+      // Only a locked overlay follows. While unlocked the user aligns by hand:
+      // the reply is still consumed below, so presses made meanwhile are
+      // discarded rather than replayed after locking.
+      if (state.locked && result.status === "following" && (delta[0] || delta[1])) {
         const imageDelta = stageImageDelta(delta, pixelSize, follow.alignment);
         const center = viewer.viewport.viewportToImageCoordinates(viewer.viewport.getCenter(true));
         const target = { x: center.x + imageDelta.x, y: center.y + imageDelta.y };
         if (![target.x, target.y, imageDelta.x, imageDelta.y].every(Number.isFinite)) {
           pauseFollow("Stage movement is outside the image coordinate range."); return false;
         }
-        // Always add to the current camera: manual alignment while unlocked is
-        // retained by the next command. Lock intentionally does not gate this.
+        // Add to the current camera, so following continues from wherever the
+        // user left the view while unlocked.
         geometry.centerOnPreservingZoom(viewer.viewport, target, OSD);
         viewer.forceRedraw();
         renderRoiBoxes();

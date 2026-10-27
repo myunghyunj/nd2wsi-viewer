@@ -49,7 +49,7 @@ body { user-select: none; -webkit-user-select: none; }
 #stage-follow-control button:disabled, #stage-follow-settings button:disabled { opacity: .4; cursor: default; }
 #stage-follow-control button:focus-visible, #stage-follow-settings :focus-visible { outline: 1px solid #fff; outline-offset: 2px; }
 #stage-follow-status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-#stage-follow-status[data-status="paused"] { color: #ffd966; }
+#stage-follow-status[data-status="paused"], #stage-follow-status[data-status="unlocked"] { color: #ffd966; }
 #stage-follow-settings { position: absolute; top: 85px; left: 12px; z-index: 4; width: min(275px, calc(100% - 24px)); max-height: calc(100% - 130px); overflow-y: auto; padding: 10px 12px; border-radius: 9px; background: rgba(25,28,33,.94); color: #fff; font-size: 11px; line-height: 1.5; }
 #stage-follow-settings[hidden] { display: none; }
 #stage-follow-settings p { margin: 0 0 8px; }

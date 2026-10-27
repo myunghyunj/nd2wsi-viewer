@@ -525,13 +525,13 @@ def test_stage_follow_is_opt_in_and_locked_commands_pan_image_and_existing_roi_t
     assert result["rotation"] == 90 and result["flip"] is True
     assert result["opacity"] == result["before"]["opacity"] == .55
     assert result["mouse"] is False and result["manualRoi"] is False
-    assert "Stage commands still move the image" in result["lockTitle"]
+    assert result["lockTitle"] == "Unlock to align by hand (L) · Key presses move the image only while locked"
     assert result["status"] == "Following SLACS keys"
     assert result["delta"] == "Last image move: 20.000, 10.000 px"
     assert result["scale"] == "Pixel size: X 0.500 · Y 2.000 µm/px"
 
 
-def test_unlocked_manual_alignment_is_retained_by_next_cumulative_stage_command():
+def test_unlocked_manual_alignment_is_kept_as_the_base_once_locked_again():
     result = run("""
       const h=followHarness(),m=h.mounted;
       await m.startStageFollow();await m.toggleLock();
@@ -539,14 +539,48 @@ def test_unlocked_manual_alignment_is_retained_by_next_cumulative_stage_command(
       await m.toggleLock();const manualEnabled=h.viewer.nav;
       h.viewer.viewport.panTo(new Point(.6,.3));
       Object.assign(h.snapshot,{seq:2,displacement_um:[15,30]});await m.pollStageFollow();
-      return {manualEnabled,camera:api.camera(h.viewer),locked:m.state.locked};
+      const unlocked={camera:api.camera(h.viewer),status:h.element('stage-follow-status').textContent,
+        data:h.element('stage-follow-status').dataset.status,enabled:m.state.follow.enabled,
+        lockLabel:h.element('overlay-lock').attributes['aria-label']};
+      await m.toggleLock();
+      Object.assign(h.snapshot,{seq:3,displacement_um:[20,40]});await m.pollStageFollow();
+      return {manualEnabled,unlocked,camera:api.camera(h.viewer),locked:m.state.locked,
+        status:h.element('stage-follow-status').textContent};
     """)
-    assert result == {"manualEnabled": True, "camera": {"center": {"x": .61, "y": .305}, "zoom": 2}, "locked": False}
+    assert result["manualEnabled"] is True
+    # While unlocked the press is consumed without moving the hand-aligned view.
+    assert result["unlocked"] == {"camera": {"center": {"x": .6, "y": .3}, "zoom": 2},
+                                  "status": "Unlocked: align by hand, lock to follow", "data": "unlocked",
+                                  "enabled": True, "lockLabel": "Lock to follow SLACS keys"}
+    # Locked again, only the newest press moves, from the manual position.
+    assert result["camera"] == {"center": pytest.approx({"x": .61, "y": .305}), "zoom": 2}
+    assert result["locked"] is True and result["status"] == "Following SLACS keys"
+
+
+def test_presses_while_unlocked_never_move_and_are_not_replayed_after_locking():
+    result = run("""
+      const h=followHarness(),m=h.mounted;await m.startStageFollow();
+      const before=api.camera(h.viewer),pans=()=>h.viewer.calls.filter(c=>c[0]==='pan').length,start=pans();
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
+      Object.assign(h.snapshot,{seq:2,displacement_um:[30,60]});await m.pollStageFollow();
+      const unlocked={camera:api.camera(h.viewer),pans:pans()-start,seq:m.state.follow.seq,
+        displacement:m.state.follow.displacement,delta:h.element('stage-follow-delta').textContent};
+      await m.toggleLock();const locked=pans();await m.pollStageFollow();  // locking itself settles the camera
+      const relocked={camera:api.camera(h.viewer),pans:pans()-locked};
+      Object.assign(h.snapshot,{seq:3,displacement_um:[35,70]});await m.pollStageFollow();
+      return {before,unlocked,relocked,after:api.camera(h.viewer),status:m.state.follow.status};
+    """)
+    assert result["unlocked"] == {"camera": result["before"], "pans": 0, "seq": 2, "displacement": [30, 60],
+                                  "delta": "Last image move: 0.000, 0.000 px"}
+    assert result["relocked"] == {"camera": result["before"], "pans": 0}
+    # Only seq 3's (5, 10) um moves the view: 10 and 5 image px at [Y, X] = [2, .5] um/px.
+    assert result["after"]["center"] == pytest.approx({"x": .41, "y": .255})
+    assert result["status"] == "following"
 
 
 def test_stage_poll_can_skip_events_without_losing_displacement_or_reapplying_duplicates():
     result = run("""
-      const h=followHarness(),m=h.mounted;await m.startStageFollow();
+      const h=followHarness(),m=h.mounted;await m.startStageFollow();await m.toggleLock();
       Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[1.25,2.5]});await m.pollStageFollow();
       Object.assign(h.snapshot,{seq:10,displacement_um:[4.75,8.5]});await m.pollStageFollow();
       const before=h.viewer.calls.filter(c=>c[0]==='pan').length;
@@ -725,7 +759,7 @@ LATE_FOLLOW = """
   let process={available:true,session_id:'one',status:'running'};const replies=[];
   const h=followHarness({bridgeOverrides:{async slacs_discovery_state(){return {...process};},
     stage_follow_state(){return new Promise(resolve=>replies.push(resolve));}}}),m=h.mounted;
-  await m.pollSlacsDiscovery();await m.startStageFollow();
+  await m.pollSlacsDiscovery();await m.startStageFollow();await m.toggleLock();
   const lost='SLACS program stopped or changed. Follow stopped; reconnect manually.';
   const reply=(seq,dx,dy)=>({enabled:true,session_id:'session-one',seq,status:'following',displacement_um:[dx,dy]});
   const settle=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
@@ -939,10 +973,10 @@ def test_mirror_checkbox_reflects_existing_roi_display_without_changing_source_o
 def test_display_mirror_does_not_reverse_or_modify_physical_stage_registration():
     result = run("""
       const h=followHarness({initialContext:{mirror_scan:undefined,flip:false}}),m=h.mounted;
-      await m.startStageFollow();
+      await m.startStageFollow();await m.toggleLock();
       Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
       const mirrored={camera:api.camera(h.viewer),delta:{...m.state.follow.lastDelta},flip:h.viewer.viewport.getFlip()};
-      m.setMirrorScan(false);
+      await m.toggleLock();m.setMirrorScan(false);await m.toggleLock();
       Object.assign(h.snapshot,{seq:2,displacement_um:[20,40]});await m.pollStageFollow();
       return {mirrored,after:{camera:api.camera(h.viewer),delta:m.state.follow.lastDelta,flip:h.viewer.viewport.getFlip()},
         alignment:m.state.follow.alignment};
@@ -997,7 +1031,7 @@ def test_step_input_is_disabled_while_following_and_passed_to_start():
 def test_waiting_and_following_status_texts_mention_slacs_keys():
     result = run("""
       const h=followHarness(),m=h.mounted;
-      await m.startStageFollow();
+      await m.startStageFollow();await m.toggleLock();
       const waiting=h.element('stage-follow-status').textContent;
       Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[1,2],keys:{counted:4,slacs_in_front:true}});
       await m.pollStageFollow();
@@ -1011,7 +1045,7 @@ def test_waiting_and_following_status_texts_mention_slacs_keys():
 def test_status_shows_slacs_not_in_front_without_pausing():
     result = run("""
       const h=followHarness(),m=h.mounted;
-      await m.startStageFollow();
+      await m.startStageFollow();await m.toggleLock();
       Object.assign(h.snapshot,{seq:0,status:'waiting',displacement_um:[0,0],keys:{counted:0,slacs_in_front:false}});
       await m.pollStageFollow();
       return {status:h.element('stage-follow-status').textContent,
@@ -1027,7 +1061,7 @@ def test_status_shows_slacs_not_in_front_without_pausing():
 def test_pause_after_slacs_not_in_front_shows_paused():
     result = run("""
       const h=followHarness(),m=h.mounted;
-      await m.startStageFollow();
+      await m.startStageFollow();await m.toggleLock();
       Object.assign(h.snapshot,{seq:0,status:'waiting',displacement_um:[0,0],keys:{counted:0,slacs_in_front:false}});
       await m.pollStageFollow();
       const before=h.element('stage-follow-status').textContent;

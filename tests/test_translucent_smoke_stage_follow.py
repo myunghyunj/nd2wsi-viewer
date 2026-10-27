@@ -665,7 +665,7 @@ def test_smoke_expressions_drive_the_real_overlay_page_follow_path():
     body = """
       const h=followHarness({initialContext:{mirror_scan:undefined,rois:[{x:390,y:240,w:20,h:20}],roiIndex:0}});
       const m=h.mounted,button=h.element('stage-follow');
-      await m.pollSlacsDiscovery();
+      await m.pollSlacsDiscovery();await m.toggleLock();  // aligned and locked, as at the instrument
       // Browser behaviour the fake DOM lacks: attributes and click() on a button.
       button.getAttribute=function(name){return this.attributes[name]??null;};
       button.click=function(){if(!this.disabled)this.listeners.click({});};
@@ -691,7 +691,7 @@ def test_smoke_expressions_drive_the_real_overlay_page_follow_path():
     for key in ("off", "on", "followed", "stopped"):
         state = result[key]
         assert isinstance(state.pop("title"), str) and state.pop("visible") is False and state.pop("hit") is False
-    common = {"pending": False, "message": "", "locked": False, "mirror": True, "disabled": False}
+    common = {"pending": False, "message": "", "locked": True, "mirror": True, "disabled": False}
     assert result["off"] == {**common, "enabled": False, "status": "off", "seq": 0, "session": "", "pressed": "false"}
     assert result["on"] == {**common, "enabled": True, "status": "waiting", "seq": 0, "session": "session-one",
                             "pressed": "true"}
