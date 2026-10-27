@@ -103,7 +103,8 @@ def test_cached_snapshot_transitions_loss_restart_and_query_error():
             raise value
         return value
 
-    monitor = discovery.SlacsDiscovery(process_query=query, on_change=notifications.append, autostart=False)
+    monitor = discovery.SlacsDiscovery(process_query=query, on_change=notifications.append, autostart=False,
+                                       failure_grace=0)
     assert monitor.snapshot()["status"] == "checking" and not calls and not notifications
     monitor.poll_once()
     assert notifications[-1]["status"] == "not_running"
@@ -222,6 +223,178 @@ def test_default_cache_coalesces_success_and_error_without_reusing_stale_success
     assert cache.read(timeout=2) == [] and len(calls) == 3
 
 
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def logged(monkeypatch):
+    events = []
+    monkeypatch.setattr(discovery.session_log, "event",
+                        lambda kind, **fields: events.append({"kind": kind, **fields}))
+    return events
+
+
+def counting(rows):
+    calls = []
+
+    def query():
+        calls.append(1)
+        value = rows[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+    return query, calls
+
+
+def test_a_found_slacs_is_then_checked_by_liveness_not_by_searching_again(monkeypatch):
+    events = logged(monkeypatch)
+    rows, alive, checked = [[process()]], [True], []
+    query, calls = counting(rows)
+
+    def liveness(pid, created):
+        checked.append((pid, created))
+        return alive[0]
+
+    monitor = discovery.SlacsDiscovery(process_query=query, liveness=liveness, autostart=False)
+    first = monitor.poll_once()
+    assert first["status"] == "running" and len(calls) == 1 and monitor.slacs_pid() == 123
+    for _ in range(5):
+        assert monitor.poll_once() == first
+    assert len(calls) == 1 and checked == [(123, BIRTH)] * 5
+    # A confirmed exit searches again at once, in the same check.
+    alive[0], rows[0] = False, []
+    assert monitor.poll_once()["status"] == "not_running" and len(calls) == 2
+    assert monitor.slacs_pid() is None
+    assert [e["kind"] for e in events] == ["slacs_exit_seen"]
+
+
+def test_checks_that_cannot_tell_keep_the_session_through_the_grace(monkeypatch):
+    events = logged(monkeypatch)
+    clock, rows, alive = Clock(), [[process()]], [True]
+    query, calls = counting(rows)
+    notifications = []
+    monitor = discovery.SlacsDiscovery(process_query=query, liveness=lambda pid, created: alive[0],
+                                       on_change=notifications.append, autostart=False,
+                                       failure_grace=15, clock=clock)
+    first = monitor.poll_once()
+    alive[0] = None
+    for step in range(7):  # 14 s of "cannot tell": still the same running session
+        clock.now += 2
+        assert monitor.poll_once() == first
+    assert len(calls) == 1 and len(notifications) == 1
+    alive[0] = True
+    clock.now += 2
+    assert monitor.poll_once() == first
+    kinds = [e["kind"] for e in events]
+    assert kinds == ["slacs_check_failing", "slacs_check_recovered"]
+    assert events[1]["failed_checks"] == 7 and events[1]["seconds"] == 14.0
+    # Past the grace a failed search finally reports an error.
+    alive[0], rows[0] = None, RuntimeError("no metadata")
+    for _ in range(8):  # 2-14 s of failures: still kept
+        clock.now += 2
+        assert monitor.poll_once() == first
+    clock.now += 2
+    state = monitor.poll_once()
+    assert state["status"] == "error" and not state["available"]
+    assert events[-1]["kind"] == "slacs_check_gave_up" and events[-1]["seconds"] == 16.0
+
+
+def test_a_failed_search_also_keeps_a_found_session_through_the_grace(monkeypatch):
+    logged(monkeypatch)
+    clock, rows = Clock(), [[process()]]
+    query, _ = counting(rows)
+    monitor = discovery.SlacsDiscovery(process_query=query, autostart=False, failure_grace=15, clock=clock)
+    first = monitor.poll_once()
+    rows[0] = RuntimeError("PowerShell timed out")
+    clock.now += 10
+    assert monitor.poll_once() == first
+    rows[0] = []  # a successful search that finds nothing is definitive
+    clock.now += 2
+    assert monitor.poll_once()["status"] == "not_running"
+
+
+def test_a_reused_pid_is_a_new_session(monkeypatch):
+    logged(monkeypatch)
+    rows = [[process()]]
+    query, _ = counting(rows)
+    monitor = discovery.SlacsDiscovery(process_query=query, liveness=lambda pid, created: False,
+                                       autostart=False)
+    first = monitor.poll_once()
+    rows[0] = [process(created="2026-10-27T03:00:00.1234567Z")]
+    second = monitor.poll_once()
+    assert second["status"] == "running" and second["session_id"] != first["session_id"]
+
+
+def test_each_powershell_query_is_logged_with_its_duration_and_reason(monkeypatch):
+    events = logged(monkeypatch)
+    failures = [subprocess.TimeoutExpired("powershell", 10), subprocess.CalledProcessError(1, "powershell"),
+                json.JSONDecodeError("bad", "x", 0), FileNotFoundError("powershell")]
+    outcomes = [[process(), process(pid=7, command_line="python.exe other.py")]] + failures
+    now = [0.0]
+
+    def query(**kwargs):
+        value = outcomes.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    cache = discovery._ProcessQueryCache(clock=lambda: now[0], query=query)
+    for _ in range(5):
+        try:
+            cache.read(timeout=10)
+        except OSError:
+            pass
+        now[0] += 3
+    assert [e["kind"] for e in events] == ["slacs_query"] * 5
+    assert events[0]["ok"] is True and events[0]["python_processes"] == 2
+    assert [e["reason"] for e in events[1:]] == [
+        "timeout", "exit code 1", "invalid output", "could not start PowerShell (FileNotFoundError)"]
+    assert all(isinstance(e["seconds"], float) for e in events)
+    assert SCRIPT not in json.dumps(events) and "other.py" not in json.dumps(events)
+
+
+def test_stop_never_waits_out_a_slow_search(monkeypatch):
+    monkeypatch.setattr(discovery, "STOP_JOIN_SECONDS", 0.2)
+    entered, release = threading.Event(), threading.Event()
+
+    def query():
+        entered.set()
+        release.wait(5)
+        return [process()]
+
+    monitor = discovery.SlacsDiscovery(process_query=query, query_timeout=10)
+    try:
+        assert entered.wait(2)
+        started = time.monotonic()
+        assert monitor.stop() is False
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        monitor._thread.join(timeout=5)
+
+
+def test_cim_creation_times_convert_to_filetime_ticks():
+    assert discovery._filetime("1601-01-01T00:00:00Z") == 0
+    assert discovery._filetime("1970-01-01T00:00:00+00:00") == 116444736000000000
+    assert discovery._filetime("1970-01-01T00:00:00.0000017Z") == 116444736000000010  # microseconds
+    with pytest.raises(ValueError):
+        discovery._filetime("1970-01-01T00:00:00")
+
+
+def test_default_search_timeout_allows_a_slow_powershell_start():
+    assert discovery.QUERY_TIMEOUT >= 10 and discovery.FAILURE_GRACE >= 10
+
+
+@pytest.mark.parametrize("value", [-1, True, float("nan"), float("inf"), "15"])
+def test_failure_grace_must_be_finite_and_not_negative(value):
+    with pytest.raises(ValueError):
+        discovery.SlacsDiscovery(process_query=lambda: [], failure_grace=value, autostart=False)
+
+
 @pytest.mark.parametrize("option", ["poll_interval", "query_timeout"])
 @pytest.mark.parametrize("value", [0, -1, True, float("nan"), float("inf")])
 def test_monitor_waits_must_be_positive_finite(option, value):
@@ -258,6 +431,53 @@ def test_windows_cim_identifies_only_our_harmless_temporary_script_and_its_exit(
             time.sleep(0.1)
             state = monitor.poll_once()
         assert state == {"available": False, "session_id": None, "status": "not_running"}
+    finally:
+        monitor.stop()
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real Windows process liveness")
+def test_windows_liveness_follows_our_own_child_by_pid_and_creation_time(tmp_path):
+    if ntpath.basename(sys.executable).lower() not in {"python.exe", "pythonw.exe"}:
+        pytest.skip("requires a normally named Windows Python interpreter")
+    script = tmp_path / discovery.SCRIPT_NAME
+    script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    child = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=0x08000000)
+    queries = []
+
+    def query():
+        rows = [row for row in discovery._query_windows_processes(timeout=10) if row.get("pid") == child.pid]
+        queries.append(len(rows))
+        return rows
+
+    monitor = discovery.SlacsDiscovery(process_query=query, liveness=discovery._windows_process_alive,
+                                       autostart=False)
+    try:
+        deadline = time.monotonic() + 20
+        state = monitor.poll_once()
+        while not state["available"] and time.monotonic() < deadline:
+            time.sleep(0.2)
+            state = monitor.poll_once()
+        assert state["available"] and monitor.slacs_pid() == child.pid
+        searches = len(queries)
+        found = monitor._found
+        for _ in range(5):
+            assert monitor.poll_once() == state
+        assert len(queries) == searches  # liveness only, no PowerShell
+        assert discovery._windows_process_alive(child.pid, found["created"]) is True
+        assert discovery._windows_process_alive(child.pid, "2001-01-01T00:00:00Z") is False
+        child.terminate()
+        child.wait(timeout=5)
+        assert discovery._windows_process_alive(child.pid, found["created"]) is False
+        assert monitor.poll_once()["status"] == "not_running"
     finally:
         monitor.stop()
         if child.poll() is None:
