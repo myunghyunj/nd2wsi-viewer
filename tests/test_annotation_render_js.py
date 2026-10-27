@@ -470,3 +470,59 @@ def test_viewport_handler_uses_the_pan_path_and_the_listener_is_installed_once()
     layer_rule = re.search(r"#ann-layer \{([^}]*)\}", css).group(1)
     assert "pointer-events: none" in layer_rule
     assert "#ann-layer .hit { pointer-events: auto; cursor: pointer; }" in css
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 37])
+@pytest.mark.parametrize("flip", [False, True])
+def test_one_render_affine_matches_the_per_vertex_conversion_under_rotation_and_flip(rotation, flip):
+    out = run(r"""
+      resetState();
+      Object.assign(camera, {rotation: ROTATION, flip: FLIP, zoom: 0.0123, cx: 51234.5, cy: 40321.25});
+      state.info = {width: 100000, height: 80000, pixelSizeUm: [0.5, 0.5]};
+      state.tempLine = null; state.landmark.points = [];
+      const ring = [[100, 100], [90000, 100], [90000, 70000], [100, 100]];
+      state.annotations = [
+        {id: 'far', type: 'box', x: 99000, y: 79000, w: 500, h: 400, text: ''},
+        {id: 'pin', type: 'pin', x: 250, y: 70000, text: ''},
+        {id: 'line', type: 'line', x1: 10, y1: 20, x2: 98000, y2: 77000, text: ''},
+        {id: 'shape', type: 'geojson', text: '', geojson: {type: 'Feature', properties: {},
+          geometry: {type: 'Polygon', coordinates: [ring]}}},
+      ];
+      c.renderAnnotations();
+      const nodes = descendants(root()), errors = [];
+      const near = (p, q) => errors.push(Math.max(Math.abs(p.x - q.x), Math.abs(p.y - q.y)));
+      const box = state.annotations[0];
+      const points = nodes.find(n => n.tag === 'polygon').getAttribute('points').split(' ')
+        .map(pair => pair.split(',').map(Number));
+      [[box.x, box.y], [box.x + box.w, box.y], [box.x + box.w, box.y + box.h], [box.x, box.y + box.h]]
+        .forEach(([x, y], i) => near({x: points[i][0], y: points[i][1]}, toEl(x, y)));
+      const pin = nodes.find(n => n.tag === 'circle');
+      near({x: +pin.getAttribute('cx'), y: +pin.getAttribute('cy')}, toEl(250, 70000));
+      const line = nodes.find(n => n.tag === 'line');
+      near({x: +line.getAttribute('x1'), y: +line.getAttribute('y1')}, toEl(10, 20));
+      near({x: +line.getAttribute('x2'), y: +line.getAttribute('y2')}, toEl(98000, 77000));
+      const d = nodes.find(n => n.tag === 'path').getAttribute('d');
+      const vertices = [...d.matchAll(/[ML](\S+) (\S+)/g)].map(m => ({x: +m[1], y: +m[2]}));
+      ring.forEach(([x, y], i) => near(vertices[i], toEl(x, y)));
+      return {worst: Math.max(...errors), checked: errors.length};
+    """.replace("ROTATION", str(rotation)).replace("FLIP", json.dumps(flip)))
+    assert out["checked"] == 4 + 1 + 2 + 4
+    assert out["worst"] < 1e-6
+
+
+def test_a_full_render_converts_through_openseadragon_a_fixed_number_of_times():
+    out = run(r"""
+      resetState();
+      Object.assign(camera, {rotation: 37, flip: true});
+      state.tempLine = null; state.landmark.points = [];
+      const calls = {n: 0}, convert = viewport.imageToViewerElementCoordinates;
+      viewport.imageToViewerElementCoordinates = function (p) { calls.n++; return convert.call(this, p); };
+      const counts = [];
+      for (const n of [10, 2000]) {
+        state.annotations = boxes(n); state.annRevision += 1;
+        calls.n = 0; c.renderAnnotations(); counts.push(calls.n);
+      }
+      return counts;
+    """)
+    # three probes for the render and three for the pan mapping, at any size
+    assert out == [6, 6]

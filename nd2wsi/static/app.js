@@ -2722,13 +2722,22 @@ function renderAnnotations() {
   layer.replaceChildren();
   // A fresh root carries no pan translation (refreshAnnotationsForViewport).
   const root = svgEl("g", { "data-ann-root": "" }, layer);
+  // OpenSeadragon's image-to-element mapping is affine, flip and rotation
+  // included, so three probes give it exactly up to float rounding. Every
+  // vertex below is then a multiply-add instead of an OpenSeadragon call,
+  // which matters for imports of up to 250k points on every zoom frame.
+  const span = 1024; // image px between the probes, as in annotationMapping()
+  const o = toEl(0, 0), ex = toEl(span, 0), ey = toEl(0, span);
+  const xx = (ex.x - o.x) / span, xy = (ex.y - o.y) / span;
+  const yx = (ey.x - o.x) / span, yy = (ey.y - o.y) / span;
+  const project = (x, y) => ({ x: o.x + xx * x + yx * y, y: o.y + xy * x + yy * y });
   if (state.astromap && !state.annotations.some((a) => a.type === "box" && a.astromap === true && a.id === state.astromap.activeId))
     state.astromap.activeId = state.annotations.find((a) => a.type === "box" && a.astromap === true)?.id || null;
 
   const drawLine = (a, isTemp) => {
     const col = annColor(a);
-    const p1 = toEl(a.x1, a.y1);
-    const p2 = toEl(a.x2, a.y2);
+    const p1 = project(a.x1, a.y1);
+    const p2 = project(a.x2, a.y2);
     const g = svgEl("g", {}, root);
     svgEl("line", {
       x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
@@ -2757,7 +2766,8 @@ function renderAnnotations() {
     if (a.type === "line") drawLine(a, false);
     else if (a.type === "box") {
       const corners = [
-        toEl(a.x, a.y), toEl(a.x + a.w, a.y), toEl(a.x + a.w, a.y + a.h), toEl(a.x, a.y + a.h),
+        project(a.x, a.y), project(a.x + a.w, a.y),
+        project(a.x + a.w, a.y + a.h), project(a.x, a.y + a.h),
       ];
       const left = Math.min(...corners.map((c) => c.x));
       const top = Math.min(...corners.map((c) => c.y));
@@ -2773,9 +2783,9 @@ function renderAnnotations() {
       chip(root, left, top - 22, a.astromap === true
         ? `${astromapNumber}${note ? " · " + note : ""}` : a.text || "Box", a.id);
     } else if (a.type === "geojson") {
-      renderImportedGeoJSON(a, root);
+      renderImportedGeoJSON(a, root, project);
     } else if (a.type === "pin") {
-      const p = toEl(a.x, a.y);
+      const p = project(a.x, a.y);
       const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, root);
       svgEl("circle", { cx: p.x, cy: p.y, r: 6, fill: annColor(a), stroke: "#fff", "stroke-width": 1.5 }, g);
       svgEl("circle", { cx: p.x, cy: p.y, r: 1.8, fill: "#fff" }, g);
@@ -2787,10 +2797,10 @@ function renderAnnotations() {
   rememberAnnotationFrame(root);
 }
 
-function renderImportedGeoJSON(item, layer) {
+function renderImportedGeoJSON(item, layer, project = toEl) {
   const api = window.Nd2AnnotationGeoJSON;
   try {
-    const parts = api.displayParts(item.geojson.geometry, toEl);
+    const parts = api.displayParts(item.geojson.geometry, project);
     const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, layer);
     for (const path of parts.paths) svgEl("path", {
       d: path.d, fill: path.closed ? hexAlpha(annColor(item), .08) : "none",
@@ -2800,7 +2810,7 @@ function renderImportedGeoJSON(item, layer) {
     for (const point of parts.points) svgEl("circle", {
       cx: point.x, cy: point.y, r: 6, fill: annColor(item), stroke: "#fff", "stroke-width": 1.5,
     }, group);
-    const rect = api.bounds(item.geojson.geometry), anchor = toEl(rect.x, rect.y);
+    const rect = api.bounds(item.geojson.geometry), anchor = project(rect.x, rect.y);
     chip(layer, anchor.x, anchor.y - 22, api.label(item), item.id);
   } catch (_) { /* Invalid legacy sidecar geometry must not break other annotations. */ }
 }
