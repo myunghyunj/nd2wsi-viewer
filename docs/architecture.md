@@ -12,6 +12,7 @@ import their entry point or create a second copy of its state.
 | `app.py` | Launch options, native bridge, window roles, server startup and platform selection | Creates one API and native window per session; retains compatibility entry points |
 | `window_lifecycle.py` | Save-before-close (macOS and Windows) and save-before-update (Sparkle) state machines | Receives the window, lifecycle API and logger; owns request identities, cancellation and worker/UI-thread ordering (AppKit main queue or WinForms `BeginInvoke`) |
 | `window_chrome.py` | macOS chrome/menu adapters and native file-drop delivery | Receives the owning window/API; imports native frameworks at the point of use |
+| `session_log.py` | Per-process JSON Lines session log, crash capture, health samples and retention | Imports nothing from the app; `event()` never raises and is a no-op until `app.main()` starts the log |
 
 Browser state must acknowledge saved annotations before shutdown can release
 its server resources. Cancellation belongs to the original request until its
