@@ -231,6 +231,8 @@ def test_unbundled_smoke_keeps_the_old_environment_and_budget(monkeypatch, tmp_p
     module.smoke(tmp_path / "viewer.exe", tmp_path / "input.nd2", tmp_path / "evidence")
     assert [timeout for _, timeout in calls] == [600, 180]
     assert all("ND2WSI_WEBVIEW2_RUNTIME" not in env for env, _ in calls)
+    # Session logs from the smoke runs are evidence, never files in the zipped bundle.
+    assert {env["ND2WSI_SESSION_LOG_DIR"] for env, _ in calls} == {str(tmp_path / "evidence" / "session-logs")}
 
 
 def _drop(*keys):

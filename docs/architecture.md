@@ -12,6 +12,7 @@ import their entry point or create a second copy of its state.
 | `app.py` | Launch options, native bridge, window roles, server startup and platform selection | Creates one API and native window per session; retains compatibility entry points |
 | `window_lifecycle.py` | Save-before-close (macOS and Windows) and save-before-update (Sparkle) state machines | Receives the window, lifecycle API and logger; owns request identities, cancellation and worker/UI-thread ordering (AppKit main queue or WinForms `BeginInvoke`) |
 | `window_chrome.py` | macOS chrome/menu adapters and native file-drop delivery | Receives the owning window/API; imports native frameworks at the point of use |
+| `session_log.py` | Per-process JSON Lines session log, crash capture, health samples and retention | Imports nothing from the app; `event()` never raises and is a no-op until `app.main()` starts the log, which stays open until the atexit hook (or `run()` before a diagnostic `os._exit`) closes it |
 
 Browser state must acknowledge saved annotations before shutdown can release
 its server resources. Cancellation belongs to the original request until its
@@ -66,6 +67,7 @@ fingerprint checks before and after reading.
 | `static/viewer-geometry-v1.js` | Tile source construction, flip-aware image/element point conversion, rect corners and centre-only camera moves shared by the pane and `translucent-v1.js` | Slide info, viewport and the OpenSeadragon namespace, passed per call; no shared state |
 | `static/annotation-store-v1.js` | Annotation sidecar saves: debounce, serialized queue, revision/context guards, 409 recovery drafts and plate-site owner switches | Pane state, fetch, clock, lock/frame queries and status/render/notice callbacks |
 | `static/save-status-v1.js` | Auto-save indicator: merges the save-state events of the annotation and LUT channels by precedence (conflict, failed, saving, dirty, saved), the "N s ago" and retry-countdown texts and the one-second ticker | Clock, interval timers and a render callback; no DOM |
+| `static/early-errors-v1.js` | Holds up to ten script errors raised before `app.js` (or `shell-v1.js` in the shell) installs its session-log relay, which drains them | The page's window; loaded first in `index.html` and `shell.html` |
 
 `index.html` loads each controller before `app.js`; `translucent.html` loads
 `viewer-geometry-v1.js` before `translucent-v1.js`. The same controller modules

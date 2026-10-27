@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import render
+from . import render, session_log
 from .annotation_sidecars import (
     SLIDE_SUFFIXES,
     _manifest_source_path,
@@ -1738,6 +1738,8 @@ def make_handler(
 
         def _open(self):
             job = None
+            path = None
+            began = time.monotonic()
             try:
                 data = self._body_json()
                 path = data.get("path") if isinstance(data, dict) else None
@@ -1766,10 +1768,20 @@ def make_handler(
                 RuntimeError,
             ) as e:
                 _job_update(job, state="error", error=str(e))
+                if path:
+                    self._record_open(path, began, ok=False, error=str(e))
                 return self._error(400, str(e))
             except json.JSONDecodeError as e:
                 return self._error(400, f"invalid JSON: {e}")
+            self._record_open(path, began, ok=True, sid=sid)
             return self._json({"sid": sid, "slides": registry.listing()})
+
+        @staticmethod
+        def _record_open(path, began, **fields):
+            # The desktop app's session log; a no-op for the CLI viewer.
+            session_log.event("file_open", via="shell", path=str(path),
+                              format=Path(str(path)).suffix.lower().lstrip("."),
+                              seconds=round(time.monotonic() - began, 2), **fields)
 
         def _trash(self):
             if registry.window_session is not None:

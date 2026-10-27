@@ -11,14 +11,17 @@ ND2), then the viewer loads from an ephemeral localhost port.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
+import re
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 
+from . import session_log
 from . import window_chrome as _window_chrome
 from . import window_lifecycle as _window_lifecycle
 
@@ -37,7 +40,7 @@ def log_path() -> Path:
     return Path.home() / "Library" / "Logs" / f"{APP_NAME}.log"
 
 
-def _dlog(msg: str) -> None:
+def _write_app_log(msg: str) -> None:
     """Append one diagnostic line to the per-user app log (best effort)."""
     import datetime
 
@@ -49,6 +52,104 @@ def _dlog(msg: str) -> None:
             fh.write(f"{stamp} {msg}\n")
     except OSError:
         pass
+
+
+# Diagnostic lines that report a caught failure; the session log keeps these
+# even after it reaches its size cap.
+_FAILURE_LINE = re.compile(r"fail|could not|cannot|unavailable|aborted|timed out", re.IGNORECASE)
+
+
+def _dlog(msg: str) -> None:
+    """One diagnostic line, in the app log and in this process's session log."""
+    _write_app_log(msg)
+    if _FAILURE_LINE.search(msg):
+        session_log.event("app_log", message=msg, level="error")
+    else:
+        session_log.event("app_log", message=msg)
+
+
+def _record_window_shown(*_args) -> None:
+    session_log.event("window_shown")
+
+
+def _record_window_closed(*_args) -> None:
+    session_log.event("window_closed")
+
+
+def _record_open(path, began: float | None = None, **fields) -> None:
+    """A file_open record for a slide opened from the entry page."""
+    if began is not None:
+        fields["seconds"] = round(time.monotonic() - began, 2)
+    session_log.event("file_open", via="entry", path=str(path), format=Path(path).suffix.lower().lstrip("."),
+                      **fields)
+
+
+def _run_mode(args) -> str:
+    if args.smoke:
+        return "smoke"
+    if args.handoff_check_report:
+        return "handoff-check"
+    if args.browser_replay_report:
+        return "browser-replay"
+    return "gui-smoke" if args.gui_smoke else "normal"
+
+
+def _build_info() -> dict | None:
+    """Version and commit from build-info.json beside a frozen executable."""
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        data = json.loads((Path(sys.executable).resolve().parent / "build-info.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    runtime = data.get("webview2_runtime")
+    if isinstance(runtime, dict):
+        runtime = runtime.get("distribution") or runtime.get("version")
+    return {"version": data.get("version"), "commit": data.get("commit"),
+            "binary_architecture": data.get("binary_architecture"), "webview2_runtime": runtime}
+
+
+def _runtime_facts() -> dict:
+    """OS, CPU, Python and build facts for the session log (never raises)."""
+    import platform
+
+    facts = {"frozen": bool(getattr(sys, "frozen", False)), "executable": sys.executable}
+    try:
+        facts.update(os=platform.platform(), os_release=platform.release(), os_version=platform.version(),
+                     machine=platform.machine(), python=platform.python_version(),
+                     python_bits=64 if sys.maxsize > 2**32 else 32)
+        if sys.platform == "win32":
+            version = sys.getwindowsversion()
+            facts["windows"] = {
+                "build": version.build, "edition": platform.win32_edition(),
+                # x64 emulation on ARM64 reports AMD64 here; the identifier names the real CPU.
+                "processor_architecture": os.environ.get("PROCESSOR_ARCHITECTURE"),
+                "processor_architew6432": os.environ.get("PROCESSOR_ARCHITEW6432"),
+                "processor_identifier": os.environ.get("PROCESSOR_IDENTIFIER"),
+            }
+        elif sys.platform == "darwin":
+            facts["macos"] = platform.mac_ver()[0]
+    except Exception as exc:
+        facts["facts_error"] = repr(exc)
+    build = _build_info()
+    if build is not None:
+        facts["build_info"] = build
+    return facts
+
+
+def _start_session_log(mode: str) -> Path | None:
+    """Open this process's session log and record what is running."""
+    from . import __version__
+
+    started = session_log.start(app_name=APP_NAME, version=__version__)
+    if started is None:
+        _write_app_log("session log could not start")
+        return None
+    session_log.event("app_start", mode=mode, **_runtime_facts())
+    _dlog(f"session log: {started}")
+    return started
 
 BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   html,body{height:100%;margin:0;background:#000;color:rgba(255,255,255,.85);
@@ -380,10 +481,35 @@ class UpdateShutdownCoordinator(_window_lifecycle.UpdateShutdownCoordinator):
 
 
 class WindowCloseCoordinator(_window_lifecycle.WindowCloseCoordinator):
-    """Compatibility entry point for the window-owned close guard."""
+    """Compatibility entry point for the window-owned close guard.
+
+    Each close attempt and its outcome is also kept in the session log.
+    """
 
     def __init__(self, api: Api, window):
         super().__init__(api, window, logger=lambda message: _dlog(message))
+
+    def on_closing(self) -> bool:
+        allowed = super().on_closing()
+        session_log.event("window_closing", allowed=allowed)
+        return allowed
+
+    def approve_close(self, reason: str) -> None:
+        super().approve_close(reason)
+        session_log.event("window_close", outcome="approved without save confirmation", reason=reason)
+
+    def _close_worker(self, request_id, cancelled, ask_to_force=False) -> None:
+        try:
+            super()._close_worker(request_id, cancelled, ask_to_force)
+        finally:
+            if self._approved:
+                session_log.event("window_close", outcome="closed")
+            elif self._forced:
+                pass  # approve_close recorded it
+            elif cancelled.is_set():
+                session_log.event("window_close", outcome="cancelled")
+            else:
+                session_log.event("window_close", outcome="kept open", ok=False, status=self.api._status)
 
 
 def _guard_native_close(api: Api, window) -> None:
@@ -434,6 +560,36 @@ def _install_app_updater(api: Api, window) -> None:
         install()
 
 
+class _RateLimit:
+    """At most ``limit`` accepted calls per ``period`` seconds; the rest are counted."""
+
+    def __init__(self, limit: int, period: float, clock=time.monotonic):
+        self._limit, self._period, self._clock = limit, period, clock
+        self._accepted: collections.deque = collections.deque()
+        self._dropped = 0
+        self._lock = threading.Lock()
+
+    def take(self) -> int | None:
+        """None when this call is dropped, else how many were dropped since the last accepted one."""
+        now = self._clock()
+        with self._lock:
+            while self._accepted and now - self._accepted[0] >= self._period:
+                self._accepted.popleft()
+            if len(self._accepted) >= self._limit:
+                self._dropped += 1
+                return None
+            self._accepted.append(now)
+            dropped, self._dropped = self._dropped, 0
+            return dropped
+
+
+# Script errors the shell forwards to the session log: per process, not per window.
+_CLIENT_EVENTS = _RateLimit(20, 60.0)
+_CLIENT_EVENT_SOURCES = frozenset({"shell", "pane"})
+_CLIENT_EVENT_KIND = re.compile(r"[a-z][a-z0-9_-]{0,63}")
+_CLIENT_EVENT_LIMITS = {"source": 16, "kind": 64, "message": 2000, "where": 1000, "stack": 8000}
+
+
 class Api:
     """Bridge exposed to the bootstrap page."""
 
@@ -472,7 +628,43 @@ class Api:
         """Automation defaults to a separate Agent process, never the User window."""
         from .window_launch import launch_window
 
-        return launch_window(role, app_name=APP_NAME)
+        result = launch_window(role, app_name=APP_NAME)
+        if isinstance(result, dict):
+            session_log.event("new_window", role=role, ok=result.get("ok"), message=result.get("message"))
+        return result
+
+    def log_client_event(self, payload) -> dict:
+        """Keep a script error from the shell or one of its panes in the session log.
+
+        Only the known text fields are kept, each size-capped, with this
+        server's capability URL removed; at most 20 reports a minute are
+        recorded per process and the rest are counted.
+        """
+        if not isinstance(payload, dict):
+            return {"ok": False, "message": "Expected an object"}
+        fields = {}
+        for name, limit in _CLIENT_EVENT_LIMITS.items():
+            value = payload.get(name)
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                return {"ok": False, "message": f"{name} must be text"}
+            fields[name] = value[:limit]
+        if fields["source"] not in _CLIENT_EVENT_SOURCES or not _CLIENT_EVENT_KIND.fullmatch(fields["kind"]):
+            return {"ok": False, "message": "Expected a shell or pane source and an event kind"}
+        dropped = _CLIENT_EVENTS.take()
+        if dropped is None:
+            return {"ok": False, "message": "Too many client events; this one was not recorded"}
+        with self._server_lock:
+            server = self._httpd
+        base = _server_url(server) if server is not None else None
+        for name in ("message", "where", "stack"):
+            if base:
+                fields[name] = fields[name].replace(base, "")
+        extra = {"dropped": dropped} if dropped else {}
+        session_log.event("client_error", source=fields["source"], client_kind=fields["kind"],
+                          message=fields["message"], where=fields["where"], stack=fields["stack"], **extra)
+        return {"ok": True}
 
     def open_translucent_viewer(self, sid: str, payload: dict) -> dict:
         """Open a display-only tracing window for this viewer's registered slide."""
@@ -499,6 +691,7 @@ class Api:
                     previous.close_translucent()
 
                 def remove(closed):
+                    session_log.event("translucent_closed", sid=sid)
                     with self._translucent_lock:
                         if self._translucent_windows.get(sid) is closed:
                             self._translucent_windows.pop(sid, None)
@@ -508,9 +701,11 @@ class Api:
                     title=APP_NAME + " — Translucent", logger=_dlog, on_closed=remove,
                 )
                 self._translucent_windows[sid] = overlay
+            session_log.event("translucent_opened", sid=sid, id=overlay._window.uid)
             return {"ok": True, "id": overlay._window.uid}
         except Exception as exc:
             _dlog(f"translucent viewer open failed: {exc!r}")
+            session_log.event("translucent_open_failed", sid=sid, ok=False, error=str(exc))
             return {"ok": False, "message": f"Could not open translucent viewer: {exc}"}
 
     def _close_translucent_windows(self, *_args):
@@ -518,6 +713,8 @@ class Api:
             self._translucent_owner_closed = True
             overlays = list(self._translucent_windows.values())
             self._translucent_windows.clear()
+        if overlays:
+            session_log.event("translucent_closing", count=len(overlays), reason="source viewer closing")
         for overlay in overlays:
             try:
                 overlay.close_translucent()
@@ -649,6 +846,17 @@ class Api:
 
     def check_for_updates(self) -> dict:
         """Open Windows release downloads or the macOS Sparkle update window."""
+        try:
+            result = self._check_for_updates()
+        except Exception as exc:
+            session_log.event("update_check", ok=False, error=repr(exc))
+            raise
+        if isinstance(result, dict):
+            session_log.event("update_check", ok=result.get("ok"), available=result.get("available"),
+                              current_version=result.get("current_version"), message=result.get("message"))
+        return result
+
+    def _check_for_updates(self) -> dict:
         if self._local_beta:
             return {"ok": False, "message": "Local beta — updates are disabled."}
         if self._updates_disabled:
@@ -734,6 +942,8 @@ class Api:
                 self._status = f"could not find {p.name}"
             else:
                 good.append(p)
+                continue
+            _record_open(p, ok=False, error=self._status)
         if not good:
             return None
         return self._launch_many(good)
@@ -864,20 +1074,24 @@ class Api:
                 self._frac = f
 
             _dlog(f"open {p}")
+            began = time.monotonic()
             try:
                 self._frac = 0.0  # bar up while the file opens, before ticks
                 # a plate file skips conversion; the bar stays up while the
                 # registry opens it, which reads a few frames for its window
                 url = self._open_registered(p, note, frac)
                 self._frac = -1.0
+                _record_open(p, began, ok=True)
             except Exception as e:
                 self._frac = -1.0
                 self._status = f"could not open {p.name}: {e}"
                 _dlog(f"open FAILED {p.name}: {e}")
+                _record_open(p, began, ok=False, error=str(e))
         self._status = "starting viewer …" if url else self._status
         return url
 
     def _launch(self, path: Path):
+        began = time.monotonic()
         try:
             def note(msg):
                 self._status = msg
@@ -889,10 +1103,12 @@ class Api:
             url = self._open_registered(path, note, frac)
             self._status = "starting viewer …"
             self._frac = -1.0
+            _record_open(path, began, ok=True)
             return url  # the tab shell at / lists every open slide
         except Exception as e:  # surfaced in the bootstrap page
             self._frac = -1.0
             self._status = f"could not open {path.name}: {e}"
+            _record_open(path, began, ok=False, error=str(e))
             return None
 
 
@@ -919,6 +1135,7 @@ def _dismiss_failed_webview2_window(api, window, *, spawn=None) -> None:
 
 def _startup_error(message: str, *, show_dialog: bool = True) -> None:
     _dlog(message)
+    session_log.event("error", where="startup", message=message)
     print(message, file=sys.stderr)
     if sys.platform == "win32" and show_dialog:
         try:
@@ -1523,6 +1740,8 @@ def run(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     result = main(arguments)
     if any(argument.split("=", 1)[0] in _DIAGNOSTIC_RUN_FLAGS for argument in arguments):
+        # os._exit skips the atexit hook that otherwise closes the session log.
+        session_log.stop("diagnostic run finished")
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
@@ -1553,6 +1772,24 @@ def main(argv: list[str] | None = None) -> int:
     role_args.add_argument("--agent-window", action="store_true", help="open an isolated Agent window")
     args, _ = ap.parse_known_args(argv)  # tolerate Finder's -psn_* args
 
+    # The session log covers the whole run, diagnostic runs included. It stays
+    # open after main() returns so that a crash during interpreter shutdown
+    # (native toolkit unload, daemon threads) is still captured: its atexit
+    # hook closes it, and run() closes it before a diagnostic run's os._exit.
+    mode = _run_mode(args)
+    _start_session_log(mode)
+    try:
+        result = _main(args)
+    except BaseException as exc:
+        # Escaping main(), an error also reaches the session log's
+        # sys.excepthook, which records its traceback as a crash.
+        session_log.event("app_exit", mode=mode, ok=False, error=type(exc).__name__, message=str(exc))
+        raise
+    session_log.event("app_exit", mode=mode, result=result)
+    return result
+
+
+def _main(args) -> int:
     initial = Path(args.nd2).expanduser() if args.nd2 else None
     if args.handoff_check_report:
         if (sys.platform != "darwin" or not args.agent_window or initial is None
@@ -1621,10 +1858,12 @@ def main(argv: list[str] | None = None) -> int:
                 api._webview2_runtime["appcontainer_access"] = ensure_appcontainer_access(
                     Path(api._webview2_runtime["path"]), force=os.environ.get(GRANT_SMOKE_ENV) == "1")
             _dlog(f"WebView2 runtime: {api._webview2_runtime}")
+            session_log.event("webview2_runtime", selection=api._webview2_runtime)
             from .webview2_runtime import watch_initialization
 
             def webview2_started(ok, detail, *, diagnostic=bool(args.gui_smoke)):
                 api._webview2_init = {"ok": ok, "error": detail}
+                session_log.event("webview2_init", ok=ok, error=detail)
                 if not ok:
                     _dlog(f"WebView2 initialization failed: {detail}")
                     if not diagnostic and not api._startup_error:
@@ -1682,6 +1921,8 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as exc:
                     _dlog(f"window session close record failed: {exc!r}")
     if args.gui_smoke:
+        session_log.event("gui_smoke", ok=report.get("ok"), phase=report.get("phase"), error=report.get("error"),
+                          close=report.get("close"))
         print(json.dumps(report, ensure_ascii=False))
         if args.smoke_report:
             args.smoke_report.parent.mkdir(parents=True, exist_ok=True)
@@ -1728,6 +1969,10 @@ def create_app_window(initial: Path | None, window_session=None):
     title = APP_NAME
     if window_session is not None:
         title += f" — {window_session.role.title()} · {window_session.id}"
+    session_log.event("window_created", title=title,
+                      role=window_session.role if window_session is not None else None,
+                      id=window_session.id if window_session is not None else None,
+                      initial=str(initial) if initial else None)
     window = webview.create_window(
         title,
         html=BOOT_HTML,
@@ -1756,6 +2001,8 @@ def create_app_window(initial: Path | None, window_session=None):
     window.events.before_load += lambda *_args: api.clear_native_gesture_scopes()
     window.events.closed += lambda *_args: api.clear_native_gesture_scopes()
     window.events.closed += api._close_translucent_windows
+    window.events.closed += _record_window_closed
+    window.events.shown += _record_window_shown
     _wire_file_drop(window)
     if sys.platform == "darwin":
         _inline_traffic_lights(window)

@@ -295,7 +295,8 @@ seconds. Closing again retries the save and, if that fails too, asks whether to
 close without confirmed saves. A window whose WebView2 page never loaded and
 has no slide open closes at once.
 
-Logs are stored in `%LOCALAPPDATA%\nd2wsi-viewer\logs`. WebView2 runs in
+Logs are stored in `%LOCALAPPDATA%\nd2wsi-viewer\logs` (see also
+[Session logs](#session-logs)). WebView2 runs in
 private mode with temporary browser data. Windows uses Ctrl/Alt shortcuts
 and Explorer's reveal command. For a portable copy, install updates by
 extracting a newer supplied ZIP into a fresh folder. The Windows update button
@@ -305,3 +306,38 @@ to macOS. For a newer installed version, follow that release's upgrade instructi
 The viewer executable and Setup are not Authenticode-signed. They include a project license and available
 dependency license files. A Windows code-signing certificate is optional for
 running the app but would reduce unknown-publisher warnings.
+
+## Session logs
+
+Every viewer window (each is its own process) writes a session log, so a run
+such as a demo on the instrument PC can be examined afterwards. A portable copy
+writes to the `logs` folder beside `nd2wsi-viewer.exe` when it can create it
+there; otherwise, and always for a copy installed with Setup, the log goes to
+`%LOCALAPPDATA%\nd2wsi-viewer\Logs\sessions` (on macOS,
+`~/Library/Logs/nd2wsi-viewer/sessions`, never inside the app).
+`ND2WSI_SESSION_LOG_DIR` selects another folder, and the app log above names
+the current file at startup.
+
+Each process writes `session-YYYYMMDD-HHMMSS-<pid>.jsonl`, named by its start
+time: one JSON record per line, written immediately so a crash keeps everything
+before it. A native crash is written to the matching `-fatal.txt`, which a
+normal exit deletes when it is empty. Records include the app version and build
+commit, Windows version and build, CPU architecture, the WebView2 runtime used
+and whether it started, window open and close (including save-before-close
+outcomes), the full paths of files opened and whether they opened, translucent
+viewer and Follow events, update checks, script errors from the viewer pages,
+caught errors, uncaught exceptions with tracebacks, and a memory and thread
+sample every 30 seconds. While Follow observes the stage keys, each accepted
+W/A/S/D jog is recorded with its letter, sequence number and step; W/A/S/D
+pressed while another program is in front are only counted. No other keys
+and no typed text are recorded.
+
+A session keeps only failures and its final record after 50 MB. Each start keeps
+the newest 50 sessions and at most 500 MB, deleting older files with these
+names in that folder only. The logs stay on the PC; nothing is uploaded.
+
+To send them after a demo, close every viewer window, open the log folder (paste
+`%LOCALAPPDATA%\nd2wsi-viewer\Logs\sessions` into the Explorer address bar, or
+use the `logs` folder beside the executable), select the `session-*` files from
+the demo's date and time, and choose **Send to > Compressed (zipped) folder**.
+File paths appear in full, so check them before sending the ZIP outside the lab.
