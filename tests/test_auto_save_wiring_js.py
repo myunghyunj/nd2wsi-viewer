@@ -54,7 +54,8 @@ function element(id){
   Object.defineProperty(el,'textContent',{get(){return this._text},set(v){this._text=v;this.writes++}});
   return el;
 }
-const nodes={'save-status':element('save-status'),'save-status-tooltip':element('save-status-tooltip')};
+const nodes={'save-status':element('save-status'),'save-status-tooltip':element('save-status-tooltip'),
+  'ann-editor':element('ann-editor')};
 nodes['save-status-tooltip'].rect={left:0,top:0,right:160,bottom:30,width:160,height:30};
 nodes['save-status'].attrs['aria-label']='Auto-save'; // as the markup ships it
 const state={quitPreparing:false,lutPersistence:null,saveStatus:null,autoSaveRetry:null};
@@ -66,7 +67,10 @@ const lutPersistence={dirty:false,isDirty(){return this.dirty},
 const window=eventTarget({innerWidth:800,innerHeight:600,
   Nd2SaveStatus:{createTracker:options=>SaveStatus.createTracker({...options,now:()=>now,setInterval,clearInterval})}});
 const document=eventTarget({});
-const context={state,window,document,setTimeout,clearTimeout,setInterval,clearInterval,annotationStore,$:id=>nodes[id]||null};
+// The note editor commits its text through annotationsChanged(), which marks the store dirty.
+const closeEditor=save=>{calls.push(['closeEditor',save]);nodes['ann-editor'].hidden=true;};
+const context={state,window,document,setTimeout,clearTimeout,setInterval,clearInterval,annotationStore,closeEditor,
+  $:id=>nodes[id]||null};
 vm.createContext(context);
 const start=source.indexOf('/* ---- auto-save status'),end=source.indexOf('function pixelSize(',start);
 if(start<0||end<0)throw new Error('auto-save source bounds not found');
@@ -133,6 +137,51 @@ context.wireAutoSave();state.lutPersistence=lutPersistence;
 fire(window,'pagehide');return calls;
 """)
     assert out == [["ann.flushOnPagehide", {"keepalive": True}]]
+
+
+@pytest.mark.parametrize("quit_preparing", [False, True])
+def test_pagehide_commits_the_open_note_editor_before_the_keepalive_flush(quit_preparing):
+    out = run(f"""
+context.wireAutoSave();state.lutPersistence=lutPersistence;
+nodes['ann-editor'].hidden=false;state.quitPreparing={json.dumps(quit_preparing)};
+fire(window,'pagehide');return {{calls,editorHidden:nodes['ann-editor'].hidden}};
+""")
+    if quit_preparing:
+        # the native save-before-close owns the editor while the shell quits
+        assert out == {"calls": [], "editorHidden": False}
+    else:
+        assert out == {"calls": [["closeEditor", True], ["ann.flushOnPagehide", {"keepalive": True}]],
+                       "editorHidden": True}
+
+
+PAGESHOW = r"""
+const fs=require('fs'),path=require('path'),vm=require('vm');
+const results={};
+for(const name of ['app.js','shell-v1.js']){
+  const source=fs.readFileSync(path.join(process.argv[1],name),'utf8');
+  const start=source.indexOf('window.addEventListener("pageshow"');
+  if(start<0)throw new Error('no pageshow listener in '+name);
+  const handlers=[],reloads=[];
+  const context={window:{addEventListener:(type,fn)=>handlers.push([type,fn])},
+    location:{reload:()=>reloads.push(true)}};
+  vm.createContext(context);
+  vm.runInContext(source.slice(start,source.indexOf('\n});',start)+4),context);
+  handlers.forEach(([,fn])=>fn({persisted:false}));
+  const fresh=reloads.length;
+  handlers.forEach(([,fn])=>fn({persisted:true}));
+  results[name]={types:handlers.map(([type])=>type),fresh,restored:reloads.length-fresh,
+    count:source.split('addEventListener("pageshow"').length-1};
+}
+process.stdout.write(JSON.stringify(results));
+"""
+
+
+def test_pane_and_shell_reload_only_when_restored_from_the_back_forward_cache():
+    result = subprocess.run([NODE, "-e", PAGESHOW, str(STATIC)], capture_output=True, text=True,
+                            encoding="utf-8", timeout=20)
+    assert result.returncode == 0, result.stderr
+    expected = {"types": ["pageshow"], "fresh": 0, "restored": 1, "count": 1}
+    assert json.loads(result.stdout) == {"app.js": expected, "shell-v1.js": expected}
 
 
 def test_minute_retry_requeues_annotations_flushes_dirty_luts_and_counts_down_in_the_failed_text():

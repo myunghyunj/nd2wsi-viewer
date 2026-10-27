@@ -188,6 +188,15 @@ init().catch((e) => {
   $("boot").textContent = "failed to load: " + e.message;
 });
 
+// Every pagehide listener in this pane is a one-shot teardown: the save
+// tracker, the minute retry and the LUT and shading controllers are gone
+// afterwards. A pane the browser restores from its back/forward cache would
+// come back with those already disposed and silently stop saving, so it
+// loads afresh instead.
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) location.reload();
+});
+
 async function init() {
   const res = await fetch("api/info");
   if (!res.ok) throw new Error("info endpoint returned " + res.status);
@@ -2425,8 +2434,11 @@ function retryAutoSave() {
 // keepalive; the store skips a snapshot its 409 recovery draft already holds.
 // The native path (flushAnnotationsForUpdate + lutPersistence.flush) stays
 // the authority: while the shell is preparing to quit, nothing happens here.
+// Text still open in the note editor is committed first, as the native paths
+// do, so it is part of the snapshot that leaves.
 function flushAutoSaveOnPagehide() {
   if (state.quitPreparing) return;
+  if (!$("ann-editor").hidden) closeEditor(true);
   annotationStore.flushOnPagehide({ keepalive: true });
   const lut = state.lutPersistence;
   if (lut && lut.isDirty()) lut.flush({ keepalive: true }).catch(() => {});

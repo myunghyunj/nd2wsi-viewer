@@ -704,6 +704,12 @@ function activate(sid) {
   focusActivePane();
 }
 
+// Browser mode: the panes tear their save tracking down on pagehide, so a
+// window restored from the back/forward cache loads afresh, every pane with it.
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) location.reload();
+});
+
 function refresh(selectSid) {
   return fetch("api/slides", { cache: "no-store" })
     .then((response) => response.json())
