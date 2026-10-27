@@ -32,7 +32,7 @@ Changelog = "https://github.com/myunghyunj/nd2wsi-viewer/releases"
 
 [project.optional-dependencies]
 legacy = ["nd2[legacy]"]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pytest-xdist>=3.6", "ruff==0.17.3"]
 nd2export = ["limnd2>=0.4"]
 app = ["pywebview>=6.0"]
 svs = ["imagecodecs>=2023.9"]
@@ -69,6 +69,11 @@ select = ["E4", "E7", "E9", "F", "I", "UP"]
 ignore = ["E501"]
 
 [tool.pytest.ini_options]
+faulthandler_timeout = 120
+filterwarnings = [
+  "error::DeprecationWarning:nd2wsi",
+  "ignore:Setting the shape:DeprecationWarning:nd2._nd2file",
+]
 markers = [
   "realdata: tests that need the example acquisitions from the testdata release",
 ]
