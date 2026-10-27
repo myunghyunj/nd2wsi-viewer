@@ -96,3 +96,182 @@ def test_export_is_source_bound_and_cancel_does_not_write(tmp_path, monkeypatch)
         assert path.read_bytes() == before
     finally:
         api.stop_stage_follow()
+
+
+# Key-follow source: options, lifecycle merge and client logging --------------
+
+from nd2wsi import stage_follow as stage_follow_module  # noqa: E402
+from nd2wsi import stage_keys as stage_keys_module  # noqa: E402
+from nd2wsi import translucent_window as tw  # noqa: E402
+
+
+class FakeReceiver:
+    def __init__(self, order):
+        self._order = order
+        self._session = "fake-session"
+        self.closed = False
+
+    def start(self):
+        return {"url": "http://127.0.0.1:9/", "token": "secret-token",
+                "session_id": self._session, "protocol": stage_follow_module.PROTOCOL}
+
+    def snapshot(self):
+        return {"enabled": True, "session_id": self._session, "seq": 0,
+                "displacement_um": [0, 0], "status": "waiting", "message": ""}
+
+    def close(self):
+        self.closed = True
+        self._order.append("receiver.close")
+
+
+class FakeFollower:
+    instances = []
+
+    def __init__(self, receiver, session_id, *, step_um, start_ok=True, order=None):
+        self.receiver = receiver
+        self.session_id = session_id
+        self.step_um = step_um
+        self._start_ok = start_ok
+        self._order = order if order is not None else []
+        self.stopped = None
+        FakeFollower.instances.append(self)
+
+    def start(self):
+        return self._snapshot(running=self._start_ok)
+
+    def _snapshot(self, running):
+        return {"source": "keys", "running": running, "supported": True, "step_um": self.step_um,
+                "counted": 3, "ignored_not_slacs": 1, "last_key": "D",
+                "slacs_in_front": True, "error": None if running else "boom"}
+
+    def snapshot(self):
+        return self._snapshot(running=True)
+
+    def stop(self, reason="stopped"):
+        self.stopped = reason
+        self._order.append("follower.stop")
+
+
+@pytest.fixture
+def keys_overlay(monkeypatch):
+    FakeFollower.instances.clear()
+    order = []
+    monkeypatch.setattr(stage_follow_module, "StageFollowReceiver", lambda: FakeReceiver(order))
+
+    def make(*, start_ok=True, platform="win32"):
+        monkeypatch.setattr(tw.sys, "platform", platform)
+        monkeypatch.setattr(stage_keys_module, "SlacsKeyFollower",
+                            lambda receiver, session_id, *, step_um: FakeFollower(
+                                receiver, session_id, step_um=step_um, start_ok=start_ok, order=order))
+        return make_overlay(), order
+
+    return make
+
+
+def test_keys_is_the_default_source_on_windows(keys_overlay):
+    api, _order = keys_overlay(platform="win32")
+    result = api.start_stage_follow()
+    assert result["ok"] and result["source"] == "keys"
+    follower = FakeFollower.instances[-1]
+    assert follower.step_um == tw.DEFAULT_STEP_UM
+    state = api.stage_follow_state()
+    assert state["keys"]["source"] == "keys" and state["keys"]["counted"] == 3
+    assert "token" not in state
+    api.stop_stage_follow()
+
+
+def test_adapter_is_the_default_source_off_windows(keys_overlay):
+    api, _order = keys_overlay(platform="darwin")
+    result = api.start_stage_follow()
+    assert result["ok"] and result["source"] == "adapter"
+    assert FakeFollower.instances == []
+    assert "keys" not in api.stage_follow_state()
+    api.stop_stage_follow()
+
+
+def test_explicit_keys_options_set_the_step(keys_overlay):
+    api, _order = keys_overlay(platform="darwin")
+    result = api.start_stage_follow({"source": "keys", "step_um": 2.5})
+    assert result["ok"] and result["source"] == "keys"
+    assert FakeFollower.instances[-1].step_um == 2.5
+    api.stop_stage_follow()
+
+
+@pytest.mark.parametrize("options, fragment", [
+    ({"source": "sideways"}, "Unknown"),
+    ({"source": "keys", "step_um": 0}, "between"),
+    ({"source": "keys", "step_um": 20000}, "between"),
+    ({"source": "keys", "step_um": float("nan")}, "between"),
+    ({"source": "keys", "step_um": "10"}, "between"),
+    ("not-a-dict", "Invalid"),
+])
+def test_invalid_options_are_rejected_without_a_receiver(keys_overlay, options, fragment):
+    api, _order = keys_overlay(platform="win32")
+    result = api.start_stage_follow(options)
+    assert not result["ok"] and fragment in result["message"]
+    assert api._stage_follow is None and FakeFollower.instances == []
+
+
+def test_follower_that_cannot_start_closes_the_receiver(keys_overlay):
+    api, order = keys_overlay(start_ok=False, platform="win32")
+    result = api.start_stage_follow()
+    assert not result["ok"] and result["message"] == "boom"
+    assert order == ["follower.stop", "receiver.close"]
+    assert api._stage_follow is None and api._stage_follower is None
+
+
+def test_stop_stops_the_follower_before_the_receiver(keys_overlay):
+    api, order = keys_overlay(platform="win32")
+    api.start_stage_follow()
+    order.clear()
+    api.stop_stage_follow()
+    assert order == ["follower.stop", "receiver.close"]
+    assert api._stage_follow is None and api._stage_follower is None
+
+
+def test_close_stops_the_follower_before_the_receiver(keys_overlay):
+    api, order = keys_overlay(platform="win32")
+    api.start_stage_follow()
+    order.clear()
+    api.close_translucent()
+    assert order == ["follower.stop", "receiver.close"]
+
+
+def test_restart_is_idempotent_and_reuses_the_running_follower(keys_overlay):
+    api, _order = keys_overlay(platform="win32")
+    first = api.start_stage_follow()
+    second = api.start_stage_follow({"source": "keys", "step_um": 99})
+    assert second["session_id"] == first["session_id"]
+    # A second start never builds a new follower while one is running.
+    assert len(FakeFollower.instances) == 1
+    api.stop_stage_follow()
+
+
+def test_log_client_event_caps_and_rate_limits(monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    api = make_overlay()
+    result = api.log_client_event({"source": "x" * 5000, "kind": "error",
+                                   "message": "boom", "where": "a.js:1", "stack": "y" * 9000,
+                                   "ignored": "drop me"})
+    assert result["ok"] and events[0][0] == "client_error"
+    fields = events[0][1]
+    assert set(fields) == {"source", "client_kind", "message", "where", "stack"}
+    assert len(fields["source"]) == tw.CLIENT_LOG_FIELD_LIMIT
+    assert len(fields["stack"]) == tw.CLIENT_LOG_STACK_LIMIT
+    assert fields["message"] == "boom" and fields["client_kind"] == "error"
+    assert "ignored" not in fields
+    for _ in range(tw.CLIENT_LOG_MAX * 2):
+        last = api.log_client_event({"kind": "error", "message": "again"})
+    assert last.get("rate_limited") is True
+    assert len(events) == tw.CLIENT_LOG_MAX
+
+
+def test_log_client_event_rejects_non_dict_and_closed(monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    api = make_overlay()
+    assert api.log_client_event("oops") == {"ok": False}
+    assert events == []
+    api.close_translucent()
+    assert api.log_client_event({"kind": "error"}) == {"ok": False}

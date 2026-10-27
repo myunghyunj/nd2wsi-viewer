@@ -6,6 +6,50 @@ of `nd2wsi/stage_follow.py`, the owned receiver in `translucent_window.py`, and 
 camera updates in `static/translucent-v1.js`. It does not connect to SLACS or decode
 ACS packets. Legacy SLACS files are unchanged.
 
+## Key source: observing SLACS W/A/S/D (Windows)
+
+On Windows, Follow's default source observes the W/A/S/D keys the user presses in
+the legacy SLACS program to jog the ACS stage, and moves the overlay to match. It
+is built from `nd2wsi/stage_keys.py` (`SlacsKeyFollower`) and
+`nd2wsi/slacs_identity.py`, and feeds the same commanded-displacement path through
+`StageFollowReceiver.submit` that the HTTP routes use. The overlay settings expose
+**Step per key press** (µm); set it to SLACS's Roughness, since 1 Roughness ≈ 1 µm.
+On non-Windows the default source stays the in-process/HTTP adapter.
+
+**How it works.** A hidden message-only window registers a Raw Input keyboard
+*sink* (`RIDEV_INPUTSINK`) on a daemon thread. Each W/A/S/D key-down (autorepeat
+included) becomes one commanded `delta` of `step_um` micrometres — W/S on +Y/-Y,
+A/D on -X/+X — submitted to the receiver, plus a heartbeat about once a second so
+the receiver does not go stale. Presses are counted only while SLACS owns the
+foreground window, identified from the process command line's Python script
+operand (`SniperCellSorterGUIv3.1.py`), cached per process and failing closed.
+
+**No interference (hard rule).** The observer only reads. Raw Input is a sink: it
+never consumes, delays, alters, blocks, or fails a keystroke, and SLACS's own
+commands to the ACS stage are never touched. The module never calls into SLACS or
+the controller.
+
+**Privacy.** The observer receives every keystroke in the system. Anything other
+than W/A/S/D is discarded the instant it arrives — never stored, counted
+individually, or logged. W/A/S/D pressed while SLACS is not in front are tallied
+only as `ignored_not_slacs`, never recorded individually. The session log records
+counted presses (`follow_key`), foreground transitions (`slacs_foreground`),
+start/stop and errors — never other keys.
+
+**Limits.**
+
+- The overlay follows the *commanded* key, not the stage's response: a jog the
+  ACS controller rejects (out of range, at a limit) still moves the overlay, which
+  then drifts from the physical stage until Follow is turned off and on.
+- Stage moves made without W/A/S/D (mouse jog, scripted moves, absolute goto) are
+  not seen.
+- The keys carry no orientation; stage-to-image direction is corrected with the
+  Rotation and Flip X/Y controls, exactly as for the adapter source. There is no
+  per-key mapping UI.
+- The step must match SLACS's Roughness, or the overlay moves by the wrong
+  distance per press. When SLACS loses the foreground the status shows "SLACS not
+  in front" without pausing; following resumes when it returns.
+
 With Follow enabled, stage observations move the image even while the manual
 controls are locked; the lock label states this behavior. Unlocking permits manual
 alignment. Each new displacement is added to the current image center, retaining

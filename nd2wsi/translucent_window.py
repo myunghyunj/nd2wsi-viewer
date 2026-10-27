@@ -18,6 +18,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from . import session_log
 from .window_chrome import NativeTitlebarDrag
 
 OPACITY = 0.55
@@ -25,6 +26,13 @@ MIN_OPACITY = 0.10
 OPACITY_TIMEOUT = 5
 MIN_SIZE = (220, 160)
 MAX_SIZE = 8192
+DEFAULT_STEP_UM = 10.0
+MAX_STEP_UM = 10000.0
+# Client-error forwarding is rate limited so a looping page cannot flood the log.
+CLIENT_LOG_MAX = 20
+CLIENT_LOG_WINDOW = 10.0
+CLIENT_LOG_FIELD_LIMIT = 1000
+CLIENT_LOG_STACK_LIMIT = 4000
 
 
 def _number(value, name, minimum, maximum):
@@ -183,47 +191,150 @@ class TranslucentApi:
         self._epoch = 0
         self._lock = threading.RLock()
         self._stage_follow = None
+        self._stage_follower = None
+        self._stage_follow_source = None
+        self._stage_follow_status = None
+        self._client_log_window_start = None
+        self._client_log_count = 0
 
     def translucent_context(self):
         with self._lock:
             return {**copy.deepcopy(self._context), "locked": self._locked}
 
-    def start_stage_follow(self):
-        """Opt in to this overlay's receiver; never connect to a controller."""
-        from .stage_follow import StageFollowReceiver
+    def _stage_follow_options(self, options):
+        """Resolve the stage-follow source and per-key step; never raise."""
+        default_source = "keys" if sys.platform == "win32" else "adapter"
+        source, step_um = default_source, DEFAULT_STEP_UM
+        if options is None:
+            return source, step_um, None
+        if not isinstance(options, dict):
+            return source, step_um, "Invalid stage follow options."
+        requested = options.get("source", default_source)
+        if requested not in ("keys", "adapter"):
+            return source, step_um, "Unknown stage follow source."
+        source = requested
+        if "step_um" in options:
+            value = options["step_um"]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not 0 < value <= MAX_STEP_UM):
+                return source, step_um, "Step per key press must be a number between 0.001 and 10000 µm."
+            step_um = float(value)
+        return source, step_um, None
 
+    def start_stage_follow(self, options=None):
+        """Opt in to this overlay's receiver; never connect to a controller.
+
+        ``options`` may set ``source`` ("keys" to observe SLACS W/A/S/D presses,
+        "adapter" for an external in-process/HTTP sender) and the per-key
+        ``step_um``. The key follower is a strict observer and never blocks,
+        delays, or alters a keystroke.
+        """
+        from .stage_follow import StageFollowReceiver
+        from .stage_keys import SlacsKeyFollower
+
+        source, step_um, option_error = self._stage_follow_options(options)
         with self._lock:
             if self._closed:
                 return {"ok": False, "message": "This translucent viewer is closed."}
+            if option_error is not None:
+                return {"ok": False, "message": option_error}
             pixels = self._context.get("pixel_size_um")
             if (not isinstance(pixels, (list, tuple)) or len(pixels) != 2
                     or any(isinstance(v, bool) or not isinstance(v, (float, int))
                            or not math.isfinite(v) or v <= 0 for v in pixels)):
                 return {"ok": False, "message": "Stage follow requires a calibrated image."}
-            if self._stage_follow is None:
-                receiver = StageFollowReceiver()
-                try:
-                    descriptor = receiver.start()
-                except (OSError, RuntimeError) as exc:
-                    receiver.close()
-                    return {"ok": False, "message": "Could not start the local motion receiver: " + str(exc)}
-                self._stage_follow = receiver
-            else:
+            if self._stage_follow is not None:
                 descriptor = self._stage_follow.start()
-            return {"ok": True, **descriptor}
+                return {"ok": True, "source": self._stage_follow_source, **descriptor}
+            receiver = StageFollowReceiver()
+            try:
+                descriptor = receiver.start()
+            except (OSError, RuntimeError) as exc:
+                receiver.close()
+                return {"ok": False, "message": "Could not start the local motion receiver: " + str(exc)}
+            follower = None
+            if source == "keys":
+                try:
+                    follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=step_um)
+                    snapshot = follower.start()
+                except (ValueError, OSError, RuntimeError) as exc:
+                    snapshot = {"running": False, "error": str(exc)}
+                if not snapshot.get("running"):
+                    if follower is not None:
+                        follower.stop("start_failed")
+                    receiver.close()
+                    message = snapshot.get("error") or "Could not start key following."
+                    session_log.event("follow_start", source=source, ok=False, message=message)
+                    return {"ok": False, "message": message}
+            self._stage_follow = receiver
+            self._stage_follower = follower
+            self._stage_follow_source = source
+            self._stage_follow_status = None
+        session_log.event("follow_start", source=source, step_um=step_um, ok=True)
+        return {"ok": True, "source": source, **descriptor}
 
     def stage_follow_state(self):
         with self._lock:
             receiver = self._stage_follow
+            follower = self._stage_follower
+            source = self._stage_follow_source
             if self._closed or receiver is None:
                 return {"enabled": False, "status": "off", "message": "Stage follow is off."}
-            return receiver.snapshot()
+            snapshot = receiver.snapshot()
+            if follower is not None:
+                snapshot = {**snapshot, "keys": follower.snapshot()}
+            status = snapshot.get("status")
+            changed = status != self._stage_follow_status
+            self._stage_follow_status = status
+        if changed:
+            session_log.event("follow_state", source=source, status=status)
+        return snapshot
 
     def stop_stage_follow(self):
         with self._lock:
             receiver, self._stage_follow = self._stage_follow, None
+            follower, self._stage_follower = self._stage_follower, None
+            source, self._stage_follow_source = self._stage_follow_source, None
+            self._stage_follow_status = None
+        if follower is not None:
+            follower.stop("stopped")
         if receiver is not None:
             receiver.close()
+            session_log.event("follow_stop", source=source)
+        return {"ok": True}
+
+    def log_client_event(self, payload):
+        """Record a rate-limited overlay-page diagnostic in the session log."""
+        with self._lock:
+            if self._closed:
+                return {"ok": False}
+            now = time.monotonic()
+            if (self._client_log_window_start is None
+                    or now - self._client_log_window_start > CLIENT_LOG_WINDOW):
+                self._client_log_window_start = now
+                self._client_log_count = 0
+            if self._client_log_count >= CLIENT_LOG_MAX:
+                return {"ok": True, "rate_limited": True}
+            self._client_log_count += 1
+        if not isinstance(payload, dict):
+            return {"ok": False}
+
+        def capped(key, limit):
+            value = payload.get(key)
+            if value is None:
+                return None
+            return str(value)[:limit]
+
+        # "client_kind" rather than "kind": session_log.event's first positional
+        # parameter is itself named "kind", so a "kind" field would collide.
+        session_log.event(
+            "client_error",
+            source=capped("source", CLIENT_LOG_FIELD_LIMIT),
+            client_kind=capped("kind", CLIENT_LOG_FIELD_LIMIT),
+            message=capped("message", CLIENT_LOG_FIELD_LIMIT),
+            where=capped("where", CLIENT_LOG_FIELD_LIMIT),
+            stack=capped("stack", CLIENT_LOG_STACK_LIMIT),
+        )
         return {"ok": True}
 
     def save_stage_follow_connection(self):

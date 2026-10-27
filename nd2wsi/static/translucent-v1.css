@@ -53,6 +53,7 @@ body { user-select: none; -webkit-user-select: none; }
 #stage-follow-settings p { margin: 0 0 8px; }
 #stage-follow-settings label { display: inline-flex; align-items: center; gap: 4px; }
 #stage-follow-settings .mirror-image-control { margin-bottom: 4px; }
+#stage-follow-settings .stage-follow-step-control { margin: 6px 0 4px; }
 #stage-follow-settings input[type="number"] { width: 70px; padding: 3px 5px; border: 1px solid rgba(255,255,255,.25); border-radius: 4px; background: rgba(0,0,0,.2); color: #fff; font: inherit; }
 .stage-follow-flips { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0; }
 #stage-follow-settings .stage-follow-hint { color: #c9cdd3; }

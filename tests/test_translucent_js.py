@@ -59,7 +59,10 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
   const doc={getElementById:element,createElementNS(namespace,name){return newElement(name);},
     querySelectorAll(){return [];},addEventListener(name,cb){documentListeners[name]=cb;}};
   const windowListeners={},timers=new Map();let timerIndex=0;
+  const storage=new Map();
   const win={innerWidth:800,innerHeight:500,addEventListener(name,fn){windowListeners[name]=fn;},
+    localStorage:{getItem(k){return storage.has(k)?storage.get(k):null;},
+      setItem(k,v){storage.set(k,String(v));},removeItem(k){storage.delete(k);}},
     setTimeout(fn,delay){const id=++timerIndex;timers.set(id,{fn,delay});return id;},
     clearTimeout(id){timers.delete(id);}};
   const viewer=fakeViewer();
@@ -77,7 +80,7 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
   const mounted=api.mount({window:win,document:doc,api:bridge,OSD,context:{...context,...initialContext},
     info:{...info,...infoOverrides},importer});
   viewer.handlers.open();
-  return {mounted,viewer,element,win,nativeCalls,osdOptions,documentListeners,windowListeners,timers};
+  return {mounted,viewer,element,win,storage,nativeCalls,osdOptions,documentListeners,windowListeners,timers};
 }
 function followHarness(options={}){
   const snapshot={enabled:true,session_id:'session-one',seq:0,displacement_um:[0,0],status:'waiting'};
@@ -520,7 +523,7 @@ def test_stage_follow_is_opt_in_and_locked_commands_pan_image_and_existing_roi_t
     assert result["opacity"] == result["before"]["opacity"] == .55
     assert result["mouse"] is False and result["manualRoi"] is False
     assert "Stage commands still move the image" in result["lockTitle"]
-    assert result["status"] == "Following commands"
+    assert result["status"] == "Following SLACS keys"
     assert result["delta"] == "Last image move: 20.000, 10.000 px"
     assert result["scale"] == "Pixel size: X 0.500 · Y 2.000 µm/px"
 
@@ -752,3 +755,98 @@ def test_display_mirror_does_not_reverse_or_modify_physical_stage_registration()
     assert result["after"]["camera"]["center"] == pytest.approx({"x": .44, "y": .27})
     assert result["mirrored"]["flip"] is True and result["after"]["flip"] is False
     assert result["alignment"] == {"angle": 0, "flipX": False, "flipY": False}
+
+
+def test_step_input_defaults_to_ten_and_is_shown_in_the_settings():
+    result = run("""
+      const h=followHarness(),m=h.mounted;
+      return {step:m.state.stepUm,value:h.element('stage-follow-step').value,
+        count:h.element('stage-follow-count').textContent};
+    """)
+    assert result == {"step": 10, "value": "10", "count": "Key presses: 0"}
+
+
+def test_step_change_is_clamped_and_remembered_in_local_storage():
+    result = run("""
+      const h=followHarness(),m=h.mounted,input=h.element('stage-follow-step');
+      input.value='25';const accepted=input.listeners.change();
+      const stored=h.storage.get('nd2wsi.stageFollow.stepUm');
+      input.value='0';const rejectedLow=input.listeners.change();
+      input.value='99999';const rejectedHigh=input.listeners.change();
+      return {accepted,stored,step:m.state.stepUm,value:input.value,rejectedLow,rejectedHigh};
+    """)
+    assert result == {"accepted": True, "stored": "25", "step": 25, "value": "25",
+                      "rejectedLow": False, "rejectedHigh": False}
+
+
+def test_step_input_is_disabled_while_following_and_passed_to_start():
+    result = run("""
+      let startArgs=null;
+      const h=followHarness({bridgeOverrides:{async start_stage_follow(opts){startArgs=opts;
+        return {ok:true,session_id:'session-one',token:'never',url:'http://127.0.0.1:1/motion',protocol:'test'};}}});
+      const m=h.mounted,input=h.element('stage-follow-step');
+      m.setStepUm(2.5);
+      const beforeDisabled=input.disabled;
+      await m.startStageFollow();
+      const afterDisabled=input.disabled;
+      const rejectedWhileFollowing=m.setStepUm(7);
+      return {startArgs,beforeDisabled,afterDisabled,rejectedWhileFollowing,step:m.state.stepUm};
+    """)
+    assert result["startArgs"] == {"source": "keys", "step_um": 2.5}
+    assert result["beforeDisabled"] is False and result["afterDisabled"] is True
+    assert result["rejectedWhileFollowing"] is False and result["step"] == 2.5
+
+
+def test_waiting_and_following_status_texts_mention_slacs_keys():
+    result = run("""
+      const h=followHarness(),m=h.mounted;
+      await m.startStageFollow();
+      const waiting=h.element('stage-follow-status').textContent;
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[1,2],keys:{counted:4,slacs_in_front:true}});
+      await m.pollStageFollow();
+      return {waiting,following:h.element('stage-follow-status').textContent,
+        count:h.element('stage-follow-count').textContent};
+    """)
+    assert result == {"waiting": "Waiting for W/A/S/D in SLACS",
+                      "following": "Following SLACS keys", "count": "Key presses: 4"}
+
+
+def test_status_shows_slacs_not_in_front_without_pausing():
+    result = run("""
+      const h=followHarness(),m=h.mounted;
+      await m.startStageFollow();
+      Object.assign(h.snapshot,{seq:0,status:'waiting',displacement_um:[0,0],keys:{counted:0,slacs_in_front:false}});
+      await m.pollStageFollow();
+      return {status:h.element('stage-follow-status').textContent,
+        data:h.element('stage-follow-status').dataset.status,
+        followStatus:m.state.follow.status,timers:h.timers.size};
+    """)
+    # "Not in front" is a status hint only; following is not paused and keeps polling.
+    assert result["status"] == "SLACS not in front"
+    assert result["data"] == "not-in-front" and result["followStatus"] == "waiting"
+    assert result["timers"] == 1
+
+
+def test_client_errors_are_forwarded_rate_limited_and_never_throw():
+    result = run("""
+      const logged=[];
+      const h=followHarness({bridgeOverrides:{log_client_event(payload){logged.push(payload);return {ok:true};}}}),m=h.mounted;
+      h.windowListeners.error({message:'boom',filename:'a.js',lineno:1,colno:2,error:{stack:'trace'}});
+      h.windowListeners.unhandledrejection({reason:{message:'rejected',stack:'rstack'}});
+      for(let i=0;i<40;i++)h.windowListeners.error({message:'flood'});
+      return {first:logged[0],second:logged[1],total:logged.length};
+    """)
+    assert result["first"] == {"source": "translucent", "kind": "error", "message": "boom",
+                               "where": "a.js:1:2", "stack": "trace"}
+    assert result["second"]["kind"] == "unhandledrejection" and result["second"]["message"] == "rejected"
+    assert result["total"] == 20  # rate limited to 20 per window
+
+
+def test_missing_client_logger_is_tolerated():
+    result = run("""
+      const h=followHarness(),m=h.mounted;
+      let threw=false;
+      try{h.windowListeners.error({message:'boom'});}catch(_){threw=true;}
+      return {threw};
+    """)
+    assert result == {"threw": False}
