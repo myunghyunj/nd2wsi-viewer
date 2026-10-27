@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 
 import pytest
@@ -297,7 +298,8 @@ def test_start_failure_closes_cleanly(log_events):
                                 heartbeat_interval=None)
     snapshot = follower.start()
     assert snapshot["running"] is False and snapshot["error"]
-    assert ("follow_keys_start", {"step_um": 5.0, "ok": False, "error": snapshot["error"]}) in log_events
+    assert ("follow_keys_start", {"step_um": 5.0, "step_source": "manual", "ok": False,
+                                  "error": snapshot["error"]}) in log_events
     follower.stop()
 
 
@@ -343,6 +345,559 @@ def test_integration_with_real_receiver_accumulates_displacement():
     finally:
         follower.stop()
         receiver.close()
+
+
+# -- SLACS Roughness and Mirror ------------------------------------------------
+
+
+def controls_reading(**overrides):
+    """A reading shaped like SlacsControlsMonitor.latest()."""
+    return {"ok": True, "roughness_um": 10.0, "mirror_h": False, "mirror_v": False,
+            "age_ms": 120.4, "busy": False, "error": None, "reads": 3, **overrides}
+
+
+class FakeControls:
+    """Stands in for SlacsControlsMonitor; the test sets what latest() returns."""
+
+    def __init__(self, reading=None, *, start_result=True, start_error=None, stop_error=None,
+                 latest_error=None):
+        self.reading = controls_reading() if reading is None else reading
+        self.start_result = start_result
+        self.start_error = start_error
+        self.stop_error = stop_error
+        self.latest_error = latest_error
+        self.calls = []
+
+    def start(self):
+        self.calls.append("start")
+        if self.start_error is not None:
+            raise self.start_error
+        return self.start_result
+
+    def stop(self):
+        self.calls.append("stop")
+        if self.stop_error is not None:
+            raise self.stop_error
+
+    def latest(self):
+        self.calls.append("latest")
+        if self.latest_error is not None:
+            raise self.latest_error
+        return dict(self.reading) if isinstance(self.reading, dict) else self.reading
+
+    def lifecycle(self):
+        return [call for call in self.calls if call != "latest"]
+
+
+class FakeClock:
+    def __init__(self, now=100.0):
+        self.now = now
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.now
+
+
+def slacs_follower(receiver, controls, **kwargs):
+    kwargs.setdefault("in_front", [True])
+    return make_follower(receiver, step_source="slacs", controls=controls, **kwargs)
+
+
+def logged(log_events, kind):
+    return [fields for logged_kind, fields in log_events if logged_kind == kind]
+
+
+def test_default_step_source_is_manual_and_never_touches_controls(log_events):
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=1.0, mirror_h=True, mirror_v=True))
+    follower, observer = make_follower(receiver, in_front=[True], step_um=10, controls=controls)
+    follower.start()
+    observer.send(VK_D)
+    observer.send(VK_W)
+    assert [p["delta_um"] for p in receiver.submissions] == [[10.0, 0.0], [0.0, -10.0]]
+    snapshot = follower.snapshot()
+    follower.stop()
+    assert controls.calls == []  # a manual step neither starts, reads nor stops the reader
+    assert snapshot["step_source"] == "manual" and snapshot["step_um_last"] == 10.0
+    assert all(snapshot[key] is None for key in (
+        "roughness_um", "mirror_h", "mirror_v", "controls_ok", "slacs_busy", "reading_age_ms"))
+    first = logged(log_events, "follow_key")[0]
+    assert first["step_from"] == "manual" and first["step_um"] == 10.0
+    assert first["roughness_um"] is None and first["mirror_h"] is None and first["slacs_busy"] is None
+    assert logged(log_events, "follow_keys_start")[0]["step_source"] == "manual"
+    assert logged(log_events, "follow_keys_start")[0]["controls_started"] is None
+    assert logged(log_events, "follow_keys_stop")[0]["step_source"] == "manual"
+
+
+def test_slacs_step_follows_the_current_roughness_per_press(log_events):
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=1))
+    follower, observer = slacs_follower(receiver, controls, step_um=10)
+    follower.start()
+    observer.send(VK_D)
+    controls.reading = controls_reading(roughness_um=10.0)  # the user moves the slider
+    observer.send(VK_D)
+    controls.reading = controls_reading(roughness_um=1000.0)  # Coarse
+    observer.send(VK_W)
+    assert [p["delta_um"] for p in receiver.submissions] == [[1.0, 0.0], [10.0, 0.0], [0.0, -1000.0]]
+    keys = logged(log_events, "follow_key")
+    assert [k["step_from"] for k in keys] == ["slacs", "slacs", "slacs"]
+    assert [k["step_um"] for k in keys] == [1.0, 10.0, 1000.0]
+    assert [k["roughness_um"] for k in keys] == [1.0, 10.0, 1000.0]
+    snapshot = follower.snapshot()
+    assert snapshot["step_um_last"] == 1000.0 and snapshot["step_um"] == 10.0
+    assert snapshot["step_source"] == "slacs"
+    follower.stop()
+
+
+@pytest.mark.parametrize("roughness", [None, 0, -1, True, False, float("nan"), float("inf"),
+                                       10000.5, 10**400, "10", [10]])
+def test_unreadable_roughness_falls_back_to_the_manual_step(log_events, roughness):
+    import json
+
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=roughness))
+    follower, observer = slacs_follower(receiver, controls, step_um=7)
+    follower.start()
+    observer.send(VK_A)
+    assert [p["delta_um"] for p in receiver.submissions] == [[-7.0, 0.0]]
+    record = logged(log_events, "follow_key")[0]
+    assert record["step_from"] == "fallback" and record["step_um"] == 7.0
+    assert record["roughness_um"] is None
+    json.dumps(record, allow_nan=False)  # nothing unusable leaks into the session log
+    assert follower.snapshot()["roughness_um"] is None
+    follower.stop()
+
+
+def test_slacs_step_without_a_reader_falls_back(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = slacs_follower(receiver, None, step_um=5)
+    follower.start()
+    observer.send(VK_S)
+    assert [p["delta_um"] for p in receiver.submissions] == [[0.0, 5.0]]
+    record = logged(log_events, "follow_key")[0]
+    assert record["step_from"] == "fallback" and record["mirror_h"] is None
+    snapshot = follower.snapshot()
+    assert snapshot["step_source"] == "slacs" and snapshot["controls_ok"] is None
+    assert logged(log_events, "follow_keys_start")[0]["controls_started"] is None
+    follower.stop()
+
+
+@pytest.mark.parametrize("failure", ["raises", None, ["not", "a", "dict"], "text"])
+def test_a_failing_reader_never_fails_a_press(log_events, failure):
+    receiver = RecordingReceiver()
+    controls = FakeControls()
+    if failure == "raises":
+        controls.latest_error = RuntimeError("reader crashed")
+    else:
+        controls.reading = failure
+    follower, observer = slacs_follower(receiver, controls, step_um=4)
+    follower.start()
+    observer.send(VK_D)
+    observer.send(VK_D)
+    assert [p["delta_um"] for p in receiver.submissions] == [[4.0, 0.0], [4.0, 0.0]]
+    assert [k["step_from"] for k in logged(log_events, "follow_key")] == ["fallback", "fallback"]
+    snapshot = follower.snapshot()
+    assert snapshot["counted"] == 2 and snapshot["error"] is None and snapshot["running"] is True
+    assert snapshot["controls_ok"] is False and snapshot["roughness_um"] is None
+    follower.stop()
+
+
+@pytest.mark.parametrize(("mirror_h", "mirror_v", "expected"), [
+    (False, False, [[0.0, -2.0], [0.0, 2.0], [-2.0, 0.0], [2.0, 0.0]]),
+    (True, False, [[0.0, 2.0], [0.0, -2.0], [-2.0, 0.0], [2.0, 0.0]]),    # W/S reversed
+    (False, True, [[0.0, -2.0], [0.0, 2.0], [2.0, 0.0], [-2.0, 0.0]]),    # A/D reversed
+    (True, True, [[0.0, 2.0], [0.0, -2.0], [2.0, 0.0], [-2.0, 0.0]]),
+    (None, None, [[0.0, -2.0], [0.0, 2.0], [-2.0, 0.0], [2.0, 0.0]]),     # unknown: not applied
+    ("yes", 1, [[0.0, -2.0], [0.0, 2.0], [-2.0, 0.0], [2.0, 0.0]]),       # only True counts
+])
+def test_mirror_reverses_the_matching_screen_axis(log_events, mirror_h, mirror_v, expected):
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=2.0, mirror_h=mirror_h, mirror_v=mirror_v))
+    follower, observer = slacs_follower(receiver, controls)
+    follower.start()
+    for vk in (VK_W, VK_S, VK_A, VK_D):
+        observer.send(vk)
+    deltas = [p["delta_um"] for p in receiver.submissions]
+    assert deltas == expected
+    # No -0.0 reaches the receiver or the log.
+    assert all(math.copysign(1.0, value) == 1.0 for delta in deltas for value in delta if value == 0)
+    record = logged(log_events, "follow_key")[0]
+    assert record["mirror_h"] is (mirror_h if isinstance(mirror_h, bool) else None)
+    assert record["mirror_v"] is (mirror_v if isinstance(mirror_v, bool) else None)
+    follower.stop()
+
+
+def test_mirror_still_applies_on_the_fallback_step(log_events):
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=None, mirror_h=True))
+    follower, observer = slacs_follower(receiver, controls, step_um=3)
+    follower.start()
+    observer.send(VK_W)
+    assert [p["delta_um"] for p in receiver.submissions] == [[0.0, 3.0]]
+    follower.stop()
+
+
+def test_mirror_and_the_view_sign_compose(log_events, monkeypatch):
+    monkeypatch.setattr(stage_keys, "KEY_VIEW_SIGN", -1)
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=2.0, mirror_v=True))
+    follower, observer = slacs_follower(receiver, controls)
+    follower.start()
+    for vk in (VK_W, VK_D):
+        observer.send(vk)
+    assert [p["delta_um"] for p in receiver.submissions] == [[0.0, 2.0], [2.0, 0.0]]
+    follower.stop()
+
+
+def test_follow_key_record_carries_the_reading_timing_and_pixels(log_events):
+    clock = FakeClock(50.0)
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=10, age_ms=120.6, busy=False))
+    follower, observer = slacs_follower(receiver, controls, clock=clock, pixel_size_um=(0.5, 0.3))
+    follower.start()
+    observer.send(VK_D)
+    observer.send(VK_D, down=False)
+    clock.now = 50.25
+    controls.reading = controls_reading(roughness_um=1, mirror_h=True, ok=False, busy=True, age_ms=900)
+    observer.send(VK_W)
+    first, second = logged(log_events, "follow_key")
+    assert first == {"key": "D", "seq": 1, "delta_um": [10.0, 0.0], "step_um": 10.0,
+                     "step_from": "slacs", "roughness_um": 10.0, "mirror_h": False,
+                     "mirror_v": False, "reading_age_ms": 121, "slacs_busy": False,
+                     "repeat": False, "gap_ms": None, "delta_px": [20.0, 0.0]}
+    # While SLACS is busy, its last good Roughness still drives the press.
+    assert second == {"key": "W", "seq": 2, "delta_um": [0.0, 1.0], "step_um": 1.0,
+                      "step_from": "slacs", "roughness_um": 1.0, "mirror_h": True,
+                      "mirror_v": False, "reading_age_ms": 900, "slacs_busy": True,
+                      "repeat": False, "gap_ms": 250, "delta_px": [0.0, 3.33]}
+    follower.stop()
+
+
+def test_delta_px_is_none_without_a_pixel_size(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True])
+    follower.start()
+    observer.send(VK_D)
+    assert logged(log_events, "follow_key")[0]["delta_px"] is None
+    follower.stop()
+
+
+def test_delta_px_accepts_a_list_and_never_logs_negative_zero(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], step_um=0.001,
+                                       pixel_size_um=[1.0, 1.0])
+    follower.start()
+    observer.send(VK_A)  # -0.001 px rounds to zero
+    assert logged(log_events, "follow_key")[0]["delta_px"] == [0.0, 0.0]
+    assert all(math.copysign(1.0, v) == 1.0 for v in logged(log_events, "follow_key")[0]["delta_px"])
+    follower.stop()
+
+
+@pytest.mark.parametrize("pixel_size", [(0, 1), (1, -1), (float("nan"), 1), (1, float("inf")),
+                                        (1,), (1, 2, 3), "ab", (True, 1), [1, "2"], 1.0, {"x": 1}])
+def test_pixel_size_um_is_validated(pixel_size):
+    with pytest.raises(ValueError):
+        SlacsKeyFollower(RecordingReceiver(), "sid", step_um=5, observer=ManualObserver(),
+                         pixel_size_um=pixel_size)
+
+
+@pytest.mark.parametrize("source", ["SLACS", "auto", "", None, 1])
+def test_step_source_is_validated(source):
+    with pytest.raises(ValueError):
+        SlacsKeyFollower(RecordingReceiver(), "sid", step_um=5, observer=ManualObserver(),
+                         step_source=source)
+
+
+def test_follower_owns_the_controls_lifecycle(log_events):
+    controls = FakeControls()
+    follower, _observer = slacs_follower(RecordingReceiver(), controls)
+    follower.start()
+    follower.start()  # idempotent: the reader is started once
+    assert controls.lifecycle() == ["start"]
+    follower.stop()
+    follower.stop("again")
+    assert controls.lifecycle() == ["start", "stop"]
+    assert logged(log_events, "follow_keys_start") == [
+        {"step_um": 10.0, "step_source": "slacs", "ok": True, "controls_started": True}]
+    stop = logged(log_events, "follow_keys_stop")
+    assert len(stop) == 1 and stop[0]["step_source"] == "slacs"
+
+
+def test_controls_start_exception_is_swallowed_and_logged(log_events):
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=None),
+                            start_error=RuntimeError("no trackbar"))
+    follower, observer = slacs_follower(receiver, controls, step_um=6)
+    snapshot = follower.start()
+    assert snapshot["running"] is True and snapshot["error"] is None
+    assert logged(log_events, "follow_keys_controls_error") == [
+        {"message": "Could not start the SLACS controls reader: no trackbar"}]
+    assert logged(log_events, "follow_keys_start")[0]["controls_started"] is False
+    observer.send(VK_D)  # Follow keeps working on the manual step
+    assert [p["delta_um"] for p in receiver.submissions] == [[6.0, 0.0]]
+    follower.stop()
+    assert controls.lifecycle() == ["start", "stop"]
+
+
+def test_controls_that_cannot_start_are_reported(log_events):
+    controls = FakeControls(start_result=False)
+    follower, _observer = slacs_follower(RecordingReceiver(), controls)
+    assert follower.start()["running"] is True
+    assert logged(log_events, "follow_keys_start")[0]["controls_started"] is False
+    assert logged(log_events, "follow_keys_controls_error") == []
+    follower.stop()
+
+
+def test_controls_stop_failure_never_escapes(log_events):
+    controls = FakeControls(stop_error=RuntimeError("join failed"))
+    follower, observer = slacs_follower(RecordingReceiver(), controls)
+    follower.start()
+    follower.stop()  # must not raise
+    assert observer.stopped is True
+    assert len(logged(log_events, "follow_keys_stop")) == 1
+
+
+def test_observer_failure_stops_the_controls(log_events):
+    controls = FakeControls()
+    follower = SlacsKeyFollower(RecordingReceiver(), "sid", step_um=5, observer=FailingObserver(),
+                                heartbeat_interval=None, step_source="slacs", controls=controls)
+    snapshot = follower.start()
+    assert snapshot["running"] is False and snapshot["error"]
+    assert controls.lifecycle() == ["start", "stop"]
+    assert ("follow_keys_start", {"step_um": 5.0, "step_source": "slacs", "ok": False,
+                                  "error": snapshot["error"]}) in log_events
+    follower.stop("start_failed")  # what the overlay does next; still safe
+
+
+def test_unsupported_platform_never_starts_the_controls(log_events):
+    controls = FakeControls()
+    follower = SlacsKeyFollower(RecordingReceiver(), "sid", step_um=5, platform="linux",
+                                step_source="slacs", controls=controls)
+    snapshot = follower.start()
+    assert snapshot["supported"] is False and snapshot["running"] is False
+    assert "start" not in controls.calls
+    assert logged(log_events, "follow_keys_start") == [
+        {"step_um": 5.0, "step_source": "slacs", "supported": False}]
+    follower.stop()
+    assert "start" not in controls.calls
+
+
+def test_stop_racing_controls_start_leaves_the_reader_stopped(log_events):
+    follower_box = []
+
+    class StopsDuringStart(FakeControls):
+        def start(self):
+            result = super().start()
+            follower_box[0].stop("closed")  # another thread stops Follow meanwhile
+            return result
+
+    controls = StopsDuringStart()
+    follower, _observer = slacs_follower(RecordingReceiver(), controls)
+    follower_box.append(follower)
+    follower.start()
+    assert controls.lifecycle() == ["start", "stop", "stop"]  # stop()'s, then start()'s re-check
+    assert follower.snapshot()["running"] is False
+
+
+def test_snapshot_reports_the_controls_as_they_read_now(log_events):
+    receiver = RecordingReceiver()
+    controls = FakeControls(controls_reading(roughness_um=10, mirror_h=True, age_ms=33.6))
+    follower, observer = slacs_follower(receiver, controls)
+    follower.start()
+    snapshot = follower.snapshot()
+    assert {key: snapshot[key] for key in (
+        "step_source", "step_um_last", "roughness_um", "mirror_h", "mirror_v", "controls_ok",
+        "slacs_busy", "reading_age_ms")} == {
+        "step_source": "slacs", "step_um_last": None, "roughness_um": 10.0, "mirror_h": True,
+        "mirror_v": False, "controls_ok": True, "slacs_busy": False, "reading_age_ms": 34}
+    # SLACS's UI stops answering: the reader keeps the last good values and says busy.
+    controls.reading = controls_reading(roughness_um=10, mirror_h=True, ok=False, busy=True,
+                                        age_ms=2500.2, error="timeout")
+    observer.send(VK_D)
+    snapshot = follower.snapshot()
+    assert snapshot["slacs_busy"] is True and snapshot["controls_ok"] is False
+    assert snapshot["roughness_um"] == 10.0 and snapshot["reading_age_ms"] == 2500
+    assert snapshot["step_um_last"] == 10.0
+    assert logged(log_events, "follow_key")[0]["slacs_busy"] is True
+    # Unknown or malformed fields read as None, never as a guess.
+    controls.reading = {"roughness_um": 10, "mirror_h": "on", "age_ms": float("nan"), "busy": 0}
+    snapshot = follower.snapshot()
+    assert snapshot["mirror_h"] is None and snapshot["reading_age_ms"] is None
+    assert snapshot["slacs_busy"] is None and snapshot["controls_ok"] is None
+    follower.stop()
+
+
+# -- key holds and autorepeat --------------------------------------------------
+
+
+def test_autorepeat_presses_are_marked_and_the_hold_is_logged_on_key_up(log_events):
+    clock = FakeClock(10.0)
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], clock=clock)
+    follower.start()
+    for now in (10.0, 10.5, 10.53, 10.56):  # initial repeat delay, then the repeat rate
+        clock.now = now
+        observer.send(VK_D)
+    clock.now = 10.6
+    observer.send(VK_D, down=False)
+    keys = logged(log_events, "follow_key")
+    assert [k["repeat"] for k in keys] == [False, True, True, True]
+    assert [k["gap_ms"] for k in keys] == [None, 500, 30, 30]
+    assert logged(log_events, "follow_key_hold") == [
+        {"key": "D", "presses": 4, "seconds": 0.6, "key_up": True}]
+    assert len(receiver.submissions) == 4  # the key-up itself moves nothing
+    follower.stop()
+
+
+def test_taps_are_not_logged_as_holds(log_events):
+    clock = FakeClock()
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], clock=clock)
+    follower.start()
+    for _ in range(3):
+        observer.send(VK_D)
+        clock.now += 0.05
+        observer.send(VK_D, down=False)
+        clock.now += 0.1
+    assert [k["repeat"] for k in logged(log_events, "follow_key")] == [False, False, False]
+    assert logged(log_events, "follow_key_hold") == []
+    follower.stop()
+
+
+def test_a_hold_outside_slacs_is_never_logged(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[False], clock=FakeClock())
+    follower.start()
+    for _ in range(4):
+        observer.send(VK_D)
+    observer.send(VK_D, down=False)
+    assert logged(log_events, "follow_key") == [] and logged(log_events, "follow_key_hold") == []
+    assert follower.snapshot()["ignored_not_slacs"] == 4
+    follower.stop()
+
+
+def test_a_hold_counts_only_the_presses_made_in_slacs(log_events):
+    in_front = [False]
+    clock = FakeClock()
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=in_front, clock=clock)
+    follower.start()
+    observer.send(VK_D)  # outside SLACS: tallied only
+    in_front[0] = True
+    for _ in range(2):
+        clock.now += 0.04
+        observer.send(VK_D)
+    clock.now += 0.04
+    observer.send(VK_D, down=False)
+    assert [k["repeat"] for k in logged(log_events, "follow_key")] == [True, True]
+    assert logged(log_events, "follow_key_hold") == [
+        {"key": "D", "presses": 2, "seconds": 0.12, "key_up": True}]
+    follower.stop()
+
+
+def test_a_modified_hold_counts_only_after_the_modifier_is_released(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], clock=FakeClock())
+    follower.start()
+    observer.send(VK_D, modifiers=("ctrl",))
+    observer.send(VK_D, modifiers=("ctrl",))
+    observer.send(VK_D)  # Ctrl released while D keeps repeating
+    observer.send(VK_D, down=False, modifiers=("ctrl",))
+    assert [k["repeat"] for k in logged(log_events, "follow_key")] == [True]
+    assert logged(log_events, "follow_key_hold")[0]["presses"] == 1
+    follower.stop()
+
+
+def test_a_lost_key_up_ends_the_hold_at_the_next_press(log_events):
+    clock = FakeClock(0.0)
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], clock=clock)
+    follower.start()
+    observer.send(VK_D)
+    clock.now = 0.5
+    observer.send(VK_D)
+    clock.now = 0.5 + stage_keys.HOLD_RESET_SECONDS + 0.01  # its key-up never arrived
+    observer.send(VK_D)
+    assert [k["repeat"] for k in logged(log_events, "follow_key")] == [False, True, False]
+    assert logged(log_events, "follow_key_hold") == [
+        {"key": "D", "presses": 2, "seconds": 0.5, "key_up": False}]
+    clock.now += 0.03
+    observer.send(VK_D)
+    observer.send(VK_D, down=False)
+    assert logged(log_events, "follow_key_hold")[-1]["key_up"] is True
+    follower.stop()
+
+
+def test_two_held_keys_are_tracked_separately(log_events):
+    clock = FakeClock(0.0)
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], clock=clock)
+    follower.start()
+    for now, vk in ((0.0, VK_D), (0.5, VK_D), (0.6, VK_W), (1.1, VK_W)):
+        clock.now = now
+        observer.send(vk)
+    clock.now = 1.2
+    observer.send(VK_W, down=False)
+    clock.now = 1.5
+    observer.send(VK_D, down=False)  # D stopped repeating once W went down, but stayed held
+    assert [k["repeat"] for k in logged(log_events, "follow_key")] == [False, True, False, True]
+    assert logged(log_events, "follow_key_hold") == [
+        {"key": "W", "presses": 2, "seconds": 0.6, "key_up": True},
+        {"key": "D", "presses": 2, "seconds": 1.5, "key_up": True}]
+    follower.stop()
+
+
+def test_a_hold_released_after_stop_is_not_logged(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], clock=FakeClock())
+    follower.start()
+    observer.send(VK_D)
+    observer.send(VK_D)
+    follower.stop()
+    observer.send(VK_D, down=False)
+    assert logged(log_events, "follow_key_hold") == []
+
+
+def test_non_jog_keys_are_dropped_before_any_state_is_touched(log_events):
+    clock = FakeClock()
+    controls = FakeControls()
+    receiver = RecordingReceiver()
+    follower, observer = slacs_follower(receiver, controls, clock=clock)
+    follower.start()
+    clock.calls = 0
+    controls.calls.clear()
+    logged_before = len(log_events)
+    for vk in (0x42, 0x50, 0x0D, 0x1B, 0x25, 0x51, 0x45, 0x5A, 0x31, 0x20):
+        observer.send(vk, down=True)
+        observer.send(vk, down=False)
+    # Not even timed: no clock read, no hold, no controls read, nothing logged.
+    assert clock.calls == 0 and follower._held == {} and controls.calls == []
+    assert receiver.submissions == [] and len(log_events) == logged_before
+    follower.stop()
+
+
+def test_slacs_step_with_the_real_receiver_accumulates_mirrored_roughness():
+    receiver = StageFollowReceiver()
+    descriptor = receiver.start()
+    observer = ManualObserver()
+    controls = FakeControls(controls_reading(roughness_um=1, mirror_v=True))
+    follower = SlacsKeyFollower(
+        receiver, descriptor["session_id"], step_um=10, observer=observer,
+        foreground_provider=lambda: {"pid": 1, "created": 1},
+        identifier=lambda pid, created: True, heartbeat_interval=None,
+        step_source="slacs", controls=controls, pixel_size_um=(0.65, 0.65))
+    try:
+        follower.start()
+        for vk in (VK_D, VK_D, VK_W):
+            observer.send(vk)
+        snapshot = receiver.snapshot()
+        assert snapshot["displacement_um"] == [-2.0, -1.0] and snapshot["seq"] == 3
+    finally:
+        follower.stop()
+        receiver.close()
+    assert controls.lifecycle() == ["start", "stop"]
 
 
 # -- Ctrl/Alt/Win tracking from the raw stream ---------------------------------

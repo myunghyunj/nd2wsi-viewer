@@ -11,12 +11,19 @@ observer: on Windows it uses Raw Input (``RIDEV_INPUTSINK``), which never consum
 delays, alters, or blocks a keystroke, and it never calls into SLACS or the ACS
 controller. SLACS's own keystrokes and its commands to the stage are untouched.
 
+SLACS jogs the stage by its Roughness slider (µm per press), and its Mirror
+Horizontal / Mirror Vertical checkboxes reverse W/S and A/D. With
+``step_source="slacs"`` each press moves the overlay by the Roughness a
+read-only controls reader last saw and applies the Mirror checkboxes the same
+way; while Roughness cannot be read, the manual step is used. W/A/S/D key-ups
+are observed too, so a held, autorepeating jog key shows in the session log.
+
 Privacy: Raw Input delivers every keystroke to this process. Anything that is not
-one of the four jog keys is discarded the instant it arrives; it is never stored,
-counted individually, or written to the session log. Ctrl/Alt/Win only set a
-held flag, so a jog key pressed with them can be ignored. W/A/S/D pressed while
-SLACS is not the foreground program are only tallied as ``ignored_not_slacs``,
-never recorded individually.
+one of the four jog keys, pressed or released, is discarded the instant it
+arrives; it is never stored, counted individually, or written to the session
+log. Ctrl/Alt/Win only set a held flag, so a jog key pressed with them can be
+ignored. W/A/S/D pressed while SLACS is not the foreground program are only
+tallied as ``ignored_not_slacs``, never recorded individually.
 
 The native Raw Input plumbing is Windows-only, but this module imports cleanly on
 every platform: all Win32 use is deferred into functions that run only on Windows
@@ -55,6 +62,12 @@ KEY_VIEW_SIGN = 1
 # A jog key held together with any of these is a shortcut, not a stage jog.
 BLOCKING_MODIFIERS = frozenset(("ctrl", "alt", "win"))
 MAX_STEP_UM = 10000.0
+# "slacs": SLACS's Roughness per press (manual step while unreadable); "manual": step_um.
+STEP_SOURCES = ("slacs", "manual")
+# A jog key pressed again this long after its last key-down cannot be autorepeat
+# (Windows repeats after at most 1 s, then at least 2.5 times a second): its
+# key-up was lost, for example to the secure desktop, and a new press begins.
+HOLD_RESET_SECONDS = 2.0
 
 # Receiver rejections that mean following can no longer continue (paused/closed).
 _TERMINAL_STATUSES = frozenset((409, 410))
@@ -69,6 +82,52 @@ def _validate_step_um(step_um) -> float:
     return value
 
 
+def _usable_step(value) -> float | None:
+    """``value`` as a step in µm when it is a valid one, else None."""
+    try:
+        return _validate_step_um(value)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _validate_pixel_size_um(pixel_size_um) -> tuple[float, float] | None:
+    if pixel_size_um is None:
+        return None
+    if (not isinstance(pixel_size_um, (list, tuple)) or len(pixel_size_um) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in pixel_size_um)):
+        raise ValueError("pixel_size_um must be (x_um, y_um)")
+    x_um, y_um = (float(v) for v in pixel_size_um)
+    if not all(math.isfinite(v) and v > 0 for v in (x_um, y_um)):
+        raise ValueError("pixel_size_um must be two finite positive numbers")
+    return x_um, y_um
+
+
+def _flag(value) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _rounded_ms(value) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return int(round(value))
+
+
+# What the follower knows of SLACS's controls without a reader.
+_NO_READING = {"roughness_um": None, "mirror_h": None, "mirror_v": None,
+               "controls_ok": None, "slacs_busy": None, "reading_age_ms": None}
+
+
+class _KeyHold:
+    """One jog key held down: when it went down and the presses counted since."""
+
+    __slots__ = ("since", "last_down", "presses", "repeats")
+
+    def __init__(self, now: float):
+        self.since = self.last_down = now
+        self.presses = 0  # counted presses during this hold, the first one included
+        self.repeats = 0  # counted autorepeat presses during this hold
+
+
 class SlacsKeyFollower:
     """Count SLACS W/A/S/D key-down events and drive the overlay receiver.
 
@@ -81,18 +140,36 @@ class SlacsKeyFollower:
     - ``foreground_provider() -> dict | None`` returns ``{"pid", "created"}`` for
       the process owning the foreground window, or None on any error.
     - ``identifier(pid, created) -> bool`` says whether that process is SLACS.
-    - ``clock`` and ``heartbeat_interval`` drive the idle heartbeat; pass
+    - ``clock`` times key holds and the gap between presses.
+      ``heartbeat_interval`` drives the idle heartbeat; pass
       ``heartbeat_interval=None`` to drive ``_heartbeat_tick`` manually in tests.
+    - ``step_source``: "manual" moves the overlay ``step_um`` per press.
+      "slacs" moves it by SLACS's Roughness as ``controls`` last read it and
+      applies SLACS's Mirror checkboxes; while Roughness cannot be read,
+      ``step_um`` is the fallback.
+    - ``controls``: an object with ``start() -> bool``, ``stop()`` and
+      ``latest() -> dict``, shaped like ``slacs_controls.SlacsControlsMonitor``.
+      Used only with ``step_source="slacs"``; the follower starts and stops it.
+    - ``pixel_size_um``: the overlay's ``(x_um, y_um)`` pixel size, only so each
+      logged press also shows its displacement in pixels.
     """
 
     def __init__(self, receiver, session_id: str, *, step_um,
                  observer=None, foreground_provider: Callable[[], dict | None] | None = None,
                  identifier: Callable[[int, object], bool] | None = None,
                  clock: Callable[[], float] = time.monotonic,
-                 heartbeat_interval: float | None = 1.0, platform: str | None = None):
+                 heartbeat_interval: float | None = 1.0, platform: str | None = None,
+                 step_source: str = "manual", controls=None,
+                 pixel_size_um: tuple[float, float] | None = None):
+        if step_source not in STEP_SOURCES:
+            raise ValueError("step_source must be 'slacs' or 'manual'")
         self._receiver = receiver
         self._session_id = session_id
         self._step_um = _validate_step_um(step_um)
+        self._step_source = step_source
+        # A manual step never consults SLACS, so its reader is not even started.
+        self._controls = controls if step_source == "slacs" else None
+        self._pixel_size_um = _validate_pixel_size_um(pixel_size_um)
         self._clock = clock
         self._heartbeat_interval = heartbeat_interval
         self._lock = threading.Lock()
@@ -102,6 +179,9 @@ class SlacsKeyFollower:
         self._counted = 0
         self._ignored_not_slacs = 0
         self._last_key: str | None = None
+        self._step_um_last: float | None = None
+        self._last_counted_at: float | None = None
+        self._held: dict[str, _KeyHold] = {}  # jog letter -> its key-down not yet released
         self._slacs_in_front = False
         self._error: str | None = None
         self._seq = 0
@@ -135,16 +215,20 @@ class SlacsKeyFollower:
 
     def start(self) -> dict:
         with self._lock:
-            if self._started or self._stopped:
-                return self._snapshot_locked()
-            if not self._supported:
-                self._error = "Key following is only available on Windows."
+            idle = self._started or self._stopped
+            if not idle:
                 self._started = True
-                session_log.event("follow_keys_start", step_um=self._step_um,
-                                  supported=False)
-                return self._snapshot_locked()
-            self._started = True
-            self._running = True
+                self._running = self._supported
+                if not self._supported:
+                    self._error = "Key following is only available on Windows."
+        if idle:
+            return self.snapshot()
+        if not self._supported:
+            session_log.event("follow_keys_start", step_um=self._step_um,
+                              step_source=self._step_source, supported=False)
+            return self.snapshot()
+        # Before the observer, so a first reading is likely in by the first press.
+        controls_started = self._start_controls()
         started = False
         try:
             started = bool(self._observer.start(self._on_event))
@@ -159,14 +243,16 @@ class SlacsKeyFollower:
                 self._observer.stop()
             except Exception:  # noqa: BLE001
                 pass
-            session_log.event("follow_keys_start", step_um=self._step_um, ok=False,
-                              error=self._error)
+            self._stop_controls()
+            session_log.event("follow_keys_start", step_um=self._step_um,
+                              step_source=self._step_source, ok=False, error=self._error)
             return self.snapshot()
         if self._heartbeat_interval:
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop, name="nd2wsi-stage-keys-heartbeat", daemon=True)
             self._heartbeat_thread.start()
-        session_log.event("follow_keys_start", step_um=self._step_um, ok=True)
+        session_log.event("follow_keys_start", step_um=self._step_um, step_source=self._step_source,
+                          ok=True, controls_started=controls_started)
         return self.snapshot()
 
     def stop(self, reason: str = "stopped") -> None:
@@ -177,6 +263,7 @@ class SlacsKeyFollower:
             self._stopped = True
             was_active = self._running or self._started
             self._running = False
+            self._held.clear()
             heartbeat = self._heartbeat_thread
             counted, ignored = self._counted, self._ignored_not_slacs
         self._heartbeat_stop.set()
@@ -188,9 +275,41 @@ class SlacsKeyFollower:
                 pass
         if heartbeat is not None and heartbeat is not threading.current_thread():
             heartbeat.join(timeout=2.0)
+        self._stop_controls()
         if was_active and self._supported:
-            session_log.event("follow_keys_stop", step_um=self._step_um, reason=reason,
+            session_log.event("follow_keys_stop", step_um=self._step_um,
+                              step_source=self._step_source, reason=reason,
                               counted=counted, ignored_not_slacs=ignored)
+
+    def _start_controls(self) -> bool | None:
+        """Start the SLACS controls reader this follower owns; never raise.
+
+        None when there is no reader (a manual step). A reader that fails to
+        start leaves every press on the manual step.
+        """
+        controls = self._controls
+        if controls is None:
+            return None
+        try:
+            started = bool(controls.start())
+        except Exception as exc:  # noqa: BLE001 - Follow still works on the manual step
+            started = False
+            session_log.event("follow_keys_controls_error",
+                              message=f"Could not start the SLACS controls reader: {exc}")
+        with self._lock:
+            stopped = self._stopped
+        if stopped:
+            self._stop_controls()  # stop() ran meanwhile; never leave the reader polling
+        return started
+
+    def _stop_controls(self) -> None:
+        controls = self._controls
+        if controls is None:
+            return
+        try:
+            controls.stop()
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            pass
 
     # -- key handling ------------------------------------------------------
 
@@ -199,20 +318,38 @@ class SlacsKeyFollower:
         binding = KEY_BINDINGS.get(vk)
         if binding is None:
             return  # privacy: every non-WASD key is discarded the instant it arrives
+        letter, (unit_x, unit_y) = binding
+        now = self._clock()
         if not down:
-            return  # observe presses only; key-up is ignored
+            self._key_up(letter, now)  # a key-up only ends a hold; it never moves the overlay
+            return
+        repeat, lost = self._key_down(letter, now)
+        if lost is not None:
+            self._log_hold(letter, lost, lost.last_down, key_up=False)
         if self._has_blocking_modifier(modifiers):
             return  # a jog key with Ctrl/Alt/Win is a shortcut, not a stage jog
-        letter, (unit_x, unit_y) = binding
         with self._lock:
             if not self._running:
                 return
-            step = self._step_um
+            manual_step = self._step_um
         if not self._check_foreground():
             with self._lock:
                 self._ignored_not_slacs += 1
             return  # counted only in aggregate; the individual key is never recorded
-        delta = [KEY_VIEW_SIGN * unit_x * step, KEY_VIEW_SIGN * unit_y * step]
+        reading = self._controls_reading()
+        step, step_from = manual_step, "manual"
+        if self._step_source == "slacs":
+            if reading["roughness_um"] is not None:
+                step, step_from = reading["roughness_um"], "slacs"
+            else:
+                step_from = "fallback"
+        # SLACS's Mirror Vertical reverses A/D (stage axis 0) and Mirror Horizontal
+        # reverses W/S (stage axis 1); the overlay reverses the same screen axis.
+        x_sign = -1 if reading["mirror_v"] else 1
+        y_sign = -1 if reading["mirror_h"] else 1
+        # + 0.0 turns -0.0 into 0.0 for the receiver and the log.
+        delta = [KEY_VIEW_SIGN * x_sign * unit_x * step + 0.0,
+                 KEY_VIEW_SIGN * y_sign * unit_y * step + 0.0]
         with self._lock:
             if not self._running:
                 return
@@ -225,9 +362,80 @@ class SlacsKeyFollower:
                 self._seq = seq
                 self._counted += 1
                 self._last_key = letter
-            session_log.event("follow_key", key=letter, seq=seq, delta_um=delta)
+                self._step_um_last = step
+                previous, self._last_counted_at = self._last_counted_at, now
+                hold = self._held.get(letter)
+                if hold is not None:
+                    hold.presses += 1
+                    if repeat:
+                        hold.repeats += 1
+            gap_ms = None if previous is None else int(round((now - previous) * 1000))
+            session_log.event("follow_key", key=letter, seq=seq, delta_um=delta, step_um=step,
+                              step_from=step_from, roughness_um=reading["roughness_um"],
+                              mirror_h=reading["mirror_h"], mirror_v=reading["mirror_v"],
+                              reading_age_ms=reading["reading_age_ms"],
+                              slacs_busy=reading["slacs_busy"], repeat=repeat, gap_ms=gap_ms,
+                              delta_px=self._delta_px(delta))
         else:
             self._handle_submit_failure(result)
+
+    def _key_down(self, letter: str, now: float) -> tuple[bool, _KeyHold | None]:
+        """Record a jog key-down; return (is autorepeat, a hold whose key-up was lost)."""
+        with self._lock:
+            hold = self._held.get(letter)
+            if hold is not None and now - hold.last_down <= HOLD_RESET_SECONDS:
+                hold.last_down = now  # down again without an up: the key autorepeats
+                return True, None
+            self._held[letter] = _KeyHold(now)
+            return False, hold
+
+    def _key_up(self, letter: str, now: float) -> None:
+        with self._lock:
+            hold = self._held.pop(letter, None)
+        if hold is not None:
+            self._log_hold(letter, hold, now, key_up=True)
+
+    def _log_hold(self, letter: str, hold: _KeyHold, ended: float, *, key_up: bool) -> None:
+        """Log a hold that autorepeated into counted presses; taps are not logged."""
+        if hold.repeats < 1:
+            return  # also keeps holds outside SLACS out of the log: none of them counted
+        with self._lock:
+            if not self._running:
+                return
+        session_log.event("follow_key_hold", key=letter, presses=hold.presses,
+                          seconds=round(ended - hold.since, 3), key_up=key_up)
+
+    def _delta_px(self, delta) -> list[float] | None:
+        if self._pixel_size_um is None:
+            return None
+        x_um, y_um = self._pixel_size_um
+        return [round(delta[0] / x_um, 2) + 0.0, round(delta[1] / y_um, 2) + 0.0]
+
+    def _controls_reading(self) -> dict:
+        """SLACS's Roughness and Mirror as the controls reader last saw them.
+
+        Every field is None without a reader. A reader that fails or answers
+        something unusable counts as unreadable: the press then falls back to
+        the manual step and is not mirrored. ``roughness_um`` is only ever a
+        step this follower would use.
+        """
+        reading = dict(_NO_READING)
+        controls = self._controls
+        if controls is None:
+            return reading
+        try:
+            latest = controls.latest()
+        except Exception:  # noqa: BLE001 - an unreadable SLACS never fails a press
+            latest = None
+        if not isinstance(latest, dict):
+            reading["controls_ok"] = False
+            return reading
+        reading.update(
+            roughness_um=_usable_step(latest.get("roughness_um")),
+            mirror_h=_flag(latest.get("mirror_h")), mirror_v=_flag(latest.get("mirror_v")),
+            controls_ok=_flag(latest.get("ok")), slacs_busy=_flag(latest.get("busy")),
+            reading_age_ms=_rounded_ms(latest.get("age_ms")))
+        return reading
 
     @staticmethod
     def _has_blocking_modifier(modifiers) -> bool:
@@ -326,6 +534,8 @@ class SlacsKeyFollower:
             "running": self._running,
             "supported": self._supported,
             "step_um": self._step_um,
+            "step_source": self._step_source,
+            "step_um_last": self._step_um_last,
             "counted": self._counted,
             "ignored_not_slacs": self._ignored_not_slacs,
             "last_key": self._last_key,
@@ -334,8 +544,10 @@ class SlacsKeyFollower:
         }
 
     def snapshot(self) -> dict:
+        """Follower state plus SLACS's controls as they read now (None without a reader)."""
+        reading = self._controls_reading()  # outside the lock: it calls into the reader
         with self._lock:
-            return self._snapshot_locked()
+            return {**self._snapshot_locked(), **reading}
 
 
 # -- Win32 API with private prototypes -----------------------------------------
@@ -867,4 +1079,4 @@ def _windows_process_is_slacs(pid, created=None) -> bool:
 
 
 __all__ = ["SlacsKeyFollower", "KEY_BINDINGS", "KEY_VIEW_SIGN", "BLOCKING_MODIFIERS", "MAX_STEP_UM",
-           "SCRIPT_NAME"]
+           "STEP_SOURCES", "HOLD_RESET_SECONDS", "SCRIPT_NAME"]
