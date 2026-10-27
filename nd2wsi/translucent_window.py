@@ -379,11 +379,10 @@ class TranslucentApi:
             self._stage_follow_source = source
             self._stage_follow_status = None
             # Bound to the detected SLACS process; see _on_slacs_change.
-            self._stage_follow_session = detected["session_id"]
+            bound = self._stage_follow_session = detected["session_id"]
             self._stage_follow_receiver_id = descriptor.get("session_id")
             self._stage_follow_lost = ""
-        session_log.event("follow_start", source=source, step_um=step_um, ok=True,
-                          slacs_session=self._stage_follow_session)
+        session_log.event("follow_start", source=source, step_um=step_um, ok=True, slacs_session=bound)
         return {"ok": True, "source": source, **descriptor}
 
     def stage_follow_state(self):
