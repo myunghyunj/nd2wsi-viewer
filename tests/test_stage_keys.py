@@ -745,8 +745,9 @@ def test_autorepeat_presses_are_marked_and_the_hold_is_logged_on_key_up(log_even
     keys = logged(log_events, "follow_key")
     assert [k["repeat"] for k in keys] == [False, True, True, True]
     assert [k["gap_ms"] for k in keys] == [None, 500, 30, 30]
+    # Timed from the first counted press to the last, not to the key-up.
     assert logged(log_events, "follow_key_hold") == [
-        {"key": "D", "presses": 4, "seconds": 0.6, "key_up": True}]
+        {"key": "D", "presses": 4, "seconds": 0.56, "key_up": True}]
     assert len(receiver.submissions) == 4  # the key-up itself moves nothing
     follower.stop()
 
@@ -792,8 +793,9 @@ def test_a_hold_counts_only_the_presses_made_in_slacs(log_events):
     clock.now += 0.04
     observer.send(VK_D, down=False)
     assert [k["repeat"] for k in logged(log_events, "follow_key")] == [True, True]
+    # The key-down made outside SLACS does not start the hold's time either.
     assert logged(log_events, "follow_key_hold") == [
-        {"key": "D", "presses": 2, "seconds": 0.12, "key_up": True}]
+        {"key": "D", "presses": 2, "seconds": 0.04, "key_up": True}]
     follower.stop()
 
 
@@ -823,10 +825,70 @@ def test_a_lost_key_up_ends_the_hold_at_the_next_press(log_events):
     assert [k["repeat"] for k in logged(log_events, "follow_key")] == [False, True, False]
     assert logged(log_events, "follow_key_hold") == [
         {"key": "D", "presses": 2, "seconds": 0.5, "key_up": False}]
+    kinds = [kind for kind, _ in log_events if kind.startswith("follow_key")]
+    assert kinds[-2:] == ["follow_key_hold", "follow_key"]  # logged before the new press
     clock.now += 0.03
     observer.send(VK_D)
     observer.send(VK_D, down=False)
     assert logged(log_events, "follow_key_hold")[-1]["key_up"] is True
+    follower.stop()
+
+
+def test_a_lost_hold_is_not_logged_at_a_press_outside_slacs(log_events):
+    in_front = [True]
+    clock = FakeClock(0.0)
+    follower, observer = make_follower(RecordingReceiver(), in_front=in_front, clock=clock)
+    follower.start()
+    for now in (0.0, 0.5, 0.53):
+        clock.now = now
+        observer.send(VK_D)
+    in_front[0] = False  # D's key-up was lost; much later a "d" is typed in another program
+    clock.now = 60.0
+    before = len(log_events)
+    observer.send(VK_D)
+    assert [kind for kind, _ in log_events[before:] if kind.startswith("follow_key")] == []
+    assert follower.snapshot()["ignored_not_slacs"] == 1
+    observer.send(VK_D, down=False)
+    assert logged(log_events, "follow_key_hold") == []
+    follower.stop()
+
+
+def test_a_hold_released_in_another_program_is_not_logged(log_events):
+    in_front = [True]
+    clock = FakeClock(0.0)
+    follower, observer = make_follower(RecordingReceiver(), in_front=in_front, clock=clock)
+    follower.start()
+    for now in (0.0, 0.5, 0.53):
+        clock.now = now
+        observer.send(VK_D)
+    in_front[0] = False  # the foreground moves on while D is still held and repeating
+    for now in (0.56, 0.59, 0.62):
+        clock.now = now
+        observer.send(VK_D)
+    clock.now = 0.65
+    observer.send(VK_D, down=False)
+    assert logged(log_events, "follow_key_hold") == []
+    assert follower.snapshot()["ignored_not_slacs"] == 3
+    follower.stop()
+
+
+def test_a_lost_hold_is_timed_by_its_presses_in_slacs(log_events):
+    in_front = [True]
+    clock = FakeClock(0.0)
+    follower, observer = make_follower(RecordingReceiver(), in_front=in_front, clock=clock)
+    follower.start()
+    for now in (0.0, 0.5):
+        clock.now = now
+        observer.send(VK_D)
+    in_front[0] = False
+    for now in (0.53, 0.56):  # repeats delivered to another program
+        clock.now = now
+        observer.send(VK_D)
+    in_front[0] = True  # the key-up was lost; D is pressed again in SLACS
+    clock.now = 10.0
+    observer.send(VK_D)
+    assert logged(log_events, "follow_key_hold") == [
+        {"key": "D", "presses": 2, "seconds": 0.5, "key_up": False}]
     follower.stop()
 
 
@@ -844,8 +906,8 @@ def test_two_held_keys_are_tracked_separately(log_events):
     observer.send(VK_D, down=False)  # D stopped repeating once W went down, but stayed held
     assert [k["repeat"] for k in logged(log_events, "follow_key")] == [False, True, False, True]
     assert logged(log_events, "follow_key_hold") == [
-        {"key": "W", "presses": 2, "seconds": 0.6, "key_up": True},
-        {"key": "D", "presses": 2, "seconds": 1.5, "key_up": True}]
+        {"key": "W", "presses": 2, "seconds": 0.5, "key_up": True},
+        {"key": "D", "presses": 2, "seconds": 0.5, "key_up": True}]
     follower.stop()
 
 

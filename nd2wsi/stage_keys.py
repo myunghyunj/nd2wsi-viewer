@@ -23,7 +23,9 @@ one of the four jog keys, pressed or released, is discarded the instant it
 arrives; it is never stored, counted individually, or written to the session
 log. Ctrl/Alt/Win only set a held flag, so a jog key pressed with them can be
 ignored. W/A/S/D pressed while SLACS is not the foreground program are only
-tallied as ``ignored_not_slacs``, never recorded individually.
+tallied as ``ignored_not_slacs``, never recorded individually. A held jog key
+is logged only at a press or key-up made while SLACS is in front and is timed
+by the presses SLACS got, so a jog key released elsewhere is never recorded.
 
 The native Raw Input plumbing is Windows-only, but this module imports cleanly on
 every platform: all Win32 use is deferred into functions that run only on Windows
@@ -118,12 +120,18 @@ _NO_READING = {"roughness_um": None, "mirror_h": None, "mirror_v": None,
 
 
 class _KeyHold:
-    """One jog key held down: when it went down and the presses counted since."""
+    """One jog key held down: its last key-down and the presses counted since.
 
-    __slots__ = ("since", "last_down", "presses", "repeats")
+    Only counted presses, all made in SLACS, time the hold; its first key-down,
+    later repeats and key-up may reach another program.
+    """
+
+    __slots__ = ("last_down", "first_counted", "last_counted", "presses", "repeats")
 
     def __init__(self, now: float):
-        self.since = self.last_down = now
+        self.last_down = now
+        self.first_counted: float | None = None  # clock time of the first counted press
+        self.last_counted: float | None = None
         self.presses = 0  # counted presses during this hold, the first one included
         self.repeats = 0  # counted autorepeat presses during this hold
 
@@ -319,13 +327,11 @@ class SlacsKeyFollower:
         if binding is None:
             return  # privacy: every non-WASD key is discarded the instant it arrives
         letter, (unit_x, unit_y) = binding
-        now = self._clock()
         if not down:
-            self._key_up(letter, now)  # a key-up only ends a hold; it never moves the overlay
+            self._key_up(letter)  # a key-up only ends a hold; it never moves the overlay
             return
+        now = self._clock()
         repeat, lost = self._key_down(letter, now)
-        if lost is not None:
-            self._log_hold(letter, lost, lost.last_down, key_up=False)
         if self._has_blocking_modifier(modifiers):
             return  # a jog key with Ctrl/Alt/Win is a shortcut, not a stage jog
         with self._lock:
@@ -336,6 +342,10 @@ class SlacsKeyFollower:
             with self._lock:
                 self._ignored_not_slacs += 1
             return  # counted only in aggregate; the individual key is never recorded
+        if lost is not None:
+            # Logged at this press because SLACS got it; a lost hold is dropped
+            # when its key is next pressed with a modifier or in another program.
+            self._log_hold(letter, lost, key_up=False)
         reading = self._controls_reading()
         step, step_from = manual_step, "manual"
         if self._step_source == "slacs":
@@ -366,6 +376,9 @@ class SlacsKeyFollower:
                 previous, self._last_counted_at = self._last_counted_at, now
                 hold = self._held.get(letter)
                 if hold is not None:
+                    if hold.first_counted is None:
+                        hold.first_counted = now
+                    hold.last_counted = now
                     hold.presses += 1
                     if repeat:
                         hold.repeats += 1
@@ -389,21 +402,27 @@ class SlacsKeyFollower:
             self._held[letter] = _KeyHold(now)
             return False, hold
 
-    def _key_up(self, letter: str, now: float) -> None:
+    def _key_up(self, letter: str) -> None:
         with self._lock:
             hold = self._held.pop(letter, None)
-        if hold is not None:
-            self._log_hold(letter, hold, now, key_up=True)
+        # The record is stamped at the release, so it is written only while SLACS
+        # still has the foreground: a jog key released elsewhere is never recorded.
+        if hold is not None and hold.repeats and self._foreground_identity()[1]:
+            self._log_hold(letter, hold, key_up=True)
 
-    def _log_hold(self, letter: str, hold: _KeyHold, ended: float, *, key_up: bool) -> None:
-        """Log a hold that autorepeated into counted presses; taps are not logged."""
+    def _log_hold(self, letter: str, hold: _KeyHold, *, key_up: bool) -> None:
+        """Log a hold that autorepeated into counted presses; taps are not logged.
+
+        ``seconds`` runs from the hold's first counted press to its last, so
+        neither end is a keystroke another program got.
+        """
         if hold.repeats < 1:
             return  # also keeps holds outside SLACS out of the log: none of them counted
         with self._lock:
             if not self._running:
                 return
         session_log.event("follow_key_hold", key=letter, presses=hold.presses,
-                          seconds=round(ended - hold.since, 3), key_up=key_up)
+                          seconds=round(hold.last_counted - hold.first_counted, 3), key_up=key_up)
 
     def _delta_px(self, delta) -> list[float] | None:
         if self._pixel_size_um is None:
@@ -449,8 +468,12 @@ class SlacsKeyFollower:
 
     # -- foreground identification ----------------------------------------
 
-    def _check_foreground(self) -> bool:
-        """Return whether SLACS owns the foreground window; fail closed."""
+    def _foreground_identity(self) -> tuple[object, bool]:
+        """(pid, whether it is SLACS) for the foreground window; fail closed.
+
+        Only asks: unlike ``_check_foreground`` it neither updates the follower's
+        foreground state nor logs a change, so a key-up leaves no record of its own.
+        """
         provider = self._foreground_provider
         foreground = None
         if provider is not None:
@@ -458,11 +481,14 @@ class SlacsKeyFollower:
                 foreground = provider()
             except Exception:  # noqa: BLE001 - any failure means "not SLACS"
                 foreground = None
-        pid = None
-        identified = False
-        if isinstance(foreground, dict):
-            pid = foreground.get("pid")
-            identified = self._identify(pid, foreground.get("created"))
+        if not isinstance(foreground, dict):
+            return None, False
+        pid = foreground.get("pid")
+        return pid, self._identify(pid, foreground.get("created"))
+
+    def _check_foreground(self) -> bool:
+        """Return whether SLACS owns the foreground window; fail closed."""
+        pid, identified = self._foreground_identity()
         with self._lock:
             self._slacs_in_front = identified
             marker = (pid, identified)
