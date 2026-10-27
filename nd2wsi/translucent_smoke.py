@@ -1,7 +1,7 @@
 """Live overlay checks shared by private Agent QA and packaged GUI smoke tests.
 
-All input is sent to the supplied viewer and its newly opened overlay. This
-module never discovers existing applications or sends operating-system input.
+All input is sent to the supplied viewer and its newly opened overlay. No
+operating-system input or instrument commands are sent.
 """
 
 from __future__ import annotations
@@ -466,6 +466,7 @@ def exercise_roi_boxes(child, *, timeout=30, screenshot_path=None, expected_flip
 
 
 # The overlay page's own Follow state and its visible Follow control.
+SLACS_DISCOVERY_STATE = "window.nd2Translucent.state.slacs"
 STAGE_FOLLOW_STATE = """(() => {
   const view=window.nd2Translucent,follow=view.state.follow,button=document.getElementById('stage-follow');
   return {enabled:follow.enabled,pending:follow.pending,status:follow.status,seq:follow.seq,
@@ -540,13 +541,18 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
     ``delta`` in micrometres must move the camera by delta / pixel size in
     canonical image pixels (default alignment: no axis flip, angle 0; display
     rotation and mirror are OSD's and must not change the physical axis).
-    Returns bounded evidence without the token or session ID; ``ok`` is false
-    on any mismatch, and the receiver is always stopped.
+    The diagnostic stops this overlay's process monitor and injects a synthetic
+    detection through its private callback. This tests the gated controls and
+    receiver, not actual SLACS discovery or hardware. The prior detection state
+    is restored, without restarting the monitor of this soon-to-close window.
+    Returns bounded evidence without the receiver token or session ID; ``ok``
+    is false on any mismatch, and the receiver is always stopped.
     """
     from .stage_follow import PROTOCOL
 
     result = {"ok": False, "tolerance": tolerance}
     receiver, descriptor, started = None, None, time.monotonic()
+    prior_discovery = None
     beats, stop_beats, beat_thread = {"sent": 0, "failure": None}, threading.Event(), None
 
     def follow_state():
@@ -576,6 +582,23 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
             beat_thread.join(timeout=heartbeat_interval + 6)
 
     try:
+        _check(getattr(overlay, "_stage_follow", None) is None, "A stage receiver was already running before Follow")
+        saved_discovery = overlay.slacs_discovery_state()  # Also starts a lazy monitor.
+        _check(overlay._discovery.stop() is True, "The SLACS process monitor did not stop before diagnostic injection")
+        prior_discovery = dict(saved_discovery)
+        result["discovery"] = {"source": "synthetic GUI-smoke session", "process_detection_verified": False,
+                               "monitor_stopped": True, "frontend_session_verified": False, "state_restored": False}
+        overlay._on_slacs_change({"available": True, "session_id": "gui-smoke", "status": "running"})
+
+        def synthetic_detected():
+            detected = child.evaluate_js(SLACS_DISCOVERY_STATE)
+            return (isinstance(detected, dict) and detected.get("available") is True
+                    and detected.get("session_id") == "gui-smoke")
+
+        wait_for(synthetic_detected, timeout=follow_timeout, description="synthetic SLACS session in the overlay page")
+        result["discovery"]["frontend_session_verified"] = True
+        wait_for(lambda: (lambda state: state if state.get("visible") else None)(follow_state()),
+                 timeout=follow_timeout, description="Follow control after synthetic SLACS detection (not visible)")
         context = overlay.translucent_context()
         calibration = stage_follow_calibration(context)
         if calibration is None:
@@ -593,8 +616,6 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
         expected_px = [delta_um[0] / pixel_x, delta_um[1] / pixel_y]
         result.update(pixel_size_um_yx=[pixel_y, pixel_x], delta_um=delta_um, expected_px=expected_px)
         _check(min(abs(value) for value in expected_px) > 100 * tolerance, "Stage follow delta is too small to measure")
-        _check(getattr(overlay, "_stage_follow", None) is None, "A stage receiver was already running before Follow")
-
         before = camera(child)
         before_native = native_state(child, timeout=timeout)
         before_rois = json.loads(child.evaluate_js(ROI_STATE))
@@ -739,6 +760,16 @@ def exercise_stage_follow(overlay, child, *, timeout=30, follow_timeout=10, sett
                 overlay.stop_stage_follow()
             except Exception as exc:
                 result["cleanup_error"] = str(exc)
+        if prior_discovery is not None:
+            try:
+                overlay._on_slacs_change(prior_discovery)
+                with overlay._lock:
+                    restored = overlay._slacs_snapshot == prior_discovery
+                result["discovery"]["state_restored"] = restored
+                _check(restored, "The diagnostic SLACS detection state was not restored")
+            except Exception as exc:
+                result["ok"] = False
+                result["discovery_cleanup_error"] = f"{type(exc).__name__}: {exc}"
         result["seconds"] = round(time.monotonic() - started, 3)
     return result
 

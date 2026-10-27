@@ -42,6 +42,8 @@ body { user-select: none; -webkit-user-select: none; }
 #overlay-status { position: absolute; left: 18px; right: 18px; top: 50%; transform: translateY(-50%); color: white; font-size: 13px; line-height: 1.45; text-align: center; text-shadow: 0 1px 4px #000, 0 0 8px #000; pointer-events: none; }
 #overlay-status[hidden] { display: none; }
 #stage-follow-control { position: absolute; top: 50px; left: 12px; z-index: 3; display: flex; align-items: center; gap: 7px; max-width: calc(100% - 24px); padding: 3px 5px; border-radius: 8px; background: rgba(25,28,33,.8); color: #fff; font-size: 11px; }
+#stage-follow-control[hidden], #stage-follow-disconnected[hidden] { display: none; }
+#stage-follow-disconnected { position: absolute; top: 82px; left: 12px; z-index: 3; margin: 0; padding: 6px 8px; max-width: calc(100% - 40px); border-radius: 7px; background: rgba(25,28,33,.9); color: #ffd966; font-size: 11px; }
 #stage-follow-control button, #stage-follow-settings button { border: 0; border-radius: 5px; padding: 5px 7px; color: inherit; background: rgba(255,255,255,.1); font: inherit; cursor: pointer; }
 #stage-follow[aria-pressed="true"] { background: #285572; }
 #stage-follow-control button:disabled, #stage-follow-settings button:disabled { opacity: .4; cursor: default; }

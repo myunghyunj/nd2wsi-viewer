@@ -196,6 +196,87 @@ class TranslucentApi:
         self._stage_follow_status = None
         self._client_log_window_start = None
         self._client_log_count = 0
+        self._stage_follow_session = None
+        self._stage_follow_receiver_id = None
+        self._stage_follow_lost = ""
+        self._slacs_snapshot = {"available": False, "session_id": None, "status": "waiting"}
+        self._discovery = None
+
+    def _ensure_slacs_discovery(self):
+        from .slacs_discovery import SlacsDiscovery
+
+        with self._lock:
+            if not self._closed and self._discovery is None:
+                self._discovery = SlacsDiscovery(on_change=self._on_slacs_change)
+                self._slacs_snapshot = self._discovery.snapshot()
+            return self._discovery
+
+    def _on_slacs_change(self, snapshot):
+        """Stop an active receiver as soon as its detected process is lost or replaced.
+
+        Every stage_follow_state reply computed after this point reports the loss
+        and carries no movement. A reply computed just before it may still be on its
+        way to the page, so the page is also told at once; it drops any follow reply
+        that arrives after this revocation (translucent-v1.js revokeStageFollow).
+        """
+        receiver = follower = source = revoked = message = None
+        with self._lock:
+            if self._closed:
+                return
+            available = (snapshot.get("available") is True and snapshot.get("status") == "running"
+                         and isinstance(snapshot.get("session_id"), str) and bool(snapshot["session_id"]))
+            session = snapshot.get("session_id") if available else None
+            self._slacs_snapshot = {"available": available, "session_id": session,
+                                    "status": snapshot.get("status", "unavailable")}
+            # Detection never blocks Follow; it only ends a Follow that began while
+            # SLACS was detected, once that same process is lost or replaced.
+            if (self._stage_follow is not None and self._stage_follow_session is not None
+                    and session != self._stage_follow_session):
+                receiver, self._stage_follow = self._stage_follow, None
+                follower, self._stage_follower = self._stage_follower, None
+                source, self._stage_follow_source = self._stage_follow_source, None
+                self._stage_follow_status = None
+                revoked, self._stage_follow_receiver_id = self._stage_follow_receiver_id, None
+                self._stage_follow_session = None
+                message = self._stage_follow_lost = "SLACS program stopped or changed. Follow stopped; reconnect manually."
+        if receiver is not None:
+            self._revoke_follow_in_page(revoked, message)
+            if follower is not None:
+                follower.stop("slacs_lost")
+            receiver.close()
+            session_log.event("follow_stop", source=source, reason="slacs_lost")
+
+    def _revoke_follow_in_page(self, receiver_id, message):
+        """Queue the revocation on the same script channel that carries bridge replies.
+
+        pywebview delivers every bridge reply through ``evaluate_js``, so replies queued
+        after this revocation reach the page after it. A separate thread keeps the
+        discovery callback quick and never waits on the UI thread.
+        """
+        window = self._window
+        if window is None:
+            return
+        script = ("window.nd2TranslucentRevokeFollow?.(" +
+                  json.dumps({"session_id": receiver_id, "message": message}, allow_nan=False) + "); true")
+        try:
+            threading.Thread(target=self._push_revocation, args=(window, script),
+                             name="nd2wsi-stage-follow-revoke", daemon=True).start()
+        except RuntimeError as exc:  # the receiver must still be closed by the caller
+            self._logger(f"stage follow revocation could not start: {exc!r}")
+
+    def _push_revocation(self, window, script):
+        if self._closed:
+            return
+        try:
+            window.evaluate_js(script)
+        except Exception as exc:
+            self._logger(f"stage follow revocation could not reach the page: {exc!r}")
+
+    def slacs_discovery_state(self):
+        """Report program detection; this does not establish a motion connection."""
+        self._ensure_slacs_discovery()
+        with self._lock:
+            return dict(self._slacs_snapshot)
 
     def translucent_context(self):
         with self._lock:
@@ -270,7 +351,13 @@ class TranslucentApi:
             self._stage_follower = follower
             self._stage_follow_source = source
             self._stage_follow_status = None
-        session_log.event("follow_start", source=source, step_um=step_um, ok=True)
+            # Bound to the detected SLACS process only if one was detected; see _on_slacs_change.
+            detected = self._slacs_snapshot
+            self._stage_follow_session = detected["session_id"] if detected["available"] else None
+            self._stage_follow_receiver_id = descriptor.get("session_id")
+            self._stage_follow_lost = ""
+        session_log.event("follow_start", source=source, step_um=step_um, ok=True,
+                          slacs_detected=self._stage_follow_session is not None)
         return {"ok": True, "source": source, **descriptor}
 
     def stage_follow_state(self):
@@ -279,6 +366,8 @@ class TranslucentApi:
             follower = self._stage_follower
             source = self._stage_follow_source
             if self._closed or receiver is None:
+                if not self._closed and self._stage_follow_lost:
+                    return {"enabled": False, "status": "paused", "message": self._stage_follow_lost}
                 return {"enabled": False, "status": "off", "message": "Stage follow is off."}
             snapshot = receiver.snapshot()
             if follower is not None:
@@ -298,6 +387,9 @@ class TranslucentApi:
             self._stage_follow_status = None
         if follower is not None:
             follower.stop("stopped")
+            self._stage_follow_session = None
+            self._stage_follow_receiver_id = None
+            self._stage_follow_lost = ""
         if receiver is not None:
             receiver.close()
             session_log.event("follow_stop", source=source)
@@ -692,6 +784,8 @@ class TranslucentApi:
             self._closed = True
             self._epoch += 1
         self.stop_stage_follow()
+        if self._discovery is not None:
+            self._discovery.stop()
         if self._window is not None:
             self._window.destroy()
         self._on_closed(self)
@@ -702,6 +796,8 @@ class TranslucentApi:
             self._closed = True
             self._epoch += 1
         self.stop_stage_follow()
+        if self._discovery is not None:
+            self._discovery.stop()
         self._on_closed(self)
 
 
