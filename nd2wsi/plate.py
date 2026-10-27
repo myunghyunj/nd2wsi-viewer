@@ -553,17 +553,51 @@ class PlateStore:
         self._start_stop_lock = threading.Lock()
 
     # ---- open or create -------------------------------------------------
+    @staticmethod
+    def _container_for(source: PlateSource, cache_path: str | Path | None) -> Path:
+        if cache_path is not None:
+            return Path(cache_path).expanduser().resolve()
+        container = plate_container(source.path)
+        if not container.exists():
+            legacy = container.with_name(container.name[:-len('.nd2svs')] + CACHE_SUFFIX)
+            if legacy.is_dir():
+                return legacy
+        return container
+
+    @staticmethod
+    def _shape(source: PlateSource) -> tuple[int, ...]:
+        c, h, w = source.frame_shape
+        return (source.T, source.P, source.Z, c, h // THUMB_K, w // THUMB_K)
+
+    @classmethod
+    def recorded_windows(
+        cls, source: PlateSource, *, cache_path: str | Path | None = None
+    ) -> list[dict[str, float]] | None:
+        """The default display windows an existing cache records for ``source``.
+
+        A read-only look taken before the store opens: nothing is created,
+        locked, recovered or quarantined, so an open that fails afterwards
+        leaves the disk as it found it. Any doubt means measuring again.
+        """
+        try:
+            container = cls._container_for(source, cache_path)
+            if not container.exists():
+                return None
+            manifest = cls._read(container)
+            if manifest is None or not cls._matches(
+                manifest, quick_fingerprint(source.path), cls._shape(source), source
+            ):
+                return None
+            return _stored_windows(manifest, source)
+        except Exception:
+            return None
+
     @classmethod
     def open_or_create(cls, source: PlateSource, *, cache_path: str | Path | None = None) -> PlateStore:
         explicit = cache_path is not None
-        container = Path(cache_path).expanduser().resolve() if explicit else plate_container(source.path)
-        if not explicit and not container.exists():
-            legacy = container.with_name(container.name[:-len('.nd2svs')] + CACHE_SUFFIX)
-            if legacy.is_dir():
-                container = legacy
+        container = cls._container_for(source, cache_path)
         fingerprint = quick_fingerprint(source.path)
-        c, h, w = source.frame_shape
-        shape = (source.T, source.P, source.Z, c, h // THUMB_K, w // THUMB_K)
+        shape = cls._shape(source)
         manifest = cls._read(container, recover=True)
         if explicit and (manifest is None or not cls._matches(manifest, fingerprint, shape, source)):
             raise ValueError('explicit plate cache is missing or does not match its source')
@@ -1054,12 +1088,6 @@ class PlateStore:
             return
         self.manifest = manifest
 
-    def display_windows(self) -> list[dict[str, float]] | None:
-        """Default display windows this cache generation records for its source."""
-        with self._lock:
-            manifest = self.manifest
-        return _stored_windows(manifest, self._source)
-
     def keep_display_windows(self, windows: list[dict[str, Any]]) -> None:
         """Record windows measured from the source for the next open.
 
@@ -1464,6 +1492,11 @@ class PlateSource:
         self.path = Path(path)
         self.tile = int(tile)
         self.store: PlateStore | None = None
+        # Default display windows: an open that uses the store first looks
+        # for those its cache records; windows measured instead are handed
+        # to the store's writer once it opens.
+        self._windows_lookup = (bool(store), cache_path)
+        self._measured_windows: list[dict[str, float]] | None = None
         # Process-wide RAM caches must never alias two opens of the same path.
         # This is deliberately not the server-visible source generation.
         self._open_generation = uuid.uuid4().hex
@@ -1506,38 +1539,24 @@ class PlateSource:
                 )
             self._init_from_file(self._f)
             self._check_source()
-            unavailable: Exception | None = None
             if store:
+                opened_store = None
                 try:
-                    self.store = (PlateStore.open_or_create(self) if cache_path is None
-                                  else PlateStore.open_or_create(self, cache_path=cache_path))
+                    opened_store = (PlateStore.open_or_create(self) if cache_path is None
+                                    else PlateStore.open_or_create(self, cache_path=cache_path))
+                    self.store = opened_store
+                    if self._measured_windows is not None:
+                        opened_store.keep_display_windows(self._measured_windows)
+                    opened_store.start()
                 except Exception as e:  # a store that will not open is only a slower view
-                    if cache_path is not None:
-                        raise
-                    unavailable = e
-            # The store opens before the attributes are built: a manifest that
-            # already records this source's display windows spares reading a
-            # frame of every site.
-            try:
-                self.attrs = self._build_attrs(self._level_shapes)
-            except BaseException:
-                if self.store is not None:
-                    self.store.close()
-                    self.store = None
-                raise
-            if self.store is not None:
-                try:
-                    self.store.start()
-                except Exception as e:
-                    self.store.close()
+                    if opened_store is not None:
+                        opened_store.close()
                     self.store = None
                     if cache_path is not None:
                         raise
-                    unavailable = e
-            if unavailable is not None:
-                self.attrs["nd2wsi"].setdefault("notes", []).append(
-                    f"thumbnail store unavailable ({type(unavailable).__name__}); frames are read each time"
-                )
+                    self.attrs["nd2wsi"].setdefault("notes", []).append(
+                        f"thumbnail store unavailable ({type(e).__name__}); frames are read each time"
+                    )
         except BaseException:
             if self._fd >= 0:
                 os.close(self._fd)
@@ -1549,7 +1568,6 @@ class PlateSource:
 
     # ---- metadata --------------------------------------------------------
     def _init_from_file(self, f: Any) -> None:
-        """Metadata of the open file. The attributes are built after the store opens."""
         self.sizes = dict(f.sizes)
         self._coord_axes = [a for a in self.sizes if a not in FRAME_AXES]
         self.T = int(self.sizes.get("T", 1))
@@ -1660,11 +1678,11 @@ class PlateSource:
 
         _, H, W = self.frame_shape
         shapes = level_shapes(H, W, self.tile)
-        self._level_shapes = shapes
         self.levels = [
             {"path": str(k), "width": w, "height": h, "downsample": 2**k}
             for k, (h, w) in enumerate(shapes)
         ]
+        self.attrs = self._build_attrs(shapes)
 
     def _build_attrs(self, shapes: list[tuple[int, int]]) -> dict[str, Any]:
         from .convert import _background_mode_start, build_group_attrs
@@ -1725,15 +1743,15 @@ class PlateSource:
         return attrs
 
     def _windows(self, background_mode_start: Any) -> list[dict[str, float]]:
-        """Default display windows: the store's record when it holds a valid
-        one for this source, else measured now and handed to the store."""
-        store = self.store
-        stored = store.display_windows() if store is not None else None
-        if stored is not None:
-            return stored
+        """Default display windows: those a matching cache already records
+        for this source, else measured now and kept for the store's writer."""
+        use_store, cache_path = self._windows_lookup
+        if use_store:
+            recorded = PlateStore.recorded_windows(self, cache_path=cache_path)
+            if recorded is not None:
+                return recorded
         windows = self._measure_windows()
-        if store is not None:
-            store.keep_display_windows(windows)
+        self._measured_windows = windows
         return windows
 
     def _measure_windows(self) -> list[dict[str, float]]:

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import shutil
 from types import SimpleNamespace
 
@@ -214,7 +215,15 @@ def test_display_windows_are_recorded_and_reused_without_reading_frames(plate_nd
         assert again.store.manifest == manifest
     finally:
         again.close()
+    explicit = PlateSource(plate_nd2, cache_path=path)
+    try:
+        assert _windows(explicit) == measured
+    finally:
+        explicit.close()
     assert read_manifest(path) == manifest
+
+    with pytest.raises(AssertionError, match="spare reading frames"):
+        PlateSource(plate_nd2, store=False)  # an open without the store never looks
 
 
 def test_a_reader_uses_recorded_windows_and_never_writes_them(plate_nd2, monkeypatch):
@@ -278,6 +287,44 @@ def test_a_stale_windows_record_is_measured_again_and_replaced(plate_nd2, monkey
     record = read_manifest(path)[WINDOWS_KEY]
     assert record["method"] == WINDOWS_METHOD
     assert record["windows"] == measured
+
+
+def _listing(folder):
+    return sorted(p.name for p in folder.iterdir()) if folder.exists() else None
+
+
+@pytest.mark.parametrize("existing", ["none", "stale"])
+def test_an_open_that_fails_measuring_windows_leaves_the_cache_untouched(
+    plate_nd2, monkeypatch, existing
+):
+    """Looking for recorded windows is read only: an open that fails while
+    measuring them creates no cache and quarantines no stale one."""
+    path = plate_container(plate_nd2)
+    before = None
+    if existing == "stale":
+        PlateSource(plate_nd2).close()
+        st = plate_nd2.stat()
+        os.utime(plate_nd2, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        recorded = read_manifest(path)
+        assert WINDOWS_KEY in recorded
+        assert recorded["source"]["mtime_ns"] != quick_fingerprint(plate_nd2)["mtime_ns"]
+        before = path.read_bytes()
+    listing = _listing(path.parent)
+    real_frame = PlateSource.frame
+
+    def unreadable_last_site(self, t, p, z):
+        if p == self.P - 1:
+            raise OSError("unreadable site")
+        return real_frame(self, t, p, z)
+
+    monkeypatch.setattr(PlateSource, "frame", unreadable_last_site)
+    with pytest.raises(OSError, match="unreadable site"):
+        PlateSource(plate_nd2)
+    assert _listing(path.parent) == listing
+    if before is None:
+        assert not (plate_nd2.parent / "nd2wsi").exists()
+    else:
+        assert path.read_bytes() == before
 
 
 _DROP = object()
