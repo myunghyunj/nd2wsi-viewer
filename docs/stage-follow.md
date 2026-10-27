@@ -258,3 +258,23 @@ ACS traffic, verify ownership of TCP `10.0.0.100:701`, or turn this prototype in
 a live hardware-ready release. The main viewer's orientation, key following
 only while locked, and unlocked manual alignment are the intended behavior
 after discovery.
+
+## Distribution: the SLACS-module line
+
+This branch is released to the lab as `X.Y.Z_SLACS-module` (for example
+`v2.5.4_SLACS-module`), after each public release, as a draft GitHub release that
+is never added to `updates/appcast.xml`. It keeps the session logging.
+`nd2wsi/edition.py` marks the line:
+
+- Update checks are off. The update button is disabled, a manual check returns
+  before any network request, and Sparkle is never started. A public release
+  lacks the SLACS module and logging, so this build must not offer one.
+- The Windows build names its ZIP `nd2wsi-viewer-X.Y.Z_SLACS-module-windows-x64.zip`,
+  records `edition`, `release_version` and `updates_off` in `build-info.json`, and
+  points the SDPC codec source offer at the `vX.Y.Z_SLACS-module` release.
+- Public installations never select this line's releases: the update check accepts
+  only plain version tags and public asset names.
+
+To release the next version, merge `main` into this branch after the public
+release, rebuild on the `windows` workflow, and attach the portable ZIP, its
+`.sha256` and `sdpc-codec-sources-windows-x64.zip` to a new draft release.

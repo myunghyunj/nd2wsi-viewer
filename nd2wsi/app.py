@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import session_log
+from . import edition, session_log
 from . import window_chrome as _window_chrome
 from . import window_lifecycle as _window_lifecycle
 
@@ -147,7 +147,8 @@ def _start_session_log(mode: str) -> Path | None:
     if started is None:
         _write_app_log("session log could not start")
         return None
-    session_log.event("app_start", mode=mode, **_runtime_facts())
+    session_log.event("app_start", mode=mode, edition=edition.NAME, updates_off=edition.UPDATES_OFF,
+                      **_runtime_facts())
     _dlog(f"session log: {started}")
     return started
 
@@ -611,7 +612,8 @@ class Api:
         self._open_attempt_id = None
         self._fallback_consumed = False
         self._local_beta = os.environ.get("ND2WSI_DISABLE_UPDATES") == "1"
-        self._updates_disabled = self._local_beta or (
+        self._edition_updates_off = edition.UPDATES_OFF
+        self._updates_disabled = self._local_beta or self._edition_updates_off or (
             window_session is not None and window_session.role == "agent"
         )
         self._server_lock = threading.Lock()
@@ -884,6 +886,11 @@ class Api:
 
     def update_status(self) -> dict:
         """Status shown by the shell's persistent update button."""
+        if self._edition_updates_off:
+            from . import __version__
+
+            return {"available": False, "version": __version__, "mode": "disabled",
+                    "edition": edition.NAME, "message": edition.UPDATES_OFF_MESSAGE}
         if self._local_beta:
             from . import __version__
 
@@ -918,6 +925,8 @@ class Api:
         return result
 
     def _check_for_updates(self) -> dict:
+        if self._edition_updates_off:
+            return {"ok": False, "message": edition.UPDATES_OFF_MESSAGE}
         if self._local_beta:
             return {"ok": False, "message": "Local beta — updates are disabled."}
         if self._updates_disabled:

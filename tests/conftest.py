@@ -20,6 +20,14 @@ def session_logs_stay_in_the_test_run(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def public_update_policy(request, monkeypatch):
+    """This line ships with update checks off (nd2wsi/edition.py). The update tests shared
+    with main exercise the public policy; tests marked slacs_edition keep the shipped value."""
+    if request.node.get_closest_marker("slacs_edition") is None:
+        monkeypatch.setattr("nd2wsi.edition.UPDATES_OFF", False)
+
+
+@pytest.fixture(autouse=True)
 def session_log_closed_after_each_test():
     """app.main() leaves its session log open for the atexit hook; close it per test."""
     yield

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import platform
@@ -170,6 +171,19 @@ def source_provenance(source_manifest: Path | None) -> dict:
     content = json.dumps(result["files"], sort_keys=True, separators=(",", ":")).encode("utf-8")
     result["snapshot_sha256"] = hashlib.sha256(content).hexdigest()
     return result
+
+
+def load_edition():
+    """nd2wsi/edition.py on its own; the build interpreter need not import nd2wsi."""
+    spec = importlib.util.spec_from_file_location("nd2wsi_edition", REPO / "nd2wsi" / "edition.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def archive_name(version: str) -> str:
+    """Portable ZIP name; the edition keeps it apart from the public release's ZIP."""
+    return f"{APP}-{load_edition().release_version(version)}-windows-x64.zip"
 
 
 def load_webview2_pin(path: Path = WEBVIEW2_PIN) -> dict:
@@ -376,6 +390,9 @@ def main() -> int:
     build = REPO / "build" / "windows"
     build.mkdir(parents=True, exist_ok=True)
     version = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    edition = load_edition()
+    # The tag of the release this build ships in, e.g. v2.5.4_SLACS-module.
+    release_version = edition.release_version(version)
     sdpc_manifest, sdpc_options = sdpc_bundle_options()
 
     # Fail before packaging if either scientific export or image codecs is absent.
@@ -417,10 +434,13 @@ def main() -> int:
               f"{webview2_info['file_count']} files, {webview2_info['total_bytes']:,} bytes")
     from bundle_sdpc_codec import stage
 
-    sdpc_source = stage(sdpc_manifest, bundle, out, version)
+    sdpc_source = stage(sdpc_manifest, bundle, out, release_version)
     manifest = {
         "app": APP,
         "version": version,
+        "edition": edition.NAME,
+        "release_version": release_version,
+        "updates_off": edition.UPDATES_OFF,
         "commit": provenance["base_commit"],
         "source": provenance,
         "python": platform.python_version(),
@@ -464,7 +484,7 @@ def main() -> int:
     verify_source_files(provenance)
     if webview2_info is not None:
         verify_staged_webview2_runtime(bundle, webview2_info)
-    archive = out / f"{APP}-{version}-windows-x64.zip"
+    archive = out / archive_name(version)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as target:
         for path in sorted(bundle.rglob("*")):
             if path.is_file():

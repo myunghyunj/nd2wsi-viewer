@@ -71,4 +71,5 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 markers = [
   "realdata: tests that need the example acquisitions from the testdata release",
+  "slacs_edition: keep this line's shipped update setting (nd2wsi/edition.py) instead of the public policy",
 ]

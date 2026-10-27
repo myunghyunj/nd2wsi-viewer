@@ -17,6 +17,8 @@ import webbrowser
 from importlib.metadata import PackageNotFoundError, version
 from urllib.parse import quote
 
+from . import edition
+
 REPOSITORY = "myunghyunj/nd2wsi-viewer"
 RELEASES_API = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
 MAX_METADATA_BYTES = 2 * 1024 * 1024
@@ -182,6 +184,7 @@ def check_for_updates(*, platform_name: str | None = None, machine: str | None =
     Browser/application callers can pass ``open_download=False`` to display
     the returned metadata and obtain a separate download confirmation first.
     Nothing is installed and running windows are never closed or replaced.
+    A build whose edition turns updates off returns before any request.
     """
     platform_name = sys.platform if platform_name is None else platform_name
     machine = platform.machine() if machine is None else machine
@@ -191,6 +194,9 @@ def check_for_updates(*, platform_name: str | None = None, machine: str | None =
     result = {"ok": False, "available": False, "mode": "manual-download",
               "current_version": current_version, "platform": platform_name,
               "architecture": normalize_machine(machine), "channel": selected_channel}
+    if edition.UPDATES_OFF:
+        return {**result, "mode": "disabled", "edition": edition.NAME,
+                "message": edition.UPDATES_OFF_MESSAGE}
     if platform_name not in ("darwin", "win32") or result["architecture"] is None:
         return {**result, "message": "No verified update package is available for this OS/CPU."}
     if _version_key(current_version) is None or selected_channel not in ("stable", "beta", "rc"):
