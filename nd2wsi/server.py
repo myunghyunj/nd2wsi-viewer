@@ -72,6 +72,10 @@ ASSOCIATED_RE = re.compile(
     r"^/api/associated/(thumbnail|label|macro|associated-(?:[1-9]|1[0-6]))\.jpg$"
 )
 SLIDE_RE = re.compile(r"^/s/([0-9a-f]{8})(/.*)?$")
+# A rendered ROI of this many pixels or more counts as an export for close
+# and update. The viewer's scale-strip previews and size samples are at most
+# 512 px a side; streamed ND2/TIFF exports always count.
+EXPORT_COUNT_MIN_PIXELS = 4_000_000
 
 # region-export progress, polled by the viewer's status bar
 EXPORT_JOBS: dict[str, dict] = {}
@@ -162,7 +166,13 @@ class ViewerState:
             else None
         )
         self.manifest = dict(manifest or {})
-        self.busy = _Lifecycle()  # in-flight exports, so trash can refuse
+        # Every slide read (tiles, pixels, histograms, exports) holds busy;
+        # close, replacement and trash drain it before any handle goes away.
+        self.busy = _Lifecycle()
+        # Only real exports (streamed ROI files, large renders, AstroMap)
+        # enter this, always inside busy. Close and update wait for these,
+        # never for tile reads or export previews.
+        self.exports = _Lifecycle()
         self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
         self._inspect_lock = threading.Lock()
         self._cache_usage_ready = False
@@ -1081,6 +1091,10 @@ class SlideRegistry:
     def remove(self, sid: str) -> bool:
         with self._lock:
             st = self.slides.get(sid)
+            if st is not None and self.window_session is not None and st.exports.active:
+                # A real export will not finish within the drain below.
+                # Refuse before cancelling anything or barring tile reads.
+                raise ValueError("An export from this slide is still running; close it after the export finishes")
             if st is not None and st._shading is not None:
                 st._shading.cancel()
             if st is not None and self.window_session is not None:
@@ -1118,10 +1132,14 @@ class SlideRegistry:
             close()
 
     def active_export_count(self) -> int:
-        """Return the number of exports which are still using slide state."""
+        """Return the number of real exports which are still running.
+
+        Tile, pixel and histogram reads, export previews and size samples
+        hold only ``busy``; they never hold back a tab close or an update.
+        """
         with self._lock:
             states = list(self.slides.values())
-        return sum(st.busy.active for st in states)
+        return sum(st.exports.active for st in states)
 
     def close_all_for_relaunch(self) -> None:
         """Synchronously release every source and writer before an update.
@@ -2236,7 +2254,7 @@ def make_handler(
                 # A pyramid replacement drains this lease before changing root,
                 # attrs or generation. Do not acquire _replacement_lock here:
                 # replacement holds it while waiting for readers to finish.
-                with st.busy:
+                with st.busy, st.exports:
                     plan = prepare_astromap(st, payload, resolve_frame=_frame_args,
                                            filename_prefix=prefix)
                     result = registry.astromap_downloads.create(plan, st)
@@ -2251,7 +2269,9 @@ def make_handler(
         def _astromap_download(self, st: ViewerState, q: dict):
             key = (q.get("token") or [""])[0]
             try:
-                with registry.astromap_downloads.download(key, st) as (item, source):
+                # The zip is this window's own file, not slide pixels, so it
+                # takes no busy lease; it still counts for close and update.
+                with st.exports, registry.astromap_downloads.download(key, st) as (item, source):
 
                     def write_body(output) -> None:
                         while chunk := source.read(1024 * 1024):
@@ -2276,28 +2296,35 @@ def make_handler(
                 raise
 
         def _roi_impl(self, st: ViewerState, q: dict):
+            from contextlib import nullcontext
+
             prefix = (
                 f"agent-{registry.window_session.id[:12]}_"
                 if registry.agent_window else ""
             )
             try:
                 export = prepare_export(st, q, resolve_frame=_frame_args, filename_prefix=prefix)
-                if export.streams_file:
-                    with export.file(_job_update) as artifact:
-                        self._stream_file(
-                            artifact.copy_to,
-                            size=artifact.size,
-                            content_type=artifact.content_type,
-                            filename=artifact.filename,
-                        )
-                    return
-                artifact = export.rendered()
+                # Scale-strip previews and size samples are api/roi reads too.
+                # They stay plain slide reads so they never block a close.
+                counted = (export.streams_file
+                           or export.w * export.h >= EXPORT_COUNT_MIN_PIXELS)
+                with st.exports if counted else nullcontext():
+                    if export.streams_file:
+                        with export.file(_job_update) as artifact:
+                            self._stream_file(
+                                artifact.copy_to,
+                                size=artifact.size,
+                                content_type=artifact.content_type,
+                                filename=artifact.filename,
+                            )
+                        return
+                    artifact = export.rendered()
+                    return self._send(
+                        200, artifact.body, artifact.content_type,
+                        {"Content-Disposition": content_disposition(artifact.filename)},
+                    )
             except ExportRequestError as e:
                 return self._error(400, str(e))
-            return self._send(
-                200, artifact.body, artifact.content_type,
-                {"Content-Disposition": content_disposition(artifact.filename)},
-            )
 
     return Handler
 

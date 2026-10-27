@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import email.message
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +13,8 @@ import pytest
 from nd2wsi import astromap_export as am
 from nd2wsi import render
 from nd2wsi.server import (
+    EXPORT_COUNT_MIN_PIXELS,
+    TILE_RE,
     SlideRegistry,
     ViewerState,
     _job_get,
@@ -101,7 +105,7 @@ def test_mid_stream_failure_writes_no_second_response(monkeypatch, error):
     assert wire.writes[0].count(b"HTTP/1.1") == 1
     assert handler.close_connection is True
     assert _job_get("midstream")["state"] == "error"
-    assert st.busy.active == 0
+    assert st.busy.active == st.exports.active == 0
     # The next request on a reused handler can answer errors normally again.
     handler.wfile = second = _Wire()
     handler.path = "/s/ffffffff/api/info"
@@ -167,4 +171,134 @@ def test_astromap_download_streams_with_the_security_headers(tmp_path):
     assert headers["Referrer-Policy"] == "no-referrer"
     body = b"".join(chunks)
     assert body.startswith(b"PK") and int(headers["Content-Length"]) == len(body)
+    registry.astromap_downloads.close()
+
+
+def test_tile_read_holds_busy_but_is_not_an_export(monkeypatch):
+    reading, release = threading.Event(), threading.Event()
+
+    def slow_tile(*args):
+        reading.set()
+        assert release.wait(5)
+        return b"tile"
+
+    monkeypatch.setattr(render, "render_tile", slow_tile)
+    st = state()
+    registry = window_registry(st)
+    handler = bare_handler(registry)
+    sent = []
+    handler._send = lambda code, body, ctype, *args, **kwargs: sent.append((code, body))
+    worker = threading.Thread(
+        target=handler._tile, args=(st, TILE_RE.match("/api/tile/0/0/0.jpg"), {}),
+    )
+    worker.start()
+    try:
+        assert reading.wait(5)
+        assert st.busy.active == 1
+        assert registry.active_export_count() == 0
+    finally:
+        release.set()
+        worker.join(5)
+    assert sent == [(200, b"tile")]
+
+
+def test_streamed_tiff_counts_as_one_export_until_transmission_ends(monkeypatch):
+    def write(root, attrs, destination, *args, **kwargs):
+        Path(destination).write_bytes(b"pixels")
+
+    monkeypatch.setattr(render, "export_roi_tiff", write)
+    st = state()
+    registry = window_registry(st)
+    handler = bare_handler(registry)
+    handler.send_response = lambda code: None
+    handler.send_header = lambda key, value: None
+    handler.end_headers = lambda: None
+    writing, release = threading.Event(), threading.Event()
+    received = []
+
+    class SlowSink:
+        def write(self, chunk):
+            writing.set()
+            assert release.wait(5)
+            received.append(chunk)
+
+    handler.wfile = SlowSink()
+    worker = threading.Thread(target=handler._roi, args=(st, roi_query()))
+    worker.start()
+    try:
+        assert writing.wait(5)
+        assert registry.active_export_count() == 1
+        assert st.busy.active == 1
+    finally:
+        release.set()
+        worker.join(5)
+    assert received == [b"pixels"]
+    assert registry.active_export_count() == 0
+    assert st.busy.active == st.exports.active == 0
+
+
+@pytest.mark.parametrize("side,counted", [(512, 0), (2048, 1)])
+def test_previews_and_size_samples_stay_reads_while_large_renders_count(monkeypatch, side, counted):
+    assert (side * side >= EXPORT_COUNT_MIN_PIXELS) is bool(counted)
+    st = state(width=4096, height=4096)
+    registry = window_registry(st)
+    seen = []
+
+    def rendered(root, attrs, level, x, y, w, h, *args, **kwargs):
+        seen.append((w, h, registry.active_export_count(), st.busy.active))
+        return b"image"
+
+    monkeypatch.setattr(render, "export_roi_rendered", rendered)
+    handler = bare_handler(registry)
+    sent = []
+    handler._send = lambda code, body, ctype, *args, **kwargs: sent.append((code, body, ctype))
+    handler._roi(st, roi_query(format="jpg", w=side, h=side))
+    assert seen == [(side, side, counted, 1)]
+    assert sent == [(200, b"image", "image/jpeg")]
+    assert st.busy.active == st.exports.active == 0
+
+
+def test_window_close_refuses_at_once_during_an_export_without_side_effects():
+    st = state()
+    registry = window_registry(st)
+    cancelled = []
+    st._shading = SimpleNamespace(cancel=lambda: cancelled.append(True), close=lambda: None)
+    with st.busy, st.exports:
+        started = time.monotonic()
+        with pytest.raises(ValueError, match="export"):
+            registry.remove(SID)
+        assert time.monotonic() - started < 0.5  # no drain wait
+        assert not st.busy.closed  # tile reads stay admitted
+        assert cancelled == []
+        assert registry.get(SID) is st
+    assert registry.remove(SID) is True
+    assert cancelled == [True]
+    assert registry.get(SID) is None
+
+
+def test_astromap_build_and_download_count_as_exports(monkeypatch, tmp_path):
+    st = astromap_state()
+    registry = window_registry(st)
+    registry.astromap_downloads = am.AstromapDownloads(tmp_path)
+    original_write = am.AstromapPlan.write
+    during_build = []
+
+    def counted_write(self, folder):
+        during_build.append((registry.active_export_count(), st.busy.active))
+        return original_write(self, folder)
+
+    monkeypatch.setattr(am.AstromapPlan, "write", counted_write)
+    handler, token = build_astromap(registry, st)
+    assert during_build == [(1, 1)]
+    assert registry.active_export_count() == 0
+    during_download = []
+    handler.send_response = lambda code: None
+    handler.send_header = lambda key, value: None
+    handler.end_headers = lambda: None
+    handler.wfile = SimpleNamespace(write=lambda chunk: during_download.append(
+        (registry.active_export_count(), st.busy.active)))
+    handler._astromap_download(st, {"token": [token]})
+    # The zip is the window's own file: it counts, but holds no slide-read lease.
+    assert during_download and set(during_download) == {(1, 0)}
+    assert registry.active_export_count() == 0
     registry.astromap_downloads.close()

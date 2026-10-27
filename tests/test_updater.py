@@ -102,6 +102,7 @@ def test_inject_rejects_unpinned_framework(tmp_path):
 def test_strict_relaunch_close_waits_and_closes_plate_without_timeout():
     registry = SlideRegistry()
     life = _Lifecycle()
+    exports = _Lifecycle()
     entered = threading.Event()
     release = threading.Event()
     calls = []
@@ -110,11 +111,11 @@ def test_strict_relaunch_close_waits_and_closes_plate_without_timeout():
         def close(self, timeout=300):
             calls.append(timeout)
 
-    state = SimpleNamespace(busy=life, plate=Plate(), root=None, close_shading=lambda: None)
+    state = SimpleNamespace(busy=life, exports=exports, plate=Plate(), root=None, close_shading=lambda: None)
     registry.slides["slide"] = state
 
     def export():
-        with life:
+        with life, exports:  # a real export holds both leases
             entered.set()
             release.wait(5)
 
