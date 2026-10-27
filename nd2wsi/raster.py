@@ -2,7 +2,8 @@
 
 Astromapper coordinates describe the decoded pixel grid, so EXIF display
 rotation and DPI do not change the image dimensions or invent calibration.
-Only the base image is retained; lower levels are bounded window resamples.
+The base image is retained; finer levels are bounded window resamples, and
+overview levels are resampled whole on first read and kept until close.
 """
 from __future__ import annotations
 
@@ -18,6 +19,14 @@ from .reader import ChannelInfo, PlaneSource, level_shapes
 RASTER_SUFFIXES = {".jpg", ".jpeg", ".png"}
 MAX_PIXELS = 64_000_000  # includes an 8000 x 8000 Astromap image
 MAX_JPEG_PIXELS = 512_000_000  # full-resolution stitched microscopy JPEGs
+# Pillow crops and resamples without the GIL and only reads the shared base
+# image, so reads may overlap; the bound caps how many resample
+# intermediates (one tile window or one memo band each) exist at once.
+MAX_CONCURRENT_READS = 4
+# Levels this coarse are kept whole after their first read. All of them
+# together hold about 1/64 of the base image's memory (Pillow RGB is 4 B/px).
+MEMO_MIN_DOWNSAMPLE = 8
+_MEMO_BAND_ROWS = 64  # output rows per resample while building one memo level
 
 
 def is_raster(path: str | Path) -> bool:
@@ -25,35 +34,71 @@ def is_raster(path: str | Path) -> bool:
 
 
 class _RasterLevel:
-    def __init__(self, image, shape, downsample, life, lock):
-        self._image, self._life, self._lock = image, life, lock
+    def __init__(self, image, shape, downsample, life, slots):
+        self._image, self._life, self._slots = image, life, slots
         self.shape = (3, *shape)
         self.dtype = np.dtype("uint8")
         self._downsample = downsample
+        self._memo: np.ndarray | None = None
+        self._memo_lock = threading.Lock()
 
-    def __getitem__(self, index: Any) -> np.ndarray:
+    def _resample(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        """One window of this level as (h, w, 3), straight from the base image."""
         from PIL import Image
 
-        channels, y0, y1, x0, x1 = _parse_cyx_index(index, self.shape)
-        with self._life, self._lock:
-            if x0 == x1 or y0 == y1:
-                return np.empty((3, y1 - y0, x1 - x0), self.dtype)[channels]
-            d = self._downsample
-            # A narrow axis can already have collapsed to one pixel.
-            dx, dy = min(d, self._image.width), min(d, self._image.height)
-            box = (x0 * dx, y0 * dy, x1 * dx, y1 * dy)
+        d = self._downsample
+        # A narrow axis can already have collapsed to one pixel.
+        dx, dy = min(d, self._image.width), min(d, self._image.height)
+        box = (x0 * dx, y0 * dy, x1 * dx, y1 * dy)
+        with self._slots:
             if d == 1:
                 window = self._image.crop(box)
             else:
                 window = self._image.resize((x1 - x0, y1 - y0), Image.Resampling.BOX, box=box)
             try:
-                return np.ascontiguousarray(np.moveaxis(np.asarray(window), -1, 0)[channels])
+                return np.asarray(window)
             finally:
                 window.close()
 
+    def _whole(self) -> np.ndarray:
+        """The whole level as (3, H, W), resampled once; callers hold the lifecycle.
+
+        BOX windows on this level's grid do not depend on their neighbours,
+        so building it in bands gives exactly the pixels a per-tile read
+        would, while bounding the resampler's intermediate to one band.
+        """
+        with self._memo_lock:
+            if self._memo is None:
+                _, h, w = self.shape
+                memo = np.empty(self.shape, self.dtype)
+                for r0 in range(0, h, _MEMO_BAND_ROWS):
+                    r1 = min(h, r0 + _MEMO_BAND_ROWS)
+                    memo[:, r0:r1] = np.moveaxis(self._resample(r0, r1, 0, w), -1, 0)
+                self._memo = memo
+            return self._memo
+
+    def release(self) -> None:
+        """Drop the memoized level; only after the lifecycle has drained."""
+        self._memo = None
+
+    def __getitem__(self, index: Any) -> np.ndarray:
+        channels, y0, y1, x0, x1 = _parse_cyx_index(index, self.shape)
+        with self._life:
+            if x0 == x1 or y0 == y1:
+                return np.empty((3, y1 - y0, x1 - x0), self.dtype)[channels]
+            if self._downsample >= MEMO_MIN_DOWNSAMPLE:
+                # A copy, so no caller or tile cache pins or edits the memo.
+                return self._whole()[:, y0:y1, x0:x1][channels].copy()
+            window = self._resample(y0, y1, x0, x1)
+            return np.ascontiguousarray(np.moveaxis(window, -1, 0)[channels])
+
 
 def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
-    """Open a bounded raster once, with no pixel cache or source writes."""
+    """Open a bounded raster once, with no source writes.
+
+    Reads at downsample >= ``MEMO_MIN_DOWNSAMPLE`` come from a level memoized
+    on first use; close frees it, and the base image, once reads drain.
+    """
     from PIL import Image, JpegImagePlugin
 
     from .convert import available_memory_bytes, build_group_attrs
@@ -121,13 +166,15 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         windows = [{"start": 0.0, "end": 255.0, "min": 0.0, "max": 255.0}] * 3
         attrs = build_group_attrs(source, shapes, 512, windows)
         attrs["nd2wsi"].update(direct=True, raster=True)
-        life, lock = _Lifecycle(), threading.Lock()
-        levels = {str(k): _RasterLevel(image, shape, 2 ** k, life, lock)
+        life, slots = _Lifecycle(), threading.BoundedSemaphore(MAX_CONCURRENT_READS)
+        levels = {str(k): _RasterLevel(image, shape, 2 ** k, life, slots)
                   for k, shape in enumerate(shapes)}
 
         def close():
             if life.close():
                 image.close()
+                for level in levels.values():
+                    level.release()
 
         return _Root(levels, close), attrs
     except BaseException:

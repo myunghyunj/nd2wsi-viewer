@@ -1,5 +1,8 @@
 """Raster opening keeps the TXT pixel grid and annotation ownership."""
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -78,6 +81,173 @@ def test_narrow_image_pyramid_reads_do_not_extend_past_collapsed_axis(tmp_path):
         assert root["1"][:, 0:512, :].shape == (3, 512, 1)
     finally:
         root.close(delay=0)
+
+
+def save_noise(tmp_path, size, *, name="noise.png"):
+    """Uncorrelated pixels, so any BOX rounding difference shows."""
+    path = tmp_path / name
+    pixels = np.random.default_rng(7).integers(0, 256, (size[1], size[0], 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(path, compress_level=1)
+    return path
+
+
+def box_window(image, d, y0, y1, x0, x1):
+    """What a per-tile read has always returned: one BOX resample of the window."""
+    window = image.resize((x1 - x0, y1 - y0), Image.Resampling.BOX, box=(x0 * d, y0 * d, x1 * d, y1 * d))
+    return np.moveaxis(np.asarray(window), -1, 0)
+
+
+def test_overview_levels_are_memoized_with_per_tile_pixels(tmp_path, monkeypatch):
+    path = save_noise(tmp_path, (8300, 260))
+    # Several bands per level, the last one partial.
+    monkeypatch.setattr(raster, "_MEMO_BAND_ROWS", 5)
+    root, _ = raster.open_direct(path)
+    try:
+        assert [root[k].shape for k in ("3", "4", "5")] == [(3, 32, 1037), (3, 16, 518), (3, 8, 259)]
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            expected = {k: box_window(image, 2 ** int(k), 0, root[k].shape[1], 0, root[k].shape[2])
+                        for k in ("3", "4", "5")}
+            for k in ("3", "4", "5"):
+                d, (_, h, w) = 2 ** int(k), root[k].shape
+                windows = [(0, h, x, min(w, x + 512)) for x in range(0, w, 512)]
+                windows += [(3, h - 1, 100, min(w, 357)), (h - 1, h, w - 1, w)]
+                for y0, y1, x0, x1 in windows:
+                    tile = box_window(image, d, y0, y1, x0, x1)
+                    np.testing.assert_array_equal(root[k][:, y0:y1, x0:x1], tile)
+                    np.testing.assert_array_equal(expected[k][:, y0:y1, x0:x1], tile)
+        monkeypatch.setattr(Image.Image, "resize", lambda *a, **k: pytest.fail("resampled a memoized level"))
+        for k in ("3", "4", "5"):
+            np.testing.assert_array_equal(root[k][:, :, :], expected[k])
+            np.testing.assert_array_equal(root[k][[2, 0], 1:4, 5:9], expected[k][[2, 0], 1:4, 5:9])
+            np.testing.assert_array_equal(root[k][1, 1:4, 5:9], expected[k][1, 1:4, 5:9])
+        # Reads are private copies: editing one never reaches the memo.
+        tile = root["3"][:, 0:4, 0:4]
+        assert tile.flags.c_contiguous and tile.flags.writeable
+        tile[...] = 0
+        np.testing.assert_array_equal(root["3"][:, 0:4, 0:4], expected["3"][:, 0:4, 0:4])
+        assert not np.shares_memory(root["3"][:, :, :], root["3"]._memo)
+    finally:
+        root.close(delay=0)
+    assert all(level._memo is None for level in root.values())
+
+
+def test_overview_level_is_built_once_under_concurrent_first_reads(tmp_path, monkeypatch):
+    path = save_noise(tmp_path, (8300, 260))
+    monkeypatch.setattr(raster, "_MEMO_BAND_ROWS", 5)
+    sizes, real_resize = [], Image.Image.resize
+
+    def resize(self, size, *args, **kwargs):
+        sizes.append(size)
+        time.sleep(0.01)  # keep the build open while the other readers arrive
+        return real_resize(self, size, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "resize", resize)
+    root, _ = raster.open_direct(path)
+    try:
+        with ThreadPoolExecutor(8) as pool:
+            tiles = list(pool.map(lambda x0: root["3"][:, :, x0:x0 + 100], range(0, 800, 100)))
+        assert sizes == [(1037, 5)] * 6 + [(1037, 2)]
+        np.testing.assert_array_equal(np.concatenate(tiles, axis=2), root["3"][:, :, 0:800])
+    finally:
+        root.close(delay=0)
+
+
+def test_close_waits_for_an_in_flight_memo_build_then_frees_it(tmp_path, monkeypatch):
+    path = save_noise(tmp_path, (2100, 600))
+    with Image.open(path) as image:
+        expected = box_window(image.convert("RGB"), 8, 0, 10, 0, 10)
+    entered, release, real_resize = threading.Event(), threading.Event(), Image.Image.resize
+
+    def resize(self, *args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return real_resize(self, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "resize", resize)
+    root, _ = raster.open_direct(path)
+    level = root["3"]
+    assert level.shape == (3, 75, 262)
+    with ThreadPoolExecutor(2) as pool:
+        read = pool.submit(lambda: level[:, 0:10, 0:10])
+        assert entered.wait(10)
+        closing = pool.submit(root.close, 0)
+        deadline = time.monotonic() + 10
+        while not level._life.closed and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert level._life.closed and not closing.done()
+        release.set()
+        # The build finished on a live base image, and close waited for it.
+        np.testing.assert_array_equal(read.result(10), expected)
+        closing.result(10)
+    assert all(level._memo is None for level in root.values())
+    with pytest.raises(ValueError, match="closed"):
+        level[:, 0:1, 0:1]
+
+
+def test_reads_overlap_up_to_the_slot_limit(tmp_path, monkeypatch):
+    path = save_image(tmp_path, size=(1027, 771))
+    slots = raster.MAX_CONCURRENT_READS
+    # Every slot must be busy at once, or the barrier times out.
+    gate, counter = threading.Barrier(slots, timeout=10), threading.Lock()
+    active = peak = 0
+    real_crop = Image.Image.crop
+
+    def crop(self, box=None):
+        nonlocal active, peak
+        with counter:
+            active += 1
+            peak = max(peak, active)
+        try:
+            gate.wait()
+            return real_crop(self, box)
+        finally:
+            with counter:
+                active -= 1
+
+    monkeypatch.setattr(Image.Image, "crop", crop)
+    root, _ = raster.open_direct(path)
+    try:
+        with ThreadPoolExecutor(2 * slots) as pool:
+            tiles = list(pool.map(lambda y: root["0"][:, y:y + 8, 0:8], range(0, 16 * slots, 8)))
+        assert peak == slots
+        with Image.open(path) as image:
+            expected = np.moveaxis(np.asarray(image), -1, 0)
+        np.testing.assert_array_equal(np.concatenate(tiles, axis=1), expected[:, 0:16 * slots, 0:8])
+    finally:
+        root.close(delay=0)
+
+
+def test_concurrent_reads_on_every_level_match_serial_reads(tmp_path):
+    path = save_noise(tmp_path, (2100, 600))
+    rng = np.random.default_rng(3)
+
+    def read(root, r):
+        k, channels, y0, y1, x0, x1 = r
+        return root[k][channels, y0:y1, x0:x1]
+
+    root, _ = raster.open_direct(path)
+    try:
+        assert [root[k].shape[1:] for k in sorted(root)] == [(600, 2100), (300, 1050), (150, 525), (75, 262)]
+        reads = []
+        for i in range(160):
+            k = str(rng.integers(0, len(root)))
+            _, h, w = root[k].shape
+            y0, x0 = int(rng.integers(0, h)), int(rng.integers(0, w))
+            y1, x1 = int(rng.integers(y0 + 1, min(h, y0 + 300) + 1)), int(rng.integers(x0 + 1, min(w, x0 + 300) + 1))
+            reads.append((k, [slice(None), 1, [2, 0]][i % 3], y0, y1, x0, x1))
+        expected = [read(root, r) for r in reads]
+    finally:
+        root.close(delay=0)
+    # A fresh root, so the memo levels are built while other reads race them.
+    fresh, _ = raster.open_direct(path)
+    try:
+        with ThreadPoolExecutor(8) as pool:
+            got = list(pool.map(lambda r: read(fresh, r), reads * 3))
+    finally:
+        fresh.close(delay=0)
+    for tile, want in zip(got, expected * 3, strict=True):
+        np.testing.assert_array_equal(tile, want)
 
 
 def test_alpha_is_composited_on_black_and_grayscale_becomes_rgb(tmp_path):
