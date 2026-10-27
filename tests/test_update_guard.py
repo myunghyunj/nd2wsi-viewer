@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -53,7 +54,12 @@ def test_process_death_releases_liveness_without_rewriting_recovery_record(tmp_p
         assert 'other viewer windows' in guard.acquire()
         process.terminate()
         process.wait(timeout=10)
-        assert guard.acquire() is None
+        # Windows releases a dead process's file locks after a delay that "depends upon
+        # available system resources" (LockFileEx), which parallel test workers stretch.
+        deadline = time.monotonic() + 10
+        while (blocked := guard.acquire()) is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert blocked is None
         assert record.exists()
         assert json.loads(record.read_text())['state'] == 'starting'
     finally:
