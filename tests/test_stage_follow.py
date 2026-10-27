@@ -260,3 +260,44 @@ def test_close_interrupts_client_stalled_mid_body():
     finally:
         connection.close()
         receiver.close()
+
+
+def test_submit_routes_motion_and_heartbeat_like_http(running):
+    receiver, descriptor, _ = running
+    accepted = receiver.submit(motion(descriptor, 1, [5, -3]))
+    assert accepted["ok"] and accepted["result"] == "accepted"
+    assert accepted["displacement_um"] == [5, -3] and accepted["seq"] == 1
+    beat = receiver.submit(heartbeat(descriptor))
+    assert beat["ok"] and beat["result"] == "heartbeat"
+    assert "token" not in accepted and "token" not in beat
+
+
+def test_submit_returns_errors_instead_of_raising(running):
+    receiver, descriptor, _ = running
+    receiver.submit(motion(descriptor, 1, [1, 1]))
+    gap = receiver.submit(motion(descriptor, 3, [1, 1]))  # sequence gap -> paused (409)
+    assert gap == {"ok": False, "status": 409, "message": gap["message"]}
+    assert "sequence gap" in gap["message"].lower()
+    # Once paused, further motion is refused with a status code, never an exception.
+    after = receiver.submit(motion(descriptor, 2, [1, 1]))
+    assert after["ok"] is False and after["status"] == 409
+
+
+def test_submit_rejects_bad_payloads_without_raising(running):
+    receiver, descriptor, _ = running
+    wrong_session = receiver.submit({"version": 1, "session_id": "nope", "seq": 1,
+                                     "type": "delta", "delta_um": [1, 1]})
+    assert wrong_session == {"ok": False, "status": 409, "message": wrong_session["message"]}
+    not_a_dict = receiver.submit("oops")
+    assert not_a_dict["ok"] is False and not_a_dict["status"] == 400
+    bad_type = receiver.submit({"version": 1, "session_id": descriptor["session_id"],
+                                "seq": 1, "type": "spin", "delta_um": [1, 1]})
+    assert bad_type["ok"] is False and bad_type["status"] == 400
+
+
+def test_submit_on_closed_receiver_reports_closed():
+    receiver = StageFollowReceiver()
+    descriptor = receiver.start()
+    receiver.close()
+    result = receiver.submit(heartbeat(descriptor))
+    assert result == {"ok": False, "status": 410, "message": "Receiver is closed"}

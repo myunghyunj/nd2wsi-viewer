@@ -351,6 +351,26 @@ class StageFollowReceiver:
             self._expire(self._clock())
             return self._snapshot()
 
+    def submit(self, payload) -> dict:
+        """Route one in-process observation through the same validation as HTTP.
+
+        An in-process observer (for example the W/A/S/D key follower) calls this
+        instead of opening a loopback socket. A payload carrying ``type`` is a
+        motion observation, anything else a heartbeat; both follow the identical
+        rules as ``POST /motion`` and ``POST /heartbeat``. Returns
+        ``{"ok": True, ...snapshot}`` on success or
+        ``{"ok": False, "status": <http-like code>, "message": ...}`` on a
+        rejection, never raising, so an observer never blocks on receiver state.
+        """
+        try:
+            if isinstance(payload, dict) and "type" in payload:
+                result = self._motion(payload)
+            else:
+                result = self._heartbeat(payload)
+        except _RequestError as exc:
+            return {"ok": False, "status": exc.status, "message": str(exc)}
+        return {"ok": True, **result}
+
     def _validate_session(self, payload: object):
         if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
             raise _RequestError(400, "Expected a version 1 JSON object")
