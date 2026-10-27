@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 import urllib.request
+import uuid
 import nd2wsi
 import webview
 from nd2wsi import app
@@ -44,13 +45,17 @@ api, parent = app.create_app_window(None, window_session=session)
 report = {'ok': False, 'session': session.as_dict(), 'source': str(source),
           'module': nd2wsi.__file__, 'platform': sys.platform, 'cases': [],
           'scope': 'synthetic process session and normalized commands through real native UI; no real discovery or ACS capture'}
+# Synthetic processes use the real session-identity format, which the
+# once-across-windows offer claim requires.
+QA_SESSION = 'slacs-' + uuid.uuid4().hex
+QA_SESSION_NEW = 'slacs-' + uuid.uuid4().hex
 heartbeat_stop = threading.Event()
 heartbeat_thread = None
 descriptor = None
 
 class SyntheticDiscovery:
     def __init__(self):
-        self.state = {'available': True, 'session_id': 'native-qa', 'status': 'running'}
+        self.state = {'available': True, 'session_id': QA_SESSION, 'status': 'running'}
     def snapshot(self):
         return dict(self.state)
     def stop(self):
@@ -96,6 +101,9 @@ def run():
             assert api._slacs_discovery.stop() is True
         synthetic = SyntheticDiscovery()
         api._slacs_discovery = synthetic
+        # The shell claims the one offer only while its window has focus, which
+        # this private window need not have; claim it for this window instead.
+        assert api.slacs_discovery_state(True)['offer'] is True
         wait_for(lambda: parent.evaluate_js("!document.getElementById('slacs-offer').hidden"),
                  description='synthetic process offer')
         report['synthetic_main_offer_verified'] = True
@@ -109,12 +117,18 @@ def run():
             'rotation':0,'flip':False,'query':'c=0%2C1&g='+info['generation'],'rois':rois,'roiIndex':0})
         assert result['ok'],result
         overlay=api._translucent_windows[sid]; child=overlay._window
+        # The page always asks for the W/A/S/D observer, which only Windows
+        # provides. This check commands the same receiver over its loopback
+        # adapter instead, keeping the page's validated step.
+        resolve_follow=overlay._stage_follow_options
+        overlay._stage_follow_options=lambda options: ('adapter',*resolve_follow(options)[1:])
+        report['follow_source']='adapter'
         wait_for(lambda: child.evaluate_js('!!window.nd2Translucent?.state.ready'),description='translucent ready')
         assert child.evaluate_js("document.getElementById('stage-follow-control').hidden"), 'Follow visible without detection'
         overlay.slacs_discovery_state()
         assert overlay._discovery.stop() is True
         overlay._on_slacs_change(synthetic.snapshot())
-        wait_for(lambda: child.evaluate_js("nd2Translucent.state.slacs.session_id === 'native-qa' && !document.getElementById('stage-follow-control').hidden"),
+        wait_for(lambda: child.evaluate_js(f"nd2Translucent.state.slacs.session_id === '{QA_SESSION}' && !document.getElementById('stage-follow-control').hidden"),
                  description='synthetic process overlay controls')
         report['synthetic_overlay_visibility_verified'] = True
         if os.environ.get('ND2WSI_SLACS_VISIBILITY_ONLY') == '1':
@@ -128,9 +142,9 @@ def run():
             wait_for(lambda: parent.evaluate_js("document.getElementById('slacs-offer').hidden"),
                      description='process loss hides main offer')
             assert not receiver.snapshot()['enabled']
-            synthetic.state = {'available': True, 'session_id': 'native-qa-new', 'status': 'running'}
+            synthetic.state = {'available': True, 'session_id': QA_SESSION_NEW, 'status': 'running'}
             overlay._on_slacs_change(synthetic.snapshot())
-            wait_for(lambda: child.evaluate_js("nd2Translucent.state.slacs.session_id === 'native-qa-new' && !document.getElementById('stage-follow-control').hidden"),
+            wait_for(lambda: child.evaluate_js(f"nd2Translucent.state.slacs.session_id === '{QA_SESSION_NEW}' && !document.getElementById('stage-follow-control').hidden"),
                      description='new synthetic process session')
             assert not child.evaluate_js('nd2Translucent.state.follow.enabled')
             report['synthetic_loss_and_no_auto_resume_verified'] = True
@@ -169,6 +183,18 @@ def run():
         wait_for(lambda: not close_enough(camera(child)['center'],target),description='unlocked manual pan')
         time.sleep(.25)
         manual=camera(child)['center']
+        # Unlocked, OpenSeadragon's own canvas keys (F flip, R rotate, D pan) do nothing.
+        child.evaluate_js("""(() => {const c=nd2Translucent.viewer.canvas;c.focus();
+          for (const [code,key] of [[70,'f'],[82,'r'],[68,'d']]) {
+            const e=new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true});
+            Object.defineProperty(e,'keyCode',{get:()=>code});Object.defineProperty(e,'which',{get:()=>code});
+            c.dispatchEvent(e);}
+          return true;})()""")
+        time.sleep(.2)
+        keyed=camera(child)
+        assert keyed['flip'] is False and keyed['rotation']==0 and close_enough(keyed['center'],manual), \
+            ('OpenSeadragon canvas keys changed the overlay', keyed)
+        report['canvas_keys_ignored']=True
         # Unlocked: the press is consumed without moving the hand-aligned view.
         motion(child,4,manual,type='delta',delta_um=[10,0])
         assert child.evaluate_js("document.getElementById('stage-follow-status').textContent")==\
@@ -219,9 +245,9 @@ def run():
         wait_for(lambda: parent.evaluate_js("document.getElementById('slacs-offer').hidden"),
                  description='process loss hides main offer')
         assert not old_receiver.snapshot()['enabled']
-        synthetic.state = {'available': True, 'session_id': 'native-qa-new', 'status': 'running'}
+        synthetic.state = {'available': True, 'session_id': QA_SESSION_NEW, 'status': 'running'}
         overlay._on_slacs_change(synthetic.snapshot())
-        wait_for(lambda: child.evaluate_js("nd2Translucent.state.slacs.session_id === 'native-qa-new' && !document.getElementById('stage-follow-control').hidden"),
+        wait_for(lambda: child.evaluate_js(f"nd2Translucent.state.slacs.session_id === '{QA_SESSION_NEW}' && !document.getElementById('stage-follow-control').hidden"),
                  description='new synthetic process session')
         assert not child.evaluate_js('nd2Translucent.state.follow.enabled')
         report['synthetic_loss_and_no_auto_resume_verified'] = True

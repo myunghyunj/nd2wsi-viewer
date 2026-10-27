@@ -177,10 +177,15 @@ moving the image by 1.514770953715 CSS pixels at image zoom 1, retained manual
 adjustment, absolute ROI-sized moves, ROI/zoom preservation, duplicates and
 gaps) with the original ND2, cache, annotations, context and SLACS module hashes
 unchanged. `qa/check_native_stage_follow.py` now checks the main viewer's
-orientation, screen-direction moves, presses ignored while unlocked and the
-absence of direction settings; it has not been re-run for this behavior, which
-the synthetic suite covers. No ACS capture adapter, Windows device validation,
-physical precision validation, or installed-app replacement has been completed.
+orientation, screen-direction moves, presses ignored while unlocked, that
+OpenSeadragon's canvas keys leave the overlay unchanged, and the absence of
+direction settings. W/A/S/D observation exists only on Windows, so on macOS the
+check commands the same receiver through its loopback adapter, with synthetic
+process sessions in the real `slacs-<hex>` identity format. It passed on
+2026-10-27 in a private Agent window (installed 2.5.4 runtime with this
+checkout's code): every commanded move matched to 0 px and the protected hashes
+were unchanged. No ACS capture adapter, Windows device validation, physical
+precision validation, or installed-app replacement has been completed.
 
 ## Windows delivery and automatic discovery requirements — 2026-10-26
 
