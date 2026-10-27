@@ -9,14 +9,15 @@ controller. SLACS's own keystrokes and its commands to the stage are untouched.
 
 Privacy: Raw Input delivers every keystroke to this process. Anything that is not
 one of the four jog keys is discarded the instant it arrives; it is never stored,
-counted individually, or written to the session log. W/A/S/D pressed while SLACS
-is not the foreground program are only tallied as ``ignored_not_slacs``, never
-recorded individually.
+counted individually, or written to the session log. Ctrl/Alt/Win only set a
+held flag, so a jog key pressed with them can be ignored. W/A/S/D pressed while
+SLACS is not the foreground program are only tallied as ``ignored_not_slacs``,
+never recorded individually.
 
 The native Raw Input plumbing is Windows-only, but this module imports cleanly on
-every platform: all ``ctypes.windll`` use is deferred into functions that run only
-on Windows or when a test injects its own observer, foreground provider, and
-identifier.
+every platform: all Win32 use is deferred into functions that run only on Windows
+or when a test injects its own observer, foreground provider, and identifier.
+One process-wide Raw Input registration is shared by every follower.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from functools import lru_cache
+from types import SimpleNamespace
 
 from . import session_log
 from .slacs_identity import SCRIPT_NAME, command_line_is_slacs
@@ -103,7 +106,9 @@ class SlacsKeyFollower:
             self._observer = observer
             self._supported = True
         elif resolved_platform == "win32":
-            self._observer = _RawInputKeyObserver()
+            # A subscription to the process's single Raw Input sink, so several
+            # overlays can follow at once without stealing each other's input.
+            self._observer = _SharedKeyObserver()
             self._supported = True
         else:
             self._observer = None
@@ -137,8 +142,10 @@ class SlacsKeyFollower:
         except Exception as exc:  # noqa: BLE001 - never let a driver failure escape
             self._fail(f"Could not start the keystroke observer: {exc}")
         if not started:
-            self._fail(self._error or "Could not start the keystroke observer.",
-                       stop_counting=True)
+            reason = self._error or getattr(self._observer, "error", None)
+            if reason and not reason.startswith("Could not start"):
+                reason = f"Could not start the keystroke observer: {reason}"
+            self._fail(reason or "Could not start the keystroke observer.", stop_counting=True)
             try:
                 self._observer.stop()
             except Exception:  # noqa: BLE001
@@ -322,17 +329,181 @@ class SlacsKeyFollower:
             return self._snapshot_locked()
 
 
-# -- Windows Raw Input observer ------------------------------------------------
+# -- Win32 API with private prototypes -----------------------------------------
 
 _RIDEV_INPUTSINK = 0x00000100
 _RIDEV_REMOVE = 0x00000001
 _RID_INPUT = 0x10000003
 _RIM_TYPEKEYBOARD = 1
 _RI_KEY_BREAK = 0x01
+_RI_KEY_E0 = 0x02
 _WM_INPUT = 0x00FF
 _WM_QUIT = 0x0012
 _WM_DESTROY = 0x0002
 _HWND_MESSAGE = -3
+_GET_RAW_INPUT_ERROR = 0xFFFFFFFF  # (UINT)-1
+
+
+@lru_cache(maxsize=1)
+def _win32():
+    """user32/kernel32/ntdll with every call this module makes prototyped.
+
+    Private ``WinDLL`` instances, never the shared ``ctypes.windll``: declaring
+    prototypes here must not change calls other code makes. Every handle,
+    pointer, WPARAM/LPARAM and LRESULT is pointer-sized, so nothing is truncated
+    to a 32-bit C ``long`` on 64-bit Windows. Windows only.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    LRESULT = ctypes.c_ssize_t  # LONG_PTR
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                 wintypes.LPARAM)
+
+    class RAWINPUTDEVICE(ctypes.Structure):
+        _fields_ = [("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT),
+                    ("dwFlags", wintypes.DWORD), ("hwndTarget", wintypes.HWND)]
+
+    class RAWINPUTHEADER(ctypes.Structure):
+        _fields_ = [("dwType", wintypes.DWORD), ("dwSize", wintypes.DWORD),
+                    ("hDevice", wintypes.HANDLE), ("wParam", wintypes.WPARAM)]
+
+    class RAWKEYBOARD(ctypes.Structure):
+        _fields_ = [("MakeCode", wintypes.USHORT), ("Flags", wintypes.USHORT),
+                    ("Reserved", wintypes.USHORT), ("VKey", wintypes.USHORT),
+                    ("Message", wintypes.UINT), ("ExtraInformation", wintypes.ULONG)]
+
+    class RAWINPUT_KEYBOARD(ctypes.Structure):
+        _fields_ = [("header", RAWINPUTHEADER), ("keyboard", RAWKEYBOARD)]
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                    ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                    ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
+                    ("Buffer", ctypes.c_void_p)]
+
+    def declare(function, restype, *argtypes):
+        function.restype = restype
+        function.argtypes = list(argtypes)
+
+    HWND, UINT, DWORD, HANDLE = wintypes.HWND, wintypes.UINT, wintypes.DWORD, wintypes.HANDLE
+    PFILETIME = ctypes.POINTER(wintypes.FILETIME)
+    declare(user32.DefWindowProcW, LRESULT, HWND, UINT, wintypes.WPARAM, wintypes.LPARAM)
+    declare(user32.RegisterClassW, wintypes.ATOM, ctypes.POINTER(WNDCLASSW))
+    declare(user32.UnregisterClassW, wintypes.BOOL, wintypes.LPCWSTR, wintypes.HINSTANCE)
+    declare(user32.CreateWindowExW, HWND, DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, HWND, wintypes.HMENU,
+            wintypes.HINSTANCE, wintypes.LPVOID)
+    declare(user32.DestroyWindow, wintypes.BOOL, HWND)
+    declare(user32.RegisterRawInputDevices, wintypes.BOOL, ctypes.POINTER(RAWINPUTDEVICE), UINT, UINT)
+    declare(user32.GetRawInputData, UINT, HANDLE, UINT, wintypes.LPVOID, ctypes.POINTER(UINT), UINT)
+    declare(user32.GetMessageW, wintypes.BOOL, ctypes.POINTER(wintypes.MSG), HWND, UINT, UINT)
+    declare(user32.TranslateMessage, wintypes.BOOL, ctypes.POINTER(wintypes.MSG))
+    declare(user32.DispatchMessageW, LRESULT, ctypes.POINTER(wintypes.MSG))
+    declare(user32.PostQuitMessage, None, ctypes.c_int)
+    declare(user32.PostThreadMessageW, wintypes.BOOL, DWORD, UINT, wintypes.WPARAM, wintypes.LPARAM)
+    declare(user32.GetAsyncKeyState, wintypes.SHORT, ctypes.c_int)
+    declare(user32.GetForegroundWindow, HWND)
+    declare(user32.GetWindowThreadProcessId, DWORD, HWND, wintypes.LPDWORD)
+    declare(kernel32.GetCurrentThreadId, DWORD)
+    declare(kernel32.GetModuleHandleW, wintypes.HMODULE, wintypes.LPCWSTR)
+    declare(kernel32.OpenProcess, HANDLE, DWORD, wintypes.BOOL, DWORD)
+    declare(kernel32.CloseHandle, wintypes.BOOL, HANDLE)
+    declare(kernel32.GetProcessTimes, wintypes.BOOL, HANDLE, PFILETIME, PFILETIME, PFILETIME, PFILETIME)
+    declare(kernel32.QueryFullProcessImageNameW, wintypes.BOOL, HANDLE, DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(DWORD))
+    declare(ntdll.NtQueryInformationProcess, wintypes.LONG, HANDLE, wintypes.ULONG, wintypes.LPVOID,
+            wintypes.ULONG, ctypes.POINTER(wintypes.ULONG))
+    return SimpleNamespace(
+        ctypes=ctypes, wintypes=wintypes, user32=user32, kernel32=kernel32, ntdll=ntdll,
+        WNDPROC=WNDPROC, WNDCLASSW=WNDCLASSW, RAWINPUTDEVICE=RAWINPUTDEVICE,
+        RAWINPUTHEADER=RAWINPUTHEADER, RAWINPUT_KEYBOARD=RAWINPUT_KEYBOARD,
+        UNICODE_STRING=UNICODE_STRING)
+
+
+def _win_error(api, call: str) -> OSError:
+    code = api.ctypes.get_last_error()
+    return OSError(f"{call} failed (Windows error {code})")
+
+
+# -- Ctrl/Alt/Win state from the raw stream ------------------------------------
+
+# Ctrl/Alt/Win as Raw Input reports them. The generic VK_CONTROL/VK_MENU carry
+# RI_KEY_E0 for the right-hand key; the sided codes are accepted too, so a make
+# and its break always land on the same side. GetAsyncKeyState takes the sided code.
+_GENERIC_MODIFIERS = {0x11: "ctrl", 0x12: "alt"}
+_SIDED_MODIFIERS = {0xA2: ("ctrl", "left"), 0xA3: ("ctrl", "right"),
+                    0xA4: ("alt", "left"), 0xA5: ("alt", "right"),
+                    0x5B: ("win", "left"), 0x5C: ("win", "right")}
+_SIDE_VKS = {side: vk for vk, side in _SIDED_MODIFIERS.items()}
+
+
+def _modifier_side(vk, e0) -> tuple[str, str] | None:
+    name = _GENERIC_MODIFIERS.get(vk)
+    if name is not None:
+        return name, "right" if e0 else "left"
+    return _SIDED_MODIFIERS.get(vk)
+
+
+class _ModifierTracker:
+    """Which of Ctrl/Alt/Win are held, followed from the keystroke stream itself.
+
+    ``GetKeyState`` on the observer thread only reflects key messages that thread
+    has read, and it reads none (it only gets ``WM_INPUT``), so held state comes
+    from Raw Input's own make/break events, in order. Only one timestamp per
+    held key side is kept. A break lost while another desktop had the input
+    (Ctrl+Alt+Del, the lock screen) would leave a modifier stuck and block every
+    jog, so a hold older than ``stale_after`` seconds is re-checked against the
+    physical key state; ``physically_down(side)`` must answer conservatively.
+    """
+
+    def __init__(self, *, physically_down: Callable[[tuple[str, str]], bool] | None = None,
+                 clock: Callable[[], float] = time.monotonic, stale_after: float = 2.0):
+        self._physically_down = physically_down
+        self._clock = clock
+        self._stale_after = stale_after
+        self._held: dict[tuple[str, str], float] = {}  # key side -> time of its last make
+
+    def update(self, vk, down, e0=False) -> bool:
+        """Record one keystroke; True when it was a Ctrl/Alt/Win key."""
+        side = _modifier_side(vk, e0)
+        if side is None:
+            return False
+        if down:
+            self._held[side] = self._clock()  # autorepeat refreshes the hold
+        else:
+            self._held.pop(side, None)
+        return True
+
+    def held(self) -> tuple[str, ...]:
+        now = self._clock()
+        names = set()
+        for side, since in list(self._held.items()):
+            if (now - since > self._stale_after and self._physically_down is not None
+                    and not self._physically_down(side)):
+                del self._held[side]  # its break never reached us; the key is up now
+                continue
+            names.add(side[0])
+        return tuple(sorted(names))
+
+
+def _windows_side_down(side) -> bool:
+    """Physical state of one modifier key side; unknown counts as held."""
+    try:
+        return bool(_win32().user32.GetAsyncKeyState(_SIDE_VKS[side]) & 0x8000)
+    except Exception:  # noqa: BLE001 - fail closed: a held modifier blocks the jog
+        return True
+
+
+# -- Windows Raw Input observer ------------------------------------------------
 
 
 class _RawInputKeyObserver:
@@ -340,27 +511,42 @@ class _RawInputKeyObserver:
 
     Runs its own message loop in a daemon thread. Raw Input is a sink
     (``RIDEV_INPUTSINK``): it observes keystrokes without consuming or delaying
-    them. ``stop`` is idempotent, safe from any thread, unregisters the device,
-    destroys the window, ends the loop, and joins with a timeout.
+    them. Only jog keys are forwarded; Ctrl/Alt/Win only update held state and
+    every other key is dropped here. ``stop`` is idempotent, safe from any
+    thread, unregisters the device, destroys the window, ends the loop, and
+    joins with a timeout. Raw Input allows one keyboard target per process, so
+    use it only through ``_RawInputHub``.
     """
 
     def __init__(self):
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
-        self._hwnd = None
         self._on_event: Callable[[int, bool, tuple], None] | None = None
         self._ready = threading.Event()
         self._started_ok = False
         self._wndproc = None  # keep the WNDPROC callback alive
         self._stopped = False
         self._lock = threading.Lock()
+        self._modifiers = _ModifierTracker(physically_down=_windows_side_down)
+        self.error: str | None = None
 
     def start(self, on_event) -> bool:
-        self._on_event = on_event
-        self._thread = threading.Thread(target=self._run, name="nd2wsi-stage-keys", daemon=True)
+        with self._lock:
+            if self._thread is not None or self._stopped:
+                return self._started_ok
+            self._on_event = on_event
+            self._thread = threading.Thread(target=self._run, name="nd2wsi-stage-keys", daemon=True)
         self._thread.start()
-        self._ready.wait(timeout=5.0)
+        if not self._ready.wait(timeout=5.0):
+            self.error = "The keystroke observer did not start in time."
+            self.stop()
+            return False
         return self._started_ok
+
+    def alive(self) -> bool:
+        thread = self._thread
+        return (self._started_ok and not self._stopped and thread is not None
+                and thread.is_alive())
 
     def stop(self) -> None:
         with self._lock:
@@ -370,153 +556,218 @@ class _RawInputKeyObserver:
             thread, thread_id = self._thread, self._thread_id
         if thread_id is not None:
             try:
-                import ctypes
-
-                # A WM_QUIT thread message ends GetMessageW in the loop thread; the
-                # loop's finally clause unregisters and destroys the window.
-                ctypes.windll.user32.PostThreadMessageW(thread_id, _WM_QUIT, 0, 0)
+                # WM_QUIT ends GetMessageW in the loop thread; its finally clause
+                # unregisters and destroys the window on that thread.
+                _win32().user32.PostThreadMessageW(thread_id, _WM_QUIT, 0, 0)
             except Exception:  # noqa: BLE001 - fall through to join
                 pass
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5.0)
 
     def _run(self) -> None:
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-
-        class RAWINPUTDEVICE(ctypes.Structure):
-            _fields_ = [("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT),
-                        ("dwFlags", wintypes.DWORD), ("hwndTarget", wintypes.HWND)]
-
-        class RAWINPUTHEADER(ctypes.Structure):
-            _fields_ = [("dwType", wintypes.DWORD), ("dwSize", wintypes.DWORD),
-                        ("hDevice", wintypes.HANDLE), ("wParam", wintypes.WPARAM)]
-
-        class RAWKEYBOARD(ctypes.Structure):
-            _fields_ = [("MakeCode", wintypes.USHORT), ("Flags", wintypes.USHORT),
-                        ("Reserved", wintypes.USHORT), ("VKey", wintypes.USHORT),
-                        ("Message", wintypes.UINT), ("ExtraInformation", wintypes.ULONG)]
-
-        class RAWINPUT_KB(ctypes.Structure):
-            _fields_ = [("header", RAWINPUTHEADER), ("keyboard", RAWKEYBOARD)]
-
-        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT,
-                                     wintypes.WPARAM, wintypes.LPARAM)
+        try:
+            api = _win32()
+        except Exception as exc:  # noqa: BLE001 - report failure through the ready event
+            self.error = f"Win32 is unavailable: {exc}"
+            self._ready.set()
+            return
+        ctypes, user32, kernel32 = api.ctypes, api.user32, api.kernel32
 
         def wnd_proc(hwnd, message, wparam, lparam):
             if message == _WM_INPUT:
                 try:
-                    self._dispatch_raw_input(lparam, user32, ctypes, wintypes,
-                                             RAWINPUT_KB, _RID_INPUT)
+                    self._dispatch_raw_input(api, lparam)
                 except Exception:  # noqa: BLE001 - never break the loop on one event
                     pass
-                return user32.DefWindowProcW(hwnd, message, wparam, lparam)
-            if message == _WM_DESTROY:
+            elif message == _WM_DESTROY:
                 user32.PostQuitMessage(0)
                 return 0
+            # WM_INPUT needs DefWindowProcW too, so the system can clean up.
             return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
-        self._wndproc = WNDPROC(wnd_proc)
-
-        class WNDCLASS(ctypes.Structure):
-            _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC),
-                        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
-                        ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
-                        ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
-                        ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
-
+        self._wndproc = api.WNDPROC(wnd_proc)
         hwnd = None
-        registered_class = None
+        hinstance = None
+        class_name = None
+        registered_class = False
+        registered_device = False
         try:
-            self._thread_id = kernel32.GetCurrentThreadId()
+            thread_id = kernel32.GetCurrentThreadId()
             hinstance = kernel32.GetModuleHandleW(None)
-            class_name = f"Nd2wsiStageKeys{self._thread_id}"
-            wnd_class = WNDCLASS()
-            wnd_class.lpfnWndProc = self._wndproc
-            wnd_class.hInstance = hinstance
-            wnd_class.lpszClassName = class_name
-            user32.RegisterClassW.restype = wintypes.ATOM
-            atom = user32.RegisterClassW(ctypes.byref(wnd_class))
-            if not atom:
-                raise OSError("RegisterClassW failed")
-            registered_class = class_name
-            user32.CreateWindowExW.restype = wintypes.HWND
+            class_name = f"Nd2wsiStageKeys{thread_id}"
+            wnd_class = api.WNDCLASSW(lpfnWndProc=self._wndproc, hInstance=hinstance,
+                                      lpszClassName=class_name)
+            if not user32.RegisterClassW(ctypes.byref(wnd_class)):
+                raise _win_error(api, "RegisterClassW")
+            registered_class = True
             hwnd = user32.CreateWindowExW(0, class_name, class_name, 0, 0, 0, 0, 0,
                                           _HWND_MESSAGE, None, hinstance, None)
             if not hwnd:
-                raise OSError("CreateWindowExW failed")
-            self._hwnd = hwnd
-            device = RAWINPUTDEVICE(0x01, 0x06, _RIDEV_INPUTSINK, hwnd)
-            if not user32.RegisterRawInputDevices(ctypes.byref(device), 1,
-                                                  ctypes.sizeof(RAWINPUTDEVICE)):
-                raise OSError("RegisterRawInputDevices failed")
+                raise _win_error(api, "CreateWindowExW")
+            with self._lock:
+                if self._stopped:
+                    raise RuntimeError("stopped while starting")
+                # The window gave this thread a message queue, so WM_QUIT posted
+                # by stop() from now on is delivered.
+                self._thread_id = thread_id
+            device = api.RAWINPUTDEVICE(0x01, 0x06, _RIDEV_INPUTSINK, hwnd)
+            if not user32.RegisterRawInputDevices(ctypes.byref(device), 1, ctypes.sizeof(device)):
+                raise _win_error(api, "RegisterRawInputDevices")
+            registered_device = True
             self._started_ok = True
-        except Exception:  # noqa: BLE001 - report failure through the ready event
+        except Exception as exc:  # noqa: BLE001 - report failure through the ready event
             self._started_ok = False
-            if hwnd:
-                user32.DestroyWindow(hwnd)
-                hwnd = None
-            if registered_class is not None:
-                user32.UnregisterClassW(registered_class, kernel32.GetModuleHandleW(None))
-                registered_class = None
+            self.error = str(exc)
         finally:
             self._ready.set()
-        if not self._started_ok:
-            return
 
         try:
-            msg = wintypes.MSG()
-            while True:
-                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if result == 0 or result == -1:
-                    break
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
+            if self._started_ok:
+                msg = api.wintypes.MSG()
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:  # 0 = WM_QUIT, -1 = error
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
         finally:
-            try:
-                remove = RAWINPUTDEVICE(0x01, 0x06, _RIDEV_REMOVE, None)
-                user32.RegisterRawInputDevices(ctypes.byref(remove), 1,
-                                               ctypes.sizeof(RAWINPUTDEVICE))
-            except Exception:  # noqa: BLE001
-                pass
-            if self._hwnd:
-                user32.DestroyWindow(self._hwnd)
-                self._hwnd = None
-            if registered_class is not None:
-                user32.UnregisterClassW(registered_class, kernel32.GetModuleHandleW(None))
+            if registered_device:
+                remove = api.RAWINPUTDEVICE(0x01, 0x06, _RIDEV_REMOVE, None)
+                user32.RegisterRawInputDevices(ctypes.byref(remove), 1, ctypes.sizeof(remove))
+            if hwnd:
+                user32.DestroyWindow(hwnd)
+            if registered_class:
+                user32.UnregisterClassW(class_name, hinstance)
 
-    def _dispatch_raw_input(self, lparam, user32, ctypes, wintypes, RAWINPUT_KB, rid_input):
-        size = wintypes.UINT(0)
-        header_size = RAWINPUT_KB.header.size  # sizeof(RAWINPUTHEADER)
-        user32.GetRawInputData(wintypes.HANDLE(lparam), rid_input, None,
-                               ctypes.byref(size), header_size)
-        if size.value == 0 or size.value > 1024:
+    def _dispatch_raw_input(self, api, lparam) -> None:
+        ctypes = api.ctypes
+        header_size = ctypes.sizeof(api.RAWINPUTHEADER)
+        size = api.wintypes.UINT(0)
+        if api.user32.GetRawInputData(lparam, _RID_INPUT, None, ctypes.byref(size), header_size) != 0:
+            return
+        if not header_size <= size.value <= 1024:
             return
         buffer = ctypes.create_string_buffer(size.value)
-        read = user32.GetRawInputData(wintypes.HANDLE(lparam), rid_input, buffer,
-                                      ctypes.byref(size), header_size)
-        if read <= 0:
+        read = api.user32.GetRawInputData(lparam, _RID_INPUT, buffer, ctypes.byref(size), header_size)
+        if read == _GET_RAW_INPUT_ERROR or read < ctypes.sizeof(api.RAWINPUT_KEYBOARD):
             return
-        raw = ctypes.cast(buffer, ctypes.POINTER(RAWINPUT_KB)).contents
+        raw = ctypes.cast(buffer, ctypes.POINTER(api.RAWINPUT_KEYBOARD)).contents
         if raw.header.dwType != _RIM_TYPEKEYBOARD:
             return
-        vk = int(raw.keyboard.VKey)
-        down = not (raw.keyboard.Flags & _RI_KEY_BREAK)
+        self._handle_key(int(raw.keyboard.VKey), int(raw.keyboard.Flags))
+
+    def _handle_key(self, vk: int, flags: int) -> None:
+        """Route one raw keystroke, in arrival order (the loop thread only)."""
+        down = not (flags & _RI_KEY_BREAK)
+        if self._modifiers.update(vk, down, bool(flags & _RI_KEY_E0)):
+            return  # Ctrl/Alt/Win only change held state
+        if vk not in KEY_BINDINGS:
+            return  # privacy: every other key is dropped before any callback sees it
         on_event = self._on_event
         if on_event is not None:
-            on_event(vk, down, _held_modifiers(user32))
+            on_event(vk, down, self._modifiers.held())
 
 
-def _held_modifiers(user32) -> tuple:
-    """Modifier keys currently held, sampled at the keystroke."""
-    held = []
-    for name, vk in (("ctrl", 0x11), ("alt", 0x12), ("win", 0x5B), ("win", 0x5C)):
-        if user32.GetKeyState(vk) & 0x8000:
-            held.append(name)
-    return tuple(held)
+class _RawInputHub:
+    """The process's one Raw Input keyboard sink, shared by every key follower.
+
+    ``RegisterRawInputDevices`` keeps one target window per device class per
+    process (the last registration wins), and ``RIDEV_REMOVE`` drops the
+    process's registration, so overlays following at once must not each
+    register. The first subscriber starts the observer, events fan out to every
+    subscriber, and the last one to leave stops it.
+    """
+
+    def __init__(self, observer_factory: Callable[[], object] | None = None):
+        self._factory = observer_factory or _RawInputKeyObserver
+        # Held across native start/stop too: a new observer must never register
+        # while an old one can still send RIDEV_REMOVE.
+        self._lifecycle = threading.Lock()
+        self._observer = None
+        self._subscribers: tuple = ()  # (token, callback); replaced, never mutated
+        self.error: str | None = None
+
+    def subscribe(self, token, callback) -> bool:
+        with self._lifecycle:
+            if self._observer is not None and not self._observer_alive():
+                self._stop_observer_locked()  # its loop ended; start a fresh one
+            if self._observer is None:
+                observer = self._factory()
+                error = None
+                try:
+                    started = bool(observer.start(self._dispatch))
+                except Exception as exc:  # noqa: BLE001 - report, never raise
+                    started, error = False, str(exc)
+                if not started:
+                    self.error = error or getattr(observer, "error", None)
+                    try:
+                        observer.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return False
+                self._observer = observer
+                self.error = None
+            self._subscribers = (*(s for s in self._subscribers if s[0] is not token),
+                                 (token, callback))
+            return True
+
+    def unsubscribe(self, token) -> None:
+        with self._lifecycle:
+            remaining = tuple(s for s in self._subscribers if s[0] is not token)
+            if len(remaining) == len(self._subscribers):
+                return
+            self._subscribers = remaining
+            if not remaining:
+                self._stop_observer_locked()
+
+    def _observer_alive(self) -> bool:
+        alive = getattr(self._observer, "alive", None)
+        return True if alive is None else bool(alive())
+
+    def _stop_observer_locked(self) -> None:
+        observer, self._observer = self._observer, None
+        if observer is not None:
+            try:
+                observer.stop()
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                pass
+
+    def _dispatch(self, vk, down, modifiers) -> None:
+        for _token, callback in self._subscribers:
+            try:
+                callback(vk, down, modifiers)
+            except Exception:  # noqa: BLE001 - one follower must not starve another
+                pass
+
+
+_RAW_INPUT_HUB = _RawInputHub()
+
+
+class _SharedKeyObserver:
+    """One follower's subscription to the process-wide Raw Input hub."""
+
+    def __init__(self, hub: _RawInputHub | None = None):
+        self._hub = _RAW_INPUT_HUB if hub is None else hub
+        self._lock = threading.Lock()
+        self._subscribed = False
+        self._stopped = False
+        self.error: str | None = None
+
+    def start(self, on_event) -> bool:
+        with self._lock:
+            if self._stopped:
+                return False
+            if not self._subscribed:
+                self._subscribed = self._hub.subscribe(self, on_event)
+                if not self._subscribed:
+                    self.error = self._hub.error
+            return self._subscribed
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            subscribed, self._subscribed = self._subscribed, False
+        if subscribed:
+            self._hub.unsubscribe(self)
 
 
 # -- Windows foreground + identity providers (read-only) -----------------------
@@ -526,19 +777,16 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 def _windows_foreground_process() -> dict | None:
     """Return the foreground window's owning process, or None. Read-only."""
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    hwnd = user32.GetForegroundWindow()
+    api = _win32()
+    ctypes, wintypes = api.ctypes, api.wintypes
+    hwnd = api.user32.GetForegroundWindow()
     if not hwnd:
         return None
     pid = wintypes.DWORD(0)
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    api.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if not pid.value:
         return None
-    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    handle = api.kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
     if not handle:
         return None
     try:
@@ -546,23 +794,19 @@ def _windows_foreground_process() -> dict | None:
         exit_time = wintypes.FILETIME()
         kernel_time = wintypes.FILETIME()
         user_time = wintypes.FILETIME()
-        if not kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exit_time),
-                                        ctypes.byref(kernel_time), ctypes.byref(user_time)):
+        if not api.kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                                            ctypes.byref(kernel_time), ctypes.byref(user_time)):
             return None
         created = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
     finally:
-        kernel32.CloseHandle(handle)
+        api.kernel32.CloseHandle(handle)
     return {"pid": int(pid.value), "created": int(created)}
 
 
-def _windows_process_image_name(handle) -> str | None:
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.windll.kernel32
-    size = wintypes.DWORD(32768)
-    buffer = ctypes.create_unicode_buffer(size.value)
-    if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+def _windows_process_image_name(api, handle) -> str | None:
+    size = api.wintypes.DWORD(32768)
+    buffer = api.ctypes.create_unicode_buffer(size.value)
+    if not api.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, api.ctypes.byref(size)):
         return None
     return buffer.value
 
@@ -570,28 +814,20 @@ def _windows_process_image_name(handle) -> str | None:
 _PROCESS_COMMAND_LINE_INFORMATION = 60
 
 
-def _windows_process_command_line(handle) -> str | None:
-    import ctypes
-    from ctypes import wintypes
-
-    ntdll = ctypes.windll.ntdll
-
-    class UNICODE_STRING(ctypes.Structure):
-        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
-                    ("Buffer", ctypes.c_void_p)]
-
-    length = wintypes.ULONG(0)
-    status = ntdll.NtQueryInformationProcess(handle, _PROCESS_COMMAND_LINE_INFORMATION,
-                                             None, 0, ctypes.byref(length))
+def _windows_process_command_line(api, handle) -> str | None:
+    ctypes = api.ctypes
+    length = api.wintypes.ULONG(0)
     # STATUS_INFO_LENGTH_MISMATCH (0xC0000004) is expected on the sizing call.
+    api.ntdll.NtQueryInformationProcess(handle, _PROCESS_COMMAND_LINE_INFORMATION,
+                                        None, 0, ctypes.byref(length))
     if length.value == 0 or length.value > 1 << 20:
         return None
     buffer = ctypes.create_string_buffer(length.value)
-    status = ntdll.NtQueryInformationProcess(handle, _PROCESS_COMMAND_LINE_INFORMATION,
-                                             buffer, length.value, ctypes.byref(length))
+    status = api.ntdll.NtQueryInformationProcess(handle, _PROCESS_COMMAND_LINE_INFORMATION,
+                                                 buffer, length.value, ctypes.byref(length))
     if status != 0:
         return None
-    unicode_string = ctypes.cast(buffer, ctypes.POINTER(UNICODE_STRING)).contents
+    unicode_string = ctypes.cast(buffer, ctypes.POINTER(api.UNICODE_STRING)).contents
     if not unicode_string.Buffer or unicode_string.Length == 0:
         return None
     return ctypes.wstring_at(unicode_string.Buffer, unicode_string.Length // 2)
@@ -599,24 +835,23 @@ def _windows_process_command_line(handle) -> str | None:
 
 def _windows_process_is_slacs(pid, created=None) -> bool:
     """True when ``pid`` runs the SLACS GUI script. Read-only; fails closed."""
-    import ctypes
     import ntpath
 
-    kernel32 = ctypes.windll.kernel32
+    api = _win32()
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False
-    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    handle = api.kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return False
     try:
-        image = _windows_process_image_name(handle)
+        image = _windows_process_image_name(api, handle)
         if not image or ntpath.basename(image).lower() not in ("python.exe", "pythonw.exe"):
             return False
-        command_line = _windows_process_command_line(handle)
+        command_line = _windows_process_command_line(api, handle)
     finally:
-        kernel32.CloseHandle(handle)
+        api.kernel32.CloseHandle(handle)
     if not command_line:
         return False
     return command_line_is_slacs(command_line)

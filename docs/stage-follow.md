@@ -23,6 +23,10 @@ A/D on -X/+X — submitted to the receiver, plus a heartbeat about once a second
 the receiver does not go stale. Presses are counted only while SLACS owns the
 foreground window, identified from the process command line's Python script
 operand (`SniperCellSorterGUIv3.1.py`), cached per process and failing closed.
+A jog key pressed with Ctrl, Alt or a Windows key held is a shortcut and is not
+counted; that held state is followed from the same raw keystroke stream. Windows
+allows one Raw Input keyboard target per process, so every overlay following in a
+window process shares one registration, removed when the last one stops.
 
 **No interference (hard rule).** The observer only reads. Raw Input is a sink: it
 never consumes, delays, alters, blocks, or fails a keystroke, and SLACS's own
