@@ -162,7 +162,8 @@ const NAME='reloadIfRestoredFromCache';
 const REGISTRATION='window.addEventListener("pageshow", '+NAME+');';
 const results={};
 for(const name of ['app.js','shell-v1.js']){
-  const source=fs.readFileSync(path.join(process.argv[1],name),'utf8');
+  // Windows CI checks out CRLF; the function is cut out by its '\n}\n' end.
+  const source=fs.readFileSync(path.join(process.argv[1],name),'utf8').replace(/\r\n/g,'\n');
   const start=source.indexOf('function '+NAME+'(');
   if(start<0)throw new Error('no '+NAME+' in '+name);
   const handlers=[],reloads=[];
