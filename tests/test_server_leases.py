@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import email.message
+import json
 import threading
 import time
 from pathlib import Path
@@ -10,8 +11,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from nd2wsi import annotation_workspace, render
 from nd2wsi import astromap_export as am
-from nd2wsi import render
 from nd2wsi.server import (
     EXPORT_COUNT_MIN_PIXELS,
     TILE_RE,
@@ -353,3 +354,47 @@ def test_histogram_runs_once_without_holding_the_attrs_lock(monkeypatch):
             worker.join(5)
     assert len(calls) == 1
     assert [reply["channels"] for reply in replies] == [[{"bins": []}]] * 2
+
+
+def browser_save_handler(st, items):
+    registry = SlideRegistry()  # browser mode: no window session
+    registry.slides[SID] = st
+    handler = bare_handler(registry)
+    handler._body_json = lambda limit=None: {"items": items}
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._error = lambda code, message: replies.append((code, message))
+    return handler, replies
+
+
+def test_browser_mode_annotation_save_is_atomic_and_durable(monkeypatch, tmp_path):
+    sidecar = tmp_path / "example.annotations.json"
+    synced = []
+    real_fsync = annotation_workspace.os.fsync
+    monkeypatch.setattr(annotation_workspace.os, "fsync",
+                        lambda fd: (synced.append(fd), real_fsync(fd)))
+    st = state(annotations_path=sidecar)
+    handler, replies = browser_save_handler(st, [{"id": "a"}])
+    handler._annotations_post(st, {})
+    assert replies == [(200, {"ok": True, "path": str(sidecar), "count": 1})]
+    assert synced
+    saved = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert saved["items"] == [{"id": "a"}]
+    assert saved["coordinate_space"] == "level-0-pixels"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [sidecar.name]
+
+
+def test_failed_browser_mode_annotation_save_leaves_no_temp_file(monkeypatch, tmp_path):
+    sidecar = tmp_path / "example.annotations.json"
+    sidecar.write_text('{"items": ["kept"]}', encoding="utf-8")
+
+    def disk_full(fd):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(annotation_workspace.os, "fsync", disk_full)
+    st = state(annotations_path=sidecar)
+    handler, replies = browser_save_handler(st, [{"id": "lost"}])
+    handler._annotations_post(st, {})
+    assert replies == [(500, f"could not save {sidecar.name}: disk full")]
+    assert sidecar.read_text(encoding="utf-8") == '{"items": ["kept"]}'
+    assert sorted(p.name for p in tmp_path.iterdir()) == [sidecar.name]

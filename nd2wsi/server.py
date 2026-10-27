@@ -2091,8 +2091,6 @@ def make_handler(
             self._json({"items": items, "path": str(p)})
 
         def _annotations_post(self, st: ViewerState, q: dict | None = None):
-            import uuid as _uuid
-
             try:
                 p, site = self._plate_site(st, q or {})
             except ValueError as e:
@@ -2145,12 +2143,16 @@ def make_handler(
                 except (ValueError, UnicodeError, OSError, TimeoutError) as e:
                     return self._error(500, f"could not save {p.name}: {e}")
                 return self._json({"ok": True, "path": str(p), "count": len(data["items"]), "revision": rev})
-            # unique temp + per-slide lock: two tabs saving at once cannot
-            # interleave through one shared temp name
-            with st.lock:
-                tmp = p.with_name(f".{p.name}.{_uuid.uuid4().hex[:8]}.tmp")
-                tmp.write_text(json.dumps(payload, indent=1))
-                tmp.replace(p)  # atomic
+            from .annotation_workspace import _atomic_write
+
+            # unique, fsynced temp + per-slide lock: two tabs saving at once
+            # cannot interleave, and a crash leaves the old or the new file
+            raw = json.dumps(payload, indent=1).encode("utf-8")
+            try:
+                with st.lock:
+                    _atomic_write(p, raw)
+            except OSError as e:
+                return self._error(500, f"could not save {p.name}: {e}")
             self._json({"ok": True, "path": str(p), "count": len(data["items"])})
 
         def _histogram(self, st: ViewerState, q: dict | None = None):
