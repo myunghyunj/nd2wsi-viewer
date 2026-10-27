@@ -204,6 +204,8 @@ _OPENS_LOCK = threading.Lock()
 _FLUSHER_ALIVE = False
 _LAUNCH_PATH: str | None = None  # the file given at launch, resolved
 _LAUNCH_AT = 0.0
+_OPEN_READY_TIMEOUT = 60.0  # how long queued opens wait for the page to take them
+_OPEN_CALL_TIMEOUT = 5.0  # one delivery call; the budget window_lifecycle gives a browser call
 
 
 def _dispatch_open(paths):
@@ -237,39 +239,90 @@ def _dispatch_open(paths):
     threading.Thread(target=_flush_opens, daemon=True).start()
 
 
+def _start_page_call(window, script):
+    """Run ``window.evaluate_js(script)`` on its own daemon thread.
+
+    pywebview's evaluate_js has no deadline (it first waits up to 20 s for
+    the page bridge, then for the script's answer), so the caller waits on
+    the returned ``done`` event with its own budget. A page that never
+    answers strands this helper thread, never the flusher. ``outcome`` holds
+    "value" or "error" once ``done`` is set.
+    """
+    done = threading.Event()
+    outcome: dict = {}
+
+    def call():
+        try:
+            outcome["value"] = window.evaluate_js(script)
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=call, name="finder-open-js", daemon=True).start()
+    return done, outcome
+
+
 def _flush_opens():
+    """Hand queued opens to the page until the queue is empty.
+
+    The flusher stops only when it sees the queue empty, and it clears
+    ``_FLUSHER_ALIVE`` under the same lock, so an open queued while a batch
+    is being delivered is delivered too. Every page call runs on a helper
+    thread: the readiness probe may wait until the deadline (startup can
+    hold pywebview's bridge for seconds), a delivery waits at most
+    ``_OPEN_CALL_TIMEOUT``. The next call starts only after the previous
+    one answered, so a hung page strands at most one helper thread per
+    flusher, and after the deadline the flusher gives up with the paths
+    still queued; the next open starts a new flusher that delivers them.
+    """
     import json as _json
     import time
 
     import webview
 
     global _FLUSHER_ALIVE
+    owner = True
+    deadline = time.monotonic() + _OPEN_READY_TIMEOUT
+    running = None  # (done, outcome) of the newest page call
     try:
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            if webview.windows:
-                try:
-                    ready = webview.windows[0].evaluate_js(
-                        "typeof window.__pydrop_multi"
-                    )
-                except Exception:
-                    ready = None
-                if ready == "function":
-                    with _OPENS_LOCK:
-                        batch, _PENDING_OPENS[:] = list(_PENDING_OPENS), []
-                    if batch:
-                        _dlog(f"flushing {len(batch)} queued open(s)")
-                        webview.windows[0].evaluate_js(
-                            f"window.__pydrop_multi({_json.dumps(batch)})"
-                        )
-                    return
-            time.sleep(0.3)
-        _dlog("flush_opens timed out")
+        while True:
+            with _OPENS_LOCK:
+                left = len(_PENDING_OPENS)
+                if not left or time.monotonic() >= deadline:
+                    _FLUSHER_ALIVE = owner = False
+            if not owner:
+                if left:
+                    _dlog(f"flush_opens timed out; {left} open(s) stay queued for the next open")
+                return
+            if not webview.windows:
+                time.sleep(0.3)
+                continue
+            window = webview.windows[0]
+            if running is not None and not running[0].wait(max(0.0, deadline - time.monotonic())):
+                continue  # the page still has not answered the previous call
+            running = _start_page_call(window, "typeof window.__pydrop_multi")
+            if not running[0].wait(max(0.0, deadline - time.monotonic())):
+                continue
+            if running[1].get("value") != "function":
+                time.sleep(0.3)
+                continue
+            with _OPENS_LOCK:
+                batch, _PENDING_OPENS[:] = list(_PENDING_OPENS), []
+            _dlog(f"flushing {len(batch)} queued open(s)")
+            running = _start_page_call(window, f"window.__pydrop_multi({_json.dumps(batch)})")
+            # A late answer still opens the batch, so it is never queued again.
+            if not running[0].wait(_OPEN_CALL_TIMEOUT):
+                _dlog(f"the viewer did not answer {len(batch)} open(s) within {_OPEN_CALL_TIMEOUT:g} seconds")
+            elif "error" in running[1]:
+                _dlog(f"flush_opens failed: {running[1]['error']}")
+            deadline = time.monotonic() + _OPEN_READY_TIMEOUT
     except Exception as e:
         _dlog(f"flush_opens failed: {e}")
     finally:
-        with _OPENS_LOCK:
-            _FLUSHER_ALIVE = False
+        if owner:
+            with _OPENS_LOCK:
+                _FLUSHER_ALIVE = False
 
 
 def _install_open_files_handler():
