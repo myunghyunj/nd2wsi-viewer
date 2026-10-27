@@ -193,9 +193,10 @@ init().catch((e) => {
 // afterwards. A pane the browser restores from its back/forward cache would
 // come back with those already disposed and silently stop saving, so it
 // loads afresh instead.
-window.addEventListener("pageshow", (event) => {
+function reloadIfRestoredFromCache(event) {
   if (event.persisted) location.reload();
-});
+}
+window.addEventListener("pageshow", reloadIfRestoredFromCache);
 
 async function init() {
   const res = await fetch("api/info");

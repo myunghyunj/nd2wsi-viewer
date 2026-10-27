@@ -154,23 +154,29 @@ fire(window,'pagehide');return {{calls,editorHidden:nodes['ann-editor'].hidden}}
                        "editorHidden": True}
 
 
+# Other pageshow listeners may share these files (the shell restarts its own
+# polling on pageshow), so the reload handler is found by name, not position.
 PAGESHOW = r"""
 const fs=require('fs'),path=require('path'),vm=require('vm');
+const NAME='reloadIfRestoredFromCache';
+const REGISTRATION='window.addEventListener("pageshow", '+NAME+');';
 const results={};
 for(const name of ['app.js','shell-v1.js']){
   const source=fs.readFileSync(path.join(process.argv[1],name),'utf8');
-  const start=source.indexOf('window.addEventListener("pageshow"');
-  if(start<0)throw new Error('no pageshow listener in '+name);
+  const start=source.indexOf('function '+NAME+'(');
+  if(start<0)throw new Error('no '+NAME+' in '+name);
   const handlers=[],reloads=[];
   const context={window:{addEventListener:(type,fn)=>handlers.push([type,fn])},
     location:{reload:()=>reloads.push(true)}};
   vm.createContext(context);
-  vm.runInContext(source.slice(start,source.indexOf('\n});',start)+4),context);
+  const registrations=source.split(REGISTRATION).length-1;
+  vm.runInContext(source.slice(start,source.indexOf('\n}\n',start)+3)+REGISTRATION.repeat(registrations),
+    context);
   handlers.forEach(([,fn])=>fn({persisted:false}));
   const fresh=reloads.length;
   handlers.forEach(([,fn])=>fn({persisted:true}));
   results[name]={types:handlers.map(([type])=>type),fresh,restored:reloads.length-fresh,
-    count:source.split('addEventListener("pageshow"').length-1};
+    references:source.split(NAME).length-1};
 }
 process.stdout.write(JSON.stringify(results));
 """
@@ -180,7 +186,8 @@ def test_pane_and_shell_reload_only_when_restored_from_the_back_forward_cache():
     result = subprocess.run([NODE, "-e", PAGESHOW, str(STATIC)], capture_output=True, text=True,
                             encoding="utf-8", timeout=20)
     assert result.returncode == 0, result.stderr
-    expected = {"types": ["pageshow"], "fresh": 0, "restored": 1, "count": 1}
+    # one declaration and exactly one pageshow registration per page
+    expected = {"types": ["pageshow"], "fresh": 0, "restored": 1, "references": 2}
     assert json.loads(result.stdout) == {"app.js": expected, "shell-v1.js": expected}
 
 
