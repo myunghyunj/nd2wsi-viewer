@@ -600,6 +600,48 @@ def test_a_busy_spell_is_logged_once_and_its_recovery_summarised(log_events):
     assert len(kinds(log_events, "slacs_controls")) == 1
 
 
+def test_stopping_during_a_busy_spell_closes_it_without_claiming_recovery(log_events):
+    monitor, _reader, clock = make_monitor(good(), busy(100.0), unreadable(latency=20.0),
+                                           busy(180.0))
+    monitor.poll_once()
+    for when in (1.0, 1.5, 2.0):
+        clock.now = when
+        monitor.poll_once()
+    clock.now = 4.0
+    monitor.stop()
+    monitor.stop()
+    assert kinds(log_events, "slacs_ui_responsive") == []
+    assert kinds(log_events, "slacs_ui_busy_end") == [
+        {"busy_seconds": 3.0, "max_latency_ms": 180.0, "failed_reads": 3, "ended": "stopped"}]
+    # The spell is closed before the final latency summary.
+    order = [kind for kind, _fields in log_events]
+    assert order.index("slacs_ui_busy_end") < order.index("slacs_ui_latency")
+
+
+def test_a_spell_left_open_when_slacs_goes_away_is_closed_at_stop(log_events):
+    pids = iter([SLACS_PID, SLACS_PID, None, None])
+    clock = Clock()
+    monitor = SlacsControlsMonitor(lambda: next(pids), reader=Scripted(good(), busy()),
+                                   clock=clock)
+    for when in (0.0, 0.2, 0.4, 0.6):
+        clock.now = when
+        monitor.poll_once()
+    clock.now = 1.0
+    monitor.stop()
+    assert kinds(log_events, "slacs_ui_busy_end") == [
+        {"busy_seconds": 0.8, "max_latency_ms": 100.0, "failed_reads": 1, "ended": "stopped"}]
+
+
+def test_stop_after_a_recovered_spell_does_not_close_it_again(log_events):
+    monitor, _reader, clock = make_monitor(busy(), good())
+    monitor.poll_once()
+    clock.now = 0.5
+    monitor.poll_once()
+    monitor.stop()
+    assert len(kinds(log_events, "slacs_ui_responsive")) == 1
+    assert kinds(log_events, "slacs_ui_busy_end") == []
+
+
 def test_a_slow_successful_read_counts_as_busy_but_its_values_are_used(log_events):
     slow = BUSY_LATENCY_MS + 50.0
     monitor, _reader, clock = make_monitor(good(10.0), good(1.0, latency=slow), good(1.0))

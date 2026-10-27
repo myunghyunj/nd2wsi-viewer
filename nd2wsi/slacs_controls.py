@@ -450,7 +450,8 @@ class SlacsControlsMonitor:
     leaves the last Roughness in place. Session-log records: ``slacs_controls``
     when the values or their readability change (a busy failure is reported by
     ``slacs_ui_busy`` instead, since SLACS did not answer at all),
-    ``slacs_ui_busy`` / ``slacs_ui_responsive`` around each busy spell, and a
+    ``slacs_ui_busy`` / ``slacs_ui_responsive`` around each busy spell (a spell
+    still open at stop ends with ``slacs_ui_busy_end`` instead), and a
     ``slacs_ui_latency`` summary every ``summary_seconds`` and at stop.
     ``poll_once()`` performs one read for tests that drive the clock.
     """
@@ -526,7 +527,16 @@ class SlacsControlsMonitor:
                 thread.join(timeout=STOP_JOIN_SECONDS)
             events: list = []
             with self._lock:
-                self._summarise_locked(self._clock(), events, final=True)
+                now = self._clock()
+                if self._busy_since is not None:
+                    # Follow ended while SLACS was still busy (or gone): close the spell
+                    # without claiming SLACS answered again.
+                    events.append(("slacs_ui_busy_end", {
+                        "busy_seconds": round(now - self._busy_since, 2),
+                        "max_latency_ms": round(self._busy_max_ms, 1),
+                        "failed_reads": self._busy_failed, "ended": "stopped"}))
+                    self._busy_since = None
+                self._summarise_locked(now, events, final=True)
             self._emit(events)
         except Exception:  # noqa: BLE001 - teardown must not raise
             pass
