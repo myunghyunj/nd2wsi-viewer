@@ -28,6 +28,9 @@
   <div id="stage-follow-settings" hidden>
     <label class="mirror-image-control"><input id="overlay-mirror" type="checkbox" checked /> Mirror image</label>
     <p class="stage-follow-hint">For viewing the sample from below.</p>
+    <label class="stage-follow-step-control">Step per key press <input id="stage-follow-step" type="number" min="0.001" max="10000" step="0.1" value="10" /> µm</label>
+    <p class="stage-follow-hint">Set this to SLACS's Roughness (1 Roughness ≈ 1 µm). Counts W/A/S/D only while SLACS is in front.</p>
+    <output id="stage-follow-count">Key presses: 0</output>
     <p>Stage → image alignment</p>
     <label>Rotation <input id="stage-follow-angle" type="number" min="-360" max="360" step="0.1" value="0" /> °</label>
     <div class="stage-follow-flips">

@@ -10,6 +10,13 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function (geometry) {
   "use strict";
 
+  // The per-key stage step, remembered per viewer. SLACS jogs the stage by its
+  // Roughness in micrometres; this should match it (1 Roughness ≈ 1 µm).
+  const STEP_STORAGE_KEY = "nd2wsi.stageFollow.stepUm";
+  const DEFAULT_STEP_UM = 10;
+  const MIN_STEP_UM = 0.001;
+  const MAX_STEP_UM = 10000;
+
   function validateContext(value, pageUrl) {
     if (!value || value.version !== 1 || !Array.isArray(value.center) ||
         value.center.length !== 2 || !value.center.every(Number.isFinite) ||
@@ -167,16 +174,25 @@
     const followFlipX = doc.getElementById("stage-follow-flip-x");
     const followFlipY = doc.getElementById("stage-follow-flip-y");
     const followSave = doc.getElementById("stage-follow-save");
+    const followStep = doc.getElementById("stage-follow-step");
+    const followCount = doc.getElementById("stage-follow-count");
     const mirrorControl = doc.getElementById("overlay-mirror");
     const pixelSize = stagePixelSize(info);
     const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
     const initialOpacity = validOpacity(context.opacity) ? context.opacity : .55;
+    const clampStep = value =>
+      Number.isFinite(value) && value >= MIN_STEP_UM && value <= MAX_STEP_UM ? value : null;
+    const loadStep = () => {
+      try { const stored = clampStep(Number(win.localStorage.getItem(STEP_STORAGE_KEY))); if (stored) return stored; }
+      catch (_) { /* private mode or blocked storage: fall back to the default */ }
+      return DEFAULT_STEP_UM;
+    };
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
       rois: [], roiIndex: -1, roiName: "", loadingRois: false,
-      mirrorScan: context.mirror_scan !== false,
+      mirrorScan: context.mirror_scan !== false, stepUm: loadStep(),
       opacity: initialOpacity, confirmedOpacity: initialOpacity };
     const follow = state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
-      seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "",
+      seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null,
       alignment: { angle: 0, flipX: false, flipY: false } };
     let followEpoch = 0, followTimer = null, followInFlight = false, disposed = false;
     let followLifecycle = Promise.resolve();
@@ -310,10 +326,16 @@
       followButton.disabled = follow.pending || !state.ready || !pixelSize || !available;
       followButton.setAttribute("aria-pressed", String(follow.enabled));
       followButton.title = !pixelSize ? "Follow needs a calibrated image pixel size" : !available ? "Stage follow is unavailable" :
-        follow.enabled ? "Stop following stage commands" : "Follow stage commands";
-      followStatus.textContent = follow.pending ? "Connecting…" : follow.status === "following" ? "Following commands" :
-        follow.status === "waiting" ? "Waiting for stage" : follow.status === "paused" ? "Paused" : "Off";
-      followStatus.dataset.status = follow.status;
+        follow.enabled ? "Stop following SLACS keys" : "Follow SLACS W/A/S/D keys";
+      // SLACS can lose the foreground without pausing; surface that without stopping.
+      // A pause stops polling, so it must not hide behind this stale hint.
+      const notInFront = follow.enabled && ["waiting", "following"].includes(follow.status) &&
+        !!follow.keys && follow.keys.slacs_in_front === false;
+      followStatus.textContent = follow.pending ? "Connecting…" : notInFront ? "SLACS not in front" :
+        follow.status === "following" ? "Following SLACS keys" :
+        follow.status === "waiting" ? "Waiting for W/A/S/D in SLACS" :
+        follow.status === "paused" ? "Paused" : "Off";
+      followStatus.dataset.status = notInFront ? "not-in-front" : follow.status;
       followStatus.title = follow.message;
       const editable = !state.locked && !state.pending;
       mirrorControl.checked = state.mirrorScan;
@@ -322,6 +344,15 @@
       followAngle.value = String(follow.alignment.angle);
       followFlipX.checked = follow.alignment.flipX;
       followFlipY.checked = follow.alignment.flipY;
+      if (followStep) {
+        followStep.value = String(state.stepUm);
+        // The step is fixed for a run: changing it mid-follow would desync counts.
+        followStep.disabled = follow.enabled || follow.pending;
+      }
+      if (followCount) {
+        const counted = follow.keys && Number.isFinite(follow.keys.counted) ? follow.keys.counted : 0;
+        followCount.textContent = "Key presses: " + counted;
+      }
       followSave.disabled = !follow.enabled || follow.pending || typeof api.save_stage_follow_connection !== "function";
       doc.getElementById("stage-follow-message").textContent = follow.message ||
         (!pixelSize ? "A calibrated pixel size is needed." : "Commanded motion · alignment not verified");
@@ -373,6 +404,7 @@
       follow.seq = result.seq;
       follow.status = result.status;
       follow.message = "";
+      follow.keys = result.keys && typeof result.keys === "object" ? result.keys : null;
       paintFollow();
       return true;
     };
@@ -408,11 +440,13 @@
       // Serialize native starts/stops, including a close during a pending start.
       const task = followLifecycle.catch(() => {}).then(async () => {
         if (epoch !== followEpoch || disposed) return false;
-        const result = requireSuccess(await api.start_stage_follow(), "Could not connect to the stage");
+        // Observe SLACS's W/A/S/D keys; step must match SLACS's Roughness.
+        const result = requireSuccess(await api.start_stage_follow({ source: "keys", step_um: state.stepUm }),
+          "Could not connect to the stage");
         if (epoch !== followEpoch || disposed) return false;
         if (typeof result?.session_id !== "string" || !result.session_id) throw new Error("Stage session is unavailable");
         follow.enabled = true; follow.sessionId = result.session_id; follow.status = "waiting";
-        follow.seq = 0; follow.displacement = [0, 0]; follow.lastDelta = { x: 0, y: 0 };
+        follow.seq = 0; follow.displacement = [0, 0]; follow.lastDelta = { x: 0, y: 0 }; follow.keys = null;
         scheduleStagePoll();
         return true;
       }).catch(error => {
@@ -428,7 +462,7 @@
       const wasActive = follow.enabled || follow.pending;
       const epoch = ++followEpoch;
       clearFollowTimer();
-      follow.enabled = false; follow.status = "off"; follow.sessionId = ""; follow.message = "";
+      follow.enabled = false; follow.status = "off"; follow.sessionId = ""; follow.message = ""; follow.keys = null;
       follow.pending = wasActive;
       if (!disposed) paintLock();
       if (!wasActive) return Promise.resolve(true);
@@ -475,6 +509,16 @@
       control.addEventListener("change", () => setStageAlignment({ angle: Number(followAngle.value),
         flipX: followFlipX.checked, flipY: followFlipY.checked }));
     }
+    const setStepUm = value => {
+      const next = clampStep(value);
+      if (next === null || follow.enabled || follow.pending) { paintFollow(); return false; }
+      state.stepUm = next;
+      try { win.localStorage.setItem(STEP_STORAGE_KEY, String(next)); }
+      catch (_) { /* storage may be unavailable; keep the value for this session */ }
+      paintFollow();
+      return true;
+    };
+    followStep?.addEventListener("change", () => setStepUm(Number(followStep.value)));
     followSave.addEventListener("click", async () => {
       if (!follow.enabled || follow.pending) return;
       const epoch = followEpoch;
@@ -679,12 +723,37 @@
     }, true);
     // Keep the embedded page itself at 100%; zoom belongs to the image.
     doc.addEventListener("wheel", event => { if (event.ctrlKey || state.locked) event.preventDefault(); }, { passive: false });
+    // Forward uncaught overlay errors to the session log. Rate limited, and it
+    // must never throw from inside an error handler.
+    let clientLogCount = 0, clientLogWindowStart = 0;
+    const forwardClientError = payload => {
+      try {
+        if (typeof api.log_client_event !== "function") return;
+        const now = win.performance?.now ? win.performance.now() : Date.now();
+        if (now - clientLogWindowStart > 10000) { clientLogWindowStart = now; clientLogCount = 0; }
+        if (clientLogCount >= 20) return;
+        clientLogCount += 1;
+        const result = api.log_client_event(payload);
+        if (result && typeof result.catch === "function") result.catch(() => {});
+      } catch (_) { /* logging must not surface a new error */ }
+    };
+    win.addEventListener("error", event => forwardClientError({ source: "translucent", kind: "error",
+      message: String(event?.message || event?.error || "error"),
+      where: event?.filename ? event.filename + ":" + event.lineno + ":" + event.colno : "",
+      stack: event?.error?.stack ? String(event.error.stack) : "" }));
+    win.addEventListener("unhandledrejection", event => {
+      const reason = event?.reason;
+      forwardClientError({ source: "translucent", kind: "unhandledrejection",
+        message: String(reason?.message ?? reason ?? "unhandledrejection"),
+        stack: reason?.stack ? String(reason.stack) : "" });
+    });
     win.addEventListener("pagehide", () => {
       stopStageFollow(); disposed = true;
       cancelGesture(); observer?.disconnect(); viewer.destroy();
     }, { once: true });
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
-      startStageFollow, stopStageFollow, pollStageFollow, setStageAlignment, setMirrorScan };
+      startStageFollow, stopStageFollow, pollStageFollow, setStageAlignment, setMirrorScan, setStepUm,
+      forwardClientError };
   }
 
   async function boot(win) {
