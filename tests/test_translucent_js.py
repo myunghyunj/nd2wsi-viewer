@@ -1246,12 +1246,17 @@ def test_a_remembered_off_choice_is_restored_and_blocked_storage_still_reads_rou
       const off=followHarness({stored:{'nd2wsi.stageFollow.stepAuto':'false'}});
       const garbage=followHarness({stored:{'nd2wsi.stageFollow.stepAuto':'maybe'}});
       const blocked=followHarness({blockStorage:true});
+      const blockedDefault=blocked.mounted.state.stepAuto;
+      const blockedChecked=blocked.element('stage-follow-step-auto').checked;
       const changed=blocked.mounted.setStepAuto(false);
       return {off:off.mounted.state.stepAuto,offChecked:off.element('stage-follow-step-auto').checked,
         offHidden:off.element('stage-follow-roughness').hidden,garbage:garbage.mounted.state.stepAuto,
-        changed,blocked:blocked.mounted.state.stepAuto,blockedStep:blocked.mounted.state.stepUm};
+        blockedDefault,blockedChecked,changed,blocked:blocked.mounted.state.stepAuto,
+        blockedStep:blocked.mounted.state.stepUm};
     """)
+    # Storage that throws still starts with Roughness reading on.
     assert result == {"off": False, "offChecked": False, "offHidden": True, "garbage": True,
+                      "blockedDefault": True, "blockedChecked": True,
                       "changed": True, "blocked": False, "blockedStep": 10}
 
 
