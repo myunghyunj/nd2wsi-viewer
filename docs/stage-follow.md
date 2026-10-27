@@ -261,9 +261,10 @@ after discovery.
 
 ## Distribution: the SLACS-module line
 
-This branch is released to the lab as `X.Y.Z_SLACS-module` (for example
-`v2.5.4_SLACS-module`), after each public release, as a draft GitHub release that
-is never added to `updates/appcast.xml`. It keeps the session logging.
+This branch, `slacs-module`, is released to the lab as `X.Y.Z_SLACS-module` (for
+example `v2.5.4_SLACS-module`) after each public release. Each one is a GitHub
+pre-release, never marked latest and never added to `updates/appcast.xml`. It
+keeps the session logging.
 `nd2wsi/edition.py` marks the line:
 
 - Update checks are off. The update button is disabled, a manual check returns
@@ -277,4 +278,6 @@ is never added to `updates/appcast.xml`. It keeps the session logging.
 
 To release the next version, merge `main` into this branch after the public
 release, rebuild on the `windows` workflow, and attach the portable ZIP, its
-`.sha256` and `sdpc-codec-sources-windows-x64.zip` to a new draft release.
+`.sha256`, `sdpc-codec-sources-windows-x64.zip` and its `.sha256` to a new release
+tagged `vX.Y.Z_SLACS-module`. Publish it as a pre-release that is not marked latest.
+The new tag also runs the `windows` and `realdata` workflows.
