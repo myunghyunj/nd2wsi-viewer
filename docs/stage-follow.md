@@ -89,18 +89,20 @@ Checks that cannot tell, and failed searches, keep the found session for a 15 s
 grace, so a brief failure on a slow instrument PC does not stop Follow; after
 that the session is dropped and Follow stops as for a loss.
 
-**Session log.** Records from discovery carry `monitor` (`main` or `translucent`,
-the window that owns the detector):
+**Session log.**
 
 - `slacs_detection` (window, available, session_id, status): each detection
   change, from the main window and from each translucent window.
 - `slacs_query` (ok, seconds, python_processes or reason): each real PowerShell
-  search.
+  search. The detectors share each search, so it names neither window nor
+  monitor.
 - `slacs_check_failing` (reason, grace_seconds), `slacs_check_recovered`
   (failed_checks, seconds, last_reason) and `slacs_check_gave_up` (failed_checks,
   seconds, last_reason): checks that cannot tell, their recovery, and the end of
   the grace; `slacs_exit_seen` (session_id) on a confirmed exit;
-  `slacs_liveness_summary` (checks, failed, max_ms, seconds) every 60 s.
+  `slacs_liveness_summary` (checks, failed, max_ms, seconds) every 60 s. These
+  also carry `monitor` (`main` or `translucent`, the window that owns the
+  detector).
 - `slacs_controls` (roughness_um, mirror_h, mirror_v, ok, error): each change of
   Roughness, Mirror or readability.
 - `slacs_ui_busy` (latency_ms, error) when reads start timing out, taking longer

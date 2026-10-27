@@ -215,7 +215,24 @@ def test_a_key_follow_reads_the_controls_of_the_slacs_process_the_overlay_detect
 
 
 def test_the_overlay_options_fit_the_real_follower_and_controls_monitor(monkeypatch):
-    pytest.importorskip('nd2wsi.slacs_controls')  # the Roughness reader and its follower support
+    # The Roughness reader and its follower support.
+    slacs_controls = pytest.importorskip('nd2wsi.slacs_controls')
+    real_monitor, real_follower = slacs_controls.SlacsControlsMonitor, stage_keys.SlacsKeyFollower
+    monitors, follower_options = [], []
+
+    # Spies that build the real classes: the overlay hides a monitor that fails
+    # to build (Follow then moves by the manual step), so only these can tell.
+    def monitor(*args, **kwargs):
+        made = real_monitor(*args, **kwargs)
+        monitors.append((args, kwargs, made))
+        return made
+
+    def follower(*args, **kwargs):
+        follower_options.append(kwargs)
+        return real_follower(*args, **kwargs)
+
+    monkeypatch.setattr(slacs_controls, 'SlacsControlsMonitor', monitor)
+    monkeypatch.setattr(stage_keys, 'SlacsKeyFollower', follower)
     running = {'available': True, 'session_id': 'process-one', 'status': 'running'}
     api, _ = _overlay_with_detector(monkeypatch, running)
     # Off Windows neither reads anything: no Raw Input and no window messages in a test.
@@ -224,6 +241,11 @@ def test_the_overlay_options_fit_the_real_follower_and_controls_monitor(monkeypa
         result = api.start_stage_follow({'source': 'keys', 'step_um': 4, 'step_source': 'slacs'})
     finally:
         api.close_translucent()
+    # The real monitor accepts the overlay's pid source and is what the follower gets.
+    [(args, kwargs, made)] = monitors
+    assert args == (api._slacs_pid,) and kwargs == {}
+    [options] = follower_options
+    assert options['controls'] is made
     # Every option the overlay passes is accepted; the real follower then refuses off Windows.
     assert result['ok'] is False and 'Windows' in result['message']
     assert api._stage_follow is None and api._stage_follower is None
