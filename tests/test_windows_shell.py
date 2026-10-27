@@ -762,6 +762,8 @@ def test_main_passes_edge_renderer_and_writes_gui_report(fake_webview, monkeypat
 
 
 def test_main_keeps_a_session_log_of_the_whole_run(fake_webview, monkeypatch, tmp_path):
+    import faulthandler
+
     from nd2wsi import session_log
 
     webview, window = fake_webview
@@ -772,11 +774,17 @@ def test_main_keeps_a_session_log_of_the_whole_run(fake_webview, monkeypatch, tm
     hook = sys.excepthook
     assert app.main(["--gui-smoke", "--smoke-report", str(tmp_path / "gui-smoke.json")]) == 0
     log, = (tmp_path / "session logs").glob("session-*.jsonl")
+    fatal = log.with_name(log.stem + "-fatal.txt")
+    # The log outlives main(): a crash while the interpreter shuts down is
+    # still captured, and the atexit hook (or run()) closes it.
+    assert session_log.path() == log and session_log._handle is not None
+    assert sys.excepthook is session_log._excepthook and faulthandler.is_enabled() and fatal.exists()
+    session_log.stop("exit")
     records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     by_kind = {}
     for record in records:
         by_kind.setdefault(record["kind"], []).append(record)
-    assert records[0]["kind"] == "start" and records[-1]["kind"] == "stop"
+    assert records[0]["kind"] == "start" and [record["kind"] for record in records[-2:]] == ["app_exit", "stop"]
     assert by_kind["app_start"][0]["mode"] == "gui-smoke"
     assert {"os", "machine", "python", "frozen"} <= set(by_kind["app_start"][0])
     created, = by_kind["window_created"]
@@ -788,10 +796,62 @@ def test_main_keeps_a_session_log_of_the_whole_run(fake_webview, monkeypatch, tm
     assert by_kind["gui_smoke"][0]["ok"] is True
     assert by_kind["app_exit"][0]["result"] == 0
     assert any(str(log) in record["message"] for record in by_kind["app_log"])
-    # The run closes its log: hooks are handed back and later events go nowhere.
-    assert session_log.path() == log and sys.excepthook is hook
+    # Closing the log hands the hooks back, removes the empty fatal file and
+    # later events go nowhere.
+    assert session_log.path() == log and sys.excepthook is hook and not fatal.exists()
     session_log.event("after")
     assert log.read_text(encoding="utf-8").count("\n") == len(records)
+
+
+@pytest.mark.parametrize("arguments, diagnostic", [
+    (["--gui-smoke", "slide.nd2"], True),
+    (["--browser-replay-report=report.json"], True),
+    (["slide.nd2"], False),
+])
+def test_run_closes_the_session_log_only_before_a_diagnostic_os_exit(monkeypatch, tmp_path, arguments, diagnostic):
+    from nd2wsi import session_log
+
+    def main(_arguments):
+        session_log.start(app_name=app.APP_NAME, version="test", folder=tmp_path)
+        session_log.event("app_exit", result=0)
+        return 0
+
+    def exit_now(code):
+        exits.append((code, session_log._handle is None))
+        raise SystemExit(code)
+
+    exits = []
+    monkeypatch.setattr(app, "main", main)
+    monkeypatch.setattr(app.os, "_exit", exit_now)
+    if diagnostic:
+        with pytest.raises(SystemExit):
+            app.run(arguments)
+        log, = tmp_path.glob("session-*.jsonl")
+        last = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
+        assert exits == [(0, True)]
+        assert last["kind"] == "stop" and last["reason"] == "diagnostic run finished"
+    else:
+        # An interactive run returns; the atexit hook closes the log later.
+        assert app.run(arguments) == 0
+        assert exits == [] and session_log._handle is not None
+
+
+def test_an_error_escaping_main_is_recorded_once_main_has_logged_its_exit(monkeypatch, tmp_path):
+    from nd2wsi import session_log
+
+    monkeypatch.setenv("ND2WSI_SESSION_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(app, "_main", Mock(side_effect=RuntimeError("could not open slide")))
+    monkeypatch.setattr(sys, "excepthook", lambda *_args: None)
+    with pytest.raises(RuntimeError) as raised:
+        app.main([])
+    # Uncaught, the error reaches sys.excepthook, which keeps its traceback.
+    sys.excepthook(raised.type, raised.value, raised.tb)
+    session_log.stop("exit")
+    log, = (tmp_path / "logs").glob("session-*.jsonl")
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    exit_record, crash = [record for record in records if record["kind"] in ("app_exit", "crash")]
+    assert exit_record == {**exit_record, "ok": False, "error": "RuntimeError", "message": "could not open slide"}
+    assert crash["type"] == "RuntimeError" and "could not open slide" in crash["traceback"]
 
 
 def test_main_reports_missing_webview2_without_blocking_ci(fake_webview, monkeypatch, tmp_path):

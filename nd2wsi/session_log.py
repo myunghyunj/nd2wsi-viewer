@@ -5,7 +5,8 @@ Interface used across the app:
 - ``start(app_name=..., version=..., folder=None)`` opens this run's log file and
   returns its path, or None when logging could not start.
 - ``event(kind, **fields)`` appends one record. It is thread-safe, never raises,
-  and does nothing before ``start`` or after ``stop``.
+  and does nothing before ``start`` or after ``stop``. ``kind`` may also be
+  passed by keyword.
 - ``path()`` returns the current log file, or None.
 - ``stop(reason)`` writes a final record and closes the file.
 
@@ -13,6 +14,9 @@ Each process writes ``session-YYYYMMDD-HHMMSS-<pid>.jsonl``: UTF-8, one JSON
 object per line, flushed line by line so a crash keeps everything written
 before it. A native crash (segfault, abort) is written by ``faulthandler`` to
 the matching ``-fatal.txt`` file, which is removed at a clean stop if empty.
+Past MAX_SESSION_BYTES a session keeps only failures: the LIMIT_KINDS, kinds
+ending in ``_error`` or ``_failed``, and records with ``ok=False`` or
+``level="error"``.
 
 The folder is ``ND2WSI_SESSION_LOG_DIR`` when set; otherwise ``logs`` beside a
 portable frozen Windows executable when that folder is writable (the copy keeps
@@ -43,7 +47,8 @@ from pathlib import Path
 
 ENV_FOLDER = "ND2WSI_SESSION_LOG_DIR"
 MAX_SESSION_BYTES = 50 * 1024 * 1024
-# Past the cap, only these kinds are kept, up to a small hard ceiling.
+# Past the cap, only failures are kept (these kinds, see _kept_when_limited),
+# up to a small hard ceiling.
 LIMIT_KINDS = frozenset({"error", "exception", "client_error", "crash", "stop"})
 _HARD_CEILING = MAX_SESSION_BYTES + 5 * 1024 * 1024
 KEEP_SESSIONS = 50
@@ -53,6 +58,9 @@ KEEP_TOTAL_BYTES = 500 * 1024 * 1024
 _RECENT_SECONDS = 300.0
 HEALTH_INTERVAL = 30.0
 MAX_STRING = 8192
+# A long traceback keeps its first frames and, above all, its end: the
+# innermost frames and the exception that ended the run.
+_TRACEBACK_HEAD = 1024
 _MAX_ITEMS = 200
 _MAX_DEPTH = 6
 _RESERVED = ("t", "uptime", "kind", "thread")
@@ -139,9 +147,20 @@ def start(*, app_name: str, version: str, folder: Path | None = None) -> Path | 
         return None
 
 
-def event(kind: str, /, **fields) -> None:
-    """Append one record; never raises, and is a no-op while no session is open."""
+def event(*args, **fields) -> None:
+    """``event(kind, **fields)``: append one record.
+
+    Never raises, and is a no-op while no session is open. ``kind`` may be
+    given by position or by keyword; with both, the keyword is kept as the
+    ``field_kind`` field.
+    """
     try:
+        if args:
+            kind = args[0]
+            if len(args) > 1:
+                fields["args"] = list(args[1:])
+        else:
+            kind = fields.pop("kind", "event")
         with _lock:
             if _handle is None:
                 return
@@ -196,6 +215,15 @@ def _clip(text: str) -> str:
     return text[:MAX_STRING] + f"…[+{len(text) - MAX_STRING} chars]"
 
 
+def _clip_traceback(text: str) -> str:
+    """At most MAX_STRING characters, cut from the middle of a Python traceback."""
+    if len(text) <= MAX_STRING:
+        return text
+    marker = f"\n…[{len(text) - MAX_STRING} chars omitted]…\n"
+    tail = MAX_STRING - _TRACEBACK_HEAD - len(marker)
+    return text[:_TRACEBACK_HEAD] + marker + text[len(text) - tail:]
+
+
 def _printable(value) -> str:
     try:
         return _clip(str(value))
@@ -236,26 +264,35 @@ def _write(record: dict) -> None:
     """Serialise and append one line. Caller holds ``_lock`` and an open handle."""
     global _limited, _dropped
     kind = _printable(record.pop("kind", "event"))[:100]
-    if _limited and (kind not in LIMIT_KINDS or (_bytes >= _HARD_CEILING and kind != "stop")):
+    kept = _kept_when_limited(kind, record)
+    if _limited and (not kept or (_bytes >= _HARD_CEILING and kind != "stop")):
         _dropped += 1
         return
     line = _encode(kind, record)
     if not _limited and _bytes + len(line) > MAX_SESSION_BYTES and kind != "stop":
         _limited = True
         notice = _encode("log_limit", {
-            "limit_mb": MAX_SESSION_BYTES // (1024 * 1024), "kept_kinds": sorted(LIMIT_KINDS)})
+            "limit_mb": MAX_SESSION_BYTES // (1024 * 1024), "kept_kinds": sorted(LIMIT_KINDS),
+            "also_kept": "kinds ending in _error or _failed; ok=false; level=error"})
         _append(notice)
-        if kind not in LIMIT_KINDS:
+        if not kept:
             _dropped += 1
             return
     _append(line)
+
+
+def _kept_when_limited(kind: str, fields: dict) -> bool:
+    """Whether a record is a failure, kept after the session reached its cap."""
+    return (kind in LIMIT_KINDS or kind.endswith(("_error", "_failed"))
+            or fields.get("ok") is False or fields.get("level") == "error")
 
 
 def _encode(kind: str, fields: dict) -> bytes:
     record = {"t": _timestamp(), "uptime": round(time.monotonic() - _started_monotonic, 3),
               "kind": kind, "thread": threading.current_thread().name}
     for key, value in fields.items():
-        record[_printable(key)[:200]] = _clean(value)
+        key = _printable(key)[:200]
+        record[key] = _clip_traceback(value) if key == "traceback" and isinstance(value, str) else _clean(value)
     text = json.dumps(record, ensure_ascii=False, allow_nan=False)
     # Lone surrogates (undecodable file names) become JSON \uXXXX escapes.
     return (text + "\n").encode("utf-8", "backslashreplace")

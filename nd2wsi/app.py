@@ -18,7 +18,6 @@ import re
 import sys
 import threading
 import time
-import traceback
 import uuid
 from pathlib import Path
 
@@ -55,10 +54,18 @@ def _write_app_log(msg: str) -> None:
         pass
 
 
+# Diagnostic lines that report a caught failure; the session log keeps these
+# even after it reaches its size cap.
+_FAILURE_LINE = re.compile(r"fail|could not|cannot|unavailable|aborted|timed out", re.IGNORECASE)
+
+
 def _dlog(msg: str) -> None:
     """One diagnostic line, in the app log and in this process's session log."""
     _write_app_log(msg)
-    session_log.event("app_log", message=msg)
+    if _FAILURE_LINE.search(msg):
+        session_log.event("app_log", message=msg, level="error")
+    else:
+        session_log.event("app_log", message=msg)
 
 
 def _record_window_shown(*_args) -> None:
@@ -502,7 +509,7 @@ class WindowCloseCoordinator(_window_lifecycle.WindowCloseCoordinator):
             elif cancelled.is_set():
                 session_log.event("window_close", outcome="cancelled")
             else:
-                session_log.event("window_close", outcome="kept open", status=self.api._status)
+                session_log.event("window_close", outcome="kept open", ok=False, status=self.api._status)
 
 
 def _guard_native_close(api: Api, window) -> None:
@@ -698,7 +705,7 @@ class Api:
             return {"ok": True, "id": overlay._window.uid}
         except Exception as exc:
             _dlog(f"translucent viewer open failed: {exc!r}")
-            session_log.event("translucent_open_failed", sid=sid, error=str(exc))
+            session_log.event("translucent_open_failed", sid=sid, ok=False, error=str(exc))
             return {"ok": False, "message": f"Could not open translucent viewer: {exc}"}
 
     def _close_translucent_windows(self, *_args):
@@ -1733,6 +1740,8 @@ def run(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     result = main(arguments)
     if any(argument.split("=", 1)[0] in _DIAGNOSTIC_RUN_FLAGS for argument in arguments):
+        # os._exit skips the atexit hook that otherwise closes the session log.
+        session_log.stop("diagnostic run finished")
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
@@ -1763,20 +1772,20 @@ def main(argv: list[str] | None = None) -> int:
     role_args.add_argument("--agent-window", action="store_true", help="open an isolated Agent window")
     args, _ = ap.parse_known_args(argv)  # tolerate Finder's -psn_* args
 
-    # The session log covers the whole run, diagnostic runs included, and is
-    # closed here: run() may end the process with os._exit, skipping atexit.
+    # The session log covers the whole run, diagnostic runs included. It stays
+    # open after main() returns so that a crash during interpreter shutdown
+    # (native toolkit unload, daemon threads) is still captured: its atexit
+    # hook closes it, and run() closes it before a diagnostic run's os._exit.
     mode = _run_mode(args)
     _start_session_log(mode)
-    result = None
     try:
         result = _main(args)
     except BaseException as exc:
-        session_log.event("crash", where="main", type=type(exc).__name__, message=str(exc),
-                          traceback=traceback.format_exc())
+        # Escaping main(), an error also reaches the session log's
+        # sys.excepthook, which records its traceback as a crash.
+        session_log.event("app_exit", mode=mode, ok=False, error=type(exc).__name__, message=str(exc))
         raise
-    finally:
-        session_log.event("app_exit", mode=mode, result=result)
-        session_log.stop("main returned" if result is not None else "main raised")
+    session_log.event("app_exit", mode=mode, result=result)
     return result
 
 

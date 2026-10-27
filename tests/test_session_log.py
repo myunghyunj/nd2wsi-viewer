@@ -6,6 +6,7 @@ import faulthandler
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ import pytest
 
 from nd2wsi import app, session_log
 
+ROOT = Path(__file__).resolve().parents[1]
 STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d")
 OLD = time.time() - 30 * 24 * 3600
 
@@ -131,6 +133,20 @@ def test_records_are_timestamped_json_lines_with_a_start_and_a_stop(tmp_path):
     assert last["kind"] == "stop" and last["reason"] == "done" and last["dropped"] == 0
 
 
+def test_kind_may_be_given_by_keyword_as_the_shared_interface_allows(tmp_path):
+    path = start(tmp_path)
+    session_log.event(kind="follow_state", status="waiting for stage")
+    session_log.event("follow_key", "extra", kind="shadowed")
+    session_log.event(status="no kind")
+    session_log.stop("done")
+    named, positional, unnamed = records(path)[1:4]
+    assert named["kind"] == "follow_state" and named["status"] == "waiting for stage"
+    assert "field_kind" not in named
+    assert positional["kind"] == "follow_key" and positional["field_kind"] == "shadowed"
+    assert positional["args"] == ["extra"]
+    assert unnamed["kind"] == "event" and unnamed["status"] == "no kind"
+
+
 def test_each_line_is_on_disk_as_soon_as_event_returns(tmp_path):
     path = start(tmp_path)
     session_log.event("follow", state="waiting for stage")
@@ -189,6 +205,45 @@ def test_unserialisable_values_are_stringified_and_long_strings_capped(tmp_path)
     assert records(path)[2]["kind"] == "<unprintable Unprintable>"
 
 
+def test_long_tracebacks_keep_their_innermost_frames_and_final_line(tmp_path):
+    path = start(tmp_path)
+    frames = "".join(f'  File "/src/nd2wsi/step_{index}.py", line {index}, in step_{index}\n'
+                     f"    step_{index + 1}()\n" for index in range(400))
+    trace = "Traceback (most recent call last):\n" + frames + "RuntimeError: could not open slide\n"
+    session_log.event("exception", traceback=trace, stack="s" * 20000)
+    session_log.stop("done")
+    record = records(path)[1]
+    kept = record["traceback"]
+    assert len(trace) > session_log.MAX_STRING and len(kept) == session_log.MAX_STRING
+    assert kept.startswith("Traceback (most recent call last):\n  File \"/src/nd2wsi/step_0.py\"")
+    assert kept.endswith("    step_400()\nRuntimeError: could not open slide\n")
+    assert f"[{len(trace) - session_log.MAX_STRING} chars omitted]" in kept
+    # Other long text, such as a script stack (innermost frame first), keeps its start.
+    assert record["stack"].startswith("s" * session_log.MAX_STRING) and record["stack"].endswith("chars]")
+
+
+def test_an_uncaught_deep_thread_error_keeps_its_final_line(tmp_path):
+    path = start(tmp_path)
+    # Distinct frames: Python folds a run of identical recursive ones.
+    source = "".join(f"def step_{index}():\n    step_{index + 1}()\n" for index in range(300))
+    namespace = {}
+    exec(compile(source + "def step_300():\n    raise RuntimeError('could not open slide')\n",
+                 "slide_steps.py", "exec"), namespace)
+    worker = threading.Thread(target=namespace["step_0"], name="deep-worker")
+    previous = session_log._previous_threading_excepthook
+    try:
+        # Keep pytest's own thread-exception check out of this deliberate failure.
+        session_log._previous_threading_excepthook = lambda args: None
+        worker.start()
+        worker.join()
+    finally:
+        session_log._previous_threading_excepthook = previous
+    session_log.stop("done")
+    record, = [item for item in records(path) if item.get("thread_name") == "deep-worker"]
+    assert record["traceback"].rstrip().endswith("RuntimeError: could not open slide")
+    assert "chars omitted" in record["traceback"]
+
+
 def test_events_before_start_or_after_stop_do_nothing(tmp_path):
     session_log.event("early")
     path = start(tmp_path)
@@ -216,21 +271,35 @@ def test_an_unwritable_folder_or_failing_disk_never_raises(tmp_path):
     assert kinds(path) == ["start"]
 
 
-def test_the_size_cap_keeps_only_errors_and_the_stop_record(monkeypatch, tmp_path):
+def test_the_size_cap_keeps_only_failures_and_the_stop_record(monkeypatch, tmp_path):
     monkeypatch.setattr(session_log, "MAX_SESSION_BYTES", 4000)
-    monkeypatch.setattr(session_log, "_HARD_CEILING", 6000)
+    monkeypatch.setattr(session_log, "_HARD_CEILING", 8000)
+    monkeypatch.setattr(app, "log_path", lambda: tmp_path / "app.log")
     path = start(tmp_path)
     for index in range(40):
         session_log.event("health", index=index, padding="p" * 100)
     for kind in ("error", "exception", "client_error", "crash", "app_log"):
         session_log.event(kind, message=kind)
+    # Caught failures recorded under their own kinds survive the cap too.
+    app._dlog("open FAILED slide.nd2: truncated file")
+    app._dlog("open slide.nd2")
+    app._record_open("slide.nd2", ok=False, error="truncated file")
+    app._record_open("other.nd2", ok=True)
+    session_log.event("translucent_open_failed", error="no window")
+    session_log.event("follow_keys_error", message="hook lost")
+    session_log.event("update_check", ok=False, message="offline")
+    session_log.event("update_check", ok=True)
     session_log.stop("done")
-    written = kinds(path)
-    assert written.count("log_limit") == 1
-    after = written[written.index("log_limit") + 1:]
-    assert after == ["error", "exception", "client_error", "crash", "stop"]
-    assert records(path)[-1]["dropped"] > 0
-    assert path.stat().st_size < 6000
+    written = records(path)
+    assert [record["kind"] for record in written].count("log_limit") == 1
+    after = written[[record["kind"] for record in written].index("log_limit") + 1:]
+    assert [record["kind"] for record in after] == [
+        "error", "exception", "client_error", "crash", "app_log", "file_open", "translucent_open_failed",
+        "follow_keys_error", "update_check", "stop"]
+    assert after[4]["message"] == "open FAILED slide.nd2: truncated file" and after[4]["level"] == "error"
+    assert after[5]["path"] == "slide.nd2" and after[5]["ok"] is False
+    assert written[-1]["dropped"] > 0
+    assert path.stat().st_size < 8000
 
 
 def test_past_the_hard_ceiling_only_the_stop_record_is_written(monkeypatch, tmp_path):
@@ -381,6 +450,32 @@ def test_native_crashes_go_to_a_fatal_file_removed_only_when_empty(tmp_path):
     faulthandler.dump_traceback(file=session_log._fatal_handle)  # what a fatal signal would write
     session_log.stop("done")
     assert "File" in fatal.read_text(encoding="utf-8")
+
+
+CRASH = r"""
+import faulthandler, sys
+from pathlib import Path
+from nd2wsi import session_log
+session_log.start(app_name="nd2wsi-viewer", version="9.9.9", folder=Path(sys.argv[1]))
+session_log.event("before_crash", step=1)
+faulthandler._sigsegv()
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a deliberate access violation may open Windows Error Reporting")
+def test_a_real_native_crash_is_written_to_the_fatal_file_and_keeps_earlier_records(tmp_path):
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    env.pop("PYTHONFAULTHANDLER", None)
+    result = subprocess.run([sys.executable, "-c", CRASH, str(tmp_path)], env=env,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0
+    log, = tmp_path.glob("session-*.jsonl")
+    fatal = log.with_name(log.stem + "-fatal.txt")
+    text = fatal.read_text(encoding="utf-8")
+    assert "Fatal Python error: Segmentation fault" in text and "<string>" in text
+    # faulthandler wrote to the fatal file, not to the child's stderr.
+    assert "Fatal Python error" not in result.stderr
+    assert kinds(log) == ["start", "before_crash"]
 
 
 def test_health_records_arrive_from_a_daemon_thread_that_stop_ends(monkeypatch, tmp_path):
