@@ -70,14 +70,20 @@ def test_stream_has_bounded_reads_and_keeps_temporary_file_until_consumer_finish
     assert events[-1] == {"job": "service-test", "state": "done", "pct": 100}
 
 
-@pytest.mark.parametrize("error", [BrokenPipeError("gone"), OSError("disk failure")])
+@pytest.mark.parametrize("error", [
+    BrokenPipeError("gone"),
+    # Windows sockets report a dropped download as aborted or reset.
+    ConnectionAbortedError("aborted"),
+    ConnectionResetError("reset"),
+    OSError("disk failure"),
+])
 def test_failed_writer_and_disconnected_consumer_cleanup_without_done(monkeypatch, error):
     paths = []
 
     def write(root, attrs, destination, *args, on_progress):
         paths.append(Path(destination))
         Path(destination).write_bytes(b"partial pixels")
-        if not isinstance(error, BrokenPipeError):
+        if not isinstance(error, ConnectionError):
             raise error
 
     monkeypatch.setattr(render, "export_roi_tiff", write)
@@ -88,7 +94,7 @@ def test_failed_writer_and_disconnected_consumer_cleanup_without_done(monkeypatc
     assert not paths[0].exists()
     assert "done" not in [event["state"] for event in events]
     assert events[-1]["error"] == (
-        "client disconnected" if isinstance(error, BrokenPipeError) else "OSError: disk failure"
+        "client disconnected" if isinstance(error, ConnectionError) else "OSError: disk failure"
     )
 
 
@@ -133,7 +139,9 @@ def test_plate_scope_and_agent_filename_refer_to_the_same_requested_root():
     assert export.filename == "agent-session_example_t2_p1_z3_L0_x0_y59_80x1"
 
 
-def test_window_slide_cannot_close_during_transmission_and_lease_releases_on_disconnect(monkeypatch):
+@pytest.mark.parametrize("disconnect", [BrokenPipeError, ConnectionResetError])
+def test_window_slide_cannot_close_during_transmission_and_lease_releases_on_disconnect(
+        monkeypatch, disconnect):
     paths = []
 
     def write(root, attrs, destination, *args, **kwargs):
@@ -157,14 +165,14 @@ def test_window_slide_cannot_close_during_transmission_and_lease_releases_on_dis
         def write(self, chunk):
             writing.set()
             assert release.wait(5)
-            raise BrokenPipeError("gone")
+            raise disconnect("gone")
 
     handler.wfile = DisconnectedSink()
 
     def run():
         try:
             handler._roi(st, query(job="disconnect-lifetime"))
-        except BrokenPipeError as exc:
+        except disconnect as exc:
             failures.append(exc)
 
     worker = threading.Thread(target=run)
@@ -188,17 +196,34 @@ def test_window_slide_cannot_close_during_transmission_and_lease_releases_on_dis
 
 @pytest.mark.parametrize("params,message", [
     ({"level": 4}, "level 4 out of range"),
+    ({"level": "abc"}, "invalid level"),
+    ({"level": "inf"}, "invalid level"),
     ({"x": "invalid"}, "could not convert string to float"),
+    ({"w": "nan"}, "invalid w"),
     ({"format": "bmp"}, "unknown format bmp"),
     ({"format": "png", "scalebar": 1}, "Scale bar export supports SVG and JPEG"),
+    ({"c": "abc"}, "invalid channel list c='abc'"),
+    ({"c": "abc", "format": "png"}, "invalid channel list c='abc'"),
+    ({"c": "none"}, "Select at least one channel to export"),
+    ({"c": "none", "format": "tif"}, "Select at least one channel to export"),
+    ({"c": "none", "format": "nd2"}, "Select at least one channel to export"),
 ])
 def test_adapter_preserves_bad_request_status_and_message(params, message):
     handler_type = make_handler(SlideRegistry())
     handler = handler_type.__new__(handler_type)
     handler._error = lambda status, error: (status, error)
-    status, error = handler._roi(state(), query(**params))
+    st = state()
+    status, error = handler._roi(st, query(**params))
     assert status == 400
     assert message in error
+    assert st.busy.active == 0
+
+
+def test_rendered_export_still_accepts_the_explicit_all_hidden_selection():
+    # Rendered exports keep today's behaviour for c=none until that is decided.
+    assert request(format="png", c="none").channels == []
+    assert request(format="jpg", c="none").channels == []
+    assert request(format="tiff", c="1").channels == [1]
 
 
 @pytest.fixture

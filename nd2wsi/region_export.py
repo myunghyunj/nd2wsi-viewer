@@ -188,7 +188,9 @@ class RegionExport:
         except ExportRequestError as exc:
             update_job(self.job, state="error", error=str(exc))
             raise
-        except BrokenPipeError:
+        except ConnectionError:
+            # BrokenPipeError on POSIX; Windows sockets usually raise
+            # ConnectionAbortedError or ConnectionResetError instead.
             update_job(self.job, state="error", error="client disconnected")
             raise
         except Exception as exc:
@@ -214,9 +216,12 @@ def prepare_export(
         value = query.get(name)
         if not value:
             if default is None:
-                raise ValueError(f"missing parameter {name}")
+                raise ExportRequestError(f"missing parameter {name}")
             return default
-        return int(float(value[0]))
+        try:
+            return int(float(value[0]))
+        except (ValueError, OverflowError) as exc:
+            raise ExportRequestError(f"invalid {name}: {exc}") from None
 
     meta = state.attrs["nd2wsi"]
     level = qi("level", 0)
@@ -225,19 +230,23 @@ def prepare_export(
     except KeyError:
         raise ExportRequestError(f"level {level} out of range") from None
     lw, lh = entry["width"], entry["height"]
-    try:
-        x, y, w, h = qi("x"), qi("y"), qi("w"), qi("h")
-    except ValueError as exc:
-        raise ExportRequestError(str(exc)) from exc
+    x, y, w, h = qi("x"), qi("y"), qi("w"), qi("h")
     x, y = max(0, min(x, lw - 1)), max(0, min(y, lh - 1))
     w, h = max(1, min(w, lw - x)), max(1, min(h, lh - y))
     fmt = (query.get("format") or ["nd2"])[0].lower()
     scale_bar = fmt == "svg" or (query.get("scalebar") or ["0"])[0] == "1"
     if scale_bar and fmt not in ("svg", "jpg", "jpeg"):
         raise ExportRequestError("Scale bar export supports SVG and JPEG")
-    channels = render.parse_channels(
-        (query.get("c") or [None])[0], len(state.attrs["omero"]["channels"])
-    )
+    c = (query.get("c") or [None])[0]
+    try:
+        channels = render.parse_channels(c, len(state.attrs["omero"]["channels"]))
+    except ValueError:
+        raise ExportRequestError(f"invalid channel list c={c!r}") from None
+    # ``c=none`` is an explicit all-hidden selection. A data export of zero
+    # channels has no planes to write, so refuse it instead of failing deep in
+    # a writer. Rendered exports keep their existing behaviour.
+    if not channels and fmt in ("nd2", "tif", "tiff"):
+        raise ExportRequestError("Select at least one channel to export")
     window = (query.get("win") or [None])[0]
     job = (query.get("job") or [None])[0]
     if job and not JOB_RE.match(job):
