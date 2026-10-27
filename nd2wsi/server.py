@@ -854,30 +854,25 @@ class SlideRegistry:
                 ]
             try:
                 annotations = None if degraded else self.annotation_path(store_path, attrs)
+                st = ViewerState(
+                    root,
+                    attrs,
+                    max_render_mpx=self.max_render_mpx,
+                    # annotations live in level-0 pixels; a degraded view's base
+                    # is level 1, so editing here would silently corrupt them
+                    annotations_path=annotations,
+                    # the two modes map levels differently, so tiles cached as
+                    # immutable in one must never be revived in the other
+                    generation=gen + ("-degraded" if degraded else ""),
+                    trash_path=container,
+                    source_path=source,
+                    store_path=store_path,
+                    container_path=container,
+                    manifest=manifest,
+                )
             except BaseException:
-                close = getattr(root, "close", None)
-                if close is not None:
-                    try:
-                        close(delay=0)
-                    except TypeError:
-                        close()
+                ViewerState._close_root(root)
                 raise
-            st = ViewerState(
-                root,
-                attrs,
-                max_render_mpx=self.max_render_mpx,
-                # annotations live in level-0 pixels; a degraded view's base
-                # is level 1, so editing here would silently corrupt them
-                annotations_path=annotations,
-                # the two modes map levels differently, so tiles cached as
-                # immutable in one must never be revived in the other
-                generation=gen + ("-degraded" if degraded else ""),
-                trash_path=container,
-                source_path=source,
-                store_path=store_path,
-                container_path=container,
-                manifest=manifest,
-            )
             if self.agent_window:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
@@ -916,19 +911,18 @@ class SlideRegistry:
             root = attrs = None
             for _ in range(2):
                 root, attrs = open_direct(slide_path)
+                # Never registered, so nothing reads it: close now rather than
+                # after _Root's delay, which kept a Windows sharing lock open
+                # while the retry opened the file again.
                 try:
                     current = quick_fingerprint(slide_path)
                 except Exception:
-                    close = getattr(root, "close", None)
-                    if close:
-                        close()
+                    ViewerState._close_root(root)
                     raise
                 if fingerprints_match(fingerprint, current):
                     fingerprint = current
                     break
-                close = getattr(root, "close", None)
-                if close:
-                    close()
+                ViewerState._close_root(root)
                 root = attrs = None
                 fingerprint = current
             if root is None or attrs is None:
@@ -941,20 +935,18 @@ class SlideRegistry:
             stale = self.slides.get(sid)
             try:
                 annotations = self.annotation_path(slide_path, attrs)
+                st = ViewerState(
+                    root,
+                    attrs,
+                    max_render_mpx=self.max_render_mpx,
+                    annotations_path=annotations,
+                    generation=gen,
+                    source_path=slide_path,
+                    manifest={"source": fingerprint},
+                )
             except BaseException:
-                close = getattr(root, "close", None)
-                if close:
-                    close(delay=0)
+                ViewerState._close_root(root)
                 raise
-            st = ViewerState(
-                root,
-                attrs,
-                max_render_mpx=self.max_render_mpx,
-                annotations_path=annotations,
-                generation=gen,
-                source_path=slide_path,
-                manifest={"source": fingerprint},
-            )
             if self.agent_window:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
@@ -1025,24 +1017,24 @@ class SlideRegistry:
                     source.root_for(0, 0, source.z_home), closer=source.close
                 )
                 annotations = self.annotation_path(slide_path, source.attrs, site=0)
+                stale = self.slides.get(sid)
+                container = source.store.container if source.store is not None else None
+                st = ViewerState(
+                    root,
+                    source.attrs,
+                    max_render_mpx=self.max_render_mpx,
+                    annotations_path=annotations,
+                    generation=gen,
+                    trash_path=container,
+                    source_path=slide_path,
+                    container_path=container,
+                    manifest=(dict(source.store.manifest) if source.store is not None
+                              else {"source": fingerprint}),
+                    plate=source,
+                )
             except BaseException:
                 source.close()
                 raise
-            stale = self.slides.get(sid)
-            container = source.store.container if source.store is not None else None
-            st = ViewerState(
-                root,
-                source.attrs,
-                max_render_mpx=self.max_render_mpx,
-                annotations_path=annotations,
-                generation=gen,
-                trash_path=container,
-                source_path=slide_path,
-                container_path=container,
-                manifest=(dict(source.store.manifest) if source.store is not None
-                          else {"source": fingerprint}),
-                plate=source,
-            )
             if self.agent_window:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from nd2wsi import annotation_workspace, render
+from nd2wsi import annotation_workspace, cache, raster, render, server
 from nd2wsi import astromap_export as am
 from nd2wsi.server import (
     EXPORT_COUNT_MIN_PIXELS,
@@ -398,3 +398,52 @@ def test_failed_browser_mode_annotation_save_leaves_no_temp_file(monkeypatch, tm
     assert replies == [(500, f"could not save {sidecar.name}: disk full")]
     assert sidecar.read_text(encoding="utf-8") == '{"items": ["kept"]}'
     assert sorted(p.name for p in tmp_path.iterdir()) == [sidecar.name]
+
+
+class _ClosingRoot(dict):
+    def __init__(self, number, closes):
+        super().__init__()
+        self.number, self.closes = number, closes
+
+    def close(self, delay=5.0):
+        self.closes.append((self.number, delay))
+
+
+@pytest.mark.parametrize("failure", ["state", "annotations"])
+def test_failed_direct_open_closes_each_unregistered_root_at_once(monkeypatch, tmp_path, failure):
+    image = tmp_path / "slide.png"
+    image.write_bytes(b"not decoded")
+    closes, opened = [], []
+    attrs = state().attrs
+
+    def open_direct(path):
+        opened.append(path)
+        return _ClosingRoot(len(opened), closes), attrs
+
+    # The file changes once between the first fingerprint and the first open.
+    prints = iter([{"size": 1, "mtime_ns": 1, "quick_sha256": "a"},
+                   {"size": 1, "mtime_ns": 2, "quick_sha256": "b"},
+                   {"size": 1, "mtime_ns": 2, "quick_sha256": "b"}])
+    monkeypatch.setattr(cache, "quick_fingerprint", lambda path: next(prints))
+    monkeypatch.setattr(raster, "open_direct", open_direct)
+    registry = SlideRegistry()
+    if failure == "annotations":
+        def no_sidecar(*args, **kwargs):
+            raise OSError("sidecar unavailable")
+
+        monkeypatch.setattr(registry, "annotation_path", no_sidecar)
+        expected = OSError
+    else:
+        class Unbuildable(ViewerState):
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("state unavailable")
+
+        monkeypatch.setattr(server, "ViewerState", Unbuildable)
+        monkeypatch.setattr(registry, "annotation_path", lambda *args, **kwargs: None)
+        expected = RuntimeError
+    with pytest.raises(expected):
+        registry.add_direct(image)
+    # The stale first open and the failed registration both close without
+    # _Root's 5 s delay, and nothing was registered.
+    assert closes == [(1, 0), (2, 0)]
+    assert registry.slides == {}
