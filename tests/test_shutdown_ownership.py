@@ -193,6 +193,11 @@ def start_update_waiting_for_an_export(p):
     assert p.shell.frozen and len(p.shell.prepares) == prepared + 1
 
 
+def until_the_update_lets_go(p):
+    # _running drops just before the worker releases ownership.
+    until(lambda: not p.update._running and not p.close._ownership().held_by_other(p.close))
+
+
 def test_close_while_an_update_is_prepared_is_vetoed_and_the_panes_stay_frozen(pair):
     p = pair
     start_update_waiting_for_an_export(p)
@@ -224,7 +229,7 @@ def test_close_runs_its_save_handshake_once_the_cancelled_update_lets_go(pair):
     until(lambda: NOTICE in p.shell.notices)
 
     p.update.cancel_preparation()
-    until(lambda: not p.update._running)
+    until_the_update_lets_go(p)
     assert p.shell.cancels == [(update_wire, True)]
     assert not p.shell.frozen
 
@@ -237,6 +242,42 @@ def test_close_runs_its_save_handshake_once_the_cancelled_update_lets_go(pair):
     assert p.shell.notices.count(NOTICE) == 1
     assert p.ui.call(p.close.on_closing) is True
     assert p.api.frozen_at_teardown is None
+
+
+def test_idle_page_close_is_vetoed_while_an_update_is_prepared_and_passes_without_one(pair):
+    p = pair
+    # The page bridge never became ready and no slide is open, so a close has
+    # nothing to save and normally passes at once without a request.
+    p.shell.events = SimpleNamespace(_pywebviewready=threading.Event())
+    p.api._httpd = SimpleNamespace(registry=SimpleNamespace(slides={}))
+    p.api._frac = -1.0
+    assert p.close._page_never_ready_without_slides() is True
+    start_update_waiting_for_an_export(p)
+    update_wire = p.shell.prepares[0]
+
+    assert p.ui.call(p.close.on_closing) is False
+    assert p.close._running is False
+    until(lambda: NOTICE in p.shell.notices)
+    assert p.api._status == NOTICE
+    assert p.shell.frozen
+    assert p.shell.prepares == [update_wire] and p.shell.cancels == []
+    assert p.update._running is True
+    assert p.ui.call(p.close.on_closing) is False
+    assert p.close._running is False
+
+    p.update.cancel_preparation()
+    until_the_update_lets_go(p)
+    assert p.shell.cancels == [(update_wire, True)]
+    assert not p.shell.frozen
+
+    assert p.ui.call(p.close.on_closing) is True
+    assert p.close._running is False
+    assert p.shell.prepares == [update_wire]
+    assert any("page never became ready" in line for line in p.logs)
+    # The idle close started no request, so it holds nothing: an update that
+    # follows a close the window did not carry out still proceeds.
+    assert not p.update._ownership().held_by_other(p.update)
+    until(lambda: p.shell.notices.count(NOTICE) == 2)
 
 
 def test_update_is_refused_while_a_close_is_saving_and_proceeds_after_it(pair):
