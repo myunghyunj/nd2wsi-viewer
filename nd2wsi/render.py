@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 
 from .contrast import auto_window
+from .platform_io import total_physical_memory_bytes
 
 
 def parse_channels(param: str | None, n: int) -> list[int]:
@@ -604,9 +605,9 @@ def export_roi_rendered(
     Compositing goes through float32, which at hundreds of megapixels used
     to mean several times the output size in transients. Each strip is
     composited alone into one preallocated uint8 canvas, so the peak is
-    the canvas plus one strip — the canvas itself is checked against free
-    memory before anything is read. Encoding still needs the whole image;
-    this is bounded, not streaming.
+    the canvas plus one strip — the output buffers are checked against a
+    quarter of installed memory before anything is read. Encoding still
+    needs the whole image; this is bounded, not streaming.
     """
     meta = attrs["nd2wsi"]
     lv = level_entry(meta["levels"], level)
@@ -652,14 +653,9 @@ def export_roi_rendered(
 
 
 def _available_memory() -> int:
-    """Bytes this process can reasonably claim right now."""
-    try:
-        import subprocess
+    """Bytes this process can reasonably claim: half of installed memory.
 
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5
-        )
-        total = int(out.stdout.strip())
-    except Exception:
-        total = 8 << 30
-    return total // 2
+    The same meaning on every OS. The probe is cached and starts no process,
+    so an export pays nothing for it.
+    """
+    return total_physical_memory_bytes() // 2
