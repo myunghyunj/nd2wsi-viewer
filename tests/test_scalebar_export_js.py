@@ -31,7 +31,7 @@ const context={URLSearchParams, Number, Math,
   document:{body:{append(){}},createElement:()=>({click(){downloads.push(this.href)},remove(){}})},
 };
 vm.createContext(context);
-const start=src.indexOf('function scaleBarExportIssue('),end=src.indexOf('let exportTimer',start);
+const start=src.indexOf('function scaleBarExportIssue('),end=src.indexOf('/* Poll the server',start);
 vm.runInContext(src.slice(start,end),context);
 // the real channel and render query helpers; lutParam above is the fixture's
 const queryStart=src.indexOf('function channelQuery('),queryEnd=src.indexOf('function activeFrameParams(',queryStart);

@@ -3703,51 +3703,77 @@ function downloadRoi(fmt, scaleBar = false) {
   } else showToast("export started — check your downloads");
 }
 
-/* Poll the server's write progress and fill the status-bar export gauge. */
-let exportTimer = null;
+/* Poll the server's write progress and fill the status-bar export gauge.
+   Every export polls on its own timeout chain with one request in flight,
+   so a second export never stops tracking the first and each failure is
+   reported. The gauge follows the newest export that is writing. */
+const exportJobs = new Map(); // job id -> { label, shown }, in start order
+let exportGaugeDone = null; // holds a finished export's "done" for a moment
+
+function exportGaugeOwner() {
+  let owner = null;
+  for (const [job, entry] of exportJobs) if (entry.shown) owner = job;
+  return owner;
+}
+
+function releaseExportGauge() {
+  if (exportGaugeOwner() === null) $("export-cell").hidden = true;
+}
+
 function trackExport(job, label) {
   const cell = $("export-cell");
   const fill = $("export-fill");
   const pct = $("export-pct");
-  clearInterval(exportTimer);
-  let shown = false;
+  const entry = { label, shown: false };
   const t0 = Date.now();
-  exportTimer = setInterval(() => {
-    fetch("api/roi/progress?job=" + job, { cache: "no-store" })
-      .then((r) => r.json())
-      .then((d) => {
-        const p = d.pct || 0;
-        if (d.state === "writing" || d.state === "streaming") {
-          if (!shown) {
-            shown = true;
-            cell.hidden = false;
-            cell.classList.remove("done");
-          }
+  exportJobs.set(job, entry);
+  const poll = () => fetch("api/roi/progress?job=" + job, { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : {}))
+    .catch(() => ({})) // a missed poll is retried by the next one
+    .then((d) => {
+      const elapsed = Date.now() - t0;
+      if (d.state === "writing" || d.state === "streaming") {
+        entry.shown = true;
+        if (exportGaugeOwner() === job && exportGaugeDone === null) {
+          const p = d.pct || 0;
+          cell.hidden = false;
+          cell.classList.remove("done");
           fill.style.width = p + "%";
           pct.textContent =
             d.state === "writing" ? label + " " + p + " %" : label + " saving…";
-        } else if (d.state === "done") {
-          clearInterval(exportTimer);
-          if (shown) {
-            fill.style.width = "100%";
-            cell.classList.add("done");
-            pct.textContent = label + " done";
-            setTimeout(() => { cell.hidden = true; }, 2000);
-          }
-        } else if (d.state === "error") {
-          clearInterval(exportTimer);
-          cell.hidden = true;
-          showToast("export failed: " + (d.error || "unknown error"));
-        } else if (!shown && Date.now() - t0 > 4000) {
-          clearInterval(exportTimer); // job never materialized, stay hidden
         }
-        if (Date.now() - t0 > 15 * 60 * 1000) {
-          clearInterval(exportTimer);
-          cell.hidden = true;
+      } else if (d.state === "done") {
+        const owned = exportGaugeOwner() === job;
+        exportJobs.delete(job);
+        if (owned) {
+          fill.style.width = "100%";
+          cell.classList.add("done");
+          pct.textContent = label + " done";
+          clearTimeout(exportGaugeDone);
+          exportGaugeDone = setTimeout(() => {
+            exportGaugeDone = null;
+            releaseExportGauge();
+          }, 2000);
         }
-      })
-      .catch(() => {});
-  }, 350);
+        return;
+      } else if (d.state === "error") {
+        exportJobs.delete(job);
+        releaseExportGauge();
+        showToast("export failed: " + (d.error || "unknown error"));
+        return;
+      } else if (!entry.shown && elapsed > 30000) {
+        // the request never started writing (refused, or the slide closed)
+        exportJobs.delete(job);
+        return;
+      }
+      if (elapsed > 15 * 60 * 1000) {
+        exportJobs.delete(job);
+        releaseExportGauge();
+        return;
+      }
+      setTimeout(poll, 350);
+    });
+  setTimeout(poll, 350);
 }
 
 /* ---- slide inspector ------------------------------------------------------- */

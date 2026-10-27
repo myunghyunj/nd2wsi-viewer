@@ -70,7 +70,7 @@ vm.runInContext(
   between('function svgEl(', 'function chip(') +
   between('function finishSelection(', 'function applyRoi(') +
   between('function roiOverlayPoints(', 'function ensureRoiOverlayLayer(') +
-  between('function downloadRoi(', 'let exportTimer') +
+  between('function downloadRoi(', '/* Poll the server') +
   between('function channelQuery(', 'function renderParams(') +
   between('function elementPoint(', 'function fmtUm(') +
   '\nconst SVG_NS = "http://www.w3.org/2000/svg"; wireTools();', context);
