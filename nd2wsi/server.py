@@ -1444,6 +1444,8 @@ def make_handler(
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nd2wsi"
+        # Set once a download has sent its status line; reset per request.
+        _response_started = False
 
         # ---- helpers -----------------------------------------------------
         def _discard_rejected_body(self) -> None:
@@ -1486,9 +1488,7 @@ def make_handler(
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", cache)
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
+            self._policy_headers(cache)
             if self.close_connection:
                 self.send_header("Connection", "close")
             for k, v in (extra or {}).items():
@@ -1505,10 +1505,49 @@ def make_handler(
                     pass
                 self._discard_rejected_body()
 
+        def _policy_headers(self, cache: str) -> None:
+            self.send_header("Cache-Control", cache)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+
+        def _stream_file(
+            self,
+            write_body,
+            *,
+            size: int,
+            content_type: str,
+            filename: str,
+        ) -> None:
+            """Send a 200 download whose body ``write_body(wfile)`` copies out.
+
+            Once the status line is out, a failure can no longer become an
+            error reply: it would land inside the declared Content-Length on
+            a keep-alive connection. The connection is closed instead and the
+            exception propagates, so the export's own context still sees it.
+            """
+            disposition = content_disposition(filename)
+            self._response_started = True
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", disposition)
+                self._policy_headers("no-store")
+                self.end_headers()
+                write_body(self.wfile)
+            except BaseException:
+                self.close_connection = True
+                raise
+
         def _json(self, obj: Any, code: int = 200):
             self._send(code, json.dumps(obj).encode(), "application/json")
 
         def _error(self, code: int, msg: str):
+            if self._response_started:
+                # A download already sent its status and length; drop the
+                # connection rather than write JSON into its body.
+                self.close_connection = True
+                return
             self._json({"error": msg}, code)
 
         def _body_json(self, limit: int = 10_000_000) -> Any:
@@ -1580,6 +1619,7 @@ def make_handler(
             return path[len(prefix) :]
 
         def do_GET(self):  # noqa: N802 (http.server API)
+            self._response_started = False
             try:
                 parsed = urllib.parse.urlparse(self.path)
                 path = self._gate()
@@ -1643,8 +1683,10 @@ def make_handler(
                 if sub == "/api/astromap/download":
                     return self._astromap_download(st, q)
                 return self._error(404, f"no route for {path}")
-            except BrokenPipeError:
-                pass
+            except ConnectionError:
+                # BrokenPipe on macOS, ConnectionReset/Aborted on Windows: the
+                # client left, so nothing more can be sent on this socket.
+                self.close_connection = True
             except Exception as e:  # pragma: no cover - defensive
                 try:
                     self._error(500, f"{type(e).__name__}: {e}")
@@ -1652,6 +1694,7 @@ def make_handler(
                     pass
 
         def do_POST(self):  # noqa: N802 (http.server API)
+            self._response_started = False
             try:
                 parsed = urllib.parse.urlparse(self.path)
                 path = self._gate()
@@ -1710,8 +1753,8 @@ def make_handler(
                 if st is not None and sub == "/api/reveal":
                     return self._reveal(st)
                 return self._error(404, f"no POST route for {path}")
-            except BrokenPipeError:
-                pass
+            except ConnectionError:
+                self.close_connection = True
             except Exception as e:  # pragma: no cover - defensive
                 try:
                     self._error(500, f"{type(e).__name__}: {e}")
@@ -2209,15 +2252,17 @@ def make_handler(
             key = (q.get("token") or [""])[0]
             try:
                 with registry.astromap_downloads.download(key, st) as (item, source):
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Length", str(item.path.stat().st_size))
-                    self.send_header("Content-Disposition", content_disposition(item.filename))
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("X-Content-Type-Options", "nosniff")
-                    self.end_headers()
-                    while chunk := source.read(1024 * 1024):
-                        self.wfile.write(chunk)
+
+                    def write_body(output) -> None:
+                        while chunk := source.read(1024 * 1024):
+                            output.write(chunk)
+
+                    self._stream_file(
+                        write_body,
+                        size=item.path.stat().st_size,
+                        content_type="application/zip",
+                        filename=item.filename,
+                    )
             except AstromapError as exc:
                 return self._error(404, str(exc))
 
@@ -2239,15 +2284,12 @@ def make_handler(
                 export = prepare_export(st, q, resolve_frame=_frame_args, filename_prefix=prefix)
                 if export.streams_file:
                     with export.file(_job_update) as artifact:
-                        size = artifact.size
-                        self.send_response(200)
-                        self.send_header("Content-Type", artifact.content_type)
-                        self.send_header("Content-Length", str(size))
-                        self.send_header(
-                            "Content-Disposition", content_disposition(artifact.filename)
+                        self._stream_file(
+                            artifact.copy_to,
+                            size=artifact.size,
+                            content_type=artifact.content_type,
+                            filename=artifact.filename,
                         )
-                        self.end_headers()
-                        artifact.copy_to(self.wfile)
                     return
                 artifact = export.rendered()
             except ExportRequestError as e:
