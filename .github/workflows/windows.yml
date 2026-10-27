@@ -57,12 +57,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Locked build tooling installation failed' }
       - name: Windows unit and integration tests
         timeout-minutes: 10
-        run: .venv/Scripts/python.exe -m pytest tests -vv --tb=short -m 'not realdata' -n 4 --dist loadfile --durations=25 --junitxml=test-results/windows-unit.xml
+        run: .venv/Scripts/python.exe -m pytest tests -vv --tb=short -m 'not realdata' -n 4 --dist loadfile --durations=25 --junitxml=${{ runner.temp }}/test-results/windows-unit.xml
+      # The report lives outside the checkout so build provenance still sees a clean tree.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: windows-unit-test-results
-          path: test-results/windows-unit.xml
+          path: ${{ runner.temp }}/test-results/windows-unit.xml
           retention-days: 30
       - name: Fetch checksum-verified real ND2 acquisitions
         run: .venv/Scripts/python.exe scripts/fetch_testdata.py
