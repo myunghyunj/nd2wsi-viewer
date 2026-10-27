@@ -3,7 +3,6 @@
 import base64
 import io
 import json
-import threading
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -11,12 +10,13 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import pytest
 import zarr
+from http_fixture import running_server
 from PIL import Image
 
 from nd2wsi import render, scalebar
 from nd2wsi.convert import build_group_attrs
 from nd2wsi.reader import ChannelInfo, PlaneSource
-from nd2wsi.server import create_server, server_url
+from nd2wsi.server import server_url
 
 SVG = {"s": "http://www.w3.org/2000/svg"}
 
@@ -125,16 +125,9 @@ def test_jpeg_is_full_size_high_quality_rgb_and_has_bar(specimen):
 @pytest.fixture
 def endpoint(specimen):
     _, _, path = specimen
-    server = create_server(path, host="127.0.0.1", port=0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
+    with running_server(path, host="127.0.0.1") as server:
         yield server_url(server).rstrip("/"), server
-    finally:
-        server.shutdown()
-        server.server_close()
-        server.registry.close_all(immediate=True)
-        thread.join(timeout=3)
+    server.registry.close_all(immediate=True)
 
 
 @pytest.mark.parametrize("fmt,mime", [("svg", "image/svg+xml"), ("jpg", "image/jpeg")])

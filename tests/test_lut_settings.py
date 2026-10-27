@@ -3,13 +3,13 @@
 import copy
 import json
 import os
-import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from http_fixture import serving
 
 from nd2wsi import lut_settings
 from nd2wsi.lut_settings import FORMAT, MAX_BYTES, LutSettingsStore, LutSettingsUnavailable
@@ -428,15 +428,9 @@ def http_server(source):
     server = create_server([], port=0)
     sid = server.registry.sid_for(source)
     server.registry.slides[sid] = ViewerState({}, attrs(source), source_path=source)
-    worker = threading.Thread(target=server.serve_forever, daemon=True)
-    worker.start()
     url = f"http://127.0.0.1:{server.server_address[1]}/{server.token}/s/{sid}/api/lut-settings"
-    try:
+    with serving(server):
         yield server, url
-    finally:
-        server.shutdown()
-        server.server_close()
-        worker.join(timeout=3)
 
 
 def request(url, payload=None, *, raw=None, headers=None):

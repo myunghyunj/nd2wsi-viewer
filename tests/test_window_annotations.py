@@ -1,7 +1,6 @@
 """HTTP-level window isolation, exact snapshots, and optimistic save conflicts."""
 import json
 import multiprocessing
-import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -9,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from http_fixture import serving
 
 from nd2wsi.annotation_workspace import AnnotationConflict, AnnotationWorkspace
 from nd2wsi.server import ViewerState, annotations_sidecar, create_server, plate_annotations_sidecar
@@ -32,15 +32,9 @@ def _server(source, session=None, *, plate=False):
     st = ViewerState({}, attrs, annotations_path=path, source_path=source,
                      plate=SimpleNamespace(P=2) if plate else None)
     httpd.registry.slides[sid] = st
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
     base = f"http://127.0.0.1:{httpd.server_address[1]}/{httpd.token}"
-    try:
+    with serving(httpd):
         yield httpd, base, f"{base}/s/{sid}/api/annotations"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=3)
 
 
 def _request(url, payload=None):

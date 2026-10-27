@@ -3,7 +3,6 @@
 import io
 import json
 import sys
-import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -15,12 +14,13 @@ import pytest
 tifffile = pytest.importorskip("tifffile")
 pytest.importorskip("imagecodecs")
 
+from http_fixture import running_server  # noqa: E402
+
 from nd2wsi.server import (  # noqa: E402
     ViewerState,
     _associated_source_path,
     _inspection_storage_details,
     _pixel_payload,
-    create_server,
     reveal_in_file_manager,
     server_url,
 )
@@ -74,15 +74,8 @@ def associated_svs(tmp_path):
 
 @contextmanager
 def _served(path):
-    httpd = create_server(path, host="127.0.0.1", port=0)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
+    with running_server(path, host="127.0.0.1") as httpd:
         yield httpd, server_url(httpd).rstrip("/")
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=5)
 
 
 def _get_json(url):
