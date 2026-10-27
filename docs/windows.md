@@ -327,10 +327,12 @@ and whether it started, window open and close (including save-before-close
 outcomes), the full paths of files opened and whether they opened, translucent
 viewer and Follow events, update checks, script errors from the viewer pages,
 caught errors, uncaught exceptions with tracebacks, and a memory and thread
-sample every 30 seconds. Keystrokes and typed text are not recorded; Follow
-records only counts of W/A/S/D stage commands.
+sample every 30 seconds. While Follow observes the stage keys, each accepted
+W/A/S/D jog is recorded with its letter, sequence number and step; W/A/S/D
+pressed while another program is in front are only counted. No other keys
+and no typed text are recorded.
 
-A session keeps only errors and its final record after 50 MB. Each start keeps
+A session keeps only failures and its final record after 50 MB. Each start keeps
 the newest 50 sessions and at most 500 MB, deleting older files with these
 names in that folder only. The logs stay on the PC; nothing is uploaded.
 
