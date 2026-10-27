@@ -81,9 +81,11 @@ The translucent window shows exactly the rotation and flip of the main viewer
 at handoff and has no direction settings of its own: the earlier **Mirror
 image** control, its default mirroring, and Follow's Rotation, Flip stage X and
 Flip stage Y settings are gone, and an older context's `mirror_scan` key is
-ignored. Nikon Ti/Aperio views from above and SLACS from underneath in the
-supplied context, so flip the image in the main viewer first when SLACS shows
-it mirrored.
+ignored. OpenSeadragon's own canvas keys (R rotate, F flip, W/A/S/D and arrow
+pan, +/−/0 zoom) are turned off in this window, so its orientation cannot drift
+from the main viewer's; align by dragging and scrolling. Nikon Ti/Aperio views
+from above and SLACS from underneath in the supplied context, so flip the image
+in the main viewer first when SLACS shows it mirrored.
 
 A displacement `(dx, dy)` in micrometres moves the view centre `dx` to the
 right and `dy` down on screen, as displayed (`screenImageDelta` in

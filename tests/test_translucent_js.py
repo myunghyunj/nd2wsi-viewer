@@ -1119,6 +1119,17 @@ def test_the_overlay_has_no_direction_settings_of_its_own():
     assert result == {"mirror": False, "alignment": False, "setters": [], "pure": "function", "old": "undefined"}
 
 
+@pytest.mark.parametrize("key", ["f", "F", "r", "R", "w", "a", "s", "d", "ArrowUp", "+", "-", "0"])
+def test_openseadragon_keys_cannot_rotate_flip_pan_or_zoom_the_overlay(key):
+    result = run(f"""
+      const h=harness(),handler=h.viewer.handlers['canvas-key'];
+      const event={{originalEvent:{{key:{json.dumps(key)}}},preventDefaultAction:false}};
+      if(handler)handler(event);
+      return {{registered:typeof handler,prevented:event.preventDefaultAction}};
+    """)
+    assert result == {"registered": "function", "prevented": True}
+
+
 def test_rotating_the_view_after_handoff_changes_follow_to_match_what_is_shown():
     result = run("""
       const h=followHarness({initialContext:{rotation:0,flip:false}}),m=h.mounted;
