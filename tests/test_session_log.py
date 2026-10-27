@@ -335,7 +335,8 @@ def test_retention_keeps_fifty_sessions_and_touches_only_its_own_regular_files(t
     outside.write_text("keep", encoding="utf-8")
     link = folder / "session-20200101-000000-1.jsonl"
     link.symlink_to(outside)
-    os.utime(link, (OLD - 99, OLD - 99), follow_symlinks=False)
+    if os.utime in os.supports_follow_symlinks:  # Windows cannot age a link itself
+        os.utime(link, (OLD - 99, OLD - 99), follow_symlinks=False)
     unrelated = [folder / name for name in ("notes.txt", "session-20200101-000000-2.jsonl.bak",
                                             "session-old.jsonl", "Session-20200101-000000-3.jsonl")]
     for file in unrelated:
