@@ -36,7 +36,7 @@ def test_direction_metadata_and_frame_indices_survive_plate_initialization(
     with source.path.open("rb") as stream:
         source._fd = stream.fileno()
         source._init_from_file(f)
-    meta = source.attrs["nd2wsi"]["plate"]
+    meta = source._build_attrs(source._level_shapes)["nd2wsi"]["plate"]
     assert meta["bottomToTop"] is (direction if isinstance(direction, bool) else None)
     assert meta["zHome"] == 2
     assert meta["zStepUm"] == 2.0

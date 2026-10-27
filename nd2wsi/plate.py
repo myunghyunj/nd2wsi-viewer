@@ -77,6 +77,12 @@ PLATE_K = (2, 4, 8, 16)  # box mean factors the grid may ask for
 PREFETCH_PENDING_MAX = 256  # frames queued for warming, oldest dropped first
 HISTOGRAM_LRU = 64
 THUMB_K = 8  # the reduction the store keeps, the one the site grid shows
+WINDOWS_T = 0  # default display windows sample every site at this time point,
+WINDOWS_K = 4  # at the home plane, reduced by this factor
+# Names how PlateSource._measure_windows works. Change it whenever that
+# measurement changes, so windows recorded by older builds are measured again.
+WINDOWS_METHOD = "plate-low-percentile/1"
+WINDOWS_KEY = "display_windows"  # additive manifest key; readers only use it
 UNSCORED = -1.0  # a frame whose sharpness has not been measured yet
 # Single-file containers use /2 at a new .nd2svs path. Legacy /1 directories
 # remain read-only compatible and are never rewritten on ordinary open.
@@ -99,6 +105,70 @@ def _has_integrity(manifest: dict[str, Any]) -> bool:
         and integrity.get("commit") == "payload-digest-done"
         and integrity.get("digest_name") == DIGEST_NAME
     )
+
+
+_FINGERPRINT_KEYS = ("size", "mtime_ns", "quick_sha256")
+_WINDOW_FIELDS = ("start", "end", "min", "max")
+
+
+def _windows_record(
+    manifest: dict[str, Any], source: Any, windows: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The manifest record of default display windows measured from ``source``."""
+    fingerprint = manifest.get("source") or {}
+    return {
+        "method": WINDOWS_METHOD,
+        "generation": manifest.get("generation"),
+        "source": {key: fingerprint.get(key) for key in _FINGERPRINT_KEYS},
+        "t": WINDOWS_T,
+        "z": int(source.z_home),
+        "k": WINDOWS_K,
+        "dtype": str(source.dtype),
+        "rgb": bool(source.rgb),
+        "windows": [
+            {field: float(window[field]) for field in _WINDOW_FIELDS}
+            for window in windows
+        ],
+    }
+
+
+def _stored_windows(manifest: dict[str, Any], source: Any) -> list[dict[str, float]] | None:
+    """The default display windows a plate manifest records for ``source``.
+
+    A record counts only for the cache generation and source fingerprint it
+    was written with, the plane and reduction it sampled and the method that
+    measured it. Anything else, or anything malformed, is measured again.
+    """
+    record = manifest.get(WINDOWS_KEY)
+    if not isinstance(record, dict):
+        return None
+    fingerprint = record.get("source")
+    if (
+        record.get("method") != WINDOWS_METHOD
+        or not manifest.get("generation")
+        or record.get("generation") != manifest.get("generation")
+        or not isinstance(fingerprint, dict)
+        or any(fingerprint.get(key) is None for key in _FINGERPRINT_KEYS)
+        or not fingerprints_match(fingerprint, manifest.get("source") or {})
+    ):
+        return None
+    for name, expected in (("t", WINDOWS_T), ("z", source.z_home), ("k", WINDOWS_K)):
+        if type(record.get(name)) is not int or record[name] != int(expected):
+            return None
+    if record.get("dtype") != str(source.dtype) or record.get("rgb") is not bool(source.rgb):
+        return None
+    entries = record.get("windows")
+    if not isinstance(entries, list) or len(entries) != int(source.frame_shape[0]):
+        return None
+    windows = []
+    for entry in entries:
+        values = [entry.get(field) for field in _WINDOW_FIELDS] if isinstance(entry, dict) else []
+        if len(values) != len(_WINDOW_FIELDS) or not all(
+            type(v) in (int, float) and math.isfinite(v) for v in values
+        ):
+            return None
+        windows.append({field: float(v) for field, v in zip(_WINDOW_FIELDS, values)})
+    return windows
 
 
 def _file_identity(st: os.stat_result) -> tuple[int, int, int, int]:
@@ -984,6 +1054,32 @@ class PlateStore:
             return
         self.manifest = manifest
 
+    def display_windows(self) -> list[dict[str, float]] | None:
+        """Default display windows this cache generation records for its source."""
+        with self._lock:
+            manifest = self.manifest
+        return _stored_windows(manifest, self._source)
+
+    def keep_display_windows(self, windows: list[dict[str, Any]]) -> None:
+        """Record windows measured from the source for the next open.
+
+        Only the writer persists them, as an additive manifest key in the
+        same generation. A manifest that cannot be written only means the
+        next open measures them again.
+        """
+        with self._lock:
+            if self._stop or not self.writable:
+                return
+            manifest = dict(self.manifest)
+            manifest[WINDOWS_KEY] = _windows_record(manifest, self._source, windows)
+            if _stored_windows(manifest, self._source) is None:
+                return  # a record the next open would refuse is not worth a write
+            try:
+                self._write_manifest(self.container, manifest)
+            except Exception:
+                return
+            self.manifest = manifest
+
     def get(self, t: int, p: int, z: int) -> np.ndarray | None:
         """The stored reduction of one site, reading the whole chunk.
 
@@ -1410,22 +1506,38 @@ class PlateSource:
                 )
             self._init_from_file(self._f)
             self._check_source()
+            unavailable: Exception | None = None
             if store:
-                opened_store = None
                 try:
-                    opened_store = (PlateStore.open_or_create(self) if cache_path is None
-                                    else PlateStore.open_or_create(self, cache_path=cache_path))
-                    self.store = opened_store
-                    opened_store.start()
+                    self.store = (PlateStore.open_or_create(self) if cache_path is None
+                                  else PlateStore.open_or_create(self, cache_path=cache_path))
                 except Exception as e:  # a store that will not open is only a slower view
-                    if opened_store is not None:
-                        opened_store.close()
+                    if cache_path is not None:
+                        raise
+                    unavailable = e
+            # The store opens before the attributes are built: a manifest that
+            # already records this source's display windows spares reading a
+            # frame of every site.
+            try:
+                self.attrs = self._build_attrs(self._level_shapes)
+            except BaseException:
+                if self.store is not None:
+                    self.store.close()
+                    self.store = None
+                raise
+            if self.store is not None:
+                try:
+                    self.store.start()
+                except Exception as e:
+                    self.store.close()
                     self.store = None
                     if cache_path is not None:
                         raise
-                    self.attrs["nd2wsi"].setdefault("notes", []).append(
-                        f"thumbnail store unavailable ({type(e).__name__}); frames are read each time"
-                    )
+                    unavailable = e
+            if unavailable is not None:
+                self.attrs["nd2wsi"].setdefault("notes", []).append(
+                    f"thumbnail store unavailable ({type(unavailable).__name__}); frames are read each time"
+                )
         except BaseException:
             if self._fd >= 0:
                 os.close(self._fd)
@@ -1437,6 +1549,7 @@ class PlateSource:
 
     # ---- metadata --------------------------------------------------------
     def _init_from_file(self, f: Any) -> None:
+        """Metadata of the open file. The attributes are built after the store opens."""
         self.sizes = dict(f.sizes)
         self._coord_axes = [a for a in self.sizes if a not in FRAME_AXES]
         self.T = int(self.sizes.get("T", 1))
@@ -1547,11 +1660,11 @@ class PlateSource:
 
         _, H, W = self.frame_shape
         shapes = level_shapes(H, W, self.tile)
+        self._level_shapes = shapes
         self.levels = [
             {"path": str(k), "width": w, "height": h, "downsample": 2**k}
             for k, (h, w) in enumerate(shapes)
         ]
-        self.attrs = self._build_attrs(shapes)
 
     def _build_attrs(self, shapes: list[tuple[int, int]]) -> dict[str, Any]:
         from .convert import _background_mode_start, build_group_attrs
@@ -1612,6 +1725,18 @@ class PlateSource:
         return attrs
 
     def _windows(self, background_mode_start: Any) -> list[dict[str, float]]:
+        """Default display windows: the store's record when it holds a valid
+        one for this source, else measured now and handed to the store."""
+        store = self.store
+        stored = store.display_windows() if store is not None else None
+        if stored is not None:
+            return stored
+        windows = self._measure_windows()
+        if store is not None:
+            store.keep_display_windows(windows)
+        return windows
+
+    def _measure_windows(self) -> list[dict[str, float]]:
         """Display windows from the 4x reductions of every site at t 0, home z.
 
         A camera field of a plate is phase contrast or bright field as
@@ -1619,7 +1744,7 @@ class PlateSource:
         black background, so the black point is a low percentile rather
         than the background mode the stitched scans use.
         """
-        samples = [self.reduced(0, p, self.z_home, 4) for p in range(self.P)]
+        samples = [self.reduced(WINDOWS_T, p, self.z_home, WINDOWS_K) for p in range(self.P)]
         small = np.concatenate([s.reshape(s.shape[0], -1) for s in samples], axis=1)
         if np.issubdtype(self.dtype, np.integer):
             info = np.iinfo(self.dtype)
