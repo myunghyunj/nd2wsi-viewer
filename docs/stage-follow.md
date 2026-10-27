@@ -14,16 +14,25 @@ On Windows, Follow's default source observes the W/A/S/D keys the user presses i
 the legacy SLACS program to jog the ACS stage, and moves the overlay to match. It
 is built from `nd2wsi/stage_keys.py` (`SlacsKeyFollower`) and
 `nd2wsi/slacs_identity.py`, and feeds the same commanded-displacement path through
-`StageFollowReceiver.submit` that the HTTP routes use. The overlay settings expose
-**Step per key press** (µm); set it to SLACS's Roughness, since 1 Roughness ≈ 1 µm.
-On non-Windows the default source stays the in-process/HTTP adapter.
+`StageFollowReceiver.submit` that the HTTP routes use. SLACS jogs the stage by
+its Roughness: `SLACS.py` `onKeyPress` → `moveL/R/U/D` → `acs.move(axis, ±Ro)`
+with `Ro = 0.001 * Roughness` mm, so Roughness is micrometres per press. By
+default (**Read Roughness from SLACS**, on) Follow reads Roughness and the two
+Mirror checkboxes from SLACS's window while it runs; the settings' step field is
+then **Fallback step if Roughness can't be read**. With reading turned off the
+field is **Step per key press**, and every press moves by it. The choice is
+remembered per viewer (`nd2wsi.stageFollow.stepAuto`) and, like the step, fixed
+while Follow runs. On non-Windows the default source stays the in-process/HTTP
+adapter.
 
 **How it works.** A hidden message-only window registers a Raw Input keyboard
 *sink* (`RIDEV_INPUTSINK`) on a daemon thread. Each W/A/S/D key-down (autorepeat
-included) becomes one commanded `delta` of `step_um` micrometres in a screen
+included) becomes one commanded `delta` of one step (SLACS's Roughness, or the
+manual step) in a screen
 direction — W moves the overlay's view up, S down, A left and D right, as
 displayed — submitted to the receiver, plus a heartbeat about once a second so
-the receiver does not go stale. Only these key presses are followed: the source
+the receiver does not go stale. W/A/S/D key-ups are observed too, only to tell
+an autorepeating held key from separate presses. Only these key presses are followed: the source
 registers the keyboard alone, so mouse clicks, mouse jogs and other input are
 never seen or counted. Presses are counted only while SLACS owns the
 foreground window, identified from the process command line's Python script
@@ -33,17 +42,80 @@ counted; that held state is followed from the same raw keystroke stream. Windows
 allows one Raw Input keyboard target per process, so every overlay following in a
 window process shares one registration, removed when the last one stops.
 
+**Roughness and Mirror from SLACS.** `nd2wsi/slacs_controls.py`
+(`SlacsControlsMonitor`) reads SLACS's controls about every 0.2 s while Follow
+runs, in the SLACS process discovery found (`SlacsDiscovery.slacs_pid`). The
+Roughness control is a `wx.Slider` with range 1–1000, a native
+`msctls_trackbar32` whose position always equals Roughness however it was set
+(drag, text box, E/Q, Coarse/Fine/Extra Fine). It is identified by that range;
+SLACS's two other sliders have range 1–100, and more than one 1–1000 trackbar is
+ambiguous and read as unreadable. **Mirror Horizontal** and **Mirror Vertical**
+are `Button` windows with those exact texts. Each W/A/S/D press moves by the last
+good Roughness, which is kept while SLACS is busy; until one has been read, or
+when the reader is unavailable, the press moves by the fallback step and is
+logged as such. Mirror Horizontal (SLACS's `HflipFlag`) reverses W/S, stage axis
+1, so the overlay reverses the screen's vertical move for W/S; Mirror Vertical
+(`VflipFlag`) reverses A/D, stage axis 0, and the horizontal move for A/D. An
+unknown Mirror state is not applied. The settings panel shows what the next
+press uses, for example "SLACS Roughness: 10 µm = 15.1 px · Mirror H off, V off"
+(image pixels at the overlay's calibration), "SLACS Roughness unreadable — using
+10 µm" or "SLACS busy — last Roughness 10 µm". None of this pauses Follow.
+
 **No interference (hard rule).** The observer only reads. Raw Input is a sink: it
 never consumes, delays, alters, blocks, or fails a keystroke, and SLACS's own
 commands to the ACS stage are never touched. The module never calls into SLACS or
-the controller.
+the controller. The controls reader only sends read-only queries to SLACS's
+controls (`TBM_GETPOS`, `TBM_GETRANGEMIN`, `TBM_GETRANGEMAX`, `BM_GETCHECK`),
+always through `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT`
+and a 100 ms timeout, never plain `SendMessage`, and reads window texts with
+`InternalGetWindowText`, which sends no message. A busy or hung SLACS makes a
+read time out and count as busy; it never waits on SLACS.
 
 **Privacy.** The observer receives every keystroke in the system. Anything other
-than W/A/S/D is discarded the instant it arrives — never stored, counted
-individually, or logged. W/A/S/D pressed while SLACS is not in front are tallied
-only as `ignored_not_slacs`, never recorded individually. The session log records
-counted presses (`follow_key`), foreground transitions (`slacs_foreground`),
-start/stop and errors — never other keys.
+than W/A/S/D, down or up, is discarded the instant it arrives — never stored,
+counted individually, or logged. W/A/S/D pressed while SLACS is not in front are
+tallied only as `ignored_not_slacs`, never recorded individually. The session log
+records counted presses (`follow_key`), held keys (`follow_key_hold`),
+foreground transitions (`slacs_foreground`), start/stop and errors — never other
+keys.
+
+**Detection.** Discovery searches for SLACS with the bounded PowerShell/CIM query
+described below (10 s timeout). Once a search has found it, each poll checks
+that process instead of searching again: the process is opened by pid, its
+creation time must match the one the search saw (so a reused pid is not
+mistaken for SLACS), and a zero-wait `WaitForSingleObject` tells whether it is
+still running. A confirmed exit or reused pid starts a new search at once.
+Checks that cannot tell, and failed searches, keep the found session for a 15 s
+grace, so a brief failure on a slow instrument PC does not stop Follow; after
+that the session is dropped and Follow stops as for a loss.
+
+**Session log.** Records from discovery carry `monitor` (`main` or `translucent`,
+the window that owns the detector):
+
+- `slacs_detection` (window, available, session_id, status): each detection
+  change, from the main window and from each translucent window.
+- `slacs_query` (ok, seconds, python_processes or reason): each real PowerShell
+  search.
+- `slacs_check_failing` (reason, grace_seconds), `slacs_check_recovered`
+  (failed_checks, seconds, last_reason) and `slacs_check_gave_up` (failed_checks,
+  seconds, last_reason): checks that cannot tell, their recovery, and the end of
+  the grace; `slacs_exit_seen` (session_id) on a confirmed exit;
+  `slacs_liveness_summary` (checks, failed, max_ms, seconds) every 60 s.
+- `slacs_controls` (roughness_um, mirror_h, mirror_v, ok, error): each change of
+  Roughness, Mirror or readability.
+- `slacs_ui_busy` (latency_ms, error) when reads start timing out, taking longer
+  than 250 ms or finding SLACS's window hung, `slacs_ui_responsive` (busy_seconds, max_latency_ms,
+  failed_reads) when a fast read succeeds again, and `slacs_ui_latency` (reads,
+  failed, p50_ms, max_ms) every 30 s while Follow runs.
+- `follow_start` (source, step_source, step_um, ok, slacs_session, and
+  controls_error when the reader could not be created), `follow_keys_start` and
+  `follow_keys_stop` (with step_source).
+- `follow_key` per counted press: key, seq, delta_um, step_um, step_from
+  (`slacs`, `fallback` or `manual`), roughness_um, mirror_h, mirror_v,
+  reading_age_ms, slacs_busy, repeat (an autorepeat press of a held key), gap_ms
+  (since the previous counted press) and delta_px (the move in image pixels).
+- `follow_key_hold` (key, presses, seconds) when a held key with at least one
+  counted repeat is released.
 
 **Limits.**
 
@@ -59,9 +131,13 @@ start/stop and errors — never other keys.
   overlay moves opposite to SLACS's live image, `KEY_VIEW_SIGN` in
   `nd2wsi/stage_keys.py` is the single value that reverses all four keys; it is
   deliberately not a user setting.
-- The step must match SLACS's Roughness, or the overlay moves by the wrong
-  distance per press. When SLACS loses the foreground the status shows "SLACS not
-  in front" without pausing; following resumes when it returns.
+- Roughness is read about every 0.2 s, so a press within that time of a
+  Roughness change can still move by the previous value. With reading turned
+  off, or while Roughness cannot be read, the manual step must match SLACS's
+  Roughness, or the overlay moves by the wrong distance per press. SLACS's other
+  handlers can set its step without the Roughness control; those moves are not
+  seen. When SLACS loses the foreground the status shows "SLACS not in front"
+  without pausing; following resumes when it returns.
 
 Follow moves the image only while the overlay is locked. Unlocked, the user
 aligns the overlay by hand and nothing moves it: follow replies are still
@@ -248,9 +324,11 @@ the program, not controller readiness or a validated motion stream.
 Detection uses a hidden, bounded local PowerShell/CIM process-metadata query,
 shared between viewer windows for two seconds. It checks the interpreter's
 actual script argument and identifies a session by process ID and creation
-time. It does not execute or import the legacy script. Detection is polled, so
-appearance and disappearance are not instantaneous; unavailable process
-metadata fails closed instead of guessing.
+time. It does not execute or import the legacy script. Once found, the process
+is checked by its liveness rather than searched for again, with a 15 s grace
+for checks that cannot tell (see **Detection** under the key source). Detection
+is polled, so appearance and disappearance are not instantaneous; process
+metadata that stays unavailable fails closed instead of guessing.
 
 The implementation has not yet been verified on the instrument's Windows setup
 or integrated into the separate replacement-renderer branch. It does not decode

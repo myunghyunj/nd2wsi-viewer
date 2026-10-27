@@ -11,8 +11,11 @@
   "use strict";
 
   // The per-key stage step, remembered per viewer. SLACS jogs the stage by its
-  // Roughness in micrometres; this should match it (1 Roughness ≈ 1 µm).
+  // Roughness in micrometres (1 Roughness = 1 µm per press). By default Follow
+  // reads Roughness from SLACS and this step is only the fallback while it
+  // cannot be read; with reading turned off every press moves by this step.
   const STEP_STORAGE_KEY = "nd2wsi.stageFollow.stepUm";
+  const STEP_AUTO_STORAGE_KEY = "nd2wsi.stageFollow.stepAuto";
   const DEFAULT_STEP_UM = 10;
   const MIN_STEP_UM = 0.001;
   const MAX_STEP_UM = 10000;
@@ -179,6 +182,31 @@
     return { x, y };
   }
 
+  // What the key follower's snapshot says the next W/A/S/D press moves by while
+  // Follow reads Roughness from SLACS: the last good Roughness (kept while SLACS
+  // is busy), or the fallback step while none can be read. Image pixels are at
+  // the overlay's own calibration; Mirror shows which keys SLACS reverses.
+  function slacsRoughnessText(keys, fallbackUm, pixelSize) {
+    if (!keys || typeof keys !== "object") return "SLACS Roughness is read while Follow runs";
+    const micrometres = value => String(Math.round(value * 1000) / 1000) + " µm";
+    const valid = value => typeof value === "number" && Number.isFinite(value) && value > 0 && value <= MAX_STEP_UM;
+    const roughness = valid(keys.roughness_um) ? keys.roughness_um : null;
+    const fallback = valid(keys.step_um) ? keys.step_um : fallbackUm;
+    if (keys.slacs_busy === true) {
+      return roughness !== null ? "SLACS busy — last Roughness " + micrometres(roughness) :
+        "SLACS busy — using " + micrometres(fallback);
+    }
+    if (roughness === null || keys.controls_ok !== true) {
+      return "SLACS Roughness unreadable — using " + micrometres(roughness ?? fallback);
+    }
+    const flag = value => value === true ? "on" : value === false ? "off" : "unknown";
+    const pixels = !pixelSize ? "" : pixelSize.x === pixelSize.y ?
+      " = " + (roughness / pixelSize.x).toFixed(1) + " px" :
+      " = X " + (roughness / pixelSize.x).toFixed(1) + " · Y " + (roughness / pixelSize.y).toFixed(1) + " px";
+    return "SLACS Roughness: " + micrometres(roughness) + pixels +
+      " · Mirror H " + flag(keys.mirror_h) + ", V " + flag(keys.mirror_v);
+  }
+
   function mount(options) {
     const { window: win, document: doc, api, OSD, context, info } = options;
     const importer = options.importer || win.Nd2AstromapImport;
@@ -200,6 +228,10 @@
     const followSettings = doc.getElementById("stage-follow-settings");
     const followSave = doc.getElementById("stage-follow-save");
     const followStep = doc.getElementById("stage-follow-step");
+    const followStepAuto = doc.getElementById("stage-follow-step-auto");
+    const followStepLabel = doc.getElementById("stage-follow-step-label");
+    const followStepHint = doc.getElementById("stage-follow-step-hint");
+    const followRoughness = doc.getElementById("stage-follow-roughness");
     const followCount = doc.getElementById("stage-follow-count");
     const pixelSize = stagePixelSize(info);
     const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
@@ -211,8 +243,13 @@
       catch (_) { /* private mode or blocked storage: fall back to the default */ }
       return DEFAULT_STEP_UM;
     };
+    // Reading Roughness from SLACS is on unless this viewer turned it off.
+    const loadStepAuto = () => {
+      try { return win.localStorage.getItem(STEP_AUTO_STORAGE_KEY) !== "false"; }
+      catch (_) { return true; }
+    };
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
-      rois: [], roiIndex: -1, roiName: "", loadingRois: false, stepUm: loadStep(),
+      rois: [], roiIndex: -1, roiName: "", loadingRois: false, stepUm: loadStep(), stepAuto: loadStepAuto(),
       opacity: initialOpacity, confirmedOpacity: initialOpacity };
     const follow = state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
       seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "" };
@@ -387,6 +424,22 @@
         // The step is fixed for a run: changing it mid-follow would desync counts.
         followStep.disabled = follow.enabled || follow.pending;
       }
+      if (followStepAuto) {
+        followStepAuto.checked = state.stepAuto;
+        followStepAuto.disabled = follow.enabled || follow.pending;  // fixed for a run, like the step
+      }
+      if (followStepLabel) {
+        followStepLabel.textContent = state.stepAuto ? "Fallback step if Roughness can't be read" : "Step per key press";
+      }
+      if (followStepHint) {
+        followStepHint.textContent = state.stepAuto ?
+          "Each press moves by SLACS's Roughness (1 Roughness = 1 µm), and SLACS's Mirror Horizontal and Mirror Vertical reverse W/S and A/D here too. Counts W/A/S/D only while SLACS is in front." :
+          "Set this to SLACS's Roughness (1 Roughness = 1 µm per press). Counts W/A/S/D only while SLACS is in front.";
+      }
+      if (followRoughness) {
+        followRoughness.hidden = !state.stepAuto;
+        followRoughness.textContent = state.stepAuto ? slacsRoughnessText(follow.keys, state.stepUm, pixelSize) : "";
+      }
       if (followCount) {
         const counted = follow.keys && Number.isFinite(follow.keys.counted) ? follow.keys.counted : 0;
         followCount.textContent = "Key presses: " + counted;
@@ -496,9 +549,10 @@
       // Serialize native starts/stops, including a close during a pending start.
       const task = followLifecycle.catch(() => {}).then(async () => {
         if (epoch !== followEpoch || disposed) return false;
-        // Observe SLACS's W/A/S/D keys; step must match SLACS's Roughness.
-        const result = requireSuccess(await api.start_stage_follow({ source: "keys", step_um: state.stepUm }),
-          "Could not connect to the stage");
+        // Observe SLACS's W/A/S/D keys, moving by SLACS's Roughness when it is read
+        // (the step is then the fallback), or by the step alone.
+        const result = requireSuccess(await api.start_stage_follow({ source: "keys", step_um: state.stepUm,
+          step_source: state.stepAuto ? "slacs" : "manual" }), "Could not connect to the stage");
         if (epoch !== followEpoch || disposed) return false;
         if (typeof result?.session_id !== "string" || !result.session_id) throw new Error("Stage session is unavailable");
         follow.enabled = true; follow.sessionId = result.session_id; follow.status = "waiting";
@@ -602,6 +656,15 @@
       return true;
     };
     followStep?.addEventListener("change", () => setStepUm(Number(followStep.value)));
+    const setStepAuto = value => {
+      if (typeof value !== "boolean" || follow.enabled || follow.pending) { paintFollow(); return false; }
+      state.stepAuto = value;
+      try { win.localStorage.setItem(STEP_AUTO_STORAGE_KEY, String(value)); }
+      catch (_) { /* storage may be unavailable; keep the choice for this session */ }
+      paintFollow();
+      return true;
+    };
+    followStepAuto?.addEventListener("change", () => setStepAuto(followStepAuto.checked === true));
     followSave.addEventListener("click", async () => {
       if (!follow.enabled || follow.pending) return;
       const epoch = followEpoch;
@@ -843,7 +906,7 @@
     discoveryInterval = win.setInterval(pollSlacsDiscovery, 1000);
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
       startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, revokeStageFollow,
-      setStepUm, forwardClientError };
+      setStepUm, setStepAuto, forwardClientError };
   }
 
   async function boot(win) {
@@ -871,5 +934,6 @@
   }
 
   return { validateContext, makeTileSource, camera, restoreCamera, resizePreservingScale,
-    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, stagePixelSize, screenImageDelta, mount, boot };
+    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, stagePixelSize, screenImageDelta,
+    slacsRoughnessText, mount, boot };
 });

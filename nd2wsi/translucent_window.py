@@ -206,7 +206,7 @@ class TranslucentApi:
 
         with self._lock:
             if not self._closed and self._discovery is None:
-                self._discovery = SlacsDiscovery(on_change=self._on_slacs_change)
+                self._discovery = SlacsDiscovery(on_change=self._on_slacs_change, name="translucent")
                 self._slacs_snapshot = self._discovery.snapshot()
                 logged = self._detection_to_log()
             else:
@@ -305,38 +305,84 @@ class TranslucentApi:
             return {**copy.deepcopy(self._context), "locked": self._locked}
 
     def _stage_follow_options(self, options):
-        """Resolve the stage-follow source and per-key step; never raise."""
+        """Resolve the stage-follow source, per-key step and step source; never raise.
+
+        The step source is "slacs" (each press moves by SLACS's Roughness, with
+        ``step_um`` as the fallback while it cannot be read) or "manual" (always
+        ``step_um``). Roughness is read only on Windows, so by default only the
+        Windows key source reads it.
+        """
         default_source = "keys" if sys.platform == "win32" else "adapter"
+
+        def default_step_source(source):
+            return "slacs" if sys.platform == "win32" and source == "keys" else "manual"
+
         source, step_um = default_source, DEFAULT_STEP_UM
         if options is None:
-            return source, step_um, None
+            return source, step_um, default_step_source(source), None
         if not isinstance(options, dict):
-            return source, step_um, "Invalid stage follow options."
+            return source, step_um, default_step_source(source), "Invalid stage follow options."
         requested = options.get("source", default_source)
         if requested not in ("keys", "adapter"):
-            return source, step_um, "Unknown stage follow source."
+            return source, step_um, default_step_source(source), "Unknown stage follow source."
         source = requested
+        step_source = options.get("step_source", default_step_source(source))
+        if step_source not in ("slacs", "manual"):
+            return source, step_um, default_step_source(source), "Unknown stage follow step source."
         if "step_um" in options:
             value = options["step_um"]
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or not 0 < value <= MAX_STEP_UM):
-                return source, step_um, "Step per key press must be a number between 0.001 and 10000 µm."
+                return (source, step_um, step_source,
+                        "Step per key press must be a number between 0.001 and 10000 µm.")
             step_um = float(value)
-        return source, step_um, None
+        return source, step_um, step_source, None
+
+    def _slacs_pid(self):
+        """The detected SLACS process ID for read-only control reads, or None; never raises.
+
+        Runs on the controls monitor's thread, so it takes no overlay lock. The
+        detector reports a pid only for the session it currently reports, and a
+        lost or replaced session stops Follow (_on_slacs_change).
+        """
+        discovery = self._discovery
+        if self._closed or discovery is None:
+            return None
+        try:
+            pid = discovery.slacs_pid()
+        except Exception:  # noqa: BLE001 - an unknown pid only skips a read
+            return None
+        return pid if type(pid) is int and pid > 0 else None
+
+    def _slacs_controls_monitor(self):
+        """A read-only monitor of SLACS's Roughness and Mirror controls, or None and why not.
+
+        Follow never depends on it: without one the key follower moves by the
+        manual step, recorded as a fallback.
+        """
+        try:
+            from .slacs_controls import SlacsControlsMonitor
+
+            return SlacsControlsMonitor(self._slacs_pid), None
+        except Exception as exc:  # noqa: BLE001 - a missing reader must not stop Follow
+            self._logger(f"SLACS controls monitor unavailable: {exc!r}")
+            return None, f"{type(exc).__name__}: {exc}"[:CLIENT_LOG_FIELD_LIMIT]
 
     def start_stage_follow(self, options=None):
         """Opt in to this overlay's receiver; never connect to a controller.
 
         ``options`` may set ``source`` ("keys" to observe SLACS W/A/S/D presses,
-        "adapter" for an external in-process/HTTP sender) and the per-key
-        ``step_um``. The key follower is a strict observer and never blocks,
-        delays, or alters a keystroke. Follow is refused unless SLACS is
-        detected, and is bound to that detected process.
+        "adapter" for an external in-process/HTTP sender), the per-key
+        ``step_um`` and ``step_source`` ("slacs" to move each press by SLACS's
+        Roughness, read from its window, or "manual"). The key follower is a
+        strict observer and never blocks, delays, or alters a keystroke; it owns
+        the Roughness monitor's start and stop. Follow is refused unless SLACS
+        is detected, and is bound to that detected process.
         """
         from .stage_follow import StageFollowReceiver
         from .stage_keys import SlacsKeyFollower
 
-        source, step_um, option_error = self._stage_follow_options(options)
+        source, step_um, step_source, option_error = self._stage_follow_options(options)
         with self._lock:
             if self._closed:
                 return {"ok": False, "message": "This translucent viewer is closed."}
@@ -360,10 +406,16 @@ class TranslucentApi:
             except (OSError, RuntimeError) as exc:
                 receiver.close()
                 return {"ok": False, "message": "Could not start the local motion receiver: " + str(exc)}
-            follower = None
+            follower = controls_error = None
             if source == "keys":
+                controls = None
+                if step_source == "slacs":
+                    controls, controls_error = self._slacs_controls_monitor()
                 try:
-                    follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=step_um)
+                    # The context's calibration is [Y, X]; the follower takes (X, Y).
+                    follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=step_um,
+                                                step_source=step_source, controls=controls,
+                                                pixel_size_um=(float(pixels[1]), float(pixels[0])))
                     snapshot = follower.start()
                 except (ValueError, OSError, RuntimeError) as exc:
                     snapshot = {"running": False, "error": str(exc)}
@@ -372,7 +424,8 @@ class TranslucentApi:
                         follower.stop("start_failed")
                     receiver.close()
                     message = snapshot.get("error") or "Could not start key following."
-                    session_log.event("follow_start", source=source, ok=False, message=message)
+                    session_log.event("follow_start", source=source, step_source=step_source, ok=False,
+                                      message=message)
                     return {"ok": False, "message": message}
             self._stage_follow = receiver
             self._stage_follower = follower
@@ -382,7 +435,9 @@ class TranslucentApi:
             bound = self._stage_follow_session = detected["session_id"]
             self._stage_follow_receiver_id = descriptor.get("session_id")
             self._stage_follow_lost = ""
-        session_log.event("follow_start", source=source, step_um=step_um, ok=True, slacs_session=bound)
+        extra = {"controls_error": controls_error} if controls_error else {}
+        session_log.event("follow_start", source=source, step_source=step_source, step_um=step_um, ok=True,
+                          slacs_session=bound, **extra)
         return {"ok": True, "source": source, **descriptor}
 
     def stage_follow_state(self):

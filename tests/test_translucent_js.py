@@ -45,7 +45,8 @@ function fakeViewer(){
   return {viewport,calls,handlers,nav:true,addHandler(name,cb){handlers[name]=cb;},
     forceRedraw(){},setMouseNavEnabled(value){this.nav=value;},destroy(){}};
 }
-function harness({failLock=false,failOpacity=false,opacityResult,initialContext={},bridgeOverrides={},infoOverrides={}}={}){
+function harness({failLock=false,failOpacity=false,opacityResult,initialContext={},bridgeOverrides={},infoOverrides={},
+    stored={},blockStorage=false}={}){
   const elements=new Map();
   function newElement(id){return {id,style:{},dataset:{},attributes:{},children:[],
     listeners:{},clientWidth:800,clientHeight:500,disabled:false,hidden:false,
@@ -59,9 +60,11 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
   const doc={getElementById:element,createElementNS(namespace,name){return newElement(name);},
     querySelectorAll(){return [];},addEventListener(name,cb){documentListeners[name]=cb;}};
   const windowListeners={},timers=new Map(),intervals=new Map();let timerIndex=0;
-  const storage=new Map();
+  const storage=new Map(Object.entries(stored));
+  const blocked=()=>{throw new Error('SecurityError: storage is blocked');};
   const win={innerWidth:800,innerHeight:500,addEventListener(name,fn){windowListeners[name]=fn;},
-    localStorage:{getItem(k){return storage.has(k)?storage.get(k):null;},
+    localStorage:blockStorage?{getItem:blocked,setItem:blocked,removeItem:blocked}:
+      {getItem(k){return storage.has(k)?storage.get(k):null;},
       setItem(k,v){storage.set(k,String(v));},removeItem(k){storage.delete(k);}},
     setTimeout(fn,delay){const id=++timerIndex;timers.set(id,{fn,delay});return id;},
     clearTimeout(id){timers.delete(id);},
@@ -1108,7 +1111,12 @@ def test_the_overlay_has_no_direction_settings_of_its_own():
     for removed in ("overlay-mirror", "Mirror image", "stage-follow-angle", "stage-follow-flip-x",
                     "stage-follow-flip-y", "Flip stage", "Stage → image alignment"):
         assert removed not in page
-    assert 'id="stage-follow-step"' in page and "Step per key press" in page
+    # The fake DOM makes any element on demand, so the page's own ids are pinned here.
+    for control in ("stage-follow-step", "stage-follow-step-auto", "stage-follow-step-label",
+                    "stage-follow-step-hint", "stage-follow-roughness"):
+        assert f'id="{control}"' in page
+    assert 'id="stage-follow-step-auto" type="checkbox" checked' in page
+    assert "Read Roughness from SLACS" in page and "Fallback step if Roughness can't be read" in page
     assert "directions shown on screen" in page and "main viewer" in page
     result = run("""
       const m=followHarness().mounted;
@@ -1181,9 +1189,120 @@ def test_step_input_is_disabled_while_following_and_passed_to_start():
       const rejectedWhileFollowing=m.setStepUm(7);
       return {startArgs,beforeDisabled,afterDisabled,rejectedWhileFollowing,step:m.state.stepUm};
     """)
-    assert result["startArgs"] == {"source": "keys", "step_um": 2.5}
+    # Roughness is read from SLACS by default; the step is then the fallback.
+    assert result["startArgs"] == {"source": "keys", "step_um": 2.5, "step_source": "slacs"}
     assert result["beforeDisabled"] is False and result["afterDisabled"] is True
     assert result["rejectedWhileFollowing"] is False and result["step"] == 2.5
+
+
+def test_reading_roughness_is_on_by_default_and_labels_the_step_as_its_fallback():
+    result = run("""
+      const h=followHarness(),m=h.mounted,box=h.element('stage-follow-step-auto'),out=h.element('stage-follow-roughness');
+      return {auto:m.state.stepAuto,checked:box.checked,disabled:box.disabled,
+        label:h.element('stage-follow-step-label').textContent,hint:h.element('stage-follow-step-hint').textContent,
+        roughness:out.textContent,hidden:out.hidden};
+    """)
+    hint = result.pop("hint")
+    assert result == {"auto": True, "checked": True, "disabled": False,
+                      "label": "Fallback step if Roughness can't be read",
+                      "roughness": "SLACS Roughness is read while Follow runs", "hidden": False}
+    assert "Mirror Horizontal and Mirror Vertical reverse W/S and A/D" in hint
+
+
+def test_turning_roughness_reading_off_is_remembered_fixed_while_following_and_sends_a_manual_step():
+    result = run("""
+      let startArgs=null;
+      const h=followHarness({bridgeOverrides:{async start_stage_follow(opts){startArgs=opts;
+        return {ok:true,session_id:'session-one',token:'never',url:'http://127.0.0.1:1/motion',protocol:'test'};}}});
+      const m=h.mounted,box=h.element('stage-follow-step-auto'),out=h.element('stage-follow-roughness');
+      box.checked=false;const accepted=box.listeners.change();
+      const off={stored:h.storage.get('nd2wsi.stageFollow.stepAuto'),label:h.element('stage-follow-step-label').textContent,
+        hint:h.element('stage-follow-step-hint').textContent,hidden:out.hidden,text:out.textContent};
+      const notBoolean=m.setStepAuto('yes');
+      await m.startStageFollow();
+      Object.assign(h.snapshot,{keys:{step_source:'manual',step_um:10,roughness_um:null,controls_ok:false}});
+      await m.pollStageFollow();
+      const running={disabled:box.disabled,hidden:out.hidden,rejected:m.setStepAuto(true),
+        auto:m.state.stepAuto,checked:box.checked,stored:h.storage.get('nd2wsi.stageFollow.stepAuto')};
+      await m.stopStageFollow();
+      const reenabled=m.setStepAuto(true);
+      return {accepted,off,notBoolean,startArgs,running,reenabled,afterDisabled:box.disabled,
+        stored:h.storage.get('nd2wsi.stageFollow.stepAuto'),hidden:out.hidden};
+    """)
+    assert result["accepted"] is True and result["notBoolean"] is False
+    assert result["off"] == {"stored": "false", "label": "Step per key press", "hidden": True, "text": "",
+                             "hint": "Set this to SLACS's Roughness (1 Roughness = 1 µm per press). "
+                                     "Counts W/A/S/D only while SLACS is in front."}
+    assert result["startArgs"] == {"source": "keys", "step_um": 10, "step_source": "manual"}
+    # Fixed for a run, like the step: a change while following is refused and repainted.
+    assert result["running"] == {"disabled": True, "hidden": True, "rejected": False, "auto": False,
+                                 "checked": False, "stored": "false"}
+    assert result["reenabled"] is True and result["afterDisabled"] is False
+    assert result["stored"] == "true" and result["hidden"] is False
+
+
+def test_a_remembered_off_choice_is_restored_and_blocked_storage_still_reads_roughness():
+    result = run("""
+      const off=followHarness({stored:{'nd2wsi.stageFollow.stepAuto':'false'}});
+      const garbage=followHarness({stored:{'nd2wsi.stageFollow.stepAuto':'maybe'}});
+      const blocked=followHarness({blockStorage:true});
+      const changed=blocked.mounted.setStepAuto(false);
+      return {off:off.mounted.state.stepAuto,offChecked:off.element('stage-follow-step-auto').checked,
+        offHidden:off.element('stage-follow-roughness').hidden,garbage:garbage.mounted.state.stepAuto,
+        changed,blocked:blocked.mounted.state.stepAuto,blockedStep:blocked.mounted.state.stepUm};
+    """)
+    assert result == {"off": False, "offChecked": False, "offHidden": True, "garbage": True,
+                      "changed": True, "blocked": False, "blockedStep": 10}
+
+
+def test_roughness_output_shows_the_slacs_reading_busy_and_unreadable_states_from_the_follow_snapshot():
+    result = run("""
+      const h=followHarness({infoOverrides:{pixelSizeUm:[.5,.5]}}),m=h.mounted,out=h.element('stage-follow-roughness');
+      await m.startStageFollow();await m.toggleLock();
+      const texts=[];
+      const show=async keys=>{Object.assign(h.snapshot,{keys});await m.pollStageFollow();texts.push(out.textContent);};
+      const base={source:'keys',running:true,step_um:2.5,step_source:'slacs',counted:0,slacs_in_front:true};
+      await show({...base,roughness_um:10,controls_ok:true,slacs_busy:false,mirror_h:false,mirror_v:false});
+      await show({...base,roughness_um:1,controls_ok:true,slacs_busy:false,mirror_h:true,mirror_v:null});
+      await show({...base,roughness_um:10,controls_ok:false,slacs_busy:true,mirror_h:false,mirror_v:false});
+      await show({...base,roughness_um:null,controls_ok:false,slacs_busy:true,mirror_h:null,mirror_v:null});
+      await show({...base,roughness_um:null,controls_ok:false,slacs_busy:false,mirror_h:null,mirror_v:null});
+      await show({...base,roughness_um:10,controls_ok:false,slacs_busy:false,mirror_h:false,mirror_v:false});
+      const paused=m.state.follow.status;
+      await m.stopStageFollow();texts.push(out.textContent);
+      return {texts,paused};
+    """)
+    assert result["paused"] == "waiting"  # an unreadable Roughness never pauses Follow
+    assert result["texts"] == [
+        "SLACS Roughness: 10 µm = 20.0 px · Mirror H off, V off",
+        "SLACS Roughness: 1 µm = 2.0 px · Mirror H on, V unknown",
+        "SLACS busy — last Roughness 10 µm",
+        "SLACS busy — using 2.5 µm",
+        "SLACS Roughness unreadable — using 2.5 µm",
+        # The last good Roughness is still what each press moves by.
+        "SLACS Roughness unreadable — using 10 µm",
+        "SLACS Roughness is read while Follow runs",
+    ]
+
+
+def test_roughness_text_converts_at_each_pixel_axis_and_rejects_unusable_readings():
+    result = run("""
+      const keys={step_um:10,controls_ok:true,slacs_busy:false,mirror_h:false,mirror_v:true};
+      const square={x:1,y:1};
+      return {anisotropic:api.slacsRoughnessText({...keys,roughness_um:10},10,{x:.5,y:2}),
+        uncalibrated:api.slacsRoughnessText({...keys,roughness_um:10},10,null),
+        invalid:[0,-5,20000,'10',NaN,Infinity,true,null,undefined].map(roughness_um=>
+          api.slacsRoughnessText({...keys,roughness_um},10,square)),
+        pageFallback:api.slacsRoughnessText({controls_ok:false,roughness_um:null,step_um:0},7,square),
+        idle:[null,undefined,'keys'].map(value=>api.slacsRoughnessText(value,10,square)),
+        largest:api.slacsRoughnessText({...keys,roughness_um:1000},10,{x:.660165814209375,y:.660165814209375})};
+    """)
+    assert result["anisotropic"] == "SLACS Roughness: 10 µm = X 20.0 · Y 5.0 px · Mirror H off, V on"
+    assert result["uncalibrated"] == "SLACS Roughness: 10 µm · Mirror H off, V on"
+    assert result["invalid"] == ["SLACS Roughness unreadable — using 10 µm"] * 9
+    assert result["pageFallback"] == "SLACS Roughness unreadable — using 7 µm"
+    assert result["idle"] == ["SLACS Roughness is read while Follow runs"] * 3
+    assert result["largest"] == "SLACS Roughness: 1000 µm = 1514.8 px · Mirror H off, V on"
 
 
 def test_waiting_and_following_status_texts_mention_slacs_keys():

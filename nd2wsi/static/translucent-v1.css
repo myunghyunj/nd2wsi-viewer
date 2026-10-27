@@ -54,10 +54,14 @@ body { user-select: none; -webkit-user-select: none; }
 #stage-follow-settings[hidden] { display: none; }
 #stage-follow-settings p { margin: 0 0 8px; }
 #stage-follow-settings label { display: inline-flex; align-items: center; gap: 4px; }
-#stage-follow-settings .stage-follow-step-control { margin: 6px 0 4px; }
+#stage-follow-settings .stage-follow-auto-control { margin: 2px 0 4px; }
+#stage-follow-settings .stage-follow-step-control { flex-wrap: wrap; margin: 6px 0 4px; }
 #stage-follow-settings input[type="number"] { width: 70px; padding: 3px 5px; border: 1px solid rgba(255,255,255,.25); border-radius: 4px; background: rgba(0,0,0,.2); color: #fff; font: inherit; }
+#stage-follow-settings input[type="checkbox"] { margin: 0; accent-color: #285572; }
+#stage-follow-settings input:disabled { opacity: .55; cursor: default; }
 #stage-follow-settings .stage-follow-hint { color: #c9cdd3; }
 #stage-follow-settings output { display: block; font-variant-numeric: tabular-nums; margin-bottom: 5px; }
+#stage-follow-settings output[hidden] { display: none; }
 #stage-follow-settings #stage-follow-save { margin: 5px 0 8px; }
 #stage-follow-settings #stage-follow-message { margin: 0; color: #c9cdd3; }
 .resize-handle { position: absolute; z-index: 2; touch-action: none; }

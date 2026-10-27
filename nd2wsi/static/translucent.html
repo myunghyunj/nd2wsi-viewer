@@ -27,8 +27,10 @@
   </div>
   <p id="stage-follow-disconnected" role="status" aria-live="polite" hidden></p>
   <div id="stage-follow-settings" hidden>
-    <label class="stage-follow-step-control">Step per key press <input id="stage-follow-step" type="number" min="0.001" max="10000" step="0.1" value="10" /> µm</label>
-    <p class="stage-follow-hint">Set this to SLACS's Roughness (1 Roughness ≈ 1 µm). Counts W/A/S/D only while SLACS is in front.</p>
+    <label class="stage-follow-auto-control"><input id="stage-follow-step-auto" type="checkbox" checked /> Read Roughness from SLACS</label>
+    <output id="stage-follow-roughness">SLACS Roughness is read while Follow runs</output>
+    <label class="stage-follow-step-control"><span id="stage-follow-step-label">Fallback step if Roughness can't be read</span> <input id="stage-follow-step" type="number" min="0.001" max="10000" step="0.1" value="10" /> µm</label>
+    <p class="stage-follow-hint" id="stage-follow-step-hint">Each press moves by SLACS's Roughness (1 Roughness = 1 µm), and SLACS's Mirror Horizontal and Mirror Vertical reverse W/S and A/D here too. Counts W/A/S/D only while SLACS is in front.</p>
     <output id="stage-follow-count">Key presses: 0</output>
     <p class="stage-follow-hint">W/A/S/D move the image in the directions shown on screen. Set rotation and flip in the main viewer before opening this window.</p>
     <p class="stage-follow-hint">Follows only while locked. Unlock to align by hand; key presses are ignored until you lock again.</p>

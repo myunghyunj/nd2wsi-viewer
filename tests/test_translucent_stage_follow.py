@@ -116,13 +116,17 @@ def test_overlay_logs_the_detector_state_it_starts_with(monkeypatch):
     monkeypatch.setattr(tw.session_log, 'event', lambda kind, **fields: events.append((kind, fields)))
     detector = Mock()
     detector.snapshot.return_value = {'available': False, 'session_id': None, 'status': 'checking'}
-    monkeypatch.setattr(slacs_discovery, 'SlacsDiscovery', Mock(return_value=detector))
+    factory = Mock(return_value=detector)
+    monkeypatch.setattr(slacs_discovery, 'SlacsDiscovery', factory)
     api = TranslucentApi({'pixel_size_um': [.5, .5]}, logger=Mock(), on_closed=Mock())
     api._window = Mock()
     api.slacs_discovery_state()
     api.slacs_discovery_state()
     assert [fields for kind, fields in events if kind == 'slacs_detection'] == [
         {'window': 'translucent', 'available': False, 'session_id': None, 'status': 'checking'}]
+    # The monitor's own records (liveness checks, exits) name the window that owns it.
+    factory.assert_called_once()
+    assert factory.call_args.kwargs['name'] == 'translucent'
     api.close_translucent()
 
 
@@ -220,10 +224,14 @@ class FakeReceiver:
 class FakeFollower:
     instances = []
 
-    def __init__(self, receiver, session_id, *, step_um, start_ok=True, order=None):
+    def __init__(self, receiver, session_id, *, step_um, step_source="manual", controls=None,
+                 pixel_size_um=None, start_ok=True, order=None):
         self.receiver = receiver
         self.session_id = session_id
         self.step_um = step_um
+        self.step_source = step_source
+        self.controls = controls
+        self.pixel_size_um = pixel_size_um
         self._start_ok = start_ok
         self._order = order if order is not None else []
         self.stopped = None
@@ -245,8 +253,39 @@ class FakeFollower:
         self._order.append("follower.stop")
 
 
+class FakeControlsMonitor:
+    """SlacsControlsMonitor's interface; the overlay only constructs it."""
+
+    instances = []
+
+    def __init__(self, pid_provider):
+        self.pid_provider = pid_provider
+        self.calls = []
+        FakeControlsMonitor.instances.append(self)
+
+    def start(self):
+        self.calls.append("start")
+        return True
+
+    def stop(self):
+        self.calls.append("stop")
+
+    def latest(self):
+        return {"ok": True, "roughness_um": 10.0, "mirror_h": False, "mirror_v": False, "age_ms": 0.0,
+                "busy": False, "error": None, "reads": 1}
+
+
 @pytest.fixture
-def keys_overlay(monkeypatch):
+def fake_controls(monkeypatch):
+    """Stand in for nd2wsi.slacs_controls, whose Win32 reader this module never needs."""
+    FakeControlsMonitor.instances.clear()
+    module = SimpleNamespace(SlacsControlsMonitor=FakeControlsMonitor)
+    monkeypatch.setitem(sys.modules, "nd2wsi.slacs_controls", module)
+    return module
+
+
+@pytest.fixture
+def keys_overlay(monkeypatch, fake_controls):
     FakeFollower.instances.clear()
     order = []
     monkeypatch.setattr(stage_follow_module, "StageFollowReceiver", lambda: FakeReceiver(order))
@@ -254,8 +293,8 @@ def keys_overlay(monkeypatch):
     def make(*, start_ok=True, platform="win32"):
         monkeypatch.setattr(tw.sys, "platform", platform)
         monkeypatch.setattr(stage_keys_module, "SlacsKeyFollower",
-                            lambda receiver, session_id, *, step_um: FakeFollower(
-                                receiver, session_id, step_um=step_um, start_ok=start_ok, order=order))
+                            lambda receiver, session_id, **options: FakeFollower(
+                                receiver, session_id, start_ok=start_ok, order=order, **options))
         return make_overlay(), order
 
     return make
@@ -297,12 +336,20 @@ def test_explicit_keys_options_set_the_step(keys_overlay):
     ({"source": "keys", "step_um": float("nan")}, "between"),
     ({"source": "keys", "step_um": "10"}, "between"),
     ("not-a-dict", "Invalid"),
+    ({"source": "keys", "step_source": "auto"}, "step source"),
+    ({"source": "keys", "step_source": None}, "step source"),
+    ({"source": "keys", "step_source": True}, "step source"),
+    ({"source": "keys", "step_source": ["slacs"]}, "step source"),
+    ({"step_source": "SLACS"}, "step source"),
+    ({"source": "adapter", "step_source": ""}, "step source"),
+    ({"source": "keys", "step_source": "slacs", "step_um": -1}, "between"),
 ])
 def test_invalid_options_are_rejected_without_a_receiver(keys_overlay, options, fragment):
     api, _order = keys_overlay(platform="win32")
     result = api.start_stage_follow(options)
     assert not result["ok"] and fragment in result["message"]
     assert api._stage_follow is None and FakeFollower.instances == []
+    assert FakeControlsMonitor.instances == []
 
 
 def test_follower_that_cannot_start_closes_the_receiver(keys_overlay):
@@ -337,7 +384,161 @@ def test_restart_is_idempotent_and_reuses_the_running_follower(keys_overlay):
     assert second["session_id"] == first["session_id"]
     # A second start never builds a new follower while one is running.
     assert len(FakeFollower.instances) == 1
+    assert len(FakeControlsMonitor.instances) == 1
     api.stop_stage_follow()
+
+
+# Roughness and Mirror read from SLACS ----------------------------------------
+
+def test_windows_keys_read_roughness_from_slacs_by_default(keys_overlay):
+    api, _order = keys_overlay(platform="win32")
+    api._context["pixel_size_um"] = [0.5, 0.8]  # [Y, X], anisotropic so a swap cannot pass
+    result = api.start_stage_follow()
+    assert result["ok"] and result["source"] == "keys"
+    follower = FakeFollower.instances[-1]
+    [monitor] = FakeControlsMonitor.instances
+    assert follower.step_source == "slacs" and follower.controls is monitor
+    assert follower.step_um == tw.DEFAULT_STEP_UM  # the fallback while Roughness cannot be read
+    assert follower.pixel_size_um == (0.8, 0.5)  # (X, Y) for the follower
+    # The monitor asks the overlay's detector for the pid at each read, not once at start.
+    assert monitor.pid_provider() is None
+    api._discovery = Mock()
+    api._discovery.slacs_pid.return_value = 4242
+    assert monitor.pid_provider() == 4242
+    api._on_slacs_change({"available": False, "session_id": None, "status": "not_running"})
+    assert follower.stopped == "slacs_lost"
+    # The follower owns the monitor's start and stop; the overlay never calls them.
+    assert monitor.calls == []
+    api.close_translucent()
+
+
+@pytest.mark.parametrize("platform, options, expected", [
+    ("win32", {"source": "keys"}, "slacs"),
+    ("win32", {"source": "keys", "step_um": 2.5, "step_source": "slacs"}, "slacs"),
+    ("win32", {"source": "keys", "step_source": "manual"}, "manual"),
+    ("darwin", {"source": "keys"}, "manual"),
+    ("darwin", {"source": "keys", "step_source": "slacs"}, "slacs"),  # as the page asks by default
+])
+def test_step_source_defaults_and_explicit_choices(keys_overlay, platform, options, expected):
+    api, _order = keys_overlay(platform=platform)
+    assert api.start_stage_follow(options)["ok"]
+    follower = FakeFollower.instances[-1]
+    assert follower.step_source == expected
+    assert follower.step_um == options.get("step_um", tw.DEFAULT_STEP_UM)
+    assert len(FakeControlsMonitor.instances) == (expected == "slacs")
+    assert (follower.controls is not None) is (expected == "slacs")
+    api.stop_stage_follow()
+
+
+@pytest.mark.parametrize("options", [None, {"source": "adapter"}, {"source": "adapter", "step_source": "slacs"}])
+def test_the_adapter_source_never_reads_slacs_controls(keys_overlay, options):
+    api, _order = keys_overlay(platform="darwin")
+    result = api.start_stage_follow(options)
+    assert result["ok"] and result["source"] == "adapter"
+    assert FakeFollower.instances == [] and FakeControlsMonitor.instances == []
+    api.stop_stage_follow()
+
+
+def test_follow_start_records_the_step_source(keys_overlay, monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    api, _order = keys_overlay(platform="win32")
+    assert api.start_stage_follow({"source": "keys", "step_um": 2.5, "step_source": "manual"})["ok"]
+    api.stop_stage_follow()
+    assert api.start_stage_follow()["ok"]
+    api.stop_stage_follow()
+    assert [fields for kind, fields in events if kind == "follow_start"] == [
+        {"source": "keys", "step_source": "manual", "step_um": 2.5, "ok": True, "slacs_session": "test-process"},
+        {"source": "keys", "step_source": "slacs", "step_um": tw.DEFAULT_STEP_UM, "ok": True,
+         "slacs_session": "test-process"},
+    ]
+
+
+def test_a_follower_that_cannot_start_records_its_step_source_and_leaves_the_monitor_to_it(keys_overlay, monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    api, order = keys_overlay(start_ok=False, platform="win32")
+    result = api.start_stage_follow()
+    assert result == {"ok": False, "message": "boom"}
+    assert order == ["follower.stop", "receiver.close"]
+    [monitor] = FakeControlsMonitor.instances
+    assert FakeFollower.instances[-1].controls is monitor and monitor.calls == []
+    assert [fields for kind, fields in events if kind == "follow_start"] == [
+        {"source": "keys", "step_source": "slacs", "ok": False, "message": "boom"}]
+
+
+@pytest.mark.parametrize("failure, error", [
+    ("missing", "ModuleNotFoundError"),
+    ("raises", "OSError: user32 is unavailable"),
+])
+def test_follow_still_starts_on_the_fallback_step_without_a_controls_monitor(keys_overlay, monkeypatch,
+                                                                            failure, error):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    if failure == "missing":
+        monkeypatch.setitem(sys.modules, "nd2wsi.slacs_controls", None)  # the import fails
+    else:
+        def broken(pid_provider):
+            raise OSError("user32 is unavailable")
+
+        monkeypatch.setattr(sys.modules["nd2wsi.slacs_controls"], "SlacsControlsMonitor", broken)
+    api, _order = keys_overlay(platform="win32")
+    result = api.start_stage_follow({"source": "keys", "step_um": 3})
+    assert result["ok"]
+    follower = FakeFollower.instances[-1]
+    # The follower moves by the manual step and records it as a fallback.
+    assert follower.step_source == "slacs" and follower.controls is None and follower.step_um == 3
+    [start] = [fields for kind, fields in events if kind == "follow_start"]
+    assert start["ok"] is True and start["step_source"] == "slacs"
+    assert start["controls_error"].startswith(error)
+    api._logger.assert_called()
+    api.stop_stage_follow()
+
+
+def test_slacs_pid_comes_from_the_detector_and_is_none_when_unknown():
+    api = make_overlay()
+    assert api._slacs_pid() is None  # no detector yet
+    api._discovery = Mock()
+    api._discovery.slacs_pid.return_value = 4242
+    assert api._slacs_pid() == 4242
+    for value in (None, 0, -1, True, 12.0, "4242"):
+        api._discovery.slacs_pid.return_value = value
+        assert api._slacs_pid() is None
+    api._discovery.slacs_pid.side_effect = RuntimeError("detector stopped")
+    assert api._slacs_pid() is None
+    api._discovery.slacs_pid.side_effect = None
+    api._discovery.slacs_pid.return_value = 4242
+    api.close_translucent()
+    assert api._slacs_pid() is None  # never read a closed overlay's SLACS
+
+
+def test_slacs_pid_never_waits_for_the_overlay_lock():
+    # The monitor thread asks for the pid while the overlay may hold its lock,
+    # for example while a start or stop of the follower joins that thread.
+    import threading
+
+    api = make_overlay()
+    api._discovery = Mock()
+    api._discovery.slacs_pid.return_value = 7
+    held, release, result = threading.Event(), threading.Event(), []
+
+    def hold():
+        with api._lock:
+            held.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    try:
+        reader = threading.Thread(target=lambda: result.append(api._slacs_pid()), daemon=True)
+        reader.start()
+        reader.join(2)
+        assert result == [7]
+    finally:
+        release.set()
+        holder.join(5)
+    api.close_translucent()
 
 
 def test_log_client_event_caps_and_rate_limits(monkeypatch):

@@ -686,7 +686,7 @@ class Api:
             if self._translucent_owner_closed:
                 return {"available": False, "session_id": None, "status": "closed", "offer": False}
             if self._slacs_discovery is None:
-                self._slacs_discovery = SlacsDiscovery()
+                self._slacs_discovery = SlacsDiscovery(name="main")
             detector = self._slacs_discovery
         snapshot = detector.snapshot()
         self._log_slacs_detection(snapshot)
