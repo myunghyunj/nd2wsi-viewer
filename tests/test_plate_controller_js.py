@@ -67,3 +67,20 @@ guarded.setPlateZ(2);
 console.log(JSON.stringify({z:state.plate.z,auto:state.plate.auto,changes}));
 """)
     assert out == {"z": 2, "auto": False, "changes": [2]}
+
+
+def test_pause_for_a_hidden_pane_stops_the_timer_and_keeps_t_and_z():
+    out = run(r"""
+control.setPlatePlaying(true);[...timers.values()][0].fn();
+const before={t:state.plate.t,z:state.plate.z,changes:changes.length};
+control.pausePlatePlayback();
+const paused={t:state.plate.t,z:state.plate.z,changes:changes.length,timers:timers.size,
+  playing:state.plate.playing,title:$('t-play').title};
+$('t-play').title='untouched';control.pausePlatePlayback();
+console.log(JSON.stringify({before,paused,idleTitle:$('t-play').title}));
+""")
+    assert out["before"] == {"t": 1, "z": 1, "changes": 1}
+    assert out["paused"] == {"t": 1, "z": 1, "changes": 1, "timers": 0,
+                             "playing": False, "title": "Play (space)"}
+    # pausing a plate that is not playing changes nothing
+    assert out["idleTitle"] == "untouched"

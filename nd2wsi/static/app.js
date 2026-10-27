@@ -91,7 +91,7 @@ const state = {
 
 const {
   setPlateZ, stepPlateZ, setPlateAuto, setPlateT,
-  setPlatePlaying, buildZSlider, renderZSlider, buildTimeLine,
+  setPlatePlaying, pausePlatePlayback, buildZSlider, renderZSlider, buildTimeLine,
   renderTimeLine, renderPlateAuto, loadPlateFocus, pollPlateStatus,
 } = window.Nd2PlateController.createController({
   state, $, clamp, plateZFor,
@@ -4513,6 +4513,8 @@ function wireCompareRelay() {
       receiveCompareLifecycle(event.data);
     } else if (event.data.nd2wsi === "tab-shortcut-state") {
       state.tabCount = Math.max(0, Math.floor(Number(event.data.count) || 0));
+    } else if (event.data.nd2wsi === "pane-visibility") {
+      if (event.data.visible === false) pausePlatePlayback();
     } else if (event.data.nd2wsi === "pane-translucent-open") {
       refreshSpatialContext();
       if (event.data.sid === currentSlideSid() &&

@@ -667,8 +667,19 @@ function applyFrameLayout() {
   divider.setAttribute("aria-hidden", String(!twoUp));
   for (const [key, frame] of frames) {
     const index = group.indexOf(key);
-    frame.classList.toggle("active", !compare.enabled && key === active);
+    const shown = !compare.enabled && key === active;
+    frame.classList.toggle("active", shown);
     frame.classList.toggle("compare-cell", index >= 0);
+    // Tell a pane when it is hidden or shown again, so it can pause work
+    // nobody sees (plate playback). Only changes are posted; a pane that is
+    // still loading counts itself visible and cannot be played while hidden.
+    const visible = shown || index >= 0;
+    if (frame.dataset.paneVisible !== String(visible)) {
+      frame.dataset.paneVisible = String(visible);
+      frame.contentWindow?.postMessage({
+        nd2wsi: "pane-visibility", version: VIEWPORT_PROTOCOL_VERSION, visible,
+      }, location.origin);
+    }
     frame.style.left = frame.style.top = frame.style.width = frame.style.height = "";
     if (index < 0) continue;
     let cell;

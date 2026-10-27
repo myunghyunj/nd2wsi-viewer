@@ -89,6 +89,13 @@
       }
     }
 
+    // The pane went out of sight (another tab, or left a Compare group):
+    // stop issuing frames nobody sees. T and Z stay where playback left
+    // them, and nothing restarts by itself when the pane is shown again.
+    function pausePlatePlayback() {
+      if (state.plate?.playing) setPlatePlaying(false);
+    }
+
     /* z slider: a track that fills up to the knob, a tick per plane, the home
        plane marked, a value capsule beside the knob */
 
@@ -426,7 +433,7 @@
 
     return {
       setPlateZ, stepPlateZ, setPlateAuto, setPlateT,
-      setPlatePlaying, buildZSlider, renderZSlider, buildTimeLine,
+      setPlatePlaying, pausePlatePlayback, buildZSlider, renderZSlider, buildTimeLine,
       renderTimeLine, renderPlateAuto, loadPlateFocus, pollPlateStatus,
     };
   }
