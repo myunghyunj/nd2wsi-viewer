@@ -173,7 +173,10 @@ class ViewerState:
         # enter this, always inside busy. Close and update wait for these,
         # never for tile reads or export previews.
         self.exports = _Lifecycle()
-        self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
+        # zarr reads are thread-safe; this lock is kept for attrs, the LUT
+        # store's one-time setup and browser-mode annotation writes
+        self.lock = threading.Lock()
+        self._hist_lock = threading.Lock()  # one histogram computation at a time
         self._inspect_lock = threading.Lock()
         self._cache_usage_ready = False
         self._cache_usage: dict[str, int] | None = None
@@ -1417,9 +1420,13 @@ class SlideRegistry:
             return next(iter(self.slides), None)
 
     def get(self, sid: str | None) -> ViewerState | None:
-        with self._lock:
-            if sid is None:
-                sid = next(iter(self.slides), None)
+        if sid is not None:
+            # One dict lookup is atomic and writers still serialise under
+            # _lock; the busy lease gates every use of the state. Skipping the
+            # lock keeps open slides serving while another slide opens.
+            return self.slides.get(sid) if sid else None
+        with self._lock:  # iterating can race a resize, so keep the lock
+            sid = next(iter(self.slides), None)
             return self.slides.get(sid) if sid else None
 
     def listing(self) -> list[dict[str, Any]]:
@@ -2159,7 +2166,10 @@ def make_handler(
                         "frame": {"t": t, "p": p, "z": z},
                     }
                 )
-            with st.lock:
+            # Its own lock: LUT settings and annotation saves on st.lock never
+            # wait for a histogram. Requests hold busy, and a replacement
+            # drains busy before it resets histograms.
+            with st._hist_lock:
                 if st.histograms is None:
                     st.histograms = render.compute_histograms(st.root, st.attrs)
             self._json(

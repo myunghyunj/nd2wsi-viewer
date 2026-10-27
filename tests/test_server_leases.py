@@ -302,3 +302,54 @@ def test_astromap_build_and_download_count_as_exports(monkeypatch, tmp_path):
     assert during_download and set(during_download) == {(1, 0)}
     assert registry.active_export_count() == 0
     registry.astromap_downloads.close()
+
+
+def test_get_by_sid_does_not_wait_for_an_open_holding_the_registry_lock():
+    st = state()
+    registry = window_registry(st)
+    found, first = [], []
+    with registry._lock:  # a slow open of another slide
+        by_sid = threading.Thread(target=lambda: found.append(registry.get(SID)))
+        by_sid.start()
+        by_sid.join(2)
+        assert not by_sid.is_alive()
+        assert found == [st]
+        assert registry.get("") is None
+        # The bare /api/ route iterates the registry and still serialises.
+        default = threading.Thread(target=lambda: first.append(registry.get(None)))
+        default.start()
+        default.join(0.1)
+        assert default.is_alive()
+    default.join(2)
+    assert first == [st]
+
+
+def test_histogram_runs_once_without_holding_the_attrs_lock(monkeypatch):
+    computing, release = threading.Event(), threading.Event()
+    calls = []
+
+    def compute(root, attrs):
+        calls.append(attrs)
+        computing.set()
+        assert release.wait(5)
+        return [{"bins": []}]
+
+    monkeypatch.setattr(render, "compute_histograms", compute)
+    st = state()
+    registry = window_registry(st)
+    handler = bare_handler(registry)
+    replies = []
+    handler._json = lambda obj, code=200: replies.append(obj)
+    workers = [threading.Thread(target=handler._histogram, args=(st, {})) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    try:
+        assert computing.wait(5)
+        assert st.lock.acquire(timeout=1)  # LUT settings and saves do not wait
+        st.lock.release()
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(5)
+    assert len(calls) == 1
+    assert [reply["channels"] for reply in replies] == [[{"bins": []}]] * 2
