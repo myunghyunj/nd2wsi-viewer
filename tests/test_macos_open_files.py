@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -148,11 +148,31 @@ class FakePage:
         return self.deliver(batch)
 
 
+class HookedLock:
+    """A lock that runs ``after_release`` right after every release."""
+
+    def __init__(self, after_release):
+        self.lock = threading.Lock()
+        self.after_release = after_release
+
+    def __enter__(self):
+        self.lock.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.lock.release()
+        self.after_release()
+
+
 def wait_until(condition, timeout=5.0):
     deadline = time.monotonic() + timeout
     while not condition():
         assert time.monotonic() < deadline, "timed out waiting"
         time.sleep(0.005)
+
+
+def logged(message):
+    return call(message) in app._dlog.call_args_list
 
 
 @pytest.fixture
@@ -204,6 +224,29 @@ def test_open_queued_while_a_batch_is_delivered_is_delivered(finder):
     wait_until(lambda: finder.idle() and len(page.batches) == 2)
 
     assert page.batches == [["/isolated/a.nd2"], ["/isolated/b.nd2"]]
+    assert app._PENDING_OPENS == []
+
+
+def test_open_queued_as_the_flusher_sees_the_queue_empty_is_delivered(finder, monkeypatch):
+    page = FakePage()
+    finder.webview.windows.append(page)
+    late = []
+
+    def after_release():
+        if late or app._PENDING_OPENS or page.batches != [["/isolated/a.nd2"]]:
+            return
+        # The flusher has just seen the queue empty and let go of the lock;
+        # Finder hands over another file before the flusher returns.
+        late.append(threading.Thread(target=app._dispatch_open, args=(["/isolated/late.nd2"],)))
+        late[0].start()
+        late[0].join()
+
+    monkeypatch.setattr(app, "_OPENS_LOCK", HookedLock(after_release))
+
+    app._dispatch_open(["/isolated/a.nd2"])
+    wait_until(lambda: finder.idle() and len(page.batches) == 2)
+
+    assert page.batches == [["/isolated/a.nd2"], ["/isolated/late.nd2"]]
     assert app._PENDING_OPENS == []
 
 
@@ -263,6 +306,35 @@ def test_hung_delivery_does_not_block_later_opens(finder, monkeypatch):
     app._dlog.assert_any_call("the viewer did not answer 1 open(s) within 0.05 seconds")
 
 
+def test_no_page_call_starts_while_a_delivery_is_unanswered(finder, monkeypatch):
+    monkeypatch.setattr(app, "_OPEN_CALL_TIMEOUT", 0.05)
+    hung = finder.gate()
+
+    def deliver(batch):
+        if batch == ["/isolated/a.nd2"]:
+            app._dispatch_open(["/isolated/b.nd2"])  # queued while the page hangs
+            hung.wait()
+
+    page = FakePage(deliver=deliver)
+    finder.webview.windows.append(page)
+
+    app._dispatch_open(["/isolated/a.nd2"])
+    wait_until(lambda: logged("the viewer did not answer 1 open(s) within 0.05 seconds"))
+    time.sleep(0.2)
+
+    # The flusher waits for the unanswered call instead of starting another one.
+    assert page.probes == 1
+    assert page.batches == [["/isolated/a.nd2"]]
+    assert not finder.idle()
+
+    hung.set()
+    wait_until(lambda: finder.idle() and len(page.batches) == 2)
+
+    assert page.batches == [["/isolated/a.nd2"], ["/isolated/b.nd2"]]
+    assert page.probes == 2
+    assert app._PENDING_OPENS == []
+
+
 def test_page_that_never_answers_leaves_opens_queued_for_the_next_open(finder, monkeypatch):
     monkeypatch.setattr(app, "_OPEN_READY_TIMEOUT", 0.2)
     recovered = finder.gate()
@@ -275,11 +347,43 @@ def test_page_that_never_answers_leaves_opens_queued_for_the_next_open(finder, m
     assert page.probes == 1  # the hung probe stranded one helper thread, not one per retry
     assert page.batches == []
     assert app._PENDING_OPENS == ["/isolated/a.nd2"]
-    app._dlog.assert_any_call("flush_opens timed out; 1 open(s) stay queued for the next open")
+    # the flusher logs this after it lets go of the lock, so idle can come first
+    wait_until(lambda: logged("flush_opens timed out; 1 open(s) stay queued for the next open"))
 
     monkeypatch.setattr(app, "_OPEN_READY_TIMEOUT", 5.0)
     recovered.set()
     app._dispatch_open(["/isolated/b.nd2"])
+    wait_until(lambda: finder.idle() and page.batches)
+
+    assert page.batches == [["/isolated/a.nd2", "/isolated/b.nd2"]]
+    assert app._PENDING_OPENS == []
+
+
+def test_flusher_that_gives_up_leaves_a_newer_flusher_running(finder, monkeypatch):
+    monkeypatch.setattr(app, "_OPEN_READY_TIMEOUT", 0.2)
+    answer = finder.gate()
+    page = FakePage(probe=lambda: answer.wait() and "function")
+    finder.webview.windows.append(page)
+    gave_up = []
+
+    def log(message):
+        if gave_up or not message.startswith("flush_opens timed out"):
+            return
+        # A new open arrives after the old flusher let go but before it returned.
+        gave_up.append(threading.current_thread())
+        monkeypatch.setattr(app, "_OPEN_READY_TIMEOUT", 5.0)
+        app._dispatch_open(["/isolated/b.nd2"])
+        wait_until(lambda: page.probes == 2)  # the new flusher is waiting on the page
+
+    app._dlog.side_effect = log
+    app._dispatch_open(["/isolated/a.nd2"])
+    wait_until(lambda: gave_up)
+    gave_up[0].join(timeout=5.0)
+    assert not gave_up[0].is_alive()
+
+    assert app._FLUSHER_ALIVE  # still held by the new flusher
+
+    answer.set()
     wait_until(lambda: finder.idle() and page.batches)
 
     assert page.batches == [["/isolated/a.nd2", "/isolated/b.nd2"]]
