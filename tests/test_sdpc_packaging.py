@@ -66,7 +66,7 @@ def test_mac_sdpc_association_and_release_marker(tmp_path, builder):
     target = tmp_path / "Info.plist"
     target.write_bytes(plistlib.dumps({}))
     subprocess.run([sys.executable, "-", str(target), str(ROOT / "pyproject.toml")],
-                   input=source, text=True, check=True)
+                   input=source, text=True, check=True, timeout=30)
     info = plistlib.loads(target.read_bytes())
     imported = {item["UTTypeIdentifier"]: item for item in info["UTImportedTypeDeclarations"]}
     assert imported["com.sqray.sdpc"]["UTTypeTagSpecification"]["public.filename-extension"] == ["sdpc"]
