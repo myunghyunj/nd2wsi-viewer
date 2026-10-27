@@ -1,10 +1,12 @@
 """Local evidence restores correction without extending trust across missing data."""
 import copy
+import io
 
 import numpy as np
 import pytest
 
 from nd2wsi import h_adaptive as adaptive
+from nd2wsi import h_model
 
 
 @pytest.fixture
@@ -129,3 +131,107 @@ def test_local_helpers_honor_cancellation(sampled):
     with pytest.raises(InterruptedError):
         build(cells, template, coupled_nodes=np.ones((1, 7, 11)), check=cancel_during_loop)
     assert calls == 25
+
+
+def _reference_field_at(t, basis, delta, ys, xs, local=True):
+    # Literal 2.5.4 h_model.field_at, kept to pin Model.gain bit for bit.
+    yy = (np.asarray(ys) - 15.5) / 32
+    xx = (np.asarray(xs) - 15.5) / 32
+    phase = np.array([basis[0, 0] * yy + basis[0, 1] * xx, basis[1, 0] * yy + basis[1, 1] * xx])
+    if local:
+        phase[1] += h_model.phase_delta(phase, delta)
+    return h_model.sample_template(t, phase)
+
+
+def _reference_gain(model, c, shape, origin):
+    # Literal 2.5.4 Model.gain: the envelope recomputed the phase itself.
+    ci = model.indices.index(int(c))
+    h, w = shape
+    y, x = origin
+    if not model.enabled[ci]:
+        return np.ones(shape, np.float32)
+    xx = x + np.arange(w)[None, :]
+    out = np.empty(shape, np.float32)
+    has_envelope = model.amplitude_nodes is not None and model.envelope_cell_origin is not None
+    for row in range(0, h, 128):
+        yy = y + np.arange(row, min(h, row + 128))[:, None]
+        if model.old[ci]:
+            f = _reference_field_at(model.oldtemplates[ci], model.oldbasis, model.delta, yy, xx, False)
+        else:
+            f = _reference_field_at(
+                model.templates[ci], model.basis, model.delta, yy, xx, bool(model.local[ci])
+            )
+        if has_envelope:
+            yy32 = (np.asarray(yy, dtype=np.float64) - 15.5) / 32.0
+            xx32 = (np.asarray(xx, dtype=np.float64) - 15.5) / 32.0
+            phase = np.array([
+                model.basis[0, 0] * yy32 + model.basis[0, 1] * xx32,
+                model.basis[1, 0] * yy32 + model.basis[1, 1] * xx32,
+            ])
+            if bool(model.local[ci]):
+                phase[1] = phase[1] + h_model.phase_delta(phase, model.delta)
+            amp = h_model.smooth_node_envelope_at(
+                model.amplitude_nodes[ci], model.envelope_cell_origin, phase
+            )
+            f = amp * f
+        out[row : row + len(yy)] = 1 + f
+    return out
+
+
+def _gain_model(kind):
+    rng = np.random.default_rng(27)
+    fields = dict(
+        basis=np.array([[0.9, 0.1], [-0.05, 1.1]]),
+        oldbasis=np.array([[1.02, -0.03], [0.04, 0.97]]),
+        templates=rng.normal(0, 0.05, (3, 16, 24)),
+        oldtemplates=rng.normal(0, 0.05, (3, 20, 20)),
+        delta=rng.normal(0, 0.05, (12, 12)),
+        local=np.array([True, False, True]),
+        old=np.zeros(3, dtype=bool),
+        channel_indices=np.array([2, 0, 1]),
+        enabled=np.ones(3, dtype=bool),
+    )
+    if kind == "legacy":
+        fields["old"][2] = True
+    else:
+        fields.update(
+            model_schema=np.asarray(h_model.Model.ADAPTIVE_SCHEMA),
+            amplitude_nodes=rng.uniform(0.5, 1.0, (3, 14, 14)),
+            envelope_cell_origin=np.array([0.5, 1.0]),
+        )
+    stream = io.BytesIO()
+    np.savez(stream, **fields)
+    stream.seek(0)
+    model = h_model.Model(stream)
+    if kind == "adaptive_old":
+        # Loading refuses this pairing; an in-process change still keeps the
+        # envelope on the current basis, exactly as before.
+        model.old[2] = True
+    return model
+
+
+@pytest.mark.parametrize("kind", ["legacy", "adaptive", "adaptive_old"])
+def test_gain_reuses_phase_bit_identically(kind):
+    model = _gain_model(kind)
+    shape = (300, 257)  # two full 128-row bands and a partial one
+    origins = [(0, 0), (130, -40), (-77, 913.5), (np.int64(1536), np.int32(2048))]
+    raw = np.random.default_rng(5).integers(0, 4000, shape).astype(np.uint16)
+    try:
+        for c in model.indices:
+            for origin in origins:
+                expected = _reference_gain(model, c, shape, origin)
+                actual = model.gain(c, shape, origin)
+                assert actual.dtype == expected.dtype == np.float32
+                np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+                corrected = model.correct(c, raw, *origin)
+                np.testing.assert_array_equal(
+                    corrected.view(np.uint32),
+                    (np.asarray(raw, np.float32) / expected).view(np.uint32),
+                )
+        if kind != "legacy":
+            # The envelope lattice covers part of this tile: its interior,
+            # taper and zero region (gain exactly 1) are all exercised.
+            near = _reference_gain(model, model.indices[0], shape, (0, 0))
+            assert np.any(near == 1) and np.any(np.abs(near - 1) > 1e-3)
+    finally:
+        model.data.close()

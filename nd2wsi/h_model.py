@@ -37,13 +37,17 @@ def sample_template(t, phase):
     )
 
 
-def field_at(t, basis, delta, ys, xs, local=True):
+def field_phase(basis, delta, ys, xs, local=True):
     yy = (np.asarray(ys) - 15.5) / 32
     xx = (np.asarray(xs) - 15.5) / 32
     phase = np.array([basis[0, 0] * yy + basis[0, 1] * xx, basis[1, 0] * yy + basis[1, 1] * xx])
     if local:
         phase[1] += phase_delta(phase, delta)
-    return sample_template(t, phase)
+    return phase
+
+
+def field_at(t, basis, delta, ys, xs, local=True):
+    return sample_template(t, field_phase(basis, delta, ys, xs, local))
 
 
 def template(a, sigma):
@@ -397,23 +401,21 @@ class Model:
         has_envelope = (
             self.amplitude_nodes is not None and self.envelope_cell_origin is not None
         )
+        old = bool(self.old[ci])
+        local = bool(self.local[ci])
         for row in range(0, h, 128):
             yy = y + np.arange(row, min(h, row + 128))[:, None]
-            if self.old[ci]:
+            # The current template and the adaptive envelope sample the same
+            # current-basis phase, local phase_delta included: compute it once.
+            phase = (
+                field_phase(self.basis, self.delta, yy, xx, local)
+                if has_envelope or not old else None
+            )
+            if old:
                 f = field_at(self.oldtemplates[ci], self.oldbasis, self.delta, yy, xx, False)
             else:
-                f = field_at(
-                    self.templates[ci], self.basis, self.delta, yy, xx, bool(self.local[ci])
-                )
+                f = sample_template(self.templates[ci], phase)
             if has_envelope:
-                yy32 = (np.asarray(yy, dtype=np.float64) - 15.5) / 32.0
-                xx32 = (np.asarray(xx, dtype=np.float64) - 15.5) / 32.0
-                phase = np.array([
-                    self.basis[0, 0] * yy32 + self.basis[0, 1] * xx32,
-                    self.basis[1, 0] * yy32 + self.basis[1, 1] * xx32,
-                ])
-                if bool(self.local[ci]):
-                    phase[1] = phase[1] + phase_delta(phase, self.delta)
                 amp = smooth_node_envelope_at(
                     self.amplitude_nodes[ci], self.envelope_cell_origin, phase
                 )
