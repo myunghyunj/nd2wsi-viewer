@@ -222,8 +222,9 @@ def test_windows_main_window_gets_the_same_close_guard_without_cocoa(monkeypatch
     assert api._close_coordinator.window is window
     assert window.events.closing.handlers == [api._close_coordinator.on_closing]
     assert window.events.closed.handlers[-1] == api._close_coordinator.cancel_preparation
-    # No Sparkle updater or AppKit menu on Windows; only the WebView2 guard.
-    assert window.events.shown.handlers == []
+    # No Sparkle updater or AppKit menu on Windows; only the WebView2 guard
+    # and the session-log record of the window being shown.
+    assert window.events.shown.handlers == [app._record_window_shown]
     assert len(window.events.initialized.handlers) == 1
 
 

@@ -1,5 +1,38 @@
 /* nd2wsi viewer ------------------------------------------------------------ */
 "use strict";
+
+/* Script errors in this pane go to the shell, which keeps them in the desktop
+   app's session log. Reporting never throws and sends at most 20 a minute. */
+const paneErrorsSent = [];
+function relayPaneError(kind, error, event = null) {
+  try {
+    if (window.parent === window) return false;
+    const now = Date.now();
+    while (paneErrorsSent.length && now - paneErrorsSent[0] >= 60000) paneErrorsSent.shift();
+    if (paneErrorsSent.length >= 20) return false;
+    paneErrorsSent.push(now);
+    const text = (value, limit) => {
+      try {
+        return (typeof value === "string" ? value : value === undefined || value === null ? "" : String(value))
+          .slice(0, limit);
+      } catch (_error) {
+        return "[unprintable]";
+      }
+    };
+    window.parent.postMessage({
+      nd2wsi: "client-error", kind,
+      message: text(event?.message || error?.message || error, 2000),
+      where: event?.filename ? text(`${event.filename}:${event.lineno || 0}:${event.colno || 0}`, 1000) : "",
+      stack: text(typeof error?.stack === "string" ? error.stack : "", 8000),
+    }, location.origin);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+window.addEventListener("error", (event) => relayPaneError("error", event.error, event));
+window.addEventListener("unhandledrejection", (event) => relayPaneError("unhandledrejection", event.reason));
+
 window.Nd2ShortcutRouter?.localizeLabels(document);
 
 const $ = (id) => document.getElementById(id);

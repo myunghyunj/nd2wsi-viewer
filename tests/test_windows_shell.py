@@ -88,8 +88,9 @@ def test_windows_preserves_native_window_controls_and_rejects_mshtml(fake_webvie
     assert webview.settings["ALLOW_DOWNLOADS"] is True
     assert "DRAG_REGION_SELECTOR" not in webview.settings
     assert app._wire_file_drop.call_count == 1
-    # No AppKit menu or Sparkle updater is installed on Windows.
-    assert window.events.shown.handlers == []
+    # No AppKit menu or Sparkle updater is installed on Windows; showing the
+    # window is only recorded in the session log.
+    assert window.events.shown.handlers == [app._record_window_shown]
     guard, = window.events.initialized.handlers
     assert guard("edgechromium") is True
     assert guard("mshtml") is False
@@ -758,6 +759,39 @@ def test_main_passes_edge_renderer_and_writes_gui_report(fake_webview, monkeypat
     assert report["close"]["path"] == "coordinated"
     assert window.is_closed and window.close_attempts == 2
     assert any("nd2wsiPrepareForUpdate" in script for script in window.scripts)
+
+
+def test_main_keeps_a_session_log_of_the_whole_run(fake_webview, monkeypatch, tmp_path):
+    from nd2wsi import session_log
+
+    webview, window = fake_webview
+    window.evaluate_js.return_value = {"bridge": True, "version": "test", "boot": True}
+    webview.util = SimpleNamespace(Thread=threading.Thread)
+    webview.start = Mock(side_effect=lambda callback, **_kwargs: callback())
+    monkeypatch.setenv("ND2WSI_SESSION_LOG_DIR", str(tmp_path / "session logs"))
+    hook = sys.excepthook
+    assert app.main(["--gui-smoke", "--smoke-report", str(tmp_path / "gui-smoke.json")]) == 0
+    log, = (tmp_path / "session logs").glob("session-*.jsonl")
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    by_kind = {}
+    for record in records:
+        by_kind.setdefault(record["kind"], []).append(record)
+    assert records[0]["kind"] == "start" and records[-1]["kind"] == "stop"
+    assert by_kind["app_start"][0]["mode"] == "gui-smoke"
+    assert {"os", "machine", "python", "frozen"} <= set(by_kind["app_start"][0])
+    created, = by_kind["window_created"]
+    assert created["role"] == "user" and len(created["id"]) == 32
+    assert by_kind["webview2_runtime"][0]["selection"]["kind"] == "system"
+    assert [record["allowed"] for record in by_kind["window_closing"]] == [False, True]
+    assert by_kind["window_close"] == [{**by_kind["window_close"][0], "outcome": "closed"}]
+    assert "window_closed" in by_kind
+    assert by_kind["gui_smoke"][0]["ok"] is True
+    assert by_kind["app_exit"][0]["result"] == 0
+    assert any(str(log) in record["message"] for record in by_kind["app_log"])
+    # The run closes its log: hooks are handed back and later events go nowhere.
+    assert session_log.path() == log and sys.excepthook is hook
+    session_log.event("after")
+    assert log.read_text(encoding="utf-8").count("\n") == len(records)
 
 
 def test_main_reports_missing_webview2_without_blocking_ci(fake_webview, monkeypatch, tmp_path):

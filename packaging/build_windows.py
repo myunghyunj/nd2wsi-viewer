@@ -321,7 +321,9 @@ def smoke(exe: Path, source: Path, evidence: Path, *, bundled_webview2: Path | N
         name = flag.removeprefix("--")
         log = evidence / f"{name}.log"
         log.unlink(missing_ok=True)
-        env = dict(os.environ, ND2WSI_LOG_FILE=str(log))
+        # Session logs are evidence; a portable EXE would otherwise write them
+        # into the bundle that is zipped next.
+        env = dict(os.environ, ND2WSI_LOG_FILE=str(log), ND2WSI_SESSION_LOG_DIR=str(evidence / "session-logs"))
         if bundled_webview2 is not None:
             env["ND2WSI_WEBVIEW2_RUNTIME"] = "bundled"
         command = [str(exe), flag, str(source)]

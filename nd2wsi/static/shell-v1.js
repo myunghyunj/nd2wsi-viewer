@@ -18,6 +18,76 @@ let quitPreparationRequestId = "";
 const quitPreparedPanes = new Map(); // sid -> most recent full preparation id
 const pairPicker = { open: false, mode: "start", replaceSid: null };
 
+/* Script errors in the shell and its slide panes are kept in the desktop app's
+   session log. Reporting never throws, sends at most 20 reports a minute and
+   holds a few until the pywebview bridge is ready; a browser shell drops them. */
+const clientErrors = { sent: [], pending: [], limit: 20, periodMs: 60000, maxPending: 10 };
+
+function clientErrorText(value, limit) {
+  let text;
+  try {
+    text = typeof value === "string" ? value : value === undefined || value === null ? "" : String(value);
+  } catch (_error) {
+    text = "[unprintable]";
+  }
+  return text.length > limit ? text.slice(0, limit) : text;
+}
+
+function describeClientError(kind, error, event = null) {
+  try {
+    const where = event?.filename ? `${event.filename}:${event.lineno || 0}:${event.colno || 0}` : "";
+    return { kind, message: event?.message || error?.message || error, where,
+      stack: typeof error?.stack === "string" ? error.stack : "" };
+  } catch (_error) {
+    return { kind, message: "[unreadable error]", where: "", stack: "" };
+  }
+}
+
+function sendClientError(payload) {
+  const api = window.pywebview?.api;
+  if (typeof api?.log_client_event !== "function") return false;
+  Promise.resolve(api.log_client_event(payload)).catch(() => {});
+  return true;
+}
+
+function relayClientError(report) {
+  try {
+    const now = Date.now();
+    while (clientErrors.sent.length && now - clientErrors.sent[0] >= clientErrors.periodMs) clientErrors.sent.shift();
+    if (clientErrors.sent.length >= clientErrors.limit) return false;
+    clientErrors.sent.push(now);
+    const payload = {
+      source: report.source === "pane" ? "pane" : "shell",
+      kind: clientErrorText(report.kind || "error", 64),
+      message: clientErrorText(report.message, 2000),
+      where: clientErrorText(report.where, 1000),
+      stack: clientErrorText(report.stack, 8000),
+    };
+    if (!sendClientError(payload) && clientErrors.pending.length < clientErrors.maxPending) {
+      clientErrors.pending.push(payload);
+    }
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+window.addEventListener("error", (event) => {
+  relayClientError({ source: "shell", ...describeClientError("error", event.error, event) });
+});
+window.addEventListener("unhandledrejection", (event) => {
+  relayClientError({ source: "shell", ...describeClientError("unhandledrejection", event.reason) });
+});
+window.addEventListener("pywebviewready", () => {
+  for (const payload of clientErrors.pending.splice(0)) {
+    try {
+      sendClientError(payload);
+    } catch (_error) {
+      // The session log is best effort; the shell keeps running.
+    }
+  }
+});
+
 let metalOpening = false;
 window.nd2OpenActiveInMetal = async function (retry = false) {
   if (metalOpening) return {ok:false, message:"A new window is already opening"};
@@ -2876,6 +2946,10 @@ window.addEventListener("message", (event) => {
     requestWindowZoom();
   } else if (kind === "file-drag") {
     if (senderSid) zone.hidden = false;
+  } else if (kind === "client-error") {
+    if (!senderSid) return;
+    relayClientError({ source: "pane", kind: event.data.kind, message: event.data.message,
+      where: event.data.where, stack: event.data.stack });
   } else if (kind === "theme") {
     // only the front tab colors the chrome; each tab keeps its own look
     const front = frames.get(active);
