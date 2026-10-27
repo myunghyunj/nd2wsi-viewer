@@ -67,7 +67,11 @@ Follow moves the image only while the overlay is locked. Unlocked, the user
 aligns the overlay by hand and nothing moves it: follow replies are still
 consumed, so key presses made meanwhile are discarded and never replayed after
 locking, and the status reads "Unlocked: align by hand, lock to follow" without
-stopping Follow. After locking, each new displacement is added to the current
+stopping Follow. The lock state is taken when each follow request is sent, not
+when its reply arrives: a reply to a request sent while unlocked or while a lock
+change is still pending, or answered after the lock changed, never moves the
+image, so presses made before locking (or during a lock that then fails) are
+not applied late. After locking, each new displacement is added to the current
 image center, so following continues from wherever the view was left. The
 native window position, zoom, display orientation, LUT, and ROI source geometry
 remain unchanged. ROI outlines are redrawn with the camera; their dimensions

@@ -218,6 +218,9 @@
       seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "" };
     state.slacs = { available: false, session_id: null, status: "checking" };
     let followEpoch = 0, followTimer = null, followInFlight = false, disposed = false;
+    // Bumped whenever the lock changes or settles, so a follow reply can tell
+    // whether the overlay stayed locked since its request left.
+    let lockEpoch = 0;
     let discoveryTask = null, discoveryInterval = null, discoveryGeneration = 0, disconnected = "";
     let followLifecycle = Promise.resolve();
     const showStatus = message => { status.textContent = message; status.hidden = !message; };
@@ -402,7 +405,7 @@
       follow.message = message + " Turn Follow off and on to reconnect.";
       paintFollow();
     };
-    const consumeStageState = result => {
+    const consumeStageState = (result, mayMove) => {
       if (!follow.enabled || follow.status === "paused" || disposed) return false;
       if (result?.enabled !== true || result.session_id !== follow.sessionId) {
         pauseFollow("Stage connection changed."); return false;
@@ -419,8 +422,10 @@
       }
       // Only a locked overlay follows. While unlocked the user aligns by hand:
       // the reply is still consumed below, so presses made meanwhile are
-      // discarded rather than replayed after locking.
-      if (state.locked && result.status === "following" && (delta[0] || delta[1])) {
+      // discarded rather than replayed after locking. mayMove is decided per
+      // request (pollStageFollow), because a reply carries presses counted
+      // before it was sent.
+      if (mayMove && state.locked && !state.pending && result.status === "following" && (delta[0] || delta[1])) {
         // Orientation is the main viewer's, shown unchanged; the target rotation
         // is the one OSD's own drag conversion uses.
         const imageDelta = screenImageDelta(delta, pixelSize, viewer.viewport.getRotation(),
@@ -449,13 +454,17 @@
       if (disposed || !follow.enabled || follow.status === "paused" || followInFlight) return;
       clearFollowTimer();
       const epoch = followEpoch;
+      // The lock state when the request leaves decides, not when the reply
+      // lands: a reply requested while unlocked or mid-lock, or answered after
+      // the lock changed, carries presses made while not locked and never moves.
+      const lockAtRequest = state.locked && !state.pending ? lockEpoch : -1;
       followInFlight = true;
       const watchdog = win.setTimeout(() => {
         if (epoch === followEpoch && follow.enabled && !disposed) pauseFollow("Stage connection is not responding.");
       }, 3000);
       try {
         const result = await api.stage_follow_state();
-        if (epoch === followEpoch && !disposed) consumeStageState(result);
+        if (epoch === followEpoch && !disposed) consumeStageState(result, lockAtRequest === lockEpoch);
       } catch (_) {
         if (epoch === followEpoch && follow.enabled && !disposed) pauseFollow("Stage connection was lost.");
       } finally {
@@ -616,6 +625,7 @@
       const previous = state.locked;
       state.pending = true;
       state.locked = !previous;
+      lockEpoch++;
       cancelGesture();
       if (state.ready) restoreCamera(viewer, camera(viewer)); // stop any in-flight pan/zoom
       paintLock();
@@ -627,7 +637,7 @@
       } catch (error) {
         state.locked = previous;
         showStatus(error.message || "Could not change the lock");
-      } finally { state.pending = false; paintLock(); }
+      } finally { state.pending = false; lockEpoch++; paintLock(); }
     };
     const close = async () => {
       stopStageFollow();

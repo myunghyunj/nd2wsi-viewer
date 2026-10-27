@@ -581,6 +581,85 @@ def test_presses_while_unlocked_never_move_and_are_not_replayed_after_locking():
     assert result["status"] == "following"
 
 
+def test_a_reply_requested_while_unlocked_never_moves_even_when_it_lands_after_locking():
+    """Reviewer's interleaving: the request left unlocked, the user locked before the reply."""
+    result = run("""
+      const replies=[];
+      const h=followHarness({bridgeOverrides:{stage_follow_state(){return new Promise(resolve=>replies.push(resolve));}}}),m=h.mounted;
+      await m.startStageFollow();const before=api.camera(h.viewer);
+      const polling=m.pollStageFollow();          // leaves while unlocked
+      const locking=m.toggleLock();               // locked before the reply lands
+      replies[0]({enabled:true,session_id:'session-one',seq:1,status:'following',displacement_um:[10,20]});
+      await polling;await locking;
+      const landed={camera:api.camera(h.viewer),locked:m.state.locked,seq:m.state.follow.seq,
+        displacement:m.state.follow.displacement,lastDelta:m.state.follow.lastDelta};
+      // A request sent after the lock settled follows only presses made since.
+      const next=m.pollStageFollow();
+      replies[1]({enabled:true,session_id:'session-one',seq:2,status:'following',displacement_um:[15,30]});
+      await next;
+      return {before,landed,after:api.camera(h.viewer),polls:replies.length};
+    """)
+    assert result["landed"] == {"camera": result["before"], "locked": True, "seq": 1, "displacement": [10, 20],
+                                "lastDelta": {"x": 0, "y": 0}}
+    # Only seq 2's (5, 10) um: 20 image X px and 2.5 image Y px at the 90 degree flipped view.
+    assert result["after"]["center"] == pytest.approx({"x": .42, "y": .2525})
+    assert result["polls"] == 2
+
+
+def test_a_reply_answered_across_a_lock_change_never_moves():
+    result = run("""
+      const replies=[];
+      const h=followHarness({bridgeOverrides:{stage_follow_state(){return new Promise(resolve=>replies.push(resolve));}}}),m=h.mounted;
+      await m.startStageFollow();await m.toggleLock();const before=api.camera(h.viewer);
+      const polling=m.pollStageFollow();          // leaves locked
+      await m.toggleLock();await m.toggleLock();  // unlocked and locked again meanwhile
+      replies[0]({enabled:true,session_id:'session-one',seq:1,status:'following',displacement_um:[10,20]});
+      await polling;
+      return {before,after:api.camera(h.viewer),locked:m.state.locked,seq:m.state.follow.seq};
+    """)
+    assert result["after"] == result["before"]
+    assert result["locked"] is True and result["seq"] == 1
+
+
+def test_presses_reported_while_a_lock_is_pending_never_move_even_when_the_lock_fails():
+    result = run("""
+      let finishLock;
+      const h=followHarness({bridgeOverrides:{set_translucent_locked(value){
+        return new Promise(resolve=>finishLock=()=>resolve({ok:false,error:'lock unavailable'}));}}}),m=h.mounted;
+      await m.startStageFollow();const before=api.camera(h.viewer);
+      const locking=m.toggleLock();await Promise.resolve();
+      const pending={locked:m.state.locked,pending:m.state.pending};
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
+      const during=api.camera(h.viewer);
+      finishLock();await locking;
+      Object.assign(h.snapshot,{seq:2,displacement_um:[15,30]});await m.pollStageFollow();
+      return {before,pending,during,after:api.camera(h.viewer),locked:m.state.locked,seq:m.state.follow.seq,
+        status:h.element('stage-follow-status').textContent,error:h.element('overlay-status').textContent};
+    """)
+    assert result["pending"] == {"locked": True, "pending": True}
+    assert result["during"] == result["before"] and result["after"] == result["before"]
+    assert result["locked"] is False and result["seq"] == 2
+    assert result["status"] == "Unlocked: align by hand, lock to follow"
+    assert result["error"] == "lock unavailable"
+
+
+def test_presses_reported_while_a_lock_is_pending_are_dropped_once_it_succeeds():
+    result = run("""
+      let finishLock;
+      const h=followHarness({bridgeOverrides:{set_translucent_locked(value){
+        return new Promise(resolve=>finishLock=()=>resolve({ok:true,locked:value}));}}}),m=h.mounted;
+      await m.startStageFollow();const before=api.camera(h.viewer);
+      const locking=m.toggleLock();await Promise.resolve();
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
+      const during=api.camera(h.viewer);
+      finishLock();await locking;
+      Object.assign(h.snapshot,{seq:2,displacement_um:[15,30]});await m.pollStageFollow();
+      return {before,during,after:api.camera(h.viewer),locked:m.state.locked};
+    """)
+    assert result["during"] == result["before"] and result["locked"] is True
+    assert result["after"]["center"] == pytest.approx({"x": .42, "y": .2525})
+
+
 def test_stage_poll_can_skip_events_without_losing_displacement_or_reapplying_duplicates():
     result = run("""
       const h=followHarness(),m=h.mounted;await m.startStageFollow();await m.toggleLock();
