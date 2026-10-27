@@ -102,6 +102,20 @@ def test_direction_table_maps_all_four_keys_to_screen_directions(log_events):
     follower.stop()
 
 
+def test_only_keyboard_input_is_observed():
+    # Follow counts W/A/S/D key presses only: one Raw Input registration, for the
+    # generic-desktop keyboard (usage page 1, usage 6), and no mouse input of any kind.
+    import re
+    from pathlib import Path
+
+    source = Path(stage_keys.__file__).read_text(encoding="utf-8")
+    registrations = re.findall(r"RAWINPUTDEVICE\((0x[0-9A-Fa-f]+), (0x[0-9A-Fa-f]+),", source)
+    assert registrations and set(registrations) == {("0x01", "0x06")}
+    for absent in ("RIM_TYPEMOUSE", "WM_LBUTTON", "WM_RBUTTON", "WH_MOUSE", "SetWindowsHookEx", "mouse_event"):
+        assert absent not in source
+    assert sorted(letter for letter, _ in stage_keys.KEY_BINDINGS.values()) == ["A", "D", "S", "W"]
+
+
 def test_one_sign_reverses_all_four_keys_at_once(log_events, monkeypatch):
     assert stage_keys.KEY_VIEW_SIGN == 1
     monkeypatch.setattr(stage_keys, "KEY_VIEW_SIGN", -1)
