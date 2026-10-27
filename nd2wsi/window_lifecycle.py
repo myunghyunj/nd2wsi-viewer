@@ -48,6 +48,43 @@ class LifecycleWindow(Protocol):
     def destroy(self) -> None: ...
 
 
+class _ShutdownOwnership:
+    """Which coordinator's request may freeze this window's panes.
+
+    Native close and Sparkle preparation drive the same shell, which remembers
+    one preparation request id. Two requests at once overwrite it, and the
+    loser's recovery unlocks panes the other still needs frozen, for example
+    while it tears down the server. Every coordinator of a window's api claims
+    this record before it starts a request and releases it when the request
+    ends. It never calls out, so it is safe to use under a coordinator's lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._holder: tuple[object, str] | None = None
+
+    def claim(self, coordinator: object, request_id: str) -> bool:
+        """Own the panes for ``request_id`` unless another coordinator does."""
+        with self._lock:
+            if self._holder is not None and self._holder[0] is not coordinator:
+                return False
+            self._holder = (coordinator, request_id)
+            return True
+
+    def held_by_other(self, coordinator: object) -> bool:
+        with self._lock:
+            return self._holder is not None and self._holder[0] is not coordinator
+
+    def release(self, coordinator: object, request_id: str) -> None:
+        """Give the panes up, but only from the request that holds them."""
+        with self._lock:
+            if self._holder is not None and self._holder[0] is coordinator and self._holder[1] == request_id:
+                self._holder = None
+
+
+_SHUTDOWN_OWNERSHIP_LOCK = threading.Lock()
+
+
 class UpdateShutdownCoordinator:
     """Flush browser work and release native resources before Sparkle relaunches."""
 
@@ -74,15 +111,22 @@ class UpdateShutdownCoordinator:
     def prepare_for_update(self, completion, failure) -> bool:
         with self._lock:
             already_running = self._running
-            if not already_running:
+            request_id = uuid.uuid4().hex
+            # A native close that is saving this window owns its panes; its
+            # recovery would unlock them in the middle of this preparation.
+            window_closing = not already_running and not self._ownership().claim(self, request_id)
+            if not (already_running or window_closing):
                 self._running = True
-                request_id = self._request_id = uuid.uuid4().hex
+                self._request_id = request_id
                 cancelled = self._cancelled = threading.Event()
                 self._wire_request_id = ""
                 self._teardown_started = False
         if already_running:
             # Callbacks may re-enter the coordinator; never call one under its lock.
             failure("update preparation is already running")
+            return False
+        if window_closing:
+            failure("the window is closing; update preparation waits until the close finishes")
             return False
         # Sparkle invokes its delegate on AppKit's main thread. Even with a
         # promise callback, pywebview.evaluate_js queues work to that thread and
@@ -202,12 +246,25 @@ class UpdateShutdownCoordinator:
         with self._lock:
             return self._request_id == request_id and not cancelled.is_set()
 
+    def _ownership(self) -> _ShutdownOwnership:
+        """The pane ownership shared by every coordinator of this api.
+
+        It is attached to the api on first use, so the close guard and the
+        Sparkle coordinator, which are built separately, find the same record.
+        """
+        with _SHUTDOWN_OWNERSHIP_LOCK:
+            ownership = getattr(self.api, "_shutdown_ownership", None)
+            if not isinstance(ownership, _ShutdownOwnership):
+                ownership = self.api._shutdown_ownership = _ShutdownOwnership()
+            return ownership
+
     def _finish_request(self, request_id) -> None:
         with self._lock:
             if self._request_id == request_id:
                 self._request_id = ""
                 self._running = False
                 self._wire_request_id = ""
+            self._ownership().release(self, request_id)
 
     def _recover_browser(self, request_id) -> None:
         with self._lock:
@@ -321,6 +378,10 @@ class UpdateShutdownCoordinator:
                     return
                 try:
                     self._log("Sparkle shutdown: resources released; resuming installer")
+                    # Preparation ends here. Resuming makes Sparkle send this
+                    # app a quit, which arrives as a native close; it must
+                    # reach the close guard exactly as before, not the veto.
+                    self._ownership().release(self, request_id)
                     completion()
                 except Exception as exc:
                     completion_errors.append(exc)
@@ -393,10 +454,16 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
     asks the user natively whether to close without confirmed saves. A viewer
     that answers with a refusal (conflict, slide opening, export running)
     keeps the existing behaviour: the window stays open with a notice.
+
+    Sparkle preparation and this guard never own the panes at once. While an
+    update is being prepared, a close is vetoed with a notice; an approved or
+    forced close still goes through, and so does the quit Sparkle sends once
+    the installer resumes.
     """
 
     _DRAIN_TIMEOUT = 30.0
     _UNCONFIRMED_CLOSE_TITLE = "Close without confirmed saves?"
+    _UPDATE_PREPARING_NOTICE = "An update is being prepared. Cancel it in the update window to close."
 
     def __init__(self, api: LifecycleApi, window: LifecycleWindow, *, logger: Callable[[str], None]):
         super().__init__(api, window, logger=logger)
@@ -445,16 +512,27 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
                 return True
             if self._running:
                 return False
-            if idle_page:
+            ownership = self._ownership()
+            request_id = uuid.uuid4().hex
+            # Sparkle preparation owns the panes until it resumes the
+            # installer. An idle page starts no request, so it only checks.
+            preparing_update = (ownership.held_by_other(self) if idle_page
+                                else not ownership.claim(self, request_id))
+            if preparing_update:
+                approved = False
+            elif idle_page:
                 approved = True
             else:
                 approved = False
                 self._running = True
-                request_id = self._request_id = uuid.uuid4().hex
+                self._request_id = request_id
                 cancelled = self._cancelled = threading.Event()
                 self._wire_request_id = ""
                 self._teardown_started = False
                 ask_to_force = self._failed_closes > 0
+        if preparing_update:
+            self._refuse_close_while_preparing_update()
+            return False
         if approved:
             self._log("Native close allowed: the page never became ready and no slide is open")
             return True
@@ -466,6 +544,22 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
             self.api._status = f"Window remains open: could not begin saving ({exc})."
             self._log(self.api._status)
         return False
+
+    def _refuse_close_while_preparing_update(self) -> None:
+        """Keep the window open, and say why, while Sparkle preparation owns it.
+
+        Runs on the UI thread, so the notice is sent from its own thread. The
+        panes stay frozen for the update; cancelling it in Sparkle's window
+        unlocks them, and the next close then runs the save handshake.
+        """
+        message = self._UPDATE_PREPARING_NOTICE
+        self.api._status = message
+        self._log(f"Window remains open: {message}")
+        try:
+            threading.Thread(target=self._notice, args=(message,),
+                             name="window-close-notice", daemon=True).start()
+        except Exception as exc:
+            self._log(f"update notice failed: {exc!r}")
 
     def _holds_no_slides(self) -> bool:
         server = self.api._httpd
