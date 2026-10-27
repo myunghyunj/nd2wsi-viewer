@@ -198,6 +198,7 @@ class TranslucentApi:
         self._stage_follow_receiver_id = None
         self._stage_follow_lost = ""
         self._slacs_snapshot = {"available": False, "session_id": None, "status": "waiting"}
+        self._slacs_logged = None  # the last detection state written to the session log
         self._discovery = None
 
     def _ensure_slacs_discovery(self):
@@ -207,7 +208,28 @@ class TranslucentApi:
             if not self._closed and self._discovery is None:
                 self._discovery = SlacsDiscovery(on_change=self._on_slacs_change)
                 self._slacs_snapshot = self._discovery.snapshot()
-            return self._discovery
+                logged = self._detection_to_log()
+            else:
+                logged = None
+            discovery = self._discovery
+        self._log_detection(logged)
+        return discovery
+
+    def _detection_to_log(self):
+        """The detection state to record, once per change; call with the lock held."""
+        current = self._slacs_snapshot
+        state = (current.get("available") is True, current.get("session_id"), current.get("status"))
+        if state == self._slacs_logged:
+            return None
+        self._slacs_logged = state
+        return state
+
+    @staticmethod
+    def _log_detection(state):
+        # So a detection that fails on the instrument PC can be diagnosed afterwards.
+        if state is not None:
+            session_log.event("slacs_detection", window="translucent", available=state[0],
+                              session_id=state[1], status=state[2])
 
     def _on_slacs_change(self, snapshot):
         """Stop an active receiver as soon as its detected process is lost or replaced.
@@ -226,8 +248,9 @@ class TranslucentApi:
             session = snapshot.get("session_id") if available else None
             self._slacs_snapshot = {"available": available, "session_id": session,
                                     "status": snapshot.get("status", "unavailable")}
-            # Detection never blocks Follow; it only ends a Follow that began while
-            # SLACS was detected, once that same process is lost or replaced.
+            logged = self._detection_to_log()
+            # Every Follow is bound to the SLACS process detected when it started;
+            # that process's loss or replacement ends it.
             if (self._stage_follow is not None and self._stage_follow_session is not None
                     and session != self._stage_follow_session):
                 receiver, self._stage_follow = self._stage_follow, None
@@ -237,6 +260,7 @@ class TranslucentApi:
                 revoked, self._stage_follow_receiver_id = self._stage_follow_receiver_id, None
                 self._stage_follow_session = None
                 message = self._stage_follow_lost = "SLACS program stopped or changed. Follow stopped; reconnect manually."
+        self._log_detection(logged)
         if receiver is not None:
             self._revoke_follow_in_page(revoked, message)
             if follower is not None:
@@ -306,7 +330,8 @@ class TranslucentApi:
         ``options`` may set ``source`` ("keys" to observe SLACS W/A/S/D presses,
         "adapter" for an external in-process/HTTP sender) and the per-key
         ``step_um``. The key follower is a strict observer and never blocks,
-        delays, or alters a keystroke.
+        delays, or alters a keystroke. Follow is refused unless SLACS is
+        detected, and is bound to that detected process.
         """
         from .stage_follow import StageFollowReceiver
         from .stage_keys import SlacsKeyFollower
@@ -317,6 +342,10 @@ class TranslucentApi:
                 return {"ok": False, "message": "This translucent viewer is closed."}
             if option_error is not None:
                 return {"ok": False, "message": option_error}
+            detected = self._slacs_snapshot
+            if not (detected.get("available") is True and isinstance(detected.get("session_id"), str)
+                    and detected["session_id"]):
+                return {"ok": False, "message": "SLACS is not detected. Start SLACS, then turn on Follow."}
             pixels = self._context.get("pixel_size_um")
             if (not isinstance(pixels, (list, tuple)) or len(pixels) != 2
                     or any(isinstance(v, bool) or not isinstance(v, (float, int))
@@ -349,13 +378,12 @@ class TranslucentApi:
             self._stage_follower = follower
             self._stage_follow_source = source
             self._stage_follow_status = None
-            # Bound to the detected SLACS process only if one was detected; see _on_slacs_change.
-            detected = self._slacs_snapshot
-            self._stage_follow_session = detected["session_id"] if detected["available"] else None
+            # Bound to the detected SLACS process; see _on_slacs_change.
+            self._stage_follow_session = detected["session_id"]
             self._stage_follow_receiver_id = descriptor.get("session_id")
             self._stage_follow_lost = ""
         session_log.event("follow_start", source=source, step_um=step_um, ok=True,
-                          slacs_detected=self._stage_follow_session is not None)
+                          slacs_session=self._stage_follow_session)
         return {"ok": True, "source": source, **descriptor}
 
     def stage_follow_state(self):
@@ -383,11 +411,11 @@ class TranslucentApi:
             follower, self._stage_follower = self._stage_follower, None
             source, self._stage_follow_source = self._stage_follow_source, None
             self._stage_follow_status = None
-        if follower is not None:
-            follower.stop("stopped")
             self._stage_follow_session = None
             self._stage_follow_receiver_id = None
             self._stage_follow_lost = ""
+        if follower is not None:
+            follower.stop("stopped")
         if receiver is not None:
             receiver.close()
             session_log.event("follow_stop", source=source)

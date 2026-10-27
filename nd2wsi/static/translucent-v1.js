@@ -345,15 +345,22 @@
     };
     const paintFollow = () => {
       if (disposed) return;
-      // Detection adds the main-window offer and stops a Follow bound to a lost
-      // SLACS process, but never hides or disables Follow itself.
+      // Follow appears only while SLACS is detected. The loss notice is its own
+      // element, so it stays visible after the control hides.
+      const detected = state.slacs.available === true;
+      followControl.hidden = !detected;
+      if (!detected) {
+        followSettings.hidden = true;
+        doc.getElementById("stage-follow-options").setAttribute("aria-expanded", "false");
+      }
       followDisconnected.hidden = !disconnected;
       followDisconnected.textContent = disconnected;
       const available = typeof api.start_stage_follow === "function" && typeof api.stage_follow_state === "function" &&
         typeof api.stop_stage_follow === "function";
-      followButton.disabled = follow.pending || !state.ready || !pixelSize || !available;
+      followButton.disabled = follow.pending || !state.ready || !pixelSize || !available || !detected;
       followButton.setAttribute("aria-pressed", String(follow.enabled));
       followButton.title = !pixelSize ? "Follow needs a calibrated image pixel size" : !available ? "Stage follow is unavailable" :
+        !detected ? "SLACS is not detected" :
         follow.enabled ? "Stop following SLACS keys" : "Follow SLACS W/A/S/D keys";
       // Unlocked and SLACS losing the foreground are hints that never stop Follow.
       // A pause stops polling, so it must not hide behind either stale hint.
@@ -462,13 +469,16 @@
       followTimer = win.setTimeout(pollStageFollow, 50);
     };
     const startStageFollow = async () => {
-      if (disposed || follow.enabled || follow.pending || !state.ready || !pixelSize ||
+      // A discovery reply still on its way decides; Follow needs a detected SLACS.
+      if (!state.slacs.available && discoveryTask) await discoveryTask;
+      if (disposed || follow.enabled || follow.pending || !state.ready || !pixelSize || !state.slacs.available ||
           typeof api.start_stage_follow !== "function" || typeof api.stage_follow_state !== "function" ||
           typeof api.stop_stage_follow !== "function") return false;
       const epoch = ++followEpoch;
       disconnected = "";
-      // Bound to the detected SLACS process only if one is detected now.
-      follow.slacsSession = state.slacs.available ? state.slacs.session_id : "";
+      // Every Follow is bound to the SLACS process detected now; its loss or
+      // replacement stops it (pollSlacsDiscovery, revokeStageFollow).
+      follow.slacsSession = state.slacs.session_id;
       follow.pending = true; follow.message = ""; paintFollow();
       // Serialize native starts/stops, including a close during a pending start.
       const task = followLifecycle.catch(() => {}).then(async () => {

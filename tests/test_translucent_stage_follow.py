@@ -20,23 +20,23 @@ def make_overlay():
     return api
 
 
-def test_detection_never_blocks_follow_and_ends_only_a_follow_bound_to_a_lost_process():
+def test_process_detection_gates_follow_and_loss_stops_receiver():
     api = make_overlay()
     api._discovery = Mock()  # Drive lifecycle deterministically without enumerating this machine.
     adapter = {'source': 'adapter'}  # no real keyboard observer in this test
     api._on_slacs_change({'available': False, 'session_id': None, 'status': 'not_running'})
     assert api.slacs_discovery_state()['available'] is False
-    unbound = api.start_stage_follow(adapter)
-    assert unbound['ok']  # detection never blocks Follow
-    receiver = api._stage_follow
+    refused = api.start_stage_follow(adapter)
+    assert not refused['ok'] and 'SLACS is not detected' in refused['message']
+    assert api._stage_follow is None
+    for malformed in ({'available': True, 'session_id': '', 'status': 'running'},
+                      {'available': True, 'session_id': 'process-one', 'status': 'error'}):
+        api._on_slacs_change(malformed)
+        assert not api.start_stage_follow(adapter)['ok'] and api._stage_follow is None
     try:
         api._on_slacs_change({'available': True, 'session_id': 'process-one', 'status': 'running'})
-        api._on_slacs_change({'available': False, 'session_id': None, 'status': 'error'})
-        assert api._stage_follow is receiver and receiver.snapshot()['enabled']  # never bound
-        api.stop_stage_follow()
-        api._on_slacs_change({'available': True, 'session_id': 'process-one', 'status': 'running'})
         first = api.start_stage_follow(adapter)
-        assert first['ok']
+        assert first['ok'] and api._stage_follow_session == 'process-one'  # bound to the detected process
         old_receiver = api._stage_follow
         follower = Mock()
         api._stage_follower = follower  # a key follower bound to the same Follow must stop too
@@ -45,6 +45,7 @@ def test_detection_never_blocks_follow_and_ends_only_a_follow_bound_to_a_lost_pr
         assert api._stage_follow is None and api._stage_follower is None
         follower.stop.assert_called_once_with('slacs_lost')
         assert api.stage_follow_state()['status'] == 'paused'
+        assert not api.start_stage_follow(adapter)['ok']  # lost: nothing to follow until SLACS returns
         api._on_slacs_change({'available': True, 'session_id': 'process-two', 'status': 'running'})
         assert api._stage_follow is None  # No automatic resume, even for a new process.
         second = api.start_stage_follow(adapter)
@@ -71,6 +72,58 @@ def test_context_carries_the_main_viewer_orientation_and_ignores_an_old_mirror_s
     for mirror in (True, False, 'true', None):
         older = validate_context(store, {**payload, 'mirror_scan': mirror}, slide_url='http://local/s/ito/')
         assert older == context
+
+
+def test_stop_clears_the_binding_and_the_loss_message_for_every_source():
+    api = make_overlay()
+    api._discovery = Mock()
+    try:
+        assert api.start_stage_follow({'source': 'adapter'})['ok']
+        api._on_slacs_change({'available': False, 'session_id': None, 'status': 'not_running'})
+        assert api.stage_follow_state()['status'] == 'paused'
+        api.stop_stage_follow()
+        assert api._stage_follow_session is None and api._stage_follow_receiver_id is None
+        assert api.stage_follow_state()['status'] == 'off'
+    finally:
+        api.close_translucent()
+
+
+def test_overlay_logs_each_detection_change_once(monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, 'event', lambda kind, **fields: events.append((kind, fields)))
+    api = make_overlay()  # injects a running detection
+    api._discovery = Mock()
+    for snapshot in ({'available': True, 'session_id': 'test-process', 'status': 'running'},  # unchanged
+                     {'available': False, 'session_id': None, 'status': 'error'},
+                     {'available': False, 'session_id': None, 'status': 'error'},  # unchanged
+                     {'available': False, 'session_id': None, 'status': 'not_running'},
+                     {'available': True, 'session_id': 'process-two', 'status': 'running'}):
+        api._on_slacs_change(snapshot)
+    detections = [fields for kind, fields in events if kind == 'slacs_detection']
+    assert detections == [
+        {'window': 'translucent', 'available': True, 'session_id': 'test-process', 'status': 'running'},
+        {'window': 'translucent', 'available': False, 'session_id': None, 'status': 'error'},
+        {'window': 'translucent', 'available': False, 'session_id': None, 'status': 'not_running'},
+        {'window': 'translucent', 'available': True, 'session_id': 'process-two', 'status': 'running'},
+    ]
+    api.close_translucent()
+
+
+def test_overlay_logs_the_detector_state_it_starts_with(monkeypatch):
+    from nd2wsi import slacs_discovery
+
+    events = []
+    monkeypatch.setattr(tw.session_log, 'event', lambda kind, **fields: events.append((kind, fields)))
+    detector = Mock()
+    detector.snapshot.return_value = {'available': False, 'session_id': None, 'status': 'checking'}
+    monkeypatch.setattr(slacs_discovery, 'SlacsDiscovery', Mock(return_value=detector))
+    api = TranslucentApi({'pixel_size_um': [.5, .5]}, logger=Mock(), on_closed=Mock())
+    api._window = Mock()
+    api.slacs_discovery_state()
+    api.slacs_discovery_state()
+    assert [fields for kind, fields in events if kind == 'slacs_detection'] == [
+        {'window': 'translucent', 'available': False, 'session_id': None, 'status': 'checking'}]
+    api.close_translucent()
 
 
 def test_receivers_are_owned_isolated_and_lock_does_not_stop_observation():
@@ -291,6 +344,7 @@ def test_log_client_event_caps_and_rate_limits(monkeypatch):
     events = []
     monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
     api = make_overlay()
+    events.clear()  # the injected detection is logged; only client events matter here
     result = api.log_client_event({"source": "x" * 5000, "kind": "error",
                                    "message": "boom", "where": "a.js:1", "stack": "y" * 9000,
                                    "ignored": "drop me"})
@@ -311,6 +365,7 @@ def test_log_client_event_rejects_non_dict_and_closed(monkeypatch):
     events = []
     monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
     api = make_overlay()
+    events.clear()  # the injected detection is logged; only client events matter here
     assert api.log_client_event("oops") == {"ok": False}
     assert events == []
     api.close_translucent()

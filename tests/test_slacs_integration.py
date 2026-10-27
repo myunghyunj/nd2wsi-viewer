@@ -24,6 +24,29 @@ def test_main_detector_starts_lazily_and_stops_with_window(monkeypatch):
     factory.assert_called_once()
 
 
+def test_main_window_logs_each_detection_change_once(monkeypatch):
+    from nd2wsi import app as app_module
+    from nd2wsi import slacs_discovery
+
+    events = []
+    monkeypatch.setattr(app_module.session_log, 'event', lambda kind, **fields: events.append((kind, fields)))
+    detector = Mock()
+    monkeypatch.setattr(slacs_discovery, 'SlacsDiscovery', Mock(return_value=detector))
+    api = Api(None)
+    states = [{'available': False, 'session_id': None, 'status': 'checking'},
+              {'available': False, 'session_id': None, 'status': 'checking'},
+              {'available': False, 'session_id': None, 'status': 'error'},
+              {'available': True, 'session_id': 'process-one', 'status': 'running'},
+              {'available': True, 'session_id': 'process-one', 'status': 'running'},
+              {'available': True, 'session_id': 'process-two', 'status': 'running'}]
+    for state in states:
+        detector.snapshot.return_value = dict(state)
+        api.slacs_discovery_state()
+    detections = [fields for kind, fields in events if kind == 'slacs_detection']
+    assert detections == [{'window': 'main', **state} for state in (states[0], states[2], states[3], states[5])]
+    api._close_translucent_windows()
+
+
 def test_overlay_monitor_reports_session_loss_independent_of_frontend_polling(monkeypatch):
     from nd2wsi import slacs_discovery
 

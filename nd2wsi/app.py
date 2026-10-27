@@ -622,6 +622,7 @@ class Api:
         self._slacs_offer_lock = threading.Lock()
         self._slacs_offer_claims = None
         self._slacs_offers = {}  # session_id -> whether this window shows its offer
+        self._slacs_logged = None  # the last detection state written to the session log
         if native_gesture_scopes is None:
             from .native_gestures import NativeGestureScopeCache
 
@@ -686,8 +687,19 @@ class Api:
                 self._slacs_discovery = SlacsDiscovery()
             detector = self._slacs_discovery
         snapshot = detector.snapshot()
+        self._log_slacs_detection(snapshot)
         snapshot["offer"] = self._claim_slacs_offer(snapshot, claim_offer is True)
         return snapshot
+
+    def _log_slacs_detection(self, snapshot) -> None:
+        """Record each detection change, so a failed detection can be diagnosed afterwards."""
+        state = (snapshot.get("available") is True, snapshot.get("session_id"), snapshot.get("status"))
+        with self._slacs_offer_lock:
+            if state == self._slacs_logged:
+                return
+            self._slacs_logged = state
+        session_log.event("slacs_detection", window="main", available=state[0], session_id=state[1],
+                          status=state[2])
 
     def _claim_slacs_offer(self, snapshot, claim: bool) -> bool:
         from .slacs_discovery import SlacsOfferClaims

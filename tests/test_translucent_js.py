@@ -727,35 +727,70 @@ def test_stage_close_during_start_orders_native_stop_and_discards_late_session()
     assert result == {"calls": ["start", "stop"], "enabled": False, "timers": 0}
 
 
-def test_detection_never_hides_follow_and_ends_only_a_follow_bound_to_a_lost_process():
+def test_follow_appears_only_while_slacs_is_detected_and_a_loss_stops_it_without_auto_restart():
     result = run("""
       let process={available:false,session_id:null,status:'not_running'};
       const h=followHarness({bridgeOverrides:{async slacs_discovery_state(){return {...process};}}}),m=h.mounted;
+      const initial=h.element('stage-follow-control').hidden;
       await m.pollSlacsDiscovery();
-      const absent={hidden:h.element('stage-follow-control').hidden,started:await m.startStageFollow()};
-      process={available:false,session_id:null,status:'error'};await m.pollSlacsDiscovery();
-      for(let i=0;i<8;i++)await Promise.resolve();
-      const unbound={enabled:m.state.follow.enabled,noticeHidden:h.element('stage-follow-disconnected').hidden};
-      await m.stopStageFollow();
+      const absent={hidden:h.element('stage-follow-control').hidden,disabled:h.element('stage-follow').disabled,
+        started:await m.startStageFollow(),calls:h.followCalls.slice()};
       process={available:true,session_id:'one',status:'running'};await m.pollSlacsDiscovery();
-      const found={hidden:h.element('stage-follow-control').hidden,enabled:m.state.follow.enabled};
-      await m.startStageFollow();
+      const found={hidden:h.element('stage-follow-control').hidden,disabled:h.element('stage-follow').disabled,
+        enabled:m.state.follow.enabled};
+      await m.startStageFollow();const bound=m.state.follow.slacsSession;
       process={available:false,session_id:null,status:'error'};await m.pollSlacsDiscovery();
       for(let i=0;i<8;i++)await Promise.resolve();
       const lost={hidden:h.element('stage-follow-control').hidden,notice:h.element('stage-follow-disconnected').textContent,
         noticeHidden:h.element('stage-follow-disconnected').hidden,enabled:m.state.follow.enabled,calls:h.followCalls.slice()};
       process={available:true,session_id:'two',status:'running'};await m.pollSlacsDiscovery();
-      return {absent,unbound,found,lost,again:{hidden:h.element('stage-follow-control').hidden,
+      return {initial,absent,found,bound,lost,again:{hidden:h.element('stage-follow-control').hidden,
         enabled:m.state.follow.enabled,calls:h.followCalls.slice()}};
     """)
-    assert result['absent'] == {'hidden': False, 'started': True}  # detection never gates Follow
-    assert result['unbound'] == {'enabled': True, 'noticeHidden': True}  # not bound to a process
-    assert result['found'] == {'hidden': False, 'enabled': False}
-    assert result['lost']['hidden'] is False and not result['lost']['enabled']
+    assert result['initial'] is True  # hidden until a discovery reply says SLACS is running
+    assert result['absent'] == {'hidden': True, 'disabled': True, 'started': False, 'calls': []}
+    assert result['found'] == {'hidden': False, 'disabled': False, 'enabled': False}
+    assert result['bound'] == 'one'
+    # The control hides, but the loss notice stays visible on its own.
+    assert result['lost']['hidden'] is True and not result['lost']['enabled']
     assert not result['lost']['noticeHidden'] and 'Follow stopped' in result['lost']['notice']
-    assert result['lost']['calls'].count('stop') == 2  # the manual stop, then the loss
+    assert result['lost']['calls'].count('stop') == 1
     assert result['again']['hidden'] is False and result['again']['enabled'] is False
-    assert result['again']['calls'].count('start') == 2  # no automatic restart
+    assert result['again']['calls'].count('start') == 1  # no automatic restart
+
+
+def test_start_waits_for_a_pending_discovery_reply_and_needs_detection():
+    result = run("""
+      let replies=[];
+      const h=followHarness({bridgeOverrides:{slacs_discovery_state(){return new Promise(resolve=>replies.push(resolve));}}}),m=h.mounted;
+      const starting=m.startStageFollow();for(let i=0;i<4;i++)await Promise.resolve();
+      const waiting={calls:h.followCalls.slice(),enabled:m.state.follow.enabled};
+      replies[0]({available:true,session_id:'one',status:'running'});
+      const started=await starting;
+      await m.stopStageFollow();
+      const refusing=m.pollSlacsDiscovery();replies[1]({available:false,session_id:null,status:'not_running'});
+      await refusing;
+      return {waiting,started,bound:h.followCalls.slice(),refused:await m.startStageFollow(),calls:h.followCalls};
+    """)
+    assert result["waiting"] == {"calls": [], "enabled": False}
+    assert result["started"] is True and result["bound"] == ["start", "stop"]
+    assert result["refused"] is False and result["calls"] == ["start", "stop"]
+
+
+def test_losing_detection_closes_an_open_follow_settings_panel():
+    result = run("""
+      let process={available:true,session_id:'one',status:'running'};
+      const h=followHarness({bridgeOverrides:{async slacs_discovery_state(){return {...process};}}}),m=h.mounted;
+      await m.pollSlacsDiscovery();
+      const options=h.element('stage-follow-options'),settings=h.element('stage-follow-settings');
+      settings.hidden=true;options.listeners.click();
+      const open={hidden:settings.hidden,expanded:options.attributes['aria-expanded']};
+      process={available:false,session_id:null,status:'not_running'};await m.pollSlacsDiscovery();
+      return {open,closed:{hidden:settings.hidden,expanded:options.attributes['aria-expanded'],
+        control:h.element('stage-follow-control').hidden}};
+    """)
+    assert result == {"open": {"hidden": False, "expanded": "true"},
+                      "closed": {"hidden": True, "expanded": "false", "control": True}}
 
 
 def test_slacs_loss_during_pending_start_cancels_late_session():
@@ -771,10 +806,10 @@ def test_slacs_loss_during_pending_start_cancels_late_session():
       for(let i=0;i<8;i++)await Promise.resolve();
       return {calls,enabled:m.state.follow.enabled,hidden:h.element('stage-follow-control').hidden};
     """)
-    assert result == {'calls': ['start', 'stop'], 'enabled': False, 'hidden': False}
+    assert result == {'calls': ['start', 'stop'], 'enabled': False, 'hidden': True}
 
 
-def test_slacs_invalid_or_failed_discovery_is_not_detection_and_keeps_follow_visible():
+def test_slacs_invalid_or_failed_discovery_is_not_detection_and_hides_follow():
     result = run("""
       let reply={available:true,session_id:'one',status:'error'};
       const h=followHarness({bridgeOverrides:{async slacs_discovery_state(){return reply;}}}),m=h.mounted;
@@ -785,11 +820,11 @@ def test_slacs_invalid_or_failed_discovery_is_not_detection_and_keeps_follow_vis
       h.windowListeners.pagehide();
       return {malformed,missingId,intervals:h.intervals.size};
     """)
-    assert result == {'malformed': {'hidden': False, 'detected': False},
-                      'missingId': {'hidden': False, 'detected': False}, 'intervals': 0}
+    assert result == {'malformed': {'hidden': True, 'detected': False},
+                      'missingId': {'hidden': True, 'detected': False}, 'intervals': 0}
 
 
-def test_slacs_discovery_timeout_is_not_detection_and_ignores_late_reply():
+def test_slacs_discovery_timeout_hides_follow_and_ignores_late_reply():
     result = run("""
       let reply,calls=0;
       const h=followHarness({bridgeOverrides:{slacs_discovery_state(){
@@ -803,7 +838,7 @@ def test_slacs_discovery_timeout_is_not_detection_and_ignores_late_reply():
       for(let i=0;i<5;i++)await Promise.resolve();
       return {hiddenAfterTimeout,session:m.state.slacs.session_id,hidden:h.element('stage-follow-control').hidden,calls};
     """)
-    assert result == {'hiddenAfterTimeout': False, 'session': 'new', 'hidden': False, 'calls': 2}
+    assert result == {'hiddenAfterTimeout': True, 'session': 'new', 'hidden': False, 'calls': 2}
 
 
 LATE_FOLLOW = """
@@ -901,7 +936,7 @@ def test_revocation_forgets_detection_until_a_fresh_discovery_reply():
       return {right,session:m.state.slacs.session_id,hidden:h.element('stage-follow-control').hidden,
         enabled:m.state.follow.enabled,stops:h.followCalls.filter(call=>call==='stop').length,discoveryCalls};
     """)
-    assert result == {"right": {"hidden": False, "button": True}, "session": "two", "hidden": False,
+    assert result == {"right": {"hidden": True, "button": True}, "session": "two", "hidden": False,
                       "enabled": False, "stops": 1, "discoveryCalls": 3}
 
 
