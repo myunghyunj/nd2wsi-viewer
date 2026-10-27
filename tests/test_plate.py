@@ -724,6 +724,50 @@ def test_shared_chunk_get_is_serialized_with_a_sibling_put(plate_nd2, monkeypatc
         source.close()
 
 
+def test_store_read_caches_sites_that_do_not_keep_their_chunk_alive(plate_nd2, monkeypatch):
+    """One read fills the RAM cache with every site of its chunk. Each entry
+    must own its pixels: a view would keep the whole chunk alive while the
+    byte budget counted one site."""
+    import gc
+    import weakref
+
+    from nd2wsi.plate import _REDUCED_CACHE, THUMB_K, PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    first = PlateSource(plate_nd2)
+    try:
+        for p in range(P):
+            first.reduced(0, p, 0, THUMB_K)
+    finally:
+        first.close()
+
+    again = PlateSource(plate_nd2)
+    try:
+        store = again.store
+        real_thumbs = store._thumbs
+        chunks = []
+
+        class RecordingThumbs:
+            def __getitem__(self, index):
+                block = np.asarray(real_thumbs[index])
+                chunks.append(weakref.ref(block))
+                return block
+
+        store._thumbs = RecordingThumbs()
+        got = store.get(0, 1, 0)
+        gc.collect()
+        assert len(chunks) == 1
+        assert chunks[0]() is None, "a cached site keeps the whole chunk alive"
+        assert got is not None and got.base is None
+        assert int(got[0, 0, 0]) == value(0, 1, 0)
+        for p in range(P):
+            cached = _REDUCED_CACHE.get((again._owner, 0, p, 0, THUMB_K))
+            assert cached is not None and cached.base is None
+            assert int(cached[0, 0, 0]) == value(0, p, 0)
+    finally:
+        again.close()
+
+
 def test_undecodable_shared_chunk_is_quarantined_then_repaired(plate_nd2, monkeypatch):
 
     from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container

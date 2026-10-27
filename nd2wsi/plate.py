@@ -1033,10 +1033,12 @@ class PlateStore:
 
             owner = self._source._owner
             scored = 0
+            # Copies, not views: a view would keep the whole chunk of every
+            # site alive while the byte budget counted one site.
             for p2 in np.flatnonzero(verified):
                 key = (owner, int(t), int(p2), int(z), THUMB_K)
                 if _REDUCED_CACHE.get(key) is None:
-                    _REDUCED_CACHE.put(key, np.ascontiguousarray(block[p2]))
+                    _REDUCED_CACHE.put(key, block[p2].copy())
                 if self._focus_np[t, p2, z] < 0:
                     self._focus_np[t, p2, z] = _sharpness(block[p2])
                     scored += 1
@@ -1045,7 +1047,7 @@ class PlateStore:
                 self._flush_focus_if_block_complete(t, z)
             if not verified[p]:
                 return None
-            return np.ascontiguousarray(block[p])
+            return block[p].copy()
 
     def put(self, t: int, p: int, z: int, frame: np.ndarray) -> bool:
         if self.is_committed(t, p, z):
