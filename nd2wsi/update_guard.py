@@ -9,6 +9,9 @@ from pathlib import Path
 
 from .session_lock import SessionFileLock
 
+# Seconds a launching window waits for an in-progress update installation.
+ADMISSION_TIMEOUT = 2.0
+
 
 def _coordination_root(base: Path) -> Path:
     # Packaged windows share one gate even when diagnostics use private session
@@ -33,7 +36,7 @@ def session_lifetime(base: Path, session_id: str) -> SessionFileLock:
 def window_admission(base: Path):
     gate = _installation_lock(base)
     try:
-        gate.acquire(timeout=2)
+        gate.acquire(timeout=ADMISSION_TIMEOUT)
     except TimeoutError:
         raise RuntimeError("An application update is being installed. Open the viewer again after it finishes.") from None
     try:
