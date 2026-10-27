@@ -3478,7 +3478,22 @@ function roiScale() {
 }
 
 let scaleSeq = 0;
+let scaleRequests = null; // aborts the strip's preview and size requests
+let scaleUrls = []; // object URLs of the previews on screen
+const scaleStripRest = debounce(() => updateScaleStrip(), 300);
+
+// A frame step (playback, wheel z-scrubbing): what the strip still loads for
+// the old frame stops now and can no longer land, and the strip refreshes
+// once the frame has rested for 300 ms, as the histograms do.
+function scheduleScaleStrip() {
+  ++scaleSeq;
+  scaleRequests?.abort();
+  scaleRequests = null;
+  scaleStripRest();
+}
+
 function updateScaleStrip() {
+  scaleStripRest.cancel();
   syncScaleBarExportControls();
   const strip = $("roi-scales");
   const dims = $("roi-scale-dims");
@@ -3486,6 +3501,11 @@ function updateScaleStrip() {
   const r = state.roi ? { ...state.roi } : null;
   const opts = scaleOptions();
   const seq = ++scaleSeq;
+  scaleRequests?.abort();
+  const requests = new AbortController();
+  scaleRequests = requests;
+  for (const url of scaleUrls) URL.revokeObjectURL(url);
+  scaleUrls = [];
   strip.innerHTML = "";
   if (!r || !opts.length || !frameOwnsRoi(context)) {
     dims.textContent = "–";
@@ -3506,10 +3526,10 @@ function updateScaleStrip() {
     btn.className = "scale-opt" + (o.d === sel.d ? " sel" : "");
     const img = document.createElement("img");
     const pw = Math.max(1, Math.round(field / o.d));
-    img.src = "api/roi?" + new URLSearchParams({
+    loadScalePreview(img, "api/roi?" + new URLSearchParams({
       level: levelPathFor(o.d), x: Math.max(0, Math.floor(fx / o.d)),
       y: Math.max(0, Math.floor(fy / o.d)), w: pw, h: pw, format: "jpg",
-    }) + winQ;
+    }) + winQ, requests.signal);
     img.alt = "";
     const tag = document.createElement("span");
     tag.className = "tag";
@@ -3525,11 +3545,25 @@ function updateScaleStrip() {
   dims.textContent = fmtInt(sel.w) + " × " + fmtInt(sel.h) + " px";
   const note = $("roi-scale-note");
   note.textContent = "TIFF uses this scale; ND2 stays native.";
-  estimateRenderBytes(sel, winQ, r).then((t) => {
+  estimateRenderBytes(sel, winQ, r, requests.signal).then((t) => {
     if (seq === scaleSeq && activeFrameContext()?.key === context.key && t) {
       note.textContent = t + " · TIFF keeps raw channels at this scale; ND2 stays native.";
     }
   });
+}
+
+// The previews are fetched rather than set as <img src> so a superseded
+// strip can cancel them; an image load cannot be aborted.
+function loadScalePreview(img, url, signal) {
+  fetch(url, { cache: "no-store", signal })
+    .then((res) => (res.ok ? res.blob() : null))
+    .then((blob) => {
+      if (!blob || signal.aborted) return;
+      const src = URL.createObjectURL(blob);
+      scaleUrls.push(src);
+      img.src = src;
+    })
+    .catch(() => {}); // superseded, or the preview failed: the button still works
 }
 
 function levelPathFor(d) {
@@ -3537,23 +3571,34 @@ function levelPathFor(d) {
   return lv ? lv.path : 0;
 }
 
-const sizeSamples = new Map(); // sid-stable cache: level+fmt+win -> bytes/px
-async function estimateRenderBytes(o, winQ, r = state.roi) {
+// Bytes per pixel of one real sample, by pyramid level, format, channel set
+// and where the sample sits. The frame and the LUT stay out of the key: the
+// estimate is approximate, and it should survive playback and contrast edits
+// rather than re-render two samples for every frame.
+const sizeSamples = new Map();
+const SIZE_SAMPLE_LIMIT = 64;
+async function estimateRenderBytes(o, winQ, r = state.roi, signal = undefined) {
   if (!r) return "";
   const side = Math.min(512, o.w, o.h);
   const sx = Math.max(0, Math.floor((r.x + r.w / 2) / o.d) - side / 2);
   const sy = Math.max(0, Math.floor((r.y + r.h / 2) / o.d) - side / 2);
+  const level = levelPathFor(o.d);
+  const channels = channelQuery(new URLSearchParams()).get("c") || "all";
   const parts = [];
   for (const fmt of ["jpg", "png"]) {
-    const key = o.d + ":" + fmt + ":" + winQ + ":" + Math.round(sx / 512);
+    if (signal?.aborted) return "";
+    const key = [level, fmt, channels, state.info.generation || "",
+      Math.round(sx / 512), Math.round(sy / 512)].join(":");
     let bpp = sizeSamples.get(key);
     if (bpp === undefined) {
       try {
         const res = await fetch("api/roi?" + new URLSearchParams({
-          level: levelPathFor(o.d), x: sx, y: sy, w: side, h: side, format: fmt,
-        }) + winQ, { cache: "no-store" });
+          level, x: sx, y: sy, w: side, h: side, format: fmt,
+        }) + winQ, { cache: "no-store", signal });
+        if (!res.ok) throw new Error("HTTP " + res.status);
         const blob = await res.blob();
         bpp = blob.size / (side * side);
+        if (sizeSamples.size >= SIZE_SAMPLE_LIMIT) sizeSamples.delete(sizeSamples.keys().next().value);
         sizeSamples.set(key, bpp);
       } catch (e) { bpp = null; }
     }
@@ -5301,7 +5346,7 @@ function plateFrameChanged() {
   // every t, z or focus change: frames, readouts, histogram, status bar
   invalidatePixelProbe(true);
   if (state.roi) {
-    if (frameOwnsRoi()) updateScaleStrip();
+    if (frameOwnsRoi()) scheduleScaleStrip();
     else clearRoi();
   }
   refreshTiles();
