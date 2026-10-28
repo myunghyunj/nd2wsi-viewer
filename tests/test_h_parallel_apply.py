@@ -161,33 +161,58 @@ def test_cancel_during_parallel_apply_joins_workers_before_releasing(original, m
     _assert_released(original, before)
 
 
-def test_failing_tile_propagates_after_running_tiles_finish(original, model, workers, monkeypatch):
+def test_failing_tile_cancels_queued_tiles_and_joins_running_ones(original, model, workers, monkeypatch):
     workers(WORKERS)
     before = original.container_path.read_bytes()
-    spans = []
-    calls = []
     lock = threading.Lock()
-    correct = model.correct
+    entered = []  # (tile, entered after the failure was raised)
+    spans = []
+    running = threading.Event()
+    failed = threading.Event()
+    release = threading.Event()
+    checked = hp._checked
 
-    def failing(*args):
+    class Pool(hp.ThreadPoolExecutor):
+        # The running tiles are held until the pool shuts down, which is
+        # after _build_tiles has handled the failure.
+        def __exit__(self, *exc):
+            release.set()
+            return super().__exit__(*exc)
+
+    def boom(*_args):
+        raise OSError("synthetic tile read failure")
+
+    def gated(replacement, build, args):
         with lock:
-            number = len(calls)
-            calls.append(args[0])
+            entered.append((args, failed.is_set()))
+            if len(entered) == WORKERS:
+                running.set()
+        ci, y, _, x, _ = args
+        if (ci, y, x) == (0, 0, 0):
+            # The oldest level-1 tile fails while every other worker is busy,
+            # so the tiles still queued behind them have not started.
+            assert running.wait(10)
+            failed.set()
+            return checked(replacement, boom, args)
+        assert release.wait(10)
         start = time.perf_counter()
         try:
-            time.sleep(0.03)
-            if number == 2:
-                raise ValueError("synthetic tile failure")
-            return correct(*args)
+            return checked(replacement, build, args)
         finally:
             spans.append((start, time.perf_counter()))
 
-    monkeypatch.setattr(model, "correct", failing)
-    with pytest.raises(ValueError, match="synthetic tile failure"):
+    monkeypatch.setattr(hp, "ThreadPoolExecutor", Pool)
+    monkeypatch.setattr(hp, "_checked", gated)
+    with pytest.raises(OSError, match="synthetic tile read failure"):
         _prepare(original, model)
     returned = time.perf_counter()
-    assert all(end <= returned for _, end in spans)
-    assert len(calls) < 50
+    # The tiles running at the failure finish before prepare_apply returns.
+    assert len(spans) == len(entered) - 1 and all(end <= returned for _, end in spans)
+    # The queued tiles are cancelled: only the failed tile's own worker may
+    # have taken one more before the cancellation reached it.
+    late = [args for args, after in entered if after]
+    assert len(late) <= 1, late
+    assert len(entered) <= WORKERS + 1
     _assert_released(original, before)
 
 
