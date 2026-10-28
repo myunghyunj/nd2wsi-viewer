@@ -293,6 +293,8 @@ def open_nd2_backed(
 
     f = nd2.ND2File(str(slide))
     zroot = model = None
+    # Names this open's corrected-gain entries in the process tile cache.
+    gain_tag = f"h-gain:{os.urandom(8).hex()}"
     try:
         ok, why = is_source_backable(f, selection)
         if not ok:
@@ -325,6 +327,11 @@ def open_nd2_backed(
             if not fingerprints_match(manifest.get("source", {}), quick_fingerprint(slide)):
                 raise ValueError("The original ND2 no longer matches its corrected cache")
             model = load_model(store, manifest)
+            share_gains = getattr(model, "share_gains", None)
+            if share_gains is not None:
+                # Contrast drags re-read the same level-0 tiles; the H gain
+                # costs 8-25 ms per channel per tile and never changes.
+                share_gains(_TILE_CACHE, gain_tag, int(meta["tile"]))
             levels["0"] = _PersistedHLevel0(raw_level0, model, life)
             meta["h_correction"] = manifest["h_correction"]
             meta["display_dtype"] = "float32"
@@ -359,7 +366,11 @@ def open_nd2_backed(
         raise
 
     def _teardown() -> None:
-        if not life.close():
+        drained = life.close()
+        # Corrected reads compute gains inside ``life``; once it has drained
+        # none can add one again, and a timed-out reader's leftovers age out.
+        _TILE_CACHE.purge(gain_tag)
+        if not drained:
             # a reader still holds the map after the drain timeout.
             # nd2's frames are ndarray(buffer=mmap) views, which raise no
             # BufferError on close — unmapping here would be a segfault in

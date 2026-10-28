@@ -390,7 +390,37 @@ class Model:
             bounds.append((low, high))
         self.gain_bounds = bounds
 
+    _shared_gains = None
+
+    def share_gains(self, cache, tag, tile):
+        """Reuse the gains of whole pyramid tiles through ``cache``.
+
+        ``cache`` is a bytes-bounded LRU with ``get(key)`` and ``put(key,
+        array)``; the viewer passes its process-wide decoded-tile cache and
+        purges ``tag`` when the slide closes. Only tile-aligned windows of at
+        most one tile are kept: that is what the tile renderer reads again on
+        every contrast change, while strips and export windows would only
+        evict them. Kept gains are read-only and bit-identical to fresh ones.
+        """
+        self._shared_gains = (cache, tag, int(tile))
+
     def gain(self, c, shape, origin):
+        shared = self._shared_gains
+        if shared is not None:
+            cache, tag, tile = shared
+            h, w = (int(v) for v in shape)
+            y, x = (int(v) for v in origin)
+            if 0 < h <= tile and 0 < w <= tile and y % tile == 0 and x % tile == 0:
+                key = (tag, int(c), y, x, h, w)
+                out = cache.get(key)
+                if out is None:
+                    out = self._gain(c, (h, w), (y, x))
+                    out.setflags(write=False)
+                    cache.put(key, out)
+                return out
+        return self._gain(c, shape, origin)
+
+    def _gain(self, c, shape, origin):
         ci = self.indices.index(int(c))
         h, w = shape
         y, x = origin
