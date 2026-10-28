@@ -223,3 +223,53 @@ def test_the_grid_sharpens_only_once_playback_rests():
     # stays quick, and the sharper 4x pass follows once playback stops
     assert out == {"quick": ["3/0/k8", "3/1/k8"], "whilePlaying": ["3/0/k8", "3/1/k8"],
                    "atRest": ["3/0/k4", "3/1/k4"]}
+
+
+SHARPEN_PAUSE = r"""
+const fs=require('fs'),vm=require('vm'),path=require('path');
+const source=fs.readFileSync(path.join(process.argv[1],'app.js'),'utf8').replace(/\r\n/g,'\n');
+const i=source.indexOf('function paintPlate('),j=source.indexOf('\n}\n',i);
+const timers=new Map();let timerId=0;
+// Run the oldest pending sharpen timer; it is gone once it fires.
+function fire(){const [id,timer]=[...timers][0];timers.delete(id);timer.fn();return timer.ms;}
+const cell=()=>{const img={dataset:{},src:'',getAttribute:k=>k==='src'?img.src:null};
+  return {dataset:{},img,setAttribute(){},classList:{remove(){},toggle(){}},querySelector:()=>img};};
+const sites=[{i:0,name:'A1'},{i:1,name:'A2'}];
+const state={info:{plate:{sites,Z:1,T:5}},plate:{t:3,z:0,auto:false,focus:null,k:4,playing:false,fps:8,
+  gridEls:sites.map(cell),stripEls:sites.map(cell),focusMap:null}};
+const c=vm.createContext({state,window:{Nd2PlateUI:{focusReady:()=>true}},plateGroupKey:()=> '0',
+  plateZFor:()=>0,siteLabelText:String,plateFrameUrl:(t,p,z,k)=>`${t}/${p}/k${k}`,
+  setTimeout:(fn,ms)=>{const id=++timerId;timers.set(id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id)});
+vm.runInContext(source.slice(i,j)+'\n}\n',c);
+// the real controller pauses, and its own playback timers stay apart
+const {createController}=require(path.join(process.argv[1],'plate-controller-v1.js'));
+const nodes={},playback=new Map();
+const $=id=>nodes[id]||(nodes[id]={style:{},classList:{toggle(){}},setAttribute(){},querySelectorAll(){return []}});
+const control=createController({state,$,clamp:(v,a,b)=>Math.max(a,Math.min(b,v)),
+  paintPlate:()=>c.paintPlate(),plateFrameChanged:()=>c.paintPlate(),plateFrameShown:()=>false},
+ {document:{},performance:{now:()=>0},
+  setTimeout:(fn,ms)=>{const id=++timerId;playback.set(id,fn);return id;},clearTimeout:id=>playback.delete(id)});
+const srcs=()=>state.plate.gridEls.map(el=>el.img.src);
+const out={};
+c.paintPlate();control.setPlatePlaying(true);
+// the frame is still awaited each time the sharper pass comes due
+out.waits=[fire(),fire()];out.whilePlaying=srcs();out.pending=timers.size;
+state.plate.t=4;c.paintPlate();out.stepped={srcs:srcs(),pending:timers.size};
+out.waits.push(fire());
+control.setPlatePlaying(false);out.paused=srcs();
+out.delay=fire();out.atRest=srcs();out.left=timers.size;
+console.log(JSON.stringify(out));
+"""
+
+
+def test_pausing_during_a_slow_frame_still_sharpens_the_grid():
+    result = subprocess.run([NODE, "-e", SHARPEN_PAUSE, str(STATIC)], check=True,
+                            capture_output=True, encoding="utf-8", timeout=20)
+    out = json.loads(result.stdout)
+    # while playback waits, the sharper pass keeps one timer and looks again;
+    # a step replaces it, and a pause with no repaint still sharpens the grid
+    assert out == {"waits": [350, 350, 350],
+                   "whilePlaying": ["3/0/k8", "3/1/k8"], "pending": 1,
+                   "stepped": {"srcs": ["4/0/k8", "4/1/k8"], "pending": 1},
+                   "paused": ["4/0/k8", "4/1/k8"], "delay": 350,
+                   "atRest": ["4/0/k4", "4/1/k4"], "left": 0}

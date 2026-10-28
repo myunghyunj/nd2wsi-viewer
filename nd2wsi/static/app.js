@@ -5434,16 +5434,22 @@ function paintPlate() {
   pl.sharpenTimer = null;
   if (quick && pl.focus === null) {
     const t = pl.t, z = pl.z, auto = pl.auto;
-    pl.sharpenTimer = setTimeout(() => {
+    const sharpen = () => {
       pl.sharpenTimer = null;
-      // Playback that waits for a slow frame is not a hand at rest.
-      if (pl.t !== t || pl.z !== z || pl.auto !== auto || pl.focus !== null || pl.playing) return;
+      if (pl.t !== t || pl.z !== z || pl.auto !== auto || pl.focus !== null) return;
+      // Playback that waits for a slow frame is not a hand at rest. Look
+      // again later, so a pause during that wait still gets the sharper pass.
+      if (pl.playing) {
+        pl.sharpenTimer = setTimeout(sharpen, 350);
+        return;
+      }
       sites.forEach((site) => {
         const img = pl.gridEls[site.i].querySelector("img");
         const url = plateFrameUrl(t, site.i, plateZFor(site.i), pl.k);
         if (img.getAttribute("src") !== url) img.src = url;
       });
-    }, 350);
+    };
+    pl.sharpenTimer = setTimeout(sharpen, 350);
   }
 }
 
