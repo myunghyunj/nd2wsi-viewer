@@ -16,15 +16,18 @@ import sqlite3
 import stat
 import sys
 import threading
-from collections.abc import AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from zarr.abc.store import OffsetByteRequest, RangeByteRequest, Store, SuffixByteRequest
 from zarr.core.buffer import Buffer, BufferPrototype, default_buffer_prototype
 
 from ..platform_io import filesystem_path
+from .zarr_v2 import ZarrV2RegionReader
 
 APPLICATION_ID = 0x4E443253
 FORMAT_VERSION = 2
@@ -434,6 +437,13 @@ class SQLiteStore(Store):
     def read_bytes(self, key: str) -> bytes:
         return self._read_bytes(key)
 
+    def _read_chunk(self, key: str) -> bytes | None:
+        """One whole entry, or None where it was never written."""
+        try:
+            return self._read_bytes(key)
+        except FileNotFoundError:
+            return None
+
     def get_sync(self, key: str, *, prototype=None, byte_range=None) -> Buffer | None:
         prototype = prototype or default_buffer_prototype()
         try:
@@ -600,8 +610,134 @@ def newer_file_format(path: str | os.PathLike) -> int | None:
     return version if version > MAX_READABLE_VERSION else None
 
 
+_CHUNK_POOL_LOCK = threading.Lock()
+_CHUNK_POOL: tuple[int, ThreadPoolExecutor] | None = None
+
+
+def _chunk_pool() -> ThreadPoolExecutor:
+    """The process's chunk-decode workers, made again after a fork."""
+    global _CHUNK_POOL
+    with _CHUNK_POOL_LOCK:
+        if _CHUNK_POOL is None or _CHUNK_POOL[0] != os.getpid():
+            workers = min(8, os.cpu_count() or 1)
+            _CHUNK_POOL = (os.getpid(), ThreadPoolExecutor(workers, thread_name_prefix="nd2wsi-chunk"))
+        return _CHUNK_POOL[1]
+
+
+def _spread_decodes(tasks: list[Callable[[], None]]) -> None:
+    """Run the first decode here and the others on the pool, then wait for all.
+
+    Every submitted decode finishes before this returns or raises, so no
+    worker writes into a result the caller has already dropped. During
+    interpreter shutdown the pool refuses work and the rest runs here.
+    """
+    pool = _chunk_pool()
+    futures = []
+    for task in tasks[1:]:
+        try:
+            futures.append(pool.submit(task))
+        except RuntimeError:
+            break
+    error: BaseException | None = None
+    try:
+        for task in (tasks[0], *tasks[1 + len(futures):]):
+            task()
+    finally:
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as exc:  # re-raised once all have finished
+                error = error or exc
+    if error is not None:
+        raise error
+
+
+_UNREAD = object()
+
+
+class _DirectReadArray:
+    """A read-only Zarr array whose tile-sized reads skip Zarr's dispatch.
+
+    ``ZarrV2RegionReader`` serves the selections it can prove equal to
+    Zarr's, straight from this container's encoded chunks; every other
+    selection and every other attribute goes to the Zarr array. Reads use
+    the store's own connection and lock, so closing the store ends both.
+    """
+
+    def __init__(self, array: Any):
+        self._array = array
+        self._reader: Any = _UNREAD
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._array, name)
+
+    def __repr__(self) -> str:
+        return repr(self._array)
+
+    def __array__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._array.__array__(*args, **kwargs)
+
+    def __setitem__(self, selection: Any, value: Any) -> None:
+        self._array[selection] = value
+
+    def __getitem__(self, selection: Any) -> Any:
+        reader = self._reader
+        if reader is _UNREAD:
+            reader = self._reader = self._make_reader()
+        if reader is not None:
+            result = reader.read(selection)
+            if result is not None:
+                return result
+        return self._array[selection]
+
+    def _make_reader(self) -> ZarrV2RegionReader | None:
+        array = self._array
+        store = array.store
+        if not isinstance(store, SQLiteStore):
+            return None
+        reader = ZarrV2RegionReader.open(array.path, store._read_chunk, _spread_decodes)
+        return reader if reader is not None and reader.shape == tuple(array.shape) else None
+
+
+class _DirectReadGroup:
+    """A read-only Zarr group whose arrays read tiles directly (see above)."""
+
+    def __init__(self, group: Any):
+        self._group = group
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._group, name)
+
+    def __repr__(self) -> str:
+        return repr(self._group)
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._group
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._group)
+
+    def __len__(self) -> int:
+        return len(self._group)
+
+    def __getitem__(self, key: str) -> Any:
+        import zarr
+
+        member = self._group[key]
+        if isinstance(member, zarr.Array):
+            return _DirectReadArray(member)
+        if isinstance(member, zarr.Group):
+            return _DirectReadGroup(member)
+        return member
+
+
 def open_zarr_group(path: str | os.PathLike, prefix: str = "store.ome.zarr", mode: str = "r"):
-    """Open an embedded v2 group; the caller owns ``group.store.close()``."""
+    """Open an embedded v2 group; the caller owns ``group.store.close()``.
+
+    A read-only group (``mode="r"``) hands out arrays whose tile-sized reads
+    go straight to the container's chunks; values, shapes and dtypes stay
+    exactly Zarr's, and everything else is the Zarr group and array.
+    """
     import zarr
 
     if mode not in {"r", "r+", "a", "w", "w-", "x"}:
@@ -610,7 +746,8 @@ def open_zarr_group(path: str | os.PathLike, prefix: str = "store.ome.zarr", mod
         raise FileNotFoundError(path)
     store = SQLiteStore(path, read_only=mode == "r", prefix=prefix)
     try:
-        return zarr.open_group(store=store, mode=mode, zarr_format=2)
+        group = zarr.open_group(store=store, mode=mode, zarr_format=2)
+        return _DirectReadGroup(group) if mode == "r" else group
     except sqlite3.Error as exc:
         store.close()
         raise ValueError(f"invalid or unreadable single-file cache: {path}") from exc
