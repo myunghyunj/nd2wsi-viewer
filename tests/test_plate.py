@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from http_fixture import running_server
 
 from nd2wsi import render
 
@@ -177,16 +178,13 @@ def test_windows_source_replacement_requires_closing_the_reader(plate_nd2, tmp_p
 
 @pytest.fixture(scope="module")
 def served(tmp_path_factory):
-    from nd2wsi.server import create_server, server_url
+    from nd2wsi.server import server_url
 
     home = tmp_path_factory.mktemp("plate")
     path = home / "plate.nd2"
     _write_plate(path)
-    httpd = create_server([path], host="127.0.0.1", port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    yield httpd, server_url(httpd).rstrip("/"), path
-    httpd.shutdown()
-    httpd.server_close()
+    with running_server([path], host="127.0.0.1") as httpd:
+        yield httpd, server_url(httpd).rstrip("/"), path
 
 
 def _get(url, method="GET", data=None):
