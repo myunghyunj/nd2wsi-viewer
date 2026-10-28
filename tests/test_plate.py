@@ -1339,14 +1339,15 @@ def test_the_builder_gives_up_on_a_store_that_cannot_be_written(plate_nd2, monke
     reads = {"n": 0}
     real_reduced = plate_mod.PlateSource.reduced
 
-    def counting_reduced(self, t, p, z, k):
+    def counting_reduced(self, *args, **kwargs):
         reads["n"] += 1
-        return real_reduced(self, t, p, z, k)
+        return real_reduced(self, *args, **kwargs)
 
-    def refuse(self, t, p, z, frame):
-        return  # the write silently fails, as it does on a full drive
+    def refuse(self, *args):
+        return False  # the write silently fails, as it does on a full drive
 
     monkeypatch.setattr(plate_mod.PlateStore, "put", refuse)
+    monkeypatch.setattr(plate_mod.PlateStore, "put_block", refuse)
     monkeypatch.setattr(plate_mod.PlateSource, "reduced", counting_reduced)
     src = plate_mod.PlateSource(plate_nd2)
     try:
@@ -1357,6 +1358,196 @@ def test_the_builder_gives_up_on_a_store_that_cannot_be_written(plate_nd2, monke
         assert src.store.count() == 0
         # it stopped early rather than walking the whole series over and over
         assert reads["n"] < T * P * Z, reads["n"]
+    finally:
+        src.close()
+
+
+class _RecordingArray:
+    """A zarr array that logs every read and write, in order, to ``log``."""
+
+    def __init__(self, name, real, log):
+        self._name, self._real, self._log = name, real, log
+
+    def __getattr__(self, attr):
+        return getattr(self._real, attr)
+
+    def __getitem__(self, index):
+        self._log.append((self._name, "read", index))
+        return self._real[index]
+
+    def __setitem__(self, index, value):
+        self._log.append((self._name, "write", index))
+        self._real[index] = value
+
+    @property
+    def oindex(self):
+        outer = self
+
+        class _Orthogonal:
+            def __getitem__(self, index):
+                outer._log.append((outer._name, "read", index))
+                return outer._real.oindex[index]
+
+            def __setitem__(self, index, value):
+                outer._log.append((outer._name, "write", index))
+                outer._real.oindex[index] = value
+
+        return _Orthogonal()
+
+
+def _record_store_arrays(store, log):
+    store._thumbs = _RecordingArray("thumbs", store._thumbs, log)
+    store._digest = _RecordingArray("digest", store._digest, log)
+    store._done = _RecordingArray("done", store._done, log)
+
+
+def test_the_builder_commits_each_shared_chunk_once_payload_digest_done(plate_nd2, monkeypatch):
+    """Every site of a (t, z) shares one chunk. The builder stages the
+    chunk's missing sites and commits them with one write per array, in the
+    payload, digest, done order, instead of rewriting the chunk per site."""
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore
+
+    real_start = PlateStore.start
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    src = PlateSource(plate_nd2)
+    try:
+        store = src.store
+        log = []
+        _record_store_arrays(store, log)
+        real_start(store)
+        assert _wait_full(src), store.status()
+        store._thread.join(timeout=15)
+        writes = [entry for entry in log if entry[1] == "write"]
+        assert len(writes) == 3 * T * Z, writes
+        blocks = set()
+        for i in range(0, len(writes), 3):
+            (a, _, payload), (b, _, digest), (c, _, done) = writes[i:i + 3]
+            assert (a, b, c) == ("thumbs", "digest", "done")
+            t, sites, z = payload
+            assert sites == slice(None)  # the whole chunk, not one site
+            assert digest == done == (t, list(range(P)), z)
+            blocks.add((t, z))
+        assert blocks == {(t, z) for t in range(T) for z in range(Z)}
+        # a fresh chunk is written whole, never read and rewritten
+        first_write = log.index(writes[0])
+        assert not [e for e in log[:first_write] if e[0] == "thumbs"]
+    finally:
+        src.close()
+
+    again = PlateSource(plate_nd2)
+    try:
+        assert again.store.count() == T * P * Z
+        for t in range(T):
+            for p in range(P):
+                for z in range(Z):
+                    assert np.all(again.store.get(t, p, z) == value(t, p, z))
+                    assert int(again.reduced(t, p, z, THUMB_K)[0, 0, 0]) == value(t, p, z)
+    finally:
+        again.close()
+
+
+def test_put_block_keeps_committed_and_unlisted_sites(plate_nd2, monkeypatch):
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    src = PlateSource(plate_nd2)
+    try:
+        store = src.store
+        t, z = 1, 0
+        shape = store._thumbs.shape[3:]
+        kept = np.full(shape, 7, dtype=np.uint16)
+        assert store.put(t, 1, z, kept)  # a foreground put, one site
+        log = []
+        _record_store_arrays(store, log)
+        staged = {p: np.full(shape, value(t, p, z), dtype=np.uint16) for p in (0, 1)}
+        assert store.put_block(t, z, staged)
+        # The chunk already held a site, so it is read once and merged.
+        assert [e[:2] for e in log] == [
+            ("thumbs", "read"), ("thumbs", "write"), ("digest", "write"), ("done", "write"),
+        ]
+        assert log[2][2] == log[3][2] == (t, [0], z)  # only the new site
+        block = np.asarray(store._thumbs._real[t, :, z])
+        assert np.all(block[0] == value(t, 0, z))
+        assert np.all(block[1] == 7)  # committed earlier: its bytes stay
+        assert not block[2].any()  # not offered: untouched and still missing
+        assert store.is_committed(t, 0, z) and store.is_committed(t, 1, z)
+        assert not store.is_committed(t, 2, z)
+        assert np.all(store.get(t, 0, z) == value(t, 0, z))
+        # nothing new to commit: no write at all
+        del log[:]
+        assert store.put_block(t, z, staged)
+        assert log == []
+        # a stopping store takes nothing more
+        store._stop = True
+        assert not store.put_block(t, z, {2: np.full(shape, value(t, 2, z), dtype=np.uint16)})
+        assert not store.is_committed(t, 2, z)
+        assert int(src.reduced(t, 0, z, THUMB_K)[0, 0, 0]) == value(t, 0, z)
+    finally:
+        src.close()
+
+
+def test_the_builder_stops_between_sites_and_drops_the_staged_chunk(plate_nd2, monkeypatch):
+    """A close must not wait for a whole chunk of reductions: the builder
+    checks for a stop after every site, and a half-staged chunk is never
+    written."""
+    from nd2wsi.plate import PlateSource, PlateStore
+
+    real_reduced = PlateSource.reduced
+    staging = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def gated(self, *args, **kwargs):
+        if kwargs.get("persist") is False:
+            calls.append(args)
+            staging.set()
+            assert release.wait(timeout=10)
+        return real_reduced(self, *args, **kwargs)
+
+    real_start = PlateStore.start
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    monkeypatch.setattr(PlateSource, "reduced", gated)
+    src = PlateSource(plate_nd2)
+    try:
+        store = src.store
+        real_start(store)
+        assert staging.wait(timeout=10)
+        store._stop = True  # what close() does before joining the worker
+        release.set()
+        store._thread.join(timeout=10)
+        assert not store._thread.is_alive()
+        assert len(calls) == 1, calls  # no further site was reduced
+        assert store.count() == 0  # and the one staged site was dropped
+    finally:
+        release.set()
+        src.close()
+
+
+def test_the_builder_commits_staged_sites_then_retries_a_failed_frame(plate_nd2, monkeypatch):
+    from nd2wsi.plate import PlateSource, PlateStore
+
+    real_reduced = PlateSource.reduced
+    attempts = []
+
+    def flaky(self, t, p, z, k, **kwargs):
+        if kwargs.get("persist") is False and (t, p, z) == (0, 1, 0):
+            attempts.append(self.store.count())
+            if len(attempts) == 1:
+                raise OSError("a transient read error")
+        return real_reduced(self, t, p, z, k, **kwargs)
+
+    real_start = PlateStore.start
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    monkeypatch.setattr(PlateSource, "reduced", flaky)
+    src = PlateSource(plate_nd2)
+    try:
+        store = src.store
+        store.steer(0, 0)
+        real_start(store)
+        assert _wait_full(src), store.status()
+        # site 0, staged before the failure, was committed before the retry
+        assert attempts == [0, 1]
+        assert store.count() == T * P * Z
     finally:
         src.close()
 

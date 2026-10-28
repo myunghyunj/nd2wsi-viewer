@@ -387,3 +387,42 @@ def test_measured_windows_are_pinned_to_the_recorded_method():
         {"start": pytest.approx(216.025), "end": pytest.approx(3982.625),
          "min": 0.0, "max": 65535.0},
     ], "the measurement changed: bump plate.WINDOWS_METHOD and update these values"
+
+
+def test_background_fill_writes_each_thumbnail_chunk_once(plate_nd2, monkeypatch):
+    """Each committed write is one SQLite transaction with a full fsync, and
+    all sites of a (t, z) share one thumbnail chunk. Filling the store must
+    write each chunk, and its commit metadata, once per chunk rather than
+    once per site."""
+    from collections import Counter
+
+    from nd2wsi.plate_integrity import DIGEST_NAME
+    from nd2wsi.storage.single_file import SQLiteStore
+
+    source = PlateSource(plate_nd2)
+    try:
+        writes = []
+        real_write = SQLiteStore.write_bytes
+
+        def recording(self, key, payload):
+            writes.append(self._key(key))
+            return real_write(self, key, payload)
+
+        monkeypatch.setattr(SQLiteStore, 'write_bytes', recording)
+        source.store._build()  # the background pass, run here to completion
+        assert source.store.count() == T * P * Z
+    finally:
+        source.close()
+    chunks = Counter(key.rsplit('/', 2)[-2] for key in writes if '/.z' not in key)
+    assert chunks['thumbs'] == T * Z
+    assert chunks[DIGEST_NAME] == chunks['done'] == T * Z
+    thumbs = [key for key in writes if key.rsplit('/', 2)[-2] == 'thumbs']
+    assert len(set(thumbs)) == len(thumbs) == T * Z
+    reopened = PlateSource(plate_nd2)
+    try:
+        for t in range(T):
+            for p in range(P):
+                for z in range(Z):
+                    assert np.all(reopened.store.get(t, p, z) == value(t, p, z))
+    finally:
+        reopened.close()

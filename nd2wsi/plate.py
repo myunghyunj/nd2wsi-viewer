@@ -1202,6 +1202,65 @@ class PlateStore:
             self._flush_focus_if_block_complete(t, z)
             return True
 
+    def put_block(self, t: int, z: int, frames: dict[int, np.ndarray]) -> bool:
+        """Commit several sites of one shared ``(t, z)`` chunk at once.
+
+        ``frames`` maps site index to its reduction. Every site of a time
+        point and plane lives in one chunk, so :meth:`put` rewrites (decodes,
+        encodes, commits and fsyncs) the whole chunk for each site; the
+        background builder stages a chunk's missing sites and lands them here
+        with one write per array instead of one per site. The order stays
+        payload, digest, done, all under ``_lock``. Sites already committed
+        keep their stored bytes, and so does every site not in ``frames``.
+        True when every given site is committed afterwards.
+        """
+        t, z = int(t), int(z)
+        self._refresh()
+        if not frames:
+            return True
+        if self._stop or not self.writable or self._digest is None:
+            return bool(self._committed_mask()[t, sorted(frames), z].all())
+        # Pure per-site work stays outside the lock that foreground reads wait on.
+        digests = {p: frame_digest(f) for p, f in frames.items()}
+        scores = {
+            p: _sharpness(f) for p, f in frames.items() if self._focus_np[t, p, z] < 0
+        }
+        with self._lock:
+            if self._stop or not self.writable or self._digest is None:
+                return bool(self._committed_mask()[t, sorted(frames), z].all())
+            committed = self._committed_mask()[t, :, z]
+            todo = [p for p in sorted(frames) if not committed[p]]
+            if not todo:
+                return True
+            try:
+                if len(todo) == len(committed):
+                    # The whole chunk is new: write it without reading it.
+                    block = np.stack([frames[p] for p in todo])
+                else:
+                    block = np.array(self._thumbs[t, :, z], copy=True)
+                    for p in todo:
+                        block[p] = frames[p]
+                self._thumbs[t, :, z] = block
+                self._digest.oindex[t, todo, z] = np.array(
+                    [digests[p] for p in todo], dtype=np.uint64
+                )
+                self._done.oindex[t, todo, z] = 1
+            except Exception:
+                return False  # a store that cannot be written is only slower
+            for p in todo:
+                self._digest_np[t, p, z] = digests[p]
+                self._done_np[t, p, z] = True
+                self._invalid[t, p, z] = False
+                if self._focus_np[t, p, z] < 0:
+                    score = scores.get(p)
+                    self._focus_np[t, p, z] = (
+                        _sharpness(frames[p]) if score is None else score
+                    )
+                    self._focus_dirty += 1
+            self._commit_integrity_capability()
+            self._flush_focus_if_block_complete(t, z)
+            return True
+
     def _flush_focus_if_block_complete(self, t: int, z: int) -> None:
         """Publish focus progress when one shared ``(time, z)`` block lands."""
         committed = self._committed_mask()[t, :, z]
@@ -1367,10 +1426,16 @@ class PlateStore:
             self._warmed = True
 
     def _build(self) -> None:
-        """Fill the store frame by frame, then warm what is in it.
+        """Fill the store one shared chunk at a time, then warm what is in it.
+
+        From the first missing frame the walk finds, the rest of that time
+        point and plane's missing sites are reduced in the order the walk
+        would visit them anyway, then committed together by
+        :meth:`put_block`. A stop is honoured between sites, and a close
+        loses at most the one chunk being staged.
 
         The pass gives up rather than looping when the frames stop
-        arriving: ``put`` swallows a write it cannot make, so a container
+        arriving: a write the store cannot make is swallowed, so a container
         that is read only or full would otherwise hand back the same
         missing frame forever, reading it from the ND2 each time.
         """
@@ -1384,29 +1449,41 @@ class PlateStore:
             item = self._next_missing()
             if item is None:
                 break
-            while src._fg > 0 and not self._stop:
-                time.sleep(0.02)
-            if self._stop:
-                return
-            try:
-                src.reduced(*item, THUMB_K)
-            except Exception:
-                if self._stop or src._closed:
+            t, first, z = item
+            staged: dict[int, np.ndarray] = {}
+            failed = False
+            for p in range(first, self._source.P):
+                if self.is_committed(t, p, z):
+                    continue  # stored already, perhaps by a foreground read
+                while src._fg > 0 and not self._stop:
+                    time.sleep(0.02)
+                if self._stop:
                     return
+                try:
+                    staged[p] = src.reduced(t, p, z, THUMB_K, persist=False)
+                except Exception:
+                    if self._stop or src._closed:
+                        return
+                    failed = True
+                    break
+                time.sleep(0.005)
+            if staged:
+                misses = 0
+                if not self.put_block(t, z, staged):
+                    break  # the reductions were made and the store would not take them
+                self._since_sweep = getattr(self, "_since_sweep", 0) + len(staged)
+                if self._since_sweep >= 64:
+                    self._since_sweep = 0
+                    self.sweep()
+                    self.flush_focus()
+            if failed:
                 misses += 1
                 if misses >= 8:
                     break  # the file keeps refusing this frame
                 time.sleep(0.5)
                 continue
-            misses = 0
             if not self.is_committed(*item):
-                break  # the reduction was made and the store would not take it
-            self._since_sweep = getattr(self, "_since_sweep", 0) + 1
-            if self._since_sweep >= 64:
-                self._since_sweep = 0
-                self.sweep()
-                self.flush_focus()
-            time.sleep(0.005)
+                break
         self.flush_focus()
         self.sweep()
         if not self._stop:
@@ -1860,8 +1937,13 @@ class PlateSource:
                 _FRAME_CACHE.put(key, cyx)
             return cyx
 
-    def reduced(self, t: int, p: int, z: int, k: int) -> np.ndarray:
-        """(C, H//k, W//k) box mean of one frame, rounded to the source dtype."""
+    def reduced(self, t: int, p: int, z: int, k: int, *, persist: bool = True) -> np.ndarray:
+        """(C, H//k, W//k) box mean of one frame, rounded to the source dtype.
+
+        An 8x reduction is also stored, one site at a time, unless
+        ``persist`` is False: the store's builder commits a whole chunk of
+        sites at once with :meth:`PlateStore.put_block` instead.
+        """
         if self._closed:
             raise ValueError("slide is closed")
         with self._life:
@@ -1874,7 +1956,8 @@ class PlateSource:
             hit = _REDUCED_CACHE.get(key)
             if hit is not None:
                 if (
-                    k == THUMB_K
+                    persist
+                    and k == THUMB_K
                     and self.store is not None
                     and not self.store.is_committed(t, p, z)
                     and not self._closed
@@ -1890,7 +1973,7 @@ class PlateSource:
             out = np.ascontiguousarray(box_mean(self.frame(t, p, z), k, self.dtype))
             if not self._closed:
                 _REDUCED_CACHE.put(key, out)
-                if k == THUMB_K and self.store is not None:
+                if persist and k == THUMB_K and self.store is not None:
                     self.store.put(t, p, z, out)
             return out
 
