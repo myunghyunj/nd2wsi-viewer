@@ -1516,6 +1516,7 @@ def test_the_builder_stops_between_sites_and_drops_the_staged_chunk(plate_nd2, m
         assert not store._thread.is_alive()
         assert len(calls) == 1, calls  # no further site was reduced
         assert store.count() == 0  # and the one staged site was dropped
+        assert store._staging is None  # sealed: no foreground site joins it
     finally:
         release.set()
         src.close()
@@ -1548,6 +1549,66 @@ def test_the_builder_commits_staged_sites_then_retries_a_failed_frame(plate_nd2,
         assert store.count() == T * P * Z
     finally:
         src.close()
+
+
+def test_foreground_reads_of_the_chunk_being_staged_leave_the_write_to_the_builder(
+    plate_nd2, monkeypatch
+):
+    """The first grid paint lands on the chunk the builder starts with. A
+    foreground read of one of its sites, staged already or not reached yet,
+    must not rewrite the shared chunk for that one site on the request
+    thread: the builder takes the reduction and commits the chunk once."""
+    from nd2wsi.plate import THUMB_K, PlateSource, PlateStore
+
+    t, z = 0, 0
+    real_reduced = PlateSource.reduced
+    at_site_1 = threading.Event()
+    release = threading.Event()
+    builder_calls = []
+
+    def gated(self, tt, p, zz, k, **kwargs):
+        if kwargs.get("persist") is False:
+            builder_calls.append((tt, p, zz))
+            if (tt, p, zz) == (t, 1, z):
+                at_site_1.set()
+                assert release.wait(timeout=10)
+        return real_reduced(self, tt, p, zz, k, **kwargs)
+
+    real_start = PlateStore.start
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    monkeypatch.setattr(PlateSource, "reduced", gated)
+    src = PlateSource(plate_nd2)
+    try:
+        store = src.store
+        store.steer(t, z)
+        log = []
+        _record_store_arrays(store, log)
+        real_start(store)
+        assert at_site_1.wait(timeout=10)  # site 0 is staged, nothing written yet
+        # site 0 is a memory hit on the staged reduction; site 2 is not reached
+        for p in (0, 2):
+            assert int(src.reduced(t, p, z, THUMB_K)[0, 0, 0]) == value(t, p, z)
+        assert [e for e in log if e[1] == "write"] == []
+        assert not store.is_committed(t, 0, z) and not store.is_committed(t, 2, z)
+        release.set()
+        assert _wait_full(src), store.status()
+        store._thread.join(timeout=15)
+        writes = [e for e in log if e[1] == "write" and e[2][0] == t and e[2][-1] == z]
+        assert [e[0] for e in writes] == ["thumbs", "digest", "done"], writes
+        assert writes[0][2] == (t, slice(None), z)  # the whole chunk, once
+        # the site the foreground handed over was not reduced a second time
+        assert builder_calls[:2] == [(t, 0, z), (t, 1, z)]
+        assert (t, 2, z) not in builder_calls
+    finally:
+        release.set()
+        src.close()
+
+    again = PlateSource(plate_nd2)
+    try:
+        for p in range(P):
+            assert np.all(again.store.get(t, p, z) == value(t, p, z))
+    finally:
+        again.close()
 
 
 def test_only_one_viewer_writes_the_store(plate_nd2):

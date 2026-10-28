@@ -551,6 +551,9 @@ class PlateStore:
         self._stop = False
         self._thread: threading.Thread | None = None
         self._start_stop_lock = threading.Lock()
+        # (t, z, sites) of the chunk the builder is staging for put_block
+        self._staging: tuple[int, int, dict[int, np.ndarray]] | None = None
+        self._staging_lock = threading.Lock()
 
     # ---- open or create -------------------------------------------------
     @staticmethod
@@ -1202,6 +1205,21 @@ class PlateStore:
             self._flush_focus_if_block_complete(t, z)
             return True
 
+    def offer(self, t: int, p: int, z: int, frame: np.ndarray) -> None:
+        """Store a foreground reduction, sharing the builder's chunk write.
+
+        While the builder is staging this site's ``(t, z)`` chunk, the frame
+        joins that chunk and lands with its :meth:`put_block`, so a request
+        thread never rewrites the shared chunk for one site the builder is
+        about to commit anyway. Any other site is put on its own.
+        """
+        with self._staging_lock:
+            staging = self._staging
+            if staging is not None and staging[0] == t and staging[1] == z:
+                staging[2].setdefault(p, frame)
+                return
+        self.put(t, p, z, frame)
+
     def put_block(self, t: int, z: int, frames: dict[int, np.ndarray]) -> bool:
         """Commit several sites of one shared ``(t, z)`` chunk at once.
 
@@ -1431,8 +1449,10 @@ class PlateStore:
         From the first missing frame the walk finds, the rest of that time
         point and plane's missing sites are reduced in the order the walk
         would visit them anyway, then committed together by
-        :meth:`put_block`. A stop is honoured between sites, and a close
-        loses at most the one chunk being staged.
+        :meth:`put_block`. A foreground read of a site in that chunk hands
+        its reduction over through :meth:`offer` instead of writing it, and
+        the builder skips a site it was handed. A stop is honoured between
+        sites, and a close loses at most the one chunk being staged.
 
         The pass gives up rather than looping when the frames stop
         arriving: a write the store cannot make is swallowed, so a container
@@ -1451,24 +1471,36 @@ class PlateStore:
                 break
             t, first, z = item
             staged: dict[int, np.ndarray] = {}
+            made = 0
             failed = False
-            for p in range(first, self._source.P):
-                if self.is_committed(t, p, z):
-                    continue  # stored already, perhaps by a foreground read
-                while src._fg > 0 and not self._stop:
-                    time.sleep(0.02)
-                if self._stop:
-                    return
-                try:
-                    staged[p] = src.reduced(t, p, z, THUMB_K, persist=False)
-                except Exception:
-                    if self._stop or src._closed:
+            with self._staging_lock:
+                self._staging = (t, z, staged)
+            try:
+                for p in range(first, self._source.P):
+                    if p in staged or self.is_committed(t, p, z):
+                        continue  # handed over or stored by a foreground read
+                    while src._fg > 0 and not self._stop:
+                        time.sleep(0.02)
+                    if self._stop:
                         return
-                    failed = True
-                    break
-                time.sleep(0.005)
-            if staged:
+                    try:
+                        frame = src.reduced(t, p, z, THUMB_K, persist=False)
+                    except Exception:
+                        if self._stop or src._closed:
+                            return
+                        failed = True
+                        break
+                    with self._staging_lock:
+                        staged.setdefault(p, frame)
+                    made += 1
+                    time.sleep(0.005)
+            finally:
+                # Sealed: from here a foreground read puts its site itself.
+                with self._staging_lock:
+                    self._staging = None
+            if made:
                 misses = 0
+            if staged:
                 if not self.put_block(t, z, staged):
                     break  # the reductions were made and the store would not take them
                 self._since_sweep = getattr(self, "_since_sweep", 0) + len(staged)
@@ -1940,9 +1972,10 @@ class PlateSource:
     def reduced(self, t: int, p: int, z: int, k: int, *, persist: bool = True) -> np.ndarray:
         """(C, H//k, W//k) box mean of one frame, rounded to the source dtype.
 
-        An 8x reduction is also stored, one site at a time, unless
-        ``persist`` is False: the store's builder commits a whole chunk of
-        sites at once with :meth:`PlateStore.put_block` instead.
+        An 8x reduction is also stored through :meth:`PlateStore.offer`:
+        on its own, or with the chunk the builder is staging. The builder
+        itself passes ``persist=False`` and commits a whole chunk of sites
+        at once with :meth:`PlateStore.put_block`.
         """
         if self._closed:
             raise ValueError("slide is closed")
@@ -1962,7 +1995,7 @@ class PlateSource:
                     and not self.store.is_committed(t, p, z)
                     and not self._closed
                 ):
-                    self.store.put(t, p, z, hit)
+                    self.store.offer(t, p, z, hit)
                 return hit
             if k == THUMB_K and self.store is not None:
                 stored = self.store.get(t, p, z)
@@ -1974,7 +2007,7 @@ class PlateSource:
             if not self._closed:
                 _REDUCED_CACHE.put(key, out)
                 if persist and k == THUMB_K and self.store is not None:
-                    self.store.put(t, p, z, out)
+                    self.store.offer(t, p, z, out)
             return out
 
     def status(self) -> dict[str, Any]:
