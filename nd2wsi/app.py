@@ -1511,6 +1511,51 @@ def _daemonize_pywebview_bridge_threads(webview) -> None:
 
 _DIAGNOSTIC_RUN_FLAGS = ("--gui-smoke", "--handoff-check-report", "--browser-replay-report")
 
+# How long an interactive exit waits for slide reads, exports and plate writers
+# to let go of their sources once the window has closed.
+_EXIT_TEARDOWN_TIMEOUT = 10.0
+_EXIT_TEARDOWN_UNFINISHED = threading.Event()
+
+
+def _stop_server_at_exit(api, *, diagnostic: bool) -> None:
+    """Release the server after the GUI loop has returned.
+
+    This is the strict teardown an update uses: it never closes a memory map
+    or a plate writer while a reader still holds it. Sparkle's preparation has
+    already run it before the app quits, and a diagnostic run waits for it
+    without limit, so a teardown that hangs still fails its CI step.
+
+    An interactive run's window is already gone, and a read from a share that
+    has gone away never returns. Waiting for it would leave a process nobody
+    can see, holding its window-session lock (an update in any other window
+    then refuses), its plate writer lease and its memory maps. So the teardown
+    gets ``_EXIT_TEARDOWN_TIMEOUT`` seconds on a daemon thread. If it is still
+    waiting, it is left running, ``_EXIT_TEARDOWN_UNFINISHED`` is set, and
+    ``run()`` ends the process after ``main()`` has recorded the session
+    closed. The kernel releases the locks; an abandoned export leaves only its
+    temporary file.
+    """
+    if diagnostic:
+        api.stop_server_for_update()
+        return
+    finished = threading.Event()
+    failure = []
+
+    def stop():
+        try:
+            api.stop_server_for_update()
+        except BaseException as exc:
+            failure.append(exc)
+        finally:
+            finished.set()
+
+    threading.Thread(target=stop, name="exit-teardown", daemon=True).start()
+    if not finished.wait(_EXIT_TEARDOWN_TIMEOUT):
+        _dlog(f"exit: slide teardown still waiting after {_EXIT_TEARDOWN_TIMEOUT:g} s; ending without it")
+        _EXIT_TEARDOWN_UNFINISHED.set()
+    elif failure:
+        raise failure[0]
+
 
 def run(argv: list[str] | None = None) -> int:
     """Process entry point: ``main()``, then end a diagnostic run at once.
@@ -1519,12 +1564,23 @@ def run(argv: list[str] | None = None) -> int:
     report is written and its server and window session are closed. Exiting
     with ``os._exit`` then means no thread that is still waiting (see
     ``_daemonize_pywebview_bridge_threads``) can turn a finished run into a
-    CI timeout. Interactive runs return normally; ``main()`` itself always
+    CI timeout. Interactive runs return normally unless their slide teardown
+    did not finish in time (``_stop_server_at_exit``); ``main()`` itself always
     returns, so callers and tests can inspect its result.
     """
     arguments = list(sys.argv[1:] if argv is None else argv)
     result = main(arguments)
     if any(argument.split("=", 1)[0] in _DIAGNOSTIC_RUN_FLAGS for argument in arguments):
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(result)
+    if _EXIT_TEARDOWN_UNFINISHED.is_set():
+        # A slide read still holds a source. Interpreter shutdown joins
+        # executor workers, where zarr runs store reads, and could wait for
+        # it forever; end at once instead.
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
@@ -1638,7 +1694,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         try:
             if api is not None:
-                api.stop_server_for_update()
+                _stop_server_at_exit(api, diagnostic=bool(args.gui_smoke or args.browser_replay_report))
         finally:
             if window_session is not None:
                 try:
