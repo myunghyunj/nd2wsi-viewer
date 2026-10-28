@@ -463,7 +463,8 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
 
     _DRAIN_TIMEOUT = 30.0
     _UNCONFIRMED_CLOSE_TITLE = "Close without confirmed saves?"
-    _UPDATE_PREPARING_NOTICE = "An update is being prepared. Cancel it in the update window to close."
+    _UPDATE_PREPARING_NOTICE = ("An update is waiting to install, so this window can't be closed now. "
+                                "The viewer will quit and reopen by itself when the update starts.")
 
     def __init__(self, api: LifecycleApi, window: LifecycleWindow, *, logger: Callable[[str], None]):
         super().__init__(api, window, logger=logger)
@@ -549,8 +550,9 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
         """Keep the window open, and say why, while Sparkle preparation owns it.
 
         Runs on the UI thread, so the notice is sent from its own thread. The
-        panes stay frozen for the update; cancelling it in Sparkle's window
-        unlocks them, and the next close then runs the save handshake.
+        panes stay frozen for the update. Sparkle's window has no cancel at
+        this point; only an aborted installation unlocks them, and the next
+        close then runs the save handshake.
         """
         message = self._UPDATE_PREPARING_NOTICE
         self.api._status = message
