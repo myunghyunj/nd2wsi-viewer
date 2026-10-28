@@ -5,13 +5,13 @@ window availability are stubbed. No browser, source image or user window opens.
 """
 
 import json
-import subprocess
+from pathlib import Path
 
 import pytest
-from test_update_cancel_js import NODE, STATIC
+from node_host import run_node
 from test_update_cancel_js import SCRIPT as PREPARATION_SCRIPT
 
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
+STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
 
 CLOSE_BINDINGS = r"""
 shell.slides = [{sid:'a'}, {sid:'b'}];
@@ -45,10 +45,7 @@ SCRIPT = PREPARATION_SCRIPT.replace(
 
 
 def run(body):
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(STATIC), body],
-        capture_output=True, text=True, timeout=20,
-    )
+    result = run_node(SCRIPT, STATIC, body)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 

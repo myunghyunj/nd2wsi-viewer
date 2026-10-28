@@ -1,14 +1,11 @@
 """LUT module wiring, shared channel edits and native pointer ownership."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const fs=require('fs'),path=require('path'),vm=require('vm');
@@ -48,8 +45,7 @@ process.stdout.write(JSON.stringify({navigated,frozen,before,invalid,outside,nat
 
 
 def test_real_app_adapter_freezes_channels_routes_native_scroll_and_batches_shift_drag():
-    result = subprocess.run([NODE, "-e", SCRIPT, str(STATIC)], check=True,
-                            capture_output=True, text=True, timeout=20)
+    result = run_node(SCRIPT, STATIC, check=True)
     out = json.loads(result.stdout)
     assert out["navigated"] == {"toggle": False, "auto": False, "other": [123, 789], "changes": 0}
     assert out["frozen"] == [123, 789]
@@ -92,8 +88,7 @@ process.stdout.write(JSON.stringify({listeners,one,outside,after:handlers.messag
 
 
 def test_native_trackpad_events_hit_test_once_for_every_channel_widget():
-    result = subprocess.run([NODE, "-e", DELEGATED, str(STATIC)], check=True,
-                            capture_output=True, text=True, timeout=20)
+    result = run_node(DELEGATED, STATIC, check=True)
     out = json.loads(result.stdout)
     # four channel widgets share one listener and one hit test per message
     assert out["listeners"] == 1
@@ -119,6 +114,5 @@ const fs=require('fs'),path=require('path'),vm=require('vm');const context={};vm
 for(const filename of JSON.parse(process.argv[2]))vm.runInContext(fs.readFileSync(path.join(process.argv[1],filename),'utf8'),context);
 process.stdout.write(JSON.stringify(Object.keys(context).sort()));
 """
-    result = subprocess.run([NODE, "-e", script, str(STATIC), json.dumps(list(modules))],
-                            check=True, capture_output=True, text=True, timeout=20)
+    result = run_node(script, STATIC, json.dumps(list(modules)), check=True)
     assert json.loads(result.stdout) == sorted(modules.values())

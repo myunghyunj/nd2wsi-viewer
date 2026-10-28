@@ -1,14 +1,10 @@
 """Real app initial Auto, asynchronous manual edits, and explicit API bounds."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 def test_nd2_initial_auto_is_once_only_and_respects_manual_edits_and_handoff():
@@ -40,8 +36,7 @@ delete state.initialViewHandoff;state.luts=[{lo:2,hi:8,gamma:1},null];c.initiali
 state.info.name='bright.svs';c.initializeLutAuto();const svs={axis:state.lutAutoRange,pending:[...state.lutAutoPending]};
 process.stdout.write(JSON.stringify({initial,first,afterFrame,explicit,handoff,restored,svs,changes}));
 """
-    result = subprocess.run([NODE, "-e", script, str(STATIC)], check=True,
-                            capture_output=True, text=True, timeout=20)
+    result = run_node(script, STATIC, check=True)
     out = json.loads(result.stdout)
     assert out["initial"] == {"axis": True, "pending": [True, True]}
     assert out["first"] == [{"lo": 123, "hi": 321, "gamma": 1}, None]

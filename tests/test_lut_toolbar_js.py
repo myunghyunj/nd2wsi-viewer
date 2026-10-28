@@ -1,15 +1,13 @@
 """Real LUT toolbar handlers: exact editing, clipboard routing and safe updates."""
 import json
 import re
-import shutil
-import subprocess
 from pathlib import Path
 from xml.etree import ElementTree
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
 
 HARNESS = r"""
 const fs=require('fs'),path=require('path'),vm=require('vm');
@@ -97,12 +95,10 @@ const installNative=(platform='cocoa')=>window.parent.pywebview={platform,api:{
 
 
 def run(body):
-    if NODE is None:
-        pytest.skip("node is not installed")
-    result = subprocess.run(
-        [NODE, "-e", HARNESS + "(async()=>{" + body +
-         "})().then(result=>process.stdout.write(JSON.stringify(result))).catch(error=>{console.error(error);process.exitCode=1});", str(STATIC)],
-        check=True, capture_output=True, encoding="utf-8", timeout=20,
+    result = run_node(
+        HARNESS + "(async()=>{" + body +
+        "})().then(result=>process.stdout.write(JSON.stringify(result))).catch(error=>{console.error(error);process.exitCode=1});",
+        STATIC, check=True,
     )
     return json.loads(result.stdout)
 

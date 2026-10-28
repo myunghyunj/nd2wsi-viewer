@@ -2,29 +2,19 @@
 
 import json
 import re
-import shutil
-import subprocess
 from pathlib import Path
 from xml.etree import ElementTree
 
 import pytest
+from node_host import run_node
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "nd2wsi" / "static"
 MODULE = STATIC / "astromap-v1.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 def _run(script):
-    result = subprocess.run(
-        [NODE, "-e", script, str(MODULE)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=20,
-    )
+    result = run_node(script, MODULE)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 

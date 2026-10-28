@@ -1,15 +1,11 @@
 """Exercise Info image allowlisting, accessible expansion and failure cleanup."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
-NODE = shutil.which("node")
 APP = Path(__file__).resolve().parents[1] / "nd2wsi/static/app.js"
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 def test_info_images_expand_in_place_and_only_fetch_allowed_names():
@@ -49,10 +45,7 @@ const failed = {hidden: section.hidden, count: container.children.length};
 context.renderAssociatedImages([]);
 console.log(JSON.stringify({initial, expanded, reduced, failed, fits}));
 """
-    result = subprocess.run(
-        [NODE, "-e", script, str(APP)], check=True, capture_output=True,
-        text=True, encoding="utf-8", timeout=20,
-    )
+    result = run_node(script, APP, check=True)
     data = json.loads(result.stdout)
     assert data["initial"] == {
         "count": 1, "hidden": False, "expanded": "false",

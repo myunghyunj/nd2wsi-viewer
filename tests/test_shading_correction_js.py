@@ -1,15 +1,12 @@
 """Persistent correction, explicit revocation and source-safe pyramid refresh."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const fs=require('fs'),vm=require('vm'),S=require(process.argv[1]+'/shading-correction-v1.js');
@@ -51,9 +48,9 @@ function shellFixture(){
 
 
 def run(body):
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT + body + "\n})().then(r=>process.stdout.write(JSON.stringify(r))).catch(e=>{console.error(e);process.exit(1)});", str(STATIC)],
-        text=True, encoding="utf-8", capture_output=True, timeout=20,
+    result = run_node(
+        SCRIPT + body + "\n})().then(r=>process.stdout.write(JSON.stringify(r))).catch(e=>{console.error(e);process.exit(1)});",
+        STATIC,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)

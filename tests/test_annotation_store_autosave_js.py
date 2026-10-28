@@ -6,17 +6,12 @@ and driven with a fake fetch that records every request and its init.
 """
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
 MODULE = STATIC / "annotation-store-v1.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const { createStore } = require(process.argv[1]);
@@ -69,9 +64,9 @@ const emit = (value) => process.stdout.write(JSON.stringify(value));
 
 
 def _run(body):
-    result = subprocess.run(
-        [NODE, "-e", HARNESS + "(async () => {" + body + "})().catch((error) => { console.error(error); process.exit(1); });", str(MODULE)],
-        capture_output=True, text=True, encoding="utf-8", check=True, timeout=20,
+    result = run_node(
+        HARNESS + "(async () => {" + body + "})().catch((error) => { console.error(error); process.exit(1); });",
+        MODULE, check=True,
     )
     return json.loads(result.stdout)
 

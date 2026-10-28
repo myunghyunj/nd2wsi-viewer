@@ -1,14 +1,10 @@
 """UI recovery state and exact LUT transport use the production app helpers."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 APP = Path(__file__).resolve().parents[1] / 'nd2wsi/static/app.js'
-NODE = shutil.which('node')
-pytestmark = pytest.mark.skipif(NODE is None, reason='node is not installed')
 
 
 def run(script):
@@ -20,8 +16,7 @@ const c={state,URLSearchParams,document:{querySelectorAll:()=>buttons}};vm.creat
 vm.runInContext(source.slice(source.indexOf('function setHistogramReady('),source.indexOf('function clearHistograms(')),c);
 vm.runInContext(source.slice(source.indexOf('function lutParam('),source.indexOf('function activeFrameParams(')),c);
 """
-    result = subprocess.run([NODE, '-e', harness + script, str(APP)], check=True,
-                            capture_output=True, encoding='utf-8', timeout=20)
+    result = run_node(harness + script, APP, check=True)
     return json.loads(result.stdout)
 
 

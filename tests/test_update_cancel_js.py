@@ -1,15 +1,12 @@
 """Exercise real update preparation/cancellation across shell and pane messages."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const fs = require('fs'), vm = require('vm');
@@ -158,10 +155,7 @@ Promise.resolve(vm.runInContext('(async()=>{' + process.argv[2] + '})()', shell)
 
 
 def run(body):
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(STATIC), body],
-        capture_output=True, text=True, timeout=20,
-    )
+    result = run_node(SCRIPT, STATIC, body)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 

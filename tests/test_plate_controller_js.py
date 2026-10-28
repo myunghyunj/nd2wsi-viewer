@@ -1,15 +1,11 @@
 """Exercise the public plate controller through transport events and timers."""
 import json
 import re
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const {createController}=require(process.argv[1]+'/plate-controller-v1.js');
@@ -34,8 +30,7 @@ const key=key=>$('t-track').events.keydown({key,preventDefault(){},stopPropagati
 
 
 def run(script):
-    result = subprocess.run([NODE, "-e", HARNESS + script, str(STATIC)], check=True,
-                            capture_output=True, encoding="utf-8", timeout=20)
+    result = run_node(HARNESS + script, STATIC, check=True)
     return json.loads(result.stdout)
 
 
@@ -179,8 +174,7 @@ console.log(JSON.stringify(out));
 
 
 def test_the_app_reports_a_frame_shown_once_every_visible_frame_has_settled():
-    result = subprocess.run([NODE, "-e", APP_FRAME, str(STATIC)], check=True,
-                            capture_output=True, encoding="utf-8", timeout=20)
+    result = run_node(APP_FRAME, STATIC, check=True)
     out = json.loads(result.stdout)
     # the grid counts in the overview (a hidden strip does not), the strip and
     # the viewer's own tiles while a site is focused; an image that failed is complete
@@ -216,8 +210,7 @@ console.log(JSON.stringify(out));
 
 
 def test_the_grid_sharpens_only_once_playback_rests():
-    result = subprocess.run([NODE, "-e", SHARPEN, str(STATIC)], check=True,
-                            capture_output=True, encoding="utf-8", timeout=20)
+    result = run_node(SHARPEN, STATIC, check=True)
     out = json.loads(result.stdout)
     # wide cells first get the quick 8x frames; a frame awaited during playback
     # stays quick, and the sharper 4x pass follows once playback stops
@@ -263,8 +256,7 @@ console.log(JSON.stringify(out));
 
 
 def test_pausing_during_a_slow_frame_still_sharpens_the_grid():
-    result = subprocess.run([NODE, "-e", SHARPEN_PAUSE, str(STATIC)], check=True,
-                            capture_output=True, encoding="utf-8", timeout=20)
+    result = run_node(SHARPEN_PAUSE, STATIC, check=True)
     out = json.loads(result.stdout)
     # while playback waits, the sharper pass keeps one timer and looks again;
     # a step replaces it, and a pause with no repaint still sharpens the grid

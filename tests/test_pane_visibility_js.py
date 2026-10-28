@@ -4,15 +4,11 @@ The shell's real applyFrameLayout and activate, and the pane's real
 wireCompareRelay, run against fake frames and a fake parent window.
 """
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SHELL = r"""
 const fs=require('fs'),vm=require('vm');
@@ -48,8 +44,10 @@ const take=()=>posts.splice(0).filter(([,d])=>d.nd2wsi==='pane-visibility').map(
 
 
 def run_shell(body):
-    result = subprocess.run([NODE, "-e", SHELL + "process.stdout.write(JSON.stringify((()=>{" + body + "})()));",
-                             str(STATIC)], capture_output=True, text=True, encoding="utf-8", timeout=20)
+    result = run_node(
+        SHELL + "process.stdout.write(JSON.stringify((()=>{" + body + "})()));",
+        STATIC,
+    )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -110,7 +108,6 @@ process.stdout.write(JSON.stringify({shown,foreign,hidden:paused.length}));
 
 
 def test_a_hidden_pane_pauses_plate_playback_only_on_the_shells_versioned_message():
-    result = subprocess.run([NODE, "-e", PANE, str(STATIC)], capture_output=True, text=True,
-                            encoding="utf-8", timeout=20)
+    result = run_node(PANE, STATIC)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"shown": 0, "foreign": 0, "hidden": 1}

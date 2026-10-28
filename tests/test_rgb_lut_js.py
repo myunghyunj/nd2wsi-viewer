@@ -1,15 +1,12 @@
 """Exercise the real channel panel and LUT widgets for RGB and fluorescence."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 from urllib.parse import parse_qs
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const fs=require('fs'), path=require('path'), vm=require('vm');
@@ -70,8 +67,7 @@ process.stdout.write(JSON.stringify({initial,edited,query,hidden,restored,reset,
 
 @pytest.mark.parametrize("rgb", [True, False])
 def test_channels_panel_exposes_independent_luts_toggle_and_reset(rgb):
-    result = subprocess.run([NODE, "-e", SCRIPT, str(STATIC), str(rgb).lower()],
-                            capture_output=True, encoding="utf-8", check=True, timeout=20)
+    result = run_node(SCRIPT, STATIC, str(rgb).lower(), check=True)
     out = json.loads(result.stdout)
     assert out["initial"] == {
         "closed": False, "disabled": False, "histograms": 1,

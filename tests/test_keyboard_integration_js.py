@@ -7,13 +7,13 @@ execute their production implementations.
 """
 
 import json
-import subprocess
+from pathlib import Path
 
 import pytest
-from test_compare_orientation_js import NODE, STATIC
+from node_host import run_node
 from test_compare_orientation_js import run as run_shell
 
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
+STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
 
 SCRIPT = r"""
 const fs=require('fs'), vm=require('vm');
@@ -210,10 +210,7 @@ process.stdout.write(JSON.stringify(out));
 
 
 def pane(events=(), **config):
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(STATIC), json.dumps({"events": events, **config})],
-        capture_output=True, text=True, encoding="utf-8", timeout=20,
-    )
+    result = run_node(SCRIPT, STATIC, json.dumps({"events": events, **config}))
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 

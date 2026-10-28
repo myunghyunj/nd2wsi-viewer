@@ -6,9 +6,7 @@ shortcut to a transaction completion callback with unvalidated snapshots.
 """
 
 import pytest
-from test_compare_orientation_js import NODE, run
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
+from test_compare_orientation_js import run
 
 NUDGE_REPLY = r"""
 function replyNudge(delta, changes={}) {

@@ -1,11 +1,10 @@
 """Keyboard shortcuts, exercised through the production JavaScript router."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 MODULE = (
     Path(__file__).resolve().parents[1]
@@ -20,9 +19,6 @@ SHELL_JS = ROOT / "nd2wsi" / "static" / "shell-v1.js"
 SHELL_HTML = ROOT / "nd2wsi" / "static" / "shell.html"
 README = ROOT / "README.md"
 USER_GUIDE = ROOT / "docs" / "user-guide.md"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const Router = require(process.argv[1]);
@@ -67,13 +63,7 @@ process.stdout.write(JSON.stringify(out));
 
 
 def _run(cases):
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(MODULE), json.dumps(cases)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=20,
-    )
+    result = run_node(SCRIPT, MODULE, json.dumps(cases), check=True)
     return json.loads(result.stdout)
 
 
@@ -280,9 +270,9 @@ def test_windows_control_shortcuts_preserve_ime_and_modifier_guards(turn_code, t
 
 
 def test_shortcut_labels_match_the_windows_keyboard():
-    result = subprocess.run(
-        [NODE, "-e", "const R=require(process.argv[1]); console.log(R.formatShortcutText('Export (⌘⇧E); Option-drag', 'Win32'));", str(MODULE)],
-        capture_output=True, text=True, check=True, timeout=20,
+    result = run_node(
+        "const R=require(process.argv[1]); console.log(R.formatShortcutText('Export (⌘⇧E); Option-drag', 'Win32'));",
+        MODULE, check=True,
     )
     assert result.stdout.strip() == "Export (Ctrl+Shift+E); Alt-drag"
 
@@ -435,8 +425,7 @@ def test_windows_labels_localize_accessible_shortcut_names_too():
     R.localizeLabels({documentElement:{classList:{toggle(){}}},querySelectorAll:()=>entries},'Win32');
     process.stdout.write(JSON.stringify(entries));
     """
-    result = subprocess.run([NODE, "-e", script, str(MODULE)], capture_output=True,
-                            text=True, check=True, timeout=20)
+    result = run_node(script, MODULE, check=True)
     out = json.loads(result.stdout)
     assert [row["shortcut"] for row in out] == ["Control+C", "Control+A", "Control+I", "E"]
     assert all(row["title"] == "Panels (Ctrl+C, Ctrl+A); Export (E)" for row in out)

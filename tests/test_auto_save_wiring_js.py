@@ -6,15 +6,12 @@ renderSaveStatus, wireSaveStatusTooltip) are sliced from ``app.js`` and run
 with the real ``save-status-v1.js`` tracker, fake timers and fake controllers.
 """
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const fs=require('fs'),path=require('path'),vm=require('vm');
@@ -83,10 +80,10 @@ const report=(channel,event)=>state.saveStatus.report(channel,event);
 
 
 def run(body):
-    result = subprocess.run(
-        [NODE, "-e", HARNESS + "(async()=>{" + body + "})().then(v=>process.stdout.write(JSON.stringify(v)))"
-         ".catch(e=>{console.error(e);process.exitCode=1});", str(STATIC)],
-        capture_output=True, text=True, encoding="utf-8", timeout=20,
+    result = run_node(
+        HARNESS + "(async()=>{" + body + "})().then(v=>process.stdout.write(JSON.stringify(v)))"
+        ".catch(e=>{console.error(e);process.exitCode=1});",
+        STATIC,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -184,8 +181,7 @@ process.stdout.write(JSON.stringify(results));
 
 
 def test_pane_and_shell_reload_only_when_restored_from_the_back_forward_cache():
-    result = subprocess.run([NODE, "-e", PAGESHOW, str(STATIC)], capture_output=True, text=True,
-                            encoding="utf-8", timeout=20)
+    result = run_node(PAGESHOW, STATIC)
     assert result.returncode == 0, result.stderr
     # one declaration and exactly one pageshow registration per page
     expected = {"types": ["pageshow"], "fresh": 0, "restored": 1, "references": 2}

@@ -1,15 +1,12 @@
 """GeoJSON import preserves source geometry and appends atomically to owned marks."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SETUP = r"""
 const fs=require('fs'),vm=require('vm'),path=require('path');
@@ -46,8 +43,7 @@ const polygon={type:'Polygon',coordinates:[[[100,100],[240,100],[220,220],[100,2
 
 def run(body):
     script = SETUP + "\n(async()=>{\n" + body + "\n})().then(value=>process.stdout.write(JSON.stringify(value))).catch(error=>{console.error(error);process.exit(1);});"
-    result = subprocess.run([NODE, "-e", script, str(STATIC / "annotation-geojson-v1.js")],
-                            capture_output=True, text=True, encoding="utf-8", check=True, timeout=20)
+    result = run_node(script, STATIC / "annotation-geojson-v1.js", check=True)
     return json.loads(result.stdout)
 
 

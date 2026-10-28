@@ -1,13 +1,10 @@
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
-NODE = shutil.which("node")
 MODULE = Path(__file__).resolve().parents[1] / "nd2wsi/static/window-controls-v1.js"
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 def run_case(role="agent", fail=False, supported=True):
@@ -39,7 +36,8 @@ def run_case(role="agent", fail=False, supported=True):
         disabled:doc.getElementById('new-agent-window').disabled}));
     })().catch(e => {console.error(e); process.exit(1);});
     """
-    result = subprocess.run([NODE, "-e", script, str(MODULE), json.dumps({"role": role, "fail": fail, "supported": supported})], capture_output=True, text=True, encoding="utf-8", check=True, timeout=20)
+    config = {"role": role, "fail": fail, "supported": supported}
+    result = run_node(script, MODULE, json.dumps(config), check=True)
     return json.loads(result.stdout)
 
 
@@ -93,9 +91,10 @@ def shortcut_case(platform="Win32", *, boot=False, events=None, supported=True, 
       process.stdout.write(JSON.stringify({reads,calls,seen,handlers:handlers.length,available:controls.canOpenWindow(doc)}));
     })().catch(error=>{console.error(error);process.exit(1);});
     """
-    result = subprocess.run([NODE, "-e", script, str(MODULE), json.dumps({
+    config = {
         "platform": platform, "boot": boot, "events": events or [{}], "supported": supported, "hold": hold,
-    })], check=True, capture_output=True, text=True, timeout=20)
+    }
+    result = run_node(script, MODULE, json.dumps(config), check=True)
     return json.loads(result.stdout)
 
 

@@ -2,22 +2,18 @@
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 HEADER = "INDEX\tX1\tY1\tX2\tY2\tNOTE\n"
 
 
 def run(script):
     code = "const api=require(process.argv[1]);\n" + script
-    result = subprocess.run([NODE, "-e", code, str(STATIC / "astromap-import-v1.js")],
-                            check=True, capture_output=True, text=True, encoding="utf-8", timeout=20)
+    result = run_node(code, STATIC / "astromap-import-v1.js", check=True)
     return json.loads(result.stdout)
 
 

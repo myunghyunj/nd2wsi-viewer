@@ -1,17 +1,12 @@
 """ROI display projection under viewer rotation and reflection."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "nd2wsi" / "static" / "app.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 SCRIPT = r"""
@@ -54,13 +49,7 @@ process.stdout.write(JSON.stringify(out));
 
 
 def _run():
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(APP)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=20,
-    )
+    result = run_node(SCRIPT, APP, check=True)
     return json.loads(result.stdout)
 
 

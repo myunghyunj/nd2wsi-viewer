@@ -1,9 +1,7 @@
 """Astromapper arrow review owns one key before the real OSD/plate handlers."""
 
 import pytest
-from test_keyboard_integration_js import NODE, pane
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
+from test_keyboard_integration_js import pane
 
 ITEMS = [
     {"id": "z", "type": "box", "astromap": True, "x": 10, "y": 20, "w": 10, "h": 20},

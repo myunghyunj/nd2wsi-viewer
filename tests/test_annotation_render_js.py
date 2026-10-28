@@ -8,17 +8,13 @@ layer can be compared mark for mark with a fresh full render.
 
 import json
 import re
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
 APP = STATIC / "app.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SETUP = r"""
 const fs = require('fs'), vm = require('vm'), path = require('path');
@@ -269,8 +265,7 @@ c.wireAnnotationPointer();
 
 def run(body):
     script = SETUP + "\nconst result = (() => {\n" + body + "\n})();\nprocess.stdout.write(JSON.stringify(result));"
-    result = subprocess.run([NODE, "-e", script, str(STATIC)], capture_output=True, text=True,
-                            encoding="utf-8", check=True, timeout=30)
+    result = run_node(script, STATIC, check=True, timeout=30)
     return json.loads(result.stdout)
 
 

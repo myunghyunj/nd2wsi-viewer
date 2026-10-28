@@ -1,14 +1,11 @@
 """The real shell hands keyboard focus to ready slides without stealing typing."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / 'nd2wsi' / 'static'
-NODE = shutil.which('node')
-pytestmark = pytest.mark.skipif(NODE is None, reason='node is not installed')
 
 SCRIPT = r'''
 const fs=require('fs'),vm=require('vm');
@@ -42,8 +39,7 @@ process.stdout.write(JSON.stringify(vm.runInContext(process.argv[2],context)));
 
 
 def run(body):
-    result = subprocess.run([NODE, '-e', SCRIPT, str(STATIC), body], capture_output=True,
-                            text=True, check=True, timeout=20)
+    result = run_node(SCRIPT, STATIC, body, check=True)
     return json.loads(result.stdout)
 
 

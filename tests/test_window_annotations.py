@@ -254,9 +254,7 @@ def test_compare_and_swap_lock_serializes_separate_processes(tmp_path):
 
 
 def test_frontend_queued_edits_advance_only_own_committed_revision():
-    from test_annotation_site_transitions_js import NODE, _run
-    if NODE is None:
-        pytest.skip("node is not installed")
+    from test_annotation_site_transitions_js import _run
     result = _run(r'''
 (async () => {
   state.plate.focus = 0;
@@ -282,9 +280,7 @@ def test_frontend_queued_edits_advance_only_own_committed_revision():
 
 
 def test_frontend_conflict_keeps_dirty_site_draft_and_never_adopts_other_revision():
-    from test_annotation_site_transitions_js import NODE, _run
-    if NODE is None:
-        pytest.skip("node is not installed")
+    from test_annotation_site_transitions_js import _run
     result = _run(r'''
 (async () => {
   state.plate.focus = 0;

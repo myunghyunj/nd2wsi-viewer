@@ -4,15 +4,11 @@ The production trackExport and its gauge helpers are sliced from ``app.js``
 and run with fake timers, a fake clock and a scripted progress endpoint.
 """
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 APP = Path(__file__).resolve().parents[1] / "nd2wsi" / "static" / "app.js"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const fs=require('fs'),vm=require('vm');
@@ -66,8 +62,7 @@ const tracked=()=>[...vm.runInContext('exportJobs',context).keys()];
 def run(body):
     script = HARNESS + "(async()=>{" + body + "})().then(v=>process.stdout.write(JSON.stringify(v)))" \
         ".catch(e=>{console.error(e);process.exitCode=1});"
-    result = subprocess.run([NODE, "-e", script, str(APP)], capture_output=True, text=True,
-                            encoding="utf-8", timeout=20)
+    result = run_node(script, APP)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 

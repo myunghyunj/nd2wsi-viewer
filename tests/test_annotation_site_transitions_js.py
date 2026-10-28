@@ -6,18 +6,14 @@ hold replies or answer 409. ``app.js`` only wraps these calls.
 """
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
 MODULE = STATIC / "annotation-store-v1.js"
 APP = STATIC / "app.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 def _run(body):
@@ -118,13 +114,7 @@ const snapshot = () => ({
 const emit = (value) => process.stdout.write(JSON.stringify(value));
 """ + body + r"""
 """
-    result = subprocess.run(
-        [NODE, "-e", script, str(MODULE)],
-        capture_output=True,
-        text=True, encoding="utf-8",
-        check=True,
-        timeout=20,
-    )
+    result = run_node(script, MODULE, check=True)
     return json.loads(result.stdout)
 
 

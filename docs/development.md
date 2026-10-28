@@ -52,6 +52,8 @@ ND2WSI_SMOKE_FILE=docs/example_cell.nd2 packaging/build_mac_app.sh dist
 
 CI tests Python 3.11 through 3.13, runs Ruff, builds and installs the wheel, and runs the real-data suite on every tag.
 
+The JavaScript tests (`tests/test_*_js.py`) need Node.js. They run the production frontend files in Node with a small fake DOM in a `vm` context, with no browser and no JS test framework. Each case calls `run_node(SCRIPT, *args)` from `tests/node_host.py`, which works like `node -e SCRIPT ARGS...`: the same `process.argv` layout, UTF-8 text output, a 20 s default timeout, and a skip when `node` is missing. Each pytest process (each xdist worker too) starts one Node host and runs every case in a fresh worker thread, which costs about half as much as starting a Node process per case. Set `ND2WSI_NODE_SPAWN=1` to give each case its own `node -e` process again, for example to compare the two, or for a script that needs something a worker thread cannot do, such as `process.chdir` or reading stdin.
+
 Alignment/Compare now keeps landmark drafts separate from committed geometry, requires four valid corresponding points before Done, and scopes spatial commands and remembered fits to the current pane/source/site. Clear Points, Reset Orientation, and Remove Fit have separate meanings. Physical links that cannot be represented by the renderer are blocked; Relative mapping is an explicit display-only choice. ROI previews show the final source-aligned export rectangle, and the scalebar accounts for display rotation and X/Y calibration. See [v1.2.6 validation](v1.2.6-validation.md) for coverage and limitations.
 
 ## Prior work

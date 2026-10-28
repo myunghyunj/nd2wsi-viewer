@@ -1,14 +1,11 @@
 """Production startup precedence and effective LUT persistence wiring."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 @pytest.mark.parametrize("saved,handoff,expected,changed", [
@@ -38,8 +35,7 @@ context.initializeDisplayLuts().then(()=>{
  pagehide(); process.stdout.write(JSON.stringify({luts:state.luts,pending:state.lutAutoPending,changed,disposed}));
 }).catch(error=>{console.error(error);process.exitCode=1;});
 """
-    result = subprocess.run([NODE, "-e", script, str(STATIC), json.dumps([saved, handoff])],
-                            capture_output=True, text=True, check=True, timeout=20)
+    result = run_node(script, STATIC, json.dumps([saved, handoff]), check=True)
     out = json.loads(result.stdout)
     assert out == {"luts": handoff or saved or [None, None], "pending": expected,
                    "changed": changed, "disposed": 1}

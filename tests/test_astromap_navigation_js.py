@@ -1,15 +1,12 @@
 """Astromap center-only navigation against the bundled OpenSeadragon camera."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const fs=require('fs'), vm=require('vm');
@@ -98,8 +95,7 @@ process.stdout.write(JSON.stringify({selected,missing,active:state.astromap.acti
 ])
 def test_roi_navigation_centers_source_geometry_without_changing_displayed_scale(rotation, flip, animating, keyboard, rect):
     config = {"rotation": rotation, "flip": flip, "animating": animating, "keyboard": keyboard, "rect": rect}
-    result = subprocess.run([NODE, "-e", SCRIPT, str(STATIC), json.dumps(config)],
-                            capture_output=True, text=True, encoding="utf-8", timeout=20)
+    result = run_node(SCRIPT, STATIC, json.dumps(config))
     assert result.returncode == 0, result.stderr
     out = json.loads(result.stdout)
     assert out["selected"] and not out["missing"] and out["active"] == "roi"
