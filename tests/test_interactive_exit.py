@@ -4,8 +4,8 @@ After the GUI loop returns, ``main()`` releases the server with the strict
 teardown an update uses, which waits for every reader before it closes a
 memory map. A read from a share that has gone away never finishes, so an
 interactive exit waits a bounded time, records the window session closed and
-lets ``run()`` end the process. Diagnostic runs and Sparkle keep the strict,
-unbounded wait.
+lets ``run()`` end the process. Diagnostic runs, Sparkle and a direct caller
+of ``main()``, which nothing would end, keep the strict, unbounded wait.
 """
 
 import json
@@ -35,6 +35,20 @@ def unfinished(monkeypatch):
     return flag
 
 
+@pytest.fixture
+def hard_exit_follows(monkeypatch):
+    flag = threading.Event()
+    monkeypatch.setattr(app, "_HARD_EXIT_FOLLOWS", flag)
+    return flag
+
+
+@pytest.fixture
+def under_run(hard_exit_follows):
+    """``main()`` is running inside ``run()``, which ends the process after it."""
+    hard_exit_follows.set()
+    return hard_exit_follows
+
+
 def stalled_api(release):
     calls = []
 
@@ -45,7 +59,7 @@ def stalled_api(release):
     return SimpleNamespace(_startup_error=None, stop_server_for_update=stop_server_for_update), calls
 
 
-def test_interactive_exit_stops_waiting_for_a_teardown_that_never_finishes(monkeypatch, unfinished):
+def test_interactive_exit_stops_waiting_for_a_teardown_that_never_finishes(monkeypatch, unfinished, under_run):
     monkeypatch.setattr(app, "_EXIT_TEARDOWN_TIMEOUT", 0.2)
     release = threading.Event()
     api, calls = stalled_api(release)
@@ -64,7 +78,7 @@ def test_interactive_exit_stops_waiting_for_a_teardown_that_never_finishes(monke
     assert not calls[0].is_alive()
 
 
-def test_interactive_exit_that_finishes_in_time_ends_normally(monkeypatch, unfinished):
+def test_interactive_exit_that_finishes_in_time_ends_normally(monkeypatch, unfinished, under_run):
     monkeypatch.setattr(app, "_EXIT_TEARDOWN_TIMEOUT", 5.0)
     api = SimpleNamespace(stop_server_for_update=Mock())
     app._stop_server_at_exit(api, diagnostic=False)
@@ -72,14 +86,21 @@ def test_interactive_exit_that_finishes_in_time_ends_normally(monkeypatch, unfin
     assert not unfinished.is_set()
 
 
-def test_a_teardown_error_still_reaches_the_caller(unfinished):
+def test_a_teardown_error_still_reaches_the_caller(unfinished, under_run):
     api = SimpleNamespace(stop_server_for_update=Mock(side_effect=OSError("socket already gone")))
     with pytest.raises(OSError, match="socket already gone"):
         app._stop_server_at_exit(api, diagnostic=False)
     assert not unfinished.is_set()
 
 
-def test_diagnostic_exit_keeps_the_strict_unbounded_teardown(monkeypatch, unfinished):
+@pytest.mark.parametrize("diagnostic", [True, False], ids=["diagnostic", "direct-main"])
+def test_exits_nothing_hard_ends_keep_the_strict_unbounded_teardown(monkeypatch, unfinished, hard_exit_follows,
+                                                                    diagnostic):
+    # A diagnostic run waits without limit so a hung teardown fails its CI
+    # step; a direct caller of main() has no run() to end the process after
+    # a bound, so a session recorded closed would outlive it.
+    if diagnostic:
+        hard_exit_follows.set()
     monkeypatch.setattr(app, "_EXIT_TEARDOWN_TIMEOUT", 0.01)
     caller = threading.current_thread()
     seen = []
@@ -88,9 +109,9 @@ def test_diagnostic_exit_keeps_the_strict_unbounded_teardown(monkeypatch, unfini
         time.sleep(0.3)  # longer than the interactive bound
         seen.append(threading.current_thread())
 
-    started = time.monotonic()
-    app._stop_server_at_exit(SimpleNamespace(stop_server_for_update=stop_server_for_update), diagnostic=True)
-    assert time.monotonic() - started >= 0.3
+    app._stop_server_at_exit(SimpleNamespace(stop_server_for_update=stop_server_for_update), diagnostic=diagnostic)
+    # Appended after the sleep, on the caller's own thread: the whole
+    # teardown ran synchronously and finished before the call returned.
     assert seen == [caller]
     assert not unfinished.is_set()
 
@@ -105,7 +126,8 @@ def run_native_main(monkeypatch, tmp_path, api, argv):
     return result, create.call_args.kwargs["window_session"]
 
 
-def test_interactive_main_records_the_session_closed_although_a_read_stalls(monkeypatch, tmp_path, unfinished):
+def test_interactive_main_records_the_session_closed_although_a_read_stalls(monkeypatch, tmp_path, unfinished,
+                                                                            under_run):
     monkeypatch.setattr(app, "_EXIT_TEARDOWN_TIMEOUT", 0.2)
     release = threading.Event()
     api, calls = stalled_api(release)
@@ -121,7 +143,41 @@ def test_interactive_main_records_the_session_closed_although_a_read_stalls(monk
         release.set()
 
 
-def test_gui_smoke_main_waits_for_the_whole_teardown_on_its_own_thread(monkeypatch, tmp_path, unfinished, capsys):
+def test_main_called_directly_keeps_the_session_open_until_its_teardown_ends(monkeypatch, tmp_path, unfinished,
+                                                                               hard_exit_follows):
+    # The nd2wsi-viewer console script and desktop.py call main() itself, and
+    # nothing ends their process after it: interpreter shutdown would still
+    # join the stalled read. The session must not read "closed" meanwhile.
+    monkeypatch.setattr(app, "_EXIT_TEARDOWN_TIMEOUT", 0.05)
+    release = threading.Event()
+    api, calls = stalled_api(release)
+    outcome = {}
+
+    def call_main():
+        outcome["result"], outcome["session"] = run_native_main(monkeypatch, tmp_path, api, ["--agent-window"])
+
+    caller = threading.Thread(target=call_main, daemon=True)
+    try:
+        caller.start()
+        deadline = time.monotonic() + 30
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert calls == [caller]
+        caller.join(0.5)  # ten times the interactive bound
+        assert caller.is_alive()
+        records = [json.loads(path.read_text(encoding="utf-8")) for path in tmp_path.glob("*/session.json")]
+        assert len(records) == 1 and records[0]["state"] != "closed"
+    finally:
+        release.set()
+    caller.join(30)
+    assert not caller.is_alive()
+    assert outcome["result"] == 0
+    assert json.loads((outcome["session"].root / "session.json").read_text(encoding="utf-8"))["state"] == "closed"
+    assert not unfinished.is_set()
+
+
+def test_gui_smoke_main_waits_for_the_whole_teardown_on_its_own_thread(monkeypatch, tmp_path, unfinished, under_run,
+                                                                       capsys):
     monkeypatch.setattr(app, "_EXIT_TEARDOWN_TIMEOUT", 0.01)
     caller = threading.current_thread()
     seen = []
@@ -140,8 +196,11 @@ def test_gui_smoke_main_waits_for_the_whole_teardown_on_its_own_thread(monkeypat
 
 @pytest.mark.parametrize("left_unfinished", [True, False])
 def test_run_ends_an_interactive_process_only_when_its_teardown_was_left_running(
-        monkeypatch, unfinished, left_unfinished):
+        monkeypatch, unfinished, hard_exit_follows, left_unfinished):
+    bounded = []
+
     def main(arguments):
+        bounded.append(hard_exit_follows.is_set())
         if left_unfinished:
             unfinished.set()
         return 0
@@ -150,10 +209,21 @@ def test_run_ends_an_interactive_process_only_when_its_teardown_was_left_running
     monkeypatch.setattr(app, "main", main)
     monkeypatch.setattr(app.os, "_exit", exit_now)
     assert app.run(["slide.nd2"]) == 0
+    # Only main() running inside run() may leave a teardown behind, and the
+    # permission ends with it.
+    assert bounded == [True]
+    assert not hard_exit_follows.is_set()
     if left_unfinished:
         exit_now.assert_called_once_with(0)
     else:
         exit_now.assert_not_called()
+
+
+def test_run_withdraws_the_bound_when_main_raises(monkeypatch, hard_exit_follows):
+    monkeypatch.setattr(app, "main", Mock(side_effect=RuntimeError("no display")))
+    with pytest.raises(RuntimeError, match="no display"):
+        app.run([])
+    assert not hard_exit_follows.is_set()
 
 
 # The real entry point, Api, HTTP server and registry, with only the GUI loop

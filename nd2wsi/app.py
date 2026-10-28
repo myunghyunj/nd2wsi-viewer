@@ -1515,6 +1515,9 @@ _DIAGNOSTIC_RUN_FLAGS = ("--gui-smoke", "--handoff-check-report", "--browser-rep
 # to let go of their sources once the window has closed.
 _EXIT_TEARDOWN_TIMEOUT = 10.0
 _EXIT_TEARDOWN_UNFINISHED = threading.Event()
+# Set by run() while main() runs: only then does a hard exit follow a
+# teardown that was left running.
+_HARD_EXIT_FOLLOWS = threading.Event()
 
 
 def _stop_server_at_exit(api, *, diagnostic: bool) -> None:
@@ -1534,8 +1537,14 @@ def _stop_server_at_exit(api, *, diagnostic: bool) -> None:
     ``run()`` ends the process after ``main()`` has recorded the session
     closed. The kernel releases the locks; an abandoned export leaves only its
     temporary file.
+
+    Only ``run()`` ends the process that way, so the bound applies only while
+    ``run()`` is the caller (``_HARD_EXIT_FOLLOWS``). A direct caller of
+    ``main()`` (the ``nd2wsi-viewer`` console script, ``desktop.py``) keeps
+    the strict wait: a session recorded closed while its process lives on
+    would let an update in another window go ahead past it.
     """
-    if diagnostic:
+    if diagnostic or not _HARD_EXIT_FOLLOWS.is_set():
         api.stop_server_for_update()
         return
     finished = threading.Event()
@@ -1565,22 +1574,20 @@ def run(argv: list[str] | None = None) -> int:
     with ``os._exit`` then means no thread that is still waiting (see
     ``_daemonize_pywebview_bridge_threads``) can turn a finished run into a
     CI timeout. Interactive runs return normally unless their slide teardown
-    did not finish in time (``_stop_server_at_exit``); ``main()`` itself always
+    did not finish in time (``_stop_server_at_exit``): a slide read then still
+    holds a source, and interpreter shutdown, which joins the executor workers
+    zarr runs store reads on, could wait for it forever. Both kinds of exit
+    leave through the one ``os._exit`` below. ``main()`` itself always
     returns, so callers and tests can inspect its result.
     """
     arguments = list(sys.argv[1:] if argv is None else argv)
-    result = main(arguments)
-    if any(argument.split("=", 1)[0] in _DIAGNOSTIC_RUN_FLAGS for argument in arguments):
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:
-                pass
-        os._exit(result)
-    if _EXIT_TEARDOWN_UNFINISHED.is_set():
-        # A slide read still holds a source. Interpreter shutdown joins
-        # executor workers, where zarr runs store reads, and could wait for
-        # it forever; end at once instead.
+    _HARD_EXIT_FOLLOWS.set()
+    try:
+        result = main(arguments)
+    finally:
+        _HARD_EXIT_FOLLOWS.clear()
+    diagnostic = any(argument.split("=", 1)[0] in _DIAGNOSTIC_RUN_FLAGS for argument in arguments)
+    if diagnostic or _EXIT_TEARDOWN_UNFINISHED.is_set():
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
