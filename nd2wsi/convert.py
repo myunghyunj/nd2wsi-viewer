@@ -145,9 +145,11 @@ def _write_level1_from_source(
     # emits blocks on the target grid, so the writer never has to reshuffle
     # half-tile output blocks into full store chunks.
     data = data.rechunk((1, out_tile * 2, out_tile * 2))
-    from .metal import enabled, reduce2x_or_cpu
+    from .metal import reduce2x_or_cpu
 
-    if enabled() and src.dtype in (np.dtype("uint8"), np.dtype("uint16")):
+    if src.dtype in (np.dtype("uint8"), np.dtype("uint16")):
+        # The GPU kernel when enabled, else the exact integer CPU box mean;
+        # every block is a whole number of 2x2 boxes, so none is dropped.
         mean = da.map_blocks(
             reduce2x_or_cpu, data, dtype=src.dtype,
             chunks=(data.chunks[0], tuple(n // 2 for n in data.chunks[1]),

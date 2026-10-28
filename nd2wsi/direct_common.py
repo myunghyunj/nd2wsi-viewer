@@ -15,6 +15,65 @@ import numpy as np
 
 TILE_CACHE_BYTES = 512 * 1024 * 1024  # decoded native tiles kept in memory
 
+# Inputs whose k x k box sums the exact integer route accumulates, and in what.
+# The largest sum, 65535 * 16 * 16 = 16,776,960, fits uint32 and stays under
+# 2**24, so the float32 mean it replaces is exact as well (see box_mean).
+_EXACT_ACCUMULATOR = {
+    np.dtype(np.uint8): np.dtype(np.uint16),
+    np.dtype(np.uint16): np.dtype(np.uint32),
+}
+_EXACT_K = (2, 4, 8, 16)
+
+
+def box_mean(block: np.ndarray, k: int, out_dtype: Any = None) -> np.ndarray:
+    """``k`` x ``k`` box mean over the last two axes (Y, X) of ``block``.
+
+    The one definition every reducer shares (``box-mean-floor-v1`` at k=2):
+    each box averaged in float32, an integer output rounded with ``np.rint``
+    (ties-to-even), a floating output cast without rounding, and trailing
+    rows or columns that do not fill a whole box dropped. ``out_dtype``
+    defaults to the block's dtype. The input is never modified.
+
+    uint8/uint16 input with k in 2, 4, 8, 16 into an integer dtype that holds
+    every input value takes an exact integer route that is bit-identical:
+    each sum is below 2**24 and k*k is a power of two, so the float32 mean is
+    already the exact quotient and ``rint`` its round-half-even, which the
+    shift below reproduces. Any other input keeps the float32 formula.
+    """
+    k = int(k)
+    dtype = np.dtype(block.dtype if out_dtype is None else out_dtype)
+    *lead, h, w = block.shape
+    h2, w2 = h // k, w // k
+    view = block[..., : h2 * k, : w2 * k]
+    acc = _EXACT_ACCUMULATOR.get(np.dtype(block.dtype))
+    if (
+        acc is None
+        or k not in _EXACT_K
+        or not np.issubdtype(dtype, np.integer)
+        or not np.can_cast(block.dtype, dtype)
+    ):
+        mean = view.reshape((*lead, h2, k, w2, k)).mean(axis=(-3, -1), dtype=np.float32)
+        if np.issubdtype(dtype, np.integer):
+            return np.rint(mean).astype(dtype)
+        return mean.astype(dtype)
+    # Sum k rows at a time over contiguous memory, then k neighbouring
+    # columns as k strided adds: far cheaper than a float32 mean over a
+    # 5-D view, whose innermost reduction is only k elements long.
+    rows = view.reshape((*lead, h2, k, w2 * k)).sum(axis=-2, dtype=acc)
+    total = rows[..., 0::k].copy()
+    for i in range(1, k):
+        total += rows[..., i::k]
+    # Round half to even of total / 2**shift: add half - 1, plus 1 more when
+    # the truncated quotient is odd, then truncate. At most 65,408 for uint8
+    # input at k=16, so the uint16 accumulator cannot wrap.
+    shift = 2 * (k.bit_length() - 1)
+    odd = total >> shift
+    odd &= 1
+    total += odd
+    total += (1 << (shift - 1)) - 1
+    total >>= shift
+    return total.astype(dtype)
+
 
 def _parse_cyx_index(idx: Any, shape: tuple[int, int, int]):
     """Normalize a ``(C, Y, X)`` getitem index to ``(cs, y0, y1, x0, x1)``.
@@ -181,15 +240,13 @@ class _SvsLevel:
     def _window(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         e = self._extra
         block = self._read(y0 * e, y1 * e, x0 * e, x1 * e)[..., :3]  # drop alpha
+        # Channels first before reducing: one contiguous copy (the read may be
+        # a cached native tile, never written to) makes the box sums stride
+        # over whole rows instead of three interleaved samples.
+        block = np.ascontiguousarray(np.moveaxis(block, -1, 0))
         if e > 1:
-            h2, w2 = block.shape[0] // e, block.shape[1] // e
-            block = (
-                block[: h2 * e, : w2 * e]
-                .reshape(h2, e, w2, e, 3)
-                .mean(axis=(1, 3), dtype=np.float32)
-            )
-            block = np.rint(block).astype(np.uint8)
-        return np.ascontiguousarray(np.moveaxis(block, -1, 0))
+            block = box_mean(block, e)
+        return block
 
     def __getitem__(self, idx: Any) -> np.ndarray:
         cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)

@@ -46,7 +46,7 @@ from .cache import (
     source_tag,
 )
 from .contrast import auto_window
-from .direct_common import _Lifecycle, _parse_cyx_index, _Root, _TileCache
+from .direct_common import _Lifecycle, _parse_cyx_index, _Root, _TileCache, box_mean
 from .plate_integrity import (
     DIGEST_ALGORITHM,
     DIGEST_NAME,
@@ -1887,16 +1887,7 @@ class PlateSource:
                     if not self._closed:
                         _REDUCED_CACHE.put(key, stored)
                     return stored
-            frame = self.frame(t, p, z)
-            c, h, w = frame.shape
-            h2, w2 = h // k, w // k
-            block = frame[:, : h2 * k, : w2 * k].reshape(c, h2, k, w2, k)
-            out = block.mean(axis=(2, 4), dtype=np.float32)
-            if np.issubdtype(self.dtype, np.integer):
-                out = np.rint(out).astype(self.dtype)
-            else:
-                out = out.astype(self.dtype)
-            out = np.ascontiguousarray(out)
+            out = np.ascontiguousarray(box_mean(self.frame(t, p, z), k, self.dtype))
             if not self._closed:
                 _REDUCED_CACHE.put(key, out)
                 if k == THUMB_K and self.store is not None:

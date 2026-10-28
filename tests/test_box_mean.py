@@ -11,13 +11,19 @@ the 2x reducers with literal 8x8 tables; this module pins the k-fold users:
 * ``nd2wsi.direct_common._SvsLevel`` gap levels (e = 2, 4, 8) of SVS and
   SDPC, whose reads arrive channels-last with an alpha channel;
 * ``nd2wsi.convert._write_level1_from_source``, the CPU level 1 of a cache
-  built straight from the source.
+  built straight from the source;
+* the shared kernel ``nd2wsi.direct_common.box_mean`` itself, including the
+  uint8 cases whose k=16 sums sit right under the uint16 ceiling.
 
 Every expected value is worked out by hand in the comment above ``_cases``
 (sum, mean, rounding); none is computed with the code under test. Each box is
 described by the values it holds, filled in raster order (``_fill``), so a
 kernel that groups the wrong rows or columns also lands on the wrong answer:
 every designed box sits between background boxes of a different value.
+
+The second half checks the exact integer route against the float32 formula
+it replaces, over every reachable box sum where that is cheap and over the
+sums around every rounding boundary elsewhere.
 """
 from __future__ import annotations
 
@@ -133,6 +139,46 @@ def test_tables_place_every_case_and_drop_a_margin():
 
 
 # ---------------------------------------------------------------------------
+# (a) the shared kernel
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.uint16, np.uint8])
+@pytest.mark.parametrize("k", KS)
+def test_box_mean_matches_golden(k, dtype):
+    frame, golden = _table(k, dtype)
+    before = frame.copy()
+    for block, expected in ((frame, golden), (frame[np.newaxis], golden[np.newaxis])):
+        out = direct_common.box_mean(block, k)
+        assert out.dtype == golden.dtype and out.shape == expected.shape
+        np.testing.assert_array_equal(out, expected)
+    np.testing.assert_array_equal(frame, before)  # the input is never touched
+
+
+@pytest.mark.parametrize("k", KS)
+def test_box_mean_keeps_channels_apart(k):
+    frame, golden = _table(k, np.uint16)
+    stack = np.stack([frame, np.zeros_like(frame), np.full_like(frame, 65535)])
+    out = direct_common.box_mean(stack, k)
+    np.testing.assert_array_equal(out[0], golden)
+    assert not out[1].any()
+    assert (out[2] == 65535).all()
+
+
+def test_box_mean_into_float_is_never_rounded():
+    # tie-to-0 at k=4 is a 0.5 mean; three-quarter is 0.75; hot-pixel 4095.9375.
+    frame, _ = _table(4, np.uint16)
+    out = direct_common.box_mean(frame, 4, np.float32)
+    assert out.dtype == np.float32
+    assert out[0, 1] == 0.5 and out[0, 5] == 0.75 and out[0, 14] == 4095.9375
+
+
+def test_box_mean_of_float_input_keeps_the_float_rule():
+    # [[0.5]*16] -> 0.5 unrounded into float32; into uint16 rint gives 0.
+    block = np.full((4, 4), 0.5, dtype=np.float32)
+    assert direct_common.box_mean(block, 4)[0, 0] == np.float32(0.5)
+    assert direct_common.box_mean(block, 4, np.uint16)[0, 0] == 0
+
+
+# ---------------------------------------------------------------------------
 # (b) the plate reductions, read from a real ND2 whose sites hold the tables
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
@@ -236,3 +282,93 @@ def test_level1_from_source_matches_golden(tmp_path, monkeypatch, dtype, tile):
     assert out.dtype == golden.dtype
     np.testing.assert_array_equal(out[0], golden)
     assert (out[1] == 3).all()
+
+
+# ---------------------------------------------------------------------------
+# (e) the exact integer route against the float32 formula it replaces
+# ---------------------------------------------------------------------------
+def _reference(block, k, dtype):
+    """The pre-kernel formula, verbatim: float32 box mean, rint, cast."""
+    *lead, h, w = block.shape
+    h2, w2 = h // k, w // k
+    mean = block[..., : h2 * k, : w2 * k].reshape((*lead, h2, k, w2, k)).mean(
+        axis=(-3, -1), dtype=np.float32
+    )
+    if np.issubdtype(np.dtype(dtype), np.integer):
+        return np.rint(mean).astype(dtype)
+    return mean.astype(dtype)
+
+
+def _boxes_with_sums(sums, k, dtype):
+    """A 1 x (k) x (len(sums) * k) row of boxes whose pixel sums are ``sums``.
+
+    Box i holds r pixels of q+1 and n-r pixels of q, where q, r = divmod(s, n),
+    so any sum from 0 to n * MAX is reachable.
+    """
+    n = k * k
+    sums = np.asarray(sums, dtype=np.int64)
+    q, r = np.divmod(sums, n)
+    position = np.arange(n)
+    boxes = q[:, None] + (position[None, :] < r[:, None])
+    boxes = boxes.astype(dtype).reshape(len(sums), k, k)
+    return np.ascontiguousarray(boxes.transpose(1, 0, 2).reshape(1, k, len(sums) * k))
+
+
+def _check_sums(sums, k, dtype, *, pixels_per_pass=1 << 22):
+    n = k * k
+    sums = np.asarray(sums, dtype=np.int64)
+    step = max(1, pixels_per_pass // n)
+    for i in range(0, len(sums), step):
+        part = sums[i:i + step]
+        block = _boxes_with_sums(part, k, dtype)
+        out = direct_common.box_mean(block, k)
+        np.testing.assert_array_equal(out, _reference(block, k, dtype))
+        # and the arithmetic itself: round half to even of s / n
+        q, r = np.divmod(part, n)
+        expected = q + ((2 * r > n) | ((2 * r == n) & (q % 2 == 1)))
+        np.testing.assert_array_equal(out[0, 0].astype(np.int64), expected)
+
+
+@pytest.mark.parametrize("k", KS)
+def test_every_uint8_box_sum_rounds_like_the_float_formula(k):
+    _check_sums(np.arange(255 * k * k + 1), k, np.uint8)
+
+
+@pytest.mark.parametrize("k", (2, 4))
+def test_every_uint16_box_sum_rounds_like_the_float_formula(k):
+    _check_sums(np.arange(65535 * k * k + 1), k, np.uint16)
+
+
+@pytest.mark.parametrize("k", (8, 16))
+def test_uint16_box_sums_at_every_boundary_round_like_the_float_formula(k):
+    n = k * k
+    top = 65535 * n
+    # Two sums either side of, and on, every integer mean and every tie
+    # (mean q + 1/2) for the lowest and highest 1024 means, plus a sample.
+    means = np.concatenate([np.arange(0, 1024), np.arange(65535 - 1024, 65536)])
+    offsets = np.concatenate([np.arange(-2, 3), n // 2 + np.arange(-2, 3)])
+    edges = (means[:, None] * n + offsets[None, :]).ravel()
+    sample = np.random.default_rng(k).integers(0, top + 1, 20_000)
+    sums = np.unique(np.concatenate([edges, sample]))
+    _check_sums(sums[(sums >= 0) & (sums <= top)], k, np.uint16)
+
+
+@pytest.mark.parametrize("k", KS)
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_random_frames_match_the_float_formula_with_ragged_edges(k, dtype):
+    rng = np.random.default_rng(1000 * k + np.dtype(dtype).itemsize)
+    block = rng.integers(0, np.iinfo(dtype).max + 1, (2, 5 * k + 3, 7 * k + k - 1), dtype=dtype)
+    np.testing.assert_array_equal(direct_common.box_mean(block, k), _reference(block, k, dtype))
+    np.testing.assert_array_equal(direct_common.box_mean(block, k, np.float32),
+                                  _reference(block, k, np.float32))
+    wider = np.uint32 if dtype == np.uint16 else np.uint16
+    np.testing.assert_array_equal(direct_common.box_mean(block, k, wider),
+                                  _reference(block, k, wider))
+
+
+@pytest.mark.parametrize("dtype", [np.int16, np.uint32, np.float32])
+def test_other_dtypes_keep_the_float_formula(dtype):
+    rng = np.random.default_rng(7)
+    block = (rng.random((1, 33, 35)) * 3000).astype(dtype)
+    for k in KS:
+        np.testing.assert_array_equal(direct_common.box_mean(block, k), _reference(block, k, dtype))
