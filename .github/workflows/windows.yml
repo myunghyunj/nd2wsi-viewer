@@ -76,20 +76,23 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-      # Pull requests and main pushes reuse the decoder built from the same pinned
-      # inputs. Tags and workflow_dispatch never restore it: they build from source.
-      - name: Restore the pinned SDPC decoder build
+      # Only pull requests reuse the decoder an earlier run built from the same pinned
+      # inputs. Releases take their Windows assets from the main push run, so main
+      # pushes only look the entry up: they build from source and save that build
+      # when no entry exists yet. Tags and workflow_dispatch neither restore nor save.
+      - name: Restore or look up the pinned SDPC decoder build
         id: sdpc-codec-cache
         if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch')
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/sdpc-codec
           key: sdpc-codec-v1-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('packaging/build_sdpc_codec.py', 'packaging/verify_sdpc_codec.py', 'packaging/SDPC-CODEC-NOTICE.txt') }}
+          lookup-only: ${{ github.event_name != 'pull_request' }}
       # A restored build is used only if verify_sdpc_codec.py accepts it again and it
       # carries this checkout's build inputs byte for byte. Otherwise build from source.
       - name: Re-verify the restored SDPC decoder build
         id: sdpc-codec-reuse
-        if: steps.sdpc-codec-cache.outputs.cache-hit == 'true'
+        if: github.event_name == 'pull_request' && steps.sdpc-codec-cache.outputs.cache-hit == 'true'
         shell: python
         env:
           SDPC_CODEC_KEY: ${{ steps.sdpc-codec-cache.outputs.cache-matched-key }}
@@ -120,8 +123,9 @@ jobs:
               print(f"::warning title=SDPC decoder cache rejected::Building from source instead ({error}). "
                     f"Delete the cache entry {os.environ['SDPC_CODEC_KEY']} so a later run can save a fresh one.", flush=True)
           else:
-              print("::notice title=SDPC decoder restored from cache::This run's Windows artifacts reuse a "
-                    "cached decoder. Take release assets from a tag or workflow_dispatch run.", flush=True)
+              print("::notice title=SDPC decoder restored from cache::This pull request run's Windows "
+                    "artifacts reuse a cached decoder. Main, tag and workflow_dispatch runs build it "
+                    "from source.", flush=True)
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
                   output.write("reuse=true\n")
       - uses: msys2/setup-msys2@v2
@@ -186,8 +190,9 @@ jobs:
           name: windows-build-evidence
           path: dist/windows/build-smoke/
           retention-days: 30
-      # Only a source-built decoder whose packaged SDPC smoke passed is cached.
-      # Caching is best effort: it warns instead of failing the build.
+      # A pull request or main push that found no entry caches its source-built
+      # decoder, and only after the packaged SDPC smoke passed. Caching is best
+      # effort: it warns instead of failing the build.
       - name: Stage the source-built SDPC decoder for the cache
         id: sdpc-codec-stage
         if: steps.sdpc-codec-cache.outcome == 'success' && steps.sdpc-codec-cache.outputs.cache-hit != 'true'
