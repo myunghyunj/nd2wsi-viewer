@@ -22,7 +22,10 @@ import pytest
 
 from nd2wsi import window_lifecycle
 
-NOTICE = "An update is being prepared. Cancel it in the update window to close."
+NOTICE = (
+    "An update is waiting to install, so this window can't be closed now. "
+    "The viewer will quit and reopen by itself when the update starts."
+)
 EXPORT_WAIT = "Waiting for 1 export to finish…"
 
 
