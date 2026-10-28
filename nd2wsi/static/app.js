@@ -97,7 +97,7 @@ const {
   state, $, clamp, plateZFor,
   plateZText, platePlaneNote, currentFocusSummary, plateGroupKey,
   platePeriodMs, rawValueLabel, fmtTickLabel, fmtHm,
-  fmtPeriodWords, fmtInt, paintPlate, plateFrameChanged,
+  fmtPeriodWords, fmtInt, paintPlate, plateFrameChanged, plateFrameShown,
 });
 
 // Sidecar persistence: the debounced save, the serialized save queue,
@@ -5342,6 +5342,20 @@ function markFrameLoaded(img) {
   if (seen.size >= state.info.plate.P && tz.endsWith("/" + plateGroupKey())) renderTimeLine();
 }
 
+// Whether the plate shows the current frame in full: every visible site image
+// (the grid, or the strip beside a focused site) has loaded or failed, and a
+// focused site's own tiles have arrived. Playback waits for this.
+function plateFrameShown() {
+  const pl = state.plate;
+  if (!pl || !pl.gridEls) return true;
+  for (const cell of pl.focus === null ? pl.gridEls : pl.stripEls) {
+    const img = cell?.querySelector("img");
+    if (img && !img.complete) return false;
+  }
+  const item = pl.focus === null ? null : state.viewer?.world?.getItemAt(0);
+  return !item || typeof item.getFullyLoaded !== "function" || item.getFullyLoaded();
+}
+
 function layoutPlate() {
   const pl = state.plate;
   if (!pl) return;
@@ -5422,7 +5436,8 @@ function paintPlate() {
     const t = pl.t, z = pl.z, auto = pl.auto;
     pl.sharpenTimer = setTimeout(() => {
       pl.sharpenTimer = null;
-      if (pl.t !== t || pl.z !== z || pl.auto !== auto || pl.focus !== null) return;
+      // Playback that waits for a slow frame is not a hand at rest.
+      if (pl.t !== t || pl.z !== z || pl.auto !== auto || pl.focus !== null || pl.playing) return;
       sites.forEach((site) => {
         const img = pl.gridEls[site.i].querySelector("img");
         const url = plateFrameUrl(t, site.i, plateZFor(site.i), pl.k);
