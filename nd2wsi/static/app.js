@@ -2612,10 +2612,13 @@ function svgEl(tag, attrs, parent) {
 
 function chip(parent, x, y, text, id) {
   // An annotation's own label opens it through wireAnnotationPointer(); the
-  // live ruler's label has no id and stays inert.
-  const g = svgEl("g", id ? { class: "hit", "data-ann-id": id } : { class: "" }, parent);
+  // live ruler's label has no id and stays inert. The group's translation
+  // places the label, so the annotation frame moves it with one write.
+  const attrs = id ? { class: "hit", "data-ann-id": id } : { class: "" };
+  if (x || y) attrs.transform = `translate(${x} ${y})`;
+  const g = svgEl("g", attrs, parent);
   const t = svgEl("text", {
-    x: x + 7, y: y + 12.5,
+    x: 7, y: 12.5,
     fill: "rgba(255,255,255,0.9)",
     "font-size": "11",
     "font-family": "-apple-system, BlinkMacSystemFont, sans-serif",
@@ -2624,7 +2627,7 @@ function chip(parent, x, y, text, id) {
   const w = Math.max(26, text.length * 6.2 + 14);
   g.insertBefore(
     svgEl("rect", {
-      x, y, width: w, height: 18, rx: 9,
+      x: 0, y: 0, width: w, height: 18, rx: 9,
       fill: "rgba(28,28,30,0.85)", stroke: "rgba(255,255,255,0.25)",
       "stroke-width": "0.5",
     }),
@@ -2633,16 +2636,26 @@ function chip(parent, x, y, text, id) {
   return g;
 }
 
-/* ---- annotation layer: one pointer listener and translate-only pans --------
-   renderAnnotations() draws every mark into one root group of #ann-layer and
-   remembers what it drew from. OpenSeadragon raises update-viewport on every
-   animation frame. When only the camera centre has moved since that full
-   render, the whole picture (screen-fixed labels, end ticks, pins and stroke
-   widths included) moves by one screen-space offset under any rotation or
-   flip, so refreshAnnotationsForViewport() translates the root group instead
-   of rebuilding thousands of nodes. */
+/* ---- annotation layer: image-space outlines and one pointer listener ------
+   renderAnnotations() draws every mark into one root group of #ann-layer.
+   Box outlines and imported GeoJSON shapes are drawn once, in image pixels,
+   inside one image group whose matrix maps image pixels to the element the
+   way toEl() does: OpenSeadragon's mapping is affine, flip and rotation
+   included, so three probes give that matrix exactly up to float rounding.
+   Their strokes keep a screen width (non-scaling-stroke). Labels, pins,
+   imported points, measurement lines and alignment landmarks keep a screen
+   size, so they sit above the image group and the frame places them at their
+   image anchors.
 
-let annotationFrame = null; // the last full render: root group, signatures, mapping probes
+   OpenSeadragon raises update-viewport on every animation frame. When only the
+   camera centre has moved since the frame was placed, the whole picture moves
+   by one screen-space offset under any rotation or flip, so
+   refreshAnnotationsForViewport() translates the root group. Any other camera
+   change (zoom, rotation, flip, resize) rewrites the image matrix and one
+   position per screen-fixed mark, without creating nodes. Only a change of
+   what is drawn rebuilds the layer. */
+
+let annotationFrame = null; // the last full render: root and image groups, marks, signatures, mapping
 
 const ANNOTATION_PROBE_SPAN = 1024; // image px between the mapping probes
 
@@ -2679,11 +2692,56 @@ function annotationMapping() {
   };
 }
 
-function rememberAnnotationFrame(root) {
-  annotationFrame = {
-    root, view: annotationViewSignature(), content: annotationContentSignature(),
-    ...annotationMapping(), transform: "",
-  };
+// marks: the screen-fixed parts of a full render, each with its image anchor:
+//   { node, x, y, dx, dy }  node translated to toEl(x, y) + (dx, dy)
+//   { node, box, dx, dy }   the same from the box's top-left element corner
+//   { line, body, ticks, label }  a measurement drawn in element pixels
+// The root is built detached and shown once it is placed.
+function rememberAnnotationFrame(layer, root, image, marks) {
+  annotationFrame = { root, image, marks, content: annotationContentSignature(), transform: "" };
+  placeAnnotationFrame(annotationFrame, annotationMapping());
+  layer.append(root);
+}
+
+// Fit the image group and every screen-fixed mark to the camera; the root
+// group is left untranslated.
+function placeAnnotationFrame(frame, { origin, axes }) {
+  const span = ANNOTATION_PROBE_SPAN;
+  const xx = axes[0] / span, xy = axes[1] / span, yx = axes[2] / span, yy = axes[3] / span;
+  const at = (x, y) => ({ x: origin.x + xx * x + yx * y, y: origin.y + xy * x + yy * y });
+  frame.image.setAttribute("transform", `matrix(${xx} ${xy} ${yx} ${yy} ${origin.x} ${origin.y})`);
+  for (const mark of frame.marks) placeAnnotationMark(mark, at);
+  if (frame.transform) frame.root.removeAttribute("transform");
+  Object.assign(frame, { view: annotationViewSignature(), origin, axes, transform: "" });
+}
+
+function placeAnnotationMark(mark, at) {
+  if (mark.line) {
+    const p1 = at(mark.line.x1, mark.line.y1), p2 = at(mark.line.x2, mark.line.y2);
+    const segment = (node, x1, y1, x2, y2) => {
+      node.setAttribute("x1", x1); node.setAttribute("y1", y1);
+      node.setAttribute("x2", x2); node.setAttribute("y2", y2);
+    };
+    segment(mark.body, p1.x, p1.y, p2.x, p2.y);
+    // perpendicular end ticks
+    const dx = p2.x - p1.x, dy = p2.y - p1.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = (-dy / len) * 5, ny = (dx / len) * 5;
+    [p1, p2].forEach((p, i) => segment(mark.ticks[i], p.x - nx, p.y - ny, p.x + nx, p.y + ny));
+    const mx = (p1.x + p2.x) / 2 + (-dy / len) * 14 - 20;
+    const my = (p1.y + p2.y) / 2 + (dx / len) * 14 - 9;
+    mark.label.setAttribute("transform", `translate(${mx} ${my})`);
+    return;
+  }
+  let p;
+  if (mark.box) {
+    const { x, y, w, h } = mark.box;
+    const a = at(x, y), b = at(x + w, y), c = at(x + w, y + h), d = at(x, y + h);
+    p = { x: Math.min(a.x, b.x, c.x, d.x), y: Math.min(a.y, b.y, c.y, d.y) };
+  } else {
+    p = at(mark.x, mark.y);
+  }
+  mark.node.setAttribute("transform", `translate(${p.x + mark.dx} ${p.y + mark.dy})`);
 }
 
 function sameAnnotationSignature(a, b) {
@@ -2695,18 +2753,18 @@ function sameAnnotationSignature(a, b) {
 function refreshAnnotationsForViewport() {
   const frame = annotationFrame;
   if (!frame || !state.viewer || frame.root.parentNode !== $("ann-layer") ||
-      !sameAnnotationSignature(frame.view, annotationViewSignature()) ||
       !sameAnnotationSignature(frame.content, annotationContentSignature())) {
     renderAnnotations();
     return;
   }
-  const { origin, axes } = annotationMapping();
+  const mapping = annotationMapping(), { origin, axes } = mapping;
   const dx = origin.x - frame.origin.x, dy = origin.y - frame.origin.y;
   const scale = Math.max(Math.hypot(frame.axes[0], frame.axes[1]), Math.hypot(frame.axes[2], frame.axes[3]));
   // Rounding-level differences only; anything larger is not a pure pan.
-  if (!Number.isFinite(dx) || !Number.isFinite(dy) ||
+  if (!sameAnnotationSignature(frame.view, annotationViewSignature()) ||
+      !Number.isFinite(dx) || !Number.isFinite(dy) ||
       axes.some((value, i) => !(Math.abs(value - frame.axes[i]) <= scale * 1e-9))) {
-    renderAnnotations();
+    placeAnnotationFrame(frame, mapping);
     return;
   }
   const transform = `translate(${dx} ${dy})`;
@@ -2738,42 +2796,23 @@ function renderAnnotations() {
   if (!state.viewer) return;
   layer.replaceChildren();
   // A fresh root carries no pan translation (refreshAnnotationsForViewport).
-  const root = svgEl("g", { "data-ann-root": "" }, layer);
-  // OpenSeadragon's image-to-element mapping is affine, flip and rotation
-  // included, so three probes give it exactly up to float rounding. Every
-  // vertex below is then a multiply-add instead of an OpenSeadragon call,
-  // which matters for imports of up to 250k points on every zoom frame.
-  const span = 1024; // image px between the probes, as in annotationMapping()
-  const o = toEl(0, 0), ex = toEl(span, 0), ey = toEl(0, span);
-  const xx = (ex.x - o.x) / span, xy = (ex.y - o.y) / span;
-  const yx = (ey.x - o.x) / span, yy = (ey.y - o.y) / span;
-  const project = (x, y) => ({ x: o.x + xx * x + yx * y, y: o.y + xy * x + yy * y });
+  const root = svgEl("g", { "data-ann-root": "" });
+  // Outlines in image pixels, below every screen-fixed mark. The screen-fixed
+  // parts are drawn at the origin and listed in marks; rememberAnnotationFrame()
+  // sets the image matrix and places them for the camera.
+  const image = svgEl("g", { "data-ann-image": "" }, root);
+  const marks = [];
   if (state.astromap && !state.annotations.some((a) => a.type === "box" && a.astromap === true && a.id === state.astromap.activeId))
     state.astromap.activeId = state.annotations.find((a) => a.type === "box" && a.astromap === true)?.id || null;
 
   const drawLine = (a, isTemp) => {
     const col = annColor(a);
-    const p1 = project(a.x1, a.y1);
-    const p2 = project(a.x2, a.y2);
     const g = svgEl("g", {}, root);
-    svgEl("line", {
-      x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
-      stroke: col, "stroke-width": 1.5,
-    }, g);
-    // perpendicular end ticks
-    const dx = p2.x - p1.x, dy = p2.y - p1.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const nx = (-dy / len) * 5, ny = (dx / len) * 5;
-    for (const p of [p1, p2]) {
-      svgEl("line", {
-        x1: p.x - nx, y1: p.y - ny, x2: p.x + nx, y2: p.y + ny,
-        stroke: col, "stroke-width": 1.5,
-      }, g);
-    }
+    // the body, then the perpendicular end ticks
+    const [body, ...ticks] = [0, 1, 2].map(() => svgEl("line", { stroke: col, "stroke-width": 1.5 }, g));
     const label = lineLengthLabel(a) + (a.text ? " · " + a.text : "");
-    const mx = (p1.x + p2.x) / 2 + (-dy / len) * 14 - 20;
-    const my = (p1.y + p2.y) / 2 + (dx / len) * 14 - 9;
-    chip(root, mx, my, label, isTemp ? null : a.id);
+    marks.push({ line: { x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2 }, body, ticks,
+      label: chip(root, 0, 0, label, isTemp ? null : a.id) });
   };
 
   let astromapNumber = 0;
@@ -2782,53 +2821,67 @@ function renderAnnotations() {
     if (a.astromap === true && a.astromapEnabled === false) continue;
     if (a.type === "line") drawLine(a, false);
     else if (a.type === "box") {
-      const corners = [
-        project(a.x, a.y), project(a.x + a.w, a.y),
-        project(a.x + a.w, a.y + a.h), project(a.x, a.y + a.h),
-      ];
-      const left = Math.min(...corners.map((c) => c.x));
-      const top = Math.min(...corners.map((c) => c.y));
-      const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, root);
+      const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, image);
       const active = a.astromap === true && a.id === state.astromap.activeId;
       svgEl("polygon", {
-        points: corners.map((c) => c.x + "," + c.y).join(" "),
+        points: `${a.x},${a.y} ${a.x + a.w},${a.y} ${a.x + a.w},${a.y + a.h} ${a.x},${a.y + a.h}`,
         fill: a.astromap === true ? active ? "rgba(255,217,102,.35)" : "rgba(160,166,174,.15)" : hexAlpha(annColor(a), 0.08),
         stroke: a.astromap === true ? active ? "#ffd966" : "#a0a6ae" : annColor(a), "stroke-width": 1.5,
-        "stroke-linejoin": "round",
+        "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke",
       }, g);
       const note = a.astromap === true ? astromapDisplayNote(a) : a.text;
-      chip(root, left, top - 22, a.astromap === true
+      const label = chip(root, 0, 0, a.astromap === true
         ? `${astromapNumber}${note ? " · " + note : ""}` : a.text || "Box", a.id);
+      marks.push({ node: label, box: { x: a.x, y: a.y, w: a.w, h: a.h }, dx: 0, dy: -22 });
     } else if (a.type === "geojson") {
-      renderImportedGeoJSON(a, root, project);
+      renderImportedGeoJSON(a, image, null, root, marks);
     } else if (a.type === "pin") {
-      const p = project(a.x, a.y);
       const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, root);
-      svgEl("circle", { cx: p.x, cy: p.y, r: 6, fill: annColor(a), stroke: "#fff", "stroke-width": 1.5 }, g);
-      svgEl("circle", { cx: p.x, cy: p.y, r: 1.8, fill: "#fff" }, g);
-      if (a.text) chip(root, p.x + 10, p.y - 9, a.text, a.id);
+      svgEl("circle", { r: 6, fill: annColor(a), stroke: "#fff", "stroke-width": 1.5 }, g);
+      svgEl("circle", { r: 1.8, fill: "#fff" }, g);
+      marks.push({ node: g, x: a.x, y: a.y, dx: 0, dy: 0 });
+      if (a.text) marks.push({ node: chip(root, 0, 0, a.text, a.id), x: a.x, y: a.y, dx: 10, dy: -9 });
     }
   }
   if (state.tempLine) drawLine({ ...state.tempLine, text: "" }, true);
-  renderLandmarks(root);
-  rememberAnnotationFrame(root);
+  renderLandmarks(root, marks);
+  rememberAnnotationFrame(layer, root, image, marks);
 }
 
-function renderImportedGeoJSON(item, layer, project = toEl) {
+// One imported feature, drawn through `project` (element pixels by default).
+// renderAnnotations() passes null instead: outlines stay in image pixels in its
+// image group, and the screen-sized points and label go to `fixed` at the
+// origin, listed in `marks` with their image anchors for the frame to place.
+function renderImportedGeoJSON(item, layer, project = toEl, fixed = layer, marks = null) {
   const api = window.Nd2AnnotationGeoJSON;
   try {
-    const parts = api.displayParts(item.geojson.geometry, project);
-    const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, layer);
-    for (const path of parts.paths) svgEl("path", {
-      d: path.d, fill: path.closed ? hexAlpha(annColor(item), .08) : "none",
-      "fill-rule": "evenodd", stroke: annColor(item), "stroke-width": 1.5,
-      "stroke-linejoin": "round",
-    }, group);
-    for (const point of parts.points) svgEl("circle", {
-      cx: point.x, cy: point.y, r: 6, fill: annColor(item), stroke: "#fff", "stroke-width": 1.5,
-    }, group);
-    const rect = api.bounds(item.geojson.geometry), anchor = project(rect.x, rect.y);
-    chip(layer, anchor.x, anchor.y - 22, api.label(item), item.id);
+    const geometry = item.geojson.geometry;
+    // Image-pixel outlines do not depend on the camera, so they are cached.
+    const parts = project ? api.displayParts(geometry, project) : api.imageParts(geometry);
+    const color = annColor(item);
+    if (parts.paths.length) {
+      const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, layer);
+      for (const path of parts.paths) svgEl("path", {
+        d: path.d, fill: path.closed ? hexAlpha(color, .08) : "none",
+        "fill-rule": "evenodd", stroke: color, "stroke-width": 1.5,
+        "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke",
+      }, group);
+    }
+    if (parts.points.length) {
+      const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, fixed);
+      const dot = { r: 6, fill: color, stroke: "#fff", "stroke-width": 1.5 };
+      for (const point of parts.points) {
+        if (project) svgEl("circle", { transform: `translate(${point.x} ${point.y})`, ...dot }, group);
+        else marks.push({ node: svgEl("circle", dot, group), x: point.x, y: point.y, dx: 0, dy: 0 });
+      }
+    }
+    const text = api.label(item);
+    if (project) {
+      const rect = api.bounds(geometry), anchor = project(rect.x, rect.y);
+      chip(fixed, anchor.x, anchor.y - 22, text, item.id);
+    } else {
+      marks.push({ node: chip(fixed, 0, 0, text, item.id), x: parts.bounds.x, y: parts.bounds.y, dx: 0, dy: -22 });
+    }
   } catch (_) { /* Invalid legacy sidecar geometry must not break other annotations. */ }
 }
 
@@ -2839,24 +2892,23 @@ function renderImportedGeoJSON(item, layer, project = toEl) {
 
 const LANDMARK_COLOR = "#ff9f0a";
 
-function renderLandmarks(layer) {
+// Drawn at the origin and listed in marks for the annotation frame to place.
+function renderLandmarks(layer, marks) {
   const points = state.landmark.points;
   if (!points.length) return;
   const group = svgEl("g", { class: "landmarks" }, layer);
   points.forEach((pt, i) => {
-    const p = toEl(pt.x, pt.y);
     const g = svgEl("g", {}, group);
-    svgEl("circle", {
-      cx: p.x, cy: p.y, r: 9.5, fill: LANDMARK_COLOR, stroke: "#fff", "stroke-width": 1.5,
-    }, g);
-    svgEl("line", { x1: p.x - 14, y1: p.y, x2: p.x + 14, y2: p.y, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
-    svgEl("line", { x1: p.x, y1: p.y - 14, x2: p.x, y2: p.y + 14, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
+    svgEl("circle", { r: 9.5, fill: LANDMARK_COLOR, stroke: "#fff", "stroke-width": 1.5 }, g);
+    svgEl("line", { x1: -14, y1: 0, x2: 14, y2: 0, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
+    svgEl("line", { x1: 0, y1: -14, x2: 0, y2: 14, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
     const t = svgEl("text", {
-      x: p.x, y: p.y + 3.6, fill: "#1c1c1e", "text-anchor": "middle",
+      x: 0, y: 3.6, fill: "#1c1c1e", "text-anchor": "middle",
       "font-size": "10", "font-weight": "700",
       "font-family": "-apple-system, BlinkMacSystemFont, sans-serif",
     }, g);
     t.textContent = String(i + 1);
+    marks.push({ node: g, x: pt.x, y: pt.y, dx: 0, dy: 0 });
   });
 }
 

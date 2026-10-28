@@ -171,11 +171,24 @@
     return result;
   }
 
+  // displayParts in image pixels plus the bounds, for the viewer's image-space
+  // layer. Computed once per geometry object: geometry is never edited in place
+  // (parse and featureForAnnotation work on clones).
+  const imagePartsCache = new WeakMap();
+  function imageParts(geometry) {
+    let parts = imagePartsCache.get(geometry);
+    if (!parts) {
+      parts = { ...displayParts(geometry, (x, y) => ({ x, y })), bounds: bounds(geometry) };
+      imagePartsCache.set(geometry, parts);
+    }
+    return parts;
+  }
+
   function label(item) {
     const classification = item.geojson?.properties?.classification;
     return item.text || classification?.name || (Array.isArray(classification?.names) ? classification.names.join(" / ") : "") ||
       item.geojson?.geometry?.type || "GeoJSON";
   }
 
-  return { MAX_BYTES, MAX_FEATURES, MAX_POINTS, isGeoJSON, parse, color, bounds, featureForAnnotation, displayParts, label };
+  return { MAX_BYTES, MAX_FEATURES, MAX_POINTS, isGeoJSON, parse, color, bounds, featureForAnnotation, displayParts, imageParts, label };
 });
