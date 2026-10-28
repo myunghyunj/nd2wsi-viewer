@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import zarr
+from nd2_fixture import write_synthetic_nd2
 
 from nd2wsi import render
 from nd2wsi.convert import _downsample_into, build_group_attrs
@@ -117,22 +118,26 @@ def plane_source(dtype, channels: int, rgb: bool = False) -> PlaneSource:
 
 # --- a zarr pyramid: level 0 and reduced levels -------------------------------------
 
-@pytest.fixture(params=["uint16", "uint8"])
-def zarr_slide(request, tmp_path):
+@pytest.fixture(scope="module", params=["uint16", "uint8"])
+def zarr_slide(request, tmp_path_factory):
+    """Built once per dtype, then reopened read-only: the tests only read it."""
     dtype = np.dtype(request.param)
     hi = np.iinfo(dtype).max
     raw = np.random.default_rng(11).integers(0, hi, (3, 301, 389), dtype=dtype)
     raw[:, -1, :] = hi  # odd edges carry a value padding would never invent
     raw[:, :, -1] = hi
-    store = zarr.open_group(str(tmp_path / "slide.zarr"), mode="w", zarr_format=2)
+    path = tmp_path_factory.mktemp(f"zarr-slide-{dtype}") / "slide.zarr"
+    store = zarr.open_group(str(path), mode="w", zarr_format=2)
     shapes = level_shapes(*raw.shape[1:], TILE)
     store.create_array("0", shape=raw.shape, chunks=(1, TILE, TILE), dtype=dtype)[:] = raw
     for level, shape in enumerate(shapes[1:], start=1):
         target = store.create_array(str(level), shape=(3, *shape),
                                     chunks=(1, TILE, TILE), dtype=dtype)
         _downsample_into(store[str(level - 1)], target, TILE, dtype)
+    store.store.close()
     attrs = build_group_attrs(plane_source(dtype, 3), shapes, TILE,
                               [dict(start=0, end=int(hi), min=0, max=int(hi))] * 3)
+    store = zarr.open_group(str(path), mode="r")
     try:
         yield store, attrs
     finally:
@@ -180,9 +185,10 @@ def test_rgb_store_channel_subset_still_writes_separate_planes(tmp_path, monkeyp
 
 # --- a source-backed ND2: level 0 from the memory map, reduced levels stored ---------
 
-@pytest.fixture(params=[16, 8])
-def source_backed(request, tmp_path):
-    limnd2 = pytest.importorskip("limnd2")
+@pytest.fixture(scope="module", params=[16, 8])
+def source_backed(request, tmp_path_factory):
+    """Built and registered once per bit depth: the tests only read the slide."""
+    pytest.importorskip("limnd2")
     pytest.importorskip("nd2")
     from nd2wsi.convert import ensure_cache
     from nd2wsi.server import SlideRegistry
@@ -191,15 +197,10 @@ def source_backed(request, tmp_path):
     dtype = np.uint16 if bits == 16 else np.uint8
     img = np.random.default_rng(23).integers(1, 4000 if bits == 16 else 255,
                                              (390, 520, 3), dtype=dtype)  # (Y, X, C)
-    path = tmp_path / "slide.nd2"
-    with limnd2.Nd2Writer(str(path)) as f:
-        f.imageAttributes = limnd2.ImageAttributes.create(
-            width=520, height=390, component_count=3, bits=bits, sequence_count=1)
-        f.setImage(0, img)
-        mf = limnd2.MetadataFactory(objective_magnification=20.0, pixel_calibration=0.5)
-        for name, color in (("CY5", "#FF0000"), ("FITC", "#00FF00"), ("DAPI", "#0000FF")):
-            mf.addPlane(name=name, color=color)
-        f.pictureMetadata = mf.createMetadata()
+    img.flags.writeable = False  # shared by every test in the module
+    channels = [("CY5", "#FF0000"), ("FITC", "#00FF00"), ("DAPI", "#0000FF")]
+    path = tmp_path_factory.mktemp(f"source-backed-{bits}") / "slide.nd2"
+    write_synthetic_nd2(path, img, channels, pixel_um=0.5)
     reg = SlideRegistry()
     sid = reg.add_store(ensure_cache(path, tile=128))
     st = reg.get(sid)

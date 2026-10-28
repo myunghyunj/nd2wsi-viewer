@@ -55,7 +55,20 @@ def fluor_2ch(width: int, height: int) -> np.ndarray:
     return np.clip(stack, 0, 65535).astype(np.uint16)
 
 
-def write_nd2(path: Path, img: np.ndarray, channels: list[tuple[str, str]], px_um: float):
+def write_nd2(
+    path: Path,
+    img: np.ndarray,
+    channels: list[tuple[str, str]],
+    px_um: float,
+    *,
+    magnification: float | None = 20.0,
+    modality: str | None = "Widefield Fluorescence",
+) -> Path:
+    """Write one (Y, X) or (Y, X, C) frame as a single-frame ND2.
+
+    The tests write their fixtures through this function (tests/nd2_fixture.py).
+    ``magnification`` and ``modality`` are left out of the metadata when None.
+    """
     import limnd2
 
     h, w = img.shape[:2]
@@ -68,13 +81,13 @@ def write_nd2(path: Path, img: np.ndarray, channels: list[tuple[str, str]], px_u
     with limnd2.Nd2Writer(str(path)) as f:
         f.imageAttributes = attrs
         f.setImage(0, img)
-        mf = limnd2.MetadataFactory(
-            objective_magnification=20.0, pixel_calibration=px_um
-        )
+        settings = {} if magnification is None else {"objective_magnification": magnification}
+        mf = limnd2.MetadataFactory(pixel_calibration=px_um, **settings)
+        plane = {} if modality is None else {"modality": modality}
         for name, color in channels:
-            mf.addPlane(name=name, modality="Widefield Fluorescence", color=color)
+            mf.addPlane(name=name, color=color, **plane)
         f.pictureMetadata = mf.createMetadata()
-    print(f"wrote {path}  {w}x{h}  {comps} comp(s)  {img.dtype}")
+    return path
 
 
 def main() -> None:
@@ -88,18 +101,14 @@ def main() -> None:
     sw, sh = (int(v) for v in args.slide_size.lower().split("x"))
     fw, fh = (int(v) for v in args.fluor_size.lower().split("x"))
 
-    write_nd2(
-        args.out_dir / "synthetic_slide.nd2",
-        slide_rgb(sw, sh),
-        [("Brightfield", "white")],
-        px_um=0.33,
-    )
-    write_nd2(
-        args.out_dir / "synthetic_fluor.nd2",
-        fluor_2ch(fw, fh),
-        [("DAPI", "blue"), ("GFP", "green")],
-        px_um=0.65,
-    )
+    def write(name, img, channels, px_um):
+        path = write_nd2(args.out_dir / name, img, channels, px_um)
+        comps = 1 if img.ndim == 2 else img.shape[2]
+        print(f"wrote {path}  {img.shape[1]}x{img.shape[0]}  {comps} comp(s)  {img.dtype}")
+
+    write("synthetic_slide.nd2", slide_rgb(sw, sh), [("Brightfield", "white")], px_um=0.33)
+    write("synthetic_fluor.nd2", fluor_2ch(fw, fh), [("DAPI", "blue"), ("GFP", "green")],
+          px_um=0.65)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
 """An SVS served straight from the file, with no pyramid store."""
+import shutil
+
 import numpy as np
 import pytest
 
@@ -9,12 +11,15 @@ from nd2wsi.direct import open_direct  # noqa: E402
 from nd2wsi.server import SlideRegistry  # noqa: E402
 
 
-@pytest.fixture()
-def svs(tmp_path):
-    """Baseline plus an embedded 4x level, tiled lossless JPEG 2000."""
+@pytest.fixture(scope="module")
+def svs_template(tmp_path_factory):
+    """Baseline plus an embedded 4x level, tiled lossless JPEG 2000.
+
+    Encoding takes about 0.36 s, so it happens once per module; tests get a copy.
+    """
     rng = np.random.default_rng(9)
     img = rng.integers(0, 255, (2200, 2900, 3), dtype=np.uint8)
-    p = tmp_path / "d.svs"
+    p = tmp_path_factory.mktemp("svs-template") / "d.svs"
     opts = dict(tile=(240, 240), photometric="rgb", compression="jpeg2000",
                 compressionargs={"reversible": True})
     with tifffile.TiffWriter(p) as tw:
@@ -23,6 +28,17 @@ def svs(tmp_path):
         small = (img[:2200, :2900].reshape(550, 4, 725, 4, 3)
                  .mean(axis=(1, 3)).astype(np.uint8))
         tw.write(small, subfiletype=1, **opts)
+    img.flags.writeable = False  # shared by every test in the module
+    small.flags.writeable = False
+    return p, img, small
+
+
+@pytest.fixture()
+def svs(svs_template, tmp_path):
+    """A fresh copy per test: stores and caches land beside the source."""
+    template, img, small = svs_template
+    p = tmp_path / template.name
+    shutil.copyfile(template, p)
     return p, img, small
 
 

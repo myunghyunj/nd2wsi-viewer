@@ -4,10 +4,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 from http_fixture import running_server
+from nd2_fixture import write_synthetic_nd2
 
 from nd2wsi.server import server_url
 
-limnd2 = pytest.importorskip("limnd2")
+pytest.importorskip("limnd2")
 nd2 = pytest.importorskip("nd2")
 
 
@@ -16,19 +17,8 @@ def fluor_nd2(tmp_path):
     """A small 2-channel uint16 ND2 written with limnd2 (the fixture writer)."""
     rng = np.random.default_rng(11)
     img = rng.integers(0, 4000, size=(700, 900, 2), dtype=np.uint16)  # (Y, X, C)
-    path = tmp_path / "fluor.nd2"
-    attrs = limnd2.ImageAttributes.create(
-        width=900, height=700, component_count=2, bits=16, sequence_count=1
-    )
-    with limnd2.Nd2Writer(str(path)) as f:
-        f.imageAttributes = attrs
-        f.setImage(0, img)
-        mf = limnd2.MetadataFactory(
-            objective_magnification=20.0, pixel_calibration=0.66
-        )
-        mf.addPlane(name="CY5", color="#FF0000")
-        mf.addPlane(name="DAPI", color="#0000FF")
-        f.pictureMetadata = mf.createMetadata()
+    channels = [("CY5", "#FF0000"), ("DAPI", "#0000FF")]
+    path = write_synthetic_nd2(tmp_path / "fluor.nd2", img, channels, pixel_um=0.66)
     return path, img
 
 
@@ -72,17 +62,9 @@ def test_three_channel_roundtrip(tmp_path):
 
     rng = np.random.default_rng(5)
     img = rng.integers(0, 3000, size=(600, 800, 3), dtype=np.uint16)
-    src = tmp_path / "three.nd2"
-    attrs = limnd2.ImageAttributes.create(
-        width=800, height=600, component_count=3, bits=16, sequence_count=1
-    )
-    with limnd2.Nd2Writer(str(src)) as f:
-        f.imageAttributes = attrs
-        f.setImage(0, img)
-        mf = limnd2.MetadataFactory(pixel_calibration=0.33)
-        for name, color in [("CY5", "FF0000"), ("FITC", "00FF00"), ("DAPI", "0000FF")]:
-            mf.addPlane(name=name, color=color)
-        f.pictureMetadata = mf.createMetadata()
+    channels = [("CY5", "FF0000"), ("FITC", "00FF00"), ("DAPI", "0000FF")]
+    src = write_synthetic_nd2(tmp_path / "three.nd2", img, channels, pixel_um=0.33,
+                              magnification=None)
 
     with nd2.ND2File(str(src)) as f:
         assert f.sizes.get("C") == 3 and not f.is_rgb  # channels, not RGB comps

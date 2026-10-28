@@ -1,4 +1,6 @@
 """SVS reading, pyramid geometry and the size question asked before building."""
+import shutil
+
 import numpy as np
 import pytest
 
@@ -17,12 +19,26 @@ def write_svs(path, img, tile=240, compression="jpeg2000"):
     return path
 
 
-@pytest.fixture()
-def slide(tmp_path):
-    """A tiled RGB slide whose size is a multiple of neither tile nor chunk."""
+@pytest.fixture(scope="module")
+def slide_template(tmp_path_factory):
+    """A tiled RGB slide whose size is a multiple of neither tile nor chunk.
+
+    Encoding takes about 0.1 s, so it happens once per module; tests get a copy.
+    """
     rng = np.random.default_rng(3)
     img = rng.integers(0, 255, (1300, 1717, 3), dtype=np.uint8)
-    return write_svs(tmp_path / "slide.svs", img), img
+    path = write_svs(tmp_path_factory.mktemp("svs-template") / "slide.svs", img)
+    img.flags.writeable = False  # shared by every test in the module
+    return path, img
+
+
+@pytest.fixture()
+def slide(slide_template, tmp_path):
+    """A fresh copy per test: stores and caches land beside the source."""
+    template, img = slide_template
+    path = tmp_path / template.name
+    shutil.copyfile(template, path)
+    return path, img
 
 
 def test_open_svs_reads_every_pixel(slide):

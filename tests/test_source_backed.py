@@ -5,33 +5,26 @@ import time
 import numpy as np
 import pytest
 import zarr
+from nd2_fixture import write_synthetic_nd2
 
 from nd2wsi.convert import convert, ensure_cache, open_store
 from nd2wsi.reader import PlaneSelection, is_source_backable, plane_view
 
-limnd2 = pytest.importorskip("limnd2")
+pytest.importorskip("limnd2")
 nd2 = pytest.importorskip("nd2")
 
 
 @pytest.fixture()
 def big_nd2(tmp_path):
-    """A 1600 x 1400 2-channel uint16 slide with an all-zero corner tile."""
+    """A 1600 x 1400 2-channel uint16 slide with an all-zero corner tile.
+
+    Each test writes its own file: several rename, re-time or rebuild the source.
+    """
     rng = np.random.default_rng(7)
     img = rng.integers(1, 4000, size=(1400, 1600, 2), dtype=np.uint16)  # (Y, X, C)
     img[:512, :512] = 0  # exactly one level-0 chunk of nothing per channel
-    path = tmp_path / "slide.nd2"
-    attrs = limnd2.ImageAttributes.create(
-        width=1600, height=1400, component_count=2, bits=16, sequence_count=1
-    )
-    with limnd2.Nd2Writer(str(path)) as f:
-        f.imageAttributes = attrs
-        f.setImage(0, img)
-        mf = limnd2.MetadataFactory(
-            objective_magnification=20.0, pixel_calibration=0.5
-        )
-        mf.addPlane(name="CY5", color="#FF0000")
-        mf.addPlane(name="DAPI", color="#0000FF")
-        f.pictureMetadata = mf.createMetadata()
+    channels = [("CY5", "#FF0000"), ("DAPI", "#0000FF")]
+    path = write_synthetic_nd2(tmp_path / "slide.nd2", img, channels, pixel_um=0.5)
     return path, np.moveaxis(img, -1, 0)  # (C, Y, X)
 
 
