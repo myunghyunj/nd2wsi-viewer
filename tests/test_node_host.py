@@ -50,6 +50,45 @@ def test_exit_status_output_and_uncaught_errors_match_a_node_process(transport, 
     assert message in result.stderr
 
 
+def test_an_uncaught_value_that_is_not_an_error_is_shown_inspected(transport):
+    result = run_node("throw {status: 500, body: 'down'};")
+    assert result.returncode == 1
+    assert "{ status: 500, body: 'down' }" in result.stderr
+
+
+def test_stack_traces_name_the_script_eval_with_its_own_line_numbers(transport):
+    result = run_node("process.stdout.write('out');\nnull.missing;")
+    assert result.returncode == 1
+    assert "[eval]:2" in result.stderr
+    assert "process.argv" not in result.stderr
+
+
+@pytest.mark.parametrize("script", [
+    "'use strict'\n",
+    "'use strict';\n",
+    "// a header comment\n\"use strict\";\n",
+])
+def test_a_use_strict_directive_applies_and_the_script_owns_its_global_names(transport, script):
+    result = run_node(
+        script + "const vm = 1, workerData = 2, options = 3;\n"
+        "process.stdout.write(JSON.stringify([(function () { return this; })() === undefined,"
+        " vm + workerData + options, process.argv.slice(1)]));",
+        "arg",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [True, 6, ["arg"]]
+
+
+def test_output_written_straight_to_fd_1_is_the_scripts_stdout(transport):
+    # Workers share the host's fd 1 with its replies.
+    result = run_node(
+        "const fs = require('fs'); fs.writeSync(1, 'line\\n'); fs.writeSync(1, 'partial');"
+        " process.stdout.write('ok');"
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, "line\npartialok", "")
+    assert run_node("process.stdout.write('next')").stdout == "next"
+
+
 def test_check_raises_called_process_error_with_the_script_stderr(transport):
     with pytest.raises(subprocess.CalledProcessError) as caught:
         run_node("console.error('reason'); process.exit(2);", check=True)
@@ -98,11 +137,13 @@ def test_the_host_waits_for_all_output_when_a_script_exits_at_once(host):
 
 def test_a_crashed_host_fails_the_case_and_the_next_case_gets_a_new_host(host):
     run_node("")
-    crashed = node_host._host.proc.pid
+    crashed = node_host._host
     with pytest.raises(node_host.NodeHostError, match="exited while running this case"):
         run_node("process.kill(process.pid, 'SIGKILL'); setInterval(() => {}, 1000);")
     assert run_node("process.stdout.write('again')").stdout == "again"
-    assert node_host._host.proc.pid != crashed
+    assert node_host._host.proc.pid != crashed.proc.pid
+    pipes = crashed.proc.stdin, crashed.proc.stdout, crashed.proc.stderr
+    assert all(pipe.closed for pipe in pipes)
 
 
 def test_the_host_exits_when_its_test_process_goes_away_even_mid_case(host):
@@ -118,9 +159,8 @@ def test_the_host_exits_when_its_test_process_goes_away_even_mid_case(host):
         orphan.proc.stdin.close()
         assert orphan.proc.wait(timeout=10) == 0
     finally:
-        if orphan.proc.poll() is None:
-            orphan.proc.kill()
-            orphan.proc.wait()
+        orphan.stop()
+    assert orphan.proc.stdout.closed and orphan.proc.stderr.closed
 
 
 def test_a_missing_node_skips_instead_of_failing(transport, monkeypatch):

@@ -13,7 +13,14 @@ directory after every case.
 The host starts on first use and stops when the interpreter exits, so each pytest-xdist
 worker gets its own. It also exits when its stdin closes, which covers a test process
 that is killed outright. ``ND2WSI_NODE_SPAWN=1`` runs every case in its own
-``node -e`` process instead, as the tests did before the host existed.
+``node -e`` process instead, as the tests did before the host existed; it applies to
+the whole session, for comparing the two transports.
+
+A worker cannot call ``process.chdir``, and it shares the host's file descriptors: fd 0
+is the request pipe, so a case gets no stdin, and fd 2 is the host's stderr. Bytes a case
+writes straight to fd 1 do reach its stdout, but ahead of everything it wrote through
+``process.stdout``. A script that needs any of this calls
+``subprocess.run([NODE, "-e", ...])`` itself.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ import collections
 import json
 import os
 import queue
+import secrets
 import shutil
 import subprocess
 import threading
@@ -41,9 +49,14 @@ HOST_SCRIPT = r"""
 'use strict';
 const {Worker} = require('worker_threads');
 const readline = require('readline');
+const util = require('util');
 const baseEnv = {...process.env};
 const baseCwd = process.cwd();
-const reply = (message) => process.stdout.write(JSON.stringify(message) + '\n');
+// Workers share this process's fd 1, so a case that writes to it directly
+// (fs.writeSync(1, ...)) lands in the reply stream. Every reply line starts with
+// this host's random mark; anything else on fd 1 is the current case's output.
+const mark = process.argv[2];
+const reply = (message) => process.stdout.write(mark + JSON.stringify(message) + '\n');
 function restore() {
   for (const key of Object.keys(process.env)) if (!(key in baseEnv)) delete process.env[key];
   for (const [key, value] of Object.entries(baseEnv)) {
@@ -51,15 +64,25 @@ function restore() {
   }
   if (process.cwd() !== baseCwd) process.chdir(baseCwd);
 }
-// `node -e SCRIPT a b` gives process.argv = [node, a, b]. The assignment shares the
-// script's first line so stack line numbers match, and goes after a 'use strict'
-// directive so the directive still applies.
-function withArgv(script, argv) {
-  const prelude = 'process.argv=' + JSON.stringify([process.execPath, ...argv]) + ';';
-  const directive = /^\s*(['"])use strict\1;?/.exec(script);
-  if (!directive) return prelude + script;
-  return directive[0] + prelude + script.slice(directive[0].length);
-}
+// `node -e` prints an uncaught string as is and anything else inspected, which
+// keeps an Error's own properties (an AssertionError's actual and expected).
+const describe = (error) => (typeof error === 'string' ? error : util.inspect(error)) + '\n';
+// The worker runs this fixed bootstrap and the case script arrives untouched in
+// workerData, so a 'use strict' directive stays a directive. Like `node -e SCRIPT a b`,
+// the script sees process.argv = [node, a, b], the globals require, module and exports,
+// and '[eval]' as its file name in stack traces. The arrow function keeps the
+// bootstrap's own names out of the script's global scope.
+const BOOTSTRAP = `(() => {
+  const {workerData} = require('worker_threads');
+  const vm = require('vm');
+  process.argv = workerData.argv;
+  globalThis.__filename = '[eval]';
+  const options = {filename: '[eval]'};
+  if (vm.constants && vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER) {
+    options.importModuleDynamically = vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER;
+  }
+  vm.runInThisContext(workerData.script, options);
+})();`;
 function runCase(request) {
   return new Promise((resolve) => {
     if (request.cwd && request.cwd !== process.cwd()) {
@@ -68,13 +91,14 @@ function runCase(request) {
     const out = [], err = [];
     let worker;
     try {
-      worker = new Worker(withArgv(request.script, request.argv), {
+      worker = new Worker(BOOTSTRAP, {
         eval: true, stdout: true, stderr: true,
         env: request.env || process.env,
+        workerData: {script: request.script, argv: [process.execPath, ...request.argv]},
       });
     } catch (error) {
       restore();
-      reply({id: request.id, code: 1, stdout: '', stderr: String(error && error.stack || error) + '\n'});
+      reply({id: request.id, code: 1, stdout: '', stderr: describe(error)});
       resolve();
       return;
     }
@@ -99,7 +123,7 @@ function runCase(request) {
     worker.stdout.on('end', () => { streamsOpen--; settle(); });
     worker.stderr.on('end', () => { streamsOpen--; settle(); });
     // `node -e` prints an uncaught exception to stderr; a worker reports it here.
-    worker.on('error', (error) => err.push(Buffer.from(String(error && error.stack || error) + '\n')));
+    worker.on('error', (error) => err.push(Buffer.from(describe(error))));
     worker.on('exit', (code) => {
       exitCode = code;
       clearTimeout(timer);
@@ -171,19 +195,30 @@ class _Host:
         self.next_id = 0
         self.replies = queue.SimpleQueue()
         self.stderr = collections.deque(maxlen=100)
+        # Starts every reply line, so output a case writes straight to fd 1 cannot
+        # pass for a reply.
+        self.mark = f"#{secrets.token_hex(16)}#"
         self.proc = subprocess.Popen(
-            [NODE, "-e", HOST_SCRIPT, "nd2wsi-node-host"],
+            [NODE, "-e", HOST_SCRIPT, "nd2wsi-node-host", self.mark],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        threading.Thread(target=self._read_replies, name="node-host-stdout", daemon=True).start()
-        threading.Thread(target=self._read_stderr, name="node-host-stderr", daemon=True).start()
+        self.readers = [
+            threading.Thread(target=self._read_replies, name="node-host-stdout", daemon=True),
+            threading.Thread(target=self._read_stderr, name="node-host-stderr", daemon=True),
+        ]
+        for reader in self.readers:
+            reader.start()
 
+    # Each reader closes its own pipe at the end of the stream: closing it from another
+    # thread would wait for a read in progress.
     def _read_replies(self):
         try:
             for line in self.proc.stdout:
                 self.replies.put(line)
         except (OSError, ValueError):
             pass
+        finally:
+            _close(self.proc.stdout)
         self.replies.put(None)
 
     def _read_stderr(self):
@@ -192,6 +227,8 @@ class _Host:
                 self.stderr.append(line.decode("utf-8", "replace"))
         except (OSError, ValueError):
             pass
+        finally:
+            _close(self.proc.stderr)
 
     def alive(self):
         return self.owner == os.getpid() and self.proc.poll() is None
@@ -216,6 +253,8 @@ class _Host:
         except OSError:
             raise self.failure("exited before it received this case") from None
         deadline = None if timeout is None else time.monotonic() + timeout + HOST_GRACE
+        mark = self.mark.encode("ascii")
+        stray = []
         while True:
             wait = None if deadline is None else max(0.0, deadline - time.monotonic())
             try:
@@ -226,28 +265,44 @@ class _Host:
                                   "killed and the next case starts a new host") from None
             if line is None:
                 raise self.failure("exited while running this case")
+            # Bytes the case wrote to fd 1 itself arrive before its reply, which is sent
+            # once the worker has exited; a `node -e` process would print them on stdout.
+            start = line.find(mark)
+            if start < 0:
+                stray.append(line)
+                continue
+            stray.append(line[:start])
             try:
-                message = json.loads(line.decode("utf-8"))
+                message = json.loads(line[start + len(mark):].decode("utf-8"))
             except ValueError:
-                raise self.failure(f"wrote a line that is not a reply: {line[:200]!r}") from None
+                raise self.failure(f"wrote a reply that is not JSON: {line[:200]!r}") from None
             if "protocolError" in message:
                 raise self.failure(f"could not read a request: {message['protocolError']}")
             if message.get("id") == request["id"]:
+                message["stdout"] = b"".join(stray).decode("utf-8", "replace") + message["stdout"]
                 return message
+            stray = []
 
     def stop(self):
         if self.owner != os.getpid():
             return
-        if self.proc.poll() is None:
-            try:
-                self.proc.stdin.close()
-            except OSError:
-                pass
-            try:
-                self.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
+        # Closing stdin asks a running host to exit.
+        _close(self.proc.stdin)
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        # Once the process has gone, the readers reach the end and close their pipes.
+        for reader in self.readers:
+            reader.join(timeout=2)
+
+
+def _close(pipe):
+    try:
+        pipe.close()
+    except (OSError, ValueError):
+        pass
 
 
 _host = None
