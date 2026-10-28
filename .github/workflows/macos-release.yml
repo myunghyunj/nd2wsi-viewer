@@ -60,6 +60,8 @@ jobs:
         run: |
           .venv/bin/python scripts/fetch_testdata.py 2>&1 | tee dist/macos/build-evidence/testdata.log
           echo "ND2WSI_SMOKE_FILE=$GITHUB_WORKSPACE/docs/example_cell.nd2" >> "$GITHUB_ENV"
+      # Release builds always compile the decoder from the pinned sources. Unlike
+      # windows.yml pull request and main runs, never restore it from a cache here.
       - name: Build the source-verified LGPL SDPC decoder
         run: |
           codec_output="$GITHUB_WORKSPACE/build/sdpc-codec"

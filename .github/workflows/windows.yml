@@ -39,6 +39,7 @@ jobs:
           if ($env:REQUESTED_REF -cnotmatch '^[0-9a-f]{40}$') { throw 'ref must be a full lowercase commit SHA' }
           if ((git rev-parse HEAD) -ne $env:REQUESTED_REF) { throw 'Checked out the wrong commit' }
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: '3.13.14'
           architecture: x64
@@ -75,8 +76,57 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      # Pull requests and main pushes reuse the decoder built from the same pinned
+      # inputs. Tags and workflow_dispatch never restore it: they build from source.
+      - name: Restore the pinned SDPC decoder build
+        id: sdpc-codec-cache
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch')
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/sdpc-codec
+          key: sdpc-codec-v1-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('packaging/build_sdpc_codec.py', 'packaging/verify_sdpc_codec.py', 'packaging/SDPC-CODEC-NOTICE.txt') }}
+      # A restored build is used only if verify_sdpc_codec.py accepts it again and it
+      # carries this checkout's build inputs byte for byte. Otherwise build from source.
+      - name: Re-verify the restored SDPC decoder build
+        id: sdpc-codec-reuse
+        if: steps.sdpc-codec-cache.outputs.cache-hit == 'true'
+        shell: python
+        env:
+          SDPC_CODEC_KEY: ${{ steps.sdpc-codec-cache.outputs.cache-matched-key }}
+        run: |
+          import json, os, platform, subprocess, sys, zipfile
+          from pathlib import Path
+
+          cache = Path(os.environ["RUNNER_TEMP"], "sdpc-codec")
+          manifest_path = cache / "sdpc-codec-manifest.json"
+          try:
+              if subprocess.run([sys.executable, "packaging/verify_sdpc_codec.py",
+                                 "--manifest", str(manifest_path), "--wheel-only"]).returncode:
+                  raise ValueError("verify_sdpc_codec.py rejected it")
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+              built_for = (manifest["platform"], manifest["python_version"])
+              if built_for != ("windows-x64", platform.python_version()):
+                  raise ValueError(f"it was built for {built_for}")
+              checkout = {name: Path("packaging", name).read_bytes()
+                          for name in ("build_sdpc_codec.py", "verify_sdpc_codec.py", "SDPC-CODEC-NOTICE.txt")}
+              licenses = cache / manifest["licenses_directory"]
+              if (licenses / "SDPC-CODEC-NOTICE.txt").read_bytes() != checkout["SDPC-CODEC-NOTICE.txt"]:
+                  raise ValueError("its licenses/SDPC-CODEC-NOTICE.txt differs from this checkout")
+              with zipfile.ZipFile(cache / manifest["source_archive_file"]) as archive:
+                  for name, content in checkout.items():
+                      if archive.read("packaging/" + name) != content:
+                          raise ValueError(f"its packaging/{name} differs from this checkout")
+          except (OSError, KeyError, ValueError, zipfile.BadZipFile) as error:
+              print(f"::warning title=SDPC decoder cache rejected::Building from source instead ({error}). "
+                    f"Delete the cache entry {os.environ['SDPC_CODEC_KEY']} so a later run can save a fresh one.", flush=True)
+          else:
+              print("::notice title=SDPC decoder restored from cache::This run's Windows artifacts reuse a "
+                    "cached decoder. Take release assets from a tag or workflow_dispatch run.", flush=True)
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("reuse=true\n")
       - uses: msys2/setup-msys2@v2
         id: msys2
+        if: steps.sdpc-codec-reuse.outputs.reuse != 'true'
         with:
           msystem: MSYS
           path-type: inherit
@@ -85,11 +135,17 @@ jobs:
         shell: pwsh
         env:
           MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+          SDPC_CODEC_REUSE: ${{ steps.sdpc-codec-reuse.outputs.reuse }}
         run: |
-          $codecOutput = Join-Path $env:GITHUB_WORKSPACE 'build\sdpc-codec'
-          $msysBash = Join-Path $env:MSYS2_LOCATION 'usr\bin\bash.exe'
-          .venv/Scripts/python.exe packaging/build_sdpc_codec.py --output $codecOutput --jobs 6 --msys-bash $msysBash
-          if ($LASTEXITCODE -ne 0) { throw 'Source-built SDPC codec failed' }
+          if ($env:SDPC_CODEC_REUSE -ceq 'true') {
+            $codecOutput = Join-Path $env:RUNNER_TEMP 'sdpc-codec'
+          }
+          else {
+            $codecOutput = Join-Path $env:GITHUB_WORKSPACE 'build\sdpc-codec'
+            $msysBash = Join-Path $env:MSYS2_LOCATION 'usr\bin\bash.exe'
+            .venv/Scripts/python.exe packaging/build_sdpc_codec.py --output $codecOutput --jobs 6 --msys-bash $msysBash
+            if ($LASTEXITCODE -ne 0) { throw 'Source-built SDPC codec failed' }
+          }
           $codecManifest = Join-Path $codecOutput 'sdpc-codec-manifest.json'
           $codecMetadata = Get-Content -LiteralPath $codecManifest -Raw -Encoding UTF8 | ConvertFrom-Json
           $codecWheel = Join-Path $codecOutput $codecMetadata.wheel_file
@@ -130,6 +186,39 @@ jobs:
           name: windows-build-evidence
           path: dist/windows/build-smoke/
           retention-days: 30
+      # Only a source-built decoder whose packaged SDPC smoke passed is cached.
+      # Caching is best effort: it warns instead of failing the build.
+      - name: Stage the source-built SDPC decoder for the cache
+        id: sdpc-codec-stage
+        if: steps.sdpc-codec-cache.outcome == 'success' && steps.sdpc-codec-cache.outputs.cache-hit != 'true'
+        shell: python
+        run: |
+          import json, os, shutil, subprocess, sys
+          from pathlib import Path
+
+          source = Path("build/sdpc-codec")
+          target = Path(os.environ["RUNNER_TEMP"], "sdpc-codec")
+          try:
+              manifest = json.loads((source / "sdpc-codec-manifest.json").read_text(encoding="utf-8"))
+              target.mkdir()
+              for name in ("sdpc-codec-manifest.json", manifest["wheel_file"], manifest["source_archive_file"]):
+                  (target / name).parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(source / name, target / name)
+              shutil.copytree(source / manifest["licenses_directory"], target / manifest["licenses_directory"])
+              if subprocess.run([sys.executable, "packaging/verify_sdpc_codec.py",
+                                 "--manifest", str(target / "sdpc-codec-manifest.json"), "--wheel-only"]).returncode:
+                  raise ValueError("verify_sdpc_codec.py rejected the staged copy")
+          except (OSError, KeyError, ValueError) as error:
+              print(f"::warning title=SDPC decoder not cached::{error}", flush=True)
+          else:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("staged=true\n")
+      - name: Save the source-built SDPC decoder
+        if: steps.sdpc-codec-stage.outputs.staged == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/sdpc-codec
+          key: ${{ steps.sdpc-codec-cache.outputs.cache-primary-key }}
 
   verify:
     needs: build
