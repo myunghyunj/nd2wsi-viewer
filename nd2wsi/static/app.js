@@ -2000,10 +2000,13 @@ function refreshAstromapPanel() {
   const items = astromapItems(), ready = astromapReady();
   if (!items.some((a) => a.id === state.astromap.activeId)) state.astromap.activeId = items[0]?.id || null;
   const list = $("astromap-list"), rows = state.astromap.rows;
+  // Rows follow edits and plate frames while the panel is open; opening it
+  // refreshes them (makeMacWindow onOpen).
+  const rowsShown = !state.windows?.astromap?.isHidden();
   const ids = new Set(items.map((a) => a.id));
-  for (const [id, row] of rows) if (!ids.has(id)) { row.el.remove(); rows.delete(id); }
+  for (const [id, row] of rows) if (rowsShown && !ids.has(id)) { row.el.remove(); rows.delete(id); }
   const size = window.Nd2Astromap.exportSize(state.info.width, state.info.height);
-  items.forEach((a, index) => {
+  if (rowsShown) items.forEach((a, index) => {
     let row = rows.get(a.id);
     if (!row) {
       const el = document.createElement("div"); el.className = "astromap-item";
@@ -3336,6 +3339,8 @@ function annotationItemsForThisSlide(data, geojsonFile = false) {
 }
 
 function rebuildAnnList() {
+  // A closed list is rebuilt when its window opens.
+  if (state.windows?.annot?.isHidden()) return;
   const list = $("ann-list");
   list.replaceChildren();
   $("ann-empty").style.display = state.annotations.length ? "none" : "";
@@ -4829,6 +4834,7 @@ function buildWindows() {
       zoomW: 340,
       toolbarBtn: $("tb-annot"),
       startClosed: true,
+      onOpen: () => rebuildAnnList(),
     }),
     astromap: makeMacWindow($("win-astromap"), {
       key: "astromap",
