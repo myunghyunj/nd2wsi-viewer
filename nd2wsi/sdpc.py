@@ -358,30 +358,34 @@ def associated_image_jpeg(path: str | Path, name: str, *, max_side: int = 512) -
 def _decode_tile(data: bytes, width: int, height: int) -> np.ndarray:
     av = _require_av()
     try:
-        with av.open(BytesIO(data), format="hevc", options={
-            "max_pixels": str(width * height), "threads": "1",
-        }) as container:
-            stream = container.streams.video[0]
-            stream.codec_context.thread_count = 1
-            stream.codec_context.options = {"max_pixels": str(width * height)}
-            if (stream.codec_context.width, stream.codec_context.height) != (width, height):
-                raise ValueError("SDPC tile dimensions disagree with the container")
-            frames = container.decode(video=0)
-            frame = next(frames, None)
-            if frame is None or (frame.width, frame.height) != (width, height):
-                raise ValueError("SDPC tile did not decode to its declared dimensions")
-            # Explicit chroma reconstruction/rounding avoids version/CPU-specific
-            # swscale fast paths. Preserve decoded colorspace and range metadata;
-            # this is not the vendor's separate gamma/CCM colour correction.
-            # PyAV 16 accepts integer swscale flags but exposes no enum names for
-            # SWS_ACCURATE_RND (0x40000) or SWS_BITEXACT (0x80000).
-            rgb = frame.to_ndarray(
-                format="rgb24", interpolation=2 | 0x40000 | 0x80000,
-                src_color_range=frame.color_range,
-            )
-            if next(frames, None) is not None:
-                raise ValueError("SDPC tile contains multiple frames")
-            return np.ascontiguousarray(rgb)
+        # A fresh single-threaded decoder per tile, so a damaged tile cannot carry
+        # decoder state into the next one. The HEVC parser splits the tile into
+        # packets; the raw-HEVC demuxer and stream probe behind av.open cost about
+        # half of every cold tile and decode to the same frame.
+        decoder = av.CodecContext.create("hevc", "r")
+        decoder.thread_count = 1
+        decoder.options = {"max_pixels": str(width * height)}
+        decoder.open()
+        frame = None
+        for packet in [*decoder.parse(data), *decoder.parse(None), None]:
+            for decoded in decoder.decode(packet):
+                if frame is not None:
+                    raise ValueError("SDPC tile contains multiple frames")
+                if (decoded.width, decoded.height) != (width, height):
+                    raise ValueError("SDPC tile did not decode to its declared dimensions")
+                frame = decoded
+        if frame is None:
+            raise ValueError("SDPC tile did not decode to its declared dimensions")
+        # Explicit chroma reconstruction/rounding avoids version/CPU-specific
+        # swscale fast paths. Preserve decoded colorspace and range metadata;
+        # this is not the vendor's separate gamma/CCM colour correction.
+        # PyAV 16 accepts integer swscale flags but exposes no enum names for
+        # SWS_ACCURATE_RND (0x40000) or SWS_BITEXACT (0x80000).
+        rgb = frame.to_ndarray(
+            format="rgb24", interpolation=2 | 0x40000 | 0x80000,
+            src_color_range=frame.color_range,
+        )
+        return np.ascontiguousarray(rgb)
     except Exception as exc:
         raise ValueError(f"cannot decode SDPC HEVC tile: {exc}") from exc
 
