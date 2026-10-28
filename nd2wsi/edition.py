@@ -8,11 +8,18 @@ so builds from this line never check for, offer or open public updates.
 """
 
 NAME = "SLACS-module"
+# The n-th lab build of one public version; back to 1 when main brings a new one.
+REVISION = 2
 UPDATES_OFF = True
 UPDATES_OFF_MESSAGE = ("SLACS-module build: update checks are turned off. "
                        "New SLACS-module builds are released separately.")
 
 
 def release_version(version: str) -> str:
-    """Version label for this line's tag and asset names, e.g. ``2.5.4_SLACS-module``."""
-    return f"{version}_{NAME}"
+    """Version label for this line's tag and asset names.
+
+    ``2.5.4_SLACS-module`` for the first build of 2.5.4, then
+    ``2.5.4_SLACS-module.2`` and so on.
+    """
+    label = f"{version}_{NAME}"
+    return label if REVISION == 1 else f"{label}.{REVISION}"

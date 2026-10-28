@@ -40,7 +40,14 @@ def no_network(monkeypatch):
 def test_this_line_ships_with_update_checks_off():
     assert edition.UPDATES_OFF is True
     assert edition.NAME == "SLACS-module"
+    assert edition.release_version("2.5.4") == f"2.5.4_SLACS-module.{edition.REVISION}"
+
+
+def test_the_first_build_of_a_version_keeps_the_plain_label(monkeypatch):
+    monkeypatch.setattr(edition, "REVISION", 1)
     assert edition.release_version("2.5.4") == "2.5.4_SLACS-module"
+    monkeypatch.setattr(edition, "REVISION", 2)
+    assert edition.release_version("2.5.4") == "2.5.4_SLACS-module.2"
 
 
 @pytest.mark.parametrize(("platform_name", "machine"),
@@ -102,7 +109,7 @@ def test_sparkle_is_never_installed(monkeypatch):
 
 def test_portable_zip_is_named_apart_from_the_public_zip():
     name = windows_builder().archive_name("2.5.4")
-    assert name == "nd2wsi-viewer-2.5.4_SLACS-module-windows-x64.zip"
+    assert name == f"nd2wsi-viewer-2.5.4_SLACS-module.{edition.REVISION}-windows-x64.zip"
     # The windows workflow still uploads and verifies it ...
     workflow = (ROOT / ".github/workflows/windows.yml").read_text(encoding="utf-8")
     assert "dist/windows/nd2wsi-viewer-*-windows-x64.zip\n" in workflow.replace("\r\n", "\n")
