@@ -323,6 +323,34 @@ def test_failed_annotation_confirmation_retries_without_closing_the_server(drive
     assert driver.completions == [threading.main_thread()]
 
 
+def test_a_refused_attempt_unlocks_the_viewer_until_the_next_attempt(driver):
+    # A 409 conflict refusal is resolved in the pane with Keep recovery
+    # drafts, which stays disabled while the pane is frozen for the update.
+    driver.prepare()
+    driver.main.until(lambda: len(driver.window.flushes) == 1)
+    first = driver.window.flushes[0].request_id
+    driver.window.reply(0, {"ok": False, "error": "Annotations conflict. Review the recovery notice"})
+    driver.main.until(lambda: bool(driver.window.cancellations))
+    assert driver.window.cancellations == [[first, False]]
+    driver.main.until(lambda: len(driver.window.flushes) == 2)
+    assert driver.window.flushes[1].request_id != first
+    driver.window.reply(1, {"ok": True, "panes": 1})
+    driver.main.until(lambda: bool(driver.completions))
+    assert len(driver.window.cancellations) == 1
+
+
+def test_an_unanswered_attempt_keeps_the_viewer_frozen_between_retries(driver):
+    driver.coordinator._FLUSH_TIMEOUT = 0.06
+    driver.prepare()
+    driver.main.until(lambda: len(driver.window.flushes) == 2)
+    assert driver.window.cancellations == []
+    driver.coordinator._FLUSH_TIMEOUT = 1.0
+    driver.main.until(lambda: len(driver.window.flushes) == 3)
+    driver.window.reply(2, {"ok": True, "panes": 1})
+    driver.main.until(lambda: bool(driver.completions))
+    assert driver.window.cancellations == []
+
+
 def test_javascript_bridge_exception_reports_from_worker_and_can_retry(driver):
     driver.window.raise_on_flush = RuntimeError("bridge unavailable")
     driver.prepare()

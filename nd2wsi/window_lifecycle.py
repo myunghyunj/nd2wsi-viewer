@@ -366,6 +366,12 @@ class UpdateShutdownCoordinator:
                     f"Update waiting: {message or 'annotations were not saved'}; retrying…",
                     failure,
                 )
+                # A viewer that answered with a refusal needs the user to act
+                # (an annotation conflict is resolved with Keep recovery
+                # drafts, which a frozen pane disables), so unlock it until
+                # the next attempt freezes it again, as a refused close does.
+                if not (isinstance(result, dict) and result.get("unanswered")):
+                    self._recover_browser(request_id)
                 if cancelled.wait(self._RETRY_DELAY):
                     return
             else:
