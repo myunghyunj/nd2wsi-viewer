@@ -1719,6 +1719,9 @@ def main(argv: list[str] | None = None) -> int:
         report = {**report, "ok": False, "teardown_error": failed}
         report.setdefault("error", failed)
         result = 4
+        # A browser replay writes its own report before the window closes, so
+        # that file cannot carry this; whoever captured the run sees it here.
+        print(failed, file=sys.stderr)
     if args.gui_smoke:
         print(json.dumps(report, ensure_ascii=False))
         if args.smoke_report:

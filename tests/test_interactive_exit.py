@@ -218,6 +218,25 @@ def test_a_failed_teardown_still_writes_the_smoke_report_and_fails_it(monkeypatc
     app._dlog.assert_any_call("exit: server teardown failed: OSError('plate writer lease already gone')")
 
 
+def test_a_failed_teardown_after_a_finished_browser_replay_fails_the_run_visibly(monkeypatch, tmp_path, unfinished,
+                                                                                 under_run, capsys):
+    # The replay wrote its own report before the window closed; the run
+    # must still fail, with the reason on stderr for the capturing script.
+    monkeypatch.setattr(app, "_dlog", Mock())
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "slide.nd2").write_bytes(b"")
+    report = tmp_path / "replay.json"
+    api = failing_teardown_api()
+    api._browser_replay_report = {"ok": True, "samples": [1, 2]}
+    result, _ = run_native_main(monkeypatch, tmp_path / "sessions", api, [
+        "--agent-window", "--browser-replay-report", str(report), "--benchmark-context", str(tmp_path / "ctx.json"),
+        "--benchmark-test-root", str(root), str(root / "slide.nd2")])
+    assert result == 4
+    assert "Server teardown failed: OSError: plate writer lease already gone" in capsys.readouterr().err
+    assert not report.exists()  # the replay's own file is left as it wrote it
+
+
 def test_a_failed_teardown_after_an_interactive_close_is_logged_not_raised(monkeypatch, tmp_path, unfinished,
                                                                             under_run):
     monkeypatch.setattr(app, "_dlog", Mock())
