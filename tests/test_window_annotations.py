@@ -294,7 +294,7 @@ def test_frontend_conflict_keeps_dirty_site_draft_and_never_adopts_other_revisio
     return {ok: false, status: 409, json: async () => ({current_revision: "OTHER-WINDOW-r99", draft_path: "/session/drafts/preserved.json"})};
   };
   await api.loadAnnotations(0);
-  state.annotations = [{id: "my-unsaved-roi"}]; state.annRevision = 1; state.annDirty = true;
+  state.annotations = [{id: "my-unsaved-roi", type: "pin", x: 1, y: 2}]; state.annRevision = 1; state.annDirty = true;
   await api.saveAnnotations();
   const dirtyAfterConflict = state.annDirty;
   state.plate.focus = 1; state.annContext += 1; state.annDirty = false;
@@ -307,7 +307,7 @@ def test_frontend_conflict_keeps_dirty_site_draft_and_never_adopts_other_revisio
 })().catch(e => { console.error(e); process.exit(1); });
 ''')
     assert result["dirtyAfterConflict"] and result["dirty"]
-    assert result["revision"] == "r0" and result["items"] == [{"id": "my-unsaved-roi"}]
+    assert result["revision"] == "r0" and result["items"] == [{"id": "my-unsaved-roi", "type": "pin", "x": 1, "y": 2}]
     assert result["gets"].count("api/annotations?p=0") == 1
     assert [item["expected_revision"] for item in result["posted"]] == ["r0", "r0"]
     assert result["failed"] == 1 and any("Recovery draft:" in text for text in result["statuses"])

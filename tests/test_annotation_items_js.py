@@ -60,22 +60,48 @@ emit(refused);
     assert all(message and message.startswith("annotation 1: ") for message in out), out
 
 
-def test_a_sidecar_the_pane_cannot_draw_stays_unloaded_and_is_never_saved_over():
-    out = _run(STORE + r"""
+SIDECAR = r"""
 const state = {plate: null, info: {notes: []}, annotations: [], annSite: null, annReady: false,
   annDirty: false, quitPreparing: false, editingId: null};
 const requests = [], statuses = [], timers = [];
+let reply = null;
 const store = createStore({
   state,
   fetch: (url, init = {}) => {
-    requests.push(init.method || "GET");
-    return Promise.resolve({ok: true, json: async () => ({
-      items: [{id: "a", type: "pin", x: 1, y: 2}, {id: "b", type: "box", x: 0, y: 0, w: "wide", h: 2}],
-      path: "/sidecars/slide.json", revision: "r1"})});
+    requests.push({method: init.method || "GET", body: init.body ? JSON.parse(init.body) : null});
+    if (init.method === "POST") return Promise.resolve({ok: true, json: async () => ({path: "/s.json", revision: "r2"})});
+    return Promise.resolve(reply);
   },
   onStatus: (message) => statuses.push(message),
   setTimer: (fn) => { timers.push(fn); return timers.length; }, clearTimer: () => {},
 });
+"""
+
+
+def test_sidecar_items_the_pane_cannot_draw_are_kept_aside_and_saved_back_unchanged():
+    # A sidecar 2.5.4 saved after opening another tool's file may hold items
+    # this viewer cannot draw; the rest must stay visible and editable.
+    out = _run(STORE + SIDECAR + r"""
+const odd = {id: "b", type: "ellipse", cx: 4, cy: 5, r: 2, from: "qupath"};
+reply = {ok: true, json: async () => ({items: [{id: "a", type: "pin", x: 1, y: 2, color: 7}, odd],
+  path: "/sidecars/slide.json", revision: "r1"})};
+store.load(null); await tick();
+const loaded = {ready: state.annReady, shown: state.annotations.map((a) => a.id), status: statuses.at(-1)};
+state.annotations.push({id: "c", type: "pin", x: 3, y: 4}); store.markDirty(); store.scheduleSave();
+for (const fire of timers.splice(0)) fire();
+await tick();
+const saved = requests.filter((r) => r.method === "POST").map((r) => r.body.items);
+emit({loaded, saved, colorDropped: !("color" in saved[0][0]), odd: JSON.stringify(saved[0][2]) === JSON.stringify(odd)});
+""")
+    assert out["loaded"]["ready"] is True and out["loaded"]["shown"] == ["a"]
+    assert out["loaded"]["status"].endswith("1 item(s) this viewer cannot draw are kept unchanged")
+    assert [[item["id"] for item in body] for body in out["saved"]] == [["a", "c", "b"]]
+    assert out["colorDropped"] is True and out["odd"] is True
+
+
+def test_a_sidecar_that_failed_to_load_is_never_saved_over():
+    out = _run(STORE + SIDECAR + r"""
+reply = {ok: false, status: 500};
 store.load(null); await tick();
 const status = statuses.at(-1);
 // every path that could send the pane's (empty) list for this owner
@@ -84,11 +110,12 @@ for (const fire of timers.splice(0)) fire();
 await store.retryFailed(); await store.flushOnPagehide(); await store.save(); await tick();
 let flushed = "ok";
 try { await store.flushForUpdate(); } catch (error) { flushed = error.message; }
-emit({ready: state.annReady, dirty: state.annDirty, items: state.annotations.length, requests, status, flushed});
+emit({ready: state.annReady, dirty: state.annDirty, items: state.annotations.length,
+  requests: requests.map((r) => r.method), status, flushed});
 """)
     assert out["ready"] is False and out["dirty"] is False and out["items"] == 0
     assert out["requests"] == ["GET"]
-    assert out["status"].startswith("Could not load annotations for this site (annotation 2: ")
+    assert out["status"] == "Could not load annotations for this site"
     # nothing unsaved exists, so an update or close is not held up by it
     assert out["flushed"] == "ok"
 

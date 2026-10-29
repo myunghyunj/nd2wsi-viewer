@@ -3138,6 +3138,8 @@ async function openAnnotationFile(file) {
       throw new Error("the combined annotations exceed the 8 MB import limit");
     }
     if (!append) closeEditor(false);
+    // opening replaces the whole set, including sidecar items kept aside
+    if (!append) state.annForeignItems = [];
     state.annotations = combined;
     annotationsChanged();
     setAnnStatus((append ? "Imported " : "Opened ") + file.name + " (" + imported.length + ")" +
