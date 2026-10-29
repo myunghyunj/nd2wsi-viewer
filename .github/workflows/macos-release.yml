@@ -96,7 +96,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app" 2>&1 | tee dist/macos/build-evidence/codesign-verification.log
           hdiutil verify dist/macos/nd2wsi-viewer.dmg 2>&1 | tee dist/macos/build-evidence/dmg-verification.log
           build/macapp/venv/bin/python -m pip freeze > dist/macos/build-evidence/packaged-environment.txt
-          .venv/bin/python - dist/macos/build-evidence/source-environment.txt dist/macos/build-evidence/packaged-environment.txt <<'PY'
+          .venv/bin/python - dist/macos/build-evidence/source-environment.txt dist/macos/build-evidence/packaged-environment.txt packaging/macos-build-requirements.txt <<'PY'
           import re
           import sys
 
@@ -108,13 +108,18 @@ jobs:
                       found[re.sub(r"[-_.]+", "-", match.group(1)).lower()] = match.group(2)
               return found
 
-          source, packaged = (pins(path) for path in sys.argv[1:3])
+          source, packaged, tools = (pins(path) for path in sys.argv[1:4])
           # nd2wsi is this build and av is the source-built LGPL decoder.
-          shared = (source.keys() & packaged.keys()) - {"nd2wsi", "av", "pip", "setuptools"}
+          shared = (source.keys() & packaged.keys()) - {"nd2wsi", "av", "pip", "setuptools"} - tools.keys()
           drift = {name: (source[name], packaged[name]) for name in sorted(shared) if source[name] != packaged[name]}
           if drift:
               sys.exit(f"packaged dependencies differ from uv.lock: {drift}")
-          print(f"{len(shared)} packaged dependencies match the locked source environment")
+          tool_drift = {name: (version, packaged.get(name)) for name, version in sorted(tools.items())
+                        if packaged.get(name) != version}
+          if tool_drift:
+              sys.exit(f"build tools differ from packaging/macos-build-requirements.txt: {tool_drift}")
+          print(f"{len(shared)} packaged dependencies match the locked source environment; "
+                f"{len(tools)} build tools match their lock")
           PY
           .venv/bin/python - <<'PY'
           import hashlib

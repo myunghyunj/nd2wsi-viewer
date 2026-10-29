@@ -28,6 +28,8 @@ def test_mac_bundle_installs_runtime_from_uv_lock_and_tools_from_a_hashed_lock()
     for line in re.findall(r"pip -q install [^\n]*", script):
         assert ("--require-hashes" in line or "--no-deps" in line
                 or line.endswith("--upgrade pip")), line
+    # nor may the project's build backend come unpinned from an index
+    assert 'pip -q install --no-build-isolation --no-deps "$REPO"' in script
 
 
 def test_mac_build_tools_match_the_windows_pins_and_carry_hashes():
@@ -42,6 +44,32 @@ def test_mac_build_tools_match_the_windows_pins_and_carry_hashes():
         re.findall(r"^[A-Za-z0-9_.-]+==\S+ \\\n    --hash=sha256:", locked, re.M))
 
 
-def test_release_workflow_fails_when_packaged_versions_drift_from_the_lock():
-    workflow = (ROOT / ".github" / "workflows" / "macos-release.yml").read_text()
-    assert "packaged dependencies differ from uv.lock" in workflow
+def _drift_check(tmp_path, source, packaged):
+    import subprocess
+    import sys
+
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "macos-release.yml").read_text())
+    steps = next(iter(workflow["jobs"].values()))["steps"]
+    run = next(step["run"] for step in steps if "packaged dependencies differ" in step.get("run", ""))
+    script = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    (tmp_path / "source.txt").write_text(source)
+    (tmp_path / "packaged.txt").write_text(packaged)
+    return subprocess.run(
+        [sys.executable, "-", str(tmp_path / "source.txt"), str(tmp_path / "packaged.txt"),
+         str(PACKAGING / "macos-build-requirements.txt")],
+        input=script, text=True, capture_output=True, timeout=30,
+    )
+
+
+def test_release_workflow_fails_when_packaged_versions_drift_from_the_locks(tmp_path):
+    tools = "".join(f"{name}=={version}\n" for name, version in
+                    _pins(PACKAGING / "macos-build-requirements.txt").items())
+    source = "-e file:///src/nd2wsi\nnumpy==2.5.2\npywebview==6.2.1\npytest==9.0.0\nav==16.0.1\n"
+    packaged = "nd2wsi-viewer==2.5.5\nnumpy==2.5.2\npyWebView==6.2.1\nav==16.0.1+lgpl\n" + tools
+    assert _drift_check(tmp_path, source, packaged).returncode == 0
+    drifted = _drift_check(tmp_path, source, packaged.replace("numpy==2.5.2", "numpy==2.5.3"))
+    assert drifted.returncode == 1 and "numpy" in drifted.stderr
+    unpinned_tool = _drift_check(tmp_path, source, packaged.replace("pyinstaller==6.22.2", "pyinstaller==6.22.3"))
+    assert unpinned_tool.returncode == 1 and "pyinstaller" in unpinned_tool.stderr

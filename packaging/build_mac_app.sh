@@ -61,7 +61,9 @@ uv export --project "$REPO" --frozen --no-dev --no-emit-project --emit-index-url
   --extra app --extra svs --extra nd2export --format requirements-txt \
   --output-file "$RUNTIME_LOCK" >/dev/null
 "$PY" -m pip -q install --require-hashes -r "$RUNTIME_LOCK" -r "$HERE/macos-build-requirements.txt"
-"$PY" -m pip -q install --no-deps "$REPO"
+# Build the project with the pinned setuptools above, not one fetched for an
+# isolated build environment.
+"$PY" -m pip -q install --no-build-isolation --no-deps "$REPO"
 SDPC_WHEEL="$("$PY" "$HERE/bundle_sdpc_codec.py" wheel --manifest "$ND2WSI_SDPC_CODEC_MANIFEST")"
 "$PY" -m pip -q install --no-deps --force-reinstall "$SDPC_WHEEL"
 "$PY" "$HERE/verify_sdpc_codec.py" --manifest "$ND2WSI_SDPC_CODEC_MANIFEST"
