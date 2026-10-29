@@ -292,6 +292,20 @@ emit({drawn, ruler: measure.state.tempLine, lastRender: measure.log.renders.at(-
     assert out["landmarks"] == []
 
 
+def test_a_cancelled_move_keeps_a_region_resized_during_the_drag_inside_the_image():
+    # A typed width is applied on blur, during the drag, and slides the
+    # origin back; restoring the pre-drag origin must not push it outside.
+    out = _run(TOOLS + r"""
+const move = fixture();
+move.state.tool = "move"; move.state.roi = {x: 900, y: 100, w: 50, h: 50};
+move.pointer("pointerdown", 10, 20); move.pointer("pointermove", 20, 20);
+Object.assign(move.state.roi, {x: 600, w: 400});  // applyRoiDims mid-drag
+move.state.cancelToolDrag();
+emit(move.state.roi);
+""")
+    assert out == {"x": 600, "y": 100, "w": 400, "h": 50}
+
+
 def test_a_finished_region_move_stays_where_it_was_dropped():
     out = _run(TOOLS + r"""
 const move = fixture();

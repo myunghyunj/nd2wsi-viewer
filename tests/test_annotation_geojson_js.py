@@ -257,13 +257,16 @@ def test_exports_leave_out_sidecar_items_the_viewer_cannot_draw_and_say_so():
       api.exportAnnotationsJSON();api.exportAnnotationsGeoJSON();
       const reopened=await api.openAnnotationFile(file(downloads[1].doc,'slide.annotations.json'));
       return {plain,items:downloads[1].doc.items.map(item=>item.id),features:downloads[2].doc.features.length,
-        messages,reopened};
+        messages,reopened,kept:state.annForeignItems.map(item=>item.id),status:statuses.at(-1)};
     """)
     note = " · 1 item(s) this viewer cannot draw are not included; the sidecar keeps them"
     assert result["plain"] == 0  # nothing to add without such items
     assert result["items"] == ["manual"] and result["features"] == 1
     assert result["messages"] == ["exported 1 annotation" + note, "exported 1 annotation as GeoJSON" + note]
     assert result["reopened"] is True
+    # opening the export again keeps them too, so the note stays true
+    assert result["kept"] == ["odd"]
+    assert result["status"].endswith("1 item(s) this viewer cannot draw stay in the sidecar")
 
 
 def test_an_appended_file_leaves_ids_and_room_for_the_sidecar_items_kept_aside():

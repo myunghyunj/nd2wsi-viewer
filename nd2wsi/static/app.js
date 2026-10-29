@@ -1728,8 +1728,10 @@ function wireTools() {
   const clearDrag = () => {
     const pointer = dragPointer;
     if (moveFrom && state.roi === moveFrom.roi) {
-      state.roi.x = moveFrom.x;
-      state.roi.y = moveFrom.y;
+      // the size may have changed during the drag (a typed width applied on
+      // blur), so the old origin must still keep the region inside the image
+      state.roi.x = Math.max(0, Math.min(moveFrom.x, state.info.width - state.roi.w));
+      state.roi.y = Math.max(0, Math.min(moveFrom.y, state.info.height - state.roi.h));
       moveRoiOverlay();
     }
     start = startImg = dragContext = dragPointer = current = moveFrom = landmarkStart = null;
@@ -3129,8 +3131,9 @@ async function openAnnotationFile(file) {
     const items = window.Nd2AnnotationStore.normalizeItems(parsed.items,
       () => "a" + Date.now().toString(36) + annCounter++);
     if (!append && revision !== state.annRevision) throw new Error("annotations changed while the file was opening");
-    // an append keeps the sidecar's items kept aside, and every save sends them
-    const kept = append ? state.annForeignItems || [] : [];
+    // The sidecar's items kept aside stay, for an append and a replace alike:
+    // the user cannot see or edit them, and every save sends them.
+    const kept = state.annForeignItems || [];
     const usedIds = new Set(state.annotations.concat(kept).map(item => item && item.id));
     const imported = append ? items.map(item => {
       let id;
@@ -3143,13 +3146,12 @@ async function openAnnotationFile(file) {
       throw new Error("the combined annotations exceed the 8 MB import limit");
     }
     if (!append) closeEditor(false);
-    // opening replaces the whole set, including sidecar items kept aside
-    if (!append) state.annForeignItems = [];
     state.annotations = combined;
     annotationsChanged();
     setAnnStatus((append ? "Imported " : "Opened ") + file.name + " (" + imported.length + ")" +
       (append ? " · added to existing annotations" : "") +
-      (verified ? "" : " · source not verified"));
+      (verified ? "" : " · source not verified") +
+      (kept.length ? " · " + kept.length + " item(s) this viewer cannot draw stay in the sidecar" : ""));
     return true;
   } catch (error) {
     showToast("could not open annotations: " + error.message);
@@ -3286,8 +3288,8 @@ function exportAnnotationsJSON() {
 
 // Exports hold the marks this viewer draws. A sidecar's items it cannot draw
 // (state.annForeignItems) are left out: opening a file that holds them is
-// refused, and the viewer never changes them, so they stay in the sidecar
-// even when a save fails. Say so, so nobody takes the file for all of them.
+// refused. The viewer never changes or drops them, opening a file included,
+// so they stay in the sidecar. Say so, so nobody takes the file for all.
 function keptItemsExportNote() {
   const kept = (state.annForeignItems || []).length;
   return kept ? " · " + kept + " item(s) this viewer cannot draw are not included; the sidecar keeps them" : "";

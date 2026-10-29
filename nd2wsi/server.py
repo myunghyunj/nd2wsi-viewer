@@ -1593,14 +1593,19 @@ def content_disposition(filename: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
 
 
-def _sidecar_items(document: Any) -> list:
+def _sidecar_items(document: Any, *, require_items: bool = False) -> list:
     """The items of an annotation sidecar, which must be a JSON object.
 
-    An object without items is an empty sidecar (a missing window snapshot
-    reads as {}); anything else raises ValueError.
+    A window snapshot without items is empty (a missing one reads as {}, and
+    the window writer keeps other keys). A file the browser server rewrites
+    whole on save must name its items (require_items), or a document of some
+    other kind would be replaced by the pane's empty list. Anything else
+    raises ValueError.
     """
     if not isinstance(document, dict):
         raise ValueError("annotation document must be a JSON object")
+    if require_items and "items" not in document:
+        raise ValueError("annotation document has no items list")
     items = document.get("items", [])
     if not isinstance(items, list):
         raise ValueError("annotation items must be a list")
@@ -2247,7 +2252,7 @@ def make_handler(
                     return self._error(500, f"could not read {p.name}: {e}")
             if p.exists():
                 try:
-                    items = _sidecar_items(json.loads(p.read_text(encoding="utf-8")))
+                    items = _sidecar_items(json.loads(p.read_text(encoding="utf-8")), require_items=True)
                 except (ValueError, UnicodeError, OSError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             else:

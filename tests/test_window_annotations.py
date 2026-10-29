@@ -177,8 +177,11 @@ def test_a_sidecar_without_an_items_list_is_refused_not_read_as_empty(source, tm
             status, reply = _request(url)
         replies.append((status, reply.get("items", reply.get("error", "").split(": ")[-1])))
         assert canonical.read_text(encoding="utf-8") == body
+    # a window snapshot without items is empty (the window writer keeps other
+    # keys); the browser server rewrites the whole file, so it refuses one
+    no_items = (200, []) if window else (500, "annotation document has no items list")
     assert replies == [(500, "annotation document must be a JSON object")] * 2 + \
-        [(500, "annotation items must be a list")] * 2 + [(200, [])]
+        [(500, "annotation items must be a list")] * 2 + [no_items]
 
 
 def test_conflict_draft_failure_still_never_overwrites_canonical(source, tmp_path, monkeypatch):
