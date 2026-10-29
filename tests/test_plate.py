@@ -1523,6 +1523,47 @@ def test_the_builder_repairs_an_undecodable_chunk_it_merges_into(plate_nd2, monk
                 assert digest_matches(stored, root["digest"][t, p, z])
 
 
+def test_a_chunk_that_stays_undecodable_after_its_repair_stops_the_build(plate_nd2, monkeypatch):
+    """A drive that corrupts every write of a chunk must not keep the builder
+    rewriting it forever, keeping one more copy of it each round."""
+    import threading
+
+    from zarr.core.buffer import default_buffer_prototype
+
+    from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
+    from nd2wsi.storage.single_file import SQLiteStore
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    first = PlateSource(plate_nd2)
+    try:
+        assert first.store.put(0, 0, 0, first.reduced(0, 0, 0, THUMB_K, persist=False))
+    finally:
+        first.close()
+    container = plate_container(plate_nd2)
+    payload = _test_chunk_entry(container / THUMBS_NAME / "thumbs", (0, 0, 0, 0, 0, 0))
+    payload.write_bytes(b"not-a-valid-zarr-chunk")
+    real = SQLiteStore.set_sync
+
+    def corrupting(self, key, value):
+        if key == "thumbs/0.0.0.0.0.0":
+            value = default_buffer_prototype().buffer.from_bytes(b"garbage" * 3)
+        return real(self, key, value)
+
+    monkeypatch.setattr(SQLiteStore, "set_sync", corrupting)
+    src = PlateSource(plate_nd2)
+    try:
+        builder = threading.Thread(target=src.store._build, daemon=True)
+        builder.start()
+        builder.join(10)
+        stopped = not builder.is_alive()
+        src.store._stop = True
+        builder.join(10)
+    finally:
+        src.close()
+    assert stopped
+    assert len(list(payload.parent.glob(f"{payload.name}.corrupt-*"))) == 1
+
+
 def test_the_builder_stops_between_sites_and_drops_the_staged_chunk(plate_nd2, monkeypatch):
     """A close must not wait for a whole chunk of reductions: the builder
     checks for a stop after every site, and a half-staged chunk is never

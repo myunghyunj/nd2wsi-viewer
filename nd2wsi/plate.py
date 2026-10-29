@@ -132,6 +132,13 @@ def _windows_record(
     }
 
 
+def _finite_number(value: Any) -> bool:
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return False
+
+
 def _stored_windows(manifest: dict[str, Any], source: Any) -> list[dict[str, float]] | None:
     """The default display windows a plate manifest records for ``source``.
 
@@ -163,9 +170,7 @@ def _stored_windows(manifest: dict[str, Any], source: Any) -> list[dict[str, flo
     windows = []
     for entry in entries:
         values = [entry.get(field) for field in _WINDOW_FIELDS] if isinstance(entry, dict) else []
-        if len(values) != len(_WINDOW_FIELDS) or not all(
-            type(v) in (int, float) and math.isfinite(v) for v in values
-        ):
+        if len(values) != len(_WINDOW_FIELDS) or not all(_finite_number(v) for v in values):
             return None
         windows.append({field: float(v) for field, v in zip(_WINDOW_FIELDS, values)})
     return windows
@@ -532,6 +537,7 @@ class PlateStore:
             self._digest = None
             self._digest_np = np.zeros(self._done_np.shape, dtype=np.uint64)
         self._invalid = np.zeros(self._done_np.shape, dtype=bool)
+        self._repaired_chunks: set[tuple[int, int]] = set()  # see put_block
         self._integrity_errors = 0
         self._container_current = True
         self._last_generation_check = time.monotonic()
@@ -1229,8 +1235,11 @@ class PlateStore:
         background builder stages a chunk's missing sites and lands them here
         with one write per array instead of one per site. The order stays
         payload, digest, done, all under ``_lock``. Sites already committed
-        keep their stored bytes, and so does every site not in ``frames``.
-        True when every given site is committed afterwards.
+        keep their stored bytes, and so does every site not in ``frames``,
+        unless the chunk cannot be decoded: then its payload is moved aside,
+        its committed sites are invalidated and the given sites start a fresh
+        chunk (at most once per chunk while this store is open). True when
+        every given site is committed afterwards.
         """
         t, z = int(t), int(z)
         self._refresh()
@@ -1261,7 +1270,13 @@ class PlateStore:
                         # An undecodable shared chunk. As get() does, keep its
                         # payload and fail its sites closed; once it is moved
                         # aside the given sites start a fresh chunk, and the
-                        # walk comes back for the invalidated ones.
+                        # walk comes back for the invalidated ones. A chunk
+                        # still undecodable after that rewrite (a drive that
+                        # corrupts writes) stops the build instead of looping,
+                        # each round keeping another copy of it.
+                        if (t, z) in self._repaired_chunks:
+                            return False
+                        self._repaired_chunks.add((t, z))
                         moved = self._quarantine_shared_payload(t, z)
                         self._invalidate(t, z, committed)
                         if not moved:

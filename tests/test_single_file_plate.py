@@ -456,3 +456,22 @@ def test_background_fill_writes_each_thumbnail_chunk_once(plate_nd2, monkeypatch
                     assert np.all(reopened.store.get(t, p, z) == value(t, p, z))
     finally:
         reopened.close()
+
+
+def test_a_window_record_with_an_oversized_number_is_measured_again():
+    # Hand edits can leave valid JSON that no float can hold; the record must
+    # count as malformed (and be rewritten), not make the store unavailable.
+    from types import SimpleNamespace
+
+    from nd2wsi import plate
+
+    fingerprint = {key: 1 for key in plate._FINGERPRINT_KEYS}
+    source = SimpleNamespace(z_home=0, dtype="uint16", rgb=False, frame_shape=(1, 8, 8))
+    window = {field: 10 ** 400 if n == 0 else 1.0 for n, field in enumerate(plate._WINDOW_FIELDS)}
+    manifest = {"generation": "g", "source": fingerprint, plate.WINDOWS_KEY: {
+        "method": plate.WINDOWS_METHOD, "generation": "g", "source": fingerprint,
+        "t": plate.WINDOWS_T, "z": 0, "k": plate.WINDOWS_K, "dtype": "uint16", "rgb": False,
+        "windows": [window]}}
+    assert plate._stored_windows(manifest, source) is None
+    window[plate._WINDOW_FIELDS[0]] = 2.0
+    assert plate._stored_windows(manifest, source) == [{field: float(window[field]) for field in plate._WINDOW_FIELDS}]
