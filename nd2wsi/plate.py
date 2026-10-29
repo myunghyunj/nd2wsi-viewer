@@ -1255,7 +1255,19 @@ class PlateStore:
                     # The whole chunk is new: write it without reading it.
                     block = np.stack([frames[p] for p in todo])
                 else:
-                    block = np.array(self._thumbs[t, :, z], copy=True)
+                    try:
+                        block = np.array(self._thumbs[t, :, z], copy=True)
+                    except Exception:
+                        # An undecodable shared chunk. As get() does, keep its
+                        # payload and fail its sites closed; once it is moved
+                        # aside the given sites start a fresh chunk, and the
+                        # walk comes back for the invalidated ones.
+                        moved = self._quarantine_shared_payload(t, z)
+                        self._invalidate(t, z, committed)
+                        if not moved:
+                            return False
+                        todo = sorted(frames)
+                        block = np.array(self._thumbs[t, :, z], copy=True)
                     for p in todo:
                         block[p] = frames[p]
                 self._thumbs[t, :, z] = block

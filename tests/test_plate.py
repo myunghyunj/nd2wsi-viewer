@@ -1484,6 +1484,45 @@ def test_put_block_keeps_committed_and_unlisted_sites(plate_nd2, monkeypatch):
         src.close()
 
 
+def test_the_builder_repairs_an_undecodable_chunk_it_merges_into(plate_nd2, monkeypatch):
+    """A chunk that already holds a site is read before the builder merges
+    its staged sites. If that read fails, the chunk is kept aside and its
+    sites invalidated, as a foreground get() does, and the fill goes on:
+    the build must not stop at the first chunk on every open."""
+    from nd2wsi.plate import THUMB_K, THUMBS_NAME, PlateSource, PlateStore, plate_container
+    from nd2wsi.plate_integrity import digest_matches
+
+    monkeypatch.setattr(PlateStore, "start", lambda self: None)
+    first = PlateSource(plate_nd2)
+    try:
+        assert first.store.put(0, 0, 0, first.reduced(0, 0, 0, THUMB_K, persist=False))
+    finally:
+        first.close()
+    container = plate_container(plate_nd2)
+    payload = _test_chunk_entry(container / THUMBS_NAME / "thumbs", (0, 0, 0, 0, 0, 0))
+    payload.write_bytes(b"not-a-valid-zarr-chunk")
+
+    src = PlateSource(plate_nd2)
+    try:
+        assert src.store.is_committed(0, 0, 0)  # nothing has read the chunk yet
+        src.store._build()  # the background pass, run here to completion
+        status = src.store.status()
+        assert status["done"] == T * P * Z, status
+        assert status["integrityErrors"] == 1 and status["repairPending"] == 0
+    finally:
+        src.close()
+
+    root = _open_test_group(container, "r")
+    retained = list(payload.parent.glob(f"{payload.name}.corrupt-*"))
+    assert [entry.read_bytes() for entry in retained] == [b"not-a-valid-zarr-chunk"]
+    for t in range(T):
+        for p in range(P):
+            for z in range(Z):
+                stored = np.asarray(root["thumbs"][t, p, z])
+                assert int(stored[0, 0, 0]) == value(t, p, z)
+                assert digest_matches(stored, root["digest"][t, p, z])
+
+
 def test_the_builder_stops_between_sites_and_drops_the_staged_chunk(plate_nd2, monkeypatch):
     """A close must not wait for a whole chunk of reductions: the builder
     checks for a stop after every site, and a half-staged chunk is never
