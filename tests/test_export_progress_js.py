@@ -120,6 +120,31 @@ return {saving,done,held,hidden:gauge().hidden,polls,later:requests.length,track
     assert out["later"] == out["polls"] and out["tracked"] == [] and out["toasts"] == []
 
 
+def test_an_export_that_finishes_before_its_first_poll_still_shows_done():
+    out = run("""
+progress.a={state:'done',pct:100};
+context.trackExport('a','TIFF');await advance(400);
+const done=gauge(),polls=requests.length;
+await advance(2000);
+return {done,hidden:gauge().hidden,polls,later:requests.length,tracked:tracked(),toasts};
+""")
+    # ND2 and TIFF exports show no toast, so the gauge is the only word they finished
+    assert out["done"] == {"hidden": False, "done": True, "width": "100%", "text": "TIFF done"}
+    assert out["hidden"] is True
+    assert out["polls"] == out["later"] == 1 and out["tracked"] == [] and out["toasts"] == []
+
+
+def test_a_fast_export_does_not_take_the_gauge_from_a_newer_one_that_is_writing():
+    out = run("""
+progress.b={state:'writing',pct:30};held.add('a');
+context.trackExport('a','ND2');context.trackExport('b','TIFF');await advance(400);
+progress.a={state:'done',pct:100};release('a');await advance(0);
+return {gauge:gauge(),tracked:tracked()};
+""")
+    assert out["gauge"] == {"hidden": False, "done": False, "width": "30%", "text": "TIFF 30 %"}
+    assert out["tracked"] == ["b"]
+
+
 def test_a_finished_export_keeps_done_on_the_gauge_before_an_older_export_takes_it_back():
     out = run("""
 progress.a={state:'writing',pct:20};progress.b={state:'writing',pct:50};

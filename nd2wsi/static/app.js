@@ -3894,9 +3894,12 @@ function trackExport(job, label) {
             d.state === "writing" ? label + " " + p + " %" : label + " saving…";
         }
       } else if (d.state === "done") {
+        // an export that finished before its first poll still says it is done
+        entry.shown = true;
         const owned = exportGaugeOwner() === job;
         exportJobs.delete(job);
         if (owned) {
+          cell.hidden = false;
           fill.style.width = "100%";
           cell.classList.add("done");
           pct.textContent = label + " done";
