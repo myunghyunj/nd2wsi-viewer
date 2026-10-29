@@ -734,3 +734,84 @@ def test_boot_time_counts_sleep_on_macos():
     ).stdout
     booted = int(re.search(r"sec = (\d+)", out).group(1))
     assert abs(cache_mod._boot_time() - booted) < 5
+
+
+def _dead_pid():
+    import subprocess
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return child.pid
+
+
+def _legacy_lock_id(b):
+    import hashlib
+    import socket
+
+    return hashlib.sha1(f"{socket.gethostname()}|{b}".encode()).hexdigest()[:12]
+
+
+def _legacy_b_now():
+    import time
+
+    try:
+        return round((time.time() - time.clock_gettime(time.CLOCK_UPTIME_RAW)) / 10)
+    except (AttributeError, OSError, ValueError):
+        return 0
+
+
+def test_a_lock_from_a_2_5_4_viewer_still_running_here_is_judged_by_its_pid(tmp_path):
+    # 2.5.4 hashed the host name with a boot value that drifted with sleep
+    # and wrote no boot time; its live build must survive a 2.5.5 sweep, and
+    # its lock must be reclaimable as soon as that process is gone.
+    import time
+
+    from nd2wsi.cache import sweep_stale_builds
+
+    caches = tmp_path / "caches"
+    family = "a--t0-p0-zmid.nd2svs"
+    staging = caches / f"{family}.building-old"
+    staging.mkdir(parents=True)
+    lock = CacheLock(caches / family)
+    legacy = {"time": time.time(), "gen": "old", "machine": _legacy_lock_id(_legacy_b_now())}
+    lock.path.write_text(json.dumps({**legacy, "pid": os.getpid()}))
+    assert sweep_stale_builds(caches) == 0 and staging.is_dir()
+    assert not CacheLock._stale_info(lock._read(), time.time())
+
+    lock.path.write_text(json.dumps({**legacy, "pid": _dead_pid()}))
+    assert CacheLock._stale_info(lock._read(), time.time())
+    reclaimed = CacheLock(caches / family)
+    reclaimed.acquire(timeout=0)
+    reclaimed.release()
+
+
+def test_a_2_5_4_lock_from_another_host_or_an_earlier_boot_stays_foreign(tmp_path):
+    import hashlib
+    import time
+
+    from nd2wsi import cache as cache_mod
+    from nd2wsi.cache import sweep_stale_builds
+
+    caches = tmp_path / "caches"
+    family = "a--t0-p0-zmid.nd2svs"
+    other_host = hashlib.sha1(f"elsewhere.local|{_legacy_b_now()}".encode()).hexdigest()[:12]
+    earlier_boot = (_legacy_lock_id(round((cache_mod._BOOT_TIME - 7200) / 10))
+                    if hasattr(time, "CLOCK_UPTIME_RAW") and cache_mod._BOOT_TIME is not None else None)
+    for machine in filter(None, (other_host, earlier_boot)):
+        staging = caches / f"{family}.building-x"
+        staging.mkdir(parents=True)
+        CacheLock(caches / family).path.write_text(json.dumps({
+            "pid": os.getpid(), "time": time.time() - 120, "gen": "x", "machine": machine}))
+        assert CacheLock._stale_info(CacheLock(caches / family)._read(), time.time())
+        assert sweep_stale_builds(caches) == 1 and not staging.exists()
+
+
+def test_machine_id_survives_a_host_name_change(monkeypatch):
+    # DHCP or a Bonjour conflict renames a Mac between two windows of a boot.
+    from nd2wsi import cache as cache_mod
+
+    if cache_mod._host_identity() is None:
+        pytest.skip("no hardware or OS machine identity on this platform")
+    before = cache_mod._machine_id()
+    monkeypatch.setattr(cache_mod.socket, "gethostname", lambda: "renamed-2.local")
+    assert cache_mod._machine_id() == before == cache_mod._MACHINE_ID

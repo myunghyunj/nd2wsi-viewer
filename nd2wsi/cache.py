@@ -31,6 +31,7 @@ import re
 import shutil
 import socket
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -65,10 +66,45 @@ ALGORITHM = "box-mean-floor-v1"
 # compared with a tolerance rather than hashed, because each window is its
 # own process: a rounded value flips for one window and not another when
 # the wall clock is stepped, and the sweep would then delete a live build.
+# For the same reason the machine is named by its hardware or OS identity,
+# not its host name, which DHCP or a Bonjour conflict can change between
+# two windows of one boot.
+
+
+def _host_identity() -> str | None:
+    try:
+        if sys.platform == "darwin":
+            import ctypes
+
+            uuid_bytes = ctypes.create_string_buffer(16)
+            wait = (ctypes.c_long * 2)(1, 0)  # struct timespec: give up after 1 s
+            if ctypes.CDLL(None).gethostuuid(uuid_bytes, wait) == 0:
+                return uuid_bytes.raw.hex()
+        elif os.name == "nt":
+            import winreg
+
+            access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0, access) as key:
+                return str(winreg.QueryValueEx(key, "MachineGuid")[0]) or None
+        else:
+            for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+                try:
+                    found = Path(path).read_text(encoding="ascii").strip()
+                except (OSError, UnicodeError):
+                    continue
+                if found:
+                    return found
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return None
 
 
 def _machine_id() -> str:
-    return hashlib.sha1(socket.gethostname().encode()).hexdigest()[:12]
+    """A hash naming this computer; the raw identity never reaches a lockfile."""
+    identity = _host_identity()
+    if identity is None:
+        return hashlib.sha1(socket.gethostname().encode()).hexdigest()[:12]
+    return hashlib.sha1(f"nd2wsi-lock|{identity}".encode()).hexdigest()[:12]
 
 
 def _boot_time() -> float | None:
@@ -98,6 +134,38 @@ _BOOT_TIME = _boot_time()
 # it by at least the previous session's uptime.
 _BOOT_TOLERANCE_S = 120.0
 _FOREIGN_LOCK_STALE_S = 60.0
+# 2.5.4 and older named a lock sha1("host|b")[:12], with b the boot time
+# from CLOCK_UPTIME_RAW in tens of seconds, or 0 where that clock is missing
+# (Windows, Linux), and wrote no boot time. On macOS that b grew by the time
+# slept, so a viewer of that version still running here may have written any
+# b from this boot up to now. Matching every candidate lets its pid decide,
+# rather than treating its live build as a foreign machine's. Beyond this
+# many candidates (about 115 days slept since boot) the oldest are skipped.
+_LEGACY_ID_LIMIT = 1_000_000
+_legacy_ids: dict[str, Any] = {"key": None, "high": None, "ids": set()}
+_legacy_ids_lock = threading.Lock()
+
+
+def _legacy_machine_ids() -> set[str]:
+    host = socket.gethostname()
+
+    def legacy(b: int) -> str:
+        return hashlib.sha1(f"{host}|{b}".encode()).hexdigest()[:12]
+
+    try:
+        drifted = time.time() - time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    except (AttributeError, OSError, ValueError):
+        return {legacy(0)}
+    booted = _BOOT_TIME if _BOOT_TIME is not None else drifted
+    high = round((drifted + _BOOT_TOLERANCE_S) / 10)
+    low = max(round((booted - _BOOT_TOLERANCE_S) / 10), high - _LEGACY_ID_LIMIT)
+    with _legacy_ids_lock:
+        if _legacy_ids["key"] != (host, low) or _legacy_ids["high"] is None:
+            _legacy_ids.update(key=(host, low), high=low - 1, ids=set())
+        ids = _legacy_ids["ids"]
+        ids.update(legacy(b) for b in range(_legacy_ids["high"] + 1, high + 1))
+        _legacy_ids["high"] = max(_legacy_ids["high"], high)
+        return ids
 
 
 class CacheFromNewerApp(RuntimeError):
@@ -385,7 +453,8 @@ def _taken_elsewhere(info: dict[str, Any]) -> bool:
     """True when a lock was taken on another machine or before a reboot."""
     machine = info.get("machine")
     if machine is not None and machine != _MACHINE_ID:
-        return True
+        # a lock from 2.5.4 or older carries no boot time and its own naming
+        return "boot" in info or machine not in _legacy_machine_ids()
     boot = info.get("boot")
     if boot is None or _BOOT_TIME is None:
         return False
