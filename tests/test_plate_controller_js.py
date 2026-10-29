@@ -140,6 +140,24 @@ console.log(JSON.stringify({delays,changes,timers:timers.size}));
     assert out["changes"] == [1, 2, 3, 0, 1] and out["timers"] == 0
 
 
+def test_a_frame_picked_during_playback_gets_its_own_period_and_wait():
+    out = run(r"""
+state.info.plate.T=10;state.info.plate.timesMs=[...Array(10).keys()];control.buildTimeLine();
+shown=false;control.setPlatePlaying(true);
+// the frame on screen has been awaited past the maximum wait when the user steps
+clock+=2100;$('t-next').onclick();
+const picked={t:state.plate.t,pending:timers.size,delay:[...timers.values()][0].ms};
+clock+=200;fire();
+const held={t:state.plate.t,next:[...timers.values()][0].ms};
+shown=true;clock+=16;fire();
+console.log(JSON.stringify({picked,held,stepped:state.plate.t,changes}));
+""")
+    assert out["picked"] == {"t": 1, "pending": 1, "delay": 200}
+    # one period later the picked frame is still loading: playback waits for it
+    assert out["held"] == {"t": 1, "next": 16}
+    assert out["stepped"] == 2 and out["changes"] == [[1, 1], [2, 1]]
+
+
 def test_pausing_while_a_frame_is_awaited_cancels_the_wait_and_keeps_t():
     out = run(r"""
 shown=false;control.setPlatePlaying(true);clock+=200;fire();
