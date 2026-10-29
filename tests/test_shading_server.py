@@ -204,10 +204,12 @@ def test_experimental_opt_in_is_forwarded_only_for_current_private_slide(setup):
     assert response["status"] == 409 and calls == []
 
 
-def test_slide_close_cancels_and_closes_correction_controller(setup):
+def test_slide_close_closes_correction_controller(setup):
+    # close() also cancels running work; cancel() is not called, because it
+    # reports status, which may refresh the pyramid and wait for reads.
     st, _, registry, _, _, calls = setup
     assert registry.remove("12345678")
-    assert calls == ["cancel", "close"] and st._closed
+    assert calls == ["close"] and st._closed
 
 
 def test_busy_export_preserves_committed_pyramid_when_tab_close_is_refused(setup):

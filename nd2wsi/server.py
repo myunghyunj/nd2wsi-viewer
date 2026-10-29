@@ -1147,8 +1147,9 @@ class SlideRegistry:
             if (st is not None and self.window_session is not None
                     and not st.exports.close_if_idle()):
                 raise ValueError("An export from this slide is still running; close it after the export finishes")
-            if st is not None and st._shading is not None:
-                st._shading.cancel()
+            # Shading Correction is closed by _close_state, without waiting:
+            # the controller's cancel() reports status, which may refresh the
+            # pyramid and wait for its reads while this lock is held.
             st = self.slides.pop(sid, None)
             self._retire(st)
         _close_state(st)

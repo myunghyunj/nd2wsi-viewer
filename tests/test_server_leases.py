@@ -315,18 +315,18 @@ def test_previews_and_size_samples_stay_reads_while_large_renders_count(monkeypa
 def test_window_close_refuses_at_once_during_an_export_without_side_effects():
     st = state()
     registry = window_registry(st)
-    cancelled = []
-    st._shading = SimpleNamespace(cancel=lambda: cancelled.append(True), close=lambda: None)
+    stopped = []
+    st._shading = SimpleNamespace(cancel=lambda: stopped.append("cancel"), close=lambda: stopped.append("close"))
     with st.busy, st.exports:
         started = time.monotonic()
         with pytest.raises(ValueError, match="export"):
             registry.remove(SID)
         assert time.monotonic() - started < 0.5  # no drain wait
         assert not st.busy.closed  # tile reads stay admitted
-        assert cancelled == []
+        assert stopped == []
         assert registry.get(SID) is st
     assert registry.remove(SID) is True
-    assert cancelled == [True]
+    assert stopped == ["close"]  # closing a controller also cancels its work
     assert registry.get(SID) is None
 
 
@@ -538,7 +538,7 @@ def test_window_close_lets_a_slow_read_finish_and_closes_the_root_after_it():
         started = time.monotonic()
         assert registry.remove(SID) is True  # a read is not an export
         assert time.monotonic() - started < 0.5  # and the close does not wait for it
-        assert registry.get(SID) is None and calls == ["cancel", "close"]
+        assert registry.get(SID) is None and calls == ["close"]
         assert st.busy.closed and st.exports.closed  # nothing new is admitted
         assert not closed.wait(0.2)  # the read still uses the root
     finally:
@@ -612,10 +612,35 @@ def test_window_close_checks_and_bars_exports_in_one_step():
     except ValueError as exc:  # the close may refuse for the export ...
         assert "export" in str(exc) and lease.arrivals == ["entered"]
         assert registry.get(SID) is st and not st.busy.closed
+        # a refused close leaves later exports on the open tab possible
+        assert not lease.closed
         return
     # ... or the export must be refused; never a close with it running.
     assert removed is True and lease.arrivals == ["refused"]
     assert lease.active == 0 and registry.active_export_count() == 0
+
+
+def test_window_close_never_runs_the_correction_status_refresh():
+    # The controller's cancel() reports status, and an idle controller's
+    # status refreshes the pyramid, which waits up to 30 s for slide reads.
+    # A close must not do that, least of all under the registry lock.
+    st = state()
+    calls = []
+
+    class Controller:
+        def cancel(self):
+            calls.append("cancel")
+            time.sleep(2)
+
+        def close(self):
+            calls.append("close")
+
+    st._shading = Controller()
+    registry = window_registry(st)
+    started = time.monotonic()
+    assert registry.remove(SID) is True
+    assert time.monotonic() - started < 0.5
+    assert calls == ["close"]
 
 
 @pytest.mark.parametrize("where", ["headers", "body"])
