@@ -654,6 +654,9 @@ class SlideRegistry:
 
     def __init__(self, max_render_mpx: float = 400.0, *, window_session=None):
         self.slides: dict[str, ViewerState] = {}  # insertion-ordered
+        # States that left the registry with an export still running; it
+        # counts for close and update until it finishes.
+        self._retired: list[ViewerState] = []
         self.max_render_mpx = max_render_mpx
         self._lock = threading.Lock()
         self.window_session = window_session
@@ -827,6 +830,7 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
+            self._retire(stale)
         _close_state(stale)
         return sid
 
@@ -922,6 +926,7 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
+            self._retire(stale)
         _close_state(stale)
         return sid
 
@@ -996,6 +1001,7 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
+            self._retire(stale)
         _close_state(stale)
         return sid
 
@@ -1084,6 +1090,7 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
+            self._retire(stale)
         _close_state(stale)
         return sid
 
@@ -1143,6 +1150,7 @@ class SlideRegistry:
             if st is not None and st._shading is not None:
                 st._shading.cancel()
             st = self.slides.pop(sid, None)
+            self._retire(st)
         _close_state(st)
         return st is not None
 
@@ -1170,14 +1178,30 @@ class SlideRegistry:
                     pass
             close()
 
+    def _retire(self, st: ViewerState | None) -> None:
+        """Bar exports on a state leaving the registry; keep counting running ones.
+
+        Called under ``self._lock`` in the same step that removes or
+        replaces the state, so an export request that resolved it earlier
+        cannot start afterwards, and one already streaming still counts.
+        """
+        if st is None:
+            return
+        self._retired = [old for old in self._retired if old.exports.active]
+        if not st.exports.close(timeout=0):
+            self._retired.append(st)
+
     def active_export_count(self) -> int:
         """Return the number of real exports which are still running.
 
         Tile, pixel and histogram reads, export previews and size samples
         hold only ``busy``; they never hold back a tab close or an update.
+        An export on a slide that was closed, reopened from a changed file
+        or trashed while it ran counts until it finishes.
         """
         with self._lock:
-            states = list(self.slides.values())
+            self._retired = [st for st in self._retired if st.exports.active]
+            states = [*self.slides.values(), *self._retired]
         return sum(st.exports.active for st in states)
 
     def close_all_for_relaunch(self) -> None:
@@ -1397,6 +1421,7 @@ class SlideRegistry:
                     )
                     if backend_closed:
                         self.slides.pop(sid, None)
+                        self._retire(st)
                     else:
                         st.busy.reopen()
                     raise
@@ -1407,6 +1432,7 @@ class SlideRegistry:
                 # registered state or an absent cache, never install a new state
                 # in the pop-to-rename gap and have it deleted underneath it.
                 self.slides.pop(sid, None)
+                self._retire(st)
                 # Rename while the registry plus both filesystem locks are
                 # held. Current opens cannot bind this soon-to-be-deleted inode.
                 doomed = store.with_name(
