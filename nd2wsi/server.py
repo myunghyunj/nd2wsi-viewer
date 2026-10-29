@@ -188,6 +188,10 @@ class ViewerState:
         self._shading_lock = threading.Lock()
         self._replacement_lock = threading.RLock()
         self._closed = False
+        # Pairs _closed with busy's door and is never held while waiting:
+        # a replacement or refresh that drained reads readmits them only
+        # while the slide is open.
+        self._admission = threading.Lock()
         self.correction_write_allowed = True
         self._cache_identity = self._pyramid_identity()
 
@@ -206,24 +210,34 @@ class ViewerState:
             return self._shading
 
     def close_shading(self, *, blocking: bool = True) -> bool:
-        """Close Shading Correction, then mark the slide closed for replacements.
+        """Close Shading Correction, mark the slide closed and bar its reads.
 
-        A pyramid replacement or refresh holds the replacement lock while it
-        drains reads, for up to 30 s. With ``blocking`` False this returns
-        False instead of waiting for it: the controller is closed, but the
-        slide is not marked closed until a later blocking call.
+        None of that waits. A pyramid replacement or refresh already past
+        its closed check holds the replacement lock while it drains reads,
+        for up to 30 s; it still finishes, but can no longer readmit reads.
+        With ``blocking`` this then waits for it to let go; with
+        ``blocking`` False it returns False while one holds the lock.
         """
         with self._shading_lock:
             self._shading_closed = True
             if self._shading is not None:
                 self._shading.close()
+        self._mark_closed()
         if not self._replacement_lock.acquire(blocking=blocking):
             return False
-        try:
-            self._closed = True
-        finally:
-            self._replacement_lock.release()
+        self._replacement_lock.release()
         return True
+
+    def _mark_closed(self) -> None:
+        with self._admission:
+            self._closed = True
+            self.busy.close(timeout=0)
+
+    def _readmit(self) -> None:
+        """Admit reads after a replacement drained them, unless the slide closed."""
+        with self._admission:
+            if not self._closed:
+                self.busy.reopen()
 
     def _pyramid_identity(self):
         path = self.cache_path
@@ -267,7 +281,7 @@ class ViewerState:
             probe, _ = self._open_pyramid(replacement.staging, replacement.manifest)
             self._close_root(probe)
             if not self.busy.close(timeout=30):
-                self.busy.reopen()
+                self._readmit()
                 raise ValueError("A slide read/export is still running; retry the replacement")
             admitted = False
             try:
@@ -294,7 +308,7 @@ class ViewerState:
                 # If the OS denies reopening after a successful publish, the
                 # validated cache remains on disk. Keep reads barred until reopen.
                 if admitted:
-                    self.busy.reopen()
+                    self._readmit()
 
     def refresh_pyramid(self):
         """Observe another window's atomic replacement without resetting sidecars."""
@@ -317,13 +331,13 @@ class ViewerState:
             root, attrs = self._open_pyramid(self.cache_path, manifest)
             if not self.busy.close(timeout=30):
                 self._close_root(root)
-                self.busy.reopen()
+                self._readmit()
                 raise ValueError("Waiting for slide reads before opening the replaced pyramid")
             try:
                 self._close_root(self.root)
                 self._adopt_pyramid(root, attrs, manifest)
             finally:
-                self.busy.reopen()
+                self._readmit()
 
     @property
     def source_path(self) -> Path | None:
@@ -602,10 +616,10 @@ def _close_state(st: ViewerState | None) -> None:
     if st is None:
         return
     st.exports.close(timeout=0)
-    # Busy is barred only after the state is marked closed under the
-    # replacement lock, so no pyramid replacement or refresh can swap the
-    # root or reopen busy later. While one holds that lock and drains reads,
-    # the rest of the close runs in the background, in the same order.
+    # The slide is marked closed and its reads barred at once, so a pyramid
+    # replacement or refresh still running can no longer readmit them. While
+    # one holds the replacement lock it may still swap the root, so the root
+    # closes in the background once it has let go and no read is left.
     marked = st.close_shading(blocking=False)
     if marked and st.busy.close(timeout=0):
         _close_root(st.root)
@@ -613,7 +627,7 @@ def _close_state(st: ViewerState | None) -> None:
 
     def close_after_reads() -> None:
         if not marked:
-            st.close_shading()
+            st.close_shading()  # waits for the replacement or refresh
         st.busy.close(timeout=None)
         _close_root(st.root)
 
@@ -1377,14 +1391,21 @@ class SlideRegistry:
                         "this viewer lost the plate cache writer — reopen the "
                         "slide before deleting"
                     )
-                if not st.busy.close(timeout=30):
-                    # No resource was closed or renamed. Restore admission so a
-                    # timed-out delete cannot leave a listed but unusable slide.
-                    st.busy.reopen()
-                    raise ValueError(
-                        "an export from this slide did not finish in time — "
-                        "try again when it finishes"
-                    )
+                # A refresh after another window's rebuild must not swap the
+                # root or readmit reads between the drain and the slide being
+                # marked closed, so both happen under its lock. The correction
+                # controller closes after it: its cancel() refreshes while
+                # holding the controller's own lock.
+                with st._replacement_lock:
+                    if not st.busy.close(timeout=30):
+                        # No resource was closed or renamed. Restore admission so a
+                        # timed-out delete cannot leave a listed but unusable slide.
+                        st.busy.reopen()
+                        raise ValueError(
+                            "an export from this slide did not finish in time — "
+                            "try again when it finishes"
+                        )
+                    st._mark_closed()
 
                 try:
                     st.close_shading()

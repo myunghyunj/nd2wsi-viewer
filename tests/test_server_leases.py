@@ -767,6 +767,156 @@ def test_window_close_does_not_wait_for_a_replacement_draining_reads():
     assert st._closed and st.busy.closed
 
 
+class _RecordedRoot(dict):
+    def __init__(self, name, closes):
+        super().__init__()
+        self.name, self.closes = name, closes
+
+    def close(self, delay=None):
+        self.closes.append(self.name)
+
+
+def _admissions_after(st, left):
+    """Reads busy admits after ``left()`` says the slide has left the registry."""
+    admitted, reopen = [], st.busy.reopen
+
+    def spy():
+        reopen()
+        if not left():
+            return
+        try:
+            st.busy.__enter__()
+        except ValueError:
+            return
+        admitted.append(True)
+        st.busy.__exit__(None, None, None)
+
+    st.busy.reopen = spy
+    return admitted
+
+
+def test_window_close_while_a_replacement_holds_its_lock_bars_reads_at_once():
+    st = state()
+    closes = []
+    st.root = _RecordedRoot("old", closes)
+    registry = window_registry(st)
+    probing, release = threading.Event(), threading.Event()
+    opened = iter(["probe", "new"])
+
+    def open_pyramid(path, manifest):
+        name = next(opened)
+        if name == "probe":  # validating the staged pyramid, before any drain
+            probing.set()
+            assert release.wait(5)
+        return _RecordedRoot(name, closes), st.attrs
+
+    class Replacement:
+        staging = final = "staged"
+        manifest = prior_manifest = {"generation": "corrected"}
+
+        def publish(self):
+            pass
+
+    st._open_pyramid = open_pyramid
+    replacing = threading.Thread(target=st.replace_pyramid, args=(Replacement(),))
+    replacing.start()
+    assert probing.wait(5)
+    admitted = _admissions_after(st, lambda: registry.get(SID) is None)
+    try:
+        assert registry.remove(SID) is True
+        # A request that resolved the slide before the close cannot read now.
+        assert st._closed and st.busy.closed
+        with pytest.raises(ValueError, match="closed"):
+            st.busy.__enter__()
+    finally:
+        release.set()
+        replacing.join(5)
+    assert not replacing.is_alive() and st.generation == "corrected"
+    # The replacement finished but never readmitted reads, and the new root
+    # closes once it has let go.
+    assert _wait_until(lambda: closes == ["probe", "old", "new"])
+    assert admitted == [] and st.busy.closed
+
+
+def test_a_refresh_that_finishes_after_a_window_close_does_not_readmit_reads(monkeypatch, tmp_path):
+    container = tmp_path / "slide.nd2svs"
+    container.write_bytes(b"first")
+    st = ViewerState({}, state().attrs, container_path=container, manifest={"generation": "g1"})
+    closes = []
+    swapping, release = threading.Event(), threading.Event()
+
+    class OldRoot(dict):
+        def close(self, delay=None):
+            closes.append("old")
+            swapping.set()  # the refresh has drained reads and holds busy closed
+            assert release.wait(5)
+
+    st.root = OldRoot()
+    registry = window_registry(st)
+    time.sleep(0.01)
+    container.write_bytes(b"replaced by another window")
+    monkeypatch.setattr(cache, "read_manifest", lambda path, recover=False: {"generation": "g2"})
+    st._open_pyramid = lambda path, manifest: (_RecordedRoot("new", closes), st.attrs)
+    refreshing = threading.Thread(target=st.refresh_pyramid)
+    refreshing.start()
+    assert swapping.wait(5)
+    admitted = _admissions_after(st, lambda: registry.get(SID) is None)
+    try:
+        assert registry.remove(SID) is True
+    finally:
+        release.set()
+        refreshing.join(5)
+    assert not refreshing.is_alive() and st.generation == "g2"
+    assert _wait_until(lambda: closes == ["old", "new"])
+    assert admitted == [] and st.busy.closed
+
+
+def test_cache_trash_bars_reads_for_good_when_a_refresh_runs_meanwhile(monkeypatch, tmp_path):
+    container = tmp_path / "slide.nd2svs"
+    container.write_bytes(b"first")
+    closes = []
+    st = ViewerState(_RecordedRoot("old", closes), state().attrs, trash_path=container,
+                     container_path=container, manifest={"generation": "g1"})
+    registry = SlideRegistry()  # cache removal is a browser-mode action
+    registry.slides[SID] = st
+    monkeypatch.setattr(server, "_validate_file_cache_for_trash", lambda path, manifest: None)
+    time.sleep(0.01)
+    container.write_bytes(b"replaced by another window")
+    monkeypatch.setattr(cache, "read_manifest", lambda path, recover=False: {"generation": "g2"})
+    opening, release = threading.Event(), threading.Event()
+
+    def open_pyramid(path, manifest):
+        opening.set()  # holding the replacement lock
+        assert release.wait(5)
+        return _RecordedRoot("new", closes), st.attrs
+
+    st._open_pyramid = open_pyramid
+    refreshing = threading.Thread(target=st.refresh_pyramid)  # a status poll
+    refreshing.start()
+    assert opening.wait(5)
+    errors = []
+
+    def trash():
+        try:
+            registry.trash_cache(SID)
+        except BaseException as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+
+    trashing = threading.Thread(target=trash)
+    trashing.start()
+    time.sleep(0.2)  # the trash reaches its drain while the refresh holds the lock
+    release.set()
+    refreshing.join(5)
+    trashing.join(10)
+    assert not refreshing.is_alive() and not trashing.is_alive() and errors == []
+    assert registry.get(SID) is None and not container.exists()
+    # The refreshed root is the one closed, and no read is admitted again.
+    assert closes == ["old", "new"]
+    assert st._closed and st.busy.closed
+    with pytest.raises(ValueError, match="closed"):
+        st.busy.__enter__()
+
+
 def test_a_reopened_slide_closes_its_replaced_root_only_after_reads_end(monkeypatch, tmp_path):
     image = tmp_path / "slide.png"
     image.write_bytes(b"not decoded")
