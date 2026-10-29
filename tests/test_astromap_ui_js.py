@@ -637,6 +637,31 @@ return {before,after:{note:row.note.value,stored:c.state.annotations[0].text,sav
     }
 
 
+def test_a_region_note_typed_in_the_list_is_not_reverted_by_the_open_label_editor():
+    out = _run_export(r"""
+const f=fixture(),c=f.c;
+function node() {
+  return {children:[],attrs:{},classList:{toggle(){}},setAttribute(k,v){this.attrs[k]=v;},
+    append(...items){this.children.push(...items);},remove(){},
+    insertBefore(item,before){this.children.push(item);}};
+}
+c.document.createElement=()=>node();c.state.astromap.rows=new Map();
+Object.assign(c.state.info,{width:1000,height:500});
+f.nodes.set('astromap-list',node());
+f.nodes.set('ann-editor',{hidden:false});f.nodes.set('ann-text',{value:''});
+c.state.annotations=[{id:'region',type:'box',astromap:true,x:0,y:0,w:10,h:10,text:''}];
+c.state.editingId='region';
+c.astromapItems=()=>c.state.annotations;c.frameOwnsRoi=()=>true;c.postAstromapState=()=>{};
+c.annotationsChanged=()=>c.refreshAstromapPanel();
+vm.runInContext(production('refreshAstromapPanel'),c);
+c.refreshAstromapPanel();
+const row=c.state.astromap.rows.get('region');
+c.document.activeElement=row.note;row.note.value='tumor';row.note.oninput();
+return {stored:c.state.annotations[0].text,editor:f.nodes.get('ann-text').value};
+""")
+    assert out == {"stored": "tumor", "editor": "tumor"}
+
+
 def test_clear_all_removes_only_astromap_regions_with_one_revision_render_and_save():
     pane = (STATIC / "index.html").read_text(encoding="utf-8")
     assert pane.index('id="astromap-list"') < pane.index('id="astromap-clear-all"') < pane.index('id="astromap-export"')

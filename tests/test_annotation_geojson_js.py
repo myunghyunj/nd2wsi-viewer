@@ -32,7 +32,7 @@ vm.runInContext('let annCounter=0;\n'+
   section('async function openAnnotationFile','function downloadJsonFile')+
   section('function annotationFeature','function safeFilenamePart')+
   section('function exportAnnotationsGeoJSON','function rebuildAnnList')+
-  '\nthis.api={openAnnotationFile,annotationFeature,annotationsToGeoJSON,annotationDocument,annotationItemsForThisSlide,exportAnnotationsGeoJSON};',context);
+  '\nthis.api={openAnnotationFile,annotationFeature,annotationsToGeoJSON,annotationDocument,annotationItemsForThisSlide,exportAnnotationsGeoJSON,exportAnnotationsJSON};',context);
 const api=context.api;
 const feature=(geometry,properties={name:'ROI'})=>({type:'Feature',geometry,properties});
 const collection=features=>({type:'FeatureCollection',features});
@@ -235,6 +235,56 @@ def test_native_file_colors_and_missing_ids_are_repaired_on_open():
     """)
     assert result == {"accepted": True, "colors": [None, None, None, None], "text": "12",
                       "unique": True, "kept": "dup"}
+
+
+def test_geojson_export_includes_the_label_still_being_typed():
+    result = run("""
+      element('ann-editor').hidden=false;
+      context.closeEditor=()=>{state.annotations[0].text='typed, not yet entered';element('ann-editor').hidden=true;};
+      api.exportAnnotationsGeoJSON();
+      return {name:downloads[0].doc.features[0].properties.name,editorOpen:!element('ann-editor').hidden};
+    """)
+    assert result == {"name": "typed, not yet entered", "editorOpen": False}
+
+
+def test_exports_leave_out_sidecar_items_the_viewer_cannot_draw_and_say_so():
+    # A file holding them would be refused when opened again; the sidecar
+    # keeps them, since this viewer never changes them.
+    result = run("""
+      api.exportAnnotationsJSON();
+      const plain=messages.length;
+      state.annForeignItems=[{id:'odd',type:'ellipse',cx:1,cy:2,r:3}];
+      api.exportAnnotationsJSON();api.exportAnnotationsGeoJSON();
+      const reopened=await api.openAnnotationFile(file(downloads[1].doc,'slide.annotations.json'));
+      return {plain,items:downloads[1].doc.items.map(item=>item.id),features:downloads[2].doc.features.length,
+        messages,reopened,kept:state.annForeignItems.map(item=>item.id),status:statuses.at(-1)};
+    """)
+    note = " · 1 item(s) this viewer cannot draw are not included; the sidecar keeps them"
+    assert result["plain"] == 0  # nothing to add without such items
+    assert result["items"] == ["manual"] and result["features"] == 1
+    assert result["messages"] == ["exported 1 annotation" + note, "exported 1 annotation as GeoJSON" + note]
+    assert result["reopened"] is True
+    # opening the export again keeps them too, so the note stays true
+    assert result["kept"] == ["odd"]
+    assert result["status"].endswith("1 item(s) this viewer cannot draw stay in the sidecar")
+
+
+def test_an_appended_file_leaves_ids_and_room_for_the_sidecar_items_kept_aside():
+    # Every save sends the kept items with the marks, so they count too.
+    result = run("""
+      context.Date={now:()=>0};
+      state.annForeignItems=Array.from({length:10},(_,i)=>({id:'a0'+i,type:'ellipse'}));
+      const accepted=await api.openAnnotationFile(file(feature({type:'Point',coordinates:[1,2]})));
+      const imported=state.annotations.at(-1).id;
+      state.annForeignItems=[{id:'large',type:'ellipse',note:'x'.repeat(geo.MAX_BYTES-200)}];
+      const before=JSON.stringify(state.annotations);
+      const large=await api.openAnnotationFile(file(feature({type:'Point',coordinates:[3,4]})));
+      return {accepted,imported,large,unchanged:before===JSON.stringify(state.annotations),error:messages.at(-1)};
+    """)
+    assert result["accepted"] is True
+    assert result["imported"] not in {f"a0{i}" for i in range(10)}
+    assert result["large"] is False and result["unchanged"] is True
+    assert result["error"] == "could not open annotations: the combined annotations exceed the 8 MB import limit"
 
 
 def test_geojson_export_adds_source_binding_and_roundtrip_validates_it():

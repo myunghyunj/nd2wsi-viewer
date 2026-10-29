@@ -413,10 +413,12 @@ async function initializeDisplayLuts() {
 }
 
 function initializeLutAuto() {
-  const nd2 = /\.nd2$/i.test(String(state.info.name || ""));
-  state.lutAutoRange = nd2;
+  // A single-channel 16-bit PNG is fitted like an ND2 channel; RGB images
+  // keep their fixed 0-255 axis.
+  const fitted = /\.nd2$/i.test(String(state.info.name || "")) || (!!state.info.raster && !state.info.rgb);
+  state.lutAutoRange = fitted;
   state.lutAutoPending = state.info.channels.map((_, i) =>
-    nd2 && !state.initialViewHandoff && !state.luts[i]);
+    fitted && !state.initialViewHandoff && !state.luts[i]);
 }
 
 function acceptLutHistograms(channels) {
@@ -1716,15 +1718,29 @@ function wireTools() {
   $("tool-box").title = "Source-aligned rectangle";
   $("tool-box").onclick = () => setTool("box");
 
-  let moveFrom = null; // roi origin at drag start (move mode)
+  let moveFrom = null; // roi and its origin at drag start (move mode)
   let landmarkStart = null; // a click, not a drag, places an alignment point
   const drawStart = () => state.tool === "astromap"
     ? imageToViewerElementPoint(startImg) : start;
+  // Ends a gesture; one that did not finish (a tool change, a lost pointer,
+  // an update freezing the pane) leaves nothing behind: a moved region goes
+  // back, the live ruler goes, and a pending landmark click is dropped.
   const clearDrag = () => {
     const pointer = dragPointer;
-    start = startImg = dragContext = dragPointer = current = moveFrom = null;
+    if (moveFrom && state.roi === moveFrom.roi) {
+      // the size may have changed during the drag (a typed width applied on
+      // blur), so the old origin must still keep the region inside the image
+      state.roi.x = Math.max(0, Math.min(moveFrom.x, state.info.width - state.roi.w));
+      state.roi.y = Math.max(0, Math.min(moveFrom.y, state.info.height - state.roi.h));
+      moveRoiOverlay();
+    }
+    start = startImg = dragContext = dragPointer = current = moveFrom = landmarkStart = null;
     rubber.style.display = "none";
     stage.classList.remove("grabbing");
+    if (state.tempLine) {
+      state.tempLine = null;
+      renderAnnotations();
+    }
     try { if (pointer !== null) stage.releasePointerCapture(pointer); } catch (_) { /* optional */ }
   };
   state.cancelToolDrag = clearDrag;
@@ -1754,7 +1770,7 @@ function wireTools() {
     dragContext = activeFrameContext()?.key;
     dragPointer = ev.pointerId;
     if (state.tool === "move") {
-      moveFrom = { x: state.roi.x, y: state.roi.y };
+      moveFrom = { roi: state.roi, x: state.roi.x, y: state.roi.y };
       stage.classList.add("grabbing");
     }
     if (state.tool === "roi" || state.tool === "box" || state.tool === "astromap") {
@@ -2022,7 +2038,11 @@ function refreshAstromapPanel() {
       };
       note.oninput = () => {
         const item = find(); if (!item || !astromapReady()) return;
-        item.text = note.value; annotationsChanged();
+        item.text = note.value;
+        // the label editor open on this region would otherwise write its
+        // older text back when it closes
+        if (state.editingId === item.id && !$("ann-editor").hidden) $("ann-text").value = note.value;
+        annotationsChanged();
       };
       number.onclick = () => selectAstromapRoi(a.id);
       remove.onclick = () => { if (astromapReady() && find()) removeAnnotation(a.id); };
@@ -2353,6 +2373,8 @@ function saveAnnotations(site) {
 
 async function flushAnnotationsForUpdate() {
   if (!$('ann-editor').hidden) closeEditor(true);
+  // A mark still being dragged would land after editing froze, unsaved.
+  state.cancelToolDrag?.();
   state.quitPreparing = true;
   await annotationStore.flushForUpdate();
 }
@@ -3080,17 +3102,7 @@ function wireAnnotationPanel() {
     ev.stopPropagation();
   });
 
-  $("ann-export").onclick = () => {
-    if (!annotationOwnerReady()) {
-      showToast("Choose a site before exporting annotations");
-      return;
-    }
-    downloadJsonFile(
-      annotationDocument(),
-      state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
-      "application/json"
-    );
-  };
+  $("ann-export").onclick = exportAnnotationsJSON;
   $("ann-geojson").onclick = exportAnnotationsGeoJSON;
   $("ann-open").onclick = () => {
     if (annLocked() || state.quitPreparing) showToast("Annotations are currently locked or unavailable");
@@ -3119,7 +3131,10 @@ async function openAnnotationFile(file) {
     const items = window.Nd2AnnotationStore.normalizeItems(parsed.items,
       () => "a" + Date.now().toString(36) + annCounter++);
     if (!append && revision !== state.annRevision) throw new Error("annotations changed while the file was opening");
-    const usedIds = new Set(state.annotations.map(item => item.id));
+    // The sidecar's items kept aside stay, for an append and a replace alike:
+    // the user cannot see or edit them, and every save sends them.
+    const kept = state.annForeignItems || [];
+    const usedIds = new Set(state.annotations.concat(kept).map(item => item && item.id));
     const imported = append ? items.map(item => {
       let id;
       do { id = "a" + Date.now().toString(36) + annCounter++; } while (usedIds.has(id));
@@ -3127,7 +3142,7 @@ async function openAnnotationFile(file) {
       return { ...item, id };
     }) : items;
     const combined = append ? state.annotations.concat(imported) : imported;
-    if (new Blob([JSON.stringify({ items: combined })]).size > window.Nd2AnnotationGeoJSON.MAX_BYTES) {
+    if (new Blob([JSON.stringify({ items: combined.concat(kept) })]).size > window.Nd2AnnotationGeoJSON.MAX_BYTES) {
       throw new Error("the combined annotations exceed the 8 MB import limit");
     }
     if (!append) closeEditor(false);
@@ -3135,7 +3150,8 @@ async function openAnnotationFile(file) {
     annotationsChanged();
     setAnnStatus((append ? "Imported " : "Opened ") + file.name + " (" + imported.length + ")" +
       (append ? " · added to existing annotations" : "") +
-      (verified ? "" : " · source not verified"));
+      (verified ? "" : " · source not verified") +
+      (kept.length ? " · " + kept.length + " item(s) this viewer cannot draw stay in the sidecar" : ""));
     return true;
   } catch (error) {
     showToast("could not open annotations: " + error.message);
@@ -3244,13 +3260,39 @@ function exportAnnotationsGeoJSON() {
     showToast("Choose a site before exporting annotations");
     return;
   }
+  if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
   const doc = annotationsToGeoJSON(state.annotations);
   const owner = annotationDocument();
   doc.coordinate_space = owner.coordinate_space;
   doc.source = owner.source;
   doc.selection = owner.selection;
   downloadJsonFile(doc, geojsonFilename(state.info), "application/geo+json");
-  showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON");
+  showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON" +
+    keptItemsExportNote());
+}
+
+function exportAnnotationsJSON() {
+  if (!annotationOwnerReady()) {
+    showToast("Choose a site before exporting annotations");
+    return;
+  }
+  if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
+  downloadJsonFile(
+    annotationDocument(),
+    state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
+    "application/json"
+  );
+  const note = keptItemsExportNote();
+  if (note) showToast("exported " + state.annotations.length + " annotation" + (state.annotations.length === 1 ? "" : "s") + note);
+}
+
+// Exports hold the marks this viewer draws. A sidecar's items it cannot draw
+// (state.annForeignItems) are left out: opening a file that holds them is
+// refused. The viewer never changes or drops them, opening a file included,
+// so they stay in the sidecar. Say so, so nobody takes the file for all.
+function keptItemsExportNote() {
+  const kept = (state.annForeignItems || []).length;
+  return kept ? " · " + kept + " item(s) this viewer cannot draw are not included; the sidecar keeps them" : "";
 }
 
 function annotationDocument() {
@@ -3504,7 +3546,9 @@ function clearRoi() {
   state.roi = null;
   state.roiSite = null;
   state.renderScale = null;
-  scaleSeq += 1;
+  // with no region the strip empties: its pending refresh and requests stop,
+  // and its preview images are released
+  updateScaleStrip();
   if (state.roiOverlayEl) {
     state.roiOverlayEl.remove();
     state.roiOverlayEl = null;
@@ -3881,9 +3925,12 @@ function trackExport(job, label) {
             d.state === "writing" ? label + " " + p + " %" : label + " saving…";
         }
       } else if (d.state === "done") {
+        // an export that finished before its first poll still says it is done
+        entry.shown = true;
         const owned = exportGaugeOwner() === job;
         exportJobs.delete(job);
         if (owned) {
+          cell.hidden = false;
           fill.style.width = "100%";
           cell.classList.add("done");
           pct.textContent = label + " done";

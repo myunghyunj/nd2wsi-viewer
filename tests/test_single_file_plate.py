@@ -289,6 +289,36 @@ def test_a_stale_windows_record_is_measured_again_and_replaced(plate_nd2, monkey
     assert record["windows"] == measured
 
 
+def test_recorded_windows_survive_a_rebuild_of_their_cache(plate_nd2, monkeypatch):
+    """Windows read from a record are still kept when the store then finds
+    its arrays unreadable and rebuilds the cache: the fresh manifest records
+    them again, so the next open does not measure every site once more."""
+    first = PlateSource(plate_nd2)
+    try:
+        measured = _windows(first)
+    finally:
+        first.close()
+    path = plate_container(plate_nd2)
+    assert WINDOWS_KEY in read_manifest(path)
+    write_entry(path, "thumbs.zarr/done/.zarray", b"not json")
+
+    monkeypatch.setattr(PlateSource, "_measure_windows", _no_measuring)
+    rebuilt = PlateSource(plate_nd2)
+    try:
+        assert _windows(rebuilt) == measured
+        assert list(path.parent.glob(path.name + ".corrupt-*"))  # it was rebuilt
+    finally:
+        rebuilt.close()
+    manifest = read_manifest(path)
+    assert manifest[WINDOWS_KEY]["generation"] == manifest["generation"]
+    assert manifest[WINDOWS_KEY]["windows"] == measured
+    again = PlateSource(plate_nd2)
+    try:
+        assert _windows(again) == measured
+    finally:
+        again.close()
+
+
 def _listing(folder):
     return sorted(p.name for p in folder.iterdir()) if folder.exists() else None
 
@@ -426,3 +456,22 @@ def test_background_fill_writes_each_thumbnail_chunk_once(plate_nd2, monkeypatch
                     assert np.all(reopened.store.get(t, p, z) == value(t, p, z))
     finally:
         reopened.close()
+
+
+def test_a_window_record_with_an_oversized_number_is_measured_again():
+    # Hand edits can leave valid JSON that no float can hold; the record must
+    # count as malformed (and be rewritten), not make the store unavailable.
+    from types import SimpleNamespace
+
+    from nd2wsi import plate
+
+    fingerprint = {key: 1 for key in plate._FINGERPRINT_KEYS}
+    source = SimpleNamespace(z_home=0, dtype="uint16", rgb=False, frame_shape=(1, 8, 8))
+    window = {field: 10 ** 400 if n == 0 else 1.0 for n, field in enumerate(plate._WINDOW_FIELDS)}
+    manifest = {"generation": "g", "source": fingerprint, plate.WINDOWS_KEY: {
+        "method": plate.WINDOWS_METHOD, "generation": "g", "source": fingerprint,
+        "t": plate.WINDOWS_T, "z": 0, "k": plate.WINDOWS_K, "dtype": "uint16", "rgb": False,
+        "windows": [window]}}
+    assert plate._stored_windows(manifest, source) is None
+    window[plate._WINDOW_FIELDS[0]] = 2.0
+    assert plate._stored_windows(manifest, source) == [{field: float(window[field]) for field in plate._WINDOW_FIELDS}]

@@ -264,7 +264,7 @@ def test_save_in_flight_during_switch_finishes_first_and_cannot_dirty_the_new_ow
   ]));
   state.plate.focus = 0;
   await store.switchOwner(0);
-  state.annotations = [{id: "late-a"}];
+  state.annotations = [{id: "late-a", type: "pin", x: 1, y: 2}];
   store.markDirty();
   server.hold = true;
   server.failPost = 503;

@@ -119,7 +119,8 @@ def test_exits_nothing_hard_ends_keep_the_strict_unbounded_teardown(monkeypatch,
 def run_native_main(monkeypatch, tmp_path, api, argv):
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path))
-    create = Mock(return_value=(api, object()))
+    # main() sets attributes on the window, as on pywebview's
+    create = Mock(return_value=(api, SimpleNamespace()))
     monkeypatch.setattr(app, "create_app_window", create)
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(start=Mock()))
     result = app.main(argv)
@@ -192,6 +193,60 @@ def test_gui_smoke_main_waits_for_the_whole_teardown_on_its_own_thread(monkeypat
     assert seen == [caller]
     assert not unfinished.is_set()
     assert json.loads((session.root / "session.json").read_text(encoding="utf-8"))["state"] == "closed"
+
+
+def failing_teardown_api():
+    def stop_server_for_update():
+        raise OSError("plate writer lease already gone")
+
+    return SimpleNamespace(_startup_error=None, stop_server_for_update=stop_server_for_update)
+
+
+def test_a_failed_teardown_still_writes_the_smoke_report_and_fails_it(monkeypatch, tmp_path, unfinished, under_run,
+                                                                        capsys):
+    monkeypatch.setattr(app, "_dlog", Mock())
+    api = failing_teardown_api()
+    api._gui_smoke_report = {"ok": True, "checks": ["window shown"]}  # the GUI checks passed
+    path = tmp_path / "report" / "smoke.json"
+    result, session = run_native_main(monkeypatch, tmp_path / "sessions", api,
+                                      ["--gui-smoke", "--smoke-report", str(path)])
+    assert result == 4
+    report = json.loads(path.read_text(encoding="utf-8"))
+    failed = "Server teardown failed: OSError: plate writer lease already gone"
+    assert report == {"ok": False, "checks": ["window shown"], "teardown_error": failed, "error": failed}
+    assert json.loads(capsys.readouterr().out) == report
+    assert json.loads((session.root / "session.json").read_text(encoding="utf-8"))["state"] == "closed"
+    app._dlog.assert_any_call("exit: server teardown failed: OSError('plate writer lease already gone')")
+
+
+def test_a_failed_teardown_after_a_finished_browser_replay_fails_the_run_visibly(monkeypatch, tmp_path, unfinished,
+                                                                                 under_run, capsys):
+    # The replay wrote its own report before the window closed; the run
+    # must still fail, with the reason on stderr for the capturing script.
+    monkeypatch.setattr(app, "_dlog", Mock())
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "slide.nd2").write_bytes(b"")
+    report = tmp_path / "replay.json"
+    api = failing_teardown_api()
+    api._browser_replay_report = {"ok": True, "samples": [1, 2]}
+    result, _ = run_native_main(monkeypatch, tmp_path / "sessions", api, [
+        "--agent-window", "--browser-replay-report", str(report), "--benchmark-context", str(tmp_path / "ctx.json"),
+        "--benchmark-test-root", str(root), str(root / "slide.nd2")])
+    # The replay ran and passed, so only the teardown fails the run.
+    assert sys.modules["webview"].start.call_count == 1
+    assert result == 4
+    assert capsys.readouterr().err.splitlines() == ["Server teardown failed: OSError: plate writer lease already gone"]
+    assert not report.exists()  # the replay's own file is left as it wrote it
+
+
+def test_a_failed_teardown_after_an_interactive_close_is_logged_not_raised(monkeypatch, tmp_path, unfinished,
+                                                                            under_run):
+    monkeypatch.setattr(app, "_dlog", Mock())
+    result, session = run_native_main(monkeypatch, tmp_path, failing_teardown_api(), ["--agent-window"])
+    assert result == 0  # main() returns, so run() still decides how the process ends
+    assert json.loads((session.root / "session.json").read_text(encoding="utf-8"))["state"] == "closed"
+    app._dlog.assert_any_call("exit: server teardown failed: OSError('plate writer lease already gone')")
 
 
 @pytest.mark.parametrize("left_unfinished", [True, False])

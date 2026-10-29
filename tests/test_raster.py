@@ -298,13 +298,72 @@ def test_16_bit_grayscale_png_keeps_its_values_through_probe_and_tiff_export(tmp
 
         info = json.loads(get("/api/info"))
         assert (info["rgb"], info["dtype"], len(info["channels"])) == (False, "uint16", 1)
-        assert info["channels"][0]["window"]["max"] == float(pixels.max())
+        window = info["channels"][0]["window"]
+        assert (window["min"], window["max"]) == (0.0, 65535.0)
+        assert 0.0 <= window["start"] < window["end"] <= float(pixels.max())
         probe = json.loads(get("/api/pixel?x=41&y=33"))
         assert probe["values"] == [{"name": "Gray", "value": int(pixels[33, 41])}]
         assert Image.open(io.BytesIO(get("/api/tile/0/0/0.jpg?c=0"))).size == (512, 512)
         exported = tifffile.imread(io.BytesIO(get("/api/roi?level=0&x=0&y=0&w=600&h=700&format=tiff")))
         assert exported.dtype == np.uint16
         assert np.array_equal(exported.reshape(pixels.shape), pixels)
+
+
+@pytest.mark.parametrize("value", [0, 1000, 65535])
+def test_a_constant_16_bit_png_gets_a_window_inside_the_uint16_range(tmp_path, value):
+    # The window rule of ND2 channels: it never ends past 65535, where the
+    # LUT handles could not be shown, and a saturated image displays white.
+    from nd2wsi.render import composite
+
+    path = tmp_path / "flat.png"
+    Image.fromarray(np.full((40, 30), value, np.uint16)).save(path)
+    root, attrs = raster.open_direct(path)
+    try:
+        window = attrs["omero"]["channels"][0]["window"]
+        assert (window["min"], window["max"]) == (0.0, 65535.0)
+        assert 0.0 <= window["start"] < window["end"] <= 65535.0
+        shown = composite(root["0"][:, :2, :2], [0], [(window["start"], window["end"])],
+                          [(255, 255, 255)], False)
+        if value == 65535:
+            assert int(shown.max()) == 255
+    finally:
+        root.close(delay=0)
+
+
+def _png16(path, samples, color_type):
+    import struct
+    import zlib
+
+    height, width = samples.shape[:2]
+    raw = b"".join(b"\0" + samples[y].astype(">u2").tobytes() for y in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 16, color_type, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+@pytest.mark.parametrize("color_type, channels", [(2, 3), (4, 2), (6, 4)])
+def test_a_16_bit_colour_png_says_its_values_were_cut_to_8_bits(tmp_path, color_type, channels):
+    # Pillow keeps only each sample's high byte; a pixel readout or TIFF
+    # export must not pass for the stored 16-bit value without a word.
+    path = tmp_path / "colour16.png"
+    _png16(path, np.full((6, 5, channels), 3000, np.uint16), color_type)
+    root, attrs = raster.open_direct(path)
+    try:
+        notes = attrs["nd2wsi"]["notes"]
+        assert any("shown at 8 bits per channel" in note for note in notes)
+        assert root["0"].dtype == np.uint8
+    finally:
+        root.close(delay=0)
+    _png16(path, np.full((6, 5), 3000, np.uint16), 0)
+    root, attrs = raster.open_direct(path)
+    try:
+        assert not any("8 bits per channel" in note for note in attrs["nd2wsi"]["notes"])
+        assert root["0"][:, 0:1, 0:1].item() == 3000
+    finally:
+        root.close(delay=0)
 
 
 def test_pixel_limit_and_memory_preflight_happen_before_full_decode(tmp_path, monkeypatch):

@@ -732,6 +732,7 @@ function refresh(selectSid) {
         if (!openSids.has(key)) {
           frame.remove();
           frames.delete(key);
+          forgetClosedPane(key);
           nativeGesturePaneScopes.delete(key);
           readyFrames.delete(key);
           shadingStates.delete(key);
@@ -834,6 +835,11 @@ async function closeTab(sid) {
     if (api?.update_block_reason) {
       const reason = await api.update_block_reason();
       if (reason) throw new Error(reason);
+    }
+    // An update or window close may have started preparing while the native
+    // check was answering; restarting it here would unlock its panes.
+    if (quitPreparation || quitPreparationRequestId) {
+      throw new Error("Finish the current save or close operation before closing another tab.");
     }
     // Removing an iframe would discard its editor, debounce and failed-save
     // snapshots. Reuse the acknowledged flush, including older plate sites,
@@ -994,6 +1000,26 @@ function finishQuitPreparation(result) {
   pending.resolve(result);
 }
 
+// Every pane still targeted has answered: the preparation succeeds unless
+// one of them refused.
+function settleQuitPreparation(pending) {
+  if (pending !== quitPreparation || pending.seen.size !== pending.targets.size) return;
+  finishQuitPreparation(pending.errors.length
+    ? { ok: false, error: pending.errors.join("; ") }
+    : { ok: true, panes: pending.targets.size });
+}
+
+// refresh() removed a pane whose slide the server closed. It holds nothing
+// left to save and can no longer answer, so a preparation that targeted it,
+// one that started while its tab was closing, stops waiting for it.
+function forgetClosedPane(sid) {
+  quitPreparedPanes.delete(sid);
+  const pending = quitPreparation;
+  if (!pending || !pending.targets.delete(sid)) return;
+  pending.seen.delete(sid);
+  settleQuitPreparation(pending);
+}
+
 window.nd2wsiPrepareForUpdate = (requestId) => {
   const id = String(requestId || "");
   if (!id) return Promise.resolve({ ok: false, error: "missing update request" });
@@ -1021,8 +1047,12 @@ window.nd2wsiPrepareForUpdate = (requestId) => {
     pending.timer = setTimeout(() => {
       if (quitPreparation !== pending) return;
       const missing = [...targets].filter((sid) => !pending.seen.has(sid));
+      // A pane that never confirmed has not answered: native preparation
+      // keeps it frozen between retries, and a repeated close may offer to
+      // close without confirmed saves.
       finishQuitPreparation({
         ok: false,
+        unanswered: true,
         error: `save confirmation timed out for ${missing.length} pane(s)`,
       });
     }, 8000);
@@ -2844,11 +2874,7 @@ window.addEventListener("message", (event) => {
     if (!event.data.ok) {
       pending.errors.push(`${slideName(senderSid)}: ${event.data.error || "save failed"}`);
     }
-    if (pending.seen.size === pending.targets.size) {
-      finishQuitPreparation(pending.errors.length
-        ? { ok: false, error: pending.errors.join("; ") }
-        : { ok: true, panes: pending.targets.size });
-    }
+    settleQuitPreparation(pending);
   } else if (kind === "native-gesture-scope") {
     if (!senderSid || !versioned) return;
     receiveNativeGestureScope(senderSid, event.data);

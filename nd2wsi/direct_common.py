@@ -104,6 +104,19 @@ def _parse_cyx_index(idx: Any, shape: tuple[int, int, int]):
     return cs, y0, y1, x0, x1
 
 
+class LeaseClosed(ValueError):
+    """A closed ``_Lifecycle`` refusing a new entry; ``lease`` is the refuser.
+
+    Still a ValueError with the same message, so existing callers keep
+    working; a caller that must tell this refusal from other ValueErrors
+    raised inside its ``with`` block checks ``lease``.
+    """
+
+    def __init__(self, lease: _Lifecycle) -> None:
+        super().__init__("slide is closed")
+        self.lease = lease
+
+
 class _Lifecycle:
     """Counts in-flight reads so close can wait for them, then bar the door.
 
@@ -121,7 +134,7 @@ class _Lifecycle:
     def __enter__(self) -> _Lifecycle:
         with self._cv:
             if self.closed:
-                raise ValueError("slide is closed")
+                raise LeaseClosed(self)
             self._n += 1
         return self
 
@@ -141,6 +154,18 @@ class _Lifecycle:
             self.closed = True
             return self._cv.wait_for(lambda: self._n == 0, timeout)
 
+    def close_if_idle(self) -> bool:
+        """Bar new entries only when none is running, without waiting.
+
+        False leaves the door exactly as it was, so a refused close cannot
+        turn away an entry that arrives meanwhile.
+        """
+        with self._cv:
+            if self._n:
+                return False
+            self.closed = True
+            return True
+
     def reopen(self) -> None:
         """Admit reads again after a close attempt timed out.
 
@@ -156,10 +181,10 @@ class _Lifecycle:
 class _Root(dict):
     """A virtual store root: level adapters by name, plus deferred close.
 
-    The registry pops the slide before calling ``close``, so no new
-    request can start; ones already running still hold the underlying
-    file for a moment, so the actual teardown runs after a short delay
-    (and, for memory-mapped sources, after the lifecycle drains).
+    A caller that cannot tell whether reads still hold the underlying file
+    gets a short delay before the actual teardown (and, for memory-mapped
+    sources, the teardown still waits for the lifecycle to drain). The
+    registry drains a closed slide's reads first and closes with delay=0.
     """
 
     def __init__(self, levels: dict[str, Any], closer: Any = None):

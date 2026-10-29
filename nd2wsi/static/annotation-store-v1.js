@@ -27,8 +27,9 @@
   // Items arrive from files other tools wrote and from sidecars on disk.
   // Every item the pane renders needs a known type, finite coordinates and a
   // unique id. A bad color, text or id is repaired on a copy (sound items are
-  // returned as they are); anything else refuses the whole set, so a failed
-  // open never replaces or autosaves over saved marks.
+  // returned as they are). Opening a file refuses the whole set otherwise, so
+  // a failed open changes nothing; a sidecar keeps such items aside instead
+  // (splitItems), because an older version may have saved them there.
   const HEX_COLOR = /^#[0-9a-f]{6}$/i;
   const COORDINATES = { pin: ["x", "y"], box: ["x", "y", "w", "h"], line: ["x1", "y1", "x2", "y2"] };
   const GEOMETRY_DEPTH = { Point: 0, MultiPoint: 1, LineString: 1, MultiLineString: 2, Polygon: 2, MultiPolygon: 3 };
@@ -51,9 +52,9 @@
     return keys.every((key) => Number.isFinite(item[key])) ? null : "coordinates must be finite numbers";
   }
 
-  function normalizeItems(items, makeId) {
+  function normalizeItems(items, makeId, reserved = []) {
     if (!Array.isArray(items)) throw new Error("no items array");
-    const used = new Set();
+    const used = new Set(reserved);
     return items.map((item, index) => {
       const problem = itemProblem(item);
       if (problem) throw new Error("annotation " + (index + 1) + ": " + problem);
@@ -72,12 +73,24 @@
     });
   }
 
+  // A sidecar's items the pane cannot draw are not shown or edited, and are
+  // written back unchanged with the drawable ones on every save. A sidecar
+  // without an items array is refused, never read as an empty one.
+  function splitItems(items, makeId) {
+    if (!Array.isArray(items)) throw new Error("no items array");
+    const drawable = [], foreign = [];
+    for (const item of items) (itemProblem(item) ? foreign : drawable).push(item);
+    const reserved = foreign.map((item) => item && item.id).filter((id) => typeof id === "string");
+    return { items: normalizeItems(drawable, makeId, reserved), foreign };
+  }
+
   // The store keeps its fields on the pane state it is given, so the pane's
   // existing readers (annotation owner checks, file import, the Astromap
   // panel) keep reading state.ann* as before; only the store writes them:
   //   state.annotations            the items; the pane edits this array itself
   //   state.editingId              cleared when another sidecar is loaded
-  //   state.annSite, annReady, annPath, annDirty, annRevision, annContext
+  //   state.annSite, annReady, annLoadFailed, annPath, annDirty, annRevision, annContext
+  //   state.annForeignItems        sidecar items the pane cannot draw, kept for saving
   //   state.annServerRevision, annServerRevisions, annAcceptedDrafts
   //   state.annSaveTail, annFailedSaves, annLoadSeq
   // It reads state.plate, state.info (plate.P, notes) and state.quitPreparing.
@@ -123,7 +136,11 @@
     // save that is still in flight (or was queued meanwhile) from one it owes
     let queuedRevision = null, queuedContext = null;
 
+    // Nothing is marked dirty, scheduled or sent for an owner whose sidecar
+    // failed to load or was refused (normalizeItems): the pane's list is then
+    // empty, and saving it would replace the sidecar on disk.
     function scheduleSave() {
+      if (state.annLoadFailed) return;
       clearTimer(timer);
       timer = setTimer(() => { timer = null; save(); }, debounceMs);
     }
@@ -134,6 +151,7 @@
     }
 
     function markDirty() {
+      if (state.annLoadFailed) return;
       state.annRevision += 1;
       state.annDirty = true;
       state.annAcceptedDrafts?.clear();
@@ -193,7 +211,8 @@
     function saveEntry(site) {
       const url = urlFor(site);
       if (!url) return null;
-      const payload = { items: state.annotations };
+      const foreign = state.annForeignItems || [];
+      const payload = { items: foreign.length ? state.annotations.concat(foreign) : state.annotations };
       if (typeof state.annServerRevision === "string") {
         payload.expected_revision = state.annServerRevision;
       }
@@ -337,6 +356,10 @@
         onStatus("Not saved: annotation is locked in this degraded view");
         return Promise.resolve({ ok: false, error: "annotation is locked" });
       }
+      if (state.annLoadFailed) {
+        onStatus("Not saved: this image's annotations did not load");
+        return Promise.resolve({ ok: false, error: "annotations did not load" });
+      }
       const entry = saveEntry(site);
       if (!entry) {
         onStatus("Not saved: choose a plate site first");
@@ -351,7 +374,8 @@
     // explicit recovery-draft acceptance resolves it (a 409 that got no draft
     // is sent again, so the server can try the draft once more). Locked panes
     // and a missing plate site are skipped like save(), silently: this path
-    // owns no status text.
+    // owns no status text. An owner whose sidecar did not load has no
+    // snapshot to send; other owners' failed requests are still retried.
     async function retryFailed(options = {}) {
       if (isLocked()) return { ok: false, error: "annotation is locked", retried: 0 };
       // Once the debounce fired, the dirty flag stays set until the request
@@ -361,7 +385,7 @@
       await state.annSaveTail;
       const runs = [], superseded = new Set();
       const queued = state.annRevision === queuedRevision && state.annContext === queuedContext;
-      if (state.annDirty && timer === null && !queued) {
+      if (!state.annLoadFailed && state.annDirty && timer === null && !queued) {
         const current = saveEntry();
         if (current && !draftHolds(state.annFailedSaves.get(current.url), current.body)) {
           // one request per sidecar: the current snapshot replaces an older
@@ -382,10 +406,11 @@
     // snapshot to the browser with keepalive. Nothing is sent when the site's
     // recovery draft already holds this body, and the debounce is called off
     // only when a save is issued. Locked panes and a missing site are skipped
-    // silently, as in retryFailed().
+    // silently, as in retryFailed(), and so is an owner whose sidecar did not
+    // load.
     function flushOnPagehide({ keepalive = true } = {}) {
       if (isLocked()) return Promise.resolve({ ok: false, error: "annotation is locked", sent: false });
-      const current = timer !== null || state.annDirty ? saveEntry() : null;
+      const current = !state.annLoadFailed && (timer !== null || state.annDirty) ? saveEntry() : null;
       if (!current || draftHolds(state.annFailedSaves.get(current.url), current.body)) {
         return Promise.resolve({ ok: true, sent: false });
       }
@@ -441,9 +466,11 @@
       const url = urlFor(targetSite);
       state.annSite = Number.isInteger(targetSite) ? targetSite : null;
       state.annReady = false;
+      state.annLoadFailed = false;
       state.annPath = null;
       state.annServerRevision = null;
       state.annotations = [];
+      state.annForeignItems = [];
       state.editingId = null;
       onEditorReset();
       onRender();
@@ -480,12 +507,14 @@
         .then((result) => {
           if (result === null || !stillCurrent() || revision !== state.annRevision) return;
           const { data: d, recovered, conflict, draftPath } = result;
-          const items = Array.isArray(d.items) ? d.items : [];
           let loadedIds = 0;
-          // A sidecar this pane cannot draw stays unloaded, never overwritten.
-          // A recovered draft is this pane's own snapshot and is kept exact.
-          state.annotations = recovered ? items
-            : normalizeItems(items, () => "a" + now().toString(36) + "s" + loadedIds++);
+          // A recovered draft is this pane's own snapshot: its drawable items
+          // come first and its kept-aside ones last, so splitting it again
+          // leaves the saved body exactly as it was.
+          const { items, foreign } = splitItems(d && d.items,
+            () => "a" + now().toString(36) + "s" + loadedIds++);
+          state.annotations = items;
+          state.annForeignItems = foreign;
           state.annPath = recovered ? null : d.path;
           state.annReady = true;
           state.annDirty = recovered;
@@ -505,19 +534,24 @@
               ? "Recovered unsaved annotations · save will retry"
               : skipped
               ? skipped
-              : state.annotations.length
-              ? "Loaded " + state.annotations.length + " from " + basename(d.path)
-              : "Sidecar: " + basename(d.path)
+              : (state.annotations.length
+                ? "Loaded " + state.annotations.length + " from " + basename(d.path)
+                : "Sidecar: " + basename(d.path)) +
+                (foreign.length ? " · " + foreign.length + " item(s) this viewer cannot draw are kept unchanged" : "")
           );
           onRecoveryNotice();
           onRender();
           onScope();
         })
-        .catch((error) => {
+        .catch(() => {
           if (!stillCurrent()) return;
+          // The list was emptied when this load started: an edit or debounce
+          // left from while it loaded would save that over the sidecar.
+          cancelScheduledSave();
+          state.annDirty = false;
           state.annReady = false;
-          const invalid = error && /^annotation \d+: /.test(error.message);
-          onStatus("Could not load annotations for this site" + (invalid ? " (" + error.message + ")" : ""));
+          state.annLoadFailed = true;
+          onStatus("Could not load annotations for this site");
           onScope();
         });
     }
@@ -594,5 +628,5 @@
     };
   }
 
-  return { createStore, normalizeItems, KEEPALIVE_BODY_LIMIT };
+  return { createStore, normalizeItems, splitItems, KEEPALIVE_BODY_LIMIT };
 });

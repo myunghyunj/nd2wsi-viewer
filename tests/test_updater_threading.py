@@ -351,6 +351,20 @@ def test_an_unanswered_attempt_keeps_the_viewer_frozen_between_retries(driver):
     assert driver.window.cancellations == []
 
 
+def test_a_pane_that_timed_out_keeps_the_viewer_frozen_between_retries(driver):
+    # The shell answers for a pane that never confirmed within 8 s; that pane
+    # may still be saving, so it is not unlocked.
+    driver.prepare()
+    driver.main.until(lambda: len(driver.window.flushes) == 1)
+    driver.window.reply(0, {"ok": False, "unanswered": True,
+                            "error": "save confirmation timed out for 1 pane(s)"})
+    driver.main.until(lambda: len(driver.window.flushes) == 2)
+    assert driver.window.cancellations == []
+    driver.window.reply(1, {"ok": True, "panes": 1})
+    driver.main.until(lambda: bool(driver.completions))
+    assert driver.window.cancellations == []
+
+
 def test_javascript_bridge_exception_reports_from_worker_and_can_retry(driver):
     driver.window.raise_on_flush = RuntimeError("bridge unavailable")
     driver.prepare()

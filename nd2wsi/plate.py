@@ -132,6 +132,13 @@ def _windows_record(
     }
 
 
+def _finite_number(value: Any) -> bool:
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return False
+
+
 def _stored_windows(manifest: dict[str, Any], source: Any) -> list[dict[str, float]] | None:
     """The default display windows a plate manifest records for ``source``.
 
@@ -163,9 +170,7 @@ def _stored_windows(manifest: dict[str, Any], source: Any) -> list[dict[str, flo
     windows = []
     for entry in entries:
         values = [entry.get(field) for field in _WINDOW_FIELDS] if isinstance(entry, dict) else []
-        if len(values) != len(_WINDOW_FIELDS) or not all(
-            type(v) in (int, float) and math.isfinite(v) for v in values
-        ):
+        if len(values) != len(_WINDOW_FIELDS) or not all(_finite_number(v) for v in values):
             return None
         windows.append({field: float(v) for field, v in zip(_WINDOW_FIELDS, values)})
     return windows
@@ -532,6 +537,7 @@ class PlateStore:
             self._digest = None
             self._digest_np = np.zeros(self._done_np.shape, dtype=np.uint64)
         self._invalid = np.zeros(self._done_np.shape, dtype=bool)
+        self._repaired_chunks: set[tuple[int, int]] = set()  # see put_block
         self._integrity_errors = 0
         self._container_current = True
         self._last_generation_check = time.monotonic()
@@ -1229,8 +1235,11 @@ class PlateStore:
         background builder stages a chunk's missing sites and lands them here
         with one write per array instead of one per site. The order stays
         payload, digest, done, all under ``_lock``. Sites already committed
-        keep their stored bytes, and so does every site not in ``frames``.
-        True when every given site is committed afterwards.
+        keep their stored bytes, and so does every site not in ``frames``,
+        unless the chunk cannot be decoded: then its payload is moved aside,
+        its committed sites are invalidated and the given sites start a fresh
+        chunk (at most once per chunk while this store is open). True when
+        every given site is committed afterwards.
         """
         t, z = int(t), int(z)
         self._refresh()
@@ -1255,7 +1264,25 @@ class PlateStore:
                     # The whole chunk is new: write it without reading it.
                     block = np.stack([frames[p] for p in todo])
                 else:
-                    block = np.array(self._thumbs[t, :, z], copy=True)
+                    try:
+                        block = np.array(self._thumbs[t, :, z], copy=True)
+                    except Exception:
+                        # An undecodable shared chunk. As get() does, keep its
+                        # payload and fail its sites closed; once it is moved
+                        # aside the given sites start a fresh chunk, and the
+                        # walk comes back for the invalidated ones. A chunk
+                        # still undecodable after that rewrite (a drive that
+                        # corrupts writes) stops the build instead of looping,
+                        # each round keeping another copy of it.
+                        if (t, z) in self._repaired_chunks:
+                            return False
+                        self._repaired_chunks.add((t, z))
+                        moved = self._quarantine_shared_payload(t, z)
+                        self._invalidate(t, z, committed)
+                        if not moved:
+                            return False
+                        todo = sorted(frames)
+                        block = np.array(self._thumbs[t, :, z], copy=True)
                     for p in todo:
                         block[p] = frames[p]
                 self._thumbs[t, :, z] = block
@@ -1602,10 +1629,10 @@ class PlateSource:
         self.tile = int(tile)
         self.store: PlateStore | None = None
         # Default display windows: an open that uses the store first looks
-        # for those its cache records; windows measured instead are handed
-        # to the store's writer once it opens.
+        # for those its cache records, else measures them. Once the store
+        # opens, its writer records them unless its manifest already does.
         self._windows_lookup = (bool(store), cache_path)
-        self._measured_windows: list[dict[str, float]] | None = None
+        self._display_windows: list[dict[str, float]] | None = None
         # Process-wide RAM caches must never alias two opens of the same path.
         # This is deliberately not the server-visible source generation.
         self._open_generation = uuid.uuid4().hex
@@ -1654,8 +1681,13 @@ class PlateSource:
                     opened_store = (PlateStore.open_or_create(self) if cache_path is None
                                     else PlateStore.open_or_create(self, cache_path=cache_path))
                     self.store = opened_store
-                    if self._measured_windows is not None:
-                        opened_store.keep_display_windows(self._measured_windows)
+                    # A cache rebuilt by open_or_create has lost the record
+                    # the windows may have been read from; write it again.
+                    if (
+                        self._display_windows is not None
+                        and _stored_windows(opened_store.manifest, self) is None
+                    ):
+                        opened_store.keep_display_windows(self._display_windows)
                     opened_store.start()
                 except Exception as e:  # a store that will not open is only a slower view
                     if opened_store is not None:
@@ -1853,14 +1885,16 @@ class PlateSource:
 
     def _windows(self, background_mode_start: Any) -> list[dict[str, float]]:
         """Default display windows: those a matching cache already records
-        for this source, else measured now and kept for the store's writer."""
+        for this source, else measured now. Either is kept for the store's
+        writer."""
         use_store, cache_path = self._windows_lookup
         if use_store:
             recorded = PlateStore.recorded_windows(self, cache_path=cache_path)
             if recorded is not None:
+                self._display_windows = recorded
                 return recorded
         windows = self._measure_windows()
-        self._measured_windows = windows
+        self._display_windows = windows
         return windows
 
     def _measure_windows(self) -> list[dict[str, float]]:

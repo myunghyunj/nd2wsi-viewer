@@ -301,7 +301,7 @@ def test_cancel_after_timeout_clears_input_locks_and_late_readiness_is_ignored()
       return {result,accepted,pending:quitPreparation,locked:classes.has('preparing-update'),
         blocked:a.inputBlocked(),text:a.writes[0].items[0].text};
     """)
-    assert out["result"] == {"ok": False, "error": "save confirmation timed out for 1 pane(s)"}
+    assert out["result"] == {"ok": False, "unanswered": True, "error": "save confirmation timed out for 1 pane(s)"}
     assert out["accepted"] is True
     assert out["pending"] is None
     assert out["locked"] is False

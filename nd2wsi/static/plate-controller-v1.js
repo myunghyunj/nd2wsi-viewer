@@ -73,6 +73,14 @@
       const next = clamp(Math.round(t), 0, state.info.plate.T - 1);
       if (next === pl.t) return;
       pl.t = next;
+      if (pl.playing && pl.timer) {
+        // A frame picked while playing (scrub, key, button) gets a full
+        // period and its own wait, not what is left of the one it replaced.
+        // playbackTick's own step finds no timer and schedules the next.
+        clearTimeout(pl.timer);
+        pl.stepAt = now();
+        pl.timer = setTimeout(playbackTick, 1000 / pl.fps);
+      }
       plateFrameChanged();
     }
 
