@@ -181,10 +181,10 @@ class _Lifecycle:
 class _Root(dict):
     """A virtual store root: level adapters by name, plus deferred close.
 
-    The registry pops the slide before calling ``close``, so no new
-    request can start; ones already running still hold the underlying
-    file for a moment, so the actual teardown runs after a short delay
-    (and, for memory-mapped sources, after the lifecycle drains).
+    A caller that cannot tell whether reads still hold the underlying file
+    gets a short delay before the actual teardown (and, for memory-mapped
+    sources, the teardown still waits for the lifecycle to drain). The
+    registry drains a closed slide's reads first and closes with delay=0.
     """
 
     def __init__(self, levels: dict[str, Any], closer: Any = None):

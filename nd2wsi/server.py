@@ -606,40 +606,6 @@ def reveal_in_file_manager(path: Path, *, platform: str | None = None, runner=No
         run(["/usr/bin/open", "-R", str(path)], check=True, timeout=10)
 
 
-def _close_state(st: ViewerState | None) -> None:
-    """Retire a state that has left the registry.
-
-    Requests that resolved it before it left may still be reading. New reads
-    and exports are barred, and the root closes once the last read is done:
-    never under a reader, and without holding the calling request thread.
-    """
-    if st is None:
-        return
-    st.exports.close(timeout=0)
-    # The slide is marked closed and its reads barred at once, so a pyramid
-    # replacement or refresh still running can no longer readmit them. While
-    # one holds the replacement lock it may still swap the root, so the root
-    # closes in the background once it has let go and no read is left.
-    marked = st.close_shading(blocking=False)
-    if marked and st.busy.close(timeout=0):
-        _close_root(st.root)
-        return
-
-    def close_after_reads() -> None:
-        if not marked:
-            st.close_shading()  # waits for the replacement or refresh
-        st.busy.close(timeout=None)
-        _close_root(st.root)
-
-    threading.Thread(target=close_after_reads, name="nd2wsi-slide-close", daemon=True).start()
-
-
-def _close_root(root: Any) -> None:
-    close = getattr(root, "close", None)
-    if close:
-        close()
-
-
 def store_generation(store_path: str | Path) -> str:
     """A token that changes whenever this store's pixels could have.
 
@@ -671,8 +637,12 @@ class SlideRegistry:
         # States that left the registry with an export still running; it
         # counts for close and update until it finishes.
         self._retired: list[ViewerState] = []
+        # States that left the registry and whose roots have not closed yet,
+        # mostly while a read finishes; shutdown and relaunch wait for them.
+        self._closing: list[ViewerState] = []
         self.max_render_mpx = max_render_mpx
         self._lock = threading.Lock()
+        self._closing_done = threading.Condition(self._lock)
         self.window_session = window_session
         self.astromap_downloads = AstromapDownloads(
             getattr(window_session, "exports_root", None)
@@ -844,8 +814,8 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
-            self._retire(stale)
-        _close_state(stale)
+            self._retire(stale, closing=True)
+        self._close_state(stale)
         return sid
 
     def _add_overview(
@@ -940,8 +910,8 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
-            self._retire(stale)
-        _close_state(stale)
+            self._retire(stale, closing=True)
+        self._close_state(stale)
         return sid
 
     def add_direct(self, slide_path: str | Path) -> str:
@@ -1015,8 +985,8 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
-            self._retire(stale)
-        _close_state(stale)
+            self._retire(stale, closing=True)
+        self._close_state(stale)
         return sid
 
     def _add_plate_cache(self, cache_path: Path, manifest: dict) -> str:
@@ -1104,8 +1074,8 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
-            self._retire(stale)
-        _close_state(stale)
+            self._retire(stale, closing=True)
+        self._close_state(stale)
         return sid
 
     def open_path(self, path: str | Path, on_progress=None) -> str:
@@ -1165,16 +1135,17 @@ class SlideRegistry:
             # the controller's cancel() reports status, which may refresh the
             # pyramid and wait for its reads while this lock is held.
             st = self.slides.pop(sid, None)
-            self._retire(st)
-        _close_state(st)
+            self._retire(st, closing=True)
+        self._close_state(st)
         return st is not None
 
     def close_all(self, *, immediate: bool = False) -> None:
         """Close every registered backend after the server stops.
 
-        Normal tab closure defers native-handle teardown briefly so in-flight
-        requests can finish. A stopped smoke-test server has no such requests,
-        so it may close source-backed roots synchronously.
+        Without ``immediate``, source-backed roots keep _Root's short delay
+        before their native handles close. A stopped smoke-test server has no
+        requests left, so it may close them synchronously, and it also waits
+        up to 30 s for slides closed earlier whose last reads are finishing.
         """
         with self._lock:
             states = list(self.slides.values())
@@ -1192,19 +1163,88 @@ class SlideRegistry:
                 except TypeError:
                     pass
             close()
+        if immediate:
+            self._wait_for_closing(timeout=30)
 
-    def _retire(self, st: ViewerState | None) -> None:
+    def _retire(self, st: ViewerState | None, *, closing: bool = False) -> None:
         """Bar exports on a state leaving the registry; keep counting running ones.
 
         Called under ``self._lock`` in the same step that removes or
         replaces the state, so an export request that resolved it earlier
         cannot start afterwards, and one already streaming still counts.
+        With ``closing`` the caller hands it to ``_close_state`` next, and
+        it is tracked until its root is closed, so a shutdown or relaunch
+        that comes first still waits for it.
         """
         if st is None:
             return
         self._retired = [old for old in self._retired if old.exports.active]
         if not st.exports.close(timeout=0):
             self._retired.append(st)
+        if closing:
+            self._closing.append(st)
+
+    def _close_state(self, st: ViewerState | None) -> None:
+        """Close a state that has left the registry and been tracked as closing.
+
+        Requests that resolved it before it left may still be reading. New
+        reads and exports are barred at once, and the root closes as soon as
+        the last read is done, without _Root's delay: never under a reader,
+        and without holding the calling request thread.
+        """
+        if st is None:
+            return
+        handed_off = False
+        try:
+            st.exports.close(timeout=0)
+            # The slide is marked closed and its reads barred at once, so a
+            # pyramid replacement or refresh still running can no longer
+            # readmit them. While one holds the replacement lock it may still
+            # swap the root, so the root closes once it has let go. A plate's
+            # frame reads and cache builder hold no busy, and its close waits
+            # for them, so a plate always closes on the closer thread.
+            quiet = st.close_shading(blocking=False)
+            if quiet and st.plate is None and st.busy.close(timeout=0):
+                ViewerState._close_root(st.root)
+                return
+
+            def close_after_reads() -> None:
+                try:
+                    self._close_after_reads(st, quiet)
+                finally:
+                    self._untrack_closing(st)
+
+            try:
+                threading.Thread(
+                    target=close_after_reads, name="nd2wsi-slide-close", daemon=True
+                ).start()
+                handed_off = True
+            except Exception:
+                # No thread to wait on: wait here rather than leave it open.
+                self._close_after_reads(st, quiet)
+        finally:
+            if not handed_off:
+                self._untrack_closing(st)
+
+    @staticmethod
+    def _close_after_reads(st: ViewerState, quiet: bool) -> None:
+        if not quiet:
+            st.close_shading()  # waits for the replacement or refresh
+        st.busy.close(timeout=None)
+        if st.plate is not None:
+            st.plate.close(timeout=None)
+        else:
+            ViewerState._close_root(st.root)
+
+    def _untrack_closing(self, st: ViewerState) -> None:
+        with self._lock:
+            self._closing = [old for old in self._closing if old is not st]
+            self._closing_done.notify_all()
+
+    def _wait_for_closing(self, *, timeout: float | None) -> bool:
+        """Wait for slides closed earlier to finish closing their roots."""
+        with self._lock:
+            return self._closing_done.wait_for(lambda: not self._closing, timeout)
 
     def active_export_count(self) -> int:
         """Return the number of real exports which are still running.
@@ -1243,6 +1283,9 @@ class SlideRegistry:
                 close(delay=0)
             except TypeError:
                 close()
+        # Slides closed just before, whose last reads are still finishing,
+        # close their roots the same way once those reads end.
+        self._wait_for_closing(timeout=None)
 
     def trash_cache(self, sid: str, on_progress=None) -> int:
         """Close the slide and delete its pyramid store. Returns bytes freed.

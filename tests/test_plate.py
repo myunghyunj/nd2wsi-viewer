@@ -448,6 +448,29 @@ def test_open_path_registers_a_plate_and_writes_no_cache(plate_nd2):
         source.reduced(0, 0, 0, 2)
 
 
+def test_a_plate_closed_and_reopened_at_once_keeps_its_cache_writer(plate_nd2):
+    from nd2wsi.server import SlideRegistry
+
+    reg = SlideRegistry()
+    try:
+        sid = reg.open_path(plate_nd2)
+        first = reg.get(sid).plate
+        assert first.store is not None and first.store.writable
+        assert reg.remove(sid)
+        # Nothing reads the closed plate, so it lets go of its writer now
+        # rather than after _Root's 5 s delay ...
+        deadline = time.monotonic() + 2.0
+        while not first._teardown_complete and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert first._teardown_complete
+        # ... and the reopened plate writes its thumbnail cache again.
+        again = reg.get(reg.open_path(plate_nd2)).plate
+        assert again is not first
+        assert again.store is not None and again.store.writable
+    finally:
+        reg.close_all(immediate=True)
+
+
 def test_registry_retries_when_plate_fingerprint_changes_during_open(
     plate_nd2, monkeypatch
 ):

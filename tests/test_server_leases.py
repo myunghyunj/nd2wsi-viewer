@@ -941,7 +941,110 @@ def test_a_reopened_slide_closes_its_replaced_root_only_after_reads_end(monkeypa
         assert registry.get(sid) is not stale
         time.sleep(0.05)
         assert closes == []
-    assert _wait_until(lambda: closes == [(1, 5.0)])  # then _Root's usual close
+    # Then at once: nothing reads it any more, so _Root's delay would only
+    # keep its file open (a Windows sharing lock, a plate writer).
+    assert _wait_until(lambda: closes == [(1, 0)])
+
+
+@pytest.mark.parametrize("kind", ["slide", "plate"])
+def test_an_idle_window_close_releases_the_source_without_delay(kind):
+    from nd2wsi.direct_common import _Root
+
+    closed = []
+
+    class Plate:  # its own close waits for frame reads and its cache builder
+        def close(self, timeout=300.0):
+            closed.append(("plate", timeout))
+
+    st = state()
+    if kind == "plate":
+        st.plate = Plate()
+        st.root = _Root({}, closer=st.plate.close)
+    else:
+        st.root = _Root({}, closer=lambda: closed.append("root"))
+    registry = window_registry(st)
+    assert registry.remove(SID) is True
+    if kind == "slide":
+        assert closed == ["root"]  # on the request thread: nothing to wait for
+    # A plate closes on the closer thread, but at once too, so reopening it
+    # right away gets its cache writer back.
+    assert _wait_until(lambda: closed == (["root"] if kind == "slide" else [("plate", None)]),
+                       timeout=1.0)
+
+
+@pytest.mark.parametrize("shutdown", ["relaunch", "immediate"])
+def test_shutdown_waits_for_a_slide_closed_while_a_read_finishes(shutdown):
+    from nd2wsi.direct_common import _Root
+
+    st = state()
+    closed = []
+    st.root = _Root({}, closer=lambda: closed.append(st.busy.active))
+    registry = window_registry(st)
+    reading, release = threading.Event(), threading.Event()
+
+    def slow_read():
+        with st.busy:
+            reading.set()
+            assert release.wait(5)
+
+    reader = threading.Thread(target=slow_read)
+    reader.start()
+    assert reading.wait(5)
+    assert registry.remove(SID) is True
+    assert closed == []  # the read still uses the root
+    stop = (registry.close_all_for_relaunch if shutdown == "relaunch"
+            else lambda: registry.close_all(immediate=True))
+    stopped = threading.Event()
+    stopping = threading.Thread(target=lambda: (stop(), stopped.set()))
+    stopping.start()
+    try:
+        # The slide left the registry, but its root is still open: an update
+        # or a stopped server must not go ahead past it.
+        assert not stopped.wait(0.3)
+    finally:
+        release.set()
+        reader.join(5)
+    assert stopped.wait(5)
+    stopping.join(5)
+    assert closed == [0]
+
+
+def test_a_window_close_without_a_closer_thread_still_closes_the_root(monkeypatch):
+    st = state()
+    closed = []
+
+    class Root(dict):
+        def close(self, delay=None):
+            closed.append((delay, st.busy.active))
+
+    st.root = Root()
+    registry = window_registry(st)
+    reading = threading.Event()
+
+    def slow_read():
+        with st.busy:
+            reading.set()
+            time.sleep(0.3)
+
+    reader = threading.Thread(target=slow_read)
+    reader.start()
+    assert reading.wait(5)
+    start = threading.Thread.start
+
+    def no_closer_thread(thread):
+        if thread.name == "nd2wsi-slide-close":
+            raise RuntimeError("can't start new thread")
+        return start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", no_closer_thread)
+    try:
+        # Waiting here is the price; a close that is lost would leave the
+        # slide's file open for the life of the process.
+        assert registry.remove(SID) is True
+        assert closed == [(0, 0)]
+    finally:
+        reader.join(5)
+    assert registry._wait_for_closing(timeout=0)
 
 
 def test_an_export_on_a_slide_reopened_from_a_changed_file_still_counts(monkeypatch, tmp_path):
