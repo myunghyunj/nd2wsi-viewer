@@ -471,6 +471,52 @@ def test_cache_manifest_selection_cannot_steer_the_sidecar_path(tmp_path, z_reso
     assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
 
 
+def test_a_cache_from_elsewhere_cannot_move_the_annotations_folder(tmp_path):
+    # Its manifest may name any existing same-named file as its source; only
+    # the file it was really built from (by fingerprint) decides the folder.
+    from nd2wsi.annotation_sidecars import annotations_sidecar
+    from nd2wsi.cache import quick_fingerprint
+    from nd2wsi.storage.single_file import write_entry
+
+    received, other = tmp_path / "received", tmp_path / "other"
+    received.mkdir()
+    other.mkdir()
+    (other / "slide.nd2").write_bytes(b"unrelated")
+    cache = received / "slide--t0-p0-zmid.nd2svs"
+
+    def manifest(**source):
+        write_entry(cache, "manifest.json", json.dumps({
+            "format": "nd2wsi-cache/5", "kind": "full", "complete": True,
+            "source": {"name": "slide.nd2", "relative_path": "../other/slide.nd2", **source},
+            "selection": {"t": 0, "p": 0, "z": "mid", "z_resolved": 0},
+        }).encode())
+
+    manifest()
+    (received / "annotations_slide.json").write_text("[]")
+    path = annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}})
+    assert path.parent == received / "nd2wsi" / "annotations"
+    assert sorted(p.name for p in other.iterdir()) == ["slide.nd2"]
+
+    # a store opened at its own path still files annotations beside its source
+    manifest(**quick_fingerprint(other / "slide.nd2"))
+    path = annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}}, migrate=False)
+    assert path.parent == other / "nd2wsi" / "annotations"
+
+
+@pytest.mark.parametrize("selection", [["t"], 1, "t0"])
+def test_a_cache_with_an_unreadable_plane_selection_is_refused(tmp_path, selection):
+    from nd2wsi.annotation_sidecars import annotations_sidecar
+    from nd2wsi.storage.single_file import write_entry
+
+    cache = tmp_path / "slide--t0-p0-zmid.nd2svs"
+    write_entry(cache, "manifest.json", json.dumps({
+        "format": "nd2wsi-cache/5", "kind": "full", "complete": True,
+        "source": {"name": "slide.nd2"}, "selection": selection,
+    }).encode())
+    with pytest.raises(ValueError):
+        annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}})
+
+
 def test_selection_tag_accepts_the_planes_the_app_writes():
     from nd2wsi.cache import selection_tag
     from nd2wsi.reader import PlaneSelection

@@ -26,6 +26,19 @@ def _manifest_source_path(container: Path, manifest: dict[str, Any]) -> Path | N
     return candidate
 
 
+def _built_from(manifest: dict[str, Any], source: Path) -> bool:
+    """Whether ``source`` is the file the cache recorded, by fingerprint."""
+    from .cache import fingerprints_match, quick_fingerprint
+
+    recorded = manifest.get("source")
+    if not isinstance(recorded, dict):
+        return False
+    try:
+        return fingerprints_match(recorded, quick_fingerprint(source))
+    except OSError:
+        return False
+
+
 def _annotation_source_name(path: Path) -> str | None:
     """Return a legacy sidecar's declared source name, when present."""
     try:
@@ -102,9 +115,16 @@ def annotations_sidecar(
     manifest = read_manifest(container) if container is not None else None
     if manifest and container is not None:
         source = _manifest_source_path(container, manifest)
-        if source is not None and source.is_file() and source.name == source_name:
+        # The manifest comes from inside the cache file. Its recorded source
+        # moves the annotations folder only when that file really is the one
+        # the cache was built from, so a cache from elsewhere cannot point the
+        # annotations at an unrelated directory that holds a same-named file.
+        if (source is not None and source.is_file() and source.name == source_name
+                and _built_from(manifest, source)):
             home = source.parent
     raw_selection = (manifest or {}).get("selection") or meta.get("selection") or {}
+    if not isinstance(raw_selection, dict):
+        raise ValueError("the cache names its image plane in an unreadable form")
     selection = {
         key: raw_selection[key]
         for key in ("t", "p")
