@@ -569,6 +569,55 @@ def test_an_export_resolved_before_a_window_close_cannot_start_after_it(tmp_path
     registry.astromap_downloads.close()
 
 
+class _RacedLease(server._Lifecycle):
+    """An export lease another request enters right after close looks at it.
+
+    That is the moment a check made apart from the bar would miss: the
+    first look at the lease (its count, or close_if_idle) is followed at
+    once by an export request that resolved the slide before the close.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.arrivals = []
+
+    def _arrive(self):
+        if self.arrivals:
+            return
+        try:
+            self.__enter__()
+        except ValueError:
+            self.arrivals.append("refused")
+        else:
+            self.arrivals.append("entered")
+
+    @property
+    def active(self):
+        count = super().active
+        self._arrive()
+        return count
+
+    def close_if_idle(self):
+        idle = super().close_if_idle()
+        self._arrive()
+        return idle
+
+
+def test_window_close_checks_and_bars_exports_in_one_step():
+    st = state()
+    st.exports = lease = _RacedLease()
+    registry = window_registry(st)
+    try:
+        removed = registry.remove(SID)
+    except ValueError as exc:  # the close may refuse for the export ...
+        assert "export" in str(exc) and lease.arrivals == ["entered"]
+        assert registry.get(SID) is st and not st.busy.closed
+        return
+    # ... or the export must be refused; never a close with it running.
+    assert removed is True and lease.arrivals == ["refused"]
+    assert lease.active == 0 and registry.active_export_count() == 0
+
+
 @pytest.mark.parametrize("where", ["headers", "body"])
 def test_an_astromap_download_failure_is_not_reported_as_a_closed_slide(monkeypatch, tmp_path, where):
     st = astromap_state()
