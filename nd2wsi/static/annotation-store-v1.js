@@ -374,7 +374,8 @@
     // explicit recovery-draft acceptance resolves it (a 409 that got no draft
     // is sent again, so the server can try the draft once more). Locked panes
     // and a missing plate site are skipped like save(), silently: this path
-    // owns no status text.
+    // owns no status text. An owner whose sidecar did not load has no
+    // snapshot to send; other owners' failed requests are still retried.
     async function retryFailed(options = {}) {
       if (isLocked()) return { ok: false, error: "annotation is locked", retried: 0 };
       // Once the debounce fired, the dirty flag stays set until the request
@@ -384,7 +385,7 @@
       await state.annSaveTail;
       const runs = [], superseded = new Set();
       const queued = state.annRevision === queuedRevision && state.annContext === queuedContext;
-      if (state.annDirty && timer === null && !queued) {
+      if (!state.annLoadFailed && state.annDirty && timer === null && !queued) {
         const current = saveEntry();
         if (current && !draftHolds(state.annFailedSaves.get(current.url), current.body)) {
           // one request per sidecar: the current snapshot replaces an older
@@ -405,10 +406,11 @@
     // snapshot to the browser with keepalive. Nothing is sent when the site's
     // recovery draft already holds this body, and the debounce is called off
     // only when a save is issued. Locked panes and a missing site are skipped
-    // silently, as in retryFailed().
+    // silently, as in retryFailed(), and so is an owner whose sidecar did not
+    // load.
     function flushOnPagehide({ keepalive = true } = {}) {
       if (isLocked()) return Promise.resolve({ ok: false, error: "annotation is locked", sent: false });
-      const current = timer !== null || state.annDirty ? saveEntry() : null;
+      const current = !state.annLoadFailed && (timer !== null || state.annDirty) ? saveEntry() : null;
       if (!current || draftHolds(state.annFailedSaves.get(current.url), current.body)) {
         return Promise.resolve({ ok: true, sent: false });
       }
@@ -543,6 +545,10 @@
         })
         .catch(() => {
           if (!stillCurrent()) return;
+          // The list was emptied when this load started: an edit or debounce
+          // left from while it loaded would save that over the sidecar.
+          cancelScheduledSave();
+          state.annDirty = false;
           state.annReady = false;
           state.annLoadFailed = true;
           onStatus("Could not load annotations for this site");
