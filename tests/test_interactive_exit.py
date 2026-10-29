@@ -119,7 +119,8 @@ def test_exits_nothing_hard_ends_keep_the_strict_unbounded_teardown(monkeypatch,
 def run_native_main(monkeypatch, tmp_path, api, argv):
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path))
-    create = Mock(return_value=(api, object()))
+    # main() sets attributes on the window, as on pywebview's
+    create = Mock(return_value=(api, SimpleNamespace()))
     monkeypatch.setattr(app, "create_app_window", create)
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(start=Mock()))
     result = app.main(argv)
@@ -232,8 +233,10 @@ def test_a_failed_teardown_after_a_finished_browser_replay_fails_the_run_visibly
     result, _ = run_native_main(monkeypatch, tmp_path / "sessions", api, [
         "--agent-window", "--browser-replay-report", str(report), "--benchmark-context", str(tmp_path / "ctx.json"),
         "--benchmark-test-root", str(root), str(root / "slide.nd2")])
+    # The replay ran and passed, so only the teardown fails the run.
+    assert sys.modules["webview"].start.call_count == 1
     assert result == 4
-    assert "Server teardown failed: OSError: plate writer lease already gone" in capsys.readouterr().err
+    assert capsys.readouterr().err.splitlines() == ["Server teardown failed: OSError: plate writer lease already gone"]
     assert not report.exists()  # the replay's own file is left as it wrote it
 
 
