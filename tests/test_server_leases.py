@@ -569,6 +569,35 @@ def test_an_export_resolved_before_a_window_close_cannot_start_after_it(tmp_path
     registry.astromap_downloads.close()
 
 
+@pytest.mark.parametrize("where", ["headers", "body"])
+def test_an_astromap_download_failure_is_not_reported_as_a_closed_slide(monkeypatch, tmp_path, where):
+    st = astromap_state()
+    registry = window_registry(st)
+    registry.astromap_downloads = am.AstromapDownloads(tmp_path)
+    handler, token = build_astromap(registry, st)
+    if where == "headers":
+        def no_header(filename):
+            raise ValueError("header value unavailable")
+
+        monkeypatch.setattr(server, "content_disposition", no_header)
+    errors = []
+    handler._error = lambda code, message: errors.append((code, message))
+    handler.send_response = lambda code: None
+    handler.send_header = lambda key, value: None
+    handler.end_headers = lambda: None
+
+    def failing_write(chunk):
+        raise ValueError("write to closed file")
+
+    handler.wfile = SimpleNamespace(write=failing_write)
+    # Not the export lease refusing: the request's catch-all handles it.
+    with pytest.raises(ValueError, match="header value|closed file"):
+        handler._astromap_download(st, {"token": [token]})
+    assert errors == []
+    assert st.exports.active == 0 and not st.exports.closed
+    registry.astromap_downloads.close()
+
+
 def test_window_close_during_pyramid_publication_keeps_reads_barred():
     st = state()
     registry = window_registry(st)

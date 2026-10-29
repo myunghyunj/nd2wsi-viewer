@@ -62,7 +62,7 @@ from .cache_removal import (
     _validate_file_cache_for_trash,
     rescue_annotations,
 )
-from .direct_common import _Lifecycle
+from .direct_common import LeaseClosed, _Lifecycle
 from .region_export import JOB_RE, ExportRequestError, prepare_export
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -2344,7 +2344,10 @@ def make_handler(
                     )
             except AstromapError as exc:
                 return self._error(404, str(exc))
-            except ValueError:  # the slide closed before the download began
+            except LeaseClosed as exc:
+                if exc.lease is not st.exports:
+                    raise
+                # The slide closed before the download began.
                 return self._error(409, "slide was closed")
 
         def _roi(self, st: ViewerState, q: dict):

@@ -104,6 +104,19 @@ def _parse_cyx_index(idx: Any, shape: tuple[int, int, int]):
     return cs, y0, y1, x0, x1
 
 
+class LeaseClosed(ValueError):
+    """A closed ``_Lifecycle`` refusing a new entry; ``lease`` is the refuser.
+
+    Still a ValueError with the same message, so existing callers keep
+    working; a caller that must tell this refusal from other ValueErrors
+    raised inside its ``with`` block checks ``lease``.
+    """
+
+    def __init__(self, lease: _Lifecycle) -> None:
+        super().__init__("slide is closed")
+        self.lease = lease
+
+
 class _Lifecycle:
     """Counts in-flight reads so close can wait for them, then bar the door.
 
@@ -121,7 +134,7 @@ class _Lifecycle:
     def __enter__(self) -> _Lifecycle:
         with self._cv:
             if self.closed:
-                raise ValueError("slide is closed")
+                raise LeaseClosed(self)
             self._n += 1
         return self
 
