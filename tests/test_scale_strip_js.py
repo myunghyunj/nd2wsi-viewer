@@ -54,7 +54,8 @@ function node(tag){
     append(...items){this.children.push(...items);},
     set innerHTML(value){this.children=[];}};
 }
-const nodes={'roi-scales':node('div'),'roi-scale-dims':node('span'),'roi-scale-note':node('span')};
+const nodes={'roi-scales':node('div'),'roi-scale-dims':node('span'),'roi-scale-note':node('span'),
+  'roi-detail':{classList:{remove(){}}},'roi-hint':{style:{}},'roi-move':{disabled:false}};
 const state={roi:{x:1000,y:2000,w:4000,h:3000},renderScale:null,channels:[0,1],luts:[],
   info:{channels:[{},{}],generation:'gen-1',maxRenderMpx:400,
     levels:[{path:'0',downsample:1},{path:'1',downsample:2},{path:'2',downsample:4}]}};
@@ -63,7 +64,7 @@ let contextKey='site-0';
 const context={state,URLSearchParams,AbortController,URL:URLs,Math,Number,String,Array,
   setTimeout,clearTimeout,fetch,$:id=>nodes[id],
   document:{createElement:tag=>node(tag)},
-  syncScaleBarExportControls(){},frameOwnsRoi:()=>true,
+  syncScaleBarExportControls(){},frameOwnsRoi:()=>!!state.roi,setTool(){},syncFrameScopedControls(){},
   activeFrameContext:()=>({key:contextKey,frame:{...frame}}),
   appendFrameParams:(q,f)=>{for(const [k,v] of Object.entries(f))q.set(k,v);return q;},
   lutParam:()=>state.win||'',fmtInt:v=>String(v),fmtBytes:b=>Math.round(b)+' B'};
@@ -72,6 +73,7 @@ vm.runInContext([
   between('function debounce(','/* ---- readout strip'),
   between('function channelQuery(','function activeFrameParams('),
   between('function scaleOptions(','/* The calibration for the µm fields'),
+  between('function clearRoi(','function updateRoiPanel('),
 ].join('\n'),context);
 // previews are 256, 128 and 64 px; the size samples are 512 px
 const isSample=r=>/[?&]w=512(&|$)/.test(r.url);
@@ -182,3 +184,31 @@ return {direct,later:requests.length-first};
     # the click refreshes at once (previews plus the new scale's first sample),
     # and the pending frame refresh is dropped
     assert out["direct"] == 3 + 1 and out["later"] == out["direct"]
+
+
+def test_clearing_the_region_stops_the_strip_and_nothing_lands_on_it():
+    out = run("""
+context.updateScaleStrip();
+const inFlight=requests.slice();
+context.clearRoi();
+const aborted=inFlight.map(r=>r.aborted);
+inFlight.filter(r=>!r.aborted).forEach(r=>r.answer(900));await advance(0);
+const afterClear={images:images(),dims:nodes['roi-scale-dims'].textContent};
+state.roi={x:1000,y:2000,w:4000,h:3000};context.updateScaleStrip();
+requests.filter(r=>!isSample(r)&&!r.answered&&!r.aborted).forEach(r=>r.answer(900));await advance(0);
+const shown=images();
+frame.t=1;context.scheduleScaleStrip();
+const before=requests.length;
+context.clearRoi();
+const revokedOnClear=[...revoked];
+await advance(1000);
+return {aborted,afterClear,shown,revokedOnClear,images:images(),later:requests.length-before};
+""")
+    # the three previews and the pending size sample stop with the region
+    assert out["aborted"] == [True] * 4
+    assert out["afterClear"] == {"images": [], "dims": "–"}
+    # previews already on screen are released at once, and the frame step's
+    # pending refresh is dropped rather than run for a region that is gone
+    assert out["shown"] == ["blob:preview-1", "blob:preview-2", "blob:preview-3"]
+    assert out["revokedOnClear"] == out["shown"]
+    assert out["images"] == [] and out["later"] == 0

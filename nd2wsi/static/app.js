@@ -3517,7 +3517,9 @@ function clearRoi() {
   state.roi = null;
   state.roiSite = null;
   state.renderScale = null;
-  scaleSeq += 1;
+  // with no region the strip empties: its pending refresh and requests stop,
+  // and its preview images are released
+  updateScaleStrip();
   if (state.roiOverlayEl) {
     state.roiOverlayEl.remove();
     state.roiOverlayEl = null;
