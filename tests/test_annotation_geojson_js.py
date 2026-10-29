@@ -237,6 +237,16 @@ def test_native_file_colors_and_missing_ids_are_repaired_on_open():
                       "unique": True, "kept": "dup"}
 
 
+def test_geojson_export_includes_the_label_still_being_typed():
+    result = run("""
+      element('ann-editor').hidden=false;
+      context.closeEditor=()=>{state.annotations[0].text='typed, not yet entered';element('ann-editor').hidden=true;};
+      api.exportAnnotationsGeoJSON();
+      return {name:downloads[0].doc.features[0].properties.name,editorOpen:!element('ann-editor').hidden};
+    """)
+    assert result == {"name": "typed, not yet entered", "editorOpen": False}
+
+
 def test_geojson_export_adds_source_binding_and_roundtrip_validates_it():
     result = run("""
       api.exportAnnotationsGeoJSON();const output=downloads[0];

@@ -2022,7 +2022,11 @@ function refreshAstromapPanel() {
       };
       note.oninput = () => {
         const item = find(); if (!item || !astromapReady()) return;
-        item.text = note.value; annotationsChanged();
+        item.text = note.value;
+        // the label editor open on this region would otherwise write its
+        // older text back when it closes
+        if (state.editingId === item.id && !$("ann-editor").hidden) $("ann-text").value = note.value;
+        annotationsChanged();
       };
       number.onclick = () => selectAstromapRoi(a.id);
       remove.onclick = () => { if (astromapReady() && find()) removeAnnotation(a.id); };
@@ -3087,6 +3091,7 @@ function wireAnnotationPanel() {
       showToast("Choose a site before exporting annotations");
       return;
     }
+    if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
     downloadJsonFile(
       annotationDocument(),
       state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
@@ -3246,6 +3251,7 @@ function exportAnnotationsGeoJSON() {
     showToast("Choose a site before exporting annotations");
     return;
   }
+  if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
   const doc = annotationsToGeoJSON(state.annotations);
   const owner = annotationDocument();
   doc.coordinate_space = owner.coordinate_space;
