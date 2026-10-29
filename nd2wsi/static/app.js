@@ -2353,6 +2353,8 @@ function saveAnnotations(site) {
 
 async function flushAnnotationsForUpdate() {
   if (!$('ann-editor').hidden) closeEditor(true);
+  // A mark still being dragged would land after editing froze, unsaved.
+  state.cancelToolDrag?.();
   state.quitPreparing = true;
   await annotationStore.flushForUpdate();
 }

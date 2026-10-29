@@ -138,6 +138,24 @@ emit({saves: changes.length, hidden: $("ann-editor").hidden});
     assert out == {"saves": 0, "hidden": True}
 
 
+def test_update_flush_drops_a_drag_in_progress_before_freezing_edits():
+    # A pin or box released after editing froze would be added unsaved.
+    out = _run(r"""
+const fs = require("fs"), vm = require("vm"), path = require("path");
+const source = fs.readFileSync(path.join(process.argv[1], "app.js"), "utf8").replace(/\r\n/g, "\n");
+const start = source.indexOf("async function flushAnnotationsForUpdate("), end = source.indexOf("\n}\n", start);
+const order = [];
+const state = {quitPreparing: false, cancelToolDrag: () => order.push(["cancel", state.quitPreparing])};
+const context = {state, $: () => ({hidden: true}), closeEditor: () => order.push(["editor"]),
+  annotationStore: {flushForUpdate: async () => order.push(["flush", state.quitPreparing])}};
+vm.createContext(context);
+vm.runInContext(source.slice(start, end) + "\n}\nthis.flush = flushAnnotationsForUpdate;", context);
+await context.flush();
+process.stdout.write(JSON.stringify(order));
+""")
+    assert out == [["cancel", False], ["flush", True]]
+
+
 def test_a_color_that_is_not_a_hex_string_falls_back_instead_of_throwing():
     out = _run(APP + r"""
 emit([16711680, "red", null, [255, 0, 0], "#ff453a"].map((color) => api.hexAlpha(api.annColor({color}), 0.5)));

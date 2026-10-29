@@ -835,6 +835,11 @@ async function closeTab(sid) {
       const reason = await api.update_block_reason();
       if (reason) throw new Error(reason);
     }
+    // An update or window close may have started preparing while the native
+    // check was answering; restarting it here would unlock its panes.
+    if (quitPreparation || quitPreparationRequestId) {
+      throw new Error("Finish the current save or close operation before closing another tab.");
+    }
     // Removing an iframe would discard its editor, debounce and failed-save
     // snapshots. Reuse the acknowledged flush, including older plate sites,
     // and keep every local pane locked until the server accepts the close.
@@ -1021,8 +1026,12 @@ window.nd2wsiPrepareForUpdate = (requestId) => {
     pending.timer = setTimeout(() => {
       if (quitPreparation !== pending) return;
       const missing = [...targets].filter((sid) => !pending.seen.has(sid));
+      // A pane that never confirmed has not answered: native preparation
+      // keeps it frozen between retries, and a repeated close may offer to
+      // close without confirmed saves.
       finishQuitPreparation({
         ok: false,
+        unanswered: true,
         error: `save confirmation timed out for ${missing.length} pane(s)`,
       });
     }, 8000);

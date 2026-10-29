@@ -186,6 +186,23 @@ def test_active_update_is_not_cancelled_or_restarted_by_tab_close():
     assert out["blocked"] == [True, True]
 
 
+def test_update_that_starts_while_close_checks_exports_is_not_restarted_or_unlocked():
+    # Between update retries the panes are editable again, so a tab close can
+    # begin; the next attempt may start while the close awaits the export check.
+    out = run("""
+      window.pywebview={api:{update_block_reason:async()=>{
+        window.nd2wsiPrepareForUpdate('native-update-retry'); return null;}}};
+      const closed=await closeTab('a'); await pump();
+      return {closed, requests:closeRequests.length, preparing:quitPreparationRequestId,
+        blocked:[panes.get('a').inputBlocked(),panes.get('b').inputBlocked()], busy:tabClosePending};
+    """)
+    assert out["closed"] is False
+    assert out["requests"] == 0
+    assert out["preparing"] == "native-update-retry"
+    assert out["blocked"] == [True, True]
+    assert out["busy"] is False
+
+
 def test_superseding_preparation_cannot_be_unlocked_by_old_close():
     out = run("""
       const a=panes.get('a'); a.holdSaves=true; a.edit('held');
