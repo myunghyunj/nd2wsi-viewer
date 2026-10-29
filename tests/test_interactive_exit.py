@@ -230,6 +230,10 @@ def test_a_failed_teardown_after_a_finished_browser_replay_fails_the_run_visibly
     report = tmp_path / "replay.json"
     api = failing_teardown_api()
     api._browser_replay_report = {"ok": True, "samples": [1, 2]}
+    # The replay module is macOS-only (it imports resource), and with
+    # webview.start mocked the replay never runs, so a stand-in keeps this
+    # test the same on every platform the suite runs on.
+    monkeypatch.setitem(sys.modules, "nd2wsi.viewport_benchmark", SimpleNamespace(run_browser_replay=Mock()))
     result, _ = run_native_main(monkeypatch, tmp_path / "sessions", api, [
         "--agent-window", "--browser-replay-report", str(report), "--benchmark-context", str(tmp_path / "ctx.json"),
         "--benchmark-test-root", str(root), str(root / "slide.nd2")])
