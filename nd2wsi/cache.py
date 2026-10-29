@@ -59,19 +59,43 @@ ALGORITHM = "box-mean-floor-v1"
 # A lock names the machine and boot that took it. A drive carried to
 # another computer brings its lockfiles along, and a pid from the other
 # machine means nothing here: the builder cannot be alive on this side.
-# The same goes for a lock from before a reboot, so the boot time is part
-# of the identity and no network hardware lookup is needed.
+# The same goes for a lock from before a reboot, so the lock also records
+# the boot time and no network hardware lookup is needed. Boot times are
+# compared with a tolerance rather than hashed, because each window is its
+# own process: a rounded value flips for one window and not another when
+# the wall clock is stepped, and the sweep would then delete a live build.
 
 
 def _machine_id() -> str:
+    return hashlib.sha1(socket.gethostname().encode()).hexdigest()[:12]
+
+
+def _boot_time() -> float | None:
+    """Wall-clock time of the last boot, steady across sleep.
+
+    macOS ``CLOCK_UPTIME_RAW`` stops while the machine sleeps, so a window
+    started after a sleep would compute a later "boot" than one started
+    before it. ``CLOCK_MONOTONIC`` on macOS, ``CLOCK_BOOTTIME`` on Linux and
+    ``GetTickCount64`` on Windows all keep counting through sleep.
+    """
     try:
-        booted = round((time.time() - time.clock_gettime(time.CLOCK_UPTIME_RAW)) / 10)
+        if os.name == "nt":
+            import ctypes
+
+            ticks = ctypes.windll.kernel32.GetTickCount64
+            ticks.restype = ctypes.c_uint64
+            return time.time() - ticks() / 1000.0
+        clock = getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
+        return time.time() - time.clock_gettime(clock)
     except (AttributeError, OSError, ValueError):
-        booted = 0
-    return hashlib.sha1(f"{socket.gethostname()}|{booted}".encode()).hexdigest()[:12]
+        return None
 
 
 _MACHINE_ID = _machine_id()
+_BOOT_TIME = _boot_time()
+# NTP steps and slew move the computed boot time by seconds; a reboot moves
+# it by at least the previous session's uptime.
+_BOOT_TOLERANCE_S = 120.0
 _FOREIGN_LOCK_STALE_S = 60.0
 
 
@@ -337,6 +361,20 @@ def quarantine(path: Path) -> Path:
     return target
 
 
+def _taken_elsewhere(info: dict[str, Any]) -> bool:
+    """True when a lock was taken on another machine or before a reboot."""
+    machine = info.get("machine")
+    if machine is not None and machine != _MACHINE_ID:
+        return True
+    boot = info.get("boot")
+    if boot is None or _BOOT_TIME is None:
+        return False
+    try:
+        return abs(float(boot) - _BOOT_TIME) > _BOOT_TOLERANCE_S
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 class CacheLock:
     """One build per source and selection, across processes.
 
@@ -408,6 +446,7 @@ class CacheLock:
             "time": time.time(),
             "gen": gen,
             "machine": _MACHINE_ID,
+            "boot": _BOOT_TIME,
         }
         if released:
             info["released"] = True
@@ -467,10 +506,10 @@ class CacheLock:
             return time.time() - mtime > 30
         if info.get("released") is True:
             return True
-        machine = info.get("machine")
-        if machine is not None and machine != _MACHINE_ID:
-            # taken on another machine: its process cannot be running
-            # here, and only clock skew argues for a short grace
+        if _taken_elsewhere(info):
+            # taken on another machine or before a reboot: its process
+            # cannot be running here, and only clock skew argues for a
+            # short grace
             try:
                 age = time.time() - float(info.get("time", 0))
             except (TypeError, ValueError, OverflowError):
@@ -712,9 +751,8 @@ def sweep_stale_builds(caches_dir: Path) -> int:
         info = lock._read()
         live = False
         if info:
-            machine = info.get("machine")
-            if machine is not None and machine != _MACHINE_ID:
-                live = False  # a builder on another machine is not running here
+            if _taken_elsewhere(info):
+                live = False  # a builder on another machine or boot is not running here
             else:
                 try:
                     live = process_is_alive(int(info.get("pid", -1)))

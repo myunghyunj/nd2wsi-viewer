@@ -9,6 +9,7 @@ all of that.
 
 import json
 import os
+import sys
 import threading
 import time
 
@@ -682,3 +683,54 @@ def test_sweep_removes_builds_left_by_another_machine(tmp_path):
     }))
     assert sweep_stale_builds(caches) == 1
     assert not staging.exists()
+
+
+def test_lock_identity_holds_across_sleep_and_ends_at_reboot(tmp_path, monkeypatch):
+    # Each window computes its identity once at start; a window started
+    # after a sleep must still see a live build from before it.
+    import time
+
+    from nd2wsi import cache as cache_mod
+    from nd2wsi.cache import sweep_stale_builds
+
+    if cache_mod._BOOT_TIME is None:
+        pytest.skip("no boot clock on this platform")
+    caches = tmp_path / "caches"
+    family = "a--t0-p0-zmid.nd2svs"
+    staging = caches / f"{family}.building-live"
+    staging.mkdir(parents=True)
+    lock = CacheLock(caches / family)
+    lock.acquire(timeout=1)
+    try:
+        info = lock._read()
+        assert info["machine"] == cache_mod._MACHINE_ID
+        # a few seconds of clock slew between two windows of the same boot
+        monkeypatch.setattr(cache_mod, "_BOOT_TIME", info["boot"] + 5)
+        assert not CacheLock._stale_info(info, time.time())
+        assert sweep_stale_builds(caches) == 0
+        assert staging.is_dir()
+    finally:
+        lock.release()
+
+    # the same pid recorded before a reboot belongs to a process long gone
+    lock.path.write_text(json.dumps({
+        "pid": os.getpid(), "time": time.time() - 120, "gen": "x",
+        "machine": cache_mod._MACHINE_ID, "boot": cache_mod._BOOT_TIME - 3600,
+    }))
+    assert CacheLock._stale_info(lock._read(), time.time())
+    assert sweep_stale_builds(caches) == 1
+    assert not staging.exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="kern.boottime is macOS-only")
+def test_boot_time_counts_sleep_on_macos():
+    import re
+    import subprocess
+
+    from nd2wsi import cache as cache_mod
+
+    out = subprocess.run(
+        ["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, check=True
+    ).stdout
+    booted = int(re.search(r"sec = (\d+)", out).group(1))
+    assert abs(cache_mod._boot_time() - booted) < 5
