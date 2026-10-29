@@ -215,6 +215,10 @@
       gestureSettingsMouse: { clickToZoom: false, dblClickToZoom: false, scrollToZoom: true },
       gestureSettingsTouch: { pinchToZoom: true, flickEnabled: false, clickToZoom: false, dblClickToZoom: false },
     });
+    // On a focused canvas OSD's own keys rotate (R), flip (F), pan (W/A/S/D,
+    // arrows) or zoom (+/-, 0). This window shows exactly the main viewer's
+    // orientation and is aligned by hand, so none of them may act here.
+    viewer.addHandler("canvas-key", event => { event.preventDefaultAction = true; });
     let drawnRois = null, roiBoxes = [];
     const renderRoiBoxes = () => {
       if (!state.ready) return;
