@@ -20,7 +20,7 @@
 
 ## Latest update
 
-- **Safer annotation files:** a file or sidecar the viewer cannot draw is refused before it replaces your marks, and a typed label survives clicking another mark.
+- **Safer annotation files:** a file the viewer cannot draw is refused before it replaces your marks, a sidecar keeps items it cannot draw, and a typed label survives clicking another mark.
 - **16-bit PNG:** 16-bit grayscale PNG files keep their stored values in display, pixel readouts and TIFF export.
 - **Sleep-safe caches:** a window opened after macOS sleep no longer removes another window's cache build.
 - **Faster plates:** plate thumbnails fill about 5 times faster, and cached slides serve more tiles per second.
