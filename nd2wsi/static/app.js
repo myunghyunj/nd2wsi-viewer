@@ -1718,15 +1718,27 @@ function wireTools() {
   $("tool-box").title = "Source-aligned rectangle";
   $("tool-box").onclick = () => setTool("box");
 
-  let moveFrom = null; // roi origin at drag start (move mode)
+  let moveFrom = null; // roi and its origin at drag start (move mode)
   let landmarkStart = null; // a click, not a drag, places an alignment point
   const drawStart = () => state.tool === "astromap"
     ? imageToViewerElementPoint(startImg) : start;
+  // Ends a gesture; one that did not finish (a tool change, a lost pointer,
+  // an update freezing the pane) leaves nothing behind: a moved region goes
+  // back, the live ruler goes, and a pending landmark click is dropped.
   const clearDrag = () => {
     const pointer = dragPointer;
-    start = startImg = dragContext = dragPointer = current = moveFrom = null;
+    if (moveFrom && state.roi === moveFrom.roi) {
+      state.roi.x = moveFrom.x;
+      state.roi.y = moveFrom.y;
+      moveRoiOverlay();
+    }
+    start = startImg = dragContext = dragPointer = current = moveFrom = landmarkStart = null;
     rubber.style.display = "none";
     stage.classList.remove("grabbing");
+    if (state.tempLine) {
+      state.tempLine = null;
+      renderAnnotations();
+    }
     try { if (pointer !== null) stage.releasePointerCapture(pointer); } catch (_) { /* optional */ }
   };
   state.cancelToolDrag = clearDrag;
@@ -1756,7 +1768,7 @@ function wireTools() {
     dragContext = activeFrameContext()?.key;
     dragPointer = ev.pointerId;
     if (state.tool === "move") {
-      moveFrom = { x: state.roi.x, y: state.roi.y };
+      moveFrom = { roi: state.roi, x: state.roi.x, y: state.roi.y };
       stage.classList.add("grabbing");
     }
     if (state.tool === "roi" || state.tool === "box" || state.tool === "astromap") {
@@ -2361,7 +2373,6 @@ async function flushAnnotationsForUpdate() {
   if (!$('ann-editor').hidden) closeEditor(true);
   // A mark still being dragged would land after editing froze, unsaved.
   state.cancelToolDrag?.();
-  state.tempLine = null;
   state.quitPreparing = true;
   await annotationStore.flushForUpdate();
 }

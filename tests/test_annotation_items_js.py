@@ -212,6 +212,97 @@ process.stdout.write(JSON.stringify(order));
     assert out == [["cancel", False], ["flush", True]]
 
 
+TOOLS = r"""
+const fs = require("fs"), vm = require("vm"), path = require("path");
+const source = fs.readFileSync(path.join(process.argv[1], "app.js"), "utf8").replace(/\r\n/g, "\n");
+const production = (name) => {
+  const start = source.indexOf("function " + name + "("), end = source.indexOf("\n}\n", start);
+  if (start < 0 || end < 0) throw new Error("production source not found: " + name);
+  return source.slice(start, end) + "\n}\n";
+};
+// the pane's real pointer handlers and update flush, on a stage whose
+// element and image coordinates are the same
+function fixture() {
+  const nodes = new Map(), log = {renders: [], overlays: [], landmarks: [], added: []};
+  const $ = (id) => {
+    if (!nodes.has(id)) nodes.set(id, {id, hidden: true, style: {}, handlers: {}, captured: new Set(),
+      classList: {add() {}, remove() {}, toggle() {}},
+      addEventListener(kind, fn) { this.handlers[kind] = fn; },
+      setPointerCapture(pointer) { this.captured.add(pointer); },
+      releasePointerCapture(pointer) { this.captured.delete(pointer); }});
+    return nodes.get(id);
+  };
+  const state = {info: {width: 1000, height: 1000}, tool: null, roi: null, tempLine: null,
+    quitPreparing: false, landmark: {active: false}, viewer: {addHandler() {}}};
+  const context = vm.createContext({state, $, Math,
+    clamp: (v, lo, hi) => Math.min(hi, Math.max(lo, v)),
+    elementPoint: (event) => ({x: event.x, y: event.y}), imgPoint: (point) => ({...point}),
+    activeFrameContext: () => ({key: "slide:frame"}), positionRubber: () => null,
+    renderAnnotations: () => log.renders.push(state.tempLine && {...state.tempLine}),
+    moveRoiOverlay: () => log.overlays.push({x: state.roi.x, y: state.roi.y}),
+    placeLandmark: (point) => log.landmarks.push(point),
+    addAnnotation: (item) => { log.added.push(item); return {...item, id: "new"}; },
+    setTool: (tool) => { state.tool = tool; }, updateRoiPanel() {}, closeEditor() {},
+    clearRoi() {}, wireRoiDims() {}, wireAnnotationPanel() {},
+    annotationStore: {flushForUpdate: async () => {}}});
+  vm.runInContext(production("wireTools") + production("flushAnnotationsForUpdate").replace(/^/, "async ") +
+    "\nwireTools();", context);
+  const stage = $("stage");
+  const pointer = (kind, x, y) => stage.handlers[kind]({x, y, button: 0, pointerId: 1, pointerType: "mouse",
+    shiftKey: false, metaKey: false, ctrlKey: false, altKey: false, preventDefault() {}, stopPropagation() {}});
+  return {state, log, stage, pointer, flush: () => context.flushAnnotationsForUpdate()};
+}
+const emit = (value) => process.stdout.write(JSON.stringify(value));
+"""
+
+
+def test_an_update_that_stops_a_drag_leaves_no_ruler_region_move_or_landmark_click_behind():
+    # The pane freezes for the update; a gesture it interrupted must not
+    # stay drawn, keep the region half moved, or place a point on release.
+    out = _run(TOOLS + r"""
+const measure = fixture();
+measure.state.tool = "measure";
+measure.pointer("pointerdown", 10, 20); measure.pointer("pointermove", 80, 110);
+const drawn = measure.state.tempLine;
+await measure.flush();
+measure.pointer("pointerup", 80, 110);
+
+const move = fixture();
+move.state.tool = "move"; move.state.roi = {x: 100, y: 100, w: 50, h: 50};
+move.pointer("pointerdown", 10, 20); move.pointer("pointermove", 40, 60);
+const moved = {x: move.state.roi.x, y: move.state.roi.y};
+await move.flush();
+
+const landmark = fixture();
+landmark.state.landmark.active = true;
+landmark.pointer("pointerdown", 10, 20);
+await landmark.flush();
+landmark.pointer("pointerup", 10, 20);
+
+emit({drawn, ruler: measure.state.tempLine, lastRender: measure.log.renders.at(-1),
+  captured: measure.stage.captured.size, added: measure.log.added,
+  moved, roi: move.state.roi, overlay: move.log.overlays.at(-1), landmarks: landmark.log.landmarks});
+""")
+    assert out["drawn"] == {"x1": 10, "y1": 20, "x2": 80, "y2": 110}
+    assert out["ruler"] is None and out["lastRender"] is None  # drawn again without it
+    assert out["captured"] == 0 and out["added"] == []
+    assert out["moved"] == {"x": 130, "y": 140}
+    assert out["roi"] == {"x": 100, "y": 100, "w": 50, "h": 50}
+    assert out["overlay"] == {"x": 100, "y": 100}
+    assert out["landmarks"] == []
+
+
+def test_a_finished_region_move_stays_where_it_was_dropped():
+    out = _run(TOOLS + r"""
+const move = fixture();
+move.state.tool = "move"; move.state.roi = {x: 100, y: 100, w: 50, h: 50};
+move.pointer("pointerdown", 10, 20); move.pointer("pointermove", 40, 60); move.pointer("pointerup", 40, 60);
+move.state.cancelToolDrag(); // a later tool change
+emit(move.state.roi);
+""")
+    assert out == {"x": 130, "y": 140, "w": 50, "h": 50}
+
+
 def test_a_color_that_is_not_a_hex_string_falls_back_instead_of_throwing():
     out = _run(APP + r"""
 emit([16711680, "red", null, [255, 0, 0], "#ff453a"].map((color) => api.hexAlpha(api.annColor({color}), 0.5)));
