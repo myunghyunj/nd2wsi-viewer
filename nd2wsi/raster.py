@@ -67,7 +67,7 @@ class _RasterLevel:
         return pixels.astype(self.dtype, copy=False)
 
     def _whole(self) -> np.ndarray:
-        """The whole level as (3, H, W), resampled once; callers hold the lifecycle.
+        """The whole level as (C, H, W), resampled once; callers hold the lifecycle.
 
         BOX windows on this level's grid do not depend on their neighbours,
         so building it in bands gives exactly the pixels a per-tile read
@@ -171,13 +171,23 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
     try:
         shapes = level_shapes(height, width, 512)
         if gray16:
-            low, high = (float(v) for v in image.getextrema())
             dtype, channels = np.dtype("uint16"), [ChannelInfo("Gray", (255, 255, 255))]
-            windows = [{"start": low, "end": max(high, low + 1.0), "min": low, "max": high}]
         else:
             dtype = np.dtype("uint8")
             channels = [ChannelInfo("Red", (255, 0, 0)), ChannelInfo("Green", (0, 255, 0)),
                         ChannelInfo("Blue", (0, 0, 255))]
+        life, slots = _Lifecycle(), threading.BoundedSemaphore(MAX_CONCURRENT_READS)
+        levels = {str(k): _RasterLevel(image, shape, 2 ** k, life, slots,
+                                       channels=len(channels), dtype=dtype)
+                  for k, shape in enumerate(shapes)}
+        if gray16:
+            # The same rule as an ND2 store's channels (convert.py): an auto
+            # window from the smallest level inside the full uint16 range.
+            from .contrast import auto_window
+
+            start, end = auto_window(levels[str(len(shapes) - 1)][:, :, :][0], dtype=dtype)
+            windows = [{"start": start, "end": end, "min": 0.0, "max": 65535.0}]
+        else:
             windows = [{"start": 0.0, "end": 255.0, "min": 0.0, "max": 255.0}] * 3
         source = PlaneSource(
             data=None, dtype=dtype, shape=(len(channels), height, width), rgb=not gray16,
@@ -185,10 +195,6 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         )
         attrs = build_group_attrs(source, shapes, 512, windows)
         attrs["nd2wsi"].update(direct=True, raster=True)
-        life, slots = _Lifecycle(), threading.BoundedSemaphore(MAX_CONCURRENT_READS)
-        levels = {str(k): _RasterLevel(image, shape, 2 ** k, life, slots,
-                                       channels=len(channels), dtype=dtype)
-                  for k, shape in enumerate(shapes)}
 
         def close():
             if life.close():

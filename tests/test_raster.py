@@ -298,13 +298,36 @@ def test_16_bit_grayscale_png_keeps_its_values_through_probe_and_tiff_export(tmp
 
         info = json.loads(get("/api/info"))
         assert (info["rgb"], info["dtype"], len(info["channels"])) == (False, "uint16", 1)
-        assert info["channels"][0]["window"]["max"] == float(pixels.max())
+        window = info["channels"][0]["window"]
+        assert (window["min"], window["max"]) == (0.0, 65535.0)
+        assert 0.0 <= window["start"] < window["end"] <= float(pixels.max())
         probe = json.loads(get("/api/pixel?x=41&y=33"))
         assert probe["values"] == [{"name": "Gray", "value": int(pixels[33, 41])}]
         assert Image.open(io.BytesIO(get("/api/tile/0/0/0.jpg?c=0"))).size == (512, 512)
         exported = tifffile.imread(io.BytesIO(get("/api/roi?level=0&x=0&y=0&w=600&h=700&format=tiff")))
         assert exported.dtype == np.uint16
         assert np.array_equal(exported.reshape(pixels.shape), pixels)
+
+
+@pytest.mark.parametrize("value", [0, 1000, 65535])
+def test_a_constant_16_bit_png_gets_a_window_inside_the_uint16_range(tmp_path, value):
+    # The window rule of ND2 channels: it never ends past 65535, where the
+    # LUT handles could not be shown, and a saturated image displays white.
+    from nd2wsi.render import composite
+
+    path = tmp_path / "flat.png"
+    Image.fromarray(np.full((40, 30), value, np.uint16)).save(path)
+    root, attrs = raster.open_direct(path)
+    try:
+        window = attrs["omero"]["channels"][0]["window"]
+        assert (window["min"], window["max"]) == (0.0, 65535.0)
+        assert 0.0 <= window["start"] < window["end"] <= 65535.0
+        shown = composite(root["0"][:, :2, :2], [0], [(window["start"], window["end"])],
+                          [(255, 255, 255)], False)
+        if value == 65535:
+            assert int(shown.max()) == 255
+    finally:
+        root.close(delay=0)
 
 
 def test_pixel_limit_and_memory_preflight_happen_before_full_decode(tmp_path, monkeypatch):
