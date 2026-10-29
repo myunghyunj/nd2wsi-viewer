@@ -34,7 +34,11 @@ state.lutWidgets[0].auto();const explicit=state.luts[0];
 state.initialViewHandoff={};state.luts=[null,null];c.initializeLutAuto();const handoff=[...state.lutAutoPending];
 delete state.initialViewHandoff;state.luts=[{lo:2,hi:8,gamma:1},null];c.initializeLutAuto();const restored=[...state.lutAutoPending];
 state.info.name='bright.svs';c.initializeLutAuto();const svs={axis:state.lutAutoRange,pending:[...state.lutAutoPending]};
-process.stdout.write(JSON.stringify({initial,first,afterFrame,explicit,handoff,restored,svs,changes}));
+state.luts=[null,null];Object.assign(state.info,{name:'camera.png',raster:true,rgb:false});c.initializeLutAuto();
+const gray16={axis:state.lutAutoRange,pending:[...state.lutAutoPending]};
+Object.assign(state.info,{name:'photo.png',rgb:true});c.initializeLutAuto();
+const rgbRaster={axis:state.lutAutoRange,pending:[...state.lutAutoPending]};
+process.stdout.write(JSON.stringify({initial,first,afterFrame,explicit,handoff,restored,svs,gray16,rgbRaster,changes}));
 """
     result = run_node(script, STATIC, check=True)
     out = json.loads(result.stdout)
@@ -45,4 +49,7 @@ process.stdout.write(JSON.stringify({initial,first,afterFrame,explicit,handoff,r
     assert out["handoff"] == [False, False]
     assert out["restored"] == [False, True]
     assert out["svs"] == {"axis": False, "pending": [False, False]}
+    # a 16-bit grayscale PNG is fitted like an ND2 channel; an RGB raster is not
+    assert out["gray16"] == {"axis": True, "pending": [True, True]}
+    assert out["rgbRaster"] == {"axis": False, "pending": [False, False]}
     assert out["changes"] == 4

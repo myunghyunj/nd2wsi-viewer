@@ -134,6 +134,12 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         budget = (available if available is not None else _available_memory()) // 2
         if width * height * 16 > budget:
             raise ValueError("Not enough memory to open this image at full resolution; close other slides and retry")
+        # Pillow narrows 16-bit colour and gray+alpha PNGs to 8 bits as it
+        # decodes them, keeping each sample's high byte; say so. The decoder
+        # tiles are gone once anything (getexif included) loads the image.
+        narrowed = image.format == "PNG" and image.mode not in GRAY16_MODES and any(
+            len(tile) > 3 and str(tile[3]).endswith(";16B") for tile in image.tile
+        )
         orientation = image.getexif().get(274, 1)
         notes = ["Stored pixel orientation; physical calibration is unavailable"]
         if orientation != 1:
@@ -164,6 +170,9 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
             else:
                 image = image.convert("RGB")
             original.close()
+        if narrowed:
+            notes.append("16-bit colour PNG is shown at 8 bits per channel; pixel values and "
+                         "TIFF data exports hold the high byte of each stored value")
     except BaseException:
         image.close()
         raise

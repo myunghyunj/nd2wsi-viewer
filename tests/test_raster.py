@@ -330,6 +330,42 @@ def test_a_constant_16_bit_png_gets_a_window_inside_the_uint16_range(tmp_path, v
         root.close(delay=0)
 
 
+def _png16(path, samples, color_type):
+    import struct
+    import zlib
+
+    height, width = samples.shape[:2]
+    raw = b"".join(b"\0" + samples[y].astype(">u2").tobytes() for y in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 16, color_type, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+@pytest.mark.parametrize("color_type, channels", [(2, 3), (4, 2), (6, 4)])
+def test_a_16_bit_colour_png_says_its_values_were_cut_to_8_bits(tmp_path, color_type, channels):
+    # Pillow keeps only each sample's high byte; a pixel readout or TIFF
+    # export must not pass for the stored 16-bit value without a word.
+    path = tmp_path / "colour16.png"
+    _png16(path, np.full((6, 5, channels), 3000, np.uint16), color_type)
+    root, attrs = raster.open_direct(path)
+    try:
+        notes = attrs["nd2wsi"]["notes"]
+        assert any("shown at 8 bits per channel" in note for note in notes)
+        assert root["0"].dtype == np.uint8
+    finally:
+        root.close(delay=0)
+    _png16(path, np.full((6, 5), 3000, np.uint16), 0)
+    root, attrs = raster.open_direct(path)
+    try:
+        assert not any("8 bits per channel" in note for note in attrs["nd2wsi"]["notes"])
+        assert root["0"][:, 0:1, 0:1].item() == 3000
+    finally:
+        root.close(delay=0)
+
+
 def test_pixel_limit_and_memory_preflight_happen_before_full_decode(tmp_path, monkeypatch):
     path = save_image(tmp_path)
     monkeypatch.setattr(Image.Image, "load", lambda _: pytest.fail("decoded before preflight"))

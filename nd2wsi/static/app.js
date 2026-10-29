@@ -413,10 +413,12 @@ async function initializeDisplayLuts() {
 }
 
 function initializeLutAuto() {
-  const nd2 = /\.nd2$/i.test(String(state.info.name || ""));
-  state.lutAutoRange = nd2;
+  // A single-channel 16-bit PNG is fitted like an ND2 channel; RGB images
+  // keep their fixed 0-255 axis.
+  const fitted = /\.nd2$/i.test(String(state.info.name || "")) || (!!state.info.raster && !state.info.rgb);
+  state.lutAutoRange = fitted;
   state.lutAutoPending = state.info.channels.map((_, i) =>
-    nd2 && !state.initialViewHandoff && !state.luts[i]);
+    fitted && !state.initialViewHandoff && !state.luts[i]);
 }
 
 function acceptLutHistograms(channels) {
@@ -2359,6 +2361,7 @@ async function flushAnnotationsForUpdate() {
   if (!$('ann-editor').hidden) closeEditor(true);
   // A mark still being dragged would land after editing froze, unsaved.
   state.cancelToolDrag?.();
+  state.tempLine = null;
   state.quitPreparing = true;
   await annotationStore.flushForUpdate();
 }
