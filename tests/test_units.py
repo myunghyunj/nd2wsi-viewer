@@ -1,4 +1,5 @@
 """Fast unit tests that need no ND2 file."""
+import json
 import os
 import stat
 import threading
@@ -407,6 +408,46 @@ def test_annotation_sidecars_follow_source_and_plane(tmp_path):
     assert "slide.nd2" in z0.name and "z0" in z0.name
     assert "z1" in z1.name
     assert "slide.svs" in svs.name
+
+
+@pytest.mark.parametrize("z_resolved", [
+    "x/../../../../victim/planted", "..\\..\\victim", "mid/..", -1, True, 1.5, [0],
+])
+def test_cache_manifest_selection_cannot_steer_the_sidecar_path(tmp_path, z_resolved):
+    # A .nd2svs from someone else carries its own manifest; its plane
+    # values must not decide where annotation files are written.
+    from nd2wsi.annotation_sidecars import annotations_sidecar
+    from nd2wsi.storage.single_file import write_entry
+
+    received = tmp_path / "received"
+    received.mkdir()
+    cache = received / "slide--t0-p0-zmid.nd2svs"
+    write_entry(cache, "manifest.json", json.dumps({
+        "format": "nd2wsi-cache/5", "kind": "full", "complete": True,
+        "source": {"name": "slide.nd2"},
+        "selection": {"t": 0, "p": 0, "z": "x", "z_resolved": z_resolved},
+    }).encode())
+    (received / "annotations_slide.json").write_text("[]")
+    before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+
+    with pytest.raises(ValueError):
+        annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}})
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
+
+
+def test_selection_tag_accepts_the_planes_the_app_writes():
+    from nd2wsi.cache import selection_tag
+    from nd2wsi.reader import PlaneSelection
+
+    assert selection_tag(PlaneSelection()) == "t0-p0-zmid"
+    assert selection_tag(PlaneSelection(t=2, p=3, z="max")) == "t2-p3-zmax"
+    assert selection_tag({"t": "1", "p": 0, "z": 4}) == "t1-p0-z4"
+    # an SVS cache records z_resolved None; existing sidecars carry that name
+    assert selection_tag({"t": 0, "p": 0, "z": None}) == "t0-p0-zNone"
+    assert selection_tag({"t": np.int64(2), "p": 0, "z": np.uint16(3)}) == "t2-p0-z3"
+    for bad in ({"t": "../a"}, {"p": -2}, {"z": "mid/.."}, {"t": False}):
+        with pytest.raises(ValueError):
+            selection_tag(bad)
 
 
 def test_auto_workers_respects_cpu_memory_and_absolute_caps(monkeypatch):

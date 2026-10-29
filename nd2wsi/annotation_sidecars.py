@@ -122,9 +122,11 @@ def annotations_sidecar(
     filename += ".json"
 
     target_dir = home / MANAGED_DIR / ANNOTATIONS_DIR
+    new = target_dir / filename
+    if new.parent != target_dir:
+        raise ValueError(f"annotation sidecar name {filename!r} leaves its folder")
     if migrate:
         target_dir.mkdir(parents=True, exist_ok=True)
-    new = target_dir / filename
 
     if not new.exists():
         import shutil

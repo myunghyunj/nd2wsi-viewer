@@ -25,6 +25,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import numbers
 import os
 import re
 import shutil
@@ -132,10 +133,29 @@ def newer_cache_format(container: str | Path) -> str | None:
     return str(m.get("format")) if number is not None and number > newest_known else None
 
 
+def _plane_part(value: Any, words: tuple[str, ...] = ()) -> str:
+    # None is what a store without that axis records (an SVS cache has
+    # z_resolved None), and it has always been named "None" on disk.
+    if value is None:
+        return "None"
+    if isinstance(value, numbers.Integral) and not isinstance(value, bool) and value >= 0:
+        return str(int(value))
+    if isinstance(value, str) and (value in words or re.fullmatch(r"[0-9]+", value)):
+        return value
+    raise ValueError(f"not a plane index: {value!r}")
+
+
 def selection_tag(selection: Any) -> str:
-    """``t0-p0-zmid`` — the requested selection, as named in the path."""
+    """``t0-p0-zmid`` — the requested selection, as named in the path.
+
+    The selection can come from a manifest inside a cache file someone
+    else made, so only plane indices and the z keywords may reach a path.
+    """
     sel = selection.describe() if hasattr(selection, "describe") else dict(selection)
-    return f"t{sel.get('t', 0)}-p{sel.get('p', 0)}-z{sel.get('z', 'mid')}"
+    t = _plane_part(sel.get("t", 0))
+    p = _plane_part(sel.get("p", 0))
+    z = _plane_part(sel.get("z", "mid"), ("mid", "max"))
+    return f"t{t}-p{p}-z{z}"
 
 
 def managed_dir(slide: str | Path) -> Path:
