@@ -266,6 +266,47 @@ def test_alpha_is_composited_on_black_and_grayscale_becomes_rgb(tmp_path):
         root.close(delay=0)
 
 
+def test_16_bit_grayscale_png_keeps_its_values_through_probe_and_tiff_export(tmp_path):
+    # A 12-bit camera image saved as 16-bit PNG used to be clipped to 255.
+    import io
+    import sys
+    import urllib.request
+    from pathlib import Path
+
+    tifffile = pytest.importorskip("tifffile")
+    sys.path.insert(0, str(Path(__file__).parent))
+    from http_fixture import running_server
+
+    from nd2wsi.server import server_url
+
+    pixels = (np.arange(700 * 600).reshape(700, 600) * 7 % 4096).astype(np.uint16)
+    path = tmp_path / "camera.png"
+    Image.fromarray(pixels).save(path)
+    root, attrs = raster.open_direct(path)
+    try:
+        assert root["0"].shape == (1, 700, 600) and root["0"].dtype == np.uint16
+        assert np.array_equal(root["0"][:, :, :][0], pixels)
+        assert root["1"][:, 0:1, 0:1].item() == round(pixels[:2, :2].mean())
+    finally:
+        root.close(delay=0)
+
+    with running_server(path, host="127.0.0.1") as httpd:
+        base = f"{server_url(httpd).rstrip('/')}/s/{httpd.registry.default_sid()}"
+
+        def get(route):
+            return urllib.request.urlopen(base + route, timeout=30).read()
+
+        info = json.loads(get("/api/info"))
+        assert (info["rgb"], info["dtype"], len(info["channels"])) == (False, "uint16", 1)
+        assert info["channels"][0]["window"]["max"] == float(pixels.max())
+        probe = json.loads(get("/api/pixel?x=41&y=33"))
+        assert probe["values"] == [{"name": "Gray", "value": int(pixels[33, 41])}]
+        assert Image.open(io.BytesIO(get("/api/tile/0/0/0.jpg?c=0"))).size == (512, 512)
+        exported = tifffile.imread(io.BytesIO(get("/api/roi?level=0&x=0&y=0&w=600&h=700&format=tiff")))
+        assert exported.dtype == np.uint16
+        assert np.array_equal(exported.reshape(pixels.shape), pixels)
+
+
 def test_pixel_limit_and_memory_preflight_happen_before_full_decode(tmp_path, monkeypatch):
     path = save_image(tmp_path)
     monkeypatch.setattr(Image.Image, "load", lambda _: pytest.fail("decoded before preflight"))

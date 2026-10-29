@@ -26,6 +26,9 @@ MAX_CONCURRENT_READS = 4
 # Levels this coarse are kept whole after their first read. All of them
 # together hold about 1/64 of the base image's memory (Pillow RGB is 4 B/px).
 MEMO_MIN_DOWNSAMPLE = 8
+# Pillow's names for 16-bit grayscale. They decode to integer mode "I" and
+# stay one uint16 channel; converting them to RGB clips every value >= 255.
+GRAY16_MODES = frozenset({"I;16", "I;16B", "I;16L", "I"})
 _MEMO_BAND_ROWS = 64  # output rows per resample while building one memo level
 
 
@@ -34,16 +37,16 @@ def is_raster(path: str | Path) -> bool:
 
 
 class _RasterLevel:
-    def __init__(self, image, shape, downsample, life, slots):
+    def __init__(self, image, shape, downsample, life, slots, *, channels=3, dtype="uint8"):
         self._image, self._life, self._slots = image, life, slots
-        self.shape = (3, *shape)
-        self.dtype = np.dtype("uint8")
+        self.shape = (channels, *shape)
+        self.dtype = np.dtype(dtype)
         self._downsample = downsample
         self._memo: np.ndarray | None = None
         self._memo_lock = threading.Lock()
 
     def _resample(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
-        """One window of this level as (h, w, 3), straight from the base image."""
+        """One window of this level as (h, w, C), straight from the base image."""
         from PIL import Image
 
         d = self._downsample
@@ -56,9 +59,12 @@ class _RasterLevel:
             else:
                 window = self._image.resize((x1 - x0, y1 - y0), Image.Resampling.BOX, box=box)
             try:
-                return np.asarray(window)
+                pixels = np.asarray(window)
             finally:
                 window.close()
+        if pixels.ndim == 2:
+            pixels = pixels[..., None]
+        return pixels.astype(self.dtype, copy=False)
 
     def _whole(self) -> np.ndarray:
         """The whole level as (3, H, W), resampled once; callers hold the lifecycle.
@@ -85,7 +91,7 @@ class _RasterLevel:
         channels, y0, y1, x0, x1 = _parse_cyx_index(index, self.shape)
         with self._life:
             if x0 == x1 or y0 == y1:
-                return np.empty((3, y1 - y0, x1 - x0), self.dtype)[channels]
+                return np.empty((self.shape[0], y1 - y0, x1 - x0), self.dtype)[channels]
             if self._downsample >= MEMO_MIN_DOWNSAMPLE:
                 # A copy, so no caller or tile cache pins or edits the memo.
                 return self._whole()[:, y0:y1, x0:x1][channels].copy()
@@ -133,7 +139,14 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         if orientation != 1:
             notes.append(f"EXIF orientation {orientation} is ignored to preserve TXT pixel coordinates")
         image.load()
-        if image.mode != "RGB":
+        gray16 = image.mode in GRAY16_MODES
+        if gray16:
+            if image.mode != "I":
+                original = image
+                image = image.convert("I")
+                original.close()
+            notes.append("16-bit grayscale values are kept as stored")
+        elif image.mode != "RGB":
             original = image
             if "A" in image.getbands() or "transparency" in image.info:
                 rgba = image if image.mode == "RGBA" else image.convert("RGBA")
@@ -157,17 +170,24 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
 
     try:
         shapes = level_shapes(height, width, 512)
+        if gray16:
+            low, high = (float(v) for v in image.getextrema())
+            dtype, channels = np.dtype("uint16"), [ChannelInfo("Gray", (255, 255, 255))]
+            windows = [{"start": low, "end": max(high, low + 1.0), "min": low, "max": high}]
+        else:
+            dtype = np.dtype("uint8")
+            channels = [ChannelInfo("Red", (255, 0, 0)), ChannelInfo("Green", (0, 255, 0)),
+                        ChannelInfo("Blue", (0, 0, 255))]
+            windows = [{"start": 0.0, "end": 255.0, "min": 0.0, "max": 255.0}] * 3
         source = PlaneSource(
-            data=None, dtype=np.dtype("uint8"), shape=(3, height, width), rgb=True,
-            channels=[ChannelInfo("Red", (255, 0, 0)), ChannelInfo("Green", (0, 255, 0)),
-                      ChannelInfo("Blue", (0, 0, 255))],
-            pixel_size_um=None, source_name=str(path), notes=notes,
+            data=None, dtype=dtype, shape=(len(channels), height, width), rgb=not gray16,
+            channels=channels, pixel_size_um=None, source_name=str(path), notes=notes,
         )
-        windows = [{"start": 0.0, "end": 255.0, "min": 0.0, "max": 255.0}] * 3
         attrs = build_group_attrs(source, shapes, 512, windows)
         attrs["nd2wsi"].update(direct=True, raster=True)
         life, slots = _Lifecycle(), threading.BoundedSemaphore(MAX_CONCURRENT_READS)
-        levels = {str(k): _RasterLevel(image, shape, 2 ** k, life, slots)
+        levels = {str(k): _RasterLevel(image, shape, 2 ** k, life, slots,
+                                       channels=len(channels), dtype=dtype)
                   for k, shape in enumerate(shapes)}
 
         def close():
