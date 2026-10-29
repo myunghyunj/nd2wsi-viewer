@@ -64,7 +64,7 @@ def test_a_sidecar_the_pane_cannot_draw_stays_unloaded_and_is_never_saved_over()
     out = _run(STORE + r"""
 const state = {plate: null, info: {notes: []}, annotations: [], annSite: null, annReady: false,
   annDirty: false, quitPreparing: false, editingId: null};
-const requests = [], statuses = [];
+const requests = [], statuses = [], timers = [];
 const store = createStore({
   state,
   fetch: (url, init = {}) => {
@@ -74,15 +74,23 @@ const store = createStore({
       path: "/sidecars/slide.json", revision: "r1"})});
   },
   onStatus: (message) => statuses.push(message),
-  setTimer: () => 1, clearTimer: () => {},
+  setTimer: (fn) => { timers.push(fn); return timers.length; }, clearTimer: () => {},
 });
 store.load(null); await tick();
-store.markDirty(); store.scheduleSave(); store.retryFailed(); await tick();
-emit({ready: state.annReady, items: state.annotations.length, requests, status: statuses.at(-1)});
+const status = statuses.at(-1);
+// every path that could send the pane's (empty) list for this owner
+store.markDirty(); store.scheduleSave();
+for (const fire of timers.splice(0)) fire();
+await store.retryFailed(); await store.flushOnPagehide(); await store.save(); await tick();
+let flushed = "ok";
+try { await store.flushForUpdate(); } catch (error) { flushed = error.message; }
+emit({ready: state.annReady, dirty: state.annDirty, items: state.annotations.length, requests, status, flushed});
 """)
-    assert out["ready"] is False and out["items"] == 0
+    assert out["ready"] is False and out["dirty"] is False and out["items"] == 0
     assert out["requests"] == ["GET"]
     assert out["status"].startswith("Could not load annotations for this site (annotation 2: ")
+    # nothing unsaved exists, so an update or close is not held up by it
+    assert out["flushed"] == "ok"
 
 
 APP = r"""

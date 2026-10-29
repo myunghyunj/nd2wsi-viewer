@@ -77,7 +77,7 @@
   // panel) keep reading state.ann* as before; only the store writes them:
   //   state.annotations            the items; the pane edits this array itself
   //   state.editingId              cleared when another sidecar is loaded
-  //   state.annSite, annReady, annPath, annDirty, annRevision, annContext
+  //   state.annSite, annReady, annLoadFailed, annPath, annDirty, annRevision, annContext
   //   state.annServerRevision, annServerRevisions, annAcceptedDrafts
   //   state.annSaveTail, annFailedSaves, annLoadSeq
   // It reads state.plate, state.info (plate.P, notes) and state.quitPreparing.
@@ -123,7 +123,11 @@
     // save that is still in flight (or was queued meanwhile) from one it owes
     let queuedRevision = null, queuedContext = null;
 
+    // Nothing is marked dirty, scheduled or sent for an owner whose sidecar
+    // failed to load or was refused (normalizeItems): the pane's list is then
+    // empty, and saving it would replace the sidecar on disk.
     function scheduleSave() {
+      if (state.annLoadFailed) return;
       clearTimer(timer);
       timer = setTimer(() => { timer = null; save(); }, debounceMs);
     }
@@ -134,6 +138,7 @@
     }
 
     function markDirty() {
+      if (state.annLoadFailed) return;
       state.annRevision += 1;
       state.annDirty = true;
       state.annAcceptedDrafts?.clear();
@@ -337,6 +342,10 @@
         onStatus("Not saved: annotation is locked in this degraded view");
         return Promise.resolve({ ok: false, error: "annotation is locked" });
       }
+      if (state.annLoadFailed) {
+        onStatus("Not saved: this image's annotations did not load");
+        return Promise.resolve({ ok: false, error: "annotations did not load" });
+      }
       const entry = saveEntry(site);
       if (!entry) {
         onStatus("Not saved: choose a plate site first");
@@ -441,6 +450,7 @@
       const url = urlFor(targetSite);
       state.annSite = Number.isInteger(targetSite) ? targetSite : null;
       state.annReady = false;
+      state.annLoadFailed = false;
       state.annPath = null;
       state.annServerRevision = null;
       state.annotations = [];
@@ -516,6 +526,7 @@
         .catch((error) => {
           if (!stillCurrent()) return;
           state.annReady = false;
+          state.annLoadFailed = true;
           const invalid = error && /^annotation \d+: /.test(error.message);
           onStatus("Could not load annotations for this site" + (invalid ? " (" + error.message + ")" : ""));
           onScope();
