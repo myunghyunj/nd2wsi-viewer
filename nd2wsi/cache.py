@@ -61,14 +61,13 @@ ALGORITHM = "box-mean-floor-v1"
 # A lock names the machine and boot that took it. A drive carried to
 # another computer brings its lockfiles along, and a pid from the other
 # machine means nothing here: the builder cannot be alive on this side.
-# The same goes for a lock from before a reboot, so the lock also records
-# the boot time and no network hardware lookup is needed. Boot times are
-# compared with a tolerance rather than hashed, because each window is its
-# own process: a rounded value flips for one window and not another when
-# the wall clock is stepped, and the sweep would then delete a live build.
-# For the same reason the machine is named by its hardware or OS identity,
-# not its host name, which DHCP or a Bonjour conflict can change between
-# two windows of one boot.
+# The same goes for a lock from before a reboot. Each window is its own
+# process, so both names must agree across every process of one boot, or
+# one window's sweep deletes another's live build: the machine is named by
+# its hardware or OS identity, not its host name (DHCP or a Bonjour conflict
+# can change that between two windows), and the boot by the system's boot
+# id, not a boot time (a clock step would move it). Where there is no boot
+# id the pid decides, as it did in 2.5.4.
 
 
 def _host_identity() -> str | None:
@@ -107,29 +106,57 @@ def _machine_id() -> str:
     return hashlib.sha1(f"nd2wsi-lock|{identity}".encode()).hexdigest()[:12]
 
 
-def _boot_time() -> float | None:
-    """Wall-clock time of the last boot, steady across sleep.
-
-    macOS ``CLOCK_UPTIME_RAW`` stops while the machine sleeps, so a window
-    started after a sleep would compute a later "boot" than one started
-    before it. ``CLOCK_MONOTONIC`` on macOS, ``CLOCK_BOOTTIME`` on Linux and
-    ``GetTickCount64`` on Windows all keep counting through sleep.
-    """
+def _boot_id() -> str | None:
+    """The system's identity of this boot, unchanged by sleep or clock steps."""
     try:
-        if os.name == "nt":
+        if sys.platform == "darwin":
             import ctypes
 
-            ticks = ctypes.windll.kernel32.GetTickCount64
-            ticks.restype = ctypes.c_uint64
-            return time.time() - ticks() / 1000.0
+            value = ctypes.create_string_buffer(64)
+            size = ctypes.c_size_t(len(value))
+            if ctypes.CDLL(None).sysctlbyname(
+                b"kern.bootsessionuuid", value, ctypes.byref(size), None, ctypes.c_size_t(0)
+            ) == 0:
+                return value.value.decode("ascii") or None
+        elif os.name == "nt":
+            import winreg
+
+            key_path = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                return str(winreg.QueryValueEx(key, "BootId")[0])
+        else:
+            return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip() or None
+    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
+        pass
+    return None
+
+
+def _boot_time() -> float | None:
+    """Wall-clock time of the last boot, counting sleep (macOS ``CLOCK_UPTIME_RAW``
+    does not); it bounds the names an older build could have written."""
+    try:
         clock = getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
         return time.time() - time.clock_gettime(clock)
     except (AttributeError, OSError, ValueError):
         return None
 
 
+def _legacy_machine_id() -> str:
+    """The name 2.5.4 and older give this machine at this moment."""
+    try:
+        booted = round((time.time() - time.clock_gettime(time.CLOCK_UPTIME_RAW)) / 10)
+    except (AttributeError, OSError, ValueError):
+        booted = 0
+    return hashlib.sha1(f"{socket.gethostname()}|{booted}".encode()).hexdigest()[:12]
+
+
 _MACHINE_ID = _machine_id()
+_BOOT_ID = _boot_id()
 _BOOT_TIME = _boot_time()
+# Builds up to 2.5.4 read only "machine". Writing their name for this
+# process there keeps an older viewer still running here from taking a
+# 2.5.5 lock for a foreign machine's and sweeping its live build.
+_LEGACY_MACHINE_ID = _legacy_machine_id()
 # NTP steps and slew move the computed boot time by seconds; a reboot moves
 # it by at least the previous session's uptime.
 _BOOT_TOLERANCE_S = 120.0
@@ -450,18 +477,15 @@ def quarantine(path: Path) -> Path:
 
 
 def _taken_elsewhere(info: dict[str, Any]) -> bool:
-    """True when a lock was taken on another machine or before a reboot."""
+    """True when a lock was taken on another machine or in another boot."""
+    if "host" in info:  # written by 2.5.5 or later
+        if info.get("host") != _MACHINE_ID:
+            return True
+        boot = info.get("boot")
+        return boot is not None and _BOOT_ID is not None and boot != _BOOT_ID
+    # 2.5.4 and older wrote only their own name of host and boot
     machine = info.get("machine")
-    if machine is not None and machine != _MACHINE_ID:
-        # a lock from 2.5.4 or older carries no boot time and its own naming
-        return "boot" in info or machine not in _legacy_machine_ids()
-    boot = info.get("boot")
-    if boot is None or _BOOT_TIME is None:
-        return False
-    try:
-        return abs(float(boot) - _BOOT_TIME) > _BOOT_TOLERANCE_S
-    except (TypeError, ValueError, OverflowError):
-        return False
+    return machine is not None and machine not in _legacy_machine_ids()
 
 
 class CacheLock:
@@ -534,8 +558,9 @@ class CacheLock:
             "pid": None if released else os.getpid(),
             "time": time.time(),
             "gen": gen,
-            "machine": _MACHINE_ID,
-            "boot": _BOOT_TIME,
+            "machine": _LEGACY_MACHINE_ID,
+            "host": _MACHINE_ID,
+            "boot": _BOOT_ID,
         }
         if released:
             info["released"] = True
@@ -573,7 +598,7 @@ class CacheLock:
                 info is not None
                 and info.get("gen") == gen
                 and info.get("pid") == os.getpid()
-                and info.get("machine") == _MACHINE_ID
+                and info.get("host") == _MACHINE_ID
                 and info.get("released") is not True
                 and self._path_is_fd(fd)
             ):
