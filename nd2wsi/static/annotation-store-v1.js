@@ -74,8 +74,10 @@
   }
 
   // A sidecar's items the pane cannot draw are not shown or edited, and are
-  // written back unchanged with the drawable ones on every save.
+  // written back unchanged with the drawable ones on every save. A sidecar
+  // without an items array is refused, never read as an empty one.
   function splitItems(items, makeId) {
+    if (!Array.isArray(items)) throw new Error("no items array");
     const drawable = [], foreign = [];
     for (const item of items) (itemProblem(item) ? foreign : drawable).push(item);
     const reserved = foreign.map((item) => item && item.id).filter((id) => typeof id === "string");
@@ -507,7 +509,7 @@
           // A recovered draft is this pane's own snapshot: its drawable items
           // come first and its kept-aside ones last, so splitting it again
           // leaves the saved body exactly as it was.
-          const { items, foreign } = splitItems(Array.isArray(d.items) ? d.items : [],
+          const { items, foreign } = splitItems(d && d.items,
             () => "a" + now().toString(36) + "s" + loadedIds++);
           state.annotations = items;
           state.annForeignItems = foreign;

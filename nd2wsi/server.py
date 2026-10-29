@@ -1593,6 +1593,20 @@ def content_disposition(filename: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
 
 
+def _sidecar_items(document: Any) -> list:
+    """The items of an annotation sidecar, which must be a JSON object.
+
+    An object without items is an empty sidecar (a missing window snapshot
+    reads as {}); anything else raises ValueError.
+    """
+    if not isinstance(document, dict):
+        raise ValueError("annotation document must be a JSON object")
+    items = document.get("items", [])
+    if not isinstance(items, list):
+        raise ValueError("annotation items must be a list")
+    return items
+
+
 def make_handler(
     registry: SlideRegistry, token: str = ""
 ) -> type[BaseHTTPRequestHandler]:
@@ -2221,18 +2235,20 @@ def make_handler(
                 return self._error(400, str(e))
             if p is None:
                 return self._json({"items": [], "path": None})
+            # A sidecar that is not an object with an items list is refused,
+            # never read as empty: the pane's next save would replace it.
             if registry.annotation_workspace is not None:
                 try:
                     document, rev = registry.annotation_workspace.read(p)
-                    return self._json({"items": document.get("items", []), "path": str(p),
+                    items = _sidecar_items(document)
+                    return self._json({"items": items, "path": str(p),
                                        "revision": rev, "window": registry.window_session.as_dict()})
                 except (ValueError, UnicodeError, OSError, TimeoutError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             if p.exists():
                 try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
-                    items = data.get("items", []) if isinstance(data, dict) else []
-                except (json.JSONDecodeError, UnicodeError, OSError) as e:
+                    items = _sidecar_items(json.loads(p.read_text(encoding="utf-8")))
+                except (ValueError, UnicodeError, OSError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             else:
                 items = []

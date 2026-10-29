@@ -120,6 +120,27 @@ emit({ready: state.annReady, dirty: state.annDirty, items: state.annotations.len
     assert out["flushed"] == "ok"
 
 
+def test_a_sidecar_without_an_items_array_fails_to_load_and_is_never_saved_over():
+    # Read as empty, the next save would replace the file with an empty list.
+    out = _run(STORE + r"""
+const results = [];
+for (const items of ["not-an-array", {}, null, undefined, 7]) {
+""" + SIDECAR + r"""
+  reply = {ok: true, json: async () => ({items, path: "/s.json", revision: "r1"})};
+  store.load(null); await tick();
+  const status = statuses.at(-1);
+  store.markDirty(); store.scheduleSave();
+  for (const fire of timers.splice(0)) fire();
+  await store.save(); await store.retryFailed(); await store.flushOnPagehide(); await tick();
+  results.push({ready: state.annReady, failed: state.annLoadFailed, status,
+    requests: requests.map((r) => r.method)});
+}
+emit(results);
+""")
+    assert out == [{"ready": False, "failed": True, "status": "Could not load annotations for this site",
+                    "requests": ["GET"]}] * 5
+
+
 APP = r"""
 const fs = require("fs"), vm = require("vm"), path = require("path");
 const source = fs.readFileSync(path.join(process.argv[1], "app.js"), "utf8").replace(/\r\n/g, "\n");

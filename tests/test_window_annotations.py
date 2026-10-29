@@ -163,6 +163,24 @@ def test_default_server_keeps_legacy_api_without_revision(source):
         assert _request(url)[1]["items"] == [{"id": "legacy-write"}]
 
 
+@pytest.mark.parametrize("window", [None, "user"], ids=["browser", "window"])
+def test_a_sidecar_without_an_items_list_is_refused_not_read_as_empty(source, tmp_path, window):
+    # Read as empty, the pane's next save would replace the file.
+    canonical = annotations_sidecar(source, _attrs(source))
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    replies = []
+    for body in ('[{"id": "a", "type": "pin", "x": 1, "y": 2}]', '"text"', '{"items": {"a": 1}}',
+                 '{"items": null}', '{"note": "no items yet"}'):
+        canonical.write_text(body, encoding="utf-8")
+        session = window and create_window_session(window, tmp_path / "sessions")
+        with _server(source, session) as (_, _, url):
+            status, reply = _request(url)
+        replies.append((status, reply.get("items", reply.get("error", "").split(": ")[-1])))
+        assert canonical.read_text(encoding="utf-8") == body
+    assert replies == [(500, "annotation document must be a JSON object")] * 2 + \
+        [(500, "annotation items must be a list")] * 2 + [(200, [])]
+
+
 def test_conflict_draft_failure_still_never_overwrites_canonical(source, tmp_path, monkeypatch):
     import nd2wsi.annotation_workspace as module
     session = create_window_session("user", tmp_path / "sessions")
