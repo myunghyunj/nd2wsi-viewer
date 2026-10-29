@@ -205,13 +205,25 @@ class ViewerState:
                 self._shading = ShadingCorrectionController(self)
             return self._shading
 
-    def close_shading(self) -> None:
+    def close_shading(self, *, blocking: bool = True) -> bool:
+        """Close Shading Correction, then mark the slide closed for replacements.
+
+        A pyramid replacement or refresh holds the replacement lock while it
+        drains reads, for up to 30 s. With ``blocking`` False this returns
+        False instead of waiting for it: the controller is closed, but the
+        slide is not marked closed until a later blocking call.
+        """
         with self._shading_lock:
             self._shading_closed = True
             if self._shading is not None:
                 self._shading.close()
-        with self._replacement_lock:
+        if not self._replacement_lock.acquire(blocking=blocking):
+            return False
+        try:
             self._closed = True
+        finally:
+            self._replacement_lock.release()
+        return True
 
     def _pyramid_identity(self):
         path = self.cache_path
@@ -589,15 +601,19 @@ def _close_state(st: ViewerState | None) -> None:
     """
     if st is None:
         return
-    # This takes the replacement lock and marks the state closed, so no
-    # pyramid replacement or refresh can swap the root or reopen busy later.
-    st.close_shading()
     st.exports.close(timeout=0)
-    if st.busy.close(timeout=0):
+    # Busy is barred only after the state is marked closed under the
+    # replacement lock, so no pyramid replacement or refresh can swap the
+    # root or reopen busy later. While one holds that lock and drains reads,
+    # the rest of the close runs in the background, in the same order.
+    marked = st.close_shading(blocking=False)
+    if marked and st.busy.close(timeout=0):
         _close_root(st.root)
         return
 
     def close_after_reads() -> None:
+        if not marked:
+            st.close_shading()
         st.busy.close(timeout=None)
         _close_root(st.root)
 

@@ -595,10 +595,73 @@ def test_window_close_during_pyramid_publication_keeps_reads_barred():
         replacing.join(5)
         closing.join(5)
     assert not replacing.is_alive() and not closing.is_alive()
-    assert st._closed and st.generation == "corrected"
-    assert st.busy.closed  # the close, not the replacement, has the last word
+    # The close finishes in the background once the replacement lets go.
+    assert _wait_until(lambda: st._closed and st.busy.closed)
+    assert st.generation == "corrected"
+    # The close, not the replacement, has the last word.
     with pytest.raises(ValueError, match="closed"):
         st.busy.__enter__()
+
+
+def test_window_close_does_not_wait_for_a_replacement_draining_reads():
+    st = state()
+    closes = []
+
+    class Root(dict):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def close(self, delay=None):
+            closes.append((self.name, st.busy.active))
+
+    class Replacement:
+        staging = final = "staged"
+        manifest = prior_manifest = {"generation": "corrected"}
+
+        def publish(self):
+            pass
+
+    st.root = Root("old")
+    opened = iter(["probe", "new"])
+    st._open_pyramid = lambda path, manifest: (Root(next(opened)), st.attrs)
+    registry = window_registry(st)
+    reading, release = threading.Event(), threading.Event()
+
+    def slow_read():  # a cold tile the replacement must wait for
+        with st.busy:
+            reading.set()
+            assert release.wait(10)
+
+    reader = threading.Thread(target=slow_read)
+    reader.start()
+    assert reading.wait(5)
+    replacing = threading.Thread(target=st.replace_pyramid, args=(Replacement(),))
+    replacing.start()
+    # The replacement holds its lock while it drains the read.
+    assert _wait_until(lambda: st.busy.closed)
+    timer = threading.Timer(2.0, release.set)  # the read ends after 2 s
+    timer.start()
+    try:
+        started = time.monotonic()
+        assert registry.remove(SID) is True
+        assert time.monotonic() - started < 0.5  # the tab close does not wait
+        assert registry.get(SID) is None
+        with pytest.raises(ValueError, match="closed"):
+            with st.exports:  # exports are barred at once all the same
+                pass
+        assert registry.active_export_count() == 0
+    finally:
+        release.set()
+        timer.cancel()
+        reader.join(5)
+        replacing.join(5)
+    assert not replacing.is_alive() and st.generation == "corrected"
+    # The background close waits for the replacement, marks the slide
+    # closed, bars reads and closes the new root once no read is left.
+    assert _wait_until(lambda: len(closes) == 3)
+    assert closes == [("probe", 1), ("old", 0), ("new", 0)]
+    assert st._closed and st.busy.closed
 
 
 def test_a_reopened_slide_closes_its_replaced_root_only_after_reads_end(monkeypatch, tmp_path):
