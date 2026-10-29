@@ -867,21 +867,21 @@ class SlideRegistry:
                 except NotImplementedError as e:
                     reason = str(e)
             degraded = root is None
-            if degraded:
-                root, attrs = open_store(store_path)
-                meta = attrs["nd2wsi"]
-                meta["kind"] = "overview-degraded"
-                for lv in meta["levels"]:
-                    lv["downsample"] //= 2
-                # the base level is now the half-resolution overview, so a
-                # pixel is twice as large — otherwise every scalebar and
-                # measurement would read half its true length
-                if meta.get("pixel_size_um"):
-                    meta["pixel_size_um"] = [v * 2 for v in meta["pixel_size_um"]]
-                meta["notes"] = meta.get("notes", []) + [
-                    f"{reason}; showing the stored overview at half resolution"
-                ]
             try:
+                if degraded:
+                    root, attrs = open_store(store_path)
+                    meta = attrs["nd2wsi"]
+                    meta["kind"] = "overview-degraded"
+                    for lv in meta["levels"]:
+                        lv["downsample"] //= 2
+                    # the base level is now the half-resolution overview, so a
+                    # pixel is twice as large — otherwise every scalebar and
+                    # measurement would read half its true length
+                    if meta.get("pixel_size_um"):
+                        meta["pixel_size_um"] = [v * 2 for v in meta["pixel_size_um"]]
+                    meta["notes"] = meta.get("notes", []) + [
+                        f"{reason}; showing the stored overview at half resolution"
+                    ]
                 annotations = None if degraded else self.annotation_path(store_path, attrs)
                 st = ViewerState(
                     root,

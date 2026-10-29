@@ -677,3 +677,19 @@ def test_failed_plain_reply_body_writes_no_second_response(monkeypatch, method, 
     handler.close_connection = False
     handler.do_GET()
     assert second.writes and second.writes[0].startswith(b"HTTP/1.1 404")
+
+
+def test_failed_degraded_overview_open_closes_its_store_at_once(monkeypatch, tmp_path):
+    from nd2wsi import convert
+
+    closes = []
+    # A malformed cache: its level has no downsample to halve.
+    broken = {"nd2wsi": {"levels": [{"path": "0", "width": 8, "height": 8}]}, "multiscales": [{}]}
+    monkeypatch.setattr(convert, "open_store", lambda path: (_ClosingRoot(1, closes), broken))
+    store = tmp_path / "slide.nd2svs"
+    store.write_bytes(b"")
+    registry = SlideRegistry()
+    with pytest.raises(KeyError):
+        registry._add_overview(store, {"source": {"name": "slide.nd2"}}, source_path=tmp_path / "missing.nd2")
+    assert closes == [(1, 0)]
+    assert registry.slides == {}
