@@ -150,6 +150,42 @@ def test_tidy_caches_moves_only_our_stores(tmp_path):
     assert foreign.is_dir() and not ours.exists()
 
 
+def test_tidy_remove_corrupt_caches_rescues_annotations_first(tmp_path, capsys):
+    # plate.py and convert.py quarantine old stores whole because an older
+    # build may have put annotations inside; tidy must not destroy them.
+    from nd2wsi.cli import main
+
+    caches = tmp_path / "nd2wsi" / "caches"
+    plate = caches / "x--plate.nd2svs.corrupt-20261001T000000"
+    (plate / "nested").mkdir(parents=True)
+    (plate / "nested" / "annotations_slide.nd2.json").write_bytes(b'{"items": [1]}')
+    (plate / "chunk.bin").write_bytes(b"\0" * 64)
+    pyramid = tmp_path / "pyramids" / "x.ome.zarr.corrupt-20261001T000000"
+    pyramid.mkdir(parents=True)
+    (pyramid / "annotations_x.nd2.json").write_bytes(b'{"items": [2]}')
+
+    assert main(["tidy", str(tmp_path), "--remove-corrupt-caches"]) == 0
+    assert not plate.exists() and not pyramid.exists()
+    home = tmp_path / "nd2wsi" / "annotations"
+    assert (home / "annotations_slide.nd2.json").read_bytes() == b'{"items": [1]}'
+    assert (home / "annotations_x.nd2.json").read_bytes() == b'{"items": [2]}'
+    assert "rescued annotations_slide.nd2.json" in capsys.readouterr().out
+
+
+def test_tidy_keeps_a_quarantined_store_whose_annotations_cannot_be_saved(tmp_path, capsys):
+    from nd2wsi.cli import main
+
+    corpse = tmp_path / "nd2wsi" / "caches" / "x.nd2svs.corrupt-1"
+    corpse.mkdir(parents=True)
+    (corpse / "annotations_x.nd2.json").write_bytes(b"[]")
+    # the rescue destination is a file, so nothing can be copied out
+    (tmp_path / "nd2wsi" / "annotations").write_bytes(b"")
+
+    assert main(["tidy", str(tmp_path), "--remove-corrupt-caches"]) == 0
+    assert (corpse / "annotations_x.nd2.json").read_bytes() == b"[]"
+    assert "kept x.nd2svs.corrupt-1" in capsys.readouterr().err
+
+
 def test_annotations_live_in_the_managed_folder(tmp_path):
     """Work goes to nd2wsi/annotations/, whatever holds the cache, and old
     sidecars migrate there on open."""
