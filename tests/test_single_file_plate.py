@@ -289,6 +289,36 @@ def test_a_stale_windows_record_is_measured_again_and_replaced(plate_nd2, monkey
     assert record["windows"] == measured
 
 
+def test_recorded_windows_survive_a_rebuild_of_their_cache(plate_nd2, monkeypatch):
+    """Windows read from a record are still kept when the store then finds
+    its arrays unreadable and rebuilds the cache: the fresh manifest records
+    them again, so the next open does not measure every site once more."""
+    first = PlateSource(plate_nd2)
+    try:
+        measured = _windows(first)
+    finally:
+        first.close()
+    path = plate_container(plate_nd2)
+    assert WINDOWS_KEY in read_manifest(path)
+    write_entry(path, "thumbs.zarr/done/.zarray", b"not json")
+
+    monkeypatch.setattr(PlateSource, "_measure_windows", _no_measuring)
+    rebuilt = PlateSource(plate_nd2)
+    try:
+        assert _windows(rebuilt) == measured
+        assert list(path.parent.glob(path.name + ".corrupt-*"))  # it was rebuilt
+    finally:
+        rebuilt.close()
+    manifest = read_manifest(path)
+    assert manifest[WINDOWS_KEY]["generation"] == manifest["generation"]
+    assert manifest[WINDOWS_KEY]["windows"] == measured
+    again = PlateSource(plate_nd2)
+    try:
+        assert _windows(again) == measured
+    finally:
+        again.close()
+
+
 def _listing(folder):
     return sorted(p.name for p in folder.iterdir()) if folder.exists() else None
 

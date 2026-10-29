@@ -1614,10 +1614,10 @@ class PlateSource:
         self.tile = int(tile)
         self.store: PlateStore | None = None
         # Default display windows: an open that uses the store first looks
-        # for those its cache records; windows measured instead are handed
-        # to the store's writer once it opens.
+        # for those its cache records, else measures them. Once the store
+        # opens, its writer records them unless its manifest already does.
         self._windows_lookup = (bool(store), cache_path)
-        self._measured_windows: list[dict[str, float]] | None = None
+        self._display_windows: list[dict[str, float]] | None = None
         # Process-wide RAM caches must never alias two opens of the same path.
         # This is deliberately not the server-visible source generation.
         self._open_generation = uuid.uuid4().hex
@@ -1666,8 +1666,13 @@ class PlateSource:
                     opened_store = (PlateStore.open_or_create(self) if cache_path is None
                                     else PlateStore.open_or_create(self, cache_path=cache_path))
                     self.store = opened_store
-                    if self._measured_windows is not None:
-                        opened_store.keep_display_windows(self._measured_windows)
+                    # A cache rebuilt by open_or_create has lost the record
+                    # the windows may have been read from; write it again.
+                    if (
+                        self._display_windows is not None
+                        and _stored_windows(opened_store.manifest, self) is None
+                    ):
+                        opened_store.keep_display_windows(self._display_windows)
                     opened_store.start()
                 except Exception as e:  # a store that will not open is only a slower view
                     if opened_store is not None:
@@ -1865,14 +1870,16 @@ class PlateSource:
 
     def _windows(self, background_mode_start: Any) -> list[dict[str, float]]:
         """Default display windows: those a matching cache already records
-        for this source, else measured now and kept for the store's writer."""
+        for this source, else measured now. Either is kept for the store's
+        writer."""
         use_store, cache_path = self._windows_lookup
         if use_store:
             recorded = PlateStore.recorded_windows(self, cache_path=cache_path)
             if recorded is not None:
+                self._display_windows = recorded
                 return recorded
         windows = self._measure_windows()
-        self._measured_windows = windows
+        self._display_windows = windows
         return windows
 
     def _measure_windows(self) -> list[dict[str, float]]:
