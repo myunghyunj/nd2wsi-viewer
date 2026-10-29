@@ -44,8 +44,32 @@ SCRIPT = PREPARATION_SCRIPT.replace(
 ).replace("Promise.resolve(vm.runInContext", CLOSE_BINDINGS + "\nPromise.resolve(vm.runInContext", 1)
 
 
-def run(body):
-    result = run_node(SCRIPT, STATIC, body)
+# The production refresh() in place of the stub, against a fake server that
+# lists the slides it has not closed; closeGate holds the close reply.
+REFRESH_BINDINGS = r"""
+for (const frame of frames.values()) frame.remove = () => {};
+Object.assign(shell, {
+  nativeGesturePaneScopes:new Map(), shadingStates:new Map(), astromapStates:new Map(),
+  shadingTokens:new Map(), compare:{enabled:false, states:new Map(), mru:[], members:new Set()},
+  pairPicker:{open:false}, active:'b', serverSlides:['a', 'b'], closeGate:null,
+  broadcastTabShortcutState(){}, activate(){}, applyFrameLayout(){}, updateCompareControls(){}, render(){},
+});
+shell.fetch = async (url, options) => {
+  if (url === 'api/slides') return {json:async()=>({slides:shell.serverSlides.map(sid=>({sid}))})};
+  const {sid} = JSON.parse(options.body);
+  shell.closeRequests.push({url, sid});
+  await shell.closeGate;
+  shell.serverSlides = shell.serverSlides.filter(open => open !== sid);
+  return {ok:true, status:200, json:async()=>({ok:true})};
+};
+vm.runInContext(production(shellSource, 'refresh'), shell);
+"""
+
+REFRESH_SCRIPT = SCRIPT.replace("Promise.resolve(vm.runInContext", REFRESH_BINDINGS + "\nPromise.resolve(vm.runInContext", 1)
+
+
+def run(body, script=SCRIPT):
+    result = run_node(script, STATIC, body)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -201,6 +225,28 @@ def test_update_that_starts_while_close_checks_exports_is_not_restarted_or_unloc
     assert out["preparing"] == "native-update-retry"
     assert out["blocked"] == [True, True]
     assert out["busy"] is False
+
+
+def test_update_that_starts_while_the_server_closes_a_tab_does_not_wait_for_the_closed_pane():
+    # The closing pane was saved by the close's own preparation; once the
+    # server closed its slide, refresh() removes it before it can answer.
+    out = run("""
+      let release; closeGate = new Promise(resolve => { release = resolve; });
+      const closing = closeTab('a'); await pump();
+      const requests = closeRequests.length;
+      frames.get('a').contentWindow.postMessage = () => {}; // removed before it answers
+      let result = 'pending';
+      window.nd2wsiPrepareForUpdate('native-update').then(value => { result = value; });
+      release(); const closed = await closing; await pump();
+      return {requests, closed, result, frames:[...frames.keys()], refreshCount,
+        preparing:quitPreparationRequestId, blocked:panes.get('b').inputBlocked(), notices};
+    """, REFRESH_SCRIPT)
+    assert out["requests"] == 1 and out["closed"] is True
+    assert out["result"] == {"ok": True, "panes": 1}
+    assert out["frames"] == ["b"] and out["refreshCount"] == 0  # the production refresh ran
+    # the update still owns the surviving pane
+    assert out["preparing"] == "native-update" and out["blocked"] is True
+    assert out["notices"] == []
 
 
 def test_superseding_preparation_cannot_be_unlocked_by_old_close():

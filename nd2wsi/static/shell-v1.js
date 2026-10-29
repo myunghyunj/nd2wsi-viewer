@@ -732,6 +732,7 @@ function refresh(selectSid) {
         if (!openSids.has(key)) {
           frame.remove();
           frames.delete(key);
+          forgetClosedPane(key);
           nativeGesturePaneScopes.delete(key);
           readyFrames.delete(key);
           shadingStates.delete(key);
@@ -997,6 +998,26 @@ function finishQuitPreparation(result) {
   quitPreparation = null;
   clearTimeout(pending.timer);
   pending.resolve(result);
+}
+
+// Every pane still targeted has answered: the preparation succeeds unless
+// one of them refused.
+function settleQuitPreparation(pending) {
+  if (pending !== quitPreparation || pending.seen.size !== pending.targets.size) return;
+  finishQuitPreparation(pending.errors.length
+    ? { ok: false, error: pending.errors.join("; ") }
+    : { ok: true, panes: pending.targets.size });
+}
+
+// refresh() removed a pane whose slide the server closed. It holds nothing
+// left to save and can no longer answer, so a preparation that targeted it,
+// one that started while its tab was closing, stops waiting for it.
+function forgetClosedPane(sid) {
+  quitPreparedPanes.delete(sid);
+  const pending = quitPreparation;
+  if (!pending || !pending.targets.delete(sid)) return;
+  pending.seen.delete(sid);
+  settleQuitPreparation(pending);
 }
 
 window.nd2wsiPrepareForUpdate = (requestId) => {
@@ -2853,11 +2874,7 @@ window.addEventListener("message", (event) => {
     if (!event.data.ok) {
       pending.errors.push(`${slideName(senderSid)}: ${event.data.error || "save failed"}`);
     }
-    if (pending.seen.size === pending.targets.size) {
-      finishQuitPreparation(pending.errors.length
-        ? { ok: false, error: pending.errors.join("; ") }
-        : { ok: true, panes: pending.targets.size });
-    }
+    settleQuitPreparation(pending);
   } else if (kind === "native-gesture-scope") {
     if (!senderSid || !versioned) return;
     receiveNativeGestureScope(senderSid, event.data);
