@@ -499,3 +499,129 @@ def test_failed_direct_open_closes_each_unregistered_root_at_once(monkeypatch, t
     # _Root's 5 s delay, and nothing was registered.
     assert closes == [(1, 0), (2, 0)]
     assert registry.slides == {}
+
+
+def _wait_until(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def test_window_close_lets_a_slow_read_finish_and_closes_the_root_after_it():
+    st = state()
+    closes, closed = [], threading.Event()
+
+    class Root(dict):
+        def close(self):
+            closes.append(st.busy.active)
+            closed.set()
+
+    st.root = Root()
+    registry = window_registry(st)
+    calls = []
+    st._shading = SimpleNamespace(cancel=lambda: calls.append("cancel"), close=lambda: calls.append("close"))
+    reading, release = threading.Event(), threading.Event()
+
+    def slow_read():  # a cold tile, a histogram, a Shading Correction strip
+        with st.busy:
+            reading.set()
+            assert release.wait(5)
+
+    reader = threading.Thread(target=slow_read)
+    reader.start()
+    try:
+        assert reading.wait(5)
+        started = time.monotonic()
+        assert registry.remove(SID) is True  # a read is not an export
+        assert time.monotonic() - started < 0.5  # and the close does not wait for it
+        assert registry.get(SID) is None and calls == ["cancel", "close"]
+        assert st.busy.closed and st.exports.closed  # nothing new is admitted
+        assert not closed.wait(0.2)  # the read still uses the root
+    finally:
+        release.set()
+        reader.join(5)
+    assert closed.wait(5) and closes == [0]
+
+
+def test_an_export_resolved_before_a_window_close_cannot_start_after_it(tmp_path):
+    st = astromap_state()
+    registry = window_registry(st)
+    registry.astromap_downloads = am.AstromapDownloads(tmp_path)
+    handler, token = build_astromap(registry, st)
+    assert registry.remove(SID) is True
+    errors, sent = [], []
+    handler._error = lambda code, message: errors.append((code, message))
+    handler.send_response = sent.append
+    handler.send_header = lambda key, value: None
+    handler.end_headers = lambda: None
+    handler.wfile = SimpleNamespace(write=sent.append)
+    # The download request resolved the slide before the close removed it.
+    handler._astromap_download(st, {"token": [token]})
+    assert errors == [(409, "slide was closed")] and sent == []
+    assert st.exports.active == 0
+    with pytest.raises(ValueError, match="closed"):
+        with st.exports:  # nor can a streamed ROI or rendered export
+            pass
+    registry.astromap_downloads.close()
+
+
+def test_window_close_during_pyramid_publication_keeps_reads_barred():
+    st = state()
+    registry = window_registry(st)
+    publishing, finish = threading.Event(), threading.Event()
+
+    class Replacement:
+        staging = final = "staged"
+        manifest = prior_manifest = {"generation": "corrected"}
+
+        def publish(self):
+            publishing.set()
+            assert finish.wait(5)
+
+    st._open_pyramid = lambda path, manifest: ({}, st.attrs)
+    replacing = threading.Thread(target=st.replace_pyramid, args=(Replacement(),))
+    replacing.start()
+    assert publishing.wait(5)  # busy is drained and closed by the replacement
+    closing = threading.Thread(target=registry.remove, args=(SID,))
+    closing.start()
+    try:
+        assert _wait_until(lambda: registry.get(SID) is None)
+    finally:
+        finish.set()  # the replacement reopens busy for its new pyramid
+        replacing.join(5)
+        closing.join(5)
+    assert not replacing.is_alive() and not closing.is_alive()
+    assert st._closed and st.generation == "corrected"
+    assert st.busy.closed  # the close, not the replacement, has the last word
+    with pytest.raises(ValueError, match="closed"):
+        st.busy.__enter__()
+
+
+def test_a_reopened_slide_closes_its_replaced_root_only_after_reads_end(monkeypatch, tmp_path):
+    image = tmp_path / "slide.png"
+    image.write_bytes(b"not decoded")
+    closes, opened = [], []
+    attrs = state().attrs
+
+    def open_direct(path):
+        opened.append(path)
+        return _ClosingRoot(len(opened), closes), attrs
+
+    # The file changes between the first open and the second.
+    prints = iter([{"size": 1, "mtime_ns": n, "quick_sha256": sha}
+                   for n, sha in ((1, "a"), (1, "a"), (2, "b"), (2, "b"))])
+    monkeypatch.setattr(cache, "quick_fingerprint", lambda path: next(prints))
+    monkeypatch.setattr(raster, "open_direct", open_direct)
+    registry = SlideRegistry()
+    monkeypatch.setattr(registry, "annotation_path", lambda *args, **kwargs: None)
+    sid = registry.add_direct(image)
+    stale = registry.get(sid)
+    with stale.busy:  # a read that resolved the slide before it reopened
+        assert registry.add_direct(image) == sid
+        assert registry.get(sid) is not stale
+        time.sleep(0.05)
+        assert closes == []
+    assert _wait_until(lambda: closes == [(1, 5.0)])  # then _Root's usual close

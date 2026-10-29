@@ -214,10 +214,10 @@ def test_busy_export_preserves_committed_pyramid_when_tab_close_is_refused(setup
     st, _, registry, _, _, calls = setup
     root = st.root
     registry.window_session = SimpleNamespace(role="user")
-    with st.busy:
+    with st.busy, st.exports:  # a real export holds both leases
         with pytest.raises(ValueError, match="export"):
             registry.remove("12345678")
-        assert not st.busy.closed
-    assert calls == ["cancel"]
+        assert not st.busy.closed and not st.exports.closed
+    assert calls == []  # a refused close leaves the correction running
     assert registry.get("12345678") is st and st.root is root
     assert st.shading.status()["applied"] is True and not st._closed

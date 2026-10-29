@@ -149,9 +149,9 @@ def test_agent_trash_blocked_and_window_close_rejects_active_export(source, tmp_
         with pytest.raises(PermissionError):
             httpd.registry.trash_cache(sid)
         st = httpd.registry.get(sid)
-        with st.busy:
+        with st.busy, st.exports:  # a real export holds both leases
             assert _request(base + "/api/close", {"sid": sid})[0] == 409
-            assert httpd.registry.get(sid) is st and not st.busy.closed
+            assert httpd.registry.get(sid) is st and not st.busy.closed and not st.exports.closed
         assert _request(base + "/api/close", {"sid": sid})[0] == 200
         assert st.busy.closed
 

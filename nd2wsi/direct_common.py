@@ -141,6 +141,18 @@ class _Lifecycle:
             self.closed = True
             return self._cv.wait_for(lambda: self._n == 0, timeout)
 
+    def close_if_idle(self) -> bool:
+        """Bar new entries only when none is running, without waiting.
+
+        False leaves the door exactly as it was, so a refused close cannot
+        turn away an entry that arrives meanwhile.
+        """
+        with self._cv:
+            if self._n:
+                return False
+            self.closed = True
+            return True
+
     def reopen(self) -> None:
         """Admit reads again after a close attempt timed out.
 

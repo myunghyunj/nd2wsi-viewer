@@ -575,10 +575,31 @@ def reveal_in_file_manager(path: Path, *, platform: str | None = None, runner=No
 
 
 def _close_state(st: ViewerState | None) -> None:
+    """Retire a state that has left the registry.
+
+    Requests that resolved it before it left may still be reading. New reads
+    and exports are barred, and the root closes once the last read is done:
+    never under a reader, and without holding the calling request thread.
+    """
     if st is None:
         return
+    # This takes the replacement lock and marks the state closed, so no
+    # pyramid replacement or refresh can swap the root or reopen busy later.
     st.close_shading()
-    close = getattr(st.root, "close", None)
+    st.exports.close(timeout=0)
+    if st.busy.close(timeout=0):
+        _close_root(st.root)
+        return
+
+    def close_after_reads() -> None:
+        st.busy.close(timeout=None)
+        _close_root(st.root)
+
+    threading.Thread(target=close_after_reads, name="nd2wsi-slide-close", daemon=True).start()
+
+
+def _close_root(root: Any) -> None:
+    close = getattr(root, "close", None)
     if close:
         close()
 
@@ -1088,18 +1109,17 @@ class SlideRegistry:
     def remove(self, sid: str) -> bool:
         with self._lock:
             st = self.slides.get(sid)
-            if st is not None and self.window_session is not None and st.exports.active:
-                # A real export will not finish within the drain below.
-                # Refuse before cancelling anything or barring tile reads.
+            # Only a real export refuses a window's close, and it refuses
+            # before anything is cancelled or barred. The check also bars
+            # exports in one step, so an export request that resolved this
+            # slide already cannot start after it and go uncounted. Tile,
+            # pixel and histogram reads never refuse: _close_state lets them
+            # finish before the root closes.
+            if (st is not None and self.window_session is not None
+                    and not st.exports.close_if_idle()):
                 raise ValueError("An export from this slide is still running; close it after the export finishes")
             if st is not None and st._shading is not None:
                 st._shading.cancel()
-            if st is not None and self.window_session is not None:
-                # Atomically bar export admission; a separate active check
-                # would race an already-resolved HTTP export request.
-                if not st.busy.close(timeout=1):
-                    st.busy.reopen()
-                    raise ValueError("An export from this slide is still running; close it after the export finishes")
             st = self.slides.pop(sid, None)
         _close_state(st)
         return st is not None
@@ -2294,6 +2314,8 @@ def make_handler(
                     )
             except AstromapError as exc:
                 return self._error(404, str(exc))
+            except ValueError:  # the slide closed before the download began
+                return self._error(409, "slide was closed")
 
         def _roi(self, st: ViewerState, q: dict):
             try:
