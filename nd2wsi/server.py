@@ -1756,7 +1756,17 @@ def make_handler(
                     except ValueError as e:
                         return self._error(409, str(e))
                 if sub == "/api/shading/status":
-                    return self._json(st.shading.status())
+                    try:
+                        controller = st.shading
+                    except ValueError:
+                        if not st._shading_closed:
+                            raise
+                        # Resolved before the close, which came before any
+                        # controller: answer as a closed controller does.
+                        from .h_correction import closed_status
+
+                        return self._json(closed_status(st))
+                    return self._json(controller.status())
                 if sub == "/api/annotations":
                     return self._annotations_get(st, q)
                 associated = ASSOCIATED_RE.match(sub)

@@ -843,6 +843,42 @@ def test_no_shading_controller_is_made_for_a_closed_slide():
     assert st._shading is None
 
 
+def shading_status_reply(registry, st):
+    """GET status for a state the request resolved, whether or not it is still open."""
+    replies = []
+    handler = bare_handler(registry)
+    handler.command, handler.path = "GET", f"/s/{SID}/api/shading/status"
+    handler._gate = lambda: handler.path
+    handler._resolve = lambda path: (st, "/api/shading/status")
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._error = lambda code, message: replies.append((code, message))
+    handler.do_GET()
+    assert len(replies) == 1
+    return replies[0]
+
+
+def test_a_slide_closed_before_any_controller_reports_slide_closed():
+    with_controller, without = state(), state()
+    for st in (with_controller, without):
+        st.generation = "g1"
+    with_controller.shading  # a pane already asked for status
+    registry = window_registry(with_controller)
+    assert registry.remove(SID) is True
+    registry.slides[SID] = without
+    assert registry.remove(SID) is True
+    code, closed = shading_status_reply(registry, with_controller)
+    assert code == 200 and closed["state"] == "cancelled" and closed["reason"] == "Slide closed"
+    # Never a server failure, and the same reply as the closed controller's.
+    code, reply = shading_status_reply(registry, without)
+    assert code == 200, reply
+    assert without._shading is None
+    assert set(reply) == set(closed)
+    assert {key: reply[key] for key in ("state", "reason", "generation", "applied", "can_cancel")} == {
+        "state": "cancelled", "reason": "Slide closed", "generation": "g1",
+        "applied": False, "can_cancel": False,
+    }
+
+
 @pytest.mark.parametrize("error", [TimeoutError("timed out"), OSError(errno.ENETRESET, "network reset")])
 @pytest.mark.parametrize("method", ["GET", "POST"])
 def test_failed_plain_reply_body_writes_no_second_response(monkeypatch, method, error):
