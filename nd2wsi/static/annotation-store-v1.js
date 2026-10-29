@@ -24,6 +24,54 @@
     return new TextEncoder().encode(body).length <= KEEPALIVE_BODY_LIMIT;
   }
 
+  // Items arrive from files other tools wrote and from sidecars on disk.
+  // Every item the pane renders needs a known type, finite coordinates and a
+  // unique id. A bad color, text or id is repaired on a copy (sound items are
+  // returned as they are); anything else refuses the whole set, so a failed
+  // open never replaces or autosaves over saved marks.
+  const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+  const COORDINATES = { pin: ["x", "y"], box: ["x", "y", "w", "h"], line: ["x1", "y1", "x2", "y2"] };
+  const GEOMETRY_DEPTH = { Point: 0, MultiPoint: 1, LineString: 1, MultiLineString: 2, Polygon: 2, MultiPolygon: 3 };
+
+  function finitePoints(values, depth) {
+    if (!Array.isArray(values)) return false;
+    if (depth === 0) return values.length >= 2 && Number.isFinite(values[0]) && Number.isFinite(values[1]);
+    return values.length > 0 && values.every((value) => finitePoints(value, depth - 1));
+  }
+
+  function itemProblem(item) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return "not an annotation object";
+    if (item.type === "geojson") {
+      const geometry = item.geojson && item.geojson.geometry;
+      const depth = geometry ? GEOMETRY_DEPTH[geometry.type] : undefined;
+      return depth !== undefined && finitePoints(geometry.coordinates, depth) ? null : "invalid geometry";
+    }
+    const keys = Object.prototype.hasOwnProperty.call(COORDINATES, item.type) ? COORDINATES[item.type] : null;
+    if (!keys) return "unknown type " + String(item.type);
+    return keys.every((key) => Number.isFinite(item[key])) ? null : "coordinates must be finite numbers";
+  }
+
+  function normalizeItems(items, makeId) {
+    if (!Array.isArray(items)) throw new Error("no items array");
+    const used = new Set();
+    return items.map((item, index) => {
+      const problem = itemProblem(item);
+      if (problem) throw new Error("annotation " + (index + 1) + ": " + problem);
+      const badColor = "color" in item && !(typeof item.color === "string" && HEX_COLOR.test(item.color));
+      const badText = item.text != null && typeof item.text !== "string";
+      const badId = typeof item.id !== "string" || !item.id || used.has(item.id);
+      let result = item;
+      if (badColor || badText || badId) {
+        result = { ...item };
+        if (badColor) delete result.color;
+        if (badText) result.text = String(item.text);
+        if (badId) do { result.id = makeId(); } while (used.has(result.id));
+      }
+      used.add(result.id);
+      return result;
+    });
+  }
+
   // The store keeps its fields on the pane state it is given, so the pane's
   // existing readers (annotation owner checks, file import, the Astromap
   // panel) keep reading state.ann* as before; only the store writes them:
@@ -432,7 +480,12 @@
         .then((result) => {
           if (result === null || !stillCurrent() || revision !== state.annRevision) return;
           const { data: d, recovered, conflict, draftPath } = result;
-          state.annotations = Array.isArray(d.items) ? d.items : [];
+          const items = Array.isArray(d.items) ? d.items : [];
+          let loadedIds = 0;
+          // A sidecar this pane cannot draw stays unloaded, never overwritten.
+          // A recovered draft is this pane's own snapshot and is kept exact.
+          state.annotations = recovered ? items
+            : normalizeItems(items, () => "a" + now().toString(36) + "s" + loadedIds++);
           state.annPath = recovered ? null : d.path;
           state.annReady = true;
           state.annDirty = recovered;
@@ -460,10 +513,11 @@
           onRender();
           onScope();
         })
-        .catch(() => {
+        .catch((error) => {
           if (!stillCurrent()) return;
           state.annReady = false;
-          onStatus("Could not load annotations for this site");
+          const invalid = error && /^annotation \d+: /.test(error.message);
+          onStatus("Could not load annotations for this site" + (invalid ? " (" + error.message + ")" : ""));
           onScope();
         });
     }
@@ -540,5 +594,5 @@
     };
   }
 
-  return { createStore, KEEPALIVE_BODY_LIMIT };
+  return { createStore, normalizeItems, KEEPALIVE_BODY_LIMIT };
 });

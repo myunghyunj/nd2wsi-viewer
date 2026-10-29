@@ -20,7 +20,8 @@ const messages=[],statuses=[],saved=[],downloads=[];
 let locked=false,ready=true;
 const elements=new Map();
 const element=id=>{if(!elements.has(id))elements.set(id,{value:'selected',hidden:true});return elements.get(id);};
-const context={window:{Nd2AnnotationGeoJSON:geo},state,console,Blob,Date,Set,JSON,Number,Array,Error,
+const store=require(path.join(path.dirname(process.argv[1]),'annotation-store-v1.js'));
+const context={window:{Nd2AnnotationGeoJSON:geo,Nd2AnnotationStore:store},state,console,Blob,Date,Set,JSON,Number,Array,Error,
   annotationOwnerReady:()=>ready,annLocked:()=>locked,$:element,
   annotationsChanged(){state.annRevision++;saved.push(JSON.parse(JSON.stringify(state.annotations)));},
   setAnnStatus:message=>statuses.push(message),showToast:message=>messages.push(message),closeEditor(){},
@@ -210,6 +211,30 @@ def test_geojson_empty_array_and_oversized_file_never_clear_manual_annotations()
       return {empty,oversized,read,unchanged:before===JSON.stringify(state.annotations),saves:saved.length};
     """)
     assert result == {"empty": False, "oversized": False, "read": False, "unchanged": True, "saves": 0}
+
+
+def test_native_file_with_an_undrawable_item_is_refused_before_anything_changes():
+    result = run("""
+      const before=JSON.stringify(state.annotations);
+      const accepted=await api.openAnnotationFile(file({source:'slide.nd2',items:[
+        {type:'pin',x:1,y:2},{type:'box',x:0,y:0,w:'wide',h:4}]},'colleague.annotations.json'));
+      return {accepted,unchanged:before===JSON.stringify(state.annotations),saves:saved.length,message:messages.at(-1)};
+    """)
+    assert result["accepted"] is False and result["unchanged"] is True and result["saves"] == 0
+    assert result["message"] == "could not open annotations: annotation 2: coordinates must be finite numbers"
+
+
+def test_native_file_colors_and_missing_ids_are_repaired_on_open():
+    result = run("""
+      const accepted=await api.openAnnotationFile(file({source:'slide.nd2',items:[
+        {type:'pin',x:1,y:2,color:16711680},{type:'pin',x:3,y:4,text:12},{id:'dup',type:'pin',x:5,y:6},{id:'dup',type:'pin',x:7,y:8}]},
+        'converted.annotations.json'));
+      const ids=state.annotations.map(item=>item.id);
+      return {accepted,colors:state.annotations.map(item=>item.color??null),text:state.annotations[1].text,
+        unique:new Set(ids).size===ids.length&&ids.every(id=>typeof id==='string'&&id),kept:ids[2]};
+    """)
+    assert result == {"accepted": True, "colors": [None, None, None, None], "text": "12",
+                      "unique": True, "kept": "dup"}
 
 
 def test_geojson_export_adds_source_binding_and_roundtrip_validates_it():

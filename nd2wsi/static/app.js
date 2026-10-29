@@ -2594,7 +2594,7 @@ const ACCENT = "#0a84ff";
 const ANN_COLORS = ["#0a84ff", "#ffd60a", "#30d158", "#ff453a", "#ff9f0a", "#bf5af2"];
 
 function annColor(a) {
-  return a.color || ACCENT;
+  return typeof a.color === "string" && /^#[0-9a-f]{6}$/i.test(a.color) ? a.color : ACCENT;
 }
 function cycleAnnColor(a) {
   const i = ANN_COLORS.indexOf(annColor(a));
@@ -3031,8 +3031,12 @@ function undoLandmark() {
 function openEditor(id) {
   const a = state.annotations.find((x) => x.id === id);
   if (!a) return;
-  state.editingId = id;
   const ed = $("ann-editor");
+  // Reopening the mark being edited keeps the typed label; switching to
+  // another mark, or placing a new one, saves it first.
+  if (!ed.hidden && state.editingId === id) { $("ann-text").focus(); return; }
+  closeEditor(true);
+  state.editingId = id;
   ed.hidden = false;
   $("ann-text").value = a.text || "";
   const p =
@@ -3053,8 +3057,9 @@ function closeEditor(save = true) {
   if ($("ann-editor").hidden) return;
   if (save && state.editingId) {
     const a = state.annotations.find((x) => x.id === state.editingId);
-    if (a) {
-      a.text = $("ann-text").value.trim();
+    const text = $("ann-text").value.trim();
+    if (a && (a.text || "") !== text) {
+      a.text = text;
       annotationsChanged();
     }
   }
@@ -3108,7 +3113,11 @@ async function openAnnotationFile(file) {
     if (request !== state.annImportSeq) return false;
     if (context !== state.annContext || site !== state.annSite || !annotationOwnerReady() ||
         annLocked() || state.quitPreparing) throw new Error("the image or annotation state changed while the file was opening");
-    const { items, verified, append = false } = annotationItemsForThisSlide(JSON.parse(text), /\.geojson$/i.test(file.name));
+    const parsed = annotationItemsForThisSlide(JSON.parse(text), /\.geojson$/i.test(file.name));
+    const { verified, append = false } = parsed;
+    // Checked before anything changes: a file the pane cannot draw is refused.
+    const items = window.Nd2AnnotationStore.normalizeItems(parsed.items,
+      () => "a" + Date.now().toString(36) + annCounter++);
     if (!append && revision !== state.annRevision) throw new Error("annotations changed while the file was opening");
     const usedIds = new Set(state.annotations.map(item => item.id));
     const imported = append ? items.map(item => {

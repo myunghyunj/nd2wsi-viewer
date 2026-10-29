@@ -288,7 +288,7 @@ def test_frontend_conflict_keeps_dirty_site_draft_and_never_adopts_other_revisio
   context.fetch = async (url, options = {}) => {
     if (!options.method) {
       gets.push(url);
-      return {ok: true, json: async () => ({items: [{id: "disk"}], revision: url.endsWith("p=0") ? "r0" : "b0", path: "a.json"})};
+      return {ok: true, json: async () => ({items: [{id: "disk", type: "pin", x: 1, y: 2}], revision: url.endsWith("p=0") ? "r0" : "b0", path: "a.json"})};
     }
     posted.push(JSON.parse(options.body));
     return {ok: false, status: 409, json: async () => ({current_revision: "OTHER-WINDOW-r99", draft_path: "/session/drafts/preserved.json"})};
