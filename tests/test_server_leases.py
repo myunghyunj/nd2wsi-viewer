@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import email.message
+import errno
 import json
 import threading
 import time
@@ -645,3 +646,34 @@ def test_no_shading_controller_is_made_for_a_closed_slide():
     handler.do_POST()
     assert replies == [(409, "This slide's Shading Correction controller is closed")]
     assert st._shading is None
+
+
+@pytest.mark.parametrize("error", [TimeoutError("timed out"), OSError(errno.ENETRESET, "network reset")])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_failed_plain_reply_body_writes_no_second_response(monkeypatch, method, error):
+    st = state()
+    registry = window_registry(st)
+    wire = _ResetAfterHeaders(error)
+    if method == "GET":
+        monkeypatch.setattr(render, "render_tile", lambda *args: b"tile")
+        handler = socket_handler(registry, f"/s/{SID}/api/tile/0/0/0.jpg", wire)
+        handler.do_GET()
+    else:
+        idle = {"state": "idle"}
+        st._shading = SimpleNamespace(status=lambda: {"generation": "g1"}, cancel=lambda: idle,
+                                      revoke=lambda: idle, close=lambda: None)
+        handler = socket_handler(registry, f"/s/{SID}/api/shading/cancel", wire)
+        handler.command = "POST"
+        handler.headers["Content-Type"] = "application/json"
+        handler._body_json = lambda limit: {"generation": "g1"}
+        handler.do_POST()
+    head, *rest = wire.attempts
+    assert head.startswith(b"HTTP/1.1 200")
+    assert len(rest) == 1 and b"HTTP/1.1" not in rest[0]  # the failed body, no 500 after it
+    assert handler.close_connection is True
+    # The next request on a reused handler answers errors normally again.
+    handler.wfile = second = _Wire()
+    handler.command, handler.path = "GET", "/s/ffffffff/api/info"
+    handler.close_connection = False
+    handler.do_GET()
+    assert second.writes and second.writes[0].startswith(b"HTTP/1.1 404")

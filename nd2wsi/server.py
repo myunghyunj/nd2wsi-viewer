@@ -1533,25 +1533,33 @@ def make_handler(
             rejecting_post = self.command == "POST" and code >= 300
             if rejecting_post:
                 self.close_connection = True
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self._policy_headers(cache)
-            if self.close_connection:
-                self.send_header("Connection", "close")
-            for k, v in (extra or {}).items():
-                self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(body)
-            if rejecting_post:
-                import socket
+            # As in _stream_file: once the status line may be out, a failed
+            # write cannot become an error reply inside this one's declared
+            # length. _error drops the connection instead.
+            self._response_started = True
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self._policy_headers(cache)
+                if self.close_connection:
+                    self.send_header("Connection", "close")
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+                if rejecting_post:
+                    import socket
 
-                self.wfile.flush()
-                try:
-                    self.connection.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-                self._discard_rejected_body()
+                    self.wfile.flush()
+                    try:
+                        self.connection.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    self._discard_rejected_body()
+            except BaseException:
+                self.close_connection = True
+                raise
 
         def _policy_headers(self, cache: str) -> None:
             self.send_header("Cache-Control", cache)
