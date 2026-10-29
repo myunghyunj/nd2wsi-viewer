@@ -12,31 +12,45 @@ from typing import Any
 
 SLIDE_SUFFIXES = {".nd2", ".svs", ".sdpc"}
 
+def _slide_folder(container: Path) -> Path:
+    """The slide's folder, for a cache or store in any layout the app writes."""
+    from .cache import MANAGED_DIR
+    from .convert import CACHE_DIR_NAME
+
+    home = container.parent
+    if home.name in (CACHE_DIR_NAME, "caches"):
+        home = home.parent
+    if home.name == MANAGED_DIR:
+        home = home.parent
+    return home
+
+
 def _manifest_source_path(container: Path, manifest: dict[str, Any]) -> Path | None:
+    """The source file a cache records, if it is where the app would put it.
+
+    The manifest comes from inside the cache file, which may come from
+    someone else, so its relative path is not trusted to point anywhere.
+    Every layout the app writes keeps the source in the slide's folder,
+    beside the managed folder that holds the cache; a recorded path that
+    leaves that folder, or names a directory, names no source here. A source
+    that was since deleted keeps its path, as provenance. Callers use the
+    answer as the slide's source (LUT settings, inspection, reveal and
+    source-backed reads, each of which checks the file itself).
+    """
     from .cache import source_base
 
     src = manifest.get("source") or {}
     rel = src.get("relative_path") if isinstance(src, dict) else None
     if not isinstance(rel, str) or not rel:
         return None
+    container = Path(container).resolve()
     candidate = (source_base(container) / rel).resolve()
     recorded_name = src.get("name")
     if recorded_name and candidate.name != Path(str(recorded_name)).name:
         return None
+    if candidate.parent != _slide_folder(container) or candidate.is_dir():
+        return None
     return candidate
-
-
-def _built_from(manifest: dict[str, Any], source: Path) -> bool:
-    """Whether ``source`` is the file the cache recorded, by fingerprint."""
-    from .cache import fingerprints_match, quick_fingerprint
-
-    recorded = manifest.get("source")
-    if not isinstance(recorded, dict):
-        return False
-    try:
-        return fingerprints_match(recorded, quick_fingerprint(source))
-    except OSError:
-        return False
 
 
 def _annotation_source_name(path: Path) -> str | None:
@@ -106,22 +120,12 @@ def annotations_sidecar(
     stem = Path(source_name).stem
 
     container = manifest_container(store_path)
-    home = container.parent if container is not None else store_path.parent
-    if home.name in (CACHE_DIR_NAME, "caches"):
-        home = home.parent
-    if home.name == MANAGED_DIR:
-        home = home.parent
+    # Always the slide's folder by the cache's own location: a recorded
+    # source (_manifest_source_path) is only ever accepted inside it, so the
+    # manifest of a cache from elsewhere cannot move the annotations.
+    home = _slide_folder(container if container is not None else store_path)
 
     manifest = read_manifest(container) if container is not None else None
-    if manifest and container is not None:
-        source = _manifest_source_path(container, manifest)
-        # The manifest comes from inside the cache file. Its recorded source
-        # moves the annotations folder only when that file really is the one
-        # the cache was built from, so a cache from elsewhere cannot point the
-        # annotations at an unrelated directory that holds a same-named file.
-        if (source is not None and source.is_file() and source.name == source_name
-                and _built_from(manifest, source)):
-            home = source.parent
     raw_selection = (manifest or {}).get("selection") or meta.get("selection") or {}
     if not isinstance(raw_selection, dict):
         raise ValueError("the cache names its image plane in an unreadable form")

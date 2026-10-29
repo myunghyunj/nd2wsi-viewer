@@ -213,3 +213,45 @@ def test_uppercase_extension_keeps_manifest_and_provenance(cache_file):
         assert state.container_path == upper and state.source_path == source
     finally:
         registry.close_all(immediate=True)
+
+
+def test_a_received_cache_cannot_name_a_source_outside_its_folder(tmp_path, monkeypatch):
+    # Its manifest's relative path would otherwise become the slide's source:
+    # LUT settings keyed to another slide, inspection walking any directory,
+    # and Reveal or Open in Metal acting on it.
+    import json
+
+    import numpy as np
+
+    from nd2wsi.server import SlideRegistry
+    from nd2wsi.storage.single_file import SQLiteStore, open_zarr_group
+
+    received, other = tmp_path / "received", tmp_path / "other"
+    received.mkdir()
+    other.mkdir()
+    (other / "slide.nd2").write_bytes(b"someone else's slide")
+    monkeypatch.setenv("ND2WSI_LUT_SETTINGS_ROOT", str(tmp_path / "luts"))
+    for n, rel in enumerate(("../other/slide.nd2", "../" * 8)):
+        cache = received / f"slide{n}--t0-p0-z0.nd2svs"
+        group = open_zarr_group(cache, prefix="store.ome.zarr", mode="a")
+        group.create_array("0", data=np.zeros((1, 8, 8), dtype=np.uint16), chunks=(1, 4, 4))
+        group.attrs.update({
+            "multiscales": [{"datasets": [{"path": "0"}]}],
+            "omero": {"channels": [{"label": "DAPI", "color": "0000FF", "window": {"start": 0, "end": 100}}]},
+            "nd2wsi": {"source": "slide.nd2", "dtype": "uint16", "selection": {"t": 0, "p": 0, "z": 0},
+                       "levels": [{"path": "0", "width": 8, "height": 8, "downsample": 1}]},
+        })
+        group.store.close()
+        store = SQLiteStore(cache)
+        store.write_bytes("manifest.json", json.dumps({
+            "format": "nd2wsi-cache/5", "kind": "full", "complete": True, "generation": f"g{n}",
+            "source": {"name": "slide.nd2", "relative_path": rel},
+            "selection": {"t": 0, "p": 0, "z": 0, "z_resolved": 0},
+        }).encode())
+        store.close()
+        registry = SlideRegistry()
+        try:
+            state = registry.get(registry.open_path(cache))
+            assert state.source_path is None
+        finally:
+            registry.close_all(immediate=True)

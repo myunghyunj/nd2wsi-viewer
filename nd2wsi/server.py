@@ -847,7 +847,7 @@ class SlideRegistry:
         runtime, the stored overview still shows — at half resolution,
         with a note saying why — rather than failing to open at all.
         """
-        from .cache import fingerprints_match, manifest_container, quick_fingerprint, source_base
+        from .cache import fingerprints_match, manifest_container, quick_fingerprint
         from .convert import open_store
         from .direct import open_nd2_backed
 
@@ -857,12 +857,12 @@ class SlideRegistry:
         stale = None
         with self._lock:
             src_info = manifest.get("source", {})
+            # None when the manifest's source is missing or outside the
+            # slide's folder; then no path from inside the cache is used.
             source = source_path or _manifest_source_path(container, manifest)
-            if source is None:
-                source = (source_base(container) / src_info.get("relative_path", "")).resolve()
             source_ok = False
             try:
-                source_ok = source.is_file() and fingerprints_match(
+                source_ok = source is not None and source.is_file() and fingerprints_match(
                     src_info, quick_fingerprint(source)
                 )
             except OSError:
@@ -879,7 +879,7 @@ class SlideRegistry:
                 stale = st
             root = attrs = None
             reason = f"{src_info.get('name', 'source')} is missing"
-            if source.is_file() and not source_ok:
+            if source is not None and source.is_file() and not source_ok:
                 reason = f"{source.name} has changed since this cache was built"
             if source_ok:
                 try:

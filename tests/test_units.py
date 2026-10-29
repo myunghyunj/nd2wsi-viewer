@@ -497,10 +497,39 @@ def test_a_cache_from_elsewhere_cannot_move_the_annotations_folder(tmp_path):
     assert path.parent == received / "nd2wsi" / "annotations"
     assert sorted(p.name for p in other.iterdir()) == ["slide.nd2"]
 
-    # a store opened at its own path still files annotations beside its source
+    # nor can a matching fingerprint, which a copy that keeps mtimes makes
+    # easy to know: every real cache keeps its source in this folder anyway
     manifest(**quick_fingerprint(other / "slide.nd2"))
     path = annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}}, migrate=False)
-    assert path.parent == other / "nd2wsi" / "annotations"
+    assert path.parent == received / "nd2wsi" / "annotations"
+    assert sorted(p.name for p in other.iterdir()) == ["slide.nd2"]
+
+
+@pytest.mark.parametrize("layout, rel", [
+    ("nd2wsi/caches/slide--t0-p0-zmid.nd2svs", "../../slide.nd2"),
+    ("nd2wsi/caches/slide--t0-p0-zmid.nd2wsi-cache", "../../../slide.nd2"),
+    ("slide--t0-p0-zmid.nd2svs", "slide.nd2"),
+])
+def test_manifest_source_is_accepted_only_in_the_slides_folder(tmp_path, layout, rel):
+    from nd2wsi.annotation_sidecars import _manifest_source_path
+
+    slide = tmp_path / "slides" / "slide.nd2"
+    slide.parent.mkdir()
+    slide.write_bytes(b"nd2")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "slide.nd2").write_bytes(b"someone else's")
+    container = slide.parent / layout
+    container.parent.mkdir(parents=True, exist_ok=True)
+    found = _manifest_source_path(container, {"source": {"name": "slide.nd2", "relative_path": rel}})
+    assert found == slide.resolve()
+    for outside in ("../" * rel.count("../") + "../other/slide.nd2", "../" * 6, str(tmp_path / "other" / "slide.nd2")):
+        assert _manifest_source_path(container, {"source": {"relative_path": outside}}) is None
+    # a directory in the slide's folder is never a source; a deleted source
+    # keeps its path as provenance
+    (slide.parent / "subdir").mkdir()
+    assert _manifest_source_path(container, {"source": {"relative_path": rel.replace("slide.nd2", "subdir")}}) is None
+    slide.unlink()
+    assert _manifest_source_path(container, {"source": {"name": "slide.nd2", "relative_path": rel}}) == slide.resolve()
 
 
 @pytest.mark.parametrize("selection", [["t"], 1, "t0"])
