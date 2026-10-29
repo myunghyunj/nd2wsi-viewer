@@ -194,6 +194,39 @@ def test_gui_smoke_main_waits_for_the_whole_teardown_on_its_own_thread(monkeypat
     assert json.loads((session.root / "session.json").read_text(encoding="utf-8"))["state"] == "closed"
 
 
+def failing_teardown_api():
+    def stop_server_for_update():
+        raise OSError("plate writer lease already gone")
+
+    return SimpleNamespace(_startup_error=None, stop_server_for_update=stop_server_for_update)
+
+
+def test_a_failed_teardown_still_writes_the_smoke_report_and_fails_it(monkeypatch, tmp_path, unfinished, under_run,
+                                                                        capsys):
+    monkeypatch.setattr(app, "_dlog", Mock())
+    api = failing_teardown_api()
+    api._gui_smoke_report = {"ok": True, "checks": ["window shown"]}  # the GUI checks passed
+    path = tmp_path / "report" / "smoke.json"
+    result, session = run_native_main(monkeypatch, tmp_path / "sessions", api,
+                                      ["--gui-smoke", "--smoke-report", str(path)])
+    assert result == 4
+    report = json.loads(path.read_text(encoding="utf-8"))
+    failed = "Server teardown failed: OSError: plate writer lease already gone"
+    assert report == {"ok": False, "checks": ["window shown"], "teardown_error": failed, "error": failed}
+    assert json.loads(capsys.readouterr().out) == report
+    assert json.loads((session.root / "session.json").read_text(encoding="utf-8"))["state"] == "closed"
+    app._dlog.assert_any_call("exit: server teardown failed: OSError('plate writer lease already gone')")
+
+
+def test_a_failed_teardown_after_an_interactive_close_is_logged_not_raised(monkeypatch, tmp_path, unfinished,
+                                                                            under_run):
+    monkeypatch.setattr(app, "_dlog", Mock())
+    result, session = run_native_main(monkeypatch, tmp_path, failing_teardown_api(), ["--agent-window"])
+    assert result == 0  # main() returns, so run() still decides how the process ends
+    assert json.loads((session.root / "session.json").read_text(encoding="utf-8"))["state"] == "closed"
+    app._dlog.assert_any_call("exit: server teardown failed: OSError('plate writer lease already gone')")
+
+
 @pytest.mark.parametrize("left_unfinished", [True, False])
 def test_run_ends_an_interactive_process_only_when_its_teardown_was_left_running(
         monkeypatch, unfinished, hard_exit_follows, left_unfinished):

@@ -1650,6 +1650,7 @@ def main(argv: list[str] | None = None) -> int:
 
     api = None
     window_session = None
+    teardown_error = None
     try:
         if sys.platform in ("darwin", "win32"):
             from .window_sessions import create_window_session
@@ -1702,12 +1703,22 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if api is not None:
                 _stop_server_at_exit(api, diagnostic=bool(args.gui_smoke or args.browser_replay_report))
+        except Exception as exc:
+            # The window is gone. A failed teardown must not skip the reports
+            # below or run()'s exit; a diagnostic run fails on it instead.
+            teardown_error = exc
+            _dlog(f"exit: server teardown failed: {exc!r}")
         finally:
             if window_session is not None:
                 try:
                     window_session.mark_closed()
                 except Exception as exc:
                     _dlog(f"window session close record failed: {exc!r}")
+    if teardown_error is not None and (args.gui_smoke or args.browser_replay_report):
+        failed = f"Server teardown failed: {type(teardown_error).__name__}: {teardown_error}"
+        report = {**report, "ok": False, "teardown_error": failed}
+        report.setdefault("error", failed)
+        result = 4
     if args.gui_smoke:
         print(json.dumps(report, ensure_ascii=False))
         if args.smoke_report:
