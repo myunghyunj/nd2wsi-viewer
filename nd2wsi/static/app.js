@@ -3089,18 +3089,7 @@ function wireAnnotationPanel() {
     ev.stopPropagation();
   });
 
-  $("ann-export").onclick = () => {
-    if (!annotationOwnerReady()) {
-      showToast("Choose a site before exporting annotations");
-      return;
-    }
-    if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
-    downloadJsonFile(
-      annotationDocument(),
-      state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
-      "application/json"
-    );
-  };
+  $("ann-export").onclick = exportAnnotationsJSON;
   $("ann-geojson").onclick = exportAnnotationsGeoJSON;
   $("ann-open").onclick = () => {
     if (annLocked() || state.quitPreparing) showToast("Annotations are currently locked or unavailable");
@@ -3129,7 +3118,9 @@ async function openAnnotationFile(file) {
     const items = window.Nd2AnnotationStore.normalizeItems(parsed.items,
       () => "a" + Date.now().toString(36) + annCounter++);
     if (!append && revision !== state.annRevision) throw new Error("annotations changed while the file was opening");
-    const usedIds = new Set(state.annotations.map(item => item.id));
+    // an append keeps the sidecar's items kept aside, and every save sends them
+    const kept = append ? state.annForeignItems || [] : [];
+    const usedIds = new Set(state.annotations.concat(kept).map(item => item && item.id));
     const imported = append ? items.map(item => {
       let id;
       do { id = "a" + Date.now().toString(36) + annCounter++; } while (usedIds.has(id));
@@ -3137,7 +3128,7 @@ async function openAnnotationFile(file) {
       return { ...item, id };
     }) : items;
     const combined = append ? state.annotations.concat(imported) : imported;
-    if (new Blob([JSON.stringify({ items: combined })]).size > window.Nd2AnnotationGeoJSON.MAX_BYTES) {
+    if (new Blob([JSON.stringify({ items: combined.concat(kept) })]).size > window.Nd2AnnotationGeoJSON.MAX_BYTES) {
       throw new Error("the combined annotations exceed the 8 MB import limit");
     }
     if (!append) closeEditor(false);
@@ -3263,7 +3254,32 @@ function exportAnnotationsGeoJSON() {
   doc.source = owner.source;
   doc.selection = owner.selection;
   downloadJsonFile(doc, geojsonFilename(state.info), "application/geo+json");
-  showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON");
+  showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON" +
+    keptItemsExportNote());
+}
+
+function exportAnnotationsJSON() {
+  if (!annotationOwnerReady()) {
+    showToast("Choose a site before exporting annotations");
+    return;
+  }
+  if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
+  downloadJsonFile(
+    annotationDocument(),
+    state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
+    "application/json"
+  );
+  const note = keptItemsExportNote();
+  if (note) showToast("exported " + state.annotations.length + " annotation" + (state.annotations.length === 1 ? "" : "s") + note);
+}
+
+// Exports hold the marks this viewer draws. A sidecar's items it cannot draw
+// (state.annForeignItems) are left out: opening a file that holds them is
+// refused, and the viewer never changes them, so they stay in the sidecar
+// even when a save fails. Say so, so nobody takes the file for all of them.
+function keptItemsExportNote() {
+  const kept = (state.annForeignItems || []).length;
+  return kept ? " · " + kept + " item(s) this viewer cannot draw are not included; the sidecar keeps them" : "";
 }
 
 function annotationDocument() {
