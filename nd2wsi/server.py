@@ -184,6 +184,7 @@ class ViewerState:
         self._cache_usage: dict[str, int] | None = None
         self._lut_settings_store = None
         self._shading = None
+        self._shading_closed = False
         self._shading_lock = threading.Lock()
         self._replacement_lock = threading.RLock()
         self._closed = False
@@ -195,6 +196,10 @@ class ViewerState:
         """Persistent, source-bound correction of the registered display pyramid."""
         with self._shading_lock:
             if self._shading is None:
+                if self._shading_closed:
+                    # A request that resolved this slide before it closed
+                    # must not start a correction on the retired state.
+                    raise ValueError("This slide's Shading Correction controller is closed")
                 from .h_correction import ShadingCorrectionController
 
                 self._shading = ShadingCorrectionController(self)
@@ -202,6 +207,7 @@ class ViewerState:
 
     def close_shading(self) -> None:
         with self._shading_lock:
+            self._shading_closed = True
             if self._shading is not None:
                 self._shading.close()
         with self._replacement_lock:

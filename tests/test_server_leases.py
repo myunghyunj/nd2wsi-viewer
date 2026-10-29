@@ -625,3 +625,23 @@ def test_a_reopened_slide_closes_its_replaced_root_only_after_reads_end(monkeypa
         time.sleep(0.05)
         assert closes == []
     assert _wait_until(lambda: closes == [(1, 5.0)])  # then _Root's usual close
+
+
+def test_no_shading_controller_is_made_for_a_closed_slide():
+    st = state()
+    registry = window_registry(st)
+    assert registry.remove(SID) is True
+    with pytest.raises(ValueError, match="closed"):
+        st.shading
+    replies = []
+    handler = bare_handler(registry)
+    handler.command, handler.path = "POST", f"/s/{SID}/api/shading/start"
+    handler.headers = {"Content-Type": "application/json"}
+    handler._gate = lambda: handler.path
+    handler._resolve = lambda path: (st, "/api/shading/start")  # resolved before the close
+    handler._body_json = lambda limit: {"generation": st.generation}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._error = lambda code, message: replies.append((code, message))
+    handler.do_POST()
+    assert replies == [(409, "This slide's Shading Correction controller is closed")]
+    assert st._shading is None
