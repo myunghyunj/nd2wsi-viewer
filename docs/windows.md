@@ -13,11 +13,10 @@ The archive includes Python and the scientific libraries. Install Microsoft
 Edge WebView2 Runtime separately if it is missing. The app also requires .NET
 Framework 4.6.2 or later.
 
-The x64 app targets Windows 10 version 1709 or later and Windows 11 on
-Intel/AMD. Windows 11 ARM64 uses the same executable through x64 emulation;
-this is not a native ARM64 build. Release records identify the exact executable
-and the x64/ARM64 execution targets checked. Windows 10 Education and local
-Parallels were not separately tested for these releases.
+The x64 app targets Windows 11 on Intel/AMD. Windows 11 ARM64 uses the same
+executable through x64 emulation; this is not a native ARM64 build. Release
+records identify the exact executable and the x64/ARM64 execution targets
+checked. Windows 10 is not tested and is not a supported target.
 
 The executable is not Authenticode-signed, so Windows may show an
 unknown-publisher warning. Updates are installed manually from Releases.
@@ -87,14 +86,10 @@ Target execution modes (the verified CI environments are listed above):
 
 | Computer | Execution |
 | --- | --- |
-| Windows 10 x64, version 1709/build 16299 or later, including Education | Native x64; 22H2 recommended |
 | Windows 11 on Intel/AMD x64 | Native x64 |
 | Windows 11 on ARM64 | Same x64 EXE through Windows x64 emulation |
 
-Windows 10 ARM64 and 32-bit Windows are not supported. The laboratory target
-is Windows 10 Education x64; its actual edition and build are recorded by the
-supplied verification script. This is a desktop Windows edition even when the
-computer is used as a laboratory server.
+Windows 10 and 32-bit Windows are not supported targets.
 
 There is no GPU compute requirement. ARM64-native packaging is not claimed:
 the locked Python/.NET bridge and some scientific dependencies do not provide
