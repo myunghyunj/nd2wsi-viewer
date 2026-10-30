@@ -2,8 +2,9 @@
 
 This spawns a genuine Tk process named like the SLACS GUI, brings it to the
 foreground, injects real W/A/S/D keystrokes with SendInput, and asserts the
-overlay receiver moved by the commanded amount, that Ctrl+D is not counted, and
-that the same key is not counted when a different program is in front. It never
+overlay receiver moved by the commanded amount, that Ctrl+D is not counted, that
+SLACS's "," and "." are logged without moving anything, and that the same key
+is not counted when a different program is in front. It never
 patches foreground detection, the identifier, or the keyboard observer. On Windows
 it fails with diagnostics rather than skipping when the foreground cannot be
 arranged, because a green-by-skip here would hide a broken observer on the one
@@ -70,6 +71,7 @@ if sys.platform == "win32":
     _kernel32.GetCurrentThreadId.argtypes = []
 
 VK_W, VK_D, VK_CONTROL, VK_MENU = 0x57, 0x44, 0x11, 0x12
+VK_OEM_COMMA, VK_OEM_PERIOD = 0xBC, 0xBE  # SLACS's laser shot and next well
 KEYEVENTF_KEYUP = 0x0002
 ASFW_ANY = 0xFFFFFFFF
 SW_SHOW = 5
@@ -235,7 +237,9 @@ def test_real_wasd_follows_only_while_slacs_is_in_front(tmp_path):
     other = other_hwnd = None
     receiver = StageFollowReceiver()
     descriptor = receiver.start()
-    follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=STEP_UM)
+    marks = []  # one call per logged "," or "." press
+    follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=STEP_UM,
+                                mark_context=lambda: marks.append(time.monotonic()) or {})
     try:
         _activate(slacs, slacs_hwnd, slacs_pid)
         assert _windows_process_is_slacs(slacs_pid), "the SLACS test process was not identified"
@@ -260,6 +264,14 @@ def test_real_wasd_follows_only_while_slacs_is_in_front(tmp_path):
         assert displacement == expected, (displacement, follower.snapshot())
         counted = follower.snapshot()["counted"]
         assert counted == 5
+
+        # SLACS's "," and "." reach the follower and are logged, but never move or count.
+        for vk in (VK_OEM_COMMA, VK_OEM_PERIOD):
+            _press(vk)
+            time.sleep(0.05)
+        assert _wait_until(lambda: len(marks) == 2, 5), (marks, _foreground_description())
+        assert follower.snapshot()["counted"] == counted
+        assert receiver.snapshot()["displacement_um"] == expected
 
         # A different foreground program: the same key must not be counted.
         other, other_hwnd, other_pid = _spawn_window(tmp_path, "other.py", "Other window",

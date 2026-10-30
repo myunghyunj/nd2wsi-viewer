@@ -19,6 +19,19 @@ def session_logs_stay_in_the_test_run(tmp_path_factory):
         os.environ[name] = previous
 
 
+@pytest.fixture(autouse=True, scope="session")
+def follow_flips_stay_in_the_test_run(tmp_path_factory):
+    """Overlays remember Follow's flips per format; never write the user's file."""
+    name = "ND2WSI_FOLLOW_FLIPS_ROOT"
+    previous = os.environ.get(name)
+    os.environ[name] = str(tmp_path_factory.mktemp("follow-flips"))
+    yield
+    if previous is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous
+
+
 @pytest.fixture(autouse=True)
 def public_update_policy(request, monkeypatch):
     """This line ships with update checks off (nd2wsi/edition.py). The update tests shared

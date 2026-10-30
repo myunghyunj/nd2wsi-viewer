@@ -15,17 +15,30 @@ SLACS jogs the stage by its Roughness slider (µm per press), and its Mirror
 Horizontal / Mirror Vertical checkboxes reverse W/S and A/D. With
 ``step_source="slacs"`` each press moves the overlay by the Roughness a
 read-only controls reader last saw and applies the Mirror checkboxes the same
-way; while Roughness cannot be read, the manual step is used. W/A/S/D key-ups
-are observed too, so a held, autorepeating jog key shows in the session log.
+way; while Roughness cannot be read, the manual step is used. The user's two
+Follow flips (``flip_x`` for A/D, ``flip_y`` for W/S) reverse the same screen
+axes once more, from the next press on; they never change the image. W/A/S/D
+key-ups are observed too, so a held, autorepeating jog key shows in the session
+log.
+
+SLACS's ``,`` (laser shot) and ``.`` (next well, the 96-well collection stage)
+never jog the sample stage, so they never move the overlay and are never
+counted. While a follower runs, each physical press of one made in SLACS is
+logged once as ``slacs_key`` with the overlay's context, its image centre
+included; an autorepeating hold adds one ``slacs_key_hold`` at its key-up. Each
+following overlay logs its own record of a press; the records share a ``press``
+number.
 
 Privacy: Raw Input delivers every keystroke to this process. Anything that is not
-one of the four jog keys, pressed or released, is discarded the instant it
-arrives; it is never stored, counted individually, or written to the session
-log. Ctrl/Alt/Win only set a held flag, so a jog key pressed with them can be
-ignored. W/A/S/D pressed while SLACS is not the foreground program are only
-tallied as ``ignored_not_slacs``, never recorded individually. A held jog key
-is logged only at a press or key-up made while SLACS is in front and is timed
-by the presses SLACS got, so a jog key released elsewhere is never recorded.
+one of the four jog keys or SLACS's ``,`` and ``.``, pressed or released, is
+discarded the instant it arrives; it is never stored, counted individually, or
+written to the session log. Ctrl/Alt/Win only set a held flag, so a jog key
+pressed with them can be ignored. W/A/S/D pressed while SLACS is not the
+foreground program are only tallied as ``ignored_not_slacs``, never recorded
+individually; ``,`` and ``.`` pressed there, or with a Windows key held, are
+not even tallied. A held key is logged only at a press or key-up made while
+SLACS is in front and is timed by the presses SLACS got, so a key released
+elsewhere is never recorded.
 
 The native Raw Input plumbing is Windows-only, but this module imports cleanly on
 every platform: all Win32 use is deferred into functions that run only on Windows
@@ -51,7 +64,8 @@ from .slacs_identity import SCRIPT_NAME, command_line_is_slacs
 # which jog letter, and the unit screen direction it moves the overlay's view
 # (scaled by step_um). Directions are screen right (+x) and screen down (+y) as
 # displayed, the receiver's commanded axes: W moves the view up, S down, A left
-# and D right.
+# and D right. Only these keys move the overlay; Mirror and the user's Follow
+# flips may reverse an axis.
 KEY_BINDINGS: dict[int, tuple[str, tuple[float, float]]] = {
     0x57: ("W", (0.0, -1.0)),
     0x53: ("S", (0.0, 1.0)),
@@ -59,8 +73,14 @@ KEY_BINDINGS: dict[int, tuple[str, tuple[float, float]]] = {
     0x44: ("D", (1.0, 0.0)),
 }
 # The one value to change if, on the instrument, the overlay moves opposite to
-# SLACS's live image: -1 reverses all four keys at once. Not a user setting.
+# SLACS's live image: -1 reverses all four keys at once. Not a user setting;
+# the user's per-axis Follow flips compose with it.
 KEY_VIEW_SIGN = 1
+# SLACS keys that act without jogging the sample stage (SLACS.py onKeyPress): logged, never followed.
+MARK_KEYS: dict[int, tuple[str, str]] = {
+    0xBC: (",", "laser_shot"),   # VK_OEM_COMMA = SLACS key 44
+    0xBE: (".", "next_well"),    # VK_OEM_PERIOD = SLACS key 46 (96-well stage, axes 4/5)
+}
 # A jog key held together with any of these is a shortcut, not a stage jog.
 BLOCKING_MODIFIERS = frozenset(("ctrl", "alt", "win"))
 MAX_STEP_UM = 10000.0
@@ -104,6 +124,23 @@ def _validate_pixel_size_um(pixel_size_um) -> tuple[float, float] | None:
     return x_um, y_um
 
 
+def _validate_flip(value, name) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be true or false")
+    return value
+
+
+def _modifier_names(modifiers) -> set[str]:
+    """The held modifier names, lowercased, from a tuple of names or a {name: held} dict."""
+    if not modifiers:
+        return set()
+    if isinstance(modifiers, dict):
+        held = {name for name, value in modifiers.items() if value}
+    else:
+        held = set(modifiers)
+    return {str(name).lower() for name in held}
+
+
 def _flag(value) -> bool | None:
     return value if isinstance(value, bool) else None
 
@@ -136,9 +173,23 @@ class _KeyHold:
         self.repeats = 0  # counted autorepeat presses during this hold
 
 
+class _MarkHold:
+    """One ``,`` or ``.`` held down: its first key-down, made in SLACS, and its repeats there."""
+
+    __slots__ = ("first_down", "last_down", "last_repeat", "repeats", "press")
+
+    def __init__(self, now: float):
+        self.first_down = now
+        self.last_down = now
+        self.last_repeat = now  # the last autorepeat SLACS got; times the hold
+        self.repeats = 0  # autorepeat key-downs made while SLACS was in front
+        self.press: int | None = None  # the logged press's number in this process
+
+
 class SlacsKeyFollower:
     """Count SLACS W/A/S/D key-down events and drive the overlay receiver.
 
+    SLACS's ``,`` and ``.`` presses are only logged, apart from the jog path.
     Dependencies are injected so the logic is fully testable off Windows:
 
     - ``observer``: an object with ``start(on_event) -> bool`` and ``stop()``.
@@ -160,6 +211,11 @@ class SlacsKeyFollower:
       Used only with ``step_source="slacs"``; the follower starts and stops it.
     - ``pixel_size_um``: the overlay's ``(x_um, y_um)`` pixel size, only so each
       logged press also shows its displacement in pixels.
+    - ``flip_x`` / ``flip_y``: the user's Follow flips, reversing the on-screen
+      move of A/D or W/S; ``set_flips`` changes them from the next press on.
+    - ``mark_context() -> dict``: the overlay's state for each logged SLACS
+      ``,``/``.`` press (image centre, Follow progress, SLACS session). It runs
+      on the observer thread, so it must never wait for the overlay's lock.
     """
 
     def __init__(self, receiver, session_id: str, *, step_um,
@@ -168,7 +224,9 @@ class SlacsKeyFollower:
                  clock: Callable[[], float] = time.monotonic,
                  heartbeat_interval: float | None = 1.0, platform: str | None = None,
                  step_source: str = "manual", controls=None,
-                 pixel_size_um: tuple[float, float] | None = None):
+                 pixel_size_um: tuple[float, float] | None = None,
+                 flip_x: bool = False, flip_y: bool = False,
+                 mark_context: Callable[[], dict] | None = None):
         if step_source not in STEP_SOURCES:
             raise ValueError("step_source must be 'slacs' or 'manual'")
         self._receiver = receiver
@@ -178,6 +236,9 @@ class SlacsKeyFollower:
         # A manual step never consults SLACS, so its reader is not even started.
         self._controls = controls if step_source == "slacs" else None
         self._pixel_size_um = _validate_pixel_size_um(pixel_size_um)
+        self._flip_x = _validate_flip(flip_x, "flip_x")
+        self._flip_y = _validate_flip(flip_y, "flip_y")
+        self._mark_context = mark_context
         self._clock = clock
         self._heartbeat_interval = heartbeat_interval
         self._lock = threading.Lock()
@@ -190,6 +251,7 @@ class SlacsKeyFollower:
         self._step_um_last: float | None = None
         self._last_counted_at: float | None = None
         self._held: dict[str, _KeyHold] = {}  # jog letter -> its key-down not yet released
+        self._mark_held: dict[str, _MarkHold] = {}  # "," or "." -> its key-down not yet released
         self._slacs_in_front = False
         self._error: str | None = None
         self._seq = 0
@@ -272,6 +334,7 @@ class SlacsKeyFollower:
             was_active = self._running or self._started
             self._running = False
             self._held.clear()
+            self._mark_held.clear()
             heartbeat = self._heartbeat_thread
             counted, ignored = self._counted, self._ignored_not_slacs
         self._heartbeat_stop.set()
@@ -319,13 +382,26 @@ class SlacsKeyFollower:
         except Exception:  # noqa: BLE001 - teardown must not raise
             pass
 
+    # -- direction flips ---------------------------------------------------
+
+    def set_flips(self, flip_x, flip_y) -> tuple[bool, bool]:
+        """Reverse the on-screen A/D (flip_x) or W/S (flip_y) move from the next press on."""
+        flip_x, flip_y = _validate_flip(flip_x, "flip_x"), _validate_flip(flip_y, "flip_y")
+        with self._lock:
+            previous = (self._flip_x, self._flip_y)
+            self._flip_x, self._flip_y = flip_x, flip_y
+        return previous
+
     # -- key handling ------------------------------------------------------
 
     def _on_event(self, vk, down, modifiers=()) -> None:
-        """Handle one raw keystroke. Non-jog keys are dropped immediately."""
+        """Handle one raw keystroke. Keys other than W/A/S/D, "," and "." are dropped immediately."""
+        if vk in MARK_KEYS:
+            self._on_mark(vk, down, modifiers)  # logged only: it never touches the jog state
+            return
         binding = KEY_BINDINGS.get(vk)
         if binding is None:
-            return  # privacy: every non-WASD key is discarded the instant it arrives
+            return  # privacy: every other key is discarded the instant it arrives
         letter, (unit_x, unit_y) = binding
         if not down:
             self._key_up(letter)  # a key-up only ends a hold; it never moves the overlay
@@ -338,6 +414,7 @@ class SlacsKeyFollower:
             if not self._running:
                 return
             manual_step = self._step_um
+            flip_x, flip_y = self._flip_x, self._flip_y
         if not self._check_foreground():
             with self._lock:
                 self._ignored_not_slacs += 1
@@ -355,8 +432,9 @@ class SlacsKeyFollower:
                 step_from = "fallback"
         # SLACS's Mirror Vertical reverses A/D (stage axis 0) and Mirror Horizontal
         # reverses W/S (stage axis 1); the overlay reverses the same screen axis.
-        x_sign = -1 if reading["mirror_v"] else 1
-        y_sign = -1 if reading["mirror_h"] else 1
+        # The user's flips reverse it once more: each reversal flips the sign.
+        x_sign = (-1 if reading["mirror_v"] else 1) * (-1 if flip_x else 1)
+        y_sign = (-1 if reading["mirror_h"] else 1) * (-1 if flip_y else 1)
         # + 0.0 turns -0.0 into 0.0 for the receiver and the log.
         delta = [KEY_VIEW_SIGN * x_sign * unit_x * step + 0.0,
                  KEY_VIEW_SIGN * y_sign * unit_y * step + 0.0]
@@ -388,7 +466,7 @@ class SlacsKeyFollower:
                               mirror_h=reading["mirror_h"], mirror_v=reading["mirror_v"],
                               reading_age_ms=reading["reading_age_ms"],
                               slacs_busy=reading["slacs_busy"], repeat=repeat, gap_ms=gap_ms,
-                              delta_px=self._delta_px(delta))
+                              delta_px=self._delta_px(delta), flip_x=flip_x, flip_y=flip_y)
         else:
             self._handle_submit_failure(result)
 
@@ -424,6 +502,83 @@ class SlacsKeyFollower:
         session_log.event("follow_key_hold", key=letter, presses=hold.presses,
                           seconds=round(hold.last_counted - hold.first_counted, 3), key_up=key_up)
 
+    # -- SLACS laser shot and next well --------------------------------------
+
+    def _on_mark(self, vk, down, modifiers=()) -> None:
+        """Log one physical SLACS "," (laser shot) or "." (next well) press; never raises.
+
+        Apart from the jog path: a mark never moves the overlay, is never counted
+        or submitted, and never reads the jog holds or SLACS's controls. Each new
+        press made with SLACS in front writes one ``slacs_key`` with the
+        overlay's context; its autorepeats only add to a ``slacs_key_hold``
+        written at the key-up. Overlays following at once each log the same
+        press, with the same ``press`` number. The foreground is only asked, so
+        a mark leaves no ``slacs_foreground`` record of its own. Presses in
+        another program, and presses with a Windows key held (the shell takes
+        those, SLACS never sees them), leave no trace.
+        """
+        key, action = MARK_KEYS[vk]
+        if not down:
+            with self._lock:
+                hold = self._mark_held.pop(key, None) if self._running else None
+            # Stamped at the release, so written only while SLACS still has the foreground.
+            if hold is not None and hold.repeats and self._foreground_identity()[1]:
+                self._log_mark_hold(key, action, hold, key_up=True)
+            return
+        now = self._clock()
+        held = _modifier_names(modifiers)
+        if "win" in held:
+            return
+        in_front = self._foreground_identity()[1]
+        with self._lock:
+            if not self._running:
+                return
+            hold = self._mark_held.get(key)
+            if hold is not None and now - hold.last_down <= HOLD_RESET_SECONDS:
+                hold.last_down = now  # down again without an up: the key autorepeats
+                if in_front:
+                    hold.repeats += 1
+                    hold.last_repeat = now
+                return
+            if not in_front:
+                self._mark_held.pop(key, None)
+                return  # another program's keystroke: neither recorded nor tallied
+            pressed = self._mark_held[key] = _MarkHold(now)
+        if hold is not None and hold.repeats:
+            self._log_mark_hold(key, action, hold, key_up=False)  # its key-up was lost
+        # Key events arrive one at a time on the observer thread: none reads the hold before this.
+        pressed.press = self._press_number()
+        fields = {"key": key, "action": action, "press": pressed.press, "modifiers": sorted(held)}
+        for name, value in self._mark_fields().items():
+            fields.setdefault(name, value)
+        session_log.event("slacs_key", **fields)
+
+    def _log_mark_hold(self, key: str, action: str, hold: _MarkHold, *, key_up: bool) -> None:
+        session_log.event("slacs_key_hold", key=key, action=action, press=hold.press, repeats=hold.repeats,
+                          seconds=round(hold.last_repeat - hold.first_down, 3), key_up=key_up)
+
+    def _press_number(self) -> int | None:
+        """This press's number from the shared Raw Input hub, or None without one."""
+        numbering = getattr(self._observer, "press_number", None)
+        if not callable(numbering):
+            return None
+        try:
+            number = numbering()
+        except Exception:  # noqa: BLE001 - the press is still logged
+            return None
+        return number if type(number) is int else None
+
+    def _mark_fields(self) -> dict:
+        """The overlay's context for a mark record; a failure is named, never raised."""
+        provider = self._mark_context
+        if provider is None:
+            return {"context_error": "unavailable"}
+        try:
+            context = provider()
+        except Exception as exc:  # noqa: BLE001 - the press is still logged
+            return {"context_error": type(exc).__name__}
+        return context if isinstance(context, dict) else {"context_error": "unavailable"}
+
     def _delta_px(self, delta) -> list[float] | None:
         if self._pixel_size_um is None:
             return None
@@ -458,13 +613,7 @@ class SlacsKeyFollower:
 
     @staticmethod
     def _has_blocking_modifier(modifiers) -> bool:
-        if not modifiers:
-            return False
-        if isinstance(modifiers, dict):
-            held = {name for name, value in modifiers.items() if value}
-        else:
-            held = set(modifiers)
-        return bool(BLOCKING_MODIFIERS & {str(name).lower() for name in held})
+        return bool(BLOCKING_MODIFIERS & _modifier_names(modifiers))
 
     # -- foreground identification ----------------------------------------
 
@@ -567,6 +716,8 @@ class SlacsKeyFollower:
             "last_key": self._last_key,
             "slacs_in_front": self._slacs_in_front,
             "error": self._error,
+            "flip_x": self._flip_x,
+            "flip_y": self._flip_y,
         }
 
     def snapshot(self) -> dict:
@@ -758,11 +909,11 @@ class _RawInputKeyObserver:
 
     Runs its own message loop in a daemon thread. Raw Input is a sink
     (``RIDEV_INPUTSINK``): it observes keystrokes without consuming or delaying
-    them. Only jog keys are forwarded; Ctrl/Alt/Win only update held state and
-    every other key is dropped here. ``stop`` is idempotent, safe from any
-    thread, unregisters the device, destroys the window, ends the loop, and
-    joins with a timeout. Raw Input allows one keyboard target per process, so
-    use it only through ``_RawInputHub``.
+    them. Only jog keys and SLACS's ``,``/``.`` are forwarded; Ctrl/Alt/Win only
+    update held state and every other key is dropped here. ``stop`` is
+    idempotent, safe from any thread, unregisters the device, destroys the
+    window, ends the loop, and joins with a timeout. Raw Input allows one
+    keyboard target per process, so use it only through ``_RawInputHub``.
     """
 
     def __init__(self):
@@ -905,8 +1056,8 @@ class _RawInputKeyObserver:
         down = not (flags & _RI_KEY_BREAK)
         if self._modifiers.update(vk, down, bool(flags & _RI_KEY_E0)):
             return  # Ctrl/Alt/Win only change held state
-        if vk not in KEY_BINDINGS:
-            return  # privacy: every other key is dropped before any callback sees it
+        if vk not in KEY_BINDINGS and vk not in MARK_KEYS:
+            return  # privacy: every key but W/A/S/D, "," and "." is dropped before any callback sees it
         on_event = self._on_event
         if on_event is not None:
             on_event(vk, down, self._modifiers.held())
@@ -919,7 +1070,9 @@ class _RawInputHub:
     process (the last registration wins), and ``RIDEV_REMOVE`` drops the
     process's registration, so overlays following at once must not each
     register. The first subscriber starts the observer, events fan out to every
-    subscriber, and the last one to leave stops it.
+    subscriber, and the last one to leave stops it. It also numbers the SLACS
+    ``,``/``.`` presses that followers log, so the records several overlays write
+    for one press share a number.
     """
 
     def __init__(self, observer_factory: Callable[[], object] | None = None):
@@ -930,6 +1083,9 @@ class _RawInputHub:
         self._observer = None
         self._subscribers: tuple = ()  # (token, callback); replaced, never mutated
         self.error: str | None = None
+        self._press_lock = threading.Lock()  # a leaf lock: nothing else is taken under it
+        self._presses = 0
+        self._event_press: int | None = None  # the number given to the event being dispatched
 
     def subscribe(self, token, callback) -> bool:
         with self._lifecycle:
@@ -976,7 +1132,22 @@ class _RawInputHub:
             except Exception:  # noqa: BLE001 - teardown must not raise
                 pass
 
+    def press_number(self) -> int:
+        """The number of the press being dispatched; the same for every follower that logs it.
+
+        Called only from a subscriber's callback. A number is given only to a
+        press some follower logs, so the numbers count logged presses and say
+        nothing about any other keystroke.
+        """
+        with self._press_lock:
+            if self._event_press is None:
+                self._presses += 1
+                self._event_press = self._presses
+            return self._event_press
+
     def _dispatch(self, vk, down, modifiers) -> None:
+        with self._press_lock:
+            self._event_press = None  # a new keystroke has no number yet
         for _token, callback in self._subscribers:
             try:
                 callback(vk, down, modifiers)
@@ -1015,6 +1186,10 @@ class _SharedKeyObserver:
             subscribed, self._subscribed = self._subscribed, False
         if subscribed:
             self._hub.unsubscribe(self)
+
+    def press_number(self) -> int:
+        """The process-wide number of the SLACS press now being dispatched."""
+        return self._hub.press_number()
 
 
 # -- Windows foreground + identity providers (read-only) -----------------------
@@ -1104,5 +1279,5 @@ def _windows_process_is_slacs(pid, created=None) -> bool:
     return command_line_is_slacs(command_line)
 
 
-__all__ = ["SlacsKeyFollower", "KEY_BINDINGS", "KEY_VIEW_SIGN", "BLOCKING_MODIFIERS", "MAX_STEP_UM",
-           "STEP_SOURCES", "HOLD_RESET_SECONDS", "SCRIPT_NAME"]
+__all__ = ["SlacsKeyFollower", "KEY_BINDINGS", "KEY_VIEW_SIGN", "MARK_KEYS", "BLOCKING_MODIFIERS",
+           "MAX_STEP_UM", "STEP_SOURCES", "HOLD_RESET_SECONDS", "SCRIPT_NAME"]

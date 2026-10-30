@@ -202,7 +202,8 @@ def test_a_key_follow_reads_the_controls_of_the_slacs_process_the_overlay_detect
         [(session_id, options, made)] = followers
         [monitor] = _ControlsMonitor.instances
         assert session_id == started['session_id']
-        assert options == {'step_um': 10.0, 'step_source': 'slacs', 'controls': monitor, 'pixel_size_um': (0.5, 0.5)}
+        assert options == {'step_um': 10.0, 'step_source': 'slacs', 'controls': monitor, 'pixel_size_um': (0.5, 0.5),
+                           'flip_x': False, 'flip_y': False, 'mark_context': api._mark_context}
         assert monitor.pid_provider() == 5150
         detector.slacs_pid.return_value = None  # the detector no longer reports that process
         assert monitor.pid_provider() is None
@@ -249,3 +250,81 @@ def test_the_overlay_options_fit_the_real_follower_and_controls_monitor(monkeypa
     # Every option the overlay passes is accepted; the real follower then refuses off Windows.
     assert result['ok'] is False and 'Windows' in result['message']
     assert api._stage_follow is None and api._stage_follower is None
+
+
+class _ManualObserver:
+    def __init__(self):
+        self.on_event = None
+
+    def start(self, on_event):
+        self.on_event = on_event
+        return True
+
+    def stop(self):
+        self.stopped = True  # keeps delivering, so a stopped follower's own guard is what is tested
+
+    def send(self, vk, down=True, modifiers=()):
+        self.on_event(vk, down, modifiers)
+
+
+def test_slacs_marks_carry_the_overlay_view_while_follow_runs(monkeypatch):
+    """A real overlay and key follower: "," and "." are logged with the image centre, never followed."""
+    from nd2wsi import session_log
+
+    events = []
+    monkeypatch.setattr(session_log, 'event', lambda kind, **fields: events.append((kind, fields)))
+    observer, real_follower = _ManualObserver(), stage_keys.SlacsKeyFollower
+
+    def follower(receiver, session_id, **options):
+        return real_follower(receiver, session_id, observer=observer, foreground_provider=lambda: {'pid': 7, 'created': 1},
+                             identifier=lambda pid, created: True, heartbeat_interval=None, **options)
+
+    monkeypatch.setattr(stage_keys, 'SlacsKeyFollower', follower)
+    running = {'available': True, 'session_id': 'process-one', 'status': 'running'}
+    api, _ = _overlay_with_detector(monkeypatch, running)
+    api._context.update(dimensions=[2048, 2048], image_name='ITO.nd2', source_format='nd2')
+    api._source_format = 'nd2'
+    marks = lambda: [fields for kind, fields in events if kind == 'slacs_key']  # noqa: E731
+    try:
+        started = api.start_stage_follow({'source': 'keys', 'step_um': 10, 'step_source': 'manual'})
+        assert started['ok'] is True
+        receiver = api._stage_follow
+        observer.send(0xBC)
+        observer.send(0xBC, down=False)
+        [before] = marks()
+        assert before['image_px'] is None and before['view'] is None  # no view reported yet
+        assert before['slacs_session'] == 'process-one' and before['follow_status'] == 'waiting'
+        assert before['source_format'] == 'nd2' and before['image_name'] == 'ITO.nd2'
+        # Unlocked: the overlay is aligned by hand, and the press is still logged.
+        assert before['locked'] is False and before['counted'] == 0 and before['step_source'] == 'manual'
+        assert api.report_overlay_view({'version': 1, 'center_px': [100, 200], 'zoom': 2, 'rotation': 0,
+                                        'flip': False, 'locked': False, 'follow_session': started['session_id'],
+                                        'follow_seq': 0, 'follow_displacement_um': [0, 0]})['ok']
+        observer.send(0xBE)
+        observer.send(0xBE, down=False)
+        after = marks()[-1]
+        assert (after['key'], after['action']) == ('.', 'next_well')
+        assert after['image_px'] == [100.0, 200.0] and after['view_follow_seq'] == 0
+        assert after['flip_x'] is False and after['flip_y'] is False
+        # Neither key moved or counted anything; W/A/S/D still do.
+        assert receiver.snapshot()['seq'] == 0 and receiver.snapshot()['displacement_um'] == [0, 0]
+        api.set_stage_follow_flips({'flip_x': False, 'flip_y': True})
+        observer.send(0x57)
+        assert receiver.snapshot()['displacement_um'] == [0.0, 10.0]  # W, reversed by Flip up/down
+        observer.send(0xBC)
+        last = marks()[-1]
+        assert last['key'] == ',' and last['image_px'] == [100.0, 200.0]
+        assert last['follow_seq'] == 1 and last['counted'] == 1 and last['flip_y'] is True
+        assert last['view_follow_seq'] == 0  # the view does not show that press yet
+        # A refused report forgets the view: the next record shows no centre, not the old one.
+        assert api.report_overlay_view({'version': 1, 'center_px': [float('nan'), 0], 'zoom': 1})['ok'] is False
+        observer.send(0xBC, down=False)
+        observer.send(0xBE)
+        assert marks()[-1]['image_px'] is None and marks()[-1]['view'] is None
+        api.stop_stage_follow()
+        count = len(marks())
+        observer.send(0xBC)  # a stopped follower logs nothing
+        assert len(marks()) == count == 4
+        assert [kind for kind, _ in events].count('follow_key') == 1
+    finally:
+        api.close_translucent()

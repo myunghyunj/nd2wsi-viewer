@@ -20,10 +20,12 @@ with `Ro = 0.001 * Roughness` mm, so Roughness is micrometres per press. By
 default (**Read Roughness from SLACS**, on) Follow reads Roughness and the two
 Mirror checkboxes from SLACS's window while it runs; the settings' step field is
 then **Fallback step if Roughness can't be read**. With reading turned off the
-field is **Step per key press**, and every press moves by it. The choice is
-remembered per viewer (`nd2wsi.stageFollow.stepAuto`) and, like the step, fixed
-while Follow runs. On non-Windows the default source stays the in-process/HTTP
-adapter.
+field is **Step per key press**, and every press moves by it. The choice and the
+step are kept in the overlay page's storage (`nd2wsi.stageFollow.stepAuto`,
+`nd2wsi.stageFollow.stepUm`) for the current app run only: the page runs in a
+private web view whose origin changes with every launch. Like the step, the
+choice is fixed while Follow runs. On non-Windows the default source stays the
+in-process/HTTP adapter.
 
 **How it works.** A hidden message-only window registers a Raw Input keyboard
 *sink* (`RIDEV_INPUTSINK`) on a daemon thread. Each W/A/S/D key-down (autorepeat
@@ -61,6 +63,53 @@ press uses, for example "SLACS Roughness: 10 µm = 15.1 px · Mirror H off, V of
 (image pixels at the overlay's calibration), "SLACS Roughness unreadable — using
 10 µm" or "SLACS busy — last Roughness 10 µm". None of this pauses Follow.
 
+**Direction flips.** Two checkboxes in Follow's settings, under "W/A/S/D move
+the image in the directions shown on screen", reverse the key source's
+movement: **Flip up/down (W/S)** (`flip_y`) reverses the on-screen move of W
+and S, and **Flip left/right (A/D)** (`flip_x`) that of A and D. They name the
+keys on purpose, because SLACS's own Mirror labels are crossed (Mirror
+Horizontal reverses W/S). Each reversal flips the sign once more, so they
+compose with SLACS's Mirror checkboxes and with `KEY_VIEW_SIGN`: Mirror
+Horizontal plus Flip up/down moves W as if neither were on. A flip applies from
+the next press, also while Follow runs and while the overlay is locked; unlike
+the step it is not fixed for a run, which is safe because the page applies only
+differences of the cumulative displacement. A flip never changes the image's
+rotation, flip or camera, and it does not apply to the adapter/HTTP source. The
+pair last chosen is remembered per file format of the original image (ND2,
+including `.nd2svs` caches and OME-Zarr stores built from an ND2; SVS; SDPC;
+JPEG; PNG; other) on this PC, in
+`%LOCALAPPDATA%\nd2wsi-viewer\stage-follow\flips.json` (on macOS
+`~/Library/Application Support/nd2wsi-viewer/stage-follow/flips.json`;
+`ND2WSI_FOLLOW_FLIPS_ROOT` overrides the folder). An overlay opens with the
+flips remembered for its format, and the hint names it ("Remembered for ND2
+files on this PC."). User windows share the file, last write wins; an Agent
+window keeps a private copy under its session root and never writes the
+user's file. A file whose content is invalid restores nothing and is left as
+it is until the next toggle saves over it. A file that cannot be read at all
+(no permission, held open by another program, a link) is never saved over: the
+toggle still applies to the window and says it could not be remembered, so the
+other formats' flips are kept. SVS and SDPC slides are RGB, which the overlay
+does not open today, so their entries have no effect yet.
+
+**Laser shot and next well.** In SLACS, `,` (key 44) fires a laser shot and `.`
+(key 46) moves the 96-well collection stage (ACS axes 4/5) to the next well;
+neither moves the sample stage. While Follow's key source runs, also while the
+overlay is unlocked, each physical `,` or `.` press made with SLACS in front is
+logged once as `slacs_key`, with the overlay's view centre in original image
+pixels (`image_px`, null until the page has reported its view), the Follow
+state and displacement, Roughness, Mirror and the flips. The keys are never
+followed, counted or sent to the receiver, so the overlay stays where it is.
+Autorepeat writes no record per repeat: a held key writes one `slacs_key_hold`
+with its repeat count at the key-up. A record means "pressed while SLACS was in
+front", not "fired": focus in a SLACS text field can swallow the key. Presses
+are logged only while Follow runs; with Follow off nothing is recorded. Each
+overlay that follows writes its own record of the same press, with its own
+image centre; the records of one press share a `press` number, so count
+distinct `press` values for the number of presses. The page reports its view
+to the app after each camera change, lock change, Follow start or move, and
+window move or resize; a native window drag, whose end the page cannot see, is
+noticed within a second.
+
 **No interference (hard rule).** The observer only reads. Raw Input is a sink: it
 never consumes, delays, alters, blocks, or fails a keystroke, and SLACS's own
 commands to the ACS stage are never touched. The module never calls into SLACS or
@@ -71,13 +120,15 @@ and a 100 ms timeout, never plain `SendMessage`, and reads window texts with
 `InternalGetWindowText`, which sends no message. A busy or hung SLACS makes a
 read time out and count as busy; it never waits on SLACS.
 
-**Privacy.** The observer receives every keystroke in the system. Anything other
-than W/A/S/D, down or up, is discarded the instant it arrives — never stored,
-counted individually, or logged. W/A/S/D pressed while SLACS is not in front are
-tallied only as `ignored_not_slacs`, never recorded individually. The session log
-records counted presses (`follow_key`), held keys (`follow_key_hold`),
-foreground transitions (`slacs_foreground`), start/stop and errors — never other
-keys.
+**Privacy.** The observer receives every keystroke in the system, and only
+while Follow's key source runs. Anything other than W/A/S/D and SLACS's `,` and
+`.`, down or up, is discarded the instant it arrives — never stored, counted
+individually, or logged. W/A/S/D pressed while SLACS is not in front are
+tallied only as `ignored_not_slacs`, never recorded individually; `,` and `.`
+pressed there, or with a Windows key held, are not even tallied. The session
+log records counted presses (`follow_key`), held keys (`follow_key_hold`),
+SLACS's laser shot and next well (`slacs_key`, `slacs_key_hold`), foreground
+transitions (`slacs_foreground`), start/stop and errors — never other keys.
 
 **Detection.** Discovery searches for SLACS with the bounded PowerShell/CIM query
 described below (10 s timeout). Once a search has found it, each poll checks
@@ -109,15 +160,42 @@ that the session is dropped and Follow stops as for a loss.
   than 250 ms or finding SLACS's window hung, `slacs_ui_responsive` (busy_seconds, max_latency_ms,
   failed_reads) when a fast read succeeds again, and `slacs_ui_latency` (reads,
   failed, p50_ms, max_ms) every 30 s while Follow runs.
-- `follow_start` (source, step_source, step_um, ok, slacs_session, and
-  controls_error when the reader could not be created), `follow_keys_start` and
-  `follow_keys_stop` (with step_source).
+- `follow_start` (source, step_source, step_um, ok, slacs_session,
+  source_format, flip_x, flip_y, view_rotation and view_flip — the main
+  viewer's rotation and flip at handoff — and controls_error when the reader
+  could not be created), `follow_keys_start` and `follow_keys_stop` (with
+  step_source).
 - `follow_key` per counted press: key, seq, delta_um, step_um, step_from
   (`slacs`, `fallback` or `manual`), roughness_um, mirror_h, mirror_v,
   reading_age_ms, slacs_busy, repeat (an autorepeat press of a held key), gap_ms
-  (since the previous counted press) and delta_px (the move in image pixels).
+  (since the previous counted press), delta_px (the move in image pixels),
+  flip_x and flip_y.
 - `follow_key_hold` (key, presses, seconds) when a held key with at least one
   counted repeat is released.
+- `follow_flip` (source `user` or `remembered`, source_format, flip_x, flip_y,
+  image_name, view_rotation, view_flip; a user toggle also has previous,
+  following, follow_seq — the presses the overlay had received at the toggle;
+  a press already on its way can still arrive with the old flips, and each
+  `follow_key`'s flip_x and flip_y are the flips that press used — and saved):
+  each toggle, and the remembered flips applied when an overlay opens.
+  `follow_flip_save_failed` (source_format, flip_x, flip_y, message) and
+  `follow_flip_load_failed` (source_format, message) when the flips file cannot
+  be written or read.
+- `slacs_key` per physical `,` or `.` press in SLACS while Follow runs: key,
+  action (`laser_shot` or `next_well`), press (the press's number in this
+  window process, counting only logged presses and shared by the records
+  several overlays write for one press; null when unknown), modifiers,
+  slacs_session, image_name, source_format, image_px, view (zoom, rotation,
+  flip, container, window), view_age_ms, view_follow_seq and
+  view_displacement_um (the Follow progress the view already shows; compare
+  them with follow_seq and displacement_um for presses not yet drawn), locked, follow_status (`waiting`, `following`,
+  `paused`, `lost` or `off`), follow_seq, displacement_um, counted, step_source,
+  step_um, roughness_um, mirror_h, mirror_v, reading_age_ms, slacs_busy, flip_x
+  and flip_y; or context_error instead of the overlay fields when they could
+  not be read. `slacs_key_hold` (key, action, press, repeats, seconds, key_up)
+  when a held `,` or `.` autorepeated in SLACS; key_up is false when its
+  release was lost and the hold ended at the next press. image_px is null
+  until the page reports its view, and again after a report is refused.
 
 **Limits.**
 
@@ -129,10 +207,15 @@ that the session is dropped and Follow stops as for a loss.
 - The keys carry no orientation of their own; W/A/S/D move the overlay in the
   directions shown on screen. Match the orientation in the main viewer (rotate,
   or ⌘/Ctrl+F to flip) before opening the translucent window; the window has no
-  direction settings and no per-key mapping UI. If, on the instrument, the
-  overlay moves opposite to SLACS's live image, `KEY_VIEW_SIGN` in
-  `nd2wsi/stage_keys.py` is the single value that reverses all four keys; it is
-  deliberately not a user setting.
+  image-orientation settings, and Follow's two flips reverse movement only. If,
+  on the instrument, the overlay moves opposite to SLACS's live image,
+  `KEY_VIEW_SIGN` in `nd2wsi/stage_keys.py` is the single value that reverses
+  all four keys; it is deliberately not a user setting.
+- The flips are remembered per file format, but the right flips may depend on
+  how SLACS's camera relates to its stage rather than on the format. A
+  remembered flip could then double-correct when the same format is opened with
+  a different main-viewer orientation; `follow_start` and `follow_flip` record
+  view_rotation and view_flip so this can be checked afterwards.
 - Roughness is read about every 0.2 s, so a press within that time of a
   Roughness change can still move by the previous value. With reading turned
   off, or while Roughness cannot be read, the manual step must match SLACS's
@@ -156,10 +239,11 @@ remain unchanged. ROI outlines are redrawn with the camera; their dimensions
 are not recalculated from stage motion.
 
 The translucent window shows exactly the rotation and flip of the main viewer
-at handoff and has no direction settings of its own: the earlier **Mirror
+at handoff and has no orientation settings of its own: the earlier **Mirror
 image** control, its default mirroring, and Follow's Rotation, Flip stage X and
-Flip stage Y settings are gone, and an older context's `mirror_scan` key is
-ignored. OpenSeadragon's own canvas keys (R rotate, F flip, W/A/S/D and arrow
+Flip stage Y alignment settings are gone, and an older context's `mirror_scan`
+key is ignored. Follow's **Flip up/down (W/S)** and **Flip left/right (A/D)**
+(see **Direction flips**) reverse its movement only. OpenSeadragon's own canvas keys (R rotate, F flip, W/A/S/D and arrow
 pan, +/−/0 zoom) are turned off in this window, so its orientation cannot drift
 from the main viewer's; align by dragging and scrolling. Nikon Ti/Aperio views
 from above and SLACS from underneath in the supplied context, so flip the image
@@ -257,7 +341,7 @@ gaps) with the original ND2, cache, annotations, context and SLACS module hashes
 unchanged. `qa/check_native_stage_follow.py` now checks the main viewer's
 orientation, screen-direction moves, presses ignored while unlocked, that
 OpenSeadragon's canvas keys leave the overlay unchanged, and the absence of
-direction settings. W/A/S/D observation exists only on Windows, so on macOS the
+orientation settings. W/A/S/D observation exists only on Windows, so on macOS the
 check commands the same receiver through its loopback adapter, with synthetic
 process sessions in the real `slacs-<hex>` identity format. It passed on
 2026-10-27 in a private Agent window (installed 2.5.4 runtime with this

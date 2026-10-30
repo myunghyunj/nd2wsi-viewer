@@ -18,7 +18,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from . import session_log
+from . import follow_flips, session_log
 from .window_chrome import NativeTitlebarDrag
 
 OPACITY = 0.55
@@ -33,6 +33,14 @@ CLIENT_LOG_MAX = 20
 CLIENT_LOG_WINDOW = 10.0
 CLIENT_LOG_FIELD_LIMIT = 1000
 CLIENT_LOG_STACK_LIMIT = 4000
+# What the page may report of its current view (report_overlay_view).
+VIEW_KEYS = frozenset(("version", "center_px", "zoom", "rotation", "flip", "locked", "follow_session",
+                       "follow_seq", "follow_displacement_um", "container", "window"))
+# The overlay's state in each slacs_key record (_mark_context), in record order.
+MARK_CONTEXT_KEYS = ("slacs_session", "image_name", "source_format", "image_px", "view", "view_age_ms",
+                     "view_follow_seq", "view_displacement_um", "locked", "follow_status", "follow_seq",
+                     "displacement_um", "counted", "step_source", "step_um", "roughness_um", "mirror_h",
+                     "mirror_v", "reading_age_ms", "slacs_busy", "flip_x", "flip_y")
 
 
 def _number(value, name, minimum, maximum):
@@ -41,6 +49,15 @@ def _number(value, name, minimum, maximum):
     if not math.isfinite(value) or not minimum <= value <= maximum:
         raise ValueError(f"{name} is outside the supported range")
     return float(value)
+
+
+def _optional_numbers(value, length, name, minimum=-math.inf, maximum=math.inf):
+    """None, or ``length`` finite numbers within the bounds, as floats."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != length:
+        raise ValueError(f"Invalid {name}")
+    return [_number(item, name, minimum, maximum) for item in value]
 
 
 def validate_roi(store, payload):
@@ -77,7 +94,8 @@ def validate_context(store, payload, *, slide_url):
     if type(flip) is not bool:
         raise ValueError("Flip must be boolean")
     # The overlay shows exactly the main viewer's rotation and flip; it has no
-    # direction settings of its own. An older handoff's "mirror_scan" is ignored.
+    # orientation settings of its own. An older handoff's "mirror_scan" is
+    # ignored. Follow's flips reverse its movement only, never the orientation.
     query = payload.get("query", "")
     if not isinstance(query, str) or len(query) > 16384:
         raise ValueError("Invalid display settings")
@@ -125,6 +143,8 @@ def validate_context(store, payload, *, slide_url):
                "dimensions": [width, height],
                "pixel_size_um": copy.deepcopy(meta.get("pixel_size_um")),
                "image_name": Path(str(getattr(store, "source_path", "") or "image")).name,
+               # Follow's flips are remembered per format of the original file.
+               "source_format": follow_flips.source_format(store.attrs, getattr(store, "source_path", None)),
                "opacity": OPACITY, "opacity_mode": "native" if sys.platform == "win32" else "layer",
                "locked": False}
     if payload.get("roi") is not None:
@@ -172,9 +192,13 @@ class _OverlayDrag(NativeTitlebarDrag):
 
 
 class TranslucentApi:
-    """Display-only bridge with read-only, user-selected JPG/TXT ROI import."""
+    """Display-only bridge with read-only, user-selected JPG/TXT ROI import.
 
-    def __init__(self, context, *, logger, on_closed):
+    ``flip_store`` (a ``follow_flips.FollowFlipStore``) remembers Follow's flips
+    per image format; without one they last only as long as this overlay.
+    """
+
+    def __init__(self, context, *, logger, on_closed, flip_store=None):
         self._context = copy.deepcopy(context)
         self._context.setdefault("opacity", OPACITY)
         self._context["opacity_mode"] = "native" if sys.platform == "win32" else "layer"
@@ -200,6 +224,33 @@ class TranslucentApi:
         self._slacs_snapshot = {"available": False, "session_id": None, "status": "waiting"}
         self._slacs_logged = None  # the last detection state written to the session log
         self._discovery = None
+        source_format = self._context.get("source_format")
+        self._source_format = source_format if source_format in follow_flips.FORMATS else "other"
+        self._flip_store = flip_store
+        self._flip_save_lock = threading.Lock()
+        self._follow_flips = (False, False)  # (flip_x, flip_y); replaced whole, never mutated
+        self._overlay_view = None  # the page's last reported view; replaced whole, never mutated
+        if flip_store is not None:
+            self._restore_flips()
+
+    def _orientation(self):
+        """The main viewer's rotation and flip at handoff, as Follow records name them."""
+        return {"view_rotation": self._context.get("rotation", 0), "view_flip": self._context.get("flip", False)}
+
+    def _restore_flips(self):
+        """Start with the flips remembered for this image's format; never raises."""
+        try:
+            stored, warning = self._flip_store.load(self._source_format)
+        except Exception as exc:  # noqa: BLE001 - a broken store only loses the memory
+            stored, warning = None, f"Saved Follow flips were not restored: {exc}"
+        if warning:
+            session_log.event("follow_flip_load_failed", source_format=self._source_format, message=warning)
+        if stored is None:
+            return
+        self._follow_flips = stored
+        session_log.event("follow_flip", source="remembered", source_format=self._source_format,
+                          flip_x=stored[0], flip_y=stored[1], image_name=self._context.get("image_name"),
+                          **self._orientation())
 
     def _ensure_slacs_discovery(self):
         from .slacs_discovery import SlacsDiscovery
@@ -302,7 +353,9 @@ class TranslucentApi:
 
     def translucent_context(self):
         with self._lock:
-            return {**copy.deepcopy(self._context), "locked": self._locked}
+            flip_x, flip_y = self._follow_flips
+            return {**copy.deepcopy(self._context), "locked": self._locked, "source_format": self._source_format,
+                    "follow_flips": {"flip_x": flip_x, "flip_y": flip_y}}
 
     def _stage_follow_options(self, options):
         """Resolve the stage-follow source, per-key step and step source; never raise.
@@ -376,8 +429,10 @@ class TranslucentApi:
         ``step_um`` and ``step_source`` ("slacs" to move each press by SLACS's
         Roughness, read from its window, or "manual"). The key follower is a
         strict observer and never blocks, delays, or alters a keystroke; it owns
-        the Roughness monitor's start and stop. Follow is refused unless SLACS
-        is detected, and is bound to that detected process.
+        the Roughness monitor's start and stop. It starts with this overlay's
+        Follow flips and logs SLACS's "," and "." presses with ``_mark_context``.
+        Follow is refused unless SLACS is detected, and is bound to that
+        detected process.
         """
         from .stage_follow import StageFollowReceiver
         from .stage_keys import SlacsKeyFollower
@@ -400,6 +455,8 @@ class TranslucentApi:
             if self._stage_follow is not None:
                 descriptor = self._stage_follow.start()
                 return {"ok": True, "source": self._stage_follow_source, **descriptor}
+            # Not re-read from the store: a toggle just before Follow may still be saving.
+            flip_x, flip_y = self._follow_flips
             receiver = StageFollowReceiver()
             try:
                 descriptor = receiver.start()
@@ -415,7 +472,8 @@ class TranslucentApi:
                     # The context's calibration is [Y, X]; the follower takes (X, Y).
                     follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=step_um,
                                                 step_source=step_source, controls=controls,
-                                                pixel_size_um=(float(pixels[1]), float(pixels[0])))
+                                                pixel_size_um=(float(pixels[1]), float(pixels[0])),
+                                                flip_x=flip_x, flip_y=flip_y, mark_context=self._mark_context)
                     snapshot = follower.start()
                 except (ValueError, OSError, RuntimeError) as exc:
                     snapshot = {"running": False, "error": str(exc)}
@@ -437,8 +495,158 @@ class TranslucentApi:
             self._stage_follow_lost = ""
         extra = {"controls_error": controls_error} if controls_error else {}
         session_log.event("follow_start", source=source, step_source=step_source, step_um=step_um, ok=True,
-                          slacs_session=bound, **extra)
+                          slacs_session=bound, source_format=self._source_format, flip_x=flip_x, flip_y=flip_y,
+                          **self._orientation(), **extra)
         return {"ok": True, "source": source, **descriptor}
+
+    def set_stage_follow_flips(self, payload):
+        """Reverse Follow's on-screen A/D (flip_x) or W/S (flip_y) move; never the image.
+
+        Applies from the next key press, also while Follow runs or the overlay
+        is locked: the page applies only differences of the cumulative
+        displacement, so its sequence and displacement stay consistent. The new
+        pair is remembered for this image's format when the window has a store.
+        """
+        def current(ok, **extra):
+            flip_x, flip_y = self._follow_flips
+            return {"ok": ok, "flip_x": flip_x, "flip_y": flip_y, "source_format": self._source_format, **extra}
+
+        if (not isinstance(payload, dict) or set(payload) != {"flip_x", "flip_y"}
+                or type(payload["flip_x"]) is not bool or type(payload["flip_y"]) is not bool):
+            return current(False, message="Follow flips must be two true/false values.")
+        flips = (payload["flip_x"], payload["flip_y"])
+        with self._lock:
+            if self._closed:
+                return current(False, message="This translucent viewer is closed.")
+            previous = self._follow_flips
+            if flips == previous:
+                return current(True, changed=False)
+            self._follow_flips = flips
+            follower, receiver = self._stage_follower, self._stage_follow
+            # Lock order: overlay, then follower, as in stage_follow_state.
+            if follower is not None:
+                follower.set_flips(*flips)
+            # Only the receiver's progress at the toggle: a press already on its way
+            # may still arrive later with the old flips. Each follow_key names the
+            # flips that press used.
+            follow_seq = receiver.snapshot().get("seq") if receiver is not None else None
+        saved, message = self._remember_flips()
+        session_log.event("follow_flip", source="user", source_format=self._source_format, flip_x=flips[0],
+                          flip_y=flips[1], previous=list(previous), following=follower is not None,
+                          follow_seq=follow_seq, saved=saved, image_name=self._context.get("image_name"),
+                          **self._orientation())
+        result = {"ok": True, "changed": True, "flip_x": flips[0], "flip_y": flips[1],
+                  "source_format": self._source_format, "saved": saved}
+        if message:
+            result["message"] = message
+        return result
+
+    def _remember_flips(self):
+        """Save the current flips for this format: (saved, a message for the page or None).
+
+        Saves the pair current when the save lock is taken, so the last toggle
+        always wins on disk.
+        """
+        store = self._flip_store
+        if store is None:
+            return False, None
+        with self._flip_save_lock:
+            flip_x, flip_y = self._follow_flips
+            try:
+                store.save(self._source_format, flip_x, flip_y)
+            except (OSError, ValueError) as exc:
+                message = f"Applied for this window, but could not be remembered: {exc}"
+                session_log.event("follow_flip_save_failed", source_format=self._source_format,
+                                  flip_x=flip_x, flip_y=flip_y, message=message)
+                return False, message
+        return True, None
+
+    def report_overlay_view(self, payload):
+        """Keep the page's current view for SLACS laser-shot records; never logged.
+
+        A refused report forgets the kept view, so a later record shows no
+        image centre rather than an old one as if it were current.
+        """
+        try:
+            view = self._validated_view(payload)
+        except (TypeError, ValueError) as exc:
+            with self._lock:
+                self._overlay_view = None
+            return {"ok": False, "message": str(exc)}
+        with self._lock:
+            if self._closed:
+                return {"ok": False}
+            self._overlay_view = {**view, "at": time.monotonic()}
+        return {"ok": True}
+
+    def _validated_view(self, payload):
+        if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
+            raise ValueError("Unsupported overlay view")
+        if set(payload) - VIEW_KEYS:
+            raise ValueError("Unknown overlay view field")
+        center = payload.get("center_px")
+        if not isinstance(center, list) or len(center) != 2:
+            raise ValueError("Invalid view centre")
+        flip, locked = payload.get("flip", False), payload.get("locked", False)
+        if type(flip) is not bool or type(locked) is not bool:
+            raise ValueError("View flip and lock must be boolean")
+        session = payload.get("follow_session")
+        if session is not None and (not isinstance(session, str) or len(session) > 128):
+            raise ValueError("Invalid Follow session")
+        seq = payload.get("follow_seq")
+        if seq is not None and (type(seq) is not int or not 0 <= seq <= 2**53 - 1):
+            raise ValueError("Invalid Follow sequence number")
+        # The centre is only logged, never used to place a camera, so it is bounded
+        # generously: the page can pan the image far outside validate_context's slack.
+        return {"center_px": [_number(value, "View centre", -1e9, 1e9) for value in center],
+                "zoom": _number(payload.get("zoom"), "View scale", 1e-12, 1e6),
+                "rotation": _number(payload.get("rotation", 0), "View rotation", -360000, 360000) % 360,
+                "flip": flip, "locked": locked, "follow_session": session, "follow_seq": seq,
+                "follow_displacement_um": _optional_numbers(payload.get("follow_displacement_um"), 2,
+                                                            "Follow displacement"),
+                "container": _optional_numbers(payload.get("container"), 2, "view size", 0),
+                "window": _optional_numbers(payload.get("window"), 4, "window frame", -1e6, 1e6)}
+
+    def _mark_context(self):
+        """This overlay's state for a SLACS "," or "." record, or None once closed; never raises.
+
+        Runs on the Raw Input thread inside the key follower. Like ``_slacs_pid``
+        it never takes the overlay lock, because ``start_stage_follow`` holds it
+        across the follower's start and stop. References are read one by one and
+        may straddle a concurrent start or stop, which is acceptable for a log
+        record; the receiver and follower snapshots take only their own locks.
+        """
+        try:
+            if self._closed:
+                return None
+            receiver, follower = self._stage_follow, self._stage_follower
+            receiver_id, view = self._stage_follow_receiver_id, self._overlay_view
+            flip_x, flip_y = self._follow_flips
+            context = dict.fromkeys(MARK_CONTEXT_KEYS)
+            context.update(slacs_session=self._stage_follow_session, image_name=self._context.get("image_name"),
+                           source_format=self._source_format, locked=self._locked, flip_x=flip_x, flip_y=flip_y)
+            if view is not None:
+                center_x, center_y = view["center_px"]
+                context.update(image_px=[round(center_x, 1) + 0.0, round(center_y, 1) + 0.0],
+                               view={key: view[key] for key in ("zoom", "rotation", "flip", "container", "window")},
+                               view_age_ms=int(round((time.monotonic() - view["at"]) * 1000)))
+                if receiver_id is not None and view["follow_session"] == receiver_id:
+                    context.update(view_follow_seq=view["follow_seq"],
+                                   view_displacement_um=view["follow_displacement_um"])
+            if receiver is not None:
+                snapshot = receiver.snapshot()
+                context.update(follow_status=snapshot.get("status"), follow_seq=snapshot.get("seq"),
+                               displacement_um=snapshot.get("displacement_um"))
+            else:
+                context["follow_status"] = "lost" if self._stage_follow_lost else "off"
+            if follower is not None:
+                keys = follower.snapshot()
+                context.update({key: keys.get(key) for key in (
+                    "counted", "step_source", "step_um", "roughness_um", "mirror_h", "mirror_v",
+                    "reading_age_ms", "slacs_busy")})
+            return context
+        except Exception as exc:  # noqa: BLE001 - a log record must never break the key observer
+            return {"context_error": type(exc).__name__}
 
     def stage_follow_state(self):
         with self._lock:
@@ -881,10 +1089,10 @@ class TranslucentApi:
         self._on_closed(self)
 
 
-def create_translucent_window(context, *, url, title, logger, on_closed):
+def create_translucent_window(context, *, url, title, logger, on_closed, flip_store=None):
     import webview
 
-    api = TranslucentApi(context, logger=logger, on_closed=on_closed)
+    api = TranslucentApi(context, logger=logger, on_closed=on_closed, flip_store=flip_store)
     window = webview.create_window(
         title, url=url, js_api=api, width=640, height=480, min_size=MIN_SIZE,
         frameless=True, easy_drag=False, resizable=False, on_top=True,

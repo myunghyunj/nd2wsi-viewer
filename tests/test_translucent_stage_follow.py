@@ -225,13 +225,17 @@ class FakeFollower:
     instances = []
 
     def __init__(self, receiver, session_id, *, step_um, step_source="manual", controls=None,
-                 pixel_size_um=None, start_ok=True, order=None):
+                 pixel_size_um=None, flip_x=False, flip_y=False, mark_context=None, start_ok=True,
+                 order=None):
         self.receiver = receiver
         self.session_id = session_id
         self.step_um = step_um
         self.step_source = step_source
         self.controls = controls
         self.pixel_size_um = pixel_size_um
+        self.flips = (flip_x, flip_y)
+        self.flip_calls = []
+        self.mark_context = mark_context
         self._start_ok = start_ok
         self._order = order if order is not None else []
         self.stopped = None
@@ -240,10 +244,17 @@ class FakeFollower:
     def start(self):
         return self._snapshot(running=self._start_ok)
 
+    def set_flips(self, flip_x, flip_y):
+        self.flip_calls.append((flip_x, flip_y))
+        previous, self.flips = self.flips, (flip_x, flip_y)
+        return previous
+
     def _snapshot(self, running):
         return {"source": "keys", "running": running, "supported": True, "step_um": self.step_um,
-                "counted": 3, "ignored_not_slacs": 1, "last_key": "D",
-                "slacs_in_front": True, "error": None if running else "boom"}
+                "step_source": self.step_source, "counted": 3, "ignored_not_slacs": 1, "last_key": "D",
+                "slacs_in_front": True, "error": None if running else "boom",
+                "flip_x": self.flips[0], "flip_y": self.flips[1], "roughness_um": 12.5, "mirror_h": False,
+                "mirror_v": True, "controls_ok": True, "slacs_busy": False, "reading_age_ms": 40}
 
     def snapshot(self):
         return self._snapshot(running=True)
@@ -447,10 +458,12 @@ def test_follow_start_records_the_step_source(keys_overlay, monkeypatch):
     api.stop_stage_follow()
     assert api.start_stage_follow()["ok"]
     api.stop_stage_follow()
+    unflipped = {"source_format": "other", "flip_x": False, "flip_y": False, "view_rotation": 0, "view_flip": False}
     assert [fields for kind, fields in events if kind == "follow_start"] == [
-        {"source": "keys", "step_source": "manual", "step_um": 2.5, "ok": True, "slacs_session": "test-process"},
+        {"source": "keys", "step_source": "manual", "step_um": 2.5, "ok": True, "slacs_session": "test-process",
+         **unflipped},
         {"source": "keys", "step_source": "slacs", "step_um": tw.DEFAULT_STEP_UM, "ok": True,
-         "slacs_session": "test-process"},
+         "slacs_session": "test-process", **unflipped},
     ]
 
 
@@ -571,3 +584,227 @@ def test_log_client_event_rejects_non_dict_and_closed(monkeypatch):
     assert events == []
     api.close_translucent()
     assert api.log_client_event({"kind": "error"}) == {"ok": False}
+
+
+# Follow's direction flips, the reported view and SLACS mark context ------------
+
+from nd2wsi.follow_flips import FollowFlipStore  # noqa: E402
+
+
+def test_flip_toggle_is_validated_applied_live_and_logged(keys_overlay, monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    api, _order = keys_overlay(platform="win32")
+    assert api.start_stage_follow()["ok"]
+    assert api.set_translucent_locked(True)["locked"]  # live while locked and following
+    follower = FakeFollower.instances[-1]
+    events.clear()
+    result = api.set_stage_follow_flips({"flip_x": False, "flip_y": True})
+    assert result == {"ok": True, "changed": True, "flip_x": False, "flip_y": True, "source_format": "other",
+                      "saved": False}
+    assert follower.flip_calls == [(False, True)]
+    assert events == [("follow_flip", {
+        "source": "user", "source_format": "other", "flip_x": False, "flip_y": True, "previous": [False, False],
+        "following": True, "follow_seq": 0, "saved": False, "image_name": "ITO.nd2", "view_rotation": 0,
+        "view_flip": False})]
+    assert api.translucent_context()["follow_flips"] == {"flip_x": False, "flip_y": True}
+    assert api.stage_follow_state()["keys"]["flip_y"] is True
+    events.clear()
+    for bad in (None, {}, {"flip_x": True}, {"flip_x": 1, "flip_y": False}, {"flip_x": "true", "flip_y": False},
+                {"flip_x": True, "flip_y": False, "extra": True}, [True, False]):
+        assert api.set_stage_follow_flips(bad) == {
+            "ok": False, "flip_x": False, "flip_y": True, "source_format": "other",
+            "message": "Follow flips must be two true/false values."}
+    assert api.set_stage_follow_flips({"flip_x": False, "flip_y": True}) == {
+        "ok": True, "changed": False, "flip_x": False, "flip_y": True, "source_format": "other"}
+    assert events == [] and follower.flip_calls == [(False, True)]
+    # Without a running Follow the pair waits for the next one.
+    api.stop_stage_follow()
+    events.clear()
+    assert api.set_stage_follow_flips({"flip_x": True, "flip_y": True})["ok"]
+    [flip] = [fields for kind, fields in events if kind == "follow_flip"]
+    assert flip["following"] is False and flip["follow_seq"] is None and flip["previous"] == [False, True]
+    api.close_translucent()
+    closed = api.set_stage_follow_flips({"flip_x": False, "flip_y": False})
+    assert closed == {"ok": False, "flip_x": True, "flip_y": True, "source_format": "other",
+                      "message": "This translucent viewer is closed."}
+
+
+def test_follower_starts_with_the_overlays_flips(keys_overlay, monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    api, _order = keys_overlay(platform="win32")
+    api._context.update(rotation=270, flip=True)
+    assert api.set_stage_follow_flips({"flip_x": True, "flip_y": False})["ok"]
+    assert api.start_stage_follow()["ok"]
+    follower = FakeFollower.instances[-1]
+    assert follower.flips == (True, False) and follower.flip_calls == []
+    # The follower logs SLACS's "," and "." with this overlay's lock-free context.
+    assert follower.mark_context == api._mark_context
+    [start] = [fields for kind, fields in events if kind == "follow_start"]
+    assert {key: start[key] for key in ("source_format", "flip_x", "flip_y", "view_rotation", "view_flip")} == {
+        "source_format": "other", "flip_x": True, "flip_y": False, "view_rotation": 270, "view_flip": True}
+    api.stop_stage_follow()
+
+
+def test_the_adapter_source_never_takes_the_flips(keys_overlay):
+    api, _order = keys_overlay(platform="darwin")
+    assert api.set_stage_follow_flips({"flip_x": True, "flip_y": True})["ok"]
+    assert api.start_stage_follow()["ok"] and FakeFollower.instances == []
+    result = api.set_stage_follow_flips({"flip_x": False, "flip_y": True})
+    assert result["ok"] and result["changed"]
+    api.stop_stage_follow()
+
+
+class _BrokenStore:
+    def __init__(self, error):
+        self.error = error
+
+    def load(self, fmt):
+        return None, None
+
+    def save(self, fmt, flip_x, flip_y):
+        raise self.error
+
+
+def test_remembered_flips_load_per_format_and_are_logged(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    FollowFlipStore(root=tmp_path).save("nd2", False, True)
+    store = FollowFlipStore(root=tmp_path)
+    context = {"pixel_size_um": [.5, .5], "dimensions": [100, 100], "image_name": "a.nd2", "source_format": "nd2",
+               "rotation": 90, "flip": True}
+
+    def overlay(flip_store=store, **changes):
+        return TranslucentApi({**context, **changes}, logger=Mock(), on_closed=Mock(), flip_store=flip_store)
+
+    nd2 = overlay()
+    assert nd2.translucent_context()["follow_flips"] == {"flip_x": False, "flip_y": True}
+    assert nd2.translucent_context()["source_format"] == "nd2"
+    assert events == [("follow_flip", {"source": "remembered", "source_format": "nd2", "flip_x": False,
+                                       "flip_y": True, "image_name": "a.nd2", "view_rotation": 90,
+                                       "view_flip": True})]
+    events.clear()
+    svs = overlay(source_format="svs")
+    assert svs.translucent_context()["follow_flips"] == {"flip_x": False, "flip_y": False} and events == []
+    assert overlay(source_format="bmp").translucent_context()["source_format"] == "other"
+    # A toggle is remembered for its own format and read back by a new store.
+    result = svs.set_stage_follow_flips({"flip_x": True, "flip_y": False})
+    assert result == {"ok": True, "changed": True, "flip_x": True, "flip_y": False, "source_format": "svs",
+                      "saved": True}
+    assert FollowFlipStore(root=tmp_path).load("svs") == ((True, False), None)
+    assert FollowFlipStore(root=tmp_path).load("nd2") == ((False, True), None)
+    assert [fields["saved"] for kind, fields in events if kind == "follow_flip"] == [True]
+    # A store that cannot save: applied for this window, not remembered, and kept in the log.
+    for error in (OSError("disk full"), TimeoutError("another viewer is writing flips")):
+        broken = TranslucentApi(context, logger=Mock(), on_closed=Mock(), flip_store=_BrokenStore(error))
+        events.clear()
+        result = broken.set_stage_follow_flips({"flip_x": True, "flip_y": True})
+        assert result["ok"] is True and result["saved"] is False
+        assert result["message"] == f"Applied for this window, but could not be remembered: {error}"
+        assert broken.translucent_context()["follow_flips"] == {"flip_x": True, "flip_y": True}
+        assert [kind for kind, _ in events] == ["follow_flip_save_failed", "follow_flip"]
+        assert events[0][1] == {"source_format": "nd2", "flip_x": True, "flip_y": True,
+                                "message": result["message"]}
+    # An unreadable file restores nothing and says why, once.
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "flips.json").write_text("{", encoding="utf-8")
+    events.clear()
+    unreadable = overlay(flip_store=FollowFlipStore(root=tmp_path / "bad"))
+    assert unreadable.translucent_context()["follow_flips"] == {"flip_x": False, "flip_y": False}
+    assert [kind for kind, _ in events] == ["follow_flip_load_failed"]
+    assert events[0][1]["source_format"] == "nd2"
+    assert events[0][1]["message"].startswith("Saved Follow flips were not restored")
+
+
+def _view(**changes):
+    return {"version": 1, "center_px": [100, 200], "zoom": 2, "rotation": 450, "flip": True, "locked": False,
+            "follow_session": None, "follow_seq": None, "follow_displacement_um": None, "container": [800, 500],
+            "window": [10, 20, 800, 500], **changes}
+
+
+def test_report_overlay_view_validates_and_caches_without_logging(monkeypatch):
+    events = []
+    monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
+    api = make_overlay()  # 2048 x 2048
+    events.clear()
+    assert api.report_overlay_view(_view()) == {"ok": True}
+    cached = api._overlay_view
+    assert {key: value for key, value in cached.items() if key != "at"} == {
+        "center_px": [100.0, 200.0], "zoom": 2.0, "rotation": 90.0, "flip": True, "locked": False,
+        "follow_session": None, "follow_seq": None, "follow_displacement_um": None,
+        "container": [800.0, 500.0], "window": [10.0, 20.0, 800.0, 500.0]}
+    for bad in (_view(center_px=[-1e9 - 1, 0]), _view(center_px=[0, 1e9 + 1]),
+                _view(center_px=[float("nan"), 0]), _view(center_px=[1]), _view(zoom=True), _view(zoom=0),
+                _view(extra=1), _view(version=2), _view(version=True), _view(flip="yes"), _view(locked=None),
+                _view(follow_seq=-1), _view(follow_seq=True), _view(follow_seq=1.0),
+                _view(follow_session="x" * 129), _view(follow_session=7), _view(container=[1, -1]),
+                _view(window=[0, 0, 1e7, 0]), _view(follow_displacement_um=[1]),
+                _view(follow_displacement_um=[1, float("inf")]), None, [], "view"):
+        assert api.report_overlay_view(_view())["ok"]
+        result = api.report_overlay_view(bad)
+        assert result["ok"] is False and result["message"]
+        # Forgotten: a later laser-shot record shows no centre rather than an old one.
+        assert api._overlay_view is None
+    # The page can pan the image far past validate_context's slack; that centre is still logged as it is.
+    far = api.report_overlay_view(_view(center_px=[-8 * 2048 - 1, 9 * 2048 + 1]))
+    assert far == {"ok": True} and api._overlay_view["center_px"] == [-8 * 2048 - 1.0, 9 * 2048 + 1.0]
+    assert api.report_overlay_view(_view())["ok"] and api._overlay_view == {**cached, "at": api._overlay_view["at"]}
+    # Optional fields may be left out.
+    loose = TranslucentApi({}, logger=Mock(), on_closed=Mock())
+    assert loose.report_overlay_view({"version": 1, "center_px": [-5e8, 5e8], "zoom": 1})["ok"]
+    assert loose._overlay_view["follow_seq"] is None and loose._overlay_view["flip"] is False
+    assert events == []
+    api.close_translucent()
+    assert api.report_overlay_view(_view()) == {"ok": False}
+
+
+def test_mark_context_never_waits_for_the_overlay_lock(keys_overlay):
+    import threading
+
+    api, _order = keys_overlay(platform="win32")
+    off = api._mark_context()
+    assert list(off) == list(tw.MARK_CONTEXT_KEYS)
+    assert off["follow_status"] == "off" and off["follow_seq"] is None and off["counted"] is None
+    assert api.start_stage_follow()["ok"]
+    assert api._mark_context()["image_px"] is None  # nothing reported yet
+    api.report_overlay_view(_view(center_px=[100.04, -0.04], follow_session="another-receiver", follow_seq=5,
+                                  follow_displacement_um=[1, 2]))
+    assert api._mark_context()["view_follow_seq"] is None  # another receiver's progress
+    api.report_overlay_view(_view(follow_session="fake-session", follow_seq=0, follow_displacement_um=[0, 0]))
+    held, release, result = threading.Event(), threading.Event(), []
+
+    def hold():
+        with api._lock:
+            held.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    try:
+        reader = threading.Thread(target=lambda: result.append(api._mark_context()), daemon=True)
+        reader.start()
+        reader.join(2)
+        assert len(result) == 1
+    finally:
+        release.set()
+        holder.join(5)
+    [context] = result
+    assert context["view_age_ms"] >= 0
+    assert {key: value for key, value in context.items() if key != "view_age_ms"} == {
+        "slacs_session": "test-process", "image_name": "ITO.nd2", "source_format": "other",
+        "image_px": [100.0, 200.0],
+        "view": {"zoom": 2.0, "rotation": 90.0, "flip": True, "container": [800.0, 500.0],
+                 "window": [10.0, 20.0, 800.0, 500.0]},
+        "view_follow_seq": 0, "view_displacement_um": [0.0, 0.0], "locked": False, "follow_status": "waiting",
+        "follow_seq": 0, "displacement_um": [0, 0], "counted": 3, "step_source": "slacs",
+        "step_um": tw.DEFAULT_STEP_UM, "roughness_um": 12.5, "mirror_h": False, "mirror_v": True,
+        "reading_age_ms": 40, "slacs_busy": False, "flip_x": False, "flip_y": False}
+    api.report_overlay_view(_view(center_px=[-0.04, 0.04]))
+    assert api._mark_context()["image_px"] == [0.0, 0.0]  # never a negative zero
+    api._on_slacs_change({"available": False, "session_id": None, "status": "not_running"})
+    lost = api._mark_context()
+    assert lost["follow_status"] == "lost" and lost["slacs_session"] is None and lost["counted"] is None
+    api.close_translucent()
+    assert api._mark_context() is None

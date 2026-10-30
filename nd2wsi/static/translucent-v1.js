@@ -10,7 +10,7 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function (geometry) {
   "use strict";
 
-  // The per-key stage step, remembered per viewer. SLACS jogs the stage by its
+  // The per-key stage step, kept for this app run. SLACS jogs the stage by its
   // Roughness in micrometres (1 Roughness = 1 µm per press). By default Follow
   // reads Roughness from SLACS and this step is only the fallback while it
   // cannot be read; with reading turned off every press moves by this step.
@@ -19,6 +19,17 @@
   const DEFAULT_STEP_UM = 10;
   const MIN_STEP_UM = 0.001;
   const MAX_STEP_UM = 10000;
+  // Follow's two flips are remembered per file format by the app
+  // (follow_flips.py), never in this page's storage: its origin changes with
+  // every launch. "other" names every format not listed here.
+  const FOLLOW_FORMAT_LABELS = { nd2: "ND2", svs: "SVS", sdpc: "SDPC", jpeg: "JPEG", png: "PNG" };
+  // The current view is reported at most this often, for SLACS laser-shot records.
+  const VIEW_REPORT_MS = 200;
+
+  function followFormat(value) {
+    return typeof value === "string" && Object.prototype.hasOwnProperty.call(FOLLOW_FORMAT_LABELS, value) ?
+      value : "other";
+  }
 
   function validateContext(value, pageUrl) {
     if (!value || value.version !== 1 || !Array.isArray(value.center) ||
@@ -36,7 +47,10 @@
       }
     }
     return { ...value, slide_url: slide.href, query: query.toString(),
-      opacity: Math.max(.1, Math.min(1, Number.isFinite(value.opacity) ? value.opacity : .55)) };
+      opacity: Math.max(.1, Math.min(1, Number.isFinite(value.opacity) ? value.opacity : .55)),
+      // An older context without these starts unflipped and names no format.
+      source_format: followFormat(value.source_format),
+      follow_flips: { flip_x: value.follow_flips?.flip_x === true, flip_y: value.follow_flips?.flip_y === true } };
   }
 
   function makeTileSource(info, context, OSD) {
@@ -233,6 +247,11 @@
     const followStepHint = doc.getElementById("stage-follow-step-hint");
     const followRoughness = doc.getElementById("stage-follow-roughness");
     const followCount = doc.getElementById("stage-follow-count");
+    const flipBoxes = { y: doc.getElementById("stage-follow-flip-ud"), x: doc.getElementById("stage-follow-flip-lr") };
+    const followFlipHint = doc.getElementById("stage-follow-flip-hint");
+    const sourceFormat = followFormat(context.source_format);
+    const flipHint = "Reverses Follow's movement only, never the image. Remembered for " +
+      (sourceFormat === "other" ? "other image types" : FOLLOW_FORMAT_LABELS[sourceFormat] + " files") + " on this PC.";
     const pixelSize = stagePixelSize(info);
     const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
     const initialOpacity = validOpacity(context.opacity) ? context.opacity : .55;
@@ -250,7 +269,10 @@
     };
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
       rois: [], roiIndex: -1, roiName: "", loadingRois: false, stepUm: loadStep(), stepAuto: loadStepAuto(),
-      opacity: initialOpacity, confirmedOpacity: initialOpacity };
+      opacity: initialOpacity, confirmedOpacity: initialOpacity,
+      // Follow's flips as the app last confirmed them (remembered for this format).
+      followFlips: { x: context.follow_flips?.flip_x === true, y: context.follow_flips?.flip_y === true },
+      flipPending: false, flipMessage: "" };
     const follow = state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
       seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "" };
     state.slacs = { available: false, session_id: null, status: "checking" };
@@ -358,6 +380,51 @@
       const selected = roiBoxes[state.roiIndex];
       if (selected && roiLayer.lastElementChild !== selected) roiLayer.appendChild(selected);
     };
+    // The app keeps the current view so each SLACS laser shot (",") and next
+    // well (".") it logs carries the image-pixel centre of this window, with
+    // the Follow progress already shown. Reports are never logged themselves.
+    let viewReportTimer = null, viewReportInFlight = false, viewReportAgain = false, reportedFrame = "";
+    const finiteValues = values => values.every(Number.isFinite) ? values : null;
+    const windowFrame = () => finiteValues([win.screenX, win.screenY, win.innerWidth, win.innerHeight]);
+    const overlayView = () => {
+      const viewport = viewer.viewport;
+      const center = viewport.viewportToImageCoordinates(viewport.getCenter(true));
+      const size = viewport.getContainerSize();
+      const following = follow.enabled && !!follow.sessionId;
+      return { version: 1, center_px: [center.x, center.y],
+        zoom: viewport.viewportToImageZoom(viewport.getZoom(true)),
+        rotation: viewport.getRotation(), flip: viewport.getFlip(), locked: state.locked,
+        follow_session: following ? follow.sessionId : null, follow_seq: following ? follow.seq : null,
+        follow_displacement_um: following ? follow.displacement.slice() : null,
+        container: finiteValues([size.x, size.y]), window: windowFrame() };
+    };
+    const reportView = async () => {
+      if (disposed || !state.ready || typeof api.report_overlay_view !== "function") return false;
+      if (viewReportTimer !== null) { win.clearTimeout(viewReportTimer); viewReportTimer = null; }
+      // One request in flight; a change meanwhile is sent once it returns.
+      if (viewReportInFlight) { viewReportAgain = true; return false; }
+      viewReportInFlight = true;
+      try {
+        const view = overlayView();
+        const ok = (await api.report_overlay_view(view))?.ok === true;
+        if (ok) reportedFrame = JSON.stringify(view.window);
+        return ok;
+      } catch (_) { return false; }
+      finally {
+        viewReportInFlight = false;
+        if (viewReportAgain) { viewReportAgain = false; scheduleViewReport(); }
+      }
+    };
+    // A trailing throttle: the report sent when it fires describes the latest view.
+    const scheduleViewReport = () => {
+      if (disposed || viewReportTimer !== null || typeof api.report_overlay_view !== "function") return;
+      viewReportTimer = win.setTimeout(() => { viewReportTimer = null; reportView(); }, VIEW_REPORT_MS);
+    };
+    // Moving the window changes no camera, and a native drag ends outside the
+    // page, so the 1 s discovery tick also reports a window frame that changed.
+    const reportMovedWindow = () => {
+      if (state.ready && JSON.stringify(windowFrame()) !== reportedFrame) scheduleViewReport();
+    };
     const paintRois = () => {
       const hasRois = state.rois.length > 0;
       doc.getElementById("roi-controls").hidden = !hasRois;
@@ -444,6 +511,15 @@
         const counted = follow.keys && Number.isFinite(follow.keys.counted) ? follow.keys.counted : 0;
         followCount.textContent = "Key presses: " + counted;
       }
+      // Unlike the step, a flip applies from the next press: it stays live while
+      // following and while locked.
+      const flipAvailable = typeof api.set_stage_follow_flips === "function";
+      for (const axis of ["x", "y"]) {
+        if (!flipBoxes[axis]) continue;
+        flipBoxes[axis].checked = state.followFlips[axis];
+        flipBoxes[axis].disabled = state.flipPending || !flipAvailable;
+      }
+      if (followFlipHint) followFlipHint.textContent = state.flipMessage || flipHint;
       followSave.disabled = !follow.enabled || follow.pending || typeof api.save_stage_follow_connection !== "function";
       doc.getElementById("stage-follow-message").textContent = follow.message ||
         (!pixelSize ? "A calibrated pixel size is needed." : "Commanded motion · moves in on-screen directions");
@@ -499,12 +575,15 @@
         renderRoiBoxes();
         follow.lastDelta = imageDelta;
       }
+      const seqChanged = result.seq !== follow.seq;
       follow.displacement = cumulative.slice();
       follow.seq = result.seq;
       follow.status = result.status;
       follow.message = "";
       follow.keys = result.keys && typeof result.keys === "object" ? result.keys : null;
       paintFollow();
+      // Also while unlocked, so the app knows which presses the view already shows.
+      if (seqChanged) scheduleViewReport();
       return true;
     };
     const pollStageFollow = async () => {
@@ -558,6 +637,7 @@
         follow.enabled = true; follow.sessionId = result.session_id; follow.status = "waiting";
         follow.seq = 0; follow.displacement = [0, 0]; follow.lastDelta = { x: 0, y: 0 }; follow.keys = null;
         scheduleStagePoll();
+        reportView();
         return true;
       }).catch(error => {
         if (epoch === followEpoch && !disposed) { follow.status = "off"; follow.message = error.message || "Could not connect to the stage"; }
@@ -577,6 +657,7 @@
       follow.pending = wasActive;
       if (!disposed) paintLock();
       if (!wasActive) return Promise.resolve(true);
+      reportView();
       const task = followLifecycle.catch(() => {}).then(async () => {
         requireSuccess(await api.stop_stage_follow(), "Could not stop stage follow");
         return true;
@@ -665,6 +746,37 @@
       return true;
     };
     followStepAuto?.addEventListener("change", () => setStepAuto(followStepAuto.checked === true));
+    // Flip up/down reverses W/S (flip_y) and Flip left/right reverses A/D
+    // (flip_x) for Follow's key source, from the next press on. The app applies
+    // and remembers them; this page never turns or flips the image for them.
+    const setFollowFlips = async ({ x, y } = {}) => {
+      if (state.flipPending || disposed || typeof x !== "boolean" || typeof y !== "boolean" ||
+          typeof api.set_stage_follow_flips !== "function") { paintFollow(); return false; }
+      const previous = state.followFlips;
+      if (x === previous.x && y === previous.y) { paintFollow(); return true; }
+      state.followFlips = { x, y };
+      state.flipPending = true;
+      paintFollow();
+      try {
+        const result = requireSuccess(await api.set_stage_follow_flips({ flip_x: x, flip_y: y }),
+          "Could not change Follow's direction");
+        state.followFlips = { x: typeof result?.flip_x === "boolean" ? result.flip_x : x,
+          y: typeof result?.flip_y === "boolean" ? result.flip_y : y };
+        state.flipMessage = typeof result?.message === "string" ? result.message : "";
+        return true;
+      } catch (error) {
+        state.followFlips = previous;
+        state.flipMessage = error.message || "Could not change Follow's direction";
+        return false;
+      } finally {
+        state.flipPending = false;
+        paintFollow();
+      }
+    };
+    flipBoxes.y?.addEventListener("change", () =>
+      setFollowFlips({ x: state.followFlips.x, y: flipBoxes.y.checked === true }));
+    flipBoxes.x?.addEventListener("change", () =>
+      setFollowFlips({ x: flipBoxes.x.checked === true, y: state.followFlips.y }));
     followSave.addEventListener("click", async () => {
       if (!follow.enabled || follow.pending) return;
       const epoch = followEpoch;
@@ -704,7 +816,7 @@
       } catch (error) {
         state.locked = previous;
         showStatus(error.message || "Could not change the lock");
-      } finally { state.pending = false; lockEpoch++; paintLock(); }
+      } finally { state.pending = false; lockEpoch++; paintLock(); reportView(); }
     };
     const close = async () => {
       stopStageFollow();
@@ -762,8 +874,9 @@
 
     viewer.addHandler("open", () => {
       const viewport = viewer.viewport;
-      // Exactly the main viewer's orientation; this window has no direction
-      // settings of its own (an older handoff's mirror_scan is ignored).
+      // Exactly the main viewer's orientation; this window has no orientation
+      // settings of its own (an older handoff's mirror_scan is ignored, and
+      // Follow's flips reverse its movement only).
       viewport.setRotation(context.rotation || 0, true);
       viewport.setFlip(context.flip === true);
       restoreCamera(viewer, { zoom: context.zoom,
@@ -773,6 +886,7 @@
       paintRois();
       paintFollow();
       resize();
+      reportView();
       if (Array.isArray(context.rois) && context.rois.length) {
         setRois({ rois: context.rois, name: context.roiName || "" },
           { pan: false, index: context.roiIndex ?? -1, initial: true });
@@ -780,7 +894,8 @@
     });
     viewer.addHandler("open-failed", () => showStatus("Could not load this image. Close and reopen the translucent viewer."));
     viewer.addHandler("tile-load-failed", () => showStatus("Some image tiles could not load. Close and reopen the translucent viewer."));
-    viewer.addHandler("update-viewport", renderRoiBoxes);
+    // One handler: the outlines and the view report follow every camera change.
+    viewer.addHandler("update-viewport", () => { renderRoiBoxes(); scheduleViewReport(); });
     const resize = () => {
       if (state.ready) {
         resizePreservingScale(viewer, stage.clientWidth, stage.clientHeight, OSD);
@@ -808,9 +923,13 @@
             const dy = gesture.edge.includes("n") ? gesture.appliedHeight - height : 0;
             if (dx || dy) requireSuccess(await api.move_window(dx, dy), "Could not move this window");
             gesture.appliedWidth = width; gesture.appliedHeight = height;
+            scheduleViewReport();  // a moved or resized window changes no camera
           } else {
             const dx = x - gesture.appliedX, dy = y - gesture.appliedY;
-            if (dx || dy) requireSuccess(await api.move_window(dx, dy), "Could not move this window");
+            if (dx || dy) {
+              requireSuccess(await api.move_window(dx, dy), "Could not move this window");
+              scheduleViewReport();
+            }
             gesture.appliedX = x; gesture.appliedY = y;
           }
         }
@@ -900,13 +1019,15 @@
       stopStageFollow(); disposed = true;
       discoveryGeneration++;
       if (discoveryInterval !== null) win.clearInterval(discoveryInterval);
+      if (viewReportTimer !== null) win.clearTimeout(viewReportTimer);
+      viewReportTimer = null;
       cancelGesture(); observer?.disconnect(); viewer.destroy();
     }, { once: true });
     pollSlacsDiscovery();
-    discoveryInterval = win.setInterval(pollSlacsDiscovery, 1000);
+    discoveryInterval = win.setInterval(() => { reportMovedWindow(); pollSlacsDiscovery(); }, 1000);
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
       startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, revokeStageFollow,
-      setStepUm, setStepAuto, forwardClientError };
+      setStepUm, setStepAuto, setFollowFlips, reportView, forwardClientError };
   }
 
   async function boot(win) {

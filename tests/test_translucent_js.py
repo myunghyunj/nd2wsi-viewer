@@ -1076,7 +1076,7 @@ def test_stage_settings_editors_keep_keyboard_input_without_roi_or_window_shortc
       for(const tagName of ['INPUT','SELECT','TEXTAREA','DIV']){
         editor={tagName,isContentEditable:tagName==='DIV',closest(selector){
           return selector.includes('#stage-follow-settings')?h.element('stage-follow-settings'):null;}};
-        for(const key of ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','l','o']){
+        for(const key of ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','l','o',' ',',','.']){
           h.documentListeners.keydown({key,target:editor,ctrlKey:key==='o',preventDefault(){prevented++;}});
         }
       }
@@ -1106,15 +1106,21 @@ def test_overlay_shows_exactly_the_main_viewer_orientation_and_ignores_an_old_mi
     assert result["rotation"] == 90
 
 
-def test_the_overlay_has_no_direction_settings_of_its_own():
+def test_the_overlay_has_no_orientation_settings_and_two_follow_flips():
     page = (MODULE.parent / "translucent.html").read_text(encoding="utf-8")
     for removed in ("overlay-mirror", "Mirror image", "stage-follow-angle", "stage-follow-flip-x",
                     "stage-follow-flip-y", "Flip stage", "Stage → image alignment"):
         assert removed not in page
     # The fake DOM makes any element on demand, so the page's own ids are pinned here.
     for control in ("stage-follow-step", "stage-follow-step-auto", "stage-follow-step-label",
-                    "stage-follow-step-hint", "stage-follow-roughness"):
+                    "stage-follow-step-hint", "stage-follow-roughness", "stage-follow-flip-ud",
+                    "stage-follow-flip-lr", "stage-follow-flip-hint"):
         assert f'id="{control}"' in page
+    # The flips name their keys: SLACS's own Mirror labels are crossed (Horizontal reverses W/S).
+    assert 'id="stage-follow-flip-ud" type="checkbox" /> Flip up/down (W/S)' in page
+    assert 'id="stage-follow-flip-lr" type="checkbox" /> Flip left/right (A/D)' in page
+    assert "never the image" in page
+    assert page.index("directions shown on screen") < page.index("stage-follow-flip-ud")
     assert 'id="stage-follow-step-auto" type="checkbox" checked' in page
     assert "Read Roughness from SLACS" in page and "Fallback step if Roughness can't be read" in page
     assert "directions shown on screen" in page and "main viewer" in page
@@ -1411,3 +1417,292 @@ def test_openseadragon_keys_cannot_rotate_flip_pan_or_zoom_the_overlay(key_code,
     assert result["registered"] == "function"
     assert result["blocked"] == []
     assert result["unblocked"], "the key should act in OpenSeadragon without the handler"
+
+
+def test_follow_flips_show_the_context_and_name_the_format():
+    result = run("""
+      const bridge={async set_stage_follow_flips(){return {ok:true};}};
+      const nd2=followHarness({initialContext:{source_format:'nd2',follow_flips:{flip_x:false,flip_y:true}},
+        bridgeOverrides:bridge});
+      const odd=followHarness({initialContext:{source_format:'bmp',follow_flips:{flip_x:'yes',flip_y:1}},
+        bridgeOverrides:bridge});
+      const sdpc=followHarness({initialContext:{source_format:'sdpc'},bridgeOverrides:bridge});
+      const plain=followHarness();  // an older context and a bridge without the method
+      const show=h=>({ud:h.element('stage-follow-flip-ud').checked,lr:h.element('stage-follow-flip-lr').checked,
+        disabled:[h.element('stage-follow-flip-ud').disabled,h.element('stage-follow-flip-lr').disabled],
+        hint:h.element('stage-follow-flip-hint').textContent});
+      const check=value=>{const v=api.validateContext({...context,...value},context.slide_url);
+        return [v.source_format,v.follow_flips];};
+      return {nd2:show(nd2),odd:show(odd),sdpc:show(sdpc).hint,plain:show(plain),
+        validated:check({source_format:'constructor',follow_flips:{flip_x:true,flip_y:'true'}}),
+        older:check({}),formats:['nd2','svs','sdpc','jpeg','png','other','PNG',7].map(f=>check({source_format:f})[0])};
+    """)
+    assert result["nd2"] == {"ud": True, "lr": False, "disabled": [False, False],
+                             "hint": "Reverses Follow's movement only, never the image. "
+                                     "Remembered for ND2 files on this PC."}
+    assert result["odd"]["ud"] is False and result["odd"]["lr"] is False
+    assert result["odd"]["hint"].endswith("Remembered for other image types on this PC.")
+    assert result["sdpc"].endswith("Remembered for SDPC files on this PC.")
+    assert result["plain"]["disabled"] == [True, True] and result["plain"]["ud"] is False
+    assert result["validated"] == ["other", {"flip_x": True, "flip_y": False}]
+    assert result["older"] == ["other", {"flip_x": False, "flip_y": False}]
+    assert result["formats"] == ["nd2", "svs", "sdpc", "jpeg", "png", "other", "other", "other"]
+
+
+def test_a_flip_toggle_calls_the_bridge_stays_live_while_following_and_never_turns_the_image():
+    result = run("""
+      const args=[];
+      const h=followHarness({initialContext:{source_format:'nd2'},bridgeOverrides:{async set_stage_follow_flips(value){
+        args.push(value);return {ok:true,changed:true,flip_x:value.flip_x,flip_y:value.flip_y,source_format:'nd2',saved:true};}}});
+      const m=h.mounted,ud=h.element('stage-follow-flip-ud'),lr=h.element('stage-follow-flip-lr');
+      await m.startStageFollow();await m.toggleLock();
+      const camera=JSON.stringify(api.camera(h.viewer)),calls=h.viewer.calls.length,keys=[...h.storage.keys()];
+      const live={ud:ud.disabled,lr:lr.disabled,step:h.element('stage-follow-step').disabled};
+      ud.checked=true;const accepted=await ud.listeners.change();
+      lr.checked=true;await lr.listeners.change();
+      lr.checked=false;await lr.listeners.change();
+      const unchanged=await m.setFollowFlips({x:false,y:true});
+      const toggled={camera:JSON.stringify(api.camera(h.viewer)),calls:h.viewer.calls.slice(calls).map(c=>c[0])};
+      // Follow keeps applying differences of the cumulative displacement, flipped or not:
+      // the app flips the key's move, so the page must not flip it again.
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[0,10]});await m.pollStageFollow();
+      const plain=followHarness({initialContext:{source_format:'nd2'}});
+      await plain.mounted.startStageFollow();await plain.mounted.toggleLock();
+      Object.assign(plain.snapshot,{seq:1,status:'following',displacement_um:[0,10]});await plain.mounted.pollStageFollow();
+      return {accepted,unchanged,args,live,state:m.state.followFlips,checked:[ud.checked,lr.checked],
+        disabled:[ud.disabled,lr.disabled],orientation:h.viewer.calls.slice(calls).map(c=>c[0]).filter(c=>c==='flip'||c==='rotate'),
+        cameraUnchangedByFlips:camera===toggled.camera,callsByFlips:toggled.calls,
+        moved:JSON.stringify(api.camera(h.viewer))!==camera,
+        delta:m.state.follow.lastDelta,plainDelta:plain.mounted.state.follow.lastDelta,
+        sameCamera:JSON.stringify(api.camera(h.viewer))===JSON.stringify(api.camera(plain.viewer)),
+        storage:[...h.storage.keys()].filter(k=>!keys.includes(k)),
+        rotation:h.viewer.viewport.getRotation(),flip:h.viewer.viewport.getFlip(),hint:h.element('stage-follow-flip-hint').textContent,
+        enabled:m.state.follow.enabled,locked:m.state.locked,seq:m.state.follow.seq};
+    """)
+    assert result["accepted"] is True and result["unchanged"] is True
+    assert result["args"] == [{"flip_x": False, "flip_y": True}, {"flip_x": True, "flip_y": True},
+                              {"flip_x": False, "flip_y": True}]
+    # Unlike the step, the flips stay live while following and locked.
+    assert result["live"] == {"ud": False, "lr": False, "step": True}
+    assert result["state"] == {"x": False, "y": True} and result["checked"] == [True, False]
+    assert result["disabled"] == [False, False]
+    assert result["orientation"] == [] and result["rotation"] == 90 and result["flip"] is True
+    assert result["cameraUnchangedByFlips"] is True and result["callsByFlips"] == []
+    # The poll then moved it exactly as an overlay that was never flipped.
+    assert result["moved"] is True and result["sameCamera"] is True
+    assert result["delta"] == result["plainDelta"] and any(result["delta"].values())
+    assert result["storage"] == []  # never remembered in the page
+    assert result["hint"].endswith("Remembered for ND2 files on this PC.")
+    assert result["enabled"] is True and result["locked"] is True and result["seq"] == 1
+
+
+def test_a_failed_or_missing_flip_bridge_rolls_back_and_pending_blocks_a_second_toggle():
+    result = run("""
+      const replies=[],args=[];
+      const h=followHarness({initialContext:{source_format:'png'},bridgeOverrides:{set_stage_follow_flips(value){
+        args.push(value);return new Promise(resolve=>replies.push(resolve));}}});
+      const m=h.mounted,ud=h.element('stage-follow-flip-ud'),lr=h.element('stage-follow-flip-lr'),
+        hint=()=>h.element('stage-follow-flip-hint').textContent;
+      ud.checked=true;const first=ud.listeners.change();
+      const pending={ud:ud.disabled,lr:lr.disabled,state:{...m.state.followFlips}};
+      lr.checked=true;const blocked=await lr.listeners.change();
+      const afterBlocked={lr:lr.checked,calls:args.length};
+      replies[0]({ok:false,flip_x:false,flip_y:false,message:'This translucent viewer is closed.'});
+      const failed=await first;
+      const rolledBack={state:{...m.state.followFlips},ud:ud.checked,disabled:ud.disabled,hint:hint()};
+      ud.checked=true;const second=ud.listeners.change();
+      replies[1]({ok:true,changed:true,flip_x:false,flip_y:true,source_format:'png',saved:true});
+      const recovered={ok:await second,state:{...m.state.followFlips},hint:hint()};
+      lr.checked=true;const third=lr.listeners.change();
+      replies[2](Promise.reject(new Error('bridge lost')));
+      const thrown={ok:await third,state:{...m.state.followFlips},lr:lr.checked,hint:hint()};
+      const notBoolean=await m.setFollowFlips({x:'yes',y:false});
+      const saving=followHarness({bridgeOverrides:{async set_stage_follow_flips(v){return {ok:true,changed:true,...v,
+        saved:false,message:'Applied for this window, but could not be remembered: disk full'};}}});
+      const box=saving.element('stage-follow-flip-lr');box.checked=true;
+      const kept={ok:await box.listeners.change(),state:saving.mounted.state.followFlips,
+        hint:saving.element('stage-follow-flip-hint').textContent};
+      const missing=followHarness(),missingBox=missing.element('stage-follow-flip-ud');
+      missingBox.checked=true;
+      const refused={ok:await missingBox.listeners.change(),checked:missingBox.checked,state:missing.mounted.state.followFlips};
+      return {pending,blocked,afterBlocked,failed,rolledBack,recovered,thrown,notBoolean,kept,refused,calls:args.length};
+    """)
+    assert result["pending"] == {"ud": True, "lr": True, "state": {"x": False, "y": True}}
+    assert result["blocked"] is False and result["afterBlocked"] == {"lr": False, "calls": 1}
+    assert result["failed"] is False
+    assert result["rolledBack"] == {"state": {"x": False, "y": False}, "ud": False, "disabled": False,
+                                    "hint": "This translucent viewer is closed."}
+    assert result["recovered"] == {"ok": True, "state": {"x": False, "y": True},
+                                   "hint": "Reverses Follow's movement only, never the image. "
+                                           "Remembered for PNG files on this PC."}
+    assert result["thrown"] == {"ok": False, "state": {"x": False, "y": True}, "lr": False, "hint": "bridge lost"}
+    assert result["notBoolean"] is False and result["calls"] == 3
+    assert result["kept"] == {"ok": True, "state": {"x": True, "y": False},
+                              "hint": "Applied for this window, but could not be remembered: disk full"}
+    assert result["refused"] == {"ok": False, "checked": False, "state": {"x": False, "y": False}}
+
+
+def test_slacs_mark_keys_typed_in_the_overlay_do_nothing():
+    result = run("""
+      const h=followHarness({initialContext:{rois:[{x:100,y:100,w:4,h:4},{x:200,y:100,w:4,h:4}],roiIndex:0}}),m=h.mounted;
+      await m.startStageFollow();await m.toggleLock();
+      const before=JSON.stringify(api.camera(h.viewer)),native=h.nativeCalls.length,calls=h.followCalls.length;
+      let prevented=0;
+      for(const key of [',','.','<','>']){
+        h.documentListeners.keydown({key,target:{closest:()=>null},preventDefault(){prevented++;}});
+      }
+      await Promise.resolve();
+      return {prevented,native:h.nativeCalls.slice(native),follow:h.followCalls.slice(calls),
+        cameraUnchanged:before===JSON.stringify(api.camera(h.viewer)),roi:m.state.roiIndex,locked:m.state.locked,
+        canvasKey:typeof h.viewer.handlers['canvas-key']};
+    """)
+    assert result == {"prevented": 0, "native": [], "follow": [], "cameraUnchanged": True, "roi": 0,
+                      "locked": True, "canvasKey": "function"}
+
+
+def test_view_report_sends_the_image_centre_and_follow_progress():
+    result = run("""
+      const reports=[];
+      const h=followHarness({bridgeOverrides:{async report_overlay_view(view){
+        reports.push(JSON.parse(JSON.stringify(view)));return {ok:true};}}}),m=h.mounted;
+      const settle=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+      await settle();
+      const opened=reports.length,sent=await m.reportView(),idle=reports[reports.length-1];
+      await m.startStageFollow();await m.toggleLock();
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[10,20]});await m.pollStageFollow();
+      await settle();await m.reportView();
+      const following=reports[reports.length-1];
+      await m.stopStageFollow();await settle();
+      const stopped=reports[reports.length-1];
+      return {opened,sent,idle,following:{seq:following.follow_seq,displacement:following.follow_displacement_um,
+        session:following.follow_session,locked:following.locked},
+        stopped:{session:stopped.follow_session,seq:stopped.follow_seq,displacement:stopped.follow_displacement_um}};
+    """)
+    assert result["opened"] == 1  # the open handler reports the handed-over view
+    assert result["sent"] is True
+    # The window frame is unknown in the fake page, so it is reported as null rather than guessed.
+    assert result["idle"] == {"version": 1, "center_px": [400, 250], "zoom": 2, "rotation": 90, "flip": True,
+                              "locked": False, "follow_session": None, "follow_seq": None,
+                              "follow_displacement_um": None, "container": [800, 500], "window": None}
+    assert result["following"] == {"seq": 1, "displacement": [10, 20], "session": "session-one", "locked": True}
+    assert result["stopped"] == {"session": None, "seq": None, "displacement": None}
+
+
+def test_a_follow_move_seen_while_unlocked_is_reported_after_the_throttle():
+    result = run("""
+      const reports=[];
+      const h=followHarness({bridgeOverrides:{async report_overlay_view(view){
+        reports.push(JSON.parse(JSON.stringify(view)));return {ok:true};}}}),m=h.mounted;
+      const settle=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+      const viewTimers=()=>[...h.timers.values()].filter(t=>t.delay===200);
+      await settle();await m.startStageFollow();await settle();
+      const camera=JSON.stringify(api.camera(h.viewer)),timers=viewTimers().length,base=reports.length;
+      Object.assign(h.snapshot,{seq:1,status:'following',displacement_um:[0,10]});await m.pollStageFollow();
+      const scheduled=viewTimers().slice(timers),beforeTimer=reports.length-base;
+      scheduled[0]?.fn();await settle();
+      const report=reports[reports.length-1],sent=reports.length-base;
+      await m.pollStageFollow();  // the same sequence again: nothing new to report
+      return {scheduled:scheduled.length,beforeTimer,sent,again:viewTimers().length-timers,
+        report:{seq:report.follow_seq,displacement:report.follow_displacement_um,locked:report.locked,
+          session:report.follow_session},cameraUnchanged:camera===JSON.stringify(api.camera(h.viewer))};
+    """)
+    assert result["scheduled"] == 1 and result["beforeTimer"] == 0 and result["sent"] == 1
+    assert result["again"] == 1  # only the timer that already ran
+    # Unlocked, the press is consumed without moving the view, and the app learns it is drawn as far as it goes.
+    assert result["report"] == {"seq": 1, "displacement": [0, 10], "locked": False, "session": "session-one"}
+    assert result["cameraUnchanged"] is True
+
+
+def test_lock_changes_and_follow_start_report_the_view_at_once():
+    result = run("""
+      const reports=[];
+      const h=followHarness({bridgeOverrides:{async report_overlay_view(view){
+        reports.push(JSON.parse(JSON.stringify(view)));return {ok:true};}}}),m=h.mounted;
+      const settle=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+      const pick=view=>({locked:view.locked,session:view.follow_session,seq:view.follow_seq});
+      const step=async action=>{const base=reports.length;await action();await settle();return reports.slice(base).map(pick);};
+      await settle();
+      const started=await step(()=>m.startStageFollow());
+      const locked=await step(()=>m.toggleLock());
+      const unlocked=await step(()=>m.toggleLock());
+      return {started,locked,unlocked,timers:[...h.timers.values()].filter(t=>t.delay===200).length};
+    """)
+    assert result["started"] == [{"locked": False, "session": "session-one", "seq": 0}]
+    assert result["locked"] == [{"locked": True, "session": "session-one", "seq": 0}]
+    assert result["unlocked"] == [{"locked": False, "session": "session-one", "seq": 0}]
+    assert result["timers"] == 0  # sent at once, not throttled
+
+
+def test_moving_the_window_reports_the_new_frame():
+    result = run("""
+      const reports=[],moves=[];
+      let native=false;
+      const h=followHarness({bridgeOverrides:{async report_overlay_view(view){
+          reports.push(JSON.parse(JSON.stringify(view)));return {ok:true};},
+        async start_window_drag(){return native;},
+        async move_window(dx,dy){moves.push([dx,dy]);h.win.screenX+=dx;h.win.screenY+=dy;return {ok:true};}}}),m=h.mounted;
+      const settle=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+      const viewTimers=()=>[...h.timers.entries()].filter(([,t])=>t.delay===200);
+      const fire=()=>{const [[id,timer]]=viewTimers();h.timers.delete(id);timer.fn();};  // a fired timer is gone
+      const tick=()=>[...h.intervals.values()].find(t=>t.delay===1000).fn();
+      Object.assign(h.win,{screenX:10,screenY:20});
+      await settle();await m.reportView();
+      const first=reports[reports.length-1].window;
+      tick();await settle();
+      const idleTick=viewTimers().length;
+      // The incremental drag (no native drag here): each applied move is reported once the throttle runs.
+      const overlay=h.element('overlay'),event=(x,y)=>({button:0,screenX:x,screenY:y,pointerId:1,
+        preventDefault(){},stopImmediatePropagation(){}});
+      h.element('window-drag').listeners.pointerdown(event(100,100));await settle();
+      overlay.listeners.pointermove(event(150,130));await settle();
+      const dragTimers=viewTimers().length;  // scheduled by the applied move, before the button is up
+      overlay.listeners.pointerup(event(150,130));await settle();
+      fire();await settle();
+      const dragged=reports[reports.length-1].window;
+      // A native drag ends outside the page; the 1 s tick notices the new frame.
+      native=true;
+      h.element('window-drag').listeners.pointerdown(event(150,130));await settle();
+      Object.assign(h.win,{screenX:400,screenY:300});
+      tick();await settle();
+      const nativeTimers=viewTimers().length;
+      fire();await settle();
+      const nativeFrame=reports[reports.length-1].window;
+      tick();await settle();
+      return {first,idleTick,moves,dragTimers,dragged,nativeTimers,nativeFrame,settledTick:viewTimers().length,
+        reports:reports.length};
+    """)
+    assert result["first"] == [10, 20, 800, 500]
+    assert result["idleTick"] == 0  # an unmoved window is not reported again
+    assert result["moves"] == [[50, 30]]
+    assert result["dragTimers"] == 1 and result["dragged"] == [60, 50, 800, 500]
+    assert result["nativeTimers"] == 1 and result["nativeFrame"] == [400, 300, 800, 500]
+    assert result["settledTick"] == 0
+
+
+def test_view_reports_are_throttled_and_update_viewport_still_redraws_rois():
+    result = run("""
+      const reports=[];
+      const h=followHarness({initialContext:{rotation:0,flip:false,rois:[{x:400,y:250,w:20,h:10}],roiIndex:0},
+        bridgeOverrides:{async report_overlay_view(view){reports.push(view);return {ok:true};}}});
+      const settle=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+      await settle();
+      const base=reports.length,viewTimers=()=>[...h.timers.values()].filter(t=>t.delay===200);
+      const points=()=>h.element('roi-overlay').children[0].attributes.points,initial=points();
+      h.viewer.viewport.panTo(new Point(.41,.255));h.viewer.handlers['update-viewport']();
+      h.viewer.viewport.panTo(new Point(.42,.255));h.viewer.handlers['update-viewport']();
+      h.viewer.handlers['update-viewport']();
+      const pending=viewTimers().length,beforeTimer=reports.length-base,moved=points();
+      viewTimers()[0].fn();await settle();
+      const sent=reports.length-base,center=reports[reports.length-1].center_px;
+      h.viewer.handlers['update-viewport']();
+      const rescheduled=viewTimers().length;
+      h.windowListeners.pagehide();
+      const plain=followHarness();plain.viewer.handlers['update-viewport']();
+      return {initial,moved,pending,beforeTimer,sent,center,rescheduled,cleared:viewTimers().length,
+        plainTimers:[...plain.timers.values()].filter(t=>t.delay===200).length};
+    """)
+    assert result["moved"] != result["initial"]  # the outlines still follow the camera
+    assert result["pending"] == 1 and result["beforeTimer"] == 0
+    assert result["sent"] == 1 and result["center"] == pytest.approx([420, 255])
+    assert result["rescheduled"] == 2 and result["cleared"] == 1  # pagehide clears the pending one
+    assert result["plainTimers"] == 0  # a bridge without report_overlay_view starts no timer

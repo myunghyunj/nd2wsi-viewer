@@ -27,7 +27,7 @@ def _check(value, message):
 def expected_overlay_flip(context, source_flip):
     """The overlay's display flip: exactly the main viewer's (source handoff) flip.
 
-    The overlay has no direction settings of its own; an older context's
+    The overlay has no orientation settings of its own; an older context's
     ``mirror_scan`` key is ignored, as in the page itself.
     """
     _check(context.get("flip", source_flip) == source_flip, "Overlay context changed the source handoff flip")

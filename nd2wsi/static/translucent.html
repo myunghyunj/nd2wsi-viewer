@@ -33,6 +33,11 @@
     <p class="stage-follow-hint" id="stage-follow-step-hint">Each press moves by SLACS's Roughness (1 Roughness = 1 µm), and SLACS's Mirror Horizontal and Mirror Vertical reverse W/S and A/D here too. Counts W/A/S/D only while SLACS is in front.</p>
     <output id="stage-follow-count">Key presses: 0</output>
     <p class="stage-follow-hint">W/A/S/D move the image in the directions shown on screen. Set rotation and flip in the main viewer before opening this window.</p>
+    <div class="stage-follow-direction" role="group" aria-label="Follow direction">
+      <label><input id="stage-follow-flip-ud" type="checkbox" /> Flip up/down (W/S)</label>
+      <label><input id="stage-follow-flip-lr" type="checkbox" /> Flip left/right (A/D)</label>
+    </div>
+    <p class="stage-follow-hint" id="stage-follow-flip-hint">Reverses Follow's movement only, never the image.</p>
     <p class="stage-follow-hint">Follows only while locked. Unlock to align by hand; key presses are ignored until you lock again.</p>
     <output id="stage-follow-scale"></output>
     <output id="stage-follow-delta">Last image move: 0.000, 0.000 px</output>

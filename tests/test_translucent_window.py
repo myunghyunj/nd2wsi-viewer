@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -476,6 +478,51 @@ def test_parent_registry_owns_overlay_and_cleans_up_without_touching_source(stor
     assert api._translucent_windows == {}
     assert not api.open_translucent_viewer("abc", payload)["ok"]
     assert source_window.mock_calls == []
+
+
+@pytest.mark.parametrize("source, source_path, expected", [
+    ("slide.nd2", None, "nd2"), ("slide.nd2", "/cache/slide--t0-p0-zmid.nd2svs", "nd2"),
+    (None, "/data/x.PNG", "png"), ("scan.svs", None, "svs"), (None, None, "other"),
+])
+def test_context_names_the_follow_format(store, payload, source, source_path, expected):
+    if source is not None:
+        store.attrs["nd2wsi"]["source"] = source
+    store.source_path = source_path
+    context = overlay.validate_context(store, payload, slide_url="http://local/token/s/abc/")
+    assert context["source_format"] == expected
+    # The format only picks the remembered flips; the orientation is the handoff's.
+    assert context["rotation"] == 90 and context["flip"] is True
+
+
+def test_parent_registry_passes_one_flip_store_to_each_overlay(store, payload, monkeypatch, tmp_path):
+    from nd2wsi.follow_flips import FollowFlipStore
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    created = []
+
+    def create(context, **options):
+        created.append(options)
+        return SimpleNamespace(_window=SimpleNamespace(uid=f"trace-{len(created)}"), close_translucent=Mock())
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create)
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    registry = SimpleNamespace(get=lambda sid: store if sid in ("abc", "def") else None)
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=registry)
+    assert api.open_translucent_viewer("abc", payload)["ok"]
+    assert api.open_translucent_viewer("def", payload)["ok"]
+    assert api.open_translucent_viewer("abc", payload)["ok"]  # reopened
+    stores = [options["flip_store"] for options in created]
+    assert isinstance(stores[0], FollowFlipStore) and all(item is stores[0] for item in stores)
+    assert stores[0].path.parent == Path(os.environ["ND2WSI_FOLLOW_FLIPS_ROOT"]).resolve()
+    api._close_translucent_windows()
+    # An Agent window's overlays remember into its own session folder only.
+    created.clear()
+    agent = app.Api(None, window_session=SimpleNamespace(role="agent", root=tmp_path / "agent-session"))
+    agent._httpd = SimpleNamespace(registry=registry)
+    assert agent.open_translucent_viewer("abc", payload)["ok"]
+    assert created[0]["flip_store"].path == tmp_path / "agent-session" / "stage-follow" / "flips.json"
+    agent._close_translucent_windows()
 
 
 def test_windows_applies_alpha_once_and_uses_dpi_scaled_geometry(store, payload, monkeypatch):

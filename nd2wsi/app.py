@@ -673,6 +673,7 @@ class Api:
         self._translucent_lock = threading.RLock()
         self._translucent_windows = {}
         self._translucent_owner_closed = False
+        self._follow_flips_store = None  # built on the first overlay; shared by every overlay
         self._slacs_discovery = None
         self._slacs_offer_lock = threading.Lock()
         self._slacs_offer_claims = None
@@ -809,6 +810,7 @@ class Api:
                 overlay = create_translucent_window(
                     context, url=base_url + "static/translucent.html",
                     title=APP_NAME + " — Translucent", logger=_dlog, on_closed=remove,
+                    flip_store=self._follow_flip_store(),
                 )
                 self._translucent_windows[sid] = overlay
             session_log.event("translucent_opened", sid=sid, id=overlay._window.uid)
@@ -817,6 +819,18 @@ class Api:
             _dlog(f"translucent viewer open failed: {exc!r}")
             session_log.event("translucent_open_failed", sid=sid, ok=False, error=str(exc))
             return {"ok": False, "message": f"Could not open translucent viewer: {exc}"}
+
+    def _follow_flip_store(self):
+        """This window process's store of Follow flips per image format.
+
+        An Agent window's store keeps a private copy under its session root.
+        """
+        from .follow_flips import FollowFlipStore
+
+        with self._translucent_lock:
+            if self._follow_flips_store is None:
+                self._follow_flips_store = FollowFlipStore(self._window_session)
+            return self._follow_flips_store
 
     def _close_translucent_windows(self, *_args):
         with self._translucent_lock:

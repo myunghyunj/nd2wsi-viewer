@@ -1,9 +1,10 @@
-"""The W/A/S/D key follower observes passively and never records other keys."""
+"""The W/A/S/D key follower observes passively and records no other keys but SLACS's "," and "."."""
 
 from __future__ import annotations
 
 import math
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ from nd2wsi.stage_keys import (
 )
 
 VK_W, VK_A, VK_S, VK_D = 0x57, 0x41, 0x53, 0x44
+VK_COMMA, VK_PERIOD = 0xBC, 0xBE  # SLACS's laser shot and next well
 
 
 class ManualObserver:
@@ -551,6 +553,101 @@ def test_mirror_and_the_view_sign_compose(log_events, monkeypatch):
     follower.stop()
 
 
+# -- the user's Follow flips ---------------------------------------------------
+
+
+@pytest.mark.parametrize(("flip_x", "flip_y", "expected"), [
+    (False, False, [[0.0, -2.0], [0.0, 2.0], [-2.0, 0.0], [2.0, 0.0]]),
+    (False, True, [[0.0, 2.0], [0.0, -2.0], [-2.0, 0.0], [2.0, 0.0]]),    # W/S reversed
+    (True, False, [[0.0, -2.0], [0.0, 2.0], [2.0, 0.0], [-2.0, 0.0]]),    # A/D reversed
+    (True, True, [[0.0, 2.0], [0.0, -2.0], [2.0, 0.0], [-2.0, 0.0]]),
+])
+def test_flips_reverse_each_screen_axis(log_events, flip_x, flip_y, expected):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], step_um=2, flip_x=flip_x, flip_y=flip_y)
+    follower.start()
+    for vk in (VK_W, VK_S, VK_A, VK_D):
+        observer.send(vk)
+    deltas = [p["delta_um"] for p in receiver.submissions]
+    assert deltas == expected
+    assert all(math.copysign(1.0, value) == 1.0 for delta in deltas for value in delta if value == 0)
+    follower.stop()
+
+
+def test_flips_compose_with_mirror_and_the_view_sign(log_events, monkeypatch):
+    def first_delta(vk, reading, **flips):
+        receiver = RecordingReceiver()
+        follower, observer = slacs_follower(receiver, FakeControls(reading), **flips)
+        follower.start()
+        observer.send(vk)
+        follower.stop()
+        return receiver.submissions[0]["delta_um"]
+
+    # Each reversal flips the sign once more: Mirror plus a flip on the same axis cancel.
+    assert first_delta(VK_W, controls_reading(roughness_um=2.0, mirror_h=True), flip_y=True) == [0.0, -2.0]
+    assert first_delta(VK_A, controls_reading(roughness_um=2.0, mirror_v=True), flip_x=True) == [-2.0, 0.0]
+    # A flip on the other axis leaves Mirror's reversal as it was.
+    assert first_delta(VK_W, controls_reading(roughness_um=2.0, mirror_h=True), flip_x=True) == [0.0, 2.0]
+    monkeypatch.setattr(stage_keys, "KEY_VIEW_SIGN", -1)
+    assert first_delta(VK_W, controls_reading(roughness_um=2.0), flip_y=True) == [0.0, -2.0]
+
+
+def test_set_flips_applies_from_the_next_press_and_validates(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True])
+    follower.start()
+    observer.send(VK_W)
+    assert follower.set_flips(False, True) == (False, False)
+    observer.send(VK_W)
+    assert [p["delta_um"] for p in receiver.submissions] == [[0.0, -10.0], [0.0, 10.0]]
+    for bad in (("yes", False), (False, 1), (None, None)):
+        with pytest.raises(ValueError):
+            follower.set_flips(*bad)
+    snapshot = follower.snapshot()
+    assert (snapshot["flip_x"], snapshot["flip_y"]) == (False, True)  # unchanged by a refused call
+    follower.stop()
+    for options in ({"flip_x": 1}, {"flip_y": "true"}, {"flip_x": None}):
+        with pytest.raises(ValueError):
+            SlacsKeyFollower(RecordingReceiver(), "sid", step_um=5, observer=ManualObserver(), **options)
+
+
+def test_follow_key_and_snapshot_carry_the_flips(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True], flip_x=True)
+    follower.start()
+    snapshot = follower.snapshot()
+    assert (snapshot["flip_x"], snapshot["flip_y"]) == (True, False)
+    observer.send(VK_D)
+    follower.set_flips(False, True)
+    observer.send(VK_S)
+    keys = logged(log_events, "follow_key")
+    assert [(k["key"], k["delta_um"], k["flip_x"], k["flip_y"]) for k in keys] == [
+        ("D", [-10.0, 0.0], True, False), ("S", [0.0, -10.0], False, True)]
+    # The start and stop records stay as they were; follow_start in the overlay carries the flips.
+    assert "flip_x" not in logged(log_events, "follow_keys_start")[0]
+    follower.stop()
+    assert "flip_x" not in logged(log_events, "follow_keys_stop")[0]
+
+
+def test_flipped_presses_accumulate_in_the_real_receiver():
+    receiver = StageFollowReceiver()
+    descriptor = receiver.start()
+    observer = ManualObserver()
+    follower = SlacsKeyFollower(
+        receiver, descriptor["session_id"], step_um=10, observer=observer,
+        foreground_provider=lambda: {"pid": 1, "created": 1},
+        identifier=lambda pid, created: True, heartbeat_interval=None, flip_y=True)
+    try:
+        follower.start()
+        for vk in (VK_D, VK_W):
+            observer.send(vk)
+        snapshot = receiver.snapshot()
+        assert snapshot["displacement_um"] == [10.0, 10.0] and snapshot["seq"] == 2
+    finally:
+        follower.stop()
+        receiver.close()
+
+
 def test_follow_key_record_carries_the_reading_timing_and_pixels(log_events):
     clock = FakeClock(50.0)
     receiver = RecordingReceiver()
@@ -566,12 +663,14 @@ def test_follow_key_record_carries_the_reading_timing_and_pixels(log_events):
     assert first == {"key": "D", "seq": 1, "delta_um": [10.0, 0.0], "step_um": 10.0,
                      "step_from": "slacs", "roughness_um": 10.0, "mirror_h": False,
                      "mirror_v": False, "reading_age_ms": 121, "slacs_busy": False,
-                     "repeat": False, "gap_ms": None, "delta_px": [20.0, 0.0]}
+                     "repeat": False, "gap_ms": None, "delta_px": [20.0, 0.0],
+                     "flip_x": False, "flip_y": False}
     # While SLACS is busy, its last good Roughness still drives the press.
     assert second == {"key": "W", "seq": 2, "delta_um": [0.0, 1.0], "step_um": 1.0,
                       "step_from": "slacs", "roughness_um": 1.0, "mirror_h": True,
                       "mirror_v": False, "reading_age_ms": 900, "slacs_busy": True,
-                      "repeat": False, "gap_ms": 250, "delta_px": [0.0, 3.33]}
+                      "repeat": False, "gap_ms": 250, "delta_px": [0.0, 3.33],
+                      "flip_x": False, "flip_y": False}
     follower.stop()
 
 
@@ -1006,12 +1105,22 @@ def test_one_side_released_keeps_the_other_side_held():
     assert delivered == [(VK_D, True, ("ctrl",)), (VK_D, True, ())]
 
 
-def test_raw_observer_forwards_only_jog_keys():
+def test_raw_observer_forwards_only_jog_and_slacs_mark_keys():
     observer, delivered = raw_observer()
-    for vk in (0x42, 0x50, 0x0D, 0x1B, 0x25, 0x10, VK_CONTROL, VK_MENU, VK_RWIN, 0x31, 0x20):
+    # Numpad "." (VK_DECIMAL 0x6E) and the other OEM punctuation are not SLACS's "," and ".".
+    for vk in (0x42, 0x50, 0x0D, 0x1B, 0x25, 0x10, VK_CONTROL, VK_MENU, VK_RWIN, 0x31, 0x20,
+               0x6E, 0xBA, 0xBB, 0xBD, 0xBF, 0xDE):
         observer._handle_key(vk, 0)
         observer._handle_key(vk, RI_KEY_BREAK)
     assert delivered == []
+    observer._handle_key(VK_CONTROL, 0)
+    for vk in (VK_COMMA, VK_PERIOD):
+        observer._handle_key(vk, 0)
+        observer._handle_key(vk, RI_KEY_BREAK)
+    assert delivered == [(VK_COMMA, True, ("ctrl",)), (VK_COMMA, False, ("ctrl",)),
+                         (VK_PERIOD, True, ("ctrl",)), (VK_PERIOD, False, ("ctrl",))]
+    assert sorted(stage_keys.MARK_KEYS) == [VK_COMMA, VK_PERIOD]
+    assert not set(stage_keys.MARK_KEYS) & set(stage_keys.KEY_BINDINGS)
 
 
 def test_ctrl_jog_through_raw_observer_is_not_counted(log_events):
@@ -1161,3 +1270,258 @@ def test_default_windows_follower_subscribes_to_the_shared_hub():
                                 foreground_provider=lambda: None, identifier=lambda pid, created: False)
     assert isinstance(follower._observer, _SharedKeyObserver)
     assert follower._observer._hub is stage_keys._RAW_INPUT_HUB
+
+
+# -- SLACS laser shot (",") and next well (".") --------------------------------
+
+
+class CountingContext:
+    """Stands in for the overlay's _mark_context, counting its calls."""
+
+    def __init__(self, value=None, error=None):
+        self.value = ({"slacs_session": "process-one", "image_px": [100.0, 200.0], "follow_status": "following",
+                       "locked": True} if value is None else value)
+        self.error = error
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return dict(self.value) if isinstance(self.value, dict) else self.value
+
+
+def make_marks(in_front=True, context=None, **kwargs):
+    in_front = in_front if isinstance(in_front, list) else [in_front]
+    clock = kwargs.pop("clock", None) or FakeClock()
+    context = CountingContext() if context is None else context
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=in_front, clock=clock, mark_context=context, **kwargs)
+    follower.start()
+    return SimpleNamespace(follower=follower, observer=observer, receiver=receiver, clock=clock,
+                           context=context, in_front=in_front)
+
+
+def test_comma_and_period_in_slacs_are_logged_with_the_context(log_events):
+    marks = make_marks(context=CountingContext({"slacs_session": "process-one", "image_px": [100.0, 200.0],
+                                                "key": "spoofed", "modifiers": ["win"]}))
+    for vk in (VK_COMMA, VK_PERIOD):
+        marks.observer.send(vk)
+        marks.clock.now += 0.1
+        marks.observer.send(vk, down=False)
+    records = logged(log_events, "slacs_key")
+    # The record's own fields come first and the context never overrides them.
+    # A follower without the shared hub has no press numbers.
+    assert records == [
+        {"key": ",", "action": "laser_shot", "press": None, "modifiers": [], "slacs_session": "process-one",
+         "image_px": [100.0, 200.0]},
+        {"key": ".", "action": "next_well", "press": None, "modifiers": [], "slacs_session": "process-one",
+         "image_px": [100.0, 200.0]}]
+    assert [list(record)[:4] for record in records] == [["key", "action", "press", "modifiers"]] * 2
+    assert marks.context.calls == 2
+    # Taps leave no hold record, and the foreground is only asked: no slacs_foreground of their own.
+    assert logged(log_events, "slacs_key_hold") == [] and logged(log_events, "slacs_foreground") == []
+    marks.follower.stop()
+
+
+def test_marks_outside_slacs_are_never_recorded(log_events):
+    marks = make_marks(in_front=False)
+    for _ in range(3):  # a held "," typed in another program autorepeats
+        marks.observer.send(VK_COMMA)
+        marks.clock.now += 0.04
+    marks.observer.send(VK_COMMA, down=False)
+    marks.observer.send(VK_PERIOD)
+    marks.observer.send(VK_PERIOD, down=False)
+    assert logged(log_events, "slacs_key") == [] and logged(log_events, "slacs_key_hold") == []
+    assert marks.follower._mark_held == {} and marks.context.calls == 0
+    snapshot = marks.follower.snapshot()
+    assert snapshot["ignored_not_slacs"] == 0 and snapshot["counted"] == 0  # not even tallied
+    marks.follower.stop()
+
+
+def test_autorepeat_marks_log_one_press_and_a_hold_summary(log_events):
+    marks = make_marks(clock=FakeClock(100.0))
+    for now in (100.0, 100.5, 100.53):  # initial repeat delay, then the repeat rate
+        marks.clock.now = now
+        marks.observer.send(VK_COMMA)
+    marks.clock.now = 100.6
+    marks.observer.send(VK_COMMA, down=False)
+    assert len(logged(log_events, "slacs_key")) == 1 and marks.context.calls == 1
+    # Timed from the press to its last repeat in SLACS, not to the key-up.
+    assert logged(log_events, "slacs_key_hold") == [
+        {"key": ",", "action": "laser_shot", "press": None, "repeats": 2, "seconds": 0.53, "key_up": True}]
+    assert marks.follower._mark_held == {}
+    marks.follower.stop()
+
+
+def test_a_mark_hold_counts_only_its_repeats_in_slacs_and_a_release_elsewhere_is_not_logged(log_events):
+    marks = make_marks()
+    marks.observer.send(VK_PERIOD)
+    marks.clock.now += 0.5
+    marks.observer.send(VK_PERIOD)
+    marks.in_front[0] = False  # the foreground moves on while "." is still held
+    for _ in range(3):
+        marks.clock.now += 0.03
+        marks.observer.send(VK_PERIOD)
+    marks.observer.send(VK_PERIOD, down=False)
+    assert len(logged(log_events, "slacs_key")) == 1 and logged(log_events, "slacs_key_hold") == []
+    marks.follower.stop()
+
+
+def test_a_lost_mark_key_up_is_summarised_at_the_next_press_in_slacs(log_events):
+    marks = make_marks(clock=FakeClock(0.0))
+    for now in (0.0, 0.5, 0.53):
+        marks.clock.now = now
+        marks.observer.send(VK_COMMA)
+    marks.clock.now = 0.53 + stage_keys.HOLD_RESET_SECONDS + 0.01  # its key-up never arrived
+    marks.observer.send(VK_COMMA)
+    assert logged(log_events, "slacs_key_hold") == [
+        {"key": ",", "action": "laser_shot", "press": None, "repeats": 2, "seconds": 0.53, "key_up": False}]
+    kinds = [kind for kind, _ in log_events if kind.startswith("slacs_key")]
+    assert kinds == ["slacs_key", "slacs_key_hold", "slacs_key"]  # logged before the new press
+    marks.follower.stop()
+
+
+def test_windows_key_mark_is_dropped_and_ctrl_is_recorded(log_events):
+    marks = make_marks()
+    marks.observer.send(VK_COMMA, modifiers=("win",))
+    marks.observer.send(VK_COMMA, down=False, modifiers=("win",))
+    marks.observer.send(VK_PERIOD, modifiers={"Win": True, "ctrl": True})
+    assert logged(log_events, "slacs_key") == [] and marks.follower._mark_held == {}
+    marks.clock.now += 5
+    marks.observer.send(VK_COMMA, modifiers=("ctrl",))
+    marks.clock.now += 5
+    marks.observer.send(VK_PERIOD, modifiers={"Alt": True, "ctrl": True, "shift": False})
+    assert [(r["key"], r["modifiers"]) for r in logged(log_events, "slacs_key")] == [
+        (",", ["ctrl"]), (".", ["alt", "ctrl"])]
+    marks.follower.stop()
+
+
+def test_mark_keys_never_move_count_or_read_slacs_and_jog_keys_are_unaffected(log_events):
+    clock = FakeClock(0.0)
+    controls = FakeControls(controls_reading(roughness_um=2.0))
+    context = CountingContext()
+    receiver = RecordingReceiver()
+    follower, observer = slacs_follower(receiver, controls, clock=clock, mark_context=context)
+    follower.start()
+    controls.calls.clear()
+    for vk in (VK_COMMA, VK_PERIOD):
+        for down in (True, True, False):
+            observer.send(vk, down=down)
+    snapshot_fields = {key: follower._snapshot_locked()[key] for key in ("counted", "ignored_not_slacs", "last_key")}
+    assert receiver.submissions == [] and follower._held == {} and controls.calls == []
+    assert snapshot_fields == {"counted": 0, "ignored_not_slacs": 0, "last_key": None}
+    assert logged(log_events, "follow_key") == [] and len(logged(log_events, "slacs_key")) == 2
+    # A mark pressed in the middle of a held jog key leaves the jog exactly as it was.
+    for now, vk in ((10.0, VK_D), (10.5, VK_D), (10.51, VK_COMMA), (10.53, VK_D)):
+        clock.now = now
+        observer.send(vk)
+    clock.now = 10.6
+    observer.send(VK_D, down=False)
+    observer.send(VK_COMMA, down=False)
+    keys = logged(log_events, "follow_key")
+    assert [(k["seq"], k["delta_um"], k["repeat"]) for k in keys] == [
+        (1, [2.0, 0.0], False), (2, [2.0, 0.0], True), (3, [2.0, 0.0], True)]
+    assert logged(log_events, "follow_key_hold") == [{"key": "D", "presses": 3, "seconds": 0.53, "key_up": True}]
+    assert follower.snapshot()["counted"] == 3 and len(logged(log_events, "slacs_key")) == 3
+    follower.stop()
+
+
+@pytest.mark.parametrize(("context", "error"), [
+    (CountingContext(error=RuntimeError("overlay gone")), "RuntimeError"),
+    (lambda: None, "unavailable"),  # a closed overlay has no context
+    (lambda: ["not", "a", "dict"], "unavailable"),
+])
+def test_a_failing_context_still_logs_the_press(log_events, context, error):
+    marks = make_marks(context=context)
+    marks.observer.send(VK_COMMA)
+    assert logged(log_events, "slacs_key") == [
+        {"key": ",", "action": "laser_shot", "press": None, "modifiers": [], "context_error": error}]
+    marks.follower.stop()
+
+
+def test_a_follower_without_a_context_still_logs_the_press(log_events):
+    receiver = RecordingReceiver()
+    follower, observer = make_follower(receiver, in_front=[True])
+    follower.start()
+    observer.send(VK_PERIOD)
+    assert logged(log_events, "slacs_key") == [
+        {"key": ".", "action": "next_well", "press": None, "modifiers": [], "context_error": "unavailable"}]
+    follower.stop()
+
+
+def test_a_follower_that_is_stopped_logs_no_marks(log_events):
+    idle = make_follower(RecordingReceiver(), in_front=[True], mark_context=CountingContext())
+    idle[1].on_event = idle[0]._on_event  # never started
+    idle[1].send(VK_COMMA)
+    marks = make_marks()
+    marks.observer.send(VK_PERIOD)
+    marks.clock.now += 0.5
+    marks.observer.send(VK_PERIOD)  # held when Follow stops
+    marks.follower.stop()
+    marks.observer.send(VK_PERIOD, down=False)
+    marks.observer.send(VK_COMMA)
+    assert len(logged(log_events, "slacs_key")) == 1 and logged(log_events, "slacs_key_hold") == []
+    assert marks.follower._mark_held == {}
+    unsupported = SlacsKeyFollower(RecordingReceiver(), "sid", step_um=5, platform="linux",
+                                   mark_context=CountingContext())
+    unsupported.start()
+    unsupported._on_event(VK_COMMA, True, ())
+    assert len(logged(log_events, "slacs_key")) == 1
+
+
+def test_marks_reach_a_follower_through_the_shared_hub(log_events):
+    FakeNativeObserver.instances = []
+    hub = _RawInputHub(FakeNativeObserver)
+    follower = SlacsKeyFollower(RecordingReceiver(), "sid", step_um=2, observer=_SharedKeyObserver(hub),
+                                foreground_provider=lambda: {"pid": 1, "created": 1},
+                                identifier=lambda pid, created: True, heartbeat_interval=None,
+                                mark_context=CountingContext())
+    follower.start()
+    native = FakeNativeObserver.instances[0]
+    native.on_event(VK_COMMA, True, ())
+    follower.stop()
+    native.on_event(VK_PERIOD, True, ())
+    assert [(r["key"], r["press"]) for r in logged(log_events, "slacs_key")] == [(",", 1)]
+    assert native.stops == 1
+
+
+def test_overlays_following_at_once_log_one_press_with_one_number(log_events):
+    FakeNativeObserver.instances = []
+    hub = _RawInputHub(FakeNativeObserver)
+    clock = FakeClock(0.0)
+    in_front = [True]
+    followers = [SlacsKeyFollower(RecordingReceiver(), f"sid{i}", step_um=2, observer=_SharedKeyObserver(hub),
+                                  foreground_provider=lambda: {"pid": 1 if in_front[0] else 2, "created": 1},
+                                  identifier=lambda pid, created: pid == 1, heartbeat_interval=None,
+                                  clock=clock, mark_context=lambda name=name: {"image_name": name})
+                 for i, name in enumerate(("a.nd2", "b.nd2"))]
+    for follower in followers:
+        follower.start()
+    native = FakeNativeObserver.instances[0]
+
+    def send(vk, down=True, at=None):
+        clock.now = clock.now + 0.1 if at is None else at
+        native.on_event(vk, down, ())
+
+    send(VK_COMMA, at=0.0)
+    send(VK_COMMA, at=0.5)  # autorepeat: no new press, no new number
+    send(VK_COMMA, at=0.53)
+    send(VK_COMMA, down=False)
+    send(VK_D)  # jog keys and their key-ups never take a number
+    send(VK_D, down=False)
+    in_front[0] = False
+    send(VK_PERIOD)  # pressed in another program: no record, so no number either
+    send(VK_PERIOD, down=False)
+    in_front[0] = True
+    send(VK_PERIOD)
+    followers[0].stop()
+    send(VK_PERIOD, down=False)
+    send(VK_COMMA, at=10.0)
+    assert [(r["key"], r["press"], r["image_name"]) for r in logged(log_events, "slacs_key")] == [
+        (",", 1, "a.nd2"), (",", 1, "b.nd2"), (".", 2, "a.nd2"), (".", 2, "b.nd2"), (",", 3, "b.nd2")]
+    # Each overlay's hold summary names the press it belongs to.
+    assert [(r["key"], r["press"], r["repeats"]) for r in logged(log_events, "slacs_key_hold")] == [
+        (",", 1, 2), (",", 1, 2)]
+    followers[1].stop()
+    assert native.stops == 1
