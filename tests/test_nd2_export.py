@@ -3,10 +3,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from http_fixture import running_server
+from nd2_fixture import write_synthetic_nd2
 
 from nd2wsi.server import server_url
 
-limnd2 = pytest.importorskip("limnd2")
+pytest.importorskip("limnd2")
 nd2 = pytest.importorskip("nd2")
 
 
@@ -15,19 +17,8 @@ def fluor_nd2(tmp_path):
     """A small 2-channel uint16 ND2 written with limnd2 (the fixture writer)."""
     rng = np.random.default_rng(11)
     img = rng.integers(0, 4000, size=(700, 900, 2), dtype=np.uint16)  # (Y, X, C)
-    path = tmp_path / "fluor.nd2"
-    attrs = limnd2.ImageAttributes.create(
-        width=900, height=700, component_count=2, bits=16, sequence_count=1
-    )
-    with limnd2.Nd2Writer(str(path)) as f:
-        f.imageAttributes = attrs
-        f.setImage(0, img)
-        mf = limnd2.MetadataFactory(
-            objective_magnification=20.0, pixel_calibration=0.66
-        )
-        mf.addPlane(name="CY5", color="#FF0000")
-        mf.addPlane(name="DAPI", color="#0000FF")
-        f.pictureMetadata = mf.createMetadata()
+    channels = [("CY5", "#FF0000"), ("DAPI", "#0000FF")]
+    path = write_synthetic_nd2(tmp_path / "fluor.nd2", img, channels, pixel_um=0.66)
     return path, img
 
 
@@ -71,17 +62,9 @@ def test_three_channel_roundtrip(tmp_path):
 
     rng = np.random.default_rng(5)
     img = rng.integers(0, 3000, size=(600, 800, 3), dtype=np.uint16)
-    src = tmp_path / "three.nd2"
-    attrs = limnd2.ImageAttributes.create(
-        width=800, height=600, component_count=3, bits=16, sequence_count=1
-    )
-    with limnd2.Nd2Writer(str(src)) as f:
-        f.imageAttributes = attrs
-        f.setImage(0, img)
-        mf = limnd2.MetadataFactory(pixel_calibration=0.33)
-        for name, color in [("CY5", "FF0000"), ("FITC", "00FF00"), ("DAPI", "0000FF")]:
-            mf.addPlane(name=name, color=color)
-        f.pictureMetadata = mf.createMetadata()
+    channels = [("CY5", "FF0000"), ("FITC", "00FF00"), ("DAPI", "0000FF")]
+    src = write_synthetic_nd2(tmp_path / "three.nd2", img, channels, pixel_um=0.33,
+                              magnification=None)
 
     with nd2.ND2File(str(src)) as f:
         assert f.sizes.get("C") == 3 and not f.is_rgb  # channels, not RGB comps
@@ -105,19 +88,15 @@ def test_three_channel_roundtrip(tmp_path):
 def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
     """GET/POST /api/annotations persists a JSON sidecar next to the store."""
     import json
-    import threading
     import urllib.request
 
     from nd2wsi.convert import convert
-    from nd2wsi.server import create_server
 
     src_path, _ = fluor_nd2
     store = tmp_path / "ann.ome.zarr"
     convert(src_path, store, progress=False)
-    httpd = create_server(store, port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = server_url(httpd).rstrip("/")
-    try:
+    with running_server(store) as httpd:
+        base = server_url(httpd).rstrip("/")
         first = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
         assert first["items"] == []
         reported_path = Path(first["path"])
@@ -158,8 +137,6 @@ def test_annotation_sidecar_roundtrip(fluor_nd2, tmp_path):
 
         back = json.loads(urllib.request.urlopen(base + "/api/annotations").read())
         assert back["items"] == items  # auto-found on the next open
-    finally:
-        httpd.shutdown()
 
 
 def test_store_roi_export_matches_source(fluor_nd2, tmp_path):
@@ -185,21 +162,17 @@ def test_store_roi_export_matches_source(fluor_nd2, tmp_path):
 def test_multi_slide_registry(fluor_nd2, tmp_path):
     """Two slides share one server: /api/slides, /s/<sid>/ routes, close."""
     import json
-    import threading
     import urllib.request
 
     from nd2wsi.convert import convert
-    from nd2wsi.server import create_server
 
     src_path, _ = fluor_nd2
     s1 = tmp_path / "one.ome.zarr"
     s2 = tmp_path / "two.ome.zarr"
     convert(src_path, s1, progress=False)
     convert(src_path, s2, progress=False)
-    httpd = create_server([s1, s2], port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = server_url(httpd).rstrip("/")
-    try:
+    with running_server([s1, s2]) as httpd:
+        base = server_url(httpd).rstrip("/")
         d = json.loads(urllib.request.urlopen(base + "/api/slides").read())
         assert len(d["slides"]) == 2
         sids = [s["sid"] for s in d["slides"]]
@@ -222,26 +195,20 @@ def test_multi_slide_registry(fluor_nd2, tmp_path):
         )
         resp = json.loads(urllib.request.urlopen(req).read())
         assert len(resp["slides"]) == 1
-    finally:
-        httpd.shutdown()
 
 
 def test_export_progress_endpoint(fluor_nd2, tmp_path):
     """A jobbed export leaves 100 percent and a done state behind."""
     import json
-    import threading
     import urllib.request
 
     from nd2wsi.convert import convert
-    from nd2wsi.server import create_server
 
     src_path, _ = fluor_nd2
     store = tmp_path / "prog.ome.zarr"
     convert(src_path, store, progress=False)
-    httpd = create_server(store, port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = server_url(httpd).rstrip("/")
-    try:
+    with running_server(store) as httpd:
+        base = server_url(httpd).rstrip("/")
         body = urllib.request.urlopen(
             base + "/api/roi?level=0&x=0&y=0&w=300&h=200&format=tiff&job=t-1", timeout=60
         ).read()
@@ -254,18 +221,14 @@ def test_export_progress_endpoint(fluor_nd2, tmp_path):
             urllib.request.urlopen(base + "/api/roi/progress?job=nope").read()
         )
         assert unknown["state"] == "unknown"
-    finally:
-        httpd.shutdown()
 
 
 def test_convert_progress_and_explicit_store_is_not_trashable(fluor_nd2, tmp_path):
     """Progress works, but a user-supplied OME-Zarr is never treated as cache."""
     import json
-    import threading
     import urllib.request
 
     from nd2wsi.convert import convert
-    from nd2wsi.server import create_server
 
     src_path, _ = fluor_nd2
     store = tmp_path / "prog.ome.zarr"
@@ -275,10 +238,8 @@ def test_convert_progress_and_explicit_store_is_not_trashable(fluor_nd2, tmp_pat
     assert all(0.0 <= f <= 1.0 for f in seen)
     assert seen == sorted(seen)  # monotonic
 
-    httpd = create_server(store, port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = server_url(httpd).rstrip("/")
-    try:
+    with running_server(store) as httpd:
+        base = server_url(httpd).rstrip("/")
         sid = json.loads(
             urllib.request.urlopen(base + "/api/slides").read()
         )["slides"][0]["sid"]
@@ -308,19 +269,15 @@ def test_convert_progress_and_explicit_store_is_not_trashable(fluor_nd2, tmp_pat
             raise AssertionError("expected 404")
         except urllib.error.HTTPError as e:
             assert e.code == 404
-    finally:
-        httpd.shutdown()
 
 
 def test_open_reports_convert_progress(fluor_nd2, tmp_path):
     """POST /api/open with a job id exposes converting->done via the progress route."""
     import json
     import shutil
-    import threading
     import urllib.request
 
     from nd2wsi.convert import convert
-    from nd2wsi.server import create_server
 
     src_path, _ = fluor_nd2
     # server needs at least one slide; give it a throwaway store
@@ -329,10 +286,8 @@ def test_open_reports_convert_progress(fluor_nd2, tmp_path):
     fresh = tmp_path / "fresh.nd2"
     shutil.copy(src_path, fresh)
 
-    httpd = create_server(seed, port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = server_url(httpd).rstrip("/")
-    try:
+    with running_server(seed) as httpd:
+        base = server_url(httpd).rstrip("/")
         req = urllib.request.Request(
             base + "/api/open",
             data=json.dumps({"path": str(fresh), "job": "testjob1"}).encode(),
@@ -351,8 +306,6 @@ def test_open_reports_convert_progress(fluor_nd2, tmp_path):
         manifest = read_manifest(container)
         # an eligible uncompressed ND2 now gets a compact overview cache
         assert manifest and manifest["complete"] and manifest["kind"] == "overview"
-    finally:
-        httpd.shutdown()
 
 
 def test_failed_write_preserves_the_existing_output(fluor_nd2, tmp_path):

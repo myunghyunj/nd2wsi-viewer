@@ -123,8 +123,8 @@ def windows_allocation_block_bytes(path: str | os.PathLike) -> int:
     return block
 
 
-def windows_available_memory_bytes() -> int:
-    """Available physical memory, including reclaimable Windows standby pages."""
+def _windows_memory_status():
+    """One MEMORYSTATUSEX snapshot from GlobalMemoryStatusEx."""
     import ctypes
 
     class MemoryStatusEx(ctypes.Structure):
@@ -144,7 +144,36 @@ def windows_available_memory_bytes() -> int:
     status.length = ctypes.sizeof(status)
     if not _windows_api().GlobalMemoryStatusEx(ctypes.byref(status)):
         raise ctypes.WinError(ctypes.get_last_error())
-    return int(status.avail_phys)
+    return status
+
+
+def windows_available_memory_bytes() -> int:
+    """Available physical memory, including reclaimable Windows standby pages."""
+    return int(_windows_memory_status().avail_phys)
+
+
+FALLBACK_PHYSICAL_MEMORY_BYTES = 8 << 30
+
+
+@lru_cache(maxsize=1)
+def total_physical_memory_bytes() -> int:
+    """Installed physical memory, probed once and without starting a process.
+
+    POSIX multiplies the physical page count by the page size, which on
+    macOS equals ``sysctl hw.memsize``; Windows reads the MEMORYSTATUSEX
+    total. When the OS will not say, 8 GiB stands in. Installed memory does
+    not change while the process runs, so the answer is cached.
+    """
+    try:
+        if os.name == "nt":
+            total = int(_windows_memory_status().total_phys)
+        else:
+            pages, page_bytes = os.sysconf("SC_PHYS_PAGES"), os.sysconf("SC_PAGE_SIZE")
+            # sysconf reports an indeterminate value as -1.
+            total = pages * page_bytes if pages > 0 and page_bytes > 0 else 0
+    except (AttributeError, OSError, ValueError):
+        return FALLBACK_PHYSICAL_MEMORY_BYTES
+    return total if total > 0 else FALLBACK_PHYSICAL_MEMORY_BYTES
 
 
 def process_is_alive(pid: int) -> bool:

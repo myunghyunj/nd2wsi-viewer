@@ -228,7 +228,7 @@ def test_legacy_plist_heredoc_takes_the_version_from_argv(tmp_path, builder, nam
     argv = [str(target), name, version]
     if builder == "build_astromap_beta.sh":
         argv.insert(2, "com.nd2wsi.viewer.astromap-beta")
-    subprocess.run([sys.executable, "-", *argv], input=source, text=True, check=True)
+    subprocess.run([sys.executable, "-", *argv], input=source, text=True, check=True, timeout=30)
     info = plistlib.loads(target.read_bytes())
     assert info["ND2WSIPackageVersion"] == version and info["CFBundleVersion"] == version
     assert info["CFBundleShortVersionString"] == short

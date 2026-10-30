@@ -46,7 +46,7 @@ from .cache import (
     source_tag,
 )
 from .contrast import auto_window
-from .direct_common import _Lifecycle, _parse_cyx_index, _Root, _TileCache
+from .direct_common import _Lifecycle, _parse_cyx_index, _Root, _TileCache, box_mean
 from .plate_integrity import (
     DIGEST_ALGORITHM,
     DIGEST_NAME,
@@ -77,6 +77,12 @@ PLATE_K = (2, 4, 8, 16)  # box mean factors the grid may ask for
 PREFETCH_PENDING_MAX = 256  # frames queued for warming, oldest dropped first
 HISTOGRAM_LRU = 64
 THUMB_K = 8  # the reduction the store keeps, the one the site grid shows
+WINDOWS_T = 0  # default display windows sample every site at this time point,
+WINDOWS_K = 4  # at the home plane, reduced by this factor
+# Names how PlateSource._measure_windows works. Change it whenever that
+# measurement changes, so windows recorded by older builds are measured again.
+WINDOWS_METHOD = "plate-low-percentile/1"
+WINDOWS_KEY = "display_windows"  # additive manifest key; readers only use it
 UNSCORED = -1.0  # a frame whose sharpness has not been measured yet
 # Single-file containers use /2 at a new .nd2svs path. Legacy /1 directories
 # remain read-only compatible and are never rewritten on ordinary open.
@@ -99,6 +105,75 @@ def _has_integrity(manifest: dict[str, Any]) -> bool:
         and integrity.get("commit") == "payload-digest-done"
         and integrity.get("digest_name") == DIGEST_NAME
     )
+
+
+_FINGERPRINT_KEYS = ("size", "mtime_ns", "quick_sha256")
+_WINDOW_FIELDS = ("start", "end", "min", "max")
+
+
+def _windows_record(
+    manifest: dict[str, Any], source: Any, windows: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The manifest record of default display windows measured from ``source``."""
+    fingerprint = manifest.get("source") or {}
+    return {
+        "method": WINDOWS_METHOD,
+        "generation": manifest.get("generation"),
+        "source": {key: fingerprint.get(key) for key in _FINGERPRINT_KEYS},
+        "t": WINDOWS_T,
+        "z": int(source.z_home),
+        "k": WINDOWS_K,
+        "dtype": str(source.dtype),
+        "rgb": bool(source.rgb),
+        "windows": [
+            {field: float(window[field]) for field in _WINDOW_FIELDS}
+            for window in windows
+        ],
+    }
+
+
+def _finite_number(value: Any) -> bool:
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return False
+
+
+def _stored_windows(manifest: dict[str, Any], source: Any) -> list[dict[str, float]] | None:
+    """The default display windows a plate manifest records for ``source``.
+
+    A record counts only for the cache generation and source fingerprint it
+    was written with, the plane and reduction it sampled and the method that
+    measured it. Anything else, or anything malformed, is measured again.
+    """
+    record = manifest.get(WINDOWS_KEY)
+    if not isinstance(record, dict):
+        return None
+    fingerprint = record.get("source")
+    if (
+        record.get("method") != WINDOWS_METHOD
+        or not manifest.get("generation")
+        or record.get("generation") != manifest.get("generation")
+        or not isinstance(fingerprint, dict)
+        or any(fingerprint.get(key) is None for key in _FINGERPRINT_KEYS)
+        or not fingerprints_match(fingerprint, manifest.get("source") or {})
+    ):
+        return None
+    for name, expected in (("t", WINDOWS_T), ("z", source.z_home), ("k", WINDOWS_K)):
+        if type(record.get(name)) is not int or record[name] != int(expected):
+            return None
+    if record.get("dtype") != str(source.dtype) or record.get("rgb") is not bool(source.rgb):
+        return None
+    entries = record.get("windows")
+    if not isinstance(entries, list) or len(entries) != int(source.frame_shape[0]):
+        return None
+    windows = []
+    for entry in entries:
+        values = [entry.get(field) for field in _WINDOW_FIELDS] if isinstance(entry, dict) else []
+        if len(values) != len(_WINDOW_FIELDS) or not all(_finite_number(v) for v in values):
+            return None
+        windows.append({field: float(v) for field, v in zip(_WINDOW_FIELDS, values)})
+    return windows
 
 
 def _file_identity(st: os.stat_result) -> tuple[int, int, int, int]:
@@ -462,6 +537,7 @@ class PlateStore:
             self._digest = None
             self._digest_np = np.zeros(self._done_np.shape, dtype=np.uint64)
         self._invalid = np.zeros(self._done_np.shape, dtype=bool)
+        self._repaired_chunks: set[tuple[int, int]] = set()  # see put_block
         self._integrity_errors = 0
         self._container_current = True
         self._last_generation_check = time.monotonic()
@@ -481,19 +557,56 @@ class PlateStore:
         self._stop = False
         self._thread: threading.Thread | None = None
         self._start_stop_lock = threading.Lock()
+        # (t, z, sites) of the chunk the builder is staging for put_block
+        self._staging: tuple[int, int, dict[int, np.ndarray]] | None = None
+        self._staging_lock = threading.Lock()
 
     # ---- open or create -------------------------------------------------
+    @staticmethod
+    def _container_for(source: PlateSource, cache_path: str | Path | None) -> Path:
+        if cache_path is not None:
+            return Path(cache_path).expanduser().resolve()
+        container = plate_container(source.path)
+        if not container.exists():
+            legacy = container.with_name(container.name[:-len('.nd2svs')] + CACHE_SUFFIX)
+            if legacy.is_dir():
+                return legacy
+        return container
+
+    @staticmethod
+    def _shape(source: PlateSource) -> tuple[int, ...]:
+        c, h, w = source.frame_shape
+        return (source.T, source.P, source.Z, c, h // THUMB_K, w // THUMB_K)
+
+    @classmethod
+    def recorded_windows(
+        cls, source: PlateSource, *, cache_path: str | Path | None = None
+    ) -> list[dict[str, float]] | None:
+        """The default display windows an existing cache records for ``source``.
+
+        A read-only look taken before the store opens: nothing is created,
+        locked, recovered or quarantined, so an open that fails afterwards
+        leaves the disk as it found it. Any doubt means measuring again.
+        """
+        try:
+            container = cls._container_for(source, cache_path)
+            if not container.exists():
+                return None
+            manifest = cls._read(container)
+            if manifest is None or not cls._matches(
+                manifest, quick_fingerprint(source.path), cls._shape(source), source
+            ):
+                return None
+            return _stored_windows(manifest, source)
+        except Exception:
+            return None
+
     @classmethod
     def open_or_create(cls, source: PlateSource, *, cache_path: str | Path | None = None) -> PlateStore:
         explicit = cache_path is not None
-        container = Path(cache_path).expanduser().resolve() if explicit else plate_container(source.path)
-        if not explicit and not container.exists():
-            legacy = container.with_name(container.name[:-len('.nd2svs')] + CACHE_SUFFIX)
-            if legacy.is_dir():
-                container = legacy
+        container = cls._container_for(source, cache_path)
         fingerprint = quick_fingerprint(source.path)
-        c, h, w = source.frame_shape
-        shape = (source.T, source.P, source.Z, c, h // THUMB_K, w // THUMB_K)
+        shape = cls._shape(source)
         manifest = cls._read(container, recover=True)
         if explicit and (manifest is None or not cls._matches(manifest, fingerprint, shape, source)):
             raise ValueError('explicit plate cache is missing or does not match its source')
@@ -984,6 +1097,26 @@ class PlateStore:
             return
         self.manifest = manifest
 
+    def keep_display_windows(self, windows: list[dict[str, Any]]) -> None:
+        """Record windows measured from the source for the next open.
+
+        Only the writer persists them, as an additive manifest key in the
+        same generation. A manifest that cannot be written only means the
+        next open measures them again.
+        """
+        with self._lock:
+            if self._stop or not self.writable:
+                return
+            manifest = dict(self.manifest)
+            manifest[WINDOWS_KEY] = _windows_record(manifest, self._source, windows)
+            if _stored_windows(manifest, self._source) is None:
+                return  # a record the next open would refuse is not worth a write
+            try:
+                self._write_manifest(self.container, manifest)
+            except Exception:
+                return
+            self.manifest = manifest
+
     def get(self, t: int, p: int, z: int) -> np.ndarray | None:
         """The stored reduction of one site, reading the whole chunk.
 
@@ -1033,10 +1166,12 @@ class PlateStore:
 
             owner = self._source._owner
             scored = 0
+            # Copies, not views: a view would keep the whole chunk of every
+            # site alive while the byte budget counted one site.
             for p2 in np.flatnonzero(verified):
                 key = (owner, int(t), int(p2), int(z), THUMB_K)
                 if _REDUCED_CACHE.get(key) is None:
-                    _REDUCED_CACHE.put(key, np.ascontiguousarray(block[p2]))
+                    _REDUCED_CACHE.put(key, block[p2].copy())
                 if self._focus_np[t, p2, z] < 0:
                     self._focus_np[t, p2, z] = _sharpness(block[p2])
                     scored += 1
@@ -1045,7 +1180,7 @@ class PlateStore:
                 self._flush_focus_if_block_complete(t, z)
             if not verified[p]:
                 return None
-            return np.ascontiguousarray(block[p])
+            return block[p].copy()
 
     def put(self, t: int, p: int, z: int, frame: np.ndarray) -> bool:
         if self.is_committed(t, p, z):
@@ -1072,6 +1207,101 @@ class PlateStore:
             if self._focus_np[t, p, z] < 0:
                 self._focus_np[t, p, z] = _sharpness(frame)
                 self._focus_dirty += 1
+            self._commit_integrity_capability()
+            self._flush_focus_if_block_complete(t, z)
+            return True
+
+    def offer(self, t: int, p: int, z: int, frame: np.ndarray) -> None:
+        """Store a foreground reduction, sharing the builder's chunk write.
+
+        While the builder is staging this site's ``(t, z)`` chunk, the frame
+        joins that chunk and lands with its :meth:`put_block`, so a request
+        thread never rewrites the shared chunk for one site the builder is
+        about to commit anyway. Any other site is put on its own.
+        """
+        with self._staging_lock:
+            staging = self._staging
+            if staging is not None and staging[0] == t and staging[1] == z:
+                staging[2].setdefault(p, frame)
+                return
+        self.put(t, p, z, frame)
+
+    def put_block(self, t: int, z: int, frames: dict[int, np.ndarray]) -> bool:
+        """Commit several sites of one shared ``(t, z)`` chunk at once.
+
+        ``frames`` maps site index to its reduction. Every site of a time
+        point and plane lives in one chunk, so :meth:`put` rewrites (decodes,
+        encodes, commits and fsyncs) the whole chunk for each site; the
+        background builder stages a chunk's missing sites and lands them here
+        with one write per array instead of one per site. The order stays
+        payload, digest, done, all under ``_lock``. Sites already committed
+        keep their stored bytes, and so does every site not in ``frames``,
+        unless the chunk cannot be decoded: then its payload is moved aside,
+        its committed sites are invalidated and the given sites start a fresh
+        chunk (at most once per chunk while this store is open). True when
+        every given site is committed afterwards.
+        """
+        t, z = int(t), int(z)
+        self._refresh()
+        if not frames:
+            return True
+        if self._stop or not self.writable or self._digest is None:
+            return bool(self._committed_mask()[t, sorted(frames), z].all())
+        # Pure per-site work stays outside the lock that foreground reads wait on.
+        digests = {p: frame_digest(f) for p, f in frames.items()}
+        scores = {
+            p: _sharpness(f) for p, f in frames.items() if self._focus_np[t, p, z] < 0
+        }
+        with self._lock:
+            if self._stop or not self.writable or self._digest is None:
+                return bool(self._committed_mask()[t, sorted(frames), z].all())
+            committed = self._committed_mask()[t, :, z]
+            todo = [p for p in sorted(frames) if not committed[p]]
+            if not todo:
+                return True
+            try:
+                if len(todo) == len(committed):
+                    # The whole chunk is new: write it without reading it.
+                    block = np.stack([frames[p] for p in todo])
+                else:
+                    try:
+                        block = np.array(self._thumbs[t, :, z], copy=True)
+                    except Exception:
+                        # An undecodable shared chunk. As get() does, keep its
+                        # payload and fail its sites closed; once it is moved
+                        # aside the given sites start a fresh chunk, and the
+                        # walk comes back for the invalidated ones. A chunk
+                        # still undecodable after that rewrite (a drive that
+                        # corrupts writes) stops the build instead of looping,
+                        # each round keeping another copy of it.
+                        if (t, z) in self._repaired_chunks:
+                            return False
+                        self._repaired_chunks.add((t, z))
+                        moved = self._quarantine_shared_payload(t, z)
+                        self._invalidate(t, z, committed)
+                        if not moved:
+                            return False
+                        todo = sorted(frames)
+                        block = np.array(self._thumbs[t, :, z], copy=True)
+                    for p in todo:
+                        block[p] = frames[p]
+                self._thumbs[t, :, z] = block
+                self._digest.oindex[t, todo, z] = np.array(
+                    [digests[p] for p in todo], dtype=np.uint64
+                )
+                self._done.oindex[t, todo, z] = 1
+            except Exception:
+                return False  # a store that cannot be written is only slower
+            for p in todo:
+                self._digest_np[t, p, z] = digests[p]
+                self._done_np[t, p, z] = True
+                self._invalid[t, p, z] = False
+                if self._focus_np[t, p, z] < 0:
+                    score = scores.get(p)
+                    self._focus_np[t, p, z] = (
+                        _sharpness(frames[p]) if score is None else score
+                    )
+                    self._focus_dirty += 1
             self._commit_integrity_capability()
             self._flush_focus_if_block_complete(t, z)
             return True
@@ -1241,10 +1471,18 @@ class PlateStore:
             self._warmed = True
 
     def _build(self) -> None:
-        """Fill the store frame by frame, then warm what is in it.
+        """Fill the store one shared chunk at a time, then warm what is in it.
+
+        From the first missing frame the walk finds, the rest of that time
+        point and plane's missing sites are reduced in the order the walk
+        would visit them anyway, then committed together by
+        :meth:`put_block`. A foreground read of a site in that chunk hands
+        its reduction over through :meth:`offer` instead of writing it, and
+        the builder skips a site it was handed. A stop is honoured between
+        sites, and a close loses at most the one chunk being staged.
 
         The pass gives up rather than looping when the frames stop
-        arriving: ``put`` swallows a write it cannot make, so a container
+        arriving: a write the store cannot make is swallowed, so a container
         that is read only or full would otherwise hand back the same
         missing frame forever, reading it from the ND2 each time.
         """
@@ -1258,29 +1496,53 @@ class PlateStore:
             item = self._next_missing()
             if item is None:
                 break
-            while src._fg > 0 and not self._stop:
-                time.sleep(0.02)
-            if self._stop:
-                return
+            t, first, z = item
+            staged: dict[int, np.ndarray] = {}
+            made = 0
+            failed = False
+            with self._staging_lock:
+                self._staging = (t, z, staged)
             try:
-                src.reduced(*item, THUMB_K)
-            except Exception:
-                if self._stop or src._closed:
-                    return
+                for p in range(first, self._source.P):
+                    if p in staged or self.is_committed(t, p, z):
+                        continue  # handed over or stored by a foreground read
+                    while src._fg > 0 and not self._stop:
+                        time.sleep(0.02)
+                    if self._stop:
+                        return
+                    try:
+                        frame = src.reduced(t, p, z, THUMB_K, persist=False)
+                    except Exception:
+                        if self._stop or src._closed:
+                            return
+                        failed = True
+                        break
+                    with self._staging_lock:
+                        staged.setdefault(p, frame)
+                    made += 1
+                    time.sleep(0.005)
+            finally:
+                # Sealed: from here a foreground read puts its site itself.
+                with self._staging_lock:
+                    self._staging = None
+            if made:
+                misses = 0
+            if staged:
+                if not self.put_block(t, z, staged):
+                    break  # the reductions were made and the store would not take them
+                self._since_sweep = getattr(self, "_since_sweep", 0) + len(staged)
+                if self._since_sweep >= 64:
+                    self._since_sweep = 0
+                    self.sweep()
+                    self.flush_focus()
+            if failed:
                 misses += 1
                 if misses >= 8:
                     break  # the file keeps refusing this frame
                 time.sleep(0.5)
                 continue
-            misses = 0
             if not self.is_committed(*item):
-                break  # the reduction was made and the store would not take it
-            self._since_sweep = getattr(self, "_since_sweep", 0) + 1
-            if self._since_sweep >= 64:
-                self._since_sweep = 0
-                self.sweep()
-                self.flush_focus()
-            time.sleep(0.005)
+                break
         self.flush_focus()
         self.sweep()
         if not self._stop:
@@ -1366,6 +1628,11 @@ class PlateSource:
         self.path = Path(path)
         self.tile = int(tile)
         self.store: PlateStore | None = None
+        # Default display windows: an open that uses the store first looks
+        # for those its cache records, else measures them. Once the store
+        # opens, its writer records them unless its manifest already does.
+        self._windows_lookup = (bool(store), cache_path)
+        self._display_windows: list[dict[str, float]] | None = None
         # Process-wide RAM caches must never alias two opens of the same path.
         # This is deliberately not the server-visible source generation.
         self._open_generation = uuid.uuid4().hex
@@ -1414,6 +1681,13 @@ class PlateSource:
                     opened_store = (PlateStore.open_or_create(self) if cache_path is None
                                     else PlateStore.open_or_create(self, cache_path=cache_path))
                     self.store = opened_store
+                    # A cache rebuilt by open_or_create has lost the record
+                    # the windows may have been read from; write it again.
+                    if (
+                        self._display_windows is not None
+                        and _stored_windows(opened_store.manifest, self) is None
+                    ):
+                        opened_store.keep_display_windows(self._display_windows)
                     opened_store.start()
                 except Exception as e:  # a store that will not open is only a slower view
                     if opened_store is not None:
@@ -1610,6 +1884,20 @@ class PlateSource:
         return attrs
 
     def _windows(self, background_mode_start: Any) -> list[dict[str, float]]:
+        """Default display windows: those a matching cache already records
+        for this source, else measured now. Either is kept for the store's
+        writer."""
+        use_store, cache_path = self._windows_lookup
+        if use_store:
+            recorded = PlateStore.recorded_windows(self, cache_path=cache_path)
+            if recorded is not None:
+                self._display_windows = recorded
+                return recorded
+        windows = self._measure_windows()
+        self._display_windows = windows
+        return windows
+
+    def _measure_windows(self) -> list[dict[str, float]]:
         """Display windows from the 4x reductions of every site at t 0, home z.
 
         A camera field of a plate is phase contrast or bright field as
@@ -1617,7 +1905,7 @@ class PlateSource:
         black background, so the black point is a low percentile rather
         than the background mode the stitched scans use.
         """
-        samples = [self.reduced(0, p, self.z_home, 4) for p in range(self.P)]
+        samples = [self.reduced(WINDOWS_T, p, self.z_home, WINDOWS_K) for p in range(self.P)]
         small = np.concatenate([s.reshape(s.shape[0], -1) for s in samples], axis=1)
         if np.issubdtype(self.dtype, np.integer):
             info = np.iinfo(self.dtype)
@@ -1715,8 +2003,14 @@ class PlateSource:
                 _FRAME_CACHE.put(key, cyx)
             return cyx
 
-    def reduced(self, t: int, p: int, z: int, k: int) -> np.ndarray:
-        """(C, H//k, W//k) box mean of one frame, rounded to the source dtype."""
+    def reduced(self, t: int, p: int, z: int, k: int, *, persist: bool = True) -> np.ndarray:
+        """(C, H//k, W//k) box mean of one frame, rounded to the source dtype.
+
+        An 8x reduction is also stored through :meth:`PlateStore.offer`:
+        on its own, or with the chunk the builder is staging. The builder
+        itself passes ``persist=False`` and commits a whole chunk of sites
+        at once with :meth:`PlateStore.put_block`.
+        """
         if self._closed:
             raise ValueError("slide is closed")
         with self._life:
@@ -1729,12 +2023,13 @@ class PlateSource:
             hit = _REDUCED_CACHE.get(key)
             if hit is not None:
                 if (
-                    k == THUMB_K
+                    persist
+                    and k == THUMB_K
                     and self.store is not None
                     and not self.store.is_committed(t, p, z)
                     and not self._closed
                 ):
-                    self.store.put(t, p, z, hit)
+                    self.store.offer(t, p, z, hit)
                 return hit
             if k == THUMB_K and self.store is not None:
                 stored = self.store.get(t, p, z)
@@ -1742,20 +2037,11 @@ class PlateSource:
                     if not self._closed:
                         _REDUCED_CACHE.put(key, stored)
                     return stored
-            frame = self.frame(t, p, z)
-            c, h, w = frame.shape
-            h2, w2 = h // k, w // k
-            block = frame[:, : h2 * k, : w2 * k].reshape(c, h2, k, w2, k)
-            out = block.mean(axis=(2, 4), dtype=np.float32)
-            if np.issubdtype(self.dtype, np.integer):
-                out = np.rint(out).astype(self.dtype)
-            else:
-                out = out.astype(self.dtype)
-            out = np.ascontiguousarray(out)
+            out = np.ascontiguousarray(box_mean(self.frame(t, p, z), k, self.dtype))
             if not self._closed:
                 _REDUCED_CACHE.put(key, out)
-                if k == THUMB_K and self.store is not None:
-                    self.store.put(t, p, z, out)
+                if persist and k == THUMB_K and self.store is not None:
+                    self.store.offer(t, p, z, out)
             return out
 
     def status(self) -> dict[str, Any]:

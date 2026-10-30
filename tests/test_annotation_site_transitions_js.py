@@ -6,18 +6,14 @@ hold replies or answer 409. ``app.js`` only wraps these calls.
 """
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
 MODULE = STATIC / "annotation-store-v1.js"
 APP = STATIC / "app.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 def _run(body):
@@ -118,13 +114,7 @@ const snapshot = () => ({
 const emit = (value) => process.stdout.write(JSON.stringify(value));
 """ + body + r"""
 """
-    result = subprocess.run(
-        [NODE, "-e", script, str(MODULE)],
-        capture_output=True,
-        text=True, encoding="utf-8",
-        check=True,
-        timeout=20,
-    )
+    result = run_node(script, MODULE, check=True)
     return json.loads(result.stdout)
 
 
@@ -203,8 +193,8 @@ def test_a_to_b_to_a_keeps_latest_a_snapshot_after_save_success_or_failure(save_
 (async () => {{
   const aUrl = "api/annotations?p=0", bUrl = "api/annotations?p=1";
   const server = sidecarServer(new Map([
-    [aUrl, {{items: [{{id: "old-a"}}], path: "/sidecars/a.json", revision: "a0"}}],
-    [bUrl, {{items: [{{id: "b"}}], path: "/sidecars/b.json", revision: "b0"}}],
+    [aUrl, {{items: [{{id: "old-a", type: "pin", x: 1, y: 2}}], path: "/sidecars/a.json", revision: "a0"}}],
+    [bUrl, {{items: [{{id: "b", type: "pin", x: 1, y: 2}}], path: "/sidecars/b.json", revision: "b0"}}],
   ]));
   state.plate.focus = 0;
   await store.switchOwner(0);
@@ -270,11 +260,11 @@ def test_save_in_flight_during_switch_finishes_first_and_cannot_dirty_the_new_ow
   const aUrl = "api/annotations?p=0", bUrl = "api/annotations?p=1";
   const server = sidecarServer(new Map([
     [aUrl, {items: [], path: "/sidecars/a.json", revision: "a0"}],
-    [bUrl, {items: [{id: "b"}], path: "/sidecars/b.json", revision: "b0"}],
+    [bUrl, {items: [{id: "b", type: "pin", x: 1, y: 2}], path: "/sidecars/b.json", revision: "b0"}],
   ]));
   state.plate.focus = 0;
   await store.switchOwner(0);
-  state.annotations = [{id: "late-a"}];
+  state.annotations = [{id: "late-a", type: "pin", x: 1, y: 2}];
   store.markDirty();
   server.hold = true;
   server.failPost = 503;
@@ -315,7 +305,7 @@ def test_conflict_keeps_the_draft_and_only_explicit_acceptance_lets_the_flush_re
         r"""
 (async () => {
   const aUrl = "api/annotations?p=0";
-  const server = sidecarServer(new Map([[aUrl, {items: [{id: "disk"}], path: "/sidecars/a.json", revision: "r0"}]]),
+  const server = sidecarServer(new Map([[aUrl, {items: [{id: "disk", type: "pin", x: 1, y: 2}], path: "/sidecars/a.json", revision: "r0"}]]),
     {drafts: "/session/drafts"});
   state.plate.focus = 0;
   await store.switchOwner(0);
@@ -449,8 +439,8 @@ def test_older_load_cannot_install_over_a_newer_one():
 (async () => {
   const aUrl = "api/annotations?p=0", bUrl = "api/annotations?p=1";
   const server = sidecarServer(new Map([
-    [aUrl, {items: [{id: "a"}], path: "/sidecars/a.json", revision: "a0"}],
-    [bUrl, {items: [{id: "b"}], path: "/sidecars/b.json", revision: "b0"}],
+    [aUrl, {items: [{id: "a", type: "pin", x: 1, y: 2}], path: "/sidecars/a.json", revision: "a0"}],
+    [bUrl, {items: [{id: "b", type: "pin", x: 1, y: 2}], path: "/sidecars/b.json", revision: "b0"}],
   ]));
   server.hold = true;
   state.plate.focus = 0;

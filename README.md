@@ -20,10 +20,10 @@
 
 ## Latest update
 
-- **Windows saves before closing:** closing a window now waits for annotation, LUT and export work, as on macOS; an unresponsive viewer can still be closed after confirmation.
-- **Faster display:** tile compositing is 4–5 times faster with bit-identical colours.
-- **Smooth annotation panning:** thousands of Astromapper regions pan at full frame rate.
-- **Faster TIFF export:** reduced-level exports read each channel once; files are byte-identical.
+- **Safer annotation files:** a file the viewer cannot draw is refused before it replaces your marks, a sidecar keeps items it cannot draw, and a typed label survives clicking another mark.
+- **16-bit PNG:** 16-bit grayscale PNG files keep their stored values in display, pixel readouts and TIFF export.
+- **Sleep-safe caches:** a window opened after macOS sleep no longer removes another window's cache build.
+- **Faster plates:** plate thumbnails fill about 5 times faster, and cached slides serve more tiles per second.
 
 <p align="center">
   <img src="docs/overview-sdpc.png" alt="Brightfield SDPC slide with Slide Info in the light appearance" width="50%"><img src="docs/overview-nd2.png" alt="Fluorescence ND2 image with Channels &amp; LUTs in the dark appearance" width="50%">
@@ -31,13 +31,10 @@
 
 ## Download
 
-| Platform | Download · 2.5.4 | Requirements |
+| Platform | Download · 2.5.5 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.4/nd2wsi-viewer-2.5.4-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.4/nd2wsi-viewer-2.5.4-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 Runtime |
-
-Windows builds after 2.5.4 include the Microsoft Edge WebView2 Runtime, so WebView2
-no longer has to be installed separately. The 2.5.4 ZIP above still needs it on the PC.
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.5/nd2wsi-viewer-2.5.5-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.5/nd2wsi-viewer-2.5.5-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
 
 On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
 and keep `_internal` beside `nd2wsi-viewer.exe`. See the

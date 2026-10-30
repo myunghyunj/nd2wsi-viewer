@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nd2wsi-viewer"
-version = "2.5.4"
+version = "2.5.5"
 description = "Local whole-slide viewing for stitched Nikon ND2, Aperio SVS, and SDPC, with native-value ROI export"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,7 +32,7 @@ Changelog = "https://github.com/myunghyunj/nd2wsi-viewer/releases"
 
 [project.optional-dependencies]
 legacy = ["nd2[legacy]"]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pytest-xdist>=3.6", "ruff==0.17.3"]
 nd2export = ["limnd2>=0.4"]
 app = ["pywebview>=6.0"]
 svs = ["imagecodecs>=2023.9"]
@@ -69,6 +69,11 @@ select = ["E4", "E7", "E9", "F", "I", "UP"]
 ignore = ["E501"]
 
 [tool.pytest.ini_options]
+faulthandler_timeout = 120
+filterwarnings = [
+  "error::DeprecationWarning:nd2wsi",
+  "ignore:Setting the shape:DeprecationWarning:nd2._nd2file",
+]
 markers = [
   "realdata: tests that need the example acquisitions from the testdata release",
   "slacs_edition: keep this line's shipped update setting (nd2wsi/edition.py) instead of the public policy",

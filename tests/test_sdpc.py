@@ -3,12 +3,13 @@
 import os
 import struct
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from threading import Event
 
 import numpy as np
 import pytest
 
-pytest.importorskip("av")
+av = pytest.importorskip("av")
 
 from sdpc_fixture import HEADER, LEVEL, add_associated_images, build_sdpc  # noqa: E402
 
@@ -197,6 +198,89 @@ def test_invalid_hevc_payload_fails_when_the_tile_is_read(slide, synthetic):
             root["0"][:, :10, :10]
     finally:
         root.close(delay=0)
+
+
+def _hevc(rgb, *, frames=1, pix_fmt="yuv420p", params=""):
+    """One raw HEVC stream of ``frames`` pictures; the encoder is test-only."""
+    output = BytesIO()
+    with av.open(output, "w", format="hevc") as container:
+        stream = container.add_stream("libx265", rate=1)
+        stream.width, stream.height = rgb.shape[1], rgb.shape[0]
+        stream.pix_fmt = pix_fmt
+        stream.options = {
+            "preset": "ultrafast", "tune": "zerolatency", "crf": "24",
+            "x265-params": "log-level=none:pools=none:frame-threads=1:wpp=0" + params,
+        }
+        for index in range(frames):
+            frame = av.VideoFrame.from_ndarray(np.roll(rgb, index, axis=1), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return output.getvalue()
+
+
+def _demuxer_decode(data):
+    """Independent reference: the raw-HEVC demuxer path with the same swscale flags."""
+    with av.open(BytesIO(data), format="hevc") as container:
+        frames = list(container.decode(video=0))
+    assert len(frames) == 1
+    return frames[0].to_ndarray(format="rgb24", interpolation=2 | 0x40000 | 0x80000,
+                                src_color_range=frames[0].color_range)
+
+
+@pytest.mark.parametrize("pix_fmt, params", [
+    ("yuv420p", ""),
+    ("yuv420p", ":range=full:colorprim=bt709:transfer=bt709:colormatrix=bt709"),
+    ("yuv444p", ":colormatrix=bt470bg"),
+    ("yuv420p10le", ""),
+])
+def test_tile_decode_matches_the_demuxer_decode_bit_for_bit(pix_fmt, params):
+    rgb = np.random.default_rng(5).normal(180, 30, (256, 384, 3)).clip(0, 255).astype(np.uint8)
+    data = _hevc(rgb, pix_fmt=pix_fmt, params=params)
+    decoded = sdpc._decode_tile(data, 384, 256)
+    assert decoded.dtype == np.uint8 and decoded.flags.c_contiguous
+    np.testing.assert_array_equal(decoded, _demuxer_decode(data))
+
+
+def test_tile_decode_rejects_extra_frames_and_undeclared_dimensions():
+    rgb = np.random.default_rng(6).integers(0, 256, (128, 128, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="cannot decode SDPC HEVC tile: SDPC tile contains "
+                                         "multiple frames"):
+        sdpc._decode_tile(_hevc(rgb, frames=2), 128, 128)
+    data = _hevc(rgb)
+    with pytest.raises(ValueError, match="did not decode to its declared dimensions"):
+        sdpc._decode_tile(data, 256, 256)
+    # max_pixels refuses the oversized picture before any frame exists, so the
+    # later dimension check is never reached.
+    with pytest.raises(ValueError, match="cannot decode SDPC HEVC tile") as refused:
+        sdpc._decode_tile(data, 64, 64)
+    assert "declared dimensions" not in str(refused.value)
+
+
+def test_each_tile_gets_a_fresh_single_threaded_decoder(monkeypatch):
+    rgb = np.random.default_rng(7).normal(120, 40, (128, 128, 3)).clip(0, 255).astype(np.uint8)
+    good = _hevc(rgb)
+    reference = _demuxer_decode(good)
+    real, contexts = av.CodecContext, []
+
+    class Recording:
+        @staticmethod
+        def create(*args, **kwargs):
+            context = real.create(*args, **kwargs)
+            contexts.append(context)
+            return context
+
+    monkeypatch.setattr(av, "CodecContext", Recording)
+    np.testing.assert_array_equal(sdpc._decode_tile(good, 128, 128), reference)
+    for damaged in (b"\x00" * 4096, good[:200]):
+        with pytest.raises(ValueError, match="cannot decode SDPC HEVC tile"):
+            sdpc._decode_tile(damaged, 128, 128)
+    # A damaged tile leaves no decoder state behind for the next one.
+    np.testing.assert_array_equal(sdpc._decode_tile(good, 128, 128), reference)
+    assert len({id(context) for context in contexts}) == len(contexts) == 4
+    assert all(context.is_decoder and context.name == "hevc" and context.thread_count == 1
+               for context in contexts)
 
 
 @pytest.mark.parametrize("mutation", ["replacement", "mtime"])

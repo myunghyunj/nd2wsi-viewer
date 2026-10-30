@@ -15,6 +15,9 @@
       plateZText, platePlaneNote, currentFocusSummary, plateGroupKey,
       platePeriodMs, rawValueLabel, fmtTickLabel, fmtHm,
       fmtPeriodWords, fmtInt, paintPlate, plateFrameChanged,
+      // () => whether every frame on screen for the current t has arrived or
+      // failed; playback waits for it. Without it every frame counts as shown.
+      plateFrameShown = () => true,
     } = dependencies;
     const { document, AbortController, Nd2PlateUI: ui } = host;
     // Storage access itself may throw in restricted browser contexts. Keep it
@@ -23,6 +26,9 @@
     const fetch = (...args) => host.fetch(...args);
     const setInterval = (...args) => host.setInterval(...args);
     const clearInterval = (...args) => host.clearInterval(...args);
+    const setTimeout = (...args) => host.setTimeout(...args);
+    const clearTimeout = (...args) => host.clearTimeout(...args);
+    const now = () => host.performance?.now?.() ?? Date.now();
 
     function setPlateZ(z) {
       // reaching for the plane is how the user takes the wheel back from
@@ -67,6 +73,14 @@
       const next = clamp(Math.round(t), 0, state.info.plate.T - 1);
       if (next === pl.t) return;
       pl.t = next;
+      if (pl.playing && pl.timer) {
+        // A frame picked while playing (scrub, key, button) gets a full
+        // period and its own wait, not what is left of the one it replaced.
+        // playbackTick's own step finds no timer and schedules the next.
+        clearTimeout(pl.timer);
+        pl.stepAt = now();
+        pl.timer = setTimeout(playbackTick, 1000 / pl.fps);
+      }
       plateFrameChanged();
     }
 
@@ -79,14 +93,43 @@
       btn.innerHTML = pl.playing
         ? '<svg viewBox="0 0 16 16"><path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg>'
         : '<svg viewBox="0 0 16 16"><path d="M4 2.2v11.6c0 .6.6.9 1.1.6l8.6-5.8c.5-.3.5-1 0-1.3L5.1 1.6C4.6 1.3 4 1.6 4 2.2z"/></svg>';
-      clearInterval(pl.timer);
+      clearTimeout(pl.timer);
       pl.timer = null;
       if (pl.playing) {
-        pl.timer = setInterval(() => {
-          const T = state.info.plate.T;
-          setPlateT(pl.t + 1 >= T ? 0 : pl.t + 1);
-        }, 1000 / pl.fps);
+        pl.stepAt = now(); // the frame on screen counts from here
+        pl.timer = setTimeout(playbackTick, 1000 / pl.fps);
       }
+    }
+
+    // Playback steps at most fps times a second, and only once the frame on
+    // screen has arrived (or failed), so a slow store slows playback down
+    // instead of piling up requests behind half-loaded grids. A frame still
+    // missing after PLAYBACK_MAX_WAIT_MS is given up, so playback never stalls.
+    const PLAYBACK_MAX_WAIT_MS = 2000;
+    const PLAYBACK_POLL_MS = 16;
+
+    function playbackTick() {
+      const pl = state.plate;
+      pl.timer = null;
+      if (!pl.playing) return;
+      const waited = now() - pl.stepAt;
+      if (waited < PLAYBACK_MAX_WAIT_MS && !plateFrameShown()) {
+        pl.timer = setTimeout(playbackTick, Math.min(PLAYBACK_POLL_MS, PLAYBACK_MAX_WAIT_MS - waited));
+        return;
+      }
+      const T = state.info.plate.T;
+      pl.stepAt = now();
+      setPlateT(pl.t + 1 >= T ? 0 : pl.t + 1);
+      if (pl.playing && !pl.timer) {
+        pl.timer = setTimeout(playbackTick, Math.max(0, 1000 / pl.fps - (now() - pl.stepAt)));
+      }
+    }
+
+    // The pane went out of sight (another tab, or left a Compare group):
+    // stop issuing frames nobody sees. T and Z stay where playback left
+    // them, and nothing restarts by itself when the pane is shown again.
+    function pausePlatePlayback() {
+      if (state.plate?.playing) setPlatePlaying(false);
     }
 
     /* z slider: a track that fills up to the knob, a tick per plane, the home
@@ -426,7 +469,7 @@
 
     return {
       setPlateZ, stepPlateZ, setPlateAuto, setPlateT,
-      setPlatePlaying, buildZSlider, renderZSlider, buildTimeLine,
+      setPlatePlaying, pausePlatePlayback, buildZSlider, renderZSlider, buildTimeLine,
       renderTimeLine, renderPlateAuto, loadPlateFocus, pollPlateStatus,
     };
   }

@@ -51,14 +51,23 @@ rm -rf "$BUILD/venv"
 "$BASEPY" -m venv "$BUILD/venv"
 PY="$BUILD/venv/bin/python"
 "$PY" -m pip -q install --upgrade pip
-"$PY" -m pip -q install "$REPO" pyinstaller "pywebview>=6.0" "imagecodecs>=2023.9"
+# The bundle gets exactly the packages the test suite ran against: runtime
+# packages from uv.lock (limnd2 included, through the nd2export extra) and
+# PyInstaller from its own hash-pinned lock, as the Windows build does.
+# Nothing is resolved from the indexes at release time.
+command -v uv >/dev/null || { echo "error: uv is required to install the locked dependencies" >&2; exit 1; }
+RUNTIME_LOCK="$BUILD/runtime-requirements.txt"
+uv export --project "$REPO" --frozen --no-dev --no-emit-project --emit-index-url \
+  --extra app --extra svs --extra nd2export --format requirements-txt \
+  --output-file "$RUNTIME_LOCK" >/dev/null
+"$PY" -m pip -q install --require-hashes -r "$RUNTIME_LOCK" -r "$HERE/macos-build-requirements.txt"
+# Build the project with the pinned setuptools above, not one fetched for an
+# isolated build environment.
+"$PY" -m pip -q install --no-build-isolation --no-deps "$REPO"
 SDPC_WHEEL="$("$PY" "$HERE/bundle_sdpc_codec.py" wheel --manifest "$ND2WSI_SDPC_CODEC_MANIFEST")"
 "$PY" -m pip -q install --no-deps --force-reinstall "$SDPC_WHEEL"
 "$PY" "$HERE/verify_sdpc_codec.py" --manifest "$ND2WSI_SDPC_CODEC_MANIFEST"
-"$PY" -m pip -q install --index-url https://pypi.laboratory-imaging.com/simple limnd2 \
-  || echo "warn: limnd2 unavailable — app will ship without ND2 export"
-"$PY" -c "import limnd2; print('   limnd2', limnd2.__version__, 'in build venv')" \
-  || echo "warn: limnd2 does not import in the build venv"
+"$PY" -c "import limnd2; print('   limnd2', limnd2.__version__, 'in build venv')"
 
 echo "==> pyinstaller"
 "$BUILD/venv/bin/pyinstaller" \

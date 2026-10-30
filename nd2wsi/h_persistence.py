@@ -19,6 +19,8 @@ import stat
 import tempfile
 import uuid
 import zipfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +51,13 @@ SCHEMA = "nd2wsi-h-correction/1"
 _MODEL_LIMIT = 32 * 1024**2
 CONSENSUS_NATIVE_CONTRACT = NATIVE_CONTRACT
 LEGACY_BFFREE_NATIVE_CONTRACT = "BF-free-32x-bin-center-interpolation(native)-then-box-mean"
+# Level-1 tiles prepared at once. The viewer keeps serving tiles meanwhile, so
+# one core stays free. One task peaks near 30 bytes per native pixel of its
+# 2x window (uint16 read, float32 gain and quotient, row-band temporaries), so
+# a 256 MiB budget allows 8 tasks at tile 512 but only 2 at tile 1024.
+_APPLY_MAX_WORKERS = max(1, min(8, (os.cpu_count() or 1) - 1))
+_APPLY_TASK_BUDGET = 256 * 1024**2
+_APPLY_TASK_BYTES_PER_PIXEL = 32
 
 
 class PreparationCancelled(Exception):
@@ -300,6 +309,48 @@ def _read_native(state, replacement, ci, y0, y1, x0, x1):
         return np.array(native[ci, y0:y1, x0:x1], copy=True)
 
 
+def _apply_workers(tile):
+    per_task = _APPLY_TASK_BYTES_PER_PIXEL * (2 * int(tile)) ** 2
+    return max(1, min(_APPLY_MAX_WORKERS, _APPLY_TASK_BUDGET // per_task))
+
+
+def _checked(replacement, build, args):
+    replacement.check()
+    return build(*args)
+
+
+def _build_tiles(replacement, build, tiles, done, workers=1):
+    """Build every tile and report each result to ``done`` in tile order.
+
+    With more than one worker the tiles run on a small thread pool: each
+    writes its own chunk file, and the gain and reduction work releases the
+    GIL. Each task checks cancellation itself (and ``build`` enters
+    ``state.busy`` for its reads). On any failure the queued tasks are
+    cancelled and the running ones finish before this returns, so no worker
+    outlives the staging directory or still holds ``state.busy`` when the
+    caller closes the replacement.
+    """
+    if workers <= 1:
+        for args in tiles:
+            replacement.check()
+            done(build(*args))
+        return
+    pending = deque()
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nd2wsi-h-apply") as pool:
+        try:
+            for args in tiles:
+                replacement.check()
+                if len(pending) >= 2 * workers:
+                    done(pending.popleft().result())
+                pending.append(pool.submit(_checked, replacement, build, args))
+            while pending:
+                done(pending.popleft().result())
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            raise
+
+
 def _reduce2(values, height, width):
     if values.shape[0] == 1 and height == 1:
         values = np.repeat(values, 2, axis=0)
@@ -394,31 +445,44 @@ def prepare_apply(state, model, model_record, event, progress):
         }
         total = channels * sum(lv["height"] * lv["width"] for lv in levels)
         completed = 0
+
+        def done(count):
+            nonlocal completed
+            completed += count
+            progress(0.8 * completed / total)
+
         for lv in levels:
             key = str(lv["path"])
             target = DEFAULT_STORAGE.chunk_array(arrays[key])
-            for ci in range(channels):
-                for y in range(0, lv["height"], tile):
-                    y1 = min(y + tile, lv["height"])
-                    for x in range(0, lv["width"], tile):
-                        replacement.check()
-                        x1 = min(x + tile, lv["width"])
-                        if ci not in indices:
-                            with state.busy:
-                                block = np.asarray(state.root[key][ci, y:y1, x:x1], np.float32)
-                        elif key == "1":
-                            raw = _read_native(state, replacement, ci, y * 2, y1 * 2, x * 2, x1 * 2)
-                            block = _reduce2(model.correct(ci, raw, y * 2, x * 2), y1 - y, x1 - x)
-                        else:
-                            previous = arrays[str(int(key) - 1)]
-                            ph, pw = previous.shape[-2:]
-                            raw = np.asarray(previous[ci, y * 2:min(y1 * 2, ph), x * 2:min(x1 * 2, pw)])
-                            block = _reduce2(raw, y1 - y, x1 - x)
-                        if not np.isfinite(block).all():
-                            raise ValueError("Nonfinite values in the corrected pyramid")
-                        target.write((ci, y // tile, x // tile), block[None])
-                        completed += (y1 - y) * (x1 - x)
-                        progress(0.8 * completed / total)
+
+            def build(ci, y, y1, x, x1, key=key, target=target):
+                if ci not in indices:
+                    with state.busy:
+                        block = np.asarray(state.root[key][ci, y:y1, x:x1], np.float32)
+                elif key == "1":
+                    raw = _read_native(state, replacement, ci, y * 2, y1 * 2, x * 2, x1 * 2)
+                    block = _reduce2(model.correct(ci, raw, y * 2, x * 2), y1 - y, x1 - x)
+                else:
+                    previous = arrays[str(int(key) - 1)]
+                    ph, pw = previous.shape[-2:]
+                    raw = np.asarray(previous[ci, y * 2:min(y1 * 2, ph), x * 2:min(x1 * 2, pw)])
+                    block = _reduce2(raw, y1 - y, x1 - x)
+                if not np.isfinite(block).all():
+                    raise ValueError("Nonfinite values in the corrected pyramid")
+                target.write((ci, y // tile, x // tile), block[None])
+                return (y1 - y) * (x1 - x)
+
+            height_k, width_k = lv["height"], lv["width"]
+            tiles = (
+                (ci, y, min(y + tile, height_k), x, min(x + tile, width_k))
+                for ci in range(channels)
+                for y in range(0, height_k, tile)
+                for x in range(0, width_k, tile)
+            )
+            # Level 1 carries nearly all of the work (native reads and the
+            # model's gain); deeper levels read the level above, so they
+            # follow it serially once it is complete.
+            _build_tiles(replacement, build, tiles, done, _apply_workers(tile) if key == "1" else 1)
         meta.update(kind="overview", overview_of={"channels": channels, "height": height, "width": width},
                     dtype=str(native.dtype), display_dtype="float32", levels=levels, h_correction=correction)
         for multiscale in attrs["multiscales"]:

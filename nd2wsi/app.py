@@ -306,6 +306,8 @@ _OPENS_LOCK = threading.Lock()
 _FLUSHER_ALIVE = False
 _LAUNCH_PATH: str | None = None  # the file given at launch, resolved
 _LAUNCH_AT = 0.0
+_OPEN_READY_TIMEOUT = 60.0  # how long queued opens wait for the page to take them
+_OPEN_CALL_TIMEOUT = 5.0  # one delivery call; the budget window_lifecycle gives a browser call
 
 
 def _dispatch_open(paths):
@@ -339,39 +341,90 @@ def _dispatch_open(paths):
     threading.Thread(target=_flush_opens, daemon=True).start()
 
 
+def _start_page_call(window, script):
+    """Run ``window.evaluate_js(script)`` on its own daemon thread.
+
+    pywebview's evaluate_js has no deadline (it first waits up to 20 s for
+    the page bridge, then for the script's answer), so the caller waits on
+    the returned ``done`` event with its own budget. A page that never
+    answers strands this helper thread, never the flusher. ``outcome`` holds
+    "value" or "error" once ``done`` is set.
+    """
+    done = threading.Event()
+    outcome: dict = {}
+
+    def call():
+        try:
+            outcome["value"] = window.evaluate_js(script)
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=call, name="finder-open-js", daemon=True).start()
+    return done, outcome
+
+
 def _flush_opens():
+    """Hand queued opens to the page until the queue is empty.
+
+    The flusher stops only when it sees the queue empty, and it clears
+    ``_FLUSHER_ALIVE`` under the same lock, so an open queued while a batch
+    is being delivered is delivered too. Every page call runs on a helper
+    thread: the readiness probe may wait until the deadline (startup can
+    hold pywebview's bridge for seconds), a delivery waits at most
+    ``_OPEN_CALL_TIMEOUT``. The next call starts only after the previous
+    one answered, so a hung page strands at most one helper thread per
+    flusher, and after the deadline the flusher gives up with the paths
+    still queued; the next open starts a new flusher that delivers them.
+    """
     import json as _json
     import time
 
     import webview
 
     global _FLUSHER_ALIVE
+    owner = True
+    deadline = time.monotonic() + _OPEN_READY_TIMEOUT
+    running = None  # (done, outcome) of the newest page call
     try:
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            if webview.windows:
-                try:
-                    ready = webview.windows[0].evaluate_js(
-                        "typeof window.__pydrop_multi"
-                    )
-                except Exception:
-                    ready = None
-                if ready == "function":
-                    with _OPENS_LOCK:
-                        batch, _PENDING_OPENS[:] = list(_PENDING_OPENS), []
-                    if batch:
-                        _dlog(f"flushing {len(batch)} queued open(s)")
-                        webview.windows[0].evaluate_js(
-                            f"window.__pydrop_multi({_json.dumps(batch)})"
-                        )
-                    return
-            time.sleep(0.3)
-        _dlog("flush_opens timed out")
+        while True:
+            with _OPENS_LOCK:
+                left = len(_PENDING_OPENS)
+                if not left or time.monotonic() >= deadline:
+                    _FLUSHER_ALIVE = owner = False
+            if not owner:
+                if left:
+                    _dlog(f"flush_opens timed out; {left} open(s) stay queued for the next open")
+                return
+            if not webview.windows:
+                time.sleep(0.3)
+                continue
+            window = webview.windows[0]
+            if running is not None and not running[0].wait(max(0.0, deadline - time.monotonic())):
+                continue  # the page still has not answered the previous call
+            running = _start_page_call(window, "typeof window.__pydrop_multi")
+            if not running[0].wait(max(0.0, deadline - time.monotonic())):
+                continue
+            if running[1].get("value") != "function":
+                time.sleep(0.3)
+                continue
+            with _OPENS_LOCK:
+                batch, _PENDING_OPENS[:] = list(_PENDING_OPENS), []
+            _dlog(f"flushing {len(batch)} queued open(s)")
+            running = _start_page_call(window, f"window.__pydrop_multi({_json.dumps(batch)})")
+            # A late answer still opens the batch, so it is never queued again.
+            if not running[0].wait(_OPEN_CALL_TIMEOUT):
+                _dlog(f"the viewer did not answer {len(batch)} open(s) within {_OPEN_CALL_TIMEOUT:g} seconds")
+            elif "error" in running[1]:
+                _dlog(f"flush_opens failed: {running[1]['error']}")
+            deadline = time.monotonic() + _OPEN_READY_TIMEOUT
     except Exception as e:
         _dlog(f"flush_opens failed: {e}")
     finally:
-        with _OPENS_LOCK:
-            _FLUSHER_ALIVE = False
+        if owner:
+            with _OPENS_LOCK:
+                _FLUSHER_ALIVE = False
 
 
 def _install_open_files_handler():
@@ -1796,6 +1849,60 @@ def _daemonize_pywebview_bridge_threads(webview) -> None:
 
 _DIAGNOSTIC_RUN_FLAGS = ("--gui-smoke", "--handoff-check-report", "--browser-replay-report")
 
+# How long an interactive exit waits for slide reads, exports and plate writers
+# to let go of their sources once the window has closed.
+_EXIT_TEARDOWN_TIMEOUT = 10.0
+_EXIT_TEARDOWN_UNFINISHED = threading.Event()
+# Set by run() while main() runs: only then does a hard exit follow a
+# teardown that was left running.
+_HARD_EXIT_FOLLOWS = threading.Event()
+
+
+def _stop_server_at_exit(api, *, diagnostic: bool) -> None:
+    """Release the server after the GUI loop has returned.
+
+    This is the strict teardown an update uses: it never closes a memory map
+    or a plate writer while a reader still holds it. Sparkle's preparation has
+    already run it before the app quits, and a diagnostic run waits for it
+    without limit, so a teardown that hangs still fails its CI step.
+
+    An interactive run's window is already gone, and a read from a share that
+    has gone away never returns. Waiting for it would leave a process nobody
+    can see, holding its window-session lock (an update in any other window
+    then refuses), its plate writer lease and its memory maps. So the teardown
+    gets ``_EXIT_TEARDOWN_TIMEOUT`` seconds on a daemon thread. If it is still
+    waiting, it is left running, ``_EXIT_TEARDOWN_UNFINISHED`` is set, and
+    ``run()`` ends the process after ``main()`` has recorded the session
+    closed. The kernel releases the locks; an abandoned export leaves only its
+    temporary file.
+
+    Only ``run()`` ends the process that way, so the bound applies only while
+    ``run()`` is the caller (``_HARD_EXIT_FOLLOWS``). A direct caller of
+    ``main()`` (the ``nd2wsi-viewer`` console script, ``desktop.py``) keeps
+    the strict wait: a session recorded closed while its process lives on
+    would let an update in another window go ahead past it.
+    """
+    if diagnostic or not _HARD_EXIT_FOLLOWS.is_set():
+        api.stop_server_for_update()
+        return
+    finished = threading.Event()
+    failure = []
+
+    def stop():
+        try:
+            api.stop_server_for_update()
+        except BaseException as exc:
+            failure.append(exc)
+        finally:
+            finished.set()
+
+    threading.Thread(target=stop, name="exit-teardown", daemon=True).start()
+    if not finished.wait(_EXIT_TEARDOWN_TIMEOUT):
+        _dlog(f"exit: slide teardown still waiting after {_EXIT_TEARDOWN_TIMEOUT:g} s; ending without it")
+        _EXIT_TEARDOWN_UNFINISHED.set()
+    elif failure:
+        raise failure[0]
+
 
 def run(argv: list[str] | None = None) -> int:
     """Process entry point: ``main()``, then end a diagnostic run at once.
@@ -1804,14 +1911,23 @@ def run(argv: list[str] | None = None) -> int:
     report is written and its server and window session are closed. Exiting
     with ``os._exit`` then means no thread that is still waiting (see
     ``_daemonize_pywebview_bridge_threads``) can turn a finished run into a
-    CI timeout. Interactive runs return normally; ``main()`` itself always
+    CI timeout. Interactive runs return normally unless their slide teardown
+    did not finish in time (``_stop_server_at_exit``): a slide read then still
+    holds a source, and interpreter shutdown, which joins the executor workers
+    zarr runs store reads on, could wait for it forever. Both kinds of exit
+    leave through the one ``os._exit`` below. ``main()`` itself always
     returns, so callers and tests can inspect its result.
     """
     arguments = list(sys.argv[1:] if argv is None else argv)
-    result = main(arguments)
-    if any(argument.split("=", 1)[0] in _DIAGNOSTIC_RUN_FLAGS for argument in arguments):
+    _HARD_EXIT_FOLLOWS.set()
+    try:
+        result = main(arguments)
+    finally:
+        _HARD_EXIT_FOLLOWS.clear()
+    diagnostic = any(argument.split("=", 1)[0] in _DIAGNOSTIC_RUN_FLAGS for argument in arguments)
+    if diagnostic or _EXIT_TEARDOWN_UNFINISHED.is_set():
         # os._exit skips the atexit hook that otherwise closes the session log.
-        session_log.stop("diagnostic run finished")
+        session_log.stop("diagnostic run finished" if diagnostic else "exit teardown left running")
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
@@ -1892,6 +2008,7 @@ def _main(args) -> int:
 
     api = None
     window_session = None
+    teardown_error = None
     try:
         if sys.platform in ("darwin", "win32"):
             from .window_sessions import create_window_session
@@ -1983,13 +2100,26 @@ def _main(args) -> int:
     finally:
         try:
             if api is not None:
-                api.stop_server_for_update()
+                _stop_server_at_exit(api, diagnostic=bool(args.gui_smoke or args.browser_replay_report))
+        except Exception as exc:
+            # The window is gone. A failed teardown must not skip the reports
+            # below or run()'s exit; a diagnostic run fails on it instead.
+            teardown_error = exc
+            _dlog(f"exit: server teardown failed: {exc!r}")
         finally:
             if window_session is not None:
                 try:
                     window_session.mark_closed()
                 except Exception as exc:
                     _dlog(f"window session close record failed: {exc!r}")
+    if teardown_error is not None and (args.gui_smoke or args.browser_replay_report):
+        failed = f"Server teardown failed: {type(teardown_error).__name__}: {teardown_error}"
+        report = {**report, "ok": False, "teardown_error": failed}
+        report.setdefault("error", failed)
+        result = 4
+        # A browser replay writes its own report before the window closes, so
+        # that file cannot carry this; whoever captured the run sees it here.
+        print(failed, file=sys.stderr)
     if args.gui_smoke:
         session_log.event("gui_smoke", ok=report.get("ok"), phase=report.get("phase"), error=report.get("error"),
                           close=report.get("close"))

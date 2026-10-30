@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from nd2wsi.update_guard import UpdateInstallGuard
 from nd2wsi.window_sessions import create_window_session
 
 
-def test_existing_windows_keep_work_until_the_user_closes_them(tmp_path):
+def test_existing_windows_keep_work_until_the_user_closes_them(tmp_path, monkeypatch):
+    monkeypatch.setattr('nd2wsi.update_guard.ADMISSION_TIMEOUT', 0.05)
     owner = create_window_session('user', tmp_path)
     peer = create_window_session('agent', tmp_path)
     draft = peer.drafts_root / 'work.json'
@@ -52,7 +54,12 @@ def test_process_death_releases_liveness_without_rewriting_recovery_record(tmp_p
         assert 'other viewer windows' in guard.acquire()
         process.terminate()
         process.wait(timeout=10)
-        assert guard.acquire() is None
+        # Windows releases a dead process's file locks after a delay that "depends upon
+        # available system resources" (LockFileEx), which parallel test workers stretch.
+        deadline = time.monotonic() + 10
+        while (blocked := guard.acquire()) is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert blocked is None
         assert record.exists()
         assert json.loads(record.read_text())['state'] == 'starting'
     finally:
@@ -91,6 +98,7 @@ def test_reused_pid_in_legacy_record_does_not_invent_a_live_window(tmp_path):
 def test_custom_roots_share_liveness_and_startup_admission(tmp_path, monkeypatch):
     coordination = tmp_path / 'coordination'
     monkeypatch.setattr('nd2wsi.update_guard._coordination_root', lambda _: coordination)
+    monkeypatch.setattr('nd2wsi.update_guard.ADMISSION_TIMEOUT', 0.05)
     owner = create_window_session('user', tmp_path / 'normal')
     peer = create_window_session('agent', tmp_path / 'diagnostics')
     guard = UpdateInstallGuard(owner, bundle_peers=lambda: [])

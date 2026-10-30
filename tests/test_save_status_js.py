@@ -1,14 +1,10 @@
 """Auto-save status tracker: channel precedence, texts, countdown and ticker."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 MODULE = Path(__file__).resolve().parents[1] / "nd2wsi/static/save-status-v1.js"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const {createTracker}=require(process.argv[1]);
@@ -22,10 +18,7 @@ const brief=status=>[status.state,status.text,status.visible];
 
 
 def run(body):
-    result = subprocess.run(
-        [NODE, "-e", HARNESS + body, str(MODULE)],
-        capture_output=True, encoding="utf-8", check=True, timeout=20,
-    )
+    result = run_node(HARNESS + body, MODULE, check=True)
     return json.loads(result.stdout)
 
 

@@ -12,17 +12,20 @@ extra = '''        def pane(code):
         before=pane('JSON.stringify(state.annotations)')
         geometry=r"""(() => {
           const layer=document.getElementById('ann-layer'), root=layer.querySelector('[data-ann-root]')||layer, points=[];
-          // a pure pan translates the marks' root group instead of redrawing them
-          const pan=/^translate\\((\\S+) (\\S+)\\)$/.exec(root.getAttribute('transform')||''), dx=pan?+pan[1]:0, dy=pan?+pan[2]:0;
+          // Outlines sit in image pixels under the image group's matrix, pins and
+          // labels are placed by translate, and a pure pan translates the root:
+          // map every point through its whole transform chain into layer pixels.
+          const toLayer=layer.getScreenCTM().inverse();
+          const at=(node,x,y)=>{const q=new DOMPoint(x,y).matrixTransform(toLayer.multiply(node.getScreenCTM())); return [q.x,q.y];};
+          const num=(node,name)=>+(node.getAttribute(name)||0);
           for(const p of root.querySelectorAll('g.hit > polygon'))
-            for(const xy of p.getAttribute('points').trim().split(/\\s+/)) points.push(xy.split(',').map(Number));
+            for(const xy of p.getAttribute('points').trim().split(/\\s+/)) points.push(at(p,...xy.split(',').map(Number)));
           for(const g of root.querySelectorAll('g.hit')) {
-            const p=g.querySelector('circle'); if(p) points.push([+p.getAttribute('cx'),+p.getAttribute('cy')]);
+            const p=g.querySelector('circle'); if(p) points.push(at(p,num(p,'cx'),num(p,'cy')));
           }
           for(const g of root.children) {
-            const line=g.querySelector('line'); if(line) points.push([+line.getAttribute('x1'),+line.getAttribute('y1')],[+line.getAttribute('x2'),+line.getAttribute('y2')]);
+            const line=g.querySelector('line'); if(line) points.push(at(line,num(line,'x1'),num(line,'y1')),at(line,num(line,'x2'),num(line,'y2')));
           }
-          for(const p of points) { p[0]+=dx; p[1]+=dy; }
           return {points,size:[state.viewer.viewport.getContainerSize().x,state.viewer.viewport.getContainerSize().y],rotation:state.viewer.viewport.getRotation(),flip:state.viewer.viewport.getFlip()};
         })()"""
         original=pane(geometry)

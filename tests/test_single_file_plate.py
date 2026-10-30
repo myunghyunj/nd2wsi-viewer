@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import shutil
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,7 +11,16 @@ from test_plate import plate_nd2 as _plate_nd2_fixture
 from test_single_file_recovery import _crash_write
 
 from nd2wsi.cache import quick_fingerprint, read_manifest
-from nd2wsi.plate import THUMB_K, PlateSource, PlateStore, plate_container
+from nd2wsi.plate import (
+    THUMB_K,
+    WINDOWS_KEY,
+    WINDOWS_METHOD,
+    PlateSource,
+    PlateStore,
+    _stored_windows,
+    _windows_record,
+    plate_container,
+)
 from nd2wsi.storage.single_file import write_entry
 
 plate_nd2 = _plate_nd2_fixture
@@ -170,3 +181,297 @@ def test_failed_plate_publication_restores_existing_package(plate_nd2, monkeypat
     assert package.read_bytes() == before
     assert not list(package.parent.glob(package.name + '.building-*'))
     assert not list(package.parent.glob(package.name + '.corrupt-*'))
+
+
+def _windows(source):
+    return [channel["window"] for channel in source.attrs["omero"]["channels"]]
+
+
+def _no_measuring(self, *args):
+    raise AssertionError("recorded display windows should spare reading frames")
+
+
+def test_display_windows_are_recorded_and_reused_without_reading_frames(plate_nd2, monkeypatch):
+    first = PlateSource(plate_nd2)
+    try:
+        measured = _windows(first)
+        z_home = first.z_home
+    finally:
+        first.close()
+    path = plate_container(plate_nd2)
+    manifest = read_manifest(path)
+    record = manifest[WINDOWS_KEY]
+    assert manifest["format"] == "nd2wsi-plate/2"
+    assert record["method"] == WINDOWS_METHOD
+    assert record["generation"] == manifest["generation"]
+    assert (record["t"], record["z"], record["k"]) == (0, z_home, 4)
+    assert record["windows"] == measured
+
+    monkeypatch.setattr(PlateSource, "_measure_windows", _no_measuring)
+    monkeypatch.setattr(PlateSource, "frame", _no_measuring)
+    again = PlateSource(plate_nd2)
+    try:
+        assert _windows(again) == measured
+        assert again.store.manifest == manifest
+    finally:
+        again.close()
+    explicit = PlateSource(plate_nd2, cache_path=path)
+    try:
+        assert _windows(explicit) == measured
+    finally:
+        explicit.close()
+    assert read_manifest(path) == manifest
+
+    with pytest.raises(AssertionError, match="spare reading frames"):
+        PlateSource(plate_nd2, store=False)  # an open without the store never looks
+
+
+def test_a_reader_uses_recorded_windows_and_never_writes_them(plate_nd2, monkeypatch):
+    path = plate_container(plate_nd2)
+    writer = PlateSource(plate_nd2)
+    try:
+        measured = _windows(writer)
+        unrecorded = dict(writer.store.manifest)
+        del unrecorded[WINDOWS_KEY]
+        write_entry(path, "manifest.json", json.dumps(unrecorded).encode())
+        reader = PlateSource(plate_nd2)
+        try:
+            assert not reader.store.writable
+            assert _windows(reader) == measured  # measured again from the source
+        finally:
+            reader.close()
+        assert read_manifest(path) == unrecorded
+    finally:
+        writer.close()
+
+    recording = PlateSource(plate_nd2)  # the next writer records them again
+    try:
+        assert recording.store.writable
+        monkeypatch.setattr(PlateSource, "_measure_windows", _no_measuring)
+        reader = PlateSource(plate_nd2)
+        try:
+            assert not reader.store.writable
+            assert _windows(reader) == measured
+        finally:
+            reader.close()
+    finally:
+        recording.close()
+    assert read_manifest(path)[WINDOWS_KEY]["windows"] == measured
+
+
+def test_a_stale_windows_record_is_measured_again_and_replaced(plate_nd2, monkeypatch):
+    first = PlateSource(plate_nd2)
+    try:
+        measured = _windows(first)
+    finally:
+        first.close()
+    path = plate_container(plate_nd2)
+    manifest = read_manifest(path)
+    manifest[WINDOWS_KEY]["method"] = "plate-low-percentile/0"
+    manifest[WINDOWS_KEY]["windows"][0]["start"] = 12345.0
+    write_entry(path, "manifest.json", json.dumps(manifest).encode())
+    calls = []
+    real_measure = PlateSource._measure_windows
+
+    def counting(self):
+        calls.append(self)
+        return real_measure(self)
+
+    monkeypatch.setattr(PlateSource, "_measure_windows", counting)
+    again = PlateSource(plate_nd2)
+    try:
+        assert _windows(again) == measured
+    finally:
+        again.close()
+    assert len(calls) == 1
+    record = read_manifest(path)[WINDOWS_KEY]
+    assert record["method"] == WINDOWS_METHOD
+    assert record["windows"] == measured
+
+
+def test_recorded_windows_survive_a_rebuild_of_their_cache(plate_nd2, monkeypatch):
+    """Windows read from a record are still kept when the store then finds
+    its arrays unreadable and rebuilds the cache: the fresh manifest records
+    them again, so the next open does not measure every site once more."""
+    first = PlateSource(plate_nd2)
+    try:
+        measured = _windows(first)
+    finally:
+        first.close()
+    path = plate_container(plate_nd2)
+    assert WINDOWS_KEY in read_manifest(path)
+    write_entry(path, "thumbs.zarr/done/.zarray", b"not json")
+
+    monkeypatch.setattr(PlateSource, "_measure_windows", _no_measuring)
+    rebuilt = PlateSource(plate_nd2)
+    try:
+        assert _windows(rebuilt) == measured
+        assert list(path.parent.glob(path.name + ".corrupt-*"))  # it was rebuilt
+    finally:
+        rebuilt.close()
+    manifest = read_manifest(path)
+    assert manifest[WINDOWS_KEY]["generation"] == manifest["generation"]
+    assert manifest[WINDOWS_KEY]["windows"] == measured
+    again = PlateSource(plate_nd2)
+    try:
+        assert _windows(again) == measured
+    finally:
+        again.close()
+
+
+def _listing(folder):
+    return sorted(p.name for p in folder.iterdir()) if folder.exists() else None
+
+
+@pytest.mark.parametrize("existing", ["none", "stale"])
+def test_an_open_that_fails_measuring_windows_leaves_the_cache_untouched(
+    plate_nd2, monkeypatch, existing
+):
+    """Looking for recorded windows is read only: an open that fails while
+    measuring them creates no cache and quarantines no stale one."""
+    path = plate_container(plate_nd2)
+    before = None
+    if existing == "stale":
+        PlateSource(plate_nd2).close()
+        st = plate_nd2.stat()
+        os.utime(plate_nd2, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+        recorded = read_manifest(path)
+        assert WINDOWS_KEY in recorded
+        assert recorded["source"]["mtime_ns"] != quick_fingerprint(plate_nd2)["mtime_ns"]
+        before = path.read_bytes()
+    listing = _listing(path.parent)
+    real_frame = PlateSource.frame
+
+    def unreadable_last_site(self, t, p, z):
+        if p == self.P - 1:
+            raise OSError("unreadable site")
+        return real_frame(self, t, p, z)
+
+    monkeypatch.setattr(PlateSource, "frame", unreadable_last_site)
+    with pytest.raises(OSError, match="unreadable site"):
+        PlateSource(plate_nd2)
+    assert _listing(path.parent) == listing
+    if before is None:
+        assert not (plate_nd2.parent / "nd2wsi").exists()
+    else:
+        assert path.read_bytes() == before
+
+
+_DROP = object()
+
+
+@pytest.mark.parametrize("keys, damage", [
+    pytest.param(("generation",), "rebuilt", id="cache-rebuilt"),
+    pytest.param((WINDOWS_KEY, "generation"), "older", id="record-generation"),
+    pytest.param(("source", "quick_sha256"), "0" * 64, id="source-fingerprint"),
+    pytest.param((WINDOWS_KEY, "source"), _DROP, id="record-without-fingerprint"),
+    pytest.param((WINDOWS_KEY, "method"), "plate-low-percentile/0", id="method"),
+    pytest.param((WINDOWS_KEY, "t"), 1, id="time-point"),
+    pytest.param((WINDOWS_KEY, "t"), False, id="time-point-not-an-integer"),
+    pytest.param((WINDOWS_KEY, "z"), 0, id="plane"),
+    pytest.param((WINDOWS_KEY, "k"), 8, id="reduction"),
+    pytest.param((WINDOWS_KEY, "dtype"), "uint8", id="dtype"),
+    pytest.param((WINDOWS_KEY, "rgb"), True, id="rgb"),
+    pytest.param((WINDOWS_KEY, "windows", 1), _DROP, id="channel-count"),
+    pytest.param((WINDOWS_KEY, "windows", 0, "end"), float("inf"), id="not-finite"),
+    pytest.param((WINDOWS_KEY, "windows", 0, "start"), "1.5", id="not-a-number"),
+    pytest.param((WINDOWS_KEY, "windows", 1, "max"), _DROP, id="missing-field"),
+    pytest.param((WINDOWS_KEY,), [], id="not-a-record"),
+])
+def test_a_windows_record_counts_only_for_its_generation_source_plane_and_method(keys, damage):
+    source = SimpleNamespace(
+        z_home=1, dtype=np.dtype(np.uint16), rgb=False, frame_shape=(2, 12, 16)
+    )
+    manifest = {
+        "generation": "g1",
+        "source": {"name": "plate.nd2", "size": 10, "mtime_ns": 5, "quick_sha256": "ab" * 32},
+    }
+    windows = [
+        {"start": 101.5, "end": 3900.25, "min": 0.0, "max": 65535.0},
+        {"start": 2.0, "end": 3.0, "min": 0.0, "max": 65535.0},
+    ]
+    manifest[WINDOWS_KEY] = _windows_record(manifest, source, windows)
+    manifest = json.loads(json.dumps(manifest))
+    assert _stored_windows(manifest, source) == windows
+    target = manifest
+    for key in keys[:-1]:
+        target = target[key]
+    if damage is _DROP:
+        del target[keys[-1]]
+    else:
+        target[keys[-1]] = damage
+    assert _stored_windows(manifest, source) is None
+
+
+def test_measured_windows_are_pinned_to_the_recorded_method():
+    """Recorded windows outlive releases. A change to how they are measured
+    must also change WINDOWS_METHOD, or older records stay in use."""
+    rng = np.random.default_rng(7)
+    sites = [rng.integers(200, 4000, (2, 12, 16)).astype(np.uint16) for _ in range(3)]
+    source = PlateSource.__new__(PlateSource)
+    source.P, source.z_home, source.dtype, source.rgb = 3, 0, np.dtype(np.uint16), False
+    source.reduced = lambda t, p, z, k: sites[p] if (t, z, k) == (0, 0, 4) else None
+    assert PlateSource._measure_windows(source) == [
+        {"start": pytest.approx(211.45), "end": pytest.approx(3964.125),
+         "min": 0.0, "max": 65535.0},
+        {"start": pytest.approx(216.025), "end": pytest.approx(3982.625),
+         "min": 0.0, "max": 65535.0},
+    ], "the measurement changed: bump plate.WINDOWS_METHOD and update these values"
+
+
+def test_background_fill_writes_each_thumbnail_chunk_once(plate_nd2, monkeypatch):
+    """Each committed write is one SQLite transaction with a full fsync, and
+    all sites of a (t, z) share one thumbnail chunk. Filling the store must
+    write each chunk, and its commit metadata, once per chunk rather than
+    once per site."""
+    from collections import Counter
+
+    from nd2wsi.plate_integrity import DIGEST_NAME
+    from nd2wsi.storage.single_file import SQLiteStore
+
+    source = PlateSource(plate_nd2)
+    try:
+        writes = []
+        real_write = SQLiteStore.write_bytes
+
+        def recording(self, key, payload):
+            writes.append(self._key(key))
+            return real_write(self, key, payload)
+
+        monkeypatch.setattr(SQLiteStore, 'write_bytes', recording)
+        source.store._build()  # the background pass, run here to completion
+        assert source.store.count() == T * P * Z
+    finally:
+        source.close()
+    chunks = Counter(key.rsplit('/', 2)[-2] for key in writes if '/.z' not in key)
+    assert chunks['thumbs'] == T * Z
+    assert chunks[DIGEST_NAME] == chunks['done'] == T * Z
+    thumbs = [key for key in writes if key.rsplit('/', 2)[-2] == 'thumbs']
+    assert len(set(thumbs)) == len(thumbs) == T * Z
+    reopened = PlateSource(plate_nd2)
+    try:
+        for t in range(T):
+            for p in range(P):
+                for z in range(Z):
+                    assert np.all(reopened.store.get(t, p, z) == value(t, p, z))
+    finally:
+        reopened.close()
+
+
+def test_a_window_record_with_an_oversized_number_is_measured_again():
+    # Hand edits can leave valid JSON that no float can hold; the record must
+    # count as malformed (and be rewritten), not make the store unavailable.
+    from types import SimpleNamespace
+
+    from nd2wsi import plate
+
+    fingerprint = {key: 1 for key in plate._FINGERPRINT_KEYS}
+    source = SimpleNamespace(z_home=0, dtype="uint16", rgb=False, frame_shape=(1, 8, 8))
+    window = {field: 10 ** 400 if n == 0 else 1.0 for n, field in enumerate(plate._WINDOW_FIELDS)}
+    manifest = {"generation": "g", "source": fingerprint, plate.WINDOWS_KEY: {
+        "method": plate.WINDOWS_METHOD, "generation": "g", "source": fingerprint,
+        "t": plate.WINDOWS_T, "z": 0, "k": plate.WINDOWS_K, "dtype": "uint16", "rgb": False,
+        "windows": [window]}}
+    assert plate._stored_windows(manifest, source) is None
+    window[plate._WINDOW_FIELDS[0]] = 2.0
+    assert plate._stored_windows(manifest, source) == [{field: float(window[field]) for field in plate._WINDOW_FIELDS}]

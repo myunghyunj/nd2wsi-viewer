@@ -1,9 +1,7 @@
 """Physical zoom is independent of image size, pane width and registration fit."""
 
 import pytest
-from test_compare_orientation_js import NODE, run
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
+from test_compare_orientation_js import run
 
 SETUP = """
 compare.members=['b'];compare.pairs.delete('c');

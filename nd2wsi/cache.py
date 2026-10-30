@@ -25,11 +25,13 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import numbers
 import os
 import re
 import shutil
 import socket
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -59,11 +61,88 @@ ALGORITHM = "box-mean-floor-v1"
 # A lock names the machine and boot that took it. A drive carried to
 # another computer brings its lockfiles along, and a pid from the other
 # machine means nothing here: the builder cannot be alive on this side.
-# The same goes for a lock from before a reboot, so the boot time is part
-# of the identity and no network hardware lookup is needed.
+# The same goes for a lock from before a reboot. Each window is its own
+# process, so both names must agree across every process of one boot, or
+# one window's sweep deletes another's live build: the machine is named by
+# its hardware or OS identity, not its host name (DHCP or a Bonjour conflict
+# can change that between two windows), and the boot by the system's boot
+# id, not a boot time (a clock step would move it). Where there is no boot
+# id the pid decides, as it did in 2.5.4.
+
+
+def _host_identity() -> str | None:
+    try:
+        if sys.platform == "darwin":
+            import ctypes
+
+            uuid_bytes = ctypes.create_string_buffer(16)
+            wait = (ctypes.c_long * 2)(1, 0)  # struct timespec: give up after 1 s
+            if ctypes.CDLL(None).gethostuuid(uuid_bytes, wait) == 0:
+                return uuid_bytes.raw.hex()
+        elif os.name == "nt":
+            import winreg
+
+            access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0, access) as key:
+                return str(winreg.QueryValueEx(key, "MachineGuid")[0]) or None
+        else:
+            for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+                try:
+                    found = Path(path).read_text(encoding="ascii").strip()
+                except (OSError, UnicodeError):
+                    continue
+                if found:
+                    return found
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return None
 
 
 def _machine_id() -> str:
+    """A hash naming this computer; the raw identity never reaches a lockfile."""
+    identity = _host_identity()
+    if identity is None:
+        return hashlib.sha1(socket.gethostname().encode()).hexdigest()[:12]
+    return hashlib.sha1(f"nd2wsi-lock|{identity}".encode()).hexdigest()[:12]
+
+
+def _boot_id() -> str | None:
+    """The system's identity of this boot, unchanged by sleep or clock steps."""
+    try:
+        if sys.platform == "darwin":
+            import ctypes
+
+            value = ctypes.create_string_buffer(64)
+            size = ctypes.c_size_t(len(value))
+            if ctypes.CDLL(None).sysctlbyname(
+                b"kern.bootsessionuuid", value, ctypes.byref(size), None, ctypes.c_size_t(0)
+            ) == 0:
+                return value.value.decode("ascii") or None
+        elif os.name == "nt":
+            import winreg
+
+            key_path = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                return str(winreg.QueryValueEx(key, "BootId")[0])
+        else:
+            return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip() or None
+    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
+        pass
+    return None
+
+
+def _boot_time() -> float | None:
+    """Wall-clock time of the last boot, counting sleep (macOS ``CLOCK_UPTIME_RAW``
+    does not); it bounds the names an older build could have written."""
+    try:
+        clock = getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
+        return time.time() - time.clock_gettime(clock)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _legacy_machine_id() -> str:
+    """The name 2.5.4 and older give this machine at this moment."""
     try:
         booted = round((time.time() - time.clock_gettime(time.CLOCK_UPTIME_RAW)) / 10)
     except (AttributeError, OSError, ValueError):
@@ -72,7 +151,48 @@ def _machine_id() -> str:
 
 
 _MACHINE_ID = _machine_id()
+_BOOT_ID = _boot_id()
+_BOOT_TIME = _boot_time()
+# Builds up to 2.5.4 read only "machine". Writing their name for this
+# process there keeps an older viewer still running here from taking a
+# 2.5.5 lock for a foreign machine's and sweeping its live build.
+_LEGACY_MACHINE_ID = _legacy_machine_id()
+# NTP steps and slew move the computed boot time by seconds; a reboot moves
+# it by at least the previous session's uptime.
+_BOOT_TOLERANCE_S = 120.0
 _FOREIGN_LOCK_STALE_S = 60.0
+# 2.5.4 and older named a lock sha1("host|b")[:12], with b the boot time
+# from CLOCK_UPTIME_RAW in tens of seconds, or 0 where that clock is missing
+# (Windows, Linux), and wrote no boot time. On macOS that b grew by the time
+# slept, so a viewer of that version still running here may have written any
+# b from this boot up to now. Matching every candidate lets its pid decide,
+# rather than treating its live build as a foreign machine's. Beyond this
+# many candidates (about 115 days slept since boot) the oldest are skipped.
+_LEGACY_ID_LIMIT = 1_000_000
+_legacy_ids: dict[str, Any] = {"key": None, "high": None, "ids": set()}
+_legacy_ids_lock = threading.Lock()
+
+
+def _legacy_machine_ids() -> set[str]:
+    host = socket.gethostname()
+
+    def legacy(b: int) -> str:
+        return hashlib.sha1(f"{host}|{b}".encode()).hexdigest()[:12]
+
+    try:
+        drifted = time.time() - time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    except (AttributeError, OSError, ValueError):
+        return {legacy(0)}
+    booted = _BOOT_TIME if _BOOT_TIME is not None else drifted
+    high = round((drifted + _BOOT_TOLERANCE_S) / 10)
+    low = max(round((booted - _BOOT_TOLERANCE_S) / 10), high - _LEGACY_ID_LIMIT)
+    with _legacy_ids_lock:
+        if _legacy_ids["key"] != (host, low) or _legacy_ids["high"] is None:
+            _legacy_ids.update(key=(host, low), high=low - 1, ids=set())
+        ids = _legacy_ids["ids"]
+        ids.update(legacy(b) for b in range(_legacy_ids["high"] + 1, high + 1))
+        _legacy_ids["high"] = max(_legacy_ids["high"], high)
+        return ids
 
 
 class CacheFromNewerApp(RuntimeError):
@@ -108,10 +228,29 @@ def newer_cache_format(container: str | Path) -> str | None:
     return str(m.get("format")) if number is not None and number > newest_known else None
 
 
+def _plane_part(value: Any, words: tuple[str, ...] = ()) -> str:
+    # None is what a store without that axis records (an SVS cache has
+    # z_resolved None), and it has always been named "None" on disk.
+    if value is None:
+        return "None"
+    if isinstance(value, numbers.Integral) and not isinstance(value, bool) and value >= 0:
+        return str(int(value))
+    if isinstance(value, str) and (value in words or re.fullmatch(r"[0-9]+", value)):
+        return value
+    raise ValueError(f"not a plane index: {value!r}")
+
+
 def selection_tag(selection: Any) -> str:
-    """``t0-p0-zmid`` — the requested selection, as named in the path."""
+    """``t0-p0-zmid`` — the requested selection, as named in the path.
+
+    The selection can come from a manifest inside a cache file someone
+    else made, so only plane indices and the z keywords may reach a path.
+    """
     sel = selection.describe() if hasattr(selection, "describe") else dict(selection)
-    return f"t{sel.get('t', 0)}-p{sel.get('p', 0)}-z{sel.get('z', 'mid')}"
+    t = _plane_part(sel.get("t", 0))
+    p = _plane_part(sel.get("p", 0))
+    z = _plane_part(sel.get("z", "mid"), ("mid", "max"))
+    return f"t{t}-p{p}-z{z}"
 
 
 def managed_dir(slide: str | Path) -> Path:
@@ -337,6 +476,18 @@ def quarantine(path: Path) -> Path:
     return target
 
 
+def _taken_elsewhere(info: dict[str, Any]) -> bool:
+    """True when a lock was taken on another machine or in another boot."""
+    if "host" in info:  # written by 2.5.5 or later
+        if info.get("host") != _MACHINE_ID:
+            return True
+        boot = info.get("boot")
+        return boot is not None and _BOOT_ID is not None and boot != _BOOT_ID
+    # 2.5.4 and older wrote only their own name of host and boot
+    machine = info.get("machine")
+    return machine is not None and machine not in _legacy_machine_ids()
+
+
 class CacheLock:
     """One build per source and selection, across processes.
 
@@ -407,7 +558,9 @@ class CacheLock:
             "pid": None if released else os.getpid(),
             "time": time.time(),
             "gen": gen,
-            "machine": _MACHINE_ID,
+            "machine": _LEGACY_MACHINE_ID,
+            "host": _MACHINE_ID,
+            "boot": _BOOT_ID,
         }
         if released:
             info["released"] = True
@@ -445,7 +598,7 @@ class CacheLock:
                 info is not None
                 and info.get("gen") == gen
                 and info.get("pid") == os.getpid()
-                and info.get("machine") == _MACHINE_ID
+                and info.get("host") == _MACHINE_ID
                 and info.get("released") is not True
                 and self._path_is_fd(fd)
             ):
@@ -467,10 +620,10 @@ class CacheLock:
             return time.time() - mtime > 30
         if info.get("released") is True:
             return True
-        machine = info.get("machine")
-        if machine is not None and machine != _MACHINE_ID:
-            # taken on another machine: its process cannot be running
-            # here, and only clock skew argues for a short grace
+        if _taken_elsewhere(info):
+            # taken on another machine or before a reboot: its process
+            # cannot be running here, and only clock skew argues for a
+            # short grace
             try:
                 age = time.time() - float(info.get("time", 0))
             except (TypeError, ValueError, OverflowError):
@@ -712,9 +865,8 @@ def sweep_stale_builds(caches_dir: Path) -> int:
         info = lock._read()
         live = False
         if info:
-            machine = info.get("machine")
-            if machine is not None and machine != _MACHINE_ID:
-                live = False  # a builder on another machine is not running here
+            if _taken_elsewhere(info):
+                live = False  # a builder on another machine or boot is not running here
             else:
                 try:
                     live = process_is_alive(int(info.get("pid", -1)))

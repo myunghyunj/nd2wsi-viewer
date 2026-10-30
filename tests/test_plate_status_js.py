@@ -1,14 +1,10 @@
 """Plate status polling must describe a real cache and own its request lifetime."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 CONTROLLER = Path(__file__).resolve().parents[1] / 'nd2wsi/static/plate-controller-v1.js'
-NODE = shutil.which('node')
-pytestmark = pytest.mark.skipif(NODE is None, reason='node is not installed')
 
 HARNESS = r"""
 const {createController}=require(process.argv[1]);
@@ -37,9 +33,10 @@ const status=(extra={})=>({path:null,format:null,total:6,done:0,perT:[0,0],build
 
 
 def run(script):
-    result = subprocess.run([NODE, '-e', HARNESS + script +
-                             "\n})().catch(e=>{console.error(e);process.exit(1)});", str(CONTROLLER)],
-                            check=True, capture_output=True, encoding='utf-8', timeout=20)
+    result = run_node(
+        HARNESS + script + "\n})().catch(e=>{console.error(e);process.exit(1)});",
+        CONTROLLER, check=True,
+    )
     return json.loads(result.stdout)
 
 

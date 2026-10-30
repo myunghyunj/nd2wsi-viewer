@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import io
 import json
-import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,6 +13,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from http_fixture import serving
 from PIL import Image
 
 from nd2wsi import astromap_export as am
@@ -242,15 +242,9 @@ def http_server(st):
     server = create_server([], port=0)
     sid = "1234abcd"
     server.registry.slides[sid] = st
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}/{server.token}/s/{sid}/"
-    try:
+    with serving(server):
         yield server, base
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=3)
 
 
 def test_http_export_download_pair_stale_generation_and_lifecycle_lease(monkeypatch):

@@ -145,9 +145,11 @@ def _write_level1_from_source(
     # emits blocks on the target grid, so the writer never has to reshuffle
     # half-tile output blocks into full store chunks.
     data = data.rechunk((1, out_tile * 2, out_tile * 2))
-    from .metal import enabled, reduce2x_or_cpu
+    from .metal import reduce2x_or_cpu
 
-    if enabled() and src.dtype in (np.dtype("uint8"), np.dtype("uint16")):
+    if src.dtype in (np.dtype("uint8"), np.dtype("uint16")):
+        # The GPU kernel when enabled, else the exact integer CPU box mean;
+        # every block is a whole number of 2x2 boxes, so none is dropped.
         mean = da.map_blocks(
             reduce2x_or_cpu, data, dtype=src.dtype,
             chunks=(data.chunks[0], tuple(n // 2 for n in data.chunks[1]),
@@ -1178,16 +1180,30 @@ def open_store(path: str | Path) -> tuple[Any, dict[str, Any]]:
 
 
 class _ClosableGroup:
-    """A Zarr group with an explicit lifetime for its single-file connection."""
+    """A Zarr group with an explicit lifetime for its single-file connection.
+
+    Members are looked up once per open root. A Zarr lookup re-reads the
+    member's metadata from SQLite on every call, and every tile read starts
+    with one. The group is read-only and a replaced pyramid always arrives
+    as a new root, so the memo cannot go stale; ``close()`` drops it
+    together with the connection.
+    """
 
     def __init__(self, group: Any):
         self._group = group
+        self._members: dict[str, Any] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._group, name)
 
     def __getitem__(self, key: str) -> Any:
-        return self._group[key]
+        try:
+            return self._members[key]
+        except KeyError:
+            pass
+        # concurrent first lookups may both build a member; keep one of them
+        return self._members.setdefault(key, self._group[key])
 
     def close(self, **_: Any) -> None:
+        self._members.clear()
         self._group.store.close()

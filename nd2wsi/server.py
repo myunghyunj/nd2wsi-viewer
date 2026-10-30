@@ -62,7 +62,7 @@ from .cache_removal import (
     _validate_file_cache_for_trash,
     rescue_annotations,
 )
-from .direct_common import _Lifecycle
+from .direct_common import LeaseClosed, _Lifecycle
 from .region_export import JOB_RE, ExportRequestError, prepare_export
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -72,6 +72,10 @@ ASSOCIATED_RE = re.compile(
     r"^/api/associated/(thumbnail|label|macro|associated-(?:[1-9]|1[0-6]))\.jpg$"
 )
 SLIDE_RE = re.compile(r"^/s/([0-9a-f]{8})(/.*)?$")
+# A rendered ROI of this many pixels or more counts as an export for close
+# and update. The viewer's scale-strip previews and size samples are at most
+# 512 px a side; streamed ND2/TIFF exports always count.
+EXPORT_COUNT_MIN_PIXELS = 4_000_000
 
 # region-export progress, polled by the viewer's status bar
 EXPORT_JOBS: dict[str, dict] = {}
@@ -162,16 +166,32 @@ class ViewerState:
             else None
         )
         self.manifest = dict(manifest or {})
-        self.busy = _Lifecycle()  # in-flight exports, so trash can refuse
-        self.lock = threading.Lock()  # zarr reads are thread-safe; lock kept for attrs
+        # Every slide read (tiles, pixels, histograms, exports) holds busy;
+        # close, replacement and trash drain it before any handle goes away.
+        self.busy = _Lifecycle()
+        # Only real exports (streamed ROI files, large renders, AstroMap)
+        # enter this, inside busy, except the AstroMap zip download: it reads
+        # the window's own file, holds only this, and AstromapDownloads keeps
+        # that file until the reader is done. Close and update wait for
+        # these, never for tile reads or export previews.
+        self.exports = _Lifecycle()
+        # zarr reads are thread-safe; this lock is kept for attrs, the LUT
+        # store's one-time setup and browser-mode annotation writes
+        self.lock = threading.Lock()
+        self._hist_lock = threading.Lock()  # one histogram computation at a time
         self._inspect_lock = threading.Lock()
         self._cache_usage_ready = False
         self._cache_usage: dict[str, int] | None = None
         self._lut_settings_store = None
         self._shading = None
+        self._shading_closed = False
         self._shading_lock = threading.Lock()
         self._replacement_lock = threading.RLock()
         self._closed = False
+        # Pairs _closed with busy's door and is never held while waiting:
+        # a replacement or refresh that drained reads readmits them only
+        # while the slide is open.
+        self._admission = threading.Lock()
         self.correction_write_allowed = True
         self._cache_identity = self._pyramid_identity()
 
@@ -180,17 +200,44 @@ class ViewerState:
         """Persistent, source-bound correction of the registered display pyramid."""
         with self._shading_lock:
             if self._shading is None:
+                if self._shading_closed:
+                    # A request that resolved this slide before it closed
+                    # must not start a correction on the retired state.
+                    raise ValueError("This slide's Shading Correction controller is closed")
                 from .h_correction import ShadingCorrectionController
 
                 self._shading = ShadingCorrectionController(self)
             return self._shading
 
-    def close_shading(self) -> None:
+    def close_shading(self, *, blocking: bool = True) -> bool:
+        """Close Shading Correction, mark the slide closed and bar its reads.
+
+        None of that waits. A pyramid replacement or refresh already past
+        its closed check holds the replacement lock while it drains reads,
+        for up to 30 s; it still finishes, but can no longer readmit reads.
+        With ``blocking`` this then waits for it to let go; with
+        ``blocking`` False it returns False while one holds the lock.
+        """
         with self._shading_lock:
+            self._shading_closed = True
             if self._shading is not None:
                 self._shading.close()
-        with self._replacement_lock:
+        self._mark_closed()
+        if not self._replacement_lock.acquire(blocking=blocking):
+            return False
+        self._replacement_lock.release()
+        return True
+
+    def _mark_closed(self) -> None:
+        with self._admission:
             self._closed = True
+            self.busy.close(timeout=0)
+
+    def _readmit(self) -> None:
+        """Admit reads after a replacement drained them, unless the slide closed."""
+        with self._admission:
+            if not self._closed:
+                self.busy.reopen()
 
     def _pyramid_identity(self):
         path = self.cache_path
@@ -234,7 +281,7 @@ class ViewerState:
             probe, _ = self._open_pyramid(replacement.staging, replacement.manifest)
             self._close_root(probe)
             if not self.busy.close(timeout=30):
-                self.busy.reopen()
+                self._readmit()
                 raise ValueError("A slide read/export is still running; retry the replacement")
             admitted = False
             try:
@@ -261,7 +308,7 @@ class ViewerState:
                 # If the OS denies reopening after a successful publish, the
                 # validated cache remains on disk. Keep reads barred until reopen.
                 if admitted:
-                    self.busy.reopen()
+                    self._readmit()
 
     def refresh_pyramid(self):
         """Observe another window's atomic replacement without resetting sidecars."""
@@ -284,13 +331,13 @@ class ViewerState:
             root, attrs = self._open_pyramid(self.cache_path, manifest)
             if not self.busy.close(timeout=30):
                 self._close_root(root)
-                self.busy.reopen()
+                self._readmit()
                 raise ValueError("Waiting for slide reads before opening the replaced pyramid")
             try:
                 self._close_root(self.root)
                 self._adopt_pyramid(root, attrs, manifest)
             finally:
-                self.busy.reopen()
+                self._readmit()
 
     @property
     def source_path(self) -> Path | None:
@@ -559,15 +606,6 @@ def reveal_in_file_manager(path: Path, *, platform: str | None = None, runner=No
         run(["/usr/bin/open", "-R", str(path)], check=True, timeout=10)
 
 
-def _close_state(st: ViewerState | None) -> None:
-    if st is None:
-        return
-    st.close_shading()
-    close = getattr(st.root, "close", None)
-    if close:
-        close()
-
-
 def store_generation(store_path: str | Path) -> str:
     """A token that changes whenever this store's pixels could have.
 
@@ -596,8 +634,15 @@ class SlideRegistry:
 
     def __init__(self, max_render_mpx: float = 400.0, *, window_session=None):
         self.slides: dict[str, ViewerState] = {}  # insertion-ordered
+        # States that left the registry with an export still running; it
+        # counts for close and update until it finishes.
+        self._retired: list[ViewerState] = []
+        # States that left the registry and whose roots have not closed yet,
+        # mostly while a read finishes; shutdown and relaunch wait for them.
+        self._closing: list[ViewerState] = []
         self.max_render_mpx = max_render_mpx
         self._lock = threading.Lock()
+        self._closing_done = threading.Condition(self._lock)
         self.window_session = window_session
         self.astromap_downloads = AstromapDownloads(
             getattr(window_session, "exports_root", None)
@@ -769,7 +814,8 @@ class SlideRegistry:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
-        _close_state(stale)
+            self._retire(stale, closing=True)
+        self._close_state(stale)
         return sid
 
     def _add_overview(
@@ -785,7 +831,7 @@ class SlideRegistry:
         runtime, the stored overview still shows — at half resolution,
         with a note saying why — rather than failing to open at all.
         """
-        from .cache import fingerprints_match, manifest_container, quick_fingerprint, source_base
+        from .cache import fingerprints_match, manifest_container, quick_fingerprint
         from .convert import open_store
         from .direct import open_nd2_backed
 
@@ -795,12 +841,12 @@ class SlideRegistry:
         stale = None
         with self._lock:
             src_info = manifest.get("source", {})
+            # None when the manifest's source is missing or outside the
+            # slide's folder; then no path from inside the cache is used.
             source = source_path or _manifest_source_path(container, manifest)
-            if source is None:
-                source = (source_base(container) / src_info.get("relative_path", "")).resolve()
             source_ok = False
             try:
-                source_ok = source.is_file() and fingerprints_match(
+                source_ok = source is not None and source.is_file() and fingerprints_match(
                     src_info, quick_fingerprint(source)
                 )
             except OSError:
@@ -817,7 +863,7 @@ class SlideRegistry:
                 stale = st
             root = attrs = None
             reason = f"{src_info.get('name', 'source')} is missing"
-            if source.is_file() and not source_ok:
+            if source is not None and source.is_file() and not source_ok:
                 reason = f"{source.name} has changed since this cache was built"
             if source_ok:
                 try:
@@ -825,51 +871,47 @@ class SlideRegistry:
                 except NotImplementedError as e:
                     reason = str(e)
             degraded = root is None
-            if degraded:
-                root, attrs = open_store(store_path)
-                meta = attrs["nd2wsi"]
-                meta["kind"] = "overview-degraded"
-                for lv in meta["levels"]:
-                    lv["downsample"] //= 2
-                # the base level is now the half-resolution overview, so a
-                # pixel is twice as large — otherwise every scalebar and
-                # measurement would read half its true length
-                if meta.get("pixel_size_um"):
-                    meta["pixel_size_um"] = [v * 2 for v in meta["pixel_size_um"]]
-                meta["notes"] = meta.get("notes", []) + [
-                    f"{reason}; showing the stored overview at half resolution"
-                ]
             try:
+                if degraded:
+                    root, attrs = open_store(store_path)
+                    meta = attrs["nd2wsi"]
+                    meta["kind"] = "overview-degraded"
+                    for lv in meta["levels"]:
+                        lv["downsample"] //= 2
+                    # the base level is now the half-resolution overview, so a
+                    # pixel is twice as large — otherwise every scalebar and
+                    # measurement would read half its true length
+                    if meta.get("pixel_size_um"):
+                        meta["pixel_size_um"] = [v * 2 for v in meta["pixel_size_um"]]
+                    meta["notes"] = meta.get("notes", []) + [
+                        f"{reason}; showing the stored overview at half resolution"
+                    ]
                 annotations = None if degraded else self.annotation_path(store_path, attrs)
+                st = ViewerState(
+                    root,
+                    attrs,
+                    max_render_mpx=self.max_render_mpx,
+                    # annotations live in level-0 pixels; a degraded view's base
+                    # is level 1, so editing here would silently corrupt them
+                    annotations_path=annotations,
+                    # the two modes map levels differently, so tiles cached as
+                    # immutable in one must never be revived in the other
+                    generation=gen + ("-degraded" if degraded else ""),
+                    trash_path=container,
+                    source_path=source,
+                    store_path=store_path,
+                    container_path=container,
+                    manifest=manifest,
+                )
             except BaseException:
-                close = getattr(root, "close", None)
-                if close is not None:
-                    try:
-                        close(delay=0)
-                    except TypeError:
-                        close()
+                ViewerState._close_root(root)
                 raise
-            st = ViewerState(
-                root,
-                attrs,
-                max_render_mpx=self.max_render_mpx,
-                # annotations live in level-0 pixels; a degraded view's base
-                # is level 1, so editing here would silently corrupt them
-                annotations_path=annotations,
-                # the two modes map levels differently, so tiles cached as
-                # immutable in one must never be revived in the other
-                generation=gen + ("-degraded" if degraded else ""),
-                trash_path=container,
-                source_path=source,
-                store_path=store_path,
-                container_path=container,
-                manifest=manifest,
-            )
             if self.agent_window:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
-        _close_state(stale)
+            self._retire(stale, closing=True)
+        self._close_state(stale)
         return sid
 
     def add_direct(self, slide_path: str | Path) -> str:
@@ -903,19 +945,18 @@ class SlideRegistry:
             root = attrs = None
             for _ in range(2):
                 root, attrs = open_direct(slide_path)
+                # Never registered, so nothing reads it: close now rather than
+                # after _Root's delay, which kept a Windows sharing lock open
+                # while the retry opened the file again.
                 try:
                     current = quick_fingerprint(slide_path)
                 except Exception:
-                    close = getattr(root, "close", None)
-                    if close:
-                        close()
+                    ViewerState._close_root(root)
                     raise
                 if fingerprints_match(fingerprint, current):
                     fingerprint = current
                     break
-                close = getattr(root, "close", None)
-                if close:
-                    close()
+                ViewerState._close_root(root)
                 root = attrs = None
                 fingerprint = current
             if root is None or attrs is None:
@@ -928,25 +969,24 @@ class SlideRegistry:
             stale = self.slides.get(sid)
             try:
                 annotations = self.annotation_path(slide_path, attrs)
+                st = ViewerState(
+                    root,
+                    attrs,
+                    max_render_mpx=self.max_render_mpx,
+                    annotations_path=annotations,
+                    generation=gen,
+                    source_path=slide_path,
+                    manifest={"source": fingerprint},
+                )
             except BaseException:
-                close = getattr(root, "close", None)
-                if close:
-                    close(delay=0)
+                ViewerState._close_root(root)
                 raise
-            st = ViewerState(
-                root,
-                attrs,
-                max_render_mpx=self.max_render_mpx,
-                annotations_path=annotations,
-                generation=gen,
-                source_path=slide_path,
-                manifest={"source": fingerprint},
-            )
             if self.agent_window:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
-        _close_state(stale)
+            self._retire(stale, closing=True)
+        self._close_state(stale)
         return sid
 
     def _add_plate_cache(self, cache_path: Path, manifest: dict) -> str:
@@ -1012,29 +1052,30 @@ class SlideRegistry:
                     source.root_for(0, 0, source.z_home), closer=source.close
                 )
                 annotations = self.annotation_path(slide_path, source.attrs, site=0)
+                stale = self.slides.get(sid)
+                container = source.store.container if source.store is not None else None
+                st = ViewerState(
+                    root,
+                    source.attrs,
+                    max_render_mpx=self.max_render_mpx,
+                    annotations_path=annotations,
+                    generation=gen,
+                    trash_path=container,
+                    source_path=slide_path,
+                    container_path=container,
+                    manifest=(dict(source.store.manifest) if source.store is not None
+                              else {"source": fingerprint}),
+                    plate=source,
+                )
             except BaseException:
                 source.close()
                 raise
-            stale = self.slides.get(sid)
-            container = source.store.container if source.store is not None else None
-            st = ViewerState(
-                root,
-                source.attrs,
-                max_render_mpx=self.max_render_mpx,
-                annotations_path=annotations,
-                generation=gen,
-                trash_path=container,
-                source_path=slide_path,
-                container_path=container,
-                manifest=(dict(source.store.manifest) if source.store is not None
-                          else {"source": fingerprint}),
-                plate=source,
-            )
             if self.agent_window:
                 private = getattr(self.window_session, "exports_root", None)
                 st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
             self.slides[sid] = st
-        _close_state(stale)
+            self._retire(stale, closing=True)
+        self._close_state(stale)
         return sid
 
     def open_path(self, path: str | Path, on_progress=None) -> str:
@@ -1081,24 +1122,30 @@ class SlideRegistry:
     def remove(self, sid: str) -> bool:
         with self._lock:
             st = self.slides.get(sid)
-            if st is not None and st._shading is not None:
-                st._shading.cancel()
-            if st is not None and self.window_session is not None:
-                # Atomically bar export admission; a separate active check
-                # would race an already-resolved HTTP export request.
-                if not st.busy.close(timeout=1):
-                    st.busy.reopen()
-                    raise ValueError("An export from this slide is still running; close it after the export finishes")
+            # Only a real export refuses a window's close, and it refuses
+            # before anything is cancelled or barred. The check also bars
+            # exports in one step, so an export request that resolved this
+            # slide already cannot start after it and go uncounted. Tile,
+            # pixel and histogram reads never refuse: _close_state lets them
+            # finish before the root closes.
+            if (st is not None and self.window_session is not None
+                    and not st.exports.close_if_idle()):
+                raise ValueError("An export from this slide is still running; close it after the export finishes")
+            # Shading Correction is closed by _close_state, without waiting:
+            # the controller's cancel() reports status, which may refresh the
+            # pyramid and wait for its reads while this lock is held.
             st = self.slides.pop(sid, None)
-        _close_state(st)
+            self._retire(st, closing=True)
+        self._close_state(st)
         return st is not None
 
     def close_all(self, *, immediate: bool = False) -> None:
         """Close every registered backend after the server stops.
 
-        Normal tab closure defers native-handle teardown briefly so in-flight
-        requests can finish. A stopped smoke-test server has no such requests,
-        so it may close source-backed roots synchronously.
+        Without ``immediate``, source-backed roots keep _Root's short delay
+        before their native handles close. A stopped smoke-test server has no
+        requests left, so it may close them synchronously, and it also waits
+        up to 30 s for slides closed earlier whose last reads are finishing.
         """
         with self._lock:
             states = list(self.slides.values())
@@ -1116,12 +1163,101 @@ class SlideRegistry:
                 except TypeError:
                     pass
             close()
+        if immediate:
+            self._wait_for_closing(timeout=30)
+
+    def _retire(self, st: ViewerState | None, *, closing: bool = False) -> None:
+        """Bar exports on a state leaving the registry; keep counting running ones.
+
+        Called under ``self._lock`` in the same step that removes or
+        replaces the state, so an export request that resolved it earlier
+        cannot start afterwards, and one already streaming still counts.
+        With ``closing`` the caller hands it to ``_close_state`` next, and
+        it is tracked until its root is closed, so a shutdown or relaunch
+        that comes first still waits for it.
+        """
+        if st is None:
+            return
+        self._retired = [old for old in self._retired if old.exports.active]
+        if not st.exports.close(timeout=0):
+            self._retired.append(st)
+        if closing:
+            self._closing.append(st)
+
+    def _close_state(self, st: ViewerState | None) -> None:
+        """Close a state that has left the registry and been tracked as closing.
+
+        Requests that resolved it before it left may still be reading. New
+        reads and exports are barred at once, and the root closes as soon as
+        the last read is done, without _Root's delay: never under a reader,
+        and without holding the calling request thread.
+        """
+        if st is None:
+            return
+        handed_off = False
+        try:
+            st.exports.close(timeout=0)
+            # The slide is marked closed and its reads barred at once, so a
+            # pyramid replacement or refresh still running can no longer
+            # readmit them. While one holds the replacement lock it may still
+            # swap the root, so the root closes once it has let go. A plate's
+            # frame reads and cache builder hold no busy, and its close waits
+            # for them, so a plate always closes on the closer thread.
+            quiet = st.close_shading(blocking=False)
+            if quiet and st.plate is None and st.busy.close(timeout=0):
+                ViewerState._close_root(st.root)
+                return
+
+            def close_after_reads() -> None:
+                try:
+                    self._close_after_reads(st, quiet)
+                finally:
+                    self._untrack_closing(st)
+
+            try:
+                threading.Thread(
+                    target=close_after_reads, name="nd2wsi-slide-close", daemon=True
+                ).start()
+                handed_off = True
+            except Exception:
+                # No thread to wait on: wait here rather than leave it open.
+                self._close_after_reads(st, quiet)
+        finally:
+            if not handed_off:
+                self._untrack_closing(st)
+
+    @staticmethod
+    def _close_after_reads(st: ViewerState, quiet: bool) -> None:
+        if not quiet:
+            st.close_shading()  # waits for the replacement or refresh
+        st.busy.close(timeout=None)
+        if st.plate is not None:
+            st.plate.close(timeout=None)
+        else:
+            ViewerState._close_root(st.root)
+
+    def _untrack_closing(self, st: ViewerState) -> None:
+        with self._lock:
+            self._closing = [old for old in self._closing if old is not st]
+            self._closing_done.notify_all()
+
+    def _wait_for_closing(self, *, timeout: float | None) -> bool:
+        """Wait for slides closed earlier to finish closing their roots."""
+        with self._lock:
+            return self._closing_done.wait_for(lambda: not self._closing, timeout)
 
     def active_export_count(self) -> int:
-        """Return the number of exports which are still using slide state."""
+        """Return the number of real exports which are still running.
+
+        Tile, pixel and histogram reads, export previews and size samples
+        hold only ``busy``; they never hold back a tab close or an update.
+        An export on a slide that was closed, reopened from a changed file
+        or trashed while it ran counts until it finishes.
+        """
         with self._lock:
-            states = list(self.slides.values())
-        return sum(st.busy.active for st in states)
+            self._retired = [st for st in self._retired if st.exports.active]
+            states = [*self.slides.values(), *self._retired]
+        return sum(st.exports.active for st in states)
 
     def close_all_for_relaunch(self) -> None:
         """Synchronously release every source and writer before an update.
@@ -1147,6 +1283,9 @@ class SlideRegistry:
                 close(delay=0)
             except TypeError:
                 close()
+        # Slides closed just before, whose last reads are still finishing,
+        # close their roots the same way once those reads end.
+        self._wait_for_closing(timeout=None)
 
     def trash_cache(self, sid: str, on_progress=None) -> int:
         """Close the slide and delete its pyramid store. Returns bytes freed.
@@ -1295,14 +1434,21 @@ class SlideRegistry:
                         "this viewer lost the plate cache writer — reopen the "
                         "slide before deleting"
                     )
-                if not st.busy.close(timeout=30):
-                    # No resource was closed or renamed. Restore admission so a
-                    # timed-out delete cannot leave a listed but unusable slide.
-                    st.busy.reopen()
-                    raise ValueError(
-                        "an export from this slide did not finish in time — "
-                        "try again when it finishes"
-                    )
+                # A refresh after another window's rebuild must not swap the
+                # root or readmit reads between the drain and the slide being
+                # marked closed, so both happen under its lock. The correction
+                # controller closes after it: its cancel() refreshes while
+                # holding the controller's own lock.
+                with st._replacement_lock:
+                    if not st.busy.close(timeout=30):
+                        # No resource was closed or renamed. Restore admission so a
+                        # timed-out delete cannot leave a listed but unusable slide.
+                        st.busy.reopen()
+                        raise ValueError(
+                            "an export from this slide did not finish in time — "
+                            "try again when it finishes"
+                        )
+                    st._mark_closed()
 
                 try:
                     st.close_shading()
@@ -1340,6 +1486,7 @@ class SlideRegistry:
                     )
                     if backend_closed:
                         self.slides.pop(sid, None)
+                        self._retire(st)
                     else:
                         st.busy.reopen()
                     raise
@@ -1350,6 +1497,7 @@ class SlideRegistry:
                 # registered state or an absent cache, never install a new state
                 # in the pop-to-rename gap and have it deleted underneath it.
                 self.slides.pop(sid, None)
+                self._retire(st)
                 # Rename while the registry plus both filesystem locks are
                 # held. Current opens cannot bind this soon-to-be-deleted inode.
                 doomed = store.with_name(
@@ -1399,9 +1547,16 @@ class SlideRegistry:
             return next(iter(self.slides), None)
 
     def get(self, sid: str | None) -> ViewerState | None:
-        with self._lock:
-            if sid is None:
-                sid = next(iter(self.slides), None)
+        if sid is not None:
+            # Writers still serialise under _lock and one dict lookup is
+            # atomic. A caller may get a state that is about to be replaced
+            # or removed, as it always could once the lock was released. The
+            # busy lease guards slide reads only, not info, LUT or annotation
+            # requests. Skipping the lock keeps open slides serving while
+            # another slide opens.
+            return self.slides.get(sid) if sid else None
+        with self._lock:  # iterating can race a resize, so keep the lock
+            sid = next(iter(self.slides), None)
             return self.slides.get(sid) if sid else None
 
     def listing(self) -> list[dict[str, Any]]:
@@ -1438,12 +1593,33 @@ def content_disposition(filename: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
 
 
+def _sidecar_items(document: Any, *, require_items: bool = False) -> list:
+    """The items of an annotation sidecar, which must be a JSON object.
+
+    A window snapshot without items is empty (a missing one reads as {}, and
+    the window writer keeps other keys). A file the browser server rewrites
+    whole on save must name its items (require_items), or a document of some
+    other kind would be replaced by the pane's empty list. Anything else
+    raises ValueError.
+    """
+    if not isinstance(document, dict):
+        raise ValueError("annotation document must be a JSON object")
+    if require_items and "items" not in document:
+        raise ValueError("annotation document has no items list")
+    items = document.get("items", [])
+    if not isinstance(items, list):
+        raise ValueError("annotation items must be a list")
+    return items
+
+
 def make_handler(
     registry: SlideRegistry, token: str = ""
 ) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nd2wsi"
+        # Set once a download has sent its status line; reset per request.
+        _response_started = False
 
         # ---- helpers -----------------------------------------------------
         def _discard_rejected_body(self) -> None:
@@ -1483,32 +1659,77 @@ def make_handler(
             rejecting_post = self.command == "POST" and code >= 300
             if rejecting_post:
                 self.close_connection = True
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
+            # As in _stream_file: once the status line may be out, a failed
+            # write cannot become an error reply inside this one's declared
+            # length. _error drops the connection instead.
+            self._response_started = True
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self._policy_headers(cache)
+                if self.close_connection:
+                    self.send_header("Connection", "close")
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+                if rejecting_post:
+                    import socket
+
+                    self.wfile.flush()
+                    try:
+                        self.connection.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    self._discard_rejected_body()
+            except BaseException:
+                self.close_connection = True
+                raise
+
+        def _policy_headers(self, cache: str) -> None:
             self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
-            if self.close_connection:
-                self.send_header("Connection", "close")
-            for k, v in (extra or {}).items():
-                self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(body)
-            if rejecting_post:
-                import socket
 
-                self.wfile.flush()
-                try:
-                    self.connection.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-                self._discard_rejected_body()
+        def _stream_file(
+            self,
+            write_body,
+            *,
+            size: int,
+            content_type: str,
+            filename: str,
+        ) -> None:
+            """Send a 200 download whose body ``write_body(wfile)`` copies out.
+
+            Once the status line is out, a failure can no longer become an
+            error reply: it would land inside the declared Content-Length on
+            a keep-alive connection. The connection is closed instead and the
+            exception propagates, so the export's own context still sees it.
+            """
+            disposition = content_disposition(filename)
+            self._response_started = True
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", disposition)
+                self._policy_headers("no-store")
+                self.end_headers()
+                write_body(self.wfile)
+            except BaseException:
+                self.close_connection = True
+                raise
 
         def _json(self, obj: Any, code: int = 200):
             self._send(code, json.dumps(obj).encode(), "application/json")
 
         def _error(self, code: int, msg: str):
+            if self._response_started:
+                # A download already sent its status and length; drop the
+                # connection rather than write JSON into its body.
+                self.close_connection = True
+                return
             self._json({"error": msg}, code)
 
         def _body_json(self, limit: int = 10_000_000) -> Any:
@@ -1580,6 +1801,7 @@ def make_handler(
             return path[len(prefix) :]
 
         def do_GET(self):  # noqa: N802 (http.server API)
+            self._response_started = False
             try:
                 parsed = urllib.parse.urlparse(self.path)
                 path = self._gate()
@@ -1618,7 +1840,17 @@ def make_handler(
                     except ValueError as e:
                         return self._error(409, str(e))
                 if sub == "/api/shading/status":
-                    return self._json(st.shading.status())
+                    try:
+                        controller = st.shading
+                    except ValueError:
+                        if not st._shading_closed:
+                            raise
+                        # Resolved before the close, which came before any
+                        # controller: answer as a closed controller does.
+                        from .h_correction import closed_status
+
+                        return self._json(closed_status(st))
+                    return self._json(controller.status())
                 if sub == "/api/annotations":
                     return self._annotations_get(st, q)
                 associated = ASSOCIATED_RE.match(sub)
@@ -1643,8 +1875,10 @@ def make_handler(
                 if sub == "/api/astromap/download":
                     return self._astromap_download(st, q)
                 return self._error(404, f"no route for {path}")
-            except BrokenPipeError:
-                pass
+            except ConnectionError:
+                # BrokenPipe on macOS, ConnectionReset/Aborted on Windows: the
+                # client left, so nothing more can be sent on this socket.
+                self.close_connection = True
             except Exception as e:  # pragma: no cover - defensive
                 try:
                     self._error(500, f"{type(e).__name__}: {e}")
@@ -1652,6 +1886,7 @@ def make_handler(
                     pass
 
         def do_POST(self):  # noqa: N802 (http.server API)
+            self._response_started = False
             try:
                 parsed = urllib.parse.urlparse(self.path)
                 path = self._gate()
@@ -1710,8 +1945,8 @@ def make_handler(
                 if st is not None and sub == "/api/reveal":
                     return self._reveal(st)
                 return self._error(404, f"no POST route for {path}")
-            except BrokenPipeError:
-                pass
+            except ConnectionError:
+                self.close_connection = True
             except Exception as e:  # pragma: no cover - defensive
                 try:
                     self._error(500, f"{type(e).__name__}: {e}")
@@ -2017,26 +2252,26 @@ def make_handler(
                 return self._error(400, str(e))
             if p is None:
                 return self._json({"items": [], "path": None})
+            # A sidecar that is not an object with an items list is refused,
+            # never read as empty: the pane's next save would replace it.
             if registry.annotation_workspace is not None:
                 try:
                     document, rev = registry.annotation_workspace.read(p)
-                    return self._json({"items": document.get("items", []), "path": str(p),
+                    items = _sidecar_items(document)
+                    return self._json({"items": items, "path": str(p),
                                        "revision": rev, "window": registry.window_session.as_dict()})
                 except (ValueError, UnicodeError, OSError, TimeoutError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             if p.exists():
                 try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
-                    items = data.get("items", []) if isinstance(data, dict) else []
-                except (json.JSONDecodeError, UnicodeError, OSError) as e:
+                    items = _sidecar_items(json.loads(p.read_text(encoding="utf-8")), require_items=True)
+                except (ValueError, UnicodeError, OSError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             else:
                 items = []
             self._json({"items": items, "path": str(p)})
 
         def _annotations_post(self, st: ViewerState, q: dict | None = None):
-            import uuid as _uuid
-
             try:
                 p, site = self._plate_site(st, q or {})
             except ValueError as e:
@@ -2089,12 +2324,16 @@ def make_handler(
                 except (ValueError, UnicodeError, OSError, TimeoutError) as e:
                     return self._error(500, f"could not save {p.name}: {e}")
                 return self._json({"ok": True, "path": str(p), "count": len(data["items"]), "revision": rev})
-            # unique temp + per-slide lock: two tabs saving at once cannot
-            # interleave through one shared temp name
-            with st.lock:
-                tmp = p.with_name(f".{p.name}.{_uuid.uuid4().hex[:8]}.tmp")
-                tmp.write_text(json.dumps(payload, indent=1))
-                tmp.replace(p)  # atomic
+            from .annotation_workspace import _atomic_write
+
+            # unique, fsynced temp + per-slide lock: two tabs saving at once
+            # cannot interleave, and a crash leaves the old or the new file
+            raw = json.dumps(payload, indent=1).encode("utf-8")
+            try:
+                with st.lock:
+                    _atomic_write(p, raw)
+            except OSError as e:
+                return self._error(500, f"could not save {p.name}: {e}")
             self._json({"ok": True, "path": str(p), "count": len(data["items"])})
 
         def _histogram(self, st: ViewerState, q: dict | None = None):
@@ -2110,7 +2349,10 @@ def make_handler(
                         "frame": {"t": t, "p": p, "z": z},
                     }
                 )
-            with st.lock:
+            # Its own lock: LUT settings and annotation saves on st.lock never
+            # wait for a histogram. Requests hold busy, and a replacement
+            # drains busy before it resets histograms.
+            with st._hist_lock:
                 if st.histograms is None:
                     st.histograms = render.compute_histograms(st.root, st.attrs)
             self._json(
@@ -2205,7 +2447,7 @@ def make_handler(
                 # A pyramid replacement drains this lease before changing root,
                 # attrs or generation. Do not acquire _replacement_lock here:
                 # replacement holds it while waiting for readers to finish.
-                with st.busy:
+                with st.busy, st.exports:
                     plan = prepare_astromap(st, payload, resolve_frame=_frame_args,
                                            filename_prefix=prefix)
                     result = registry.astromap_downloads.create(plan, st)
@@ -2220,18 +2462,27 @@ def make_handler(
         def _astromap_download(self, st: ViewerState, q: dict):
             key = (q.get("token") or [""])[0]
             try:
-                with registry.astromap_downloads.download(key, st) as (item, source):
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Length", str(item.path.stat().st_size))
-                    self.send_header("Content-Disposition", content_disposition(item.filename))
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("X-Content-Type-Options", "nosniff")
-                    self.end_headers()
-                    while chunk := source.read(1024 * 1024):
-                        self.wfile.write(chunk)
+                # The zip is this window's own file, not slide pixels, so it
+                # takes no busy lease; it still counts for close and update.
+                with st.exports, registry.astromap_downloads.download(key, st) as (item, source):
+
+                    def write_body(output) -> None:
+                        while chunk := source.read(1024 * 1024):
+                            output.write(chunk)
+
+                    self._stream_file(
+                        write_body,
+                        size=item.path.stat().st_size,
+                        content_type="application/zip",
+                        filename=item.filename,
+                    )
             except AstromapError as exc:
                 return self._error(404, str(exc))
+            except LeaseClosed as exc:
+                if exc.lease is not st.exports:
+                    raise
+                # The slide closed before the download began.
+                return self._error(409, "slide was closed")
 
         def _roi(self, st: ViewerState, q: dict):
             try:
@@ -2243,31 +2494,35 @@ def make_handler(
                 raise
 
         def _roi_impl(self, st: ViewerState, q: dict):
+            from contextlib import nullcontext
+
             prefix = (
                 f"agent-{registry.window_session.id[:12]}_"
                 if registry.agent_window else ""
             )
             try:
                 export = prepare_export(st, q, resolve_frame=_frame_args, filename_prefix=prefix)
-                if export.streams_file:
-                    with export.file(_job_update) as artifact:
-                        size = artifact.size
-                        self.send_response(200)
-                        self.send_header("Content-Type", artifact.content_type)
-                        self.send_header("Content-Length", str(size))
-                        self.send_header(
-                            "Content-Disposition", content_disposition(artifact.filename)
-                        )
-                        self.end_headers()
-                        artifact.copy_to(self.wfile)
-                    return
-                artifact = export.rendered()
+                # Scale-strip previews and size samples are api/roi reads too.
+                # They stay plain slide reads so they never block a close.
+                counted = (export.streams_file
+                           or export.w * export.h >= EXPORT_COUNT_MIN_PIXELS)
+                with st.exports if counted else nullcontext():
+                    if export.streams_file:
+                        with export.file(_job_update) as artifact:
+                            self._stream_file(
+                                artifact.copy_to,
+                                size=artifact.size,
+                                content_type=artifact.content_type,
+                                filename=artifact.filename,
+                            )
+                        return
+                    artifact = export.rendered()
+                    return self._send(
+                        200, artifact.body, artifact.content_type,
+                        {"Content-Disposition": content_disposition(artifact.filename)},
+                    )
             except ExportRequestError as e:
                 return self._error(400, str(e))
-            return self._send(
-                200, artifact.body, artifact.content_type,
-                {"Content-Disposition": content_disposition(artifact.filename)},
-            )
 
     return Handler
 

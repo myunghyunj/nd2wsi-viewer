@@ -9,7 +9,6 @@ requests are refused.
 
 import json
 import socket
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -19,6 +18,8 @@ import pytest
 
 tifffile = pytest.importorskip("tifffile")
 pytest.importorskip("imagecodecs")
+
+from http_fixture import running_server  # noqa: E402
 
 from nd2wsi.server import create_server, make_handler, server_url  # noqa: E402
 
@@ -33,10 +34,8 @@ def served(tmp_path_factory):
                     compressionargs={"reversible": True})
         tw.write(img, subifds=1, description="Aperio Image|MPP = 0.5", **opts)
         tw.write(img[:700, :896][::4, ::4].copy(), subfiletype=1, **opts)
-    httpd = create_server(p, host="127.0.0.1", port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    yield httpd
-    httpd.shutdown()
+    with running_server(p, host="127.0.0.1") as httpd:
+        yield httpd
 
 
 def _status(url, method="GET", data=None, headers=None):

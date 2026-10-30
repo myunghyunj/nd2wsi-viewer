@@ -6,17 +6,12 @@ and driven with a fake fetch that records every request and its init.
 """
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
 MODULE = STATIC / "annotation-store-v1.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const { createStore } = require(process.argv[1]);
@@ -69,9 +64,9 @@ const emit = (value) => process.stdout.write(JSON.stringify(value));
 
 
 def _run(body):
-    result = subprocess.run(
-        [NODE, "-e", HARNESS + "(async () => {" + body + "})().catch((error) => { console.error(error); process.exit(1); });", str(MODULE)],
-        capture_output=True, text=True, encoding="utf-8", check=True, timeout=20,
+    result = run_node(
+        HARNESS + "(async () => {" + body + "})().catch((error) => { console.error(error); process.exit(1); });",
+        MODULE, check=True,
     )
     return json.loads(result.stdout)
 
@@ -237,6 +232,31 @@ emit({recovered, retried, posts: posts(), dirty: state.annDirty, failed: store.f
     assert out["posts"] == ["api/annotations?p=0"] * 3
     # the retry sent the current owner's snapshot, so its success cleared the dirty flag
     assert out["dirty"] is False and out["failed"] == 0 and out["last"] == ["saved"]
+
+
+def test_an_edit_made_while_a_sidecar_failed_to_load_is_never_sent_but_other_sites_still_retry():
+    # The load emptied the list first: sending it would replace site 1's
+    # sidecar with only the mark made meanwhile.
+    out = _run("""
+server.fail.set("api/annotations?p=0", 500).set("api/annotations?p=1", 500);
+edit("a"); runTimers(); await tick(); // site 0's save fails and waits for a retry
+store.resetOwner(); state.plate.focus = 1;
+const loading = store.load(1);
+edit("b"); // before the load answered
+await loading; await tick();
+const failed = {loadFailed: state.annLoadFailed, dirty: state.annDirty, timers: timers.size};
+server.fail.clear();
+const pagehide = await store.flushOnPagehide();
+const retried = await store.retryFailed();
+let flushed = "ok";
+try { await store.flushForUpdate(); } catch (error) { flushed = error.message; }
+emit({failed, pagehide, retried, posts: posts(), flushed});
+""")
+    assert out["failed"] == {"loadFailed": True, "dirty": False, "timers": 0}
+    assert out["pagehide"] == {"ok": True, "sent": False}
+    assert out["retried"] == {"ok": True, "retried": 1}
+    assert out["posts"] == ["api/annotations?p=0"] * 2
+    assert out["flushed"] == "ok"
 
 
 def test_retry_and_pagehide_respect_a_locked_pane_and_a_missing_plate_site_without_status_text():

@@ -5,10 +5,32 @@ import zipfile
 import numpy as np
 import pytest
 from PIL import Image, PdfParser
-from test_astromap_export import make_state, prepare
 
 from nd2wsi import astromap_export as am
 from nd2wsi import astromap_pdf as atlas
+from nd2wsi.server import ViewerState, _frame_args
+
+
+def make_state(*, width=80, height=60, rgb=False, root=None, levels=None):
+    """A three-channel slide; by default one level of flat 40/100/160 planes."""
+    levels = levels or [{"path": "0", "width": width, "height": height}]
+    channels = [
+        {"label": name, "color": color, "window": {"start": 0, "end": 255}}
+        for name, color in zip(("R", "G", "B"), ("FF0000", "00FF00", "0000FF"))
+    ]
+    attrs = {"nd2wsi": {"source": "example.nd2", "levels": levels, "rgb": rgb},
+             "omero": {"channels": channels}}
+    if root is None:
+        root = {levels[0]["path"]: np.stack([
+            np.full((height, width), value, np.uint8) for value in (40, 100, 160)
+        ])}
+    return ViewerState(root, attrs, generation="current")
+
+
+def prepare(st=None, **changes):
+    payload = {"generation": "current", "rois": [{"x": 5, "y": 6, "w": 12, "h": 9, "note": "A"}],
+               "channels": [0, 1, 2], "window": None, "frame": None} | changes
+    return am.prepare_astromap(st or make_state(), payload, resolve_frame=_frame_args)
 
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])

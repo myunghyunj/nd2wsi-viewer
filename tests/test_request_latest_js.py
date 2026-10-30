@@ -1,11 +1,9 @@
 """Frame ownership and stale async completion guards in production JavaScript."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 MODULE = (
     Path(__file__).resolve().parents[1]
@@ -15,19 +13,10 @@ MODULE = (
 )
 APP = MODULE.with_name("app.js")
 INDEX = MODULE.with_name("index.html")
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 def _run(script):
-    result = subprocess.run(
-        [NODE, "-e", script, str(MODULE)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=20,
-    )
+    result = run_node(script, MODULE, check=True)
     return json.loads(result.stdout)
 
 

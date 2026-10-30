@@ -11,14 +11,32 @@ from nd2wsi import smoke
 
 def test_sdpc_smoke_uses_frozen_bytes_and_decoder_only(tmp_path, monkeypatch, capsys):
     av = pytest.importorskip("av")
-    open_media = av.open
+    open_media, codec, codec_context = av.open, av.Codec, av.CodecContext
+    decoders = []
 
-    def decode_only(file, mode="r", *args, **kwargs):
+    def open_for_reading(file, mode="r", *args, **kwargs):
         assert mode == "r", "the packaged SDPC smoke test must never encode HEVC"
         return open_media(file, mode, *args, **kwargs)
 
-    monkeypatch.setattr(av, "open", decode_only)
+    def decoder_codec(name, mode="r"):
+        assert mode == "r", "the packaged SDPC smoke test must never look up an encoder"
+        return codec(name, mode)
+
+    class DecoderContexts:
+        @staticmethod
+        def create(name, mode=None, *args, **kwargs):
+            context = codec_context.create(name, mode, *args, **kwargs)
+            assert context.is_decoder and not context.is_encoder, (
+                "the packaged SDPC smoke test must never encode HEVC"
+            )
+            decoders.append(context.name)
+            return context
+
+    monkeypatch.setattr(av, "open", open_for_reading)
+    monkeypatch.setattr(av, "Codec", decoder_codec)
+    monkeypatch.setattr(av, "CodecContext", DecoderContexts)
     smoke._smoke_sdpc(tmp_path)
+    assert decoders and set(decoders) == {"hevc"}, "the smoke check decoded no SDPC tile"
     assert "smoke ok: SDPC" in capsys.readouterr().out
 
 

@@ -22,6 +22,8 @@ from typing import Any
 
 import numpy as np
 
+from ..direct_common import box_mean
+
 _lock = threading.RLock()
 _library = None
 _load_error = None
@@ -173,15 +175,11 @@ def reduce2x_cpu(block: np.ndarray, out_dtype: Any = None) -> np.ndarray:
     dropped; a caller repeats an axis already collapsed to one pixel before
     calling. ``out_dtype`` defaults to the block's dtype: an integer output
     takes the mean through ``np.rint`` (ties-to-even) before the cast, a
-    floating output is cast without any rounding.
+    floating output is cast without any rounding. This is
+    :func:`nd2wsi.direct_common.box_mean` at k=2, which reaches the same
+    bits through integer sums for uint8/uint16 input.
     """
-    dtype = np.dtype(block.dtype if out_dtype is None else out_dtype)
-    h, w = (int(n) // 2 * 2 for n in block.shape[-2:])
-    boxes = block[..., :h, :w].reshape((*block.shape[:-2], h // 2, 2, w // 2, 2))
-    mean = boxes.mean(axis=(-3, -1), dtype=np.float32)
-    if np.issubdtype(dtype, np.integer):
-        return np.rint(mean).astype(dtype)
-    return mean.astype(dtype)
+    return box_mean(block, 2, out_dtype)
 
 
 def reduce2x_or_cpu(block: np.ndarray, out_dtype: Any = None) -> np.ndarray:

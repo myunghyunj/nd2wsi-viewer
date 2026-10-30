@@ -6,8 +6,7 @@
 
 | Channel | Download | Verification |
 | --- | --- | --- |
-| Stable 2.4.1 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.4.1/nd2wsi-viewer-2.4.1-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.4.1) |
-| 2.5 Beta1 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.0b1/nd2wsi-viewer-2.5.0b1-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.5.0b1) |
+| Stable 2.5.5 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.5/nd2wsi-viewer-2.5.5-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.5.5) |
 
 Extract the entire ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
 The archive includes Python and the scientific libraries. Builds after 2.5.4
@@ -27,14 +26,14 @@ unknown-publisher warning. Updates are installed manually from Releases.
 Windows uses the standard title bar and does not use the macOS Sparkle updater.
 Use **Ctrl** for Mac **⌘** shortcuts and **Alt** for **Option**.
 
-Stable 2.4.1 includes Astromap ROI import/export and supported HEVC SDPC viewing.
+Stable 2.5.5 includes Astromap ROI import/export and supported HEVC SDPC viewing.
 Shading Correction assesses supported FITC and CY3 channels; BF and DAPI remain
 unchanged. See the [current method and limits](shading-correction-validation.md).
 
-2.5 Beta1 adds the collapsible top tools and translucent viewer, with ROI boxes,
+It has the collapsible top tools and the translucent viewer, with ROI boxes,
 navigation, locking and a 10–100% opacity slider. Windows applies opacity to
 the whole floating window, including its controls and ROI outlines. See the
-[2.5 Beta1 notes](release-notes-2.5.0b1.md).
+[2.5.5 notes](release-notes-2.5.5.md) for what changed in this release.
 
 Older validation records below apply only to the versions named in them.
 
@@ -102,9 +101,8 @@ emulation, not an ARM64-native binary.
 ## Installer build tooling
 
 The Windows app uses a native frame and Microsoft Edge WebView2. Installer
-tooling can produce a versioned Setup executable, but the current stable 2.4.1
-and 2.5 Beta1 downloads are portable ZIPs; no Setup installer is published for
-those releases. The tooling installs the app
+tooling can produce a versioned Setup executable, but the current stable 2.5.5
+download is a portable ZIP; no Setup installer is published for that release. The tooling installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
 Windows Settings > Apps for removal. The executable and `_internal` directory
@@ -221,14 +219,14 @@ To bundle the WebView2 runtime as CI does, download the cab pinned in
 to the build command.
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.5.0b1-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.5.5-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.5.0b1-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.5.5-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks

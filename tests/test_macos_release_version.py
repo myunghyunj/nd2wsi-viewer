@@ -27,7 +27,7 @@ def write_release_plist(tmp_path, builder, version):
     project = tmp_path / "pyproject.toml"
     project.write_text(f'[project]\nversion = "{version}"\n')
     completed = subprocess.run([sys.executable, "-", str(target), str(project)],
-                               input=script, text=True, capture_output=True)
+                               input=script, text=True, capture_output=True, timeout=30)
     return completed, target, original
 
 

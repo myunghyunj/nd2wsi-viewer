@@ -6,15 +6,12 @@ renderSaveStatus, wireSaveStatusTooltip) are sliced from ``app.js`` and run
 with the real ``save-status-v1.js`` tracker, fake timers and fake controllers.
 """
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi/static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const fs=require('fs'),path=require('path'),vm=require('vm');
@@ -54,7 +51,8 @@ function element(id){
   Object.defineProperty(el,'textContent',{get(){return this._text},set(v){this._text=v;this.writes++}});
   return el;
 }
-const nodes={'save-status':element('save-status'),'save-status-tooltip':element('save-status-tooltip')};
+const nodes={'save-status':element('save-status'),'save-status-tooltip':element('save-status-tooltip'),
+  'ann-editor':element('ann-editor')};
 nodes['save-status-tooltip'].rect={left:0,top:0,right:160,bottom:30,width:160,height:30};
 nodes['save-status'].attrs['aria-label']='Auto-save'; // as the markup ships it
 const state={quitPreparing:false,lutPersistence:null,saveStatus:null,autoSaveRetry:null};
@@ -66,7 +64,10 @@ const lutPersistence={dirty:false,isDirty(){return this.dirty},
 const window=eventTarget({innerWidth:800,innerHeight:600,
   Nd2SaveStatus:{createTracker:options=>SaveStatus.createTracker({...options,now:()=>now,setInterval,clearInterval})}});
 const document=eventTarget({});
-const context={state,window,document,setTimeout,clearTimeout,setInterval,clearInterval,annotationStore,$:id=>nodes[id]||null};
+// The note editor commits its text through annotationsChanged(), which marks the store dirty.
+const closeEditor=save=>{calls.push(['closeEditor',save]);nodes['ann-editor'].hidden=true;};
+const context={state,window,document,setTimeout,clearTimeout,setInterval,clearInterval,annotationStore,closeEditor,
+  $:id=>nodes[id]||null};
 vm.createContext(context);
 const start=source.indexOf('/* ---- auto-save status'),end=source.indexOf('function pixelSize(',start);
 if(start<0||end<0)throw new Error('auto-save source bounds not found');
@@ -79,10 +80,10 @@ const report=(channel,event)=>state.saveStatus.report(channel,event);
 
 
 def run(body):
-    result = subprocess.run(
-        [NODE, "-e", HARNESS + "(async()=>{" + body + "})().then(v=>process.stdout.write(JSON.stringify(v)))"
-         ".catch(e=>{console.error(e);process.exitCode=1});", str(STATIC)],
-        capture_output=True, text=True, encoding="utf-8", timeout=20,
+    result = run_node(
+        HARNESS + "(async()=>{" + body + "})().then(v=>process.stdout.write(JSON.stringify(v)))"
+        ".catch(e=>{console.error(e);process.exitCode=1});",
+        STATIC,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -133,6 +134,58 @@ context.wireAutoSave();state.lutPersistence=lutPersistence;
 fire(window,'pagehide');return calls;
 """)
     assert out == [["ann.flushOnPagehide", {"keepalive": True}]]
+
+
+@pytest.mark.parametrize("quit_preparing", [False, True])
+def test_pagehide_commits_the_open_note_editor_before_the_keepalive_flush(quit_preparing):
+    out = run(f"""
+context.wireAutoSave();state.lutPersistence=lutPersistence;
+nodes['ann-editor'].hidden=false;state.quitPreparing={json.dumps(quit_preparing)};
+fire(window,'pagehide');return {{calls,editorHidden:nodes['ann-editor'].hidden}};
+""")
+    if quit_preparing:
+        # the native save-before-close owns the editor while the shell quits
+        assert out == {"calls": [], "editorHidden": False}
+    else:
+        assert out == {"calls": [["closeEditor", True], ["ann.flushOnPagehide", {"keepalive": True}]],
+                       "editorHidden": True}
+
+
+# Other pageshow listeners may share these files (the shell restarts its own
+# polling on pageshow), so the reload handler is found by name, not position.
+PAGESHOW = r"""
+const fs=require('fs'),path=require('path'),vm=require('vm');
+const NAME='reloadIfRestoredFromCache';
+const REGISTRATION='window.addEventListener("pageshow", '+NAME+');';
+const results={};
+for(const name of ['app.js','shell-v1.js']){
+  // Windows CI checks out CRLF; the function is cut out by its '\n}\n' end.
+  const source=fs.readFileSync(path.join(process.argv[1],name),'utf8').replace(/\r\n/g,'\n');
+  const start=source.indexOf('function '+NAME+'(');
+  if(start<0)throw new Error('no '+NAME+' in '+name);
+  const handlers=[],reloads=[];
+  const context={window:{addEventListener:(type,fn)=>handlers.push([type,fn])},
+    location:{reload:()=>reloads.push(true)}};
+  vm.createContext(context);
+  const registrations=source.split(REGISTRATION).length-1;
+  vm.runInContext(source.slice(start,source.indexOf('\n}\n',start)+3)+REGISTRATION.repeat(registrations),
+    context);
+  handlers.forEach(([,fn])=>fn({persisted:false}));
+  const fresh=reloads.length;
+  handlers.forEach(([,fn])=>fn({persisted:true}));
+  results[name]={types:handlers.map(([type])=>type),fresh,restored:reloads.length-fresh,
+    references:source.split(NAME).length-1};
+}
+process.stdout.write(JSON.stringify(results));
+"""
+
+
+def test_pane_and_shell_reload_only_when_restored_from_the_back_forward_cache():
+    result = run_node(PAGESHOW, STATIC)
+    assert result.returncode == 0, result.stderr
+    # one declaration and exactly one pageshow registration per page
+    expected = {"types": ["pageshow"], "fresh": 0, "restored": 1, "references": 2}
+    assert json.loads(result.stdout) == {"app.js": expected, "shell-v1.js": expected}
 
 
 def test_minute_retry_requeues_annotations_flushes_dirty_luts_and_counts_down_in_the_failed_text():

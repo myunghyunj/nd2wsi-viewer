@@ -8,12 +8,178 @@ backend may use shards without changing the converter.
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from ..platform_io import filesystem_path
+
+
+def _index(value: Any, length: int, *, wrap: bool) -> int | None:
+    """``value`` as an in-range axis position, or None when it is not one."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        return None
+    index = int(value)
+    if wrap and index < 0:
+        index += length
+    return index if 0 <= index < length else None
+
+
+def _window(value: Any, length: int) -> tuple[int, int, bool] | None:
+    """(start, stop, keeps_axis) for an integer or a non-empty unit-step slice."""
+    if isinstance(value, slice):
+        if value.step is not None and value.step != 1:
+            return None
+        try:
+            start, stop, _ = value.indices(length)
+        except (TypeError, ValueError):
+            return None
+        return (start, stop, True) if start < stop else None
+    index = _index(value, length, wrap=True)
+    return None if index is None else (index, index + 1, False)
+
+
+class ZarrV2RegionReader:
+    """Read small selections of one Zarr v2 array straight from its chunks.
+
+    Zarr routes every read through its event loop and worker threads, which
+    costs more than the chunk decode itself for a cached tile and serializes
+    concurrent readers. This reader serves only selections whose result is
+    certain to equal Zarr's in values, shape and dtype: a full-rank tuple of
+    integers and unit-step slices, or a list of in-range integers on the first
+    axis, whose window lies inside one chunk along every other axis. That is
+    a cached tile, one channel of it, or a few of its channels. ``read``
+    returns None for anything else, and the caller asks Zarr instead.
+
+    ``fetch(key)`` returns a chunk's encoded bytes, or None where the chunk
+    was never written (Zarr fills it with the zero fill value). ``spread``
+    runs several chunk decodes, possibly concurrently, and returns when all
+    of them are done, raising the first error. Without it they run in turn.
+    """
+
+    def __init__(
+        self,
+        metadata: dict[str, Any],
+        path: str,
+        fetch: Callable[[str], bytes | None],
+        spread: Callable[[list[Callable[[], None]]], None] | None = None,
+    ):
+        import numcodecs
+
+        if metadata.get("zarr_format") != 2 or metadata.get("order", "C") != "C":
+            raise ValueError("direct reads need a C-order Zarr v2 array")
+        if metadata.get("filters"):
+            raise ValueError("direct reads do not apply filters")
+        fill = metadata.get("fill_value")
+        if not isinstance(fill, (int, float)) or fill != 0 or math.copysign(1, fill) < 0:
+            raise ValueError("direct reads need a zero fill value")  # -0.0 is not zeros
+        if not isinstance(metadata.get("dtype"), str):
+            raise ValueError("direct reads need a plain dtype")
+        self.dtype = np.dtype(metadata["dtype"])
+        if self.dtype.kind not in "biuf" or not self.dtype.isnative:
+            raise ValueError("direct reads need a native numeric dtype")
+        self.shape = tuple(int(value) for value in metadata["shape"])
+        self.chunk_shape = tuple(int(value) for value in metadata["chunks"])
+        if not self.shape or len(self.chunk_shape) != len(self.shape) or min(self.chunk_shape) < 1:
+            raise ValueError("direct reads need matching shape and chunks")
+        separator = metadata.get("dimension_separator", ".")
+        if separator not in (".", "/"):
+            raise ValueError(f"unknown dimension separator {separator!r}")
+        compressor = metadata.get("compressor")
+        self._codec = None if compressor is None else numcodecs.get_codec(compressor)
+        self._separator = separator
+        self._prefix = f"{path}/" if path else ""
+        self._fetch = fetch
+        self._spread = spread
+
+    @classmethod
+    def open(
+        cls,
+        path: str,
+        fetch: Callable[[str], bytes | None],
+        spread: Callable[[list[Callable[[], None]]], None] | None = None,
+    ) -> ZarrV2RegionReader | None:
+        """The reader for the array at ``path``, or None when only Zarr can read it."""
+        raw = fetch(f"{path}/.zarray" if path else ".zarray")
+        if raw is None:
+            return None
+        try:
+            return cls(json.loads(raw), path, fetch, spread)
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def read(self, selection: Any) -> np.ndarray | None:
+        """The selected values, or None when Zarr should serve this selection."""
+        if not isinstance(selection, tuple) or len(selection) != len(self.shape):
+            return None
+        first, *rest = selection
+        length, step = self.shape[0], self.chunk_shape[0]
+        if isinstance(first, list):
+            # Zarr reads this orthogonally only beside plain ints and slices,
+            # and with no slice at all it is a coordinate selection instead.
+            if not any(isinstance(value, slice) for value in rest) or not all(
+                isinstance(value, slice) or type(value) is int for value in rest
+            ):
+                return None
+            rows = [_index(value, length, wrap=False) for value in first]
+            if not rows or None in rows:
+                return None
+            keep_first = True
+        else:
+            span = _window(first, length)
+            if span is None:
+                return None
+            rows, keep_first = range(span[0], span[1]), span[2]
+        windows = []
+        for value, size, edge in zip(rest, self.shape[1:], self.chunk_shape[1:]):
+            span = _window(value, size)
+            if span is None or span[0] // edge != (span[1] - 1) // edge:
+                return None  # a wider window: Zarr fetches its chunks concurrently
+            windows.append(span)
+        if not keep_first and not any(keep for _, _, keep in windows):
+            return None  # a single element is a 0-d array in Zarr
+        grid = [start // edge for (start, _, _), edge in zip(windows, self.chunk_shape[1:])]
+        inner = tuple(
+            slice(start - cell * edge, stop - cell * edge)
+            for (start, stop, _), cell, edge in zip(windows, grid, self.chunk_shape[1:])
+        )
+        out = np.empty((len(rows), *(stop - start for start, stop, _ in windows)), self.dtype)
+        by_chunk: dict[int, list[tuple[int, int]]] = {}
+        for slot, row in enumerate(rows):
+            by_chunk.setdefault(row // step, []).append((slot, row % step))
+        tasks = [
+            partial(self._fill, out, self._key((cell, *grid)), rows_in_chunk, inner)
+            for cell, rows_in_chunk in by_chunk.items()
+        ]
+        if len(tasks) > 1 and self._spread is not None:
+            self._spread(tasks)
+        else:
+            for task in tasks:
+                task()
+        keep = (slice(None) if keep_first else 0,) + tuple(
+            slice(None) if keep else 0 for _, _, keep in windows
+        )
+        return out[keep]
+
+    def _key(self, index: tuple[int, ...]) -> str:
+        return self._prefix + self._separator.join(str(value) for value in index)
+
+    def _fill(
+        self, out: np.ndarray, key: str, rows: list[tuple[int, int]], inner: tuple[slice, ...]
+    ) -> None:
+        payload = self._fetch(key)
+        if payload is None:
+            for slot, _ in rows:
+                out[slot] = 0
+            return
+        decoded = payload if self._codec is None else self._codec.decode(payload)
+        chunk = np.frombuffer(decoded, self.dtype).reshape(self.chunk_shape)
+        for slot, offset in rows:
+            out[slot] = chunk[(offset, *inner)]
 
 
 class ZarrV2ChunkArray:

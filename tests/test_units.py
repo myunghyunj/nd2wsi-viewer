@@ -1,4 +1,5 @@
 """Fast unit tests that need no ND2 file."""
+import json
 import os
 import stat
 import threading
@@ -147,6 +148,42 @@ def test_tidy_caches_moves_only_our_stores(tmp_path):
     assert (tmp_path / "pyramids" / "a.ome.zarr").is_dir()
     assert (tmp_path / "pyramids" / "b.ome.zarr").is_dir()
     assert foreign.is_dir() and not ours.exists()
+
+
+def test_tidy_remove_corrupt_caches_rescues_annotations_first(tmp_path, capsys):
+    # plate.py and convert.py quarantine old stores whole because an older
+    # build may have put annotations inside; tidy must not destroy them.
+    from nd2wsi.cli import main
+
+    caches = tmp_path / "nd2wsi" / "caches"
+    plate = caches / "x--plate.nd2svs.corrupt-20261001T000000"
+    (plate / "nested").mkdir(parents=True)
+    (plate / "nested" / "annotations_slide.nd2.json").write_bytes(b'{"items": [1]}')
+    (plate / "chunk.bin").write_bytes(b"\0" * 64)
+    pyramid = tmp_path / "pyramids" / "x.ome.zarr.corrupt-20261001T000000"
+    pyramid.mkdir(parents=True)
+    (pyramid / "annotations_x.nd2.json").write_bytes(b'{"items": [2]}')
+
+    assert main(["tidy", str(tmp_path), "--remove-corrupt-caches"]) == 0
+    assert not plate.exists() and not pyramid.exists()
+    home = tmp_path / "nd2wsi" / "annotations"
+    assert (home / "annotations_slide.nd2.json").read_bytes() == b'{"items": [1]}'
+    assert (home / "annotations_x.nd2.json").read_bytes() == b'{"items": [2]}'
+    assert "rescued annotations_slide.nd2.json" in capsys.readouterr().out
+
+
+def test_tidy_keeps_a_quarantined_store_whose_annotations_cannot_be_saved(tmp_path, capsys):
+    from nd2wsi.cli import main
+
+    corpse = tmp_path / "nd2wsi" / "caches" / "x.nd2svs.corrupt-1"
+    corpse.mkdir(parents=True)
+    (corpse / "annotations_x.nd2.json").write_bytes(b"[]")
+    # the rescue destination is a file, so nothing can be copied out
+    (tmp_path / "nd2wsi" / "annotations").write_bytes(b"")
+
+    assert main(["tidy", str(tmp_path), "--remove-corrupt-caches"]) == 0
+    assert (corpse / "annotations_x.nd2.json").read_bytes() == b"[]"
+    assert "kept x.nd2svs.corrupt-1" in capsys.readouterr().err
 
 
 def test_annotations_live_in_the_managed_folder(tmp_path):
@@ -407,6 +444,121 @@ def test_annotation_sidecars_follow_source_and_plane(tmp_path):
     assert "slide.nd2" in z0.name and "z0" in z0.name
     assert "z1" in z1.name
     assert "slide.svs" in svs.name
+
+
+@pytest.mark.parametrize("z_resolved", [
+    "x/../../../../victim/planted", "..\\..\\victim", "mid/..", -1, True, 1.5, [0],
+])
+def test_cache_manifest_selection_cannot_steer_the_sidecar_path(tmp_path, z_resolved):
+    # A .nd2svs from someone else carries its own manifest; its plane
+    # values must not decide where annotation files are written.
+    from nd2wsi.annotation_sidecars import annotations_sidecar
+    from nd2wsi.storage.single_file import write_entry
+
+    received = tmp_path / "received"
+    received.mkdir()
+    cache = received / "slide--t0-p0-zmid.nd2svs"
+    write_entry(cache, "manifest.json", json.dumps({
+        "format": "nd2wsi-cache/5", "kind": "full", "complete": True,
+        "source": {"name": "slide.nd2"},
+        "selection": {"t": 0, "p": 0, "z": "x", "z_resolved": z_resolved},
+    }).encode())
+    (received / "annotations_slide.json").write_text("[]")
+    before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+
+    with pytest.raises(ValueError):
+        annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}})
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == before
+
+
+def test_a_cache_from_elsewhere_cannot_move_the_annotations_folder(tmp_path):
+    # Its manifest may name any existing same-named file as its source; only
+    # the file it was really built from (by fingerprint) decides the folder.
+    from nd2wsi.annotation_sidecars import annotations_sidecar
+    from nd2wsi.cache import quick_fingerprint
+    from nd2wsi.storage.single_file import write_entry
+
+    received, other = tmp_path / "received", tmp_path / "other"
+    received.mkdir()
+    other.mkdir()
+    (other / "slide.nd2").write_bytes(b"unrelated")
+    cache = received / "slide--t0-p0-zmid.nd2svs"
+
+    def manifest(**source):
+        write_entry(cache, "manifest.json", json.dumps({
+            "format": "nd2wsi-cache/5", "kind": "full", "complete": True,
+            "source": {"name": "slide.nd2", "relative_path": "../other/slide.nd2", **source},
+            "selection": {"t": 0, "p": 0, "z": "mid", "z_resolved": 0},
+        }).encode())
+
+    manifest()
+    (received / "annotations_slide.json").write_text("[]")
+    path = annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}})
+    assert path.parent == received / "nd2wsi" / "annotations"
+    assert sorted(p.name for p in other.iterdir()) == ["slide.nd2"]
+
+    # nor can a matching fingerprint, which a copy that keeps mtimes makes
+    # easy to know: every real cache keeps its source in this folder anyway
+    manifest(**quick_fingerprint(other / "slide.nd2"))
+    path = annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}}, migrate=False)
+    assert path.parent == received / "nd2wsi" / "annotations"
+    assert sorted(p.name for p in other.iterdir()) == ["slide.nd2"]
+
+
+@pytest.mark.parametrize("layout, rel", [
+    ("nd2wsi/caches/slide--t0-p0-zmid.nd2svs", "../../slide.nd2"),
+    ("nd2wsi/caches/slide--t0-p0-zmid.nd2wsi-cache", "../../../slide.nd2"),
+    ("slide--t0-p0-zmid.nd2svs", "slide.nd2"),
+])
+def test_manifest_source_is_accepted_only_in_the_slides_folder(tmp_path, layout, rel):
+    from nd2wsi.annotation_sidecars import _manifest_source_path
+
+    slide = tmp_path / "slides" / "slide.nd2"
+    slide.parent.mkdir()
+    slide.write_bytes(b"nd2")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "slide.nd2").write_bytes(b"someone else's")
+    container = slide.parent / layout
+    container.parent.mkdir(parents=True, exist_ok=True)
+    found = _manifest_source_path(container, {"source": {"name": "slide.nd2", "relative_path": rel}})
+    assert found == slide.resolve()
+    for outside in ("../" * rel.count("../") + "../other/slide.nd2", "../" * 6, str(tmp_path / "other" / "slide.nd2")):
+        assert _manifest_source_path(container, {"source": {"relative_path": outside}}) is None
+    # a directory in the slide's folder is never a source; a deleted source
+    # keeps its path as provenance
+    (slide.parent / "subdir").mkdir()
+    assert _manifest_source_path(container, {"source": {"relative_path": rel.replace("slide.nd2", "subdir")}}) is None
+    slide.unlink()
+    assert _manifest_source_path(container, {"source": {"name": "slide.nd2", "relative_path": rel}}) == slide.resolve()
+
+
+@pytest.mark.parametrize("selection", [["t"], 1, "t0"])
+def test_a_cache_with_an_unreadable_plane_selection_is_refused(tmp_path, selection):
+    from nd2wsi.annotation_sidecars import annotations_sidecar
+    from nd2wsi.storage.single_file import write_entry
+
+    cache = tmp_path / "slide--t0-p0-zmid.nd2svs"
+    write_entry(cache, "manifest.json", json.dumps({
+        "format": "nd2wsi-cache/5", "kind": "full", "complete": True,
+        "source": {"name": "slide.nd2"}, "selection": selection,
+    }).encode())
+    with pytest.raises(ValueError):
+        annotations_sidecar(cache, {"nd2wsi": {"source": "slide.nd2"}})
+
+
+def test_selection_tag_accepts_the_planes_the_app_writes():
+    from nd2wsi.cache import selection_tag
+    from nd2wsi.reader import PlaneSelection
+
+    assert selection_tag(PlaneSelection()) == "t0-p0-zmid"
+    assert selection_tag(PlaneSelection(t=2, p=3, z="max")) == "t2-p3-zmax"
+    assert selection_tag({"t": "1", "p": 0, "z": 4}) == "t1-p0-z4"
+    # an SVS cache records z_resolved None; existing sidecars carry that name
+    assert selection_tag({"t": 0, "p": 0, "z": None}) == "t0-p0-zNone"
+    assert selection_tag({"t": np.int64(2), "p": 0, "z": np.uint16(3)}) == "t2-p0-z3"
+    for bad in ({"t": "../a"}, {"p": -2}, {"z": "mid/.."}, {"t": False}):
+        with pytest.raises(ValueError):
+            selection_tag(bad)
 
 
 def test_auto_workers_respects_cpu_memory_and_absolute_caps(monkeypatch):

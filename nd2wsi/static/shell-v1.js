@@ -849,8 +849,19 @@ function applyFrameLayout() {
   divider.setAttribute("aria-hidden", String(!twoUp));
   for (const [key, frame] of frames) {
     const index = group.indexOf(key);
-    frame.classList.toggle("active", !compare.enabled && key === active);
+    const shown = !compare.enabled && key === active;
+    frame.classList.toggle("active", shown);
     frame.classList.toggle("compare-cell", index >= 0);
+    // Tell a pane when it is hidden or shown again, so it can pause work
+    // nobody sees (plate playback). Only changes are posted; a pane that is
+    // still loading counts itself visible and cannot be played while hidden.
+    const visible = shown || index >= 0;
+    if (frame.dataset.paneVisible !== String(visible)) {
+      frame.dataset.paneVisible = String(visible);
+      frame.contentWindow?.postMessage({
+        nd2wsi: "pane-visibility", version: VIEWPORT_PROTOCOL_VERSION, visible,
+      }, location.origin);
+    }
     frame.style.left = frame.style.top = frame.style.width = frame.style.height = "";
     if (index < 0) continue;
     let cell;
@@ -886,6 +897,13 @@ function activate(sid) {
   focusActivePane();
 }
 
+// Browser mode: the panes tear their save tracking down on pagehide, so a
+// window restored from the back/forward cache loads afresh, every pane with it.
+function reloadIfRestoredFromCache(event) {
+  if (event.persisted) location.reload();
+}
+window.addEventListener("pageshow", reloadIfRestoredFromCache);
+
 function refresh(selectSid) {
   return fetch("api/slides", { cache: "no-store" })
     .then((response) => response.json())
@@ -896,6 +914,7 @@ function refresh(selectSid) {
         if (!openSids.has(key)) {
           frame.remove();
           frames.delete(key);
+          forgetClosedPane(key);
           nativeGesturePaneScopes.delete(key);
           readyFrames.delete(key);
           shadingStates.delete(key);
@@ -998,6 +1017,11 @@ async function closeTab(sid) {
     if (api?.update_block_reason) {
       const reason = await api.update_block_reason();
       if (reason) throw new Error(reason);
+    }
+    // An update or window close may have started preparing while the native
+    // check was answering; restarting it here would unlock its panes.
+    if (quitPreparation || quitPreparationRequestId) {
+      throw new Error("Finish the current save or close operation before closing another tab.");
     }
     // Removing an iframe would discard its editor, debounce and failed-save
     // snapshots. Reuse the acknowledged flush, including older plate sites,
@@ -1158,6 +1182,26 @@ function finishQuitPreparation(result) {
   pending.resolve(result);
 }
 
+// Every pane still targeted has answered: the preparation succeeds unless
+// one of them refused.
+function settleQuitPreparation(pending) {
+  if (pending !== quitPreparation || pending.seen.size !== pending.targets.size) return;
+  finishQuitPreparation(pending.errors.length
+    ? { ok: false, error: pending.errors.join("; ") }
+    : { ok: true, panes: pending.targets.size });
+}
+
+// refresh() removed a pane whose slide the server closed. It holds nothing
+// left to save and can no longer answer, so a preparation that targeted it,
+// one that started while its tab was closing, stops waiting for it.
+function forgetClosedPane(sid) {
+  quitPreparedPanes.delete(sid);
+  const pending = quitPreparation;
+  if (!pending || !pending.targets.delete(sid)) return;
+  pending.seen.delete(sid);
+  settleQuitPreparation(pending);
+}
+
 window.nd2wsiPrepareForUpdate = (requestId) => {
   const id = String(requestId || "");
   if (!id) return Promise.resolve({ ok: false, error: "missing update request" });
@@ -1185,8 +1229,12 @@ window.nd2wsiPrepareForUpdate = (requestId) => {
     pending.timer = setTimeout(() => {
       if (quitPreparation !== pending) return;
       const missing = [...targets].filter((sid) => !pending.seen.has(sid));
+      // A pane that never confirmed has not answered: native preparation
+      // keeps it frozen between retries, and a repeated close may offer to
+      // close without confirmed saves.
       finishQuitPreparation({
         ok: false,
+        unanswered: true,
         error: `save confirmation timed out for ${missing.length} pane(s)`,
       });
     }, 8000);
@@ -3008,11 +3056,7 @@ window.addEventListener("message", (event) => {
     if (!event.data.ok) {
       pending.errors.push(`${slideName(senderSid)}: ${event.data.error || "save failed"}`);
     }
-    if (pending.seen.size === pending.targets.size) {
-      finishQuitPreparation(pending.errors.length
-        ? { ok: false, error: pending.errors.join("; ") }
-        : { ok: true, panes: pending.targets.size });
-    }
+    settleQuitPreparation(pending);
   } else if (kind === "native-gesture-scope") {
     if (!senderSid || !versioned) return;
     receiveNativeGestureScope(senderSid, event.data);

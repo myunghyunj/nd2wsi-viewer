@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -165,13 +166,111 @@ def test_windows_memory_probe_uses_available_physical_bytes(monkeypatch):
     assert platform_io.windows_available_memory_bytes() == 3 * 1024**3
 
 
+@pytest.fixture
+def fresh_memory_probe():
+    """The physical-memory probe with its process-wide cache emptied around the test."""
+    from nd2wsi.platform_io import total_physical_memory_bytes
+
+    total_physical_memory_bytes.cache_clear()
+    yield total_physical_memory_bytes
+    total_physical_memory_bytes.cache_clear()
+
+
+def test_total_memory_probe_multiplies_posix_pages_once(monkeypatch, fresh_memory_probe):
+    from nd2wsi import platform_io
+
+    calls = []
+
+    def sysconf(name):
+        calls.append(name)
+        return {"SC_PHYS_PAGES": 1_572_864, "SC_PAGE_SIZE": 16384}[name]
+
+    monkeypatch.setattr(platform_io, "os", SimpleNamespace(name="posix", sysconf=sysconf))
+    assert fresh_memory_probe() == 24 * 1024**3
+    assert fresh_memory_probe() == 24 * 1024**3
+    assert calls == ["SC_PHYS_PAGES", "SC_PAGE_SIZE"]  # installed RAM is probed once
+
+
+def test_total_memory_probe_reads_windows_total_physical_bytes(monkeypatch, fresh_memory_probe):
+    from nd2wsi import platform_io
+
+    def memory_status(pointer):
+        status = pointer._obj
+        assert status.length == 64
+        status.total_phys = 32 * 1024**3
+        status.avail_phys = 3 * 1024**3  # the export budget must not shrink with load
+        return True
+
+    monkeypatch.setattr(platform_io, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(platform_io, "_windows_api", lambda: SimpleNamespace(
+        GlobalMemoryStatusEx=memory_status,
+    ))
+    assert fresh_memory_probe() == 32 * 1024**3
+
+
+def _unsupported_sysconf(name):
+    raise ValueError(f"unrecognized configuration name {name}")
+
+
+def _missing_kernel32():
+    raise OSError("kernel32 could not be loaded")
+
+
+@pytest.mark.parametrize(("fake_os", "windows_api"), [
+    pytest.param(SimpleNamespace(name="posix", sysconf=_unsupported_sysconf), None,
+                 id="sysconf-unsupported"),
+    pytest.param(SimpleNamespace(name="posix", sysconf=lambda name: -1), None,
+                 id="sysconf-indeterminate"),
+    pytest.param(SimpleNamespace(name="posix"), None, id="no-sysconf"),
+    pytest.param(SimpleNamespace(name="nt"),
+                 lambda: SimpleNamespace(GlobalMemoryStatusEx=lambda pointer: False),
+                 id="status-call-fails"),
+    pytest.param(SimpleNamespace(name="nt"), _missing_kernel32, id="no-kernel32"),
+])
+def test_total_memory_probe_falls_back_to_eight_gib(
+    monkeypatch, fresh_memory_probe, fake_os, windows_api,
+):
+    from nd2wsi import platform_io
+
+    monkeypatch.setattr(platform_io, "os", fake_os)
+    if windows_api is not None:
+        monkeypatch.setattr(platform_io, "_windows_api", windows_api)
+    assert fresh_memory_probe() == platform_io.FALLBACK_PHYSICAL_MEMORY_BYTES == 8 * 1024**3
+
+
+def test_render_memory_budget_starts_no_process(monkeypatch, fresh_memory_probe):
+    """Every rendered export reads this budget; it must not spawn ``sysctl``."""
+    from nd2wsi import render
+
+    spawned = []
+
+    def spawn(*args, **kwargs):
+        spawned.append(args)
+        raise AssertionError("the memory probe started a process")
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    monkeypatch.setattr(subprocess, "run", spawn)
+    monkeypatch.setattr(os, "system", spawn)
+    budget = render._available_memory()
+    assert spawned == []
+    assert budget == fresh_memory_probe() // 2 > 0
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="sysctl hw.memsize is the macOS reference")
+def test_total_memory_probe_matches_macos_sysctl(fresh_memory_probe):
+    out = subprocess.run(
+        ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True, timeout=10,
+    )
+    assert fresh_memory_probe() == int(out.stdout)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows kernel APIs")
-def test_windows_memory_and_allocation_probes_work_on_this_machine(tmp_path):
+def test_windows_memory_and_allocation_probes_work_on_this_machine(tmp_path, fresh_memory_probe):
     from nd2wsi.platform_io import (
         windows_allocation_block_bytes,
         windows_available_memory_bytes,
     )
 
-    assert windows_available_memory_bytes() > 0
+    assert fresh_memory_probe() >= windows_available_memory_bytes() > 0
     block = windows_allocation_block_bytes(tmp_path)
     assert block >= 512 and block & (block - 1) == 0

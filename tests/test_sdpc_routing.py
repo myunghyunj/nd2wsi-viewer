@@ -3,7 +3,6 @@
 import copy
 import io
 import json
-import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -12,6 +11,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from http_fixture import running_server
 
 from nd2wsi import app, cli, convert, server
 from nd2wsi.annotation_sidecars import _legacy_sidecar_matches
@@ -65,16 +65,9 @@ def backend(monkeypatch, source):
 
 @contextmanager
 def served(source, session):
-    httpd = server.create_server(source, port=0, window_session=session)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
+    with running_server(source, window_session=session) as httpd:
         base = server.server_url(httpd).rstrip("/")
         yield httpd, base + "/s/" + httpd.registry.default_sid()
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=5)
 
 
 def fetch(url):

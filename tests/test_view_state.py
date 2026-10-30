@@ -3,8 +3,6 @@
 import copy
 import json
 import os
-import shutil
-import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +10,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from node_host import run_node
 
 from nd2wsi import app, render, view_state, window_launch
 from nd2wsi.window_sessions import create_window_session
@@ -151,7 +150,6 @@ def test_browser_diagnostic_refuses_user_or_unisolated_source(tmp_path):
     assert app.main(args + ["--agent-window"]) == 2
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node unavailable")
 def test_js_display_and_camera_round_trip(display):
     module = Path(__file__).resolve().parents[1] / "nd2wsi/static/view-state-v1.js"
     script = """
@@ -165,6 +163,5 @@ def test_js_display_and_camera_round_trip(display):
       m.applyDisplay(state,d);m.applyCamera(state.viewer,d);
       process.stdout.write(JSON.stringify(m.capture(state)));
     """
-    result = subprocess.run([shutil.which("node"), "-e", script, str(module), json.dumps(display)],
-                             capture_output=True, text=True, check=True, timeout=10)
+    result = run_node(script, module, json.dumps(display), check=True, timeout=10)
     assert json.loads(result.stdout) == display

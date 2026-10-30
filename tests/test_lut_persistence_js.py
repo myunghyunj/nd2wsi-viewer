@@ -1,14 +1,11 @@
 """Per-file LUT persistence: strict restore and serialized durable-save lifecycle."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 MODULE = Path(__file__).resolve().parents[1] / "nd2wsi/static/lut-persistence-v1.js"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const {createController,FORMAT}=require(process.argv[1]);
@@ -41,10 +38,10 @@ function setup(options={}) {
 
 
 def run(body):
-    result = subprocess.run(
-        [NODE, "-e", HARNESS + "(async()=>{" + body
-         + "})().then(value=>console.log(JSON.stringify(value))).catch(error=>{console.error(error);process.exitCode=1});", str(MODULE)],
-        capture_output=True, encoding="utf-8", check=True, timeout=20,
+    result = run_node(
+        HARNESS + "(async()=>{" + body
+        + "})().then(value=>console.log(JSON.stringify(value))).catch(error=>{console.error(error);process.exitCode=1});",
+        MODULE, check=True,
     )
     return json.loads(result.stdout)
 

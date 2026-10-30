@@ -40,7 +40,8 @@ def no_network(monkeypatch):
 def test_this_line_ships_with_update_checks_off():
     assert edition.UPDATES_OFF is True
     assert edition.NAME == "SLACS-module"
-    assert edition.release_version("2.5.4") == f"2.5.4_SLACS-module.{edition.REVISION}"
+    suffix = "" if edition.REVISION == 1 else f".{edition.REVISION}"
+    assert edition.release_version("2.5.4") == f"2.5.4_SLACS-module{suffix}"
 
 
 def test_the_first_build_of_a_version_keeps_the_plain_label(monkeypatch):
@@ -109,7 +110,8 @@ def test_sparkle_is_never_installed(monkeypatch):
 
 def test_portable_zip_is_named_apart_from_the_public_zip():
     name = windows_builder().archive_name("2.5.4")
-    assert name == f"nd2wsi-viewer-2.5.4_SLACS-module.{edition.REVISION}-windows-x64.zip"
+    suffix = "" if edition.REVISION == 1 else f".{edition.REVISION}"
+    assert name == f"nd2wsi-viewer-2.5.4_SLACS-module{suffix}-windows-x64.zip"
     # The windows workflow still uploads and verifies it ...
     workflow = (ROOT / ".github/workflows/windows.yml").read_text(encoding="utf-8")
     assert "dist/windows/nd2wsi-viewer-*-windows-x64.zip\n" in workflow.replace("\r\n", "\n")

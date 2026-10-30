@@ -1,7 +1,6 @@
 """HTTP-level window isolation, exact snapshots, and optimistic save conflicts."""
 import json
 import multiprocessing
-import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -9,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from http_fixture import serving
 
 from nd2wsi.annotation_workspace import AnnotationConflict, AnnotationWorkspace
 from nd2wsi.server import ViewerState, annotations_sidecar, create_server, plate_annotations_sidecar
@@ -32,15 +32,9 @@ def _server(source, session=None, *, plate=False):
     st = ViewerState({}, attrs, annotations_path=path, source_path=source,
                      plate=SimpleNamespace(P=2) if plate else None)
     httpd.registry.slides[sid] = st
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
     base = f"http://127.0.0.1:{httpd.server_address[1]}/{httpd.token}"
-    try:
+    with serving(httpd):
         yield httpd, base, f"{base}/s/{sid}/api/annotations"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=3)
 
 
 def _request(url, payload=None):
@@ -155,9 +149,9 @@ def test_agent_trash_blocked_and_window_close_rejects_active_export(source, tmp_
         with pytest.raises(PermissionError):
             httpd.registry.trash_cache(sid)
         st = httpd.registry.get(sid)
-        with st.busy:
+        with st.busy, st.exports:  # a real export holds both leases
             assert _request(base + "/api/close", {"sid": sid})[0] == 409
-            assert httpd.registry.get(sid) is st and not st.busy.closed
+            assert httpd.registry.get(sid) is st and not st.busy.closed and not st.exports.closed
         assert _request(base + "/api/close", {"sid": sid})[0] == 200
         assert st.busy.closed
 
@@ -167,6 +161,27 @@ def test_default_server_keeps_legacy_api_without_revision(source):
         assert "revision" not in _request(url)[1]
         assert _request(url, {"items": [{"id": "legacy-write"}]})[0] == 200
         assert _request(url)[1]["items"] == [{"id": "legacy-write"}]
+
+
+@pytest.mark.parametrize("window", [None, "user"], ids=["browser", "window"])
+def test_a_sidecar_without_an_items_list_is_refused_not_read_as_empty(source, tmp_path, window):
+    # Read as empty, the pane's next save would replace the file.
+    canonical = annotations_sidecar(source, _attrs(source))
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    replies = []
+    for body in ('[{"id": "a", "type": "pin", "x": 1, "y": 2}]', '"text"', '{"items": {"a": 1}}',
+                 '{"items": null}', '{"note": "no items yet"}'):
+        canonical.write_text(body, encoding="utf-8")
+        session = window and create_window_session(window, tmp_path / "sessions")
+        with _server(source, session) as (_, _, url):
+            status, reply = _request(url)
+        replies.append((status, reply.get("items", reply.get("error", "").split(": ")[-1])))
+        assert canonical.read_text(encoding="utf-8") == body
+    # a window snapshot without items is empty (the window writer keeps other
+    # keys); the browser server rewrites the whole file, so it refuses one
+    no_items = (200, []) if window else (500, "annotation document has no items list")
+    assert replies == [(500, "annotation document must be a JSON object")] * 2 + \
+        [(500, "annotation items must be a list")] * 2 + [no_items]
 
 
 def test_conflict_draft_failure_still_never_overwrites_canonical(source, tmp_path, monkeypatch):
@@ -260,9 +275,7 @@ def test_compare_and_swap_lock_serializes_separate_processes(tmp_path):
 
 
 def test_frontend_queued_edits_advance_only_own_committed_revision():
-    from test_annotation_site_transitions_js import NODE, _run
-    if NODE is None:
-        pytest.skip("node is not installed")
+    from test_annotation_site_transitions_js import _run
     result = _run(r'''
 (async () => {
   state.plate.focus = 0;
@@ -288,9 +301,7 @@ def test_frontend_queued_edits_advance_only_own_committed_revision():
 
 
 def test_frontend_conflict_keeps_dirty_site_draft_and_never_adopts_other_revision():
-    from test_annotation_site_transitions_js import NODE, _run
-    if NODE is None:
-        pytest.skip("node is not installed")
+    from test_annotation_site_transitions_js import _run
     result = _run(r'''
 (async () => {
   state.plate.focus = 0;
@@ -298,13 +309,13 @@ def test_frontend_conflict_keeps_dirty_site_draft_and_never_adopts_other_revisio
   context.fetch = async (url, options = {}) => {
     if (!options.method) {
       gets.push(url);
-      return {ok: true, json: async () => ({items: [{id: "disk"}], revision: url.endsWith("p=0") ? "r0" : "b0", path: "a.json"})};
+      return {ok: true, json: async () => ({items: [{id: "disk", type: "pin", x: 1, y: 2}], revision: url.endsWith("p=0") ? "r0" : "b0", path: "a.json"})};
     }
     posted.push(JSON.parse(options.body));
     return {ok: false, status: 409, json: async () => ({current_revision: "OTHER-WINDOW-r99", draft_path: "/session/drafts/preserved.json"})};
   };
   await api.loadAnnotations(0);
-  state.annotations = [{id: "my-unsaved-roi"}]; state.annRevision = 1; state.annDirty = true;
+  state.annotations = [{id: "my-unsaved-roi", type: "pin", x: 1, y: 2}]; state.annRevision = 1; state.annDirty = true;
   await api.saveAnnotations();
   const dirtyAfterConflict = state.annDirty;
   state.plate.focus = 1; state.annContext += 1; state.annDirty = false;
@@ -317,7 +328,7 @@ def test_frontend_conflict_keeps_dirty_site_draft_and_never_adopts_other_revisio
 })().catch(e => { console.error(e); process.exit(1); });
 ''')
     assert result["dirtyAfterConflict"] and result["dirty"]
-    assert result["revision"] == "r0" and result["items"] == [{"id": "my-unsaved-roi"}]
+    assert result["revision"] == "r0" and result["items"] == [{"id": "my-unsaved-roi", "type": "pin", "x": 1, "y": 2}]
     assert result["gets"].count("api/annotations?p=0") == 1
     assert [item["expected_revision"] for item in result["posted"]] == ["r0", "r0"]
     assert result["failed"] == 1 and any("Recovery draft:" in text for text in result["statuses"])

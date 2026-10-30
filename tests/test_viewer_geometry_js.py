@@ -1,16 +1,13 @@
 """Viewer geometry shared by the main pane and the translucent window: functions, no state."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
 MODULE = STATIC / "viewer-geometry-v1.js"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SETUP = r"""
 const geometry=require(process.argv[1]);
@@ -41,8 +38,7 @@ function fakeViewport({flip=false,width=800,height=600,zoom=2.5,scale=.5,offset=
 
 def run(body):
     script = SETUP + "\nprocess.stdout.write(JSON.stringify((()=>{\n" + body + "\n})()));"
-    result = subprocess.run([NODE, "-e", script, str(MODULE)], check=True, timeout=20,
-                            capture_output=True, text=True, encoding="utf-8")
+    result = run_node(script, MODULE, check=True)
     return json.loads(result.stdout)
 
 
@@ -159,8 +155,7 @@ const api=context.Nd2ViewerGeometry;
 process.stdout.write(JSON.stringify({globals:Object.keys(context),exports:Object.keys(api).sort(),
   functions:Object.values(api).every(value=>typeof value==='function')}));
 """
-    result = subprocess.run([NODE, "-e", script, str(MODULE)], check=True, capture_output=True,
-                            text=True, timeout=20)
+    result = run_node(script, MODULE, check=True)
     out = json.loads(result.stdout)
     assert out["globals"] == ["Nd2ViewerGeometry"]
     assert out["exports"] == ["centerOnPreservingZoom", "flipAwareElementPoint", "imageToViewerElementPoint",

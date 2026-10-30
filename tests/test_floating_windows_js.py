@@ -1,14 +1,11 @@
 """Production floating panel interactions, independent of the slide viewer."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 MODULE = Path(__file__).resolve().parents[1] / "nd2wsi/static/floating-windows-v1.js"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 HARNESS = r"""
 const {createManager}=require(process.argv[1]);
@@ -35,10 +32,7 @@ function event(extra={}){return {clientX:0,clientY:0,pointerId:1,target:{closest
 
 
 def run(script):
-    result = subprocess.run(
-        [NODE, "-e", HARNESS + script, str(MODULE)], check=True,
-        capture_output=True, text=True, timeout=20,
-    )
+    result = run_node(HARNESS + script, MODULE, check=True)
     return json.loads(result.stdout)
 
 

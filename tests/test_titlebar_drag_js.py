@@ -1,14 +1,11 @@
 """Run the real shell title-bar handlers without moving a desktop window."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
-NODE = shutil.which("node")
 SHELL = Path(__file__).resolve().parents[1] / "nd2wsi/static/shell-v1.js"
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 @pytest.mark.parametrize("platform", ["cocoa", "edgechromium", "browser"])
@@ -41,8 +38,7 @@ stamp-=1050; // Close button disappears; a nearby second click hits blank strip.
 press(true,{detail:2});
 process.stdout.write(JSON.stringify({ignored,real,closeThenBlank:calls}));
 """
-    result = subprocess.run([NODE, "-e", script, str(SHELL), platform],
-                            capture_output=True, text=True, check=True, timeout=20)
+    result = run_node(script, SHELL, platform, check=True)
     observed = json.loads(result.stdout)
     assert observed["ignored"] == []
     assert observed["real"] == (["prevent", "native"] if platform == "cocoa"

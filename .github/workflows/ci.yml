@@ -3,7 +3,12 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore: ['updates/**', 'docs/release-notes-*.md']
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -11,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uvx ruff check nd2wsi tests scripts
+      - run: uv run --frozen --extra test ruff check nd2wsi tests scripts
 
   test:
     runs-on: macos-15
@@ -32,7 +37,7 @@ jobs:
       - name: Install the locked environment
         run: uv sync --frozen --all-extras --python ${{ matrix.python }}
       - name: Unit and integration tests (synthetic fixtures)
-        run: uv run --frozen python -m pytest tests -q -m "not realdata"
+        run: uv run --frozen python -m pytest tests -q -m "not realdata" -n auto --dist loadfile
 
   package:
     runs-on: macos-15

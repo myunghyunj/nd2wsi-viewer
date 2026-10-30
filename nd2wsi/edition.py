@@ -9,7 +9,7 @@ so builds from this line never check for, offer or open public updates.
 
 NAME = "SLACS-module"
 # The n-th lab build of one public version; back to 1 when main brings a new one.
-REVISION = 2
+REVISION = 1
 UPDATES_OFF = True
 UPDATES_OFF_MESSAGE = ("SLACS-module build: update checks are turned off. "
                        "New SLACS-module builds are released separately.")

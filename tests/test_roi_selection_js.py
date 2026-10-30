@@ -2,15 +2,12 @@
 
 import json
 import math
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 APP = Path(__file__).resolve().parents[1] / "nd2wsi" / "static" / "app.js"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const fs = require('fs'), vm = require('vm');
@@ -70,7 +67,8 @@ vm.runInContext(
   between('function svgEl(', 'function chip(') +
   between('function finishSelection(', 'function applyRoi(') +
   between('function roiOverlayPoints(', 'function ensureRoiOverlayLayer(') +
-  between('function downloadRoi(', 'let exportTimer') +
+  between('function downloadRoi(', '/* Poll the server') +
+  between('function channelQuery(', 'function renderParams(') +
   between('function elementPoint(', 'function fmtUm(') +
   '\nconst SVG_NS = "http://www.w3.org/2000/svg"; wireTools();', context);
 const stage = context.$('stage');
@@ -129,8 +127,7 @@ def _expected(config):
 
 
 def _run(config):
-    result = subprocess.run([NODE, "-e", SCRIPT, str(APP), json.dumps(config)],
-                            check=True, capture_output=True, text=True, timeout=20)
+    result = run_node(SCRIPT, APP, json.dumps(config), check=True)
     return json.loads(result.stdout)
 
 

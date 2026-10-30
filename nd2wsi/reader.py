@@ -333,8 +333,6 @@ def open_plane(
         if n_z > 1:
             notes.append(f"file has {n_z} Z planes; converting z={z_index}")
 
-    _, rgb = _frame_to_cyx(frame_view(0 if z_used == "max" else int(z_used)), sizes)
-
     pixel_size, cal_source = _nd2_pixel_size(f)
     if pixel_size is None:
         notes.append("no pixel calibration in the file; measurements are in pixels")

@@ -2,29 +2,19 @@
 
 import json
 import re
-import shutil
-import subprocess
 from pathlib import Path
 from xml.etree import ElementTree
 
 import pytest
+from node_host import run_node
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "nd2wsi" / "static"
 MODULE = STATIC / "astromap-v1.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
 def _run(script):
-    result = subprocess.run(
-        [NODE, "-e", script, str(MODULE)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=20,
-    )
+    result = run_node(script, MODULE)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -645,6 +635,31 @@ return {before,after:{note:row.note.value,stored:c.state.annotations[0].text,sav
         "before": {"number": "1", "note": "", "placeholder": "Note", "original": "1", "saves": 0},
         "after": {"note": "stress granule", "stored": "stress granule", "saves": 1},
     }
+
+
+def test_a_region_note_typed_in_the_list_is_not_reverted_by_the_open_label_editor():
+    out = _run_export(r"""
+const f=fixture(),c=f.c;
+function node() {
+  return {children:[],attrs:{},classList:{toggle(){}},setAttribute(k,v){this.attrs[k]=v;},
+    append(...items){this.children.push(...items);},remove(){},
+    insertBefore(item,before){this.children.push(item);}};
+}
+c.document.createElement=()=>node();c.state.astromap.rows=new Map();
+Object.assign(c.state.info,{width:1000,height:500});
+f.nodes.set('astromap-list',node());
+f.nodes.set('ann-editor',{hidden:false});f.nodes.set('ann-text',{value:''});
+c.state.annotations=[{id:'region',type:'box',astromap:true,x:0,y:0,w:10,h:10,text:''}];
+c.state.editingId='region';
+c.astromapItems=()=>c.state.annotations;c.frameOwnsRoi=()=>true;c.postAstromapState=()=>{};
+c.annotationsChanged=()=>c.refreshAstromapPanel();
+vm.runInContext(production('refreshAstromapPanel'),c);
+c.refreshAstromapPanel();
+const row=c.state.astromap.rows.get('region');
+c.document.activeElement=row.note;row.note.value='tumor';row.note.oninput();
+return {stored:c.state.annotations[0].text,editor:f.nodes.get('ann-text').value};
+""")
+    assert out == {"stored": "tumor", "editor": "tumor"}
 
 
 def test_clear_all_removes_only_astromap_regions_with_one_revision_render_and_save():

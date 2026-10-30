@@ -1,14 +1,11 @@
 """Real widget pointer/zoom/Auto interactions for declared numeric pixel types."""
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 MODULE = Path(__file__).resolve().parents[1] / 'nd2wsi/static/lut-controls-v1.js'
-NODE = shutil.which('node')
-pytestmark = pytest.mark.skipif(NODE is None, reason='node is not installed')
 
 SCRIPT = r'''
 const {createWidget,autoWindowFromHistogram}=require(process.argv[1]);
@@ -44,8 +41,7 @@ process.stdout.write(JSON.stringify(result));
 def run(body, *, dtype='float64', lo=0, hi=1, start=None, end=None):
     spec = {'dtype': dtype, 'window': {'min': lo, 'max': hi,
             'start': lo if start is None else start, 'end': hi if end is None else end}}
-    result = subprocess.run([NODE, '-e', SCRIPT, str(MODULE), json.dumps(spec), body],
-                            capture_output=True, encoding='utf-8', check=True, timeout=20)
+    result = run_node(SCRIPT, MODULE, json.dumps(spec), body, check=True)
     return json.loads(result.stdout)
 
 

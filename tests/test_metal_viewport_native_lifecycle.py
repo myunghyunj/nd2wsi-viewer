@@ -8,13 +8,13 @@ import os
 import platform
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from http_fixture import serving
 
 pytestmark = pytest.mark.skipif(
     platform.system() != "Darwin" or os.environ.get("ND2WSI_TEST_NATIVE_LIFECYCLE") != "1",
@@ -65,9 +65,6 @@ def test_native_fault_outcome_and_gpu_drain(tmp_path, fault, kind, failure):
         def log_message(self, *args):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    worker = threading.Thread(target=server.serve_forever, daemon=True)
-    worker.start()
     report = tmp_path / "native.json"
     state = {"version": 1, "source_dimensions": [32, 32], "center": [12, 17], "zoom": 12,
              "channels": [{"window": [11, 60000], "gamma": 2, "color": [3, 73, 189], "visible": False}]}
@@ -89,14 +86,10 @@ f.argtypes=[ctypes.c_char_p]*3;f.restype=ctypes.c_int
 raise SystemExit(f(*(v.encode() for v in sys.argv[2:])))
 """
     environment = {k: v for k, v in os.environ.items() if not k.startswith("ND2WSI_VIEWPORT_")}
-    try:
+    with serving(ThreadingHTTPServer(("127.0.0.1", 0), Handler)) as server:
         result = subprocess.run([sys.executable, "-c", code, str(library),
                                  f"http://127.0.0.1:{server.server_port}/isolated/", json.dumps(context), str(report)],
                                 env=environment, capture_output=True, text=True, timeout=25)
-    finally:
-        server.shutdown()
-        server.server_close()
-        worker.join(timeout=2)
     assert report.exists(), result.stderr
     output = json.loads(report.read_text())
     if output["outcome"].get("failure_kind") == "gpu_device_unavailable":

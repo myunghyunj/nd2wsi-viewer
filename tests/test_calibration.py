@@ -16,6 +16,8 @@ import pytest
 tifffile = pytest.importorskip("tifffile")
 pytest.importorskip("imagecodecs")
 
+from http_fixture import running_server  # noqa: E402
+
 from nd2wsi.convert import convert, default_store_path, open_store  # noqa: E402
 from nd2wsi.server import SlideRegistry, server_url  # noqa: E402
 
@@ -129,21 +131,14 @@ def test_nd2_export_omits_fabricated_calibration(tmp_path):
 
 
 def test_info_payload_flags_calibration(uncalibrated_svs):
-    import threading
     import urllib.request
 
-    from nd2wsi.server import create_server
-
     path, _ = uncalibrated_svs
-    httpd = create_server(path, host="127.0.0.1", port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
+    with running_server(path, host="127.0.0.1") as httpd:
         base = server_url(httpd).rstrip("/")
         info = json.loads(urllib.request.urlopen(base + "/api/info", timeout=30).read())
         assert info["calibrated"] is False
         assert info["pixelSizeUm"] is None
-    finally:
-        httpd.shutdown()
 
 
 def test_anisotropic_pixels_export_uncalibrated():

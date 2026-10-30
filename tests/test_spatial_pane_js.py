@@ -1,15 +1,12 @@
 """Production pane lifetime guards with deliberately delayed open/message delivery."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 STATIC = Path(__file__).resolve().parents[1] / "nd2wsi" / "static"
-NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const {PaneCommandGate, spatialContext} = require(process.argv[1] + '/spatial-pane-v1.js');
@@ -27,10 +24,7 @@ process.stdout.write(JSON.stringify(eval(process.argv[2])));
 
 
 def run(body):
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(STATIC), body],
-        capture_output=True, text=True, timeout=15,
-    )
+    result = run_node(SCRIPT, STATIC, body, timeout=15)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -230,10 +224,7 @@ process.stdout.write(JSON.stringify(vm.runInContext(process.argv[2],context)));
 
 
 def run_app(body):
-    result = subprocess.run(
-        [NODE, "-e", APP_SCRIPT, str(STATIC), body],
-        capture_output=True, text=True, timeout=15,
-    )
+    result = run_node(APP_SCRIPT, STATIC, body, timeout=15)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 

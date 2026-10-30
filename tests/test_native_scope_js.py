@@ -1,11 +1,9 @@
 """Executed geometry checks for native trackpad stage scoping."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
+from node_host import run_node
 
 MODULE = (
     Path(__file__).resolve().parents[1]
@@ -13,9 +11,6 @@ MODULE = (
     / "static"
     / "native-scope-v1.js"
 )
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const Scope = require(process.argv[1]);
@@ -33,13 +28,7 @@ process.stdout.write(JSON.stringify(value));
 
 
 def _run(spec):
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(MODULE), json.dumps(spec)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=20,
-    )
+    result = run_node(SCRIPT, MODULE, json.dumps(spec), check=True)
     return json.loads(result.stdout)
 
 

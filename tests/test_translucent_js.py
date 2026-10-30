@@ -1127,17 +1127,6 @@ def test_the_overlay_has_no_direction_settings_of_its_own():
     assert result == {"mirror": False, "alignment": False, "setters": [], "pure": "function", "old": "undefined"}
 
 
-@pytest.mark.parametrize("key", ["f", "F", "r", "R", "w", "a", "s", "d", "ArrowUp", "+", "-", "0"])
-def test_openseadragon_keys_cannot_rotate_flip_pan_or_zoom_the_overlay(key):
-    result = run(f"""
-      const h=harness(),handler=h.viewer.handlers['canvas-key'];
-      const event={{originalEvent:{{key:{json.dumps(key)}}},preventDefaultAction:false}};
-      if(handler)handler(event);
-      return {{registered:typeof handler,prevented:event.preventDefaultAction}};
-    """)
-    assert result == {"registered": "function", "prevented": True}
-
-
 def test_rotating_the_view_after_handoff_changes_follow_to_match_what_is_shown():
     result = run("""
       const h=followHarness({initialContext:{rotation:0,flip:false}}),m=h.mounted;
@@ -1381,3 +1370,44 @@ def test_missing_client_logger_is_tolerated():
       return {threw};
     """)
     assert result == {"threw": False}
+
+
+# Every entry of the bundled OpenSeadragon key table: (keyCode, Shift).
+OSD_KEYS = [(38, False), (38, True), (40, False), (40, True), (37, False), (39, False),
+            (187, False), (189, False), (48, False), (87, False), (87, True), (83, False),
+            (83, True), (65, False), (68, False), (82, False), (82, True), (70, False),
+            (74, False), (75, False)]
+
+
+@pytest.mark.parametrize(("key_code", "shift"), OSD_KEYS,
+                         ids=[f"{code}{'-shift' if shift else ''}" for code, shift in OSD_KEYS])
+def test_openseadragon_keys_cannot_rotate_flip_pan_or_zoom_the_overlay(key_code, shift):
+    # Drive the bundled OSD keyboard action itself: without the tracing
+    # window's handler the key moves the view, with it the key does nothing.
+    result = run(r"""
+      const fs=require('fs'),vm=require('vm'),path=require('path');
+      const vendor=fs.readFileSync(path.join(path.dirname(process.argv[1]),
+        'vendor/openseadragon/openseadragon.min.js'),'utf8');
+      const at=vendor.indexOf('this.raiseEvent("canvas-key",');
+      if(at<0)throw Error('Bundled OSD keyboard structure changed; inspect the real handler');
+      const action=vm.runInNewContext('('+vendor.slice(vendor.lastIndexOf('function ',at),
+        vendor.indexOf('function ',at))+')',{m:{Point:function(x,y){this.x=x;this.y=y;}}});
+      const h=harness(),v=h.viewer,acted=[];
+      Object.assign(v,{panHorizontal:true,panVertical:true,pixelsPerArrowPress:40,rotationIncrement:90,
+        raiseEvent(name,args){if(v.handlers[name])v.handlers[name](args);},
+        goToPreviousPage(){acted.push('page');},goToNextPage(){acted.push('page');}});
+      Object.assign(v.viewport,{flipped:false,applyConstraints(){},deltaPointsFromPixels:point=>point,
+        panBy(){acted.push('pan');},zoomBy(){acted.push('zoom');},goHome(){acted.push('home');},
+        toggleFlip(){acted.push('flip');}});
+      const press=()=>{
+        const calls=v.calls.length,count=acted.length;
+        action.call(v,{keyCode:KEY_CODE,shift:SHIFT,ctrl:false,alt:false,meta:false,originalEvent:{}});
+        return acted.slice(count).concat(v.calls.slice(calls).map(call=>call[0]));
+      };
+      const blocked=press(),handler=v.handlers['canvas-key'];
+      delete v.handlers['canvas-key'];
+      return {registered:typeof handler,blocked,unblocked:press()};
+    """.replace("KEY_CODE", str(key_code)).replace("SHIFT", json.dumps(shift)))
+    assert result["registered"] == "function"
+    assert result["blocked"] == []
+    assert result["unblocked"], "the key should act in OpenSeadragon without the handler"

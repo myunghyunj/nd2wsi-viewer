@@ -4,16 +4,12 @@ The math lives in one classic-script module that the shell loads, so the
 test drives that exact file rather than a Python port of it."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
 ALIGN = Path(__file__).resolve().parents[1] / "nd2wsi" / "static" / "align-v1.js"
-NODE = shutil.which("node")
-
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 SCRIPT = r"""
 const A = require(process.argv[1]);
@@ -158,24 +154,12 @@ def _apply(t, x, y):
 
 
 def _run(cases):
-    result = subprocess.run(
-        [NODE, "-e", SCRIPT, str(ALIGN), json.dumps(cases)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
+    result = run_node(SCRIPT, ALIGN, json.dumps(cases), check=True, timeout=30)
     return json.loads(result.stdout)
 
 
 def _run_orientation():
-    result = subprocess.run(
-        [NODE, "-e", ORIENTATION_SCRIPT, str(ALIGN)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
+    result = run_node(ORIENTATION_SCRIPT, ALIGN, check=True, timeout=30)
     return json.loads(result.stdout)
 
 
@@ -272,12 +256,9 @@ def test_display_pose_is_the_osd_fr_inverse_for_reflections_and_swaps():
 
 
 def _evaluate_math(script):
-    result = subprocess.run(
-        [NODE, "-e", "const A = require(process.argv[1]);\n" + script, str(ALIGN)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
+    result = run_node(
+        "const A = require(process.argv[1]);\n" + script,
+        ALIGN, check=True, timeout=30,
     )
     return json.loads(result.stdout)
 

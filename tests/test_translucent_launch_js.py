@@ -1,15 +1,12 @@
 """Launch the exact displayed fluorescence frame without copying user geometry."""
 
 import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from node_host import run_node
 
-NODE = shutil.which("node")
 APP = Path(__file__).resolve().parents[1] / "nd2wsi/static/app.js"
-pytestmark = pytest.mark.skipif(NODE is None, reason="node unavailable")
 
 
 def launch(**options):
@@ -49,8 +46,7 @@ def launch(**options):
       out.roi=state.roi;out.annotations=state.annotations;
       process.stdout.write(JSON.stringify(out));})();
     """
-    result = subprocess.run([NODE, "-e", script, str(APP), json.dumps(options)],
-                            capture_output=True, text=True, check=True, timeout=10)
+    result = run_node(script, APP, json.dumps(options), check=True, timeout=10)
     return json.loads(result.stdout)
 
 

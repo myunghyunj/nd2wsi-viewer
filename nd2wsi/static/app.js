@@ -127,13 +127,13 @@ const state = {
 
 const {
   setPlateZ, stepPlateZ, setPlateAuto, setPlateT,
-  setPlatePlaying, buildZSlider, renderZSlider, buildTimeLine,
+  setPlatePlaying, pausePlatePlayback, buildZSlider, renderZSlider, buildTimeLine,
   renderTimeLine, renderPlateAuto, loadPlateFocus, pollPlateStatus,
 } = window.Nd2PlateController.createController({
   state, $, clamp, plateZFor,
   plateZText, platePlaneNote, currentFocusSummary, plateGroupKey,
   platePeriodMs, rawValueLabel, fmtTickLabel, fmtHm,
-  fmtPeriodWords, fmtInt, paintPlate, plateFrameChanged,
+  fmtPeriodWords, fmtInt, paintPlate, plateFrameChanged, plateFrameShown,
 });
 
 // Sidecar persistence: the debounced save, the serialized save queue,
@@ -223,6 +223,16 @@ function wireShellToolState() {
 init().catch((e) => {
   $("boot").textContent = "failed to load: " + e.message;
 });
+
+// Every pagehide listener in this pane is a one-shot teardown: the save
+// tracker, the minute retry and the LUT and shading controllers are gone
+// afterwards. A pane the browser restores from its back/forward cache would
+// come back with those already disposed and silently stop saving, so it
+// loads afresh instead.
+function reloadIfRestoredFromCache(event) {
+  if (event.persisted) location.reload();
+}
+window.addEventListener("pageshow", reloadIfRestoredFromCache);
 
 async function init() {
   const res = await fetch("api/info");
@@ -439,10 +449,12 @@ async function initializeDisplayLuts() {
 }
 
 function initializeLutAuto() {
-  const nd2 = /\.nd2$/i.test(String(state.info.name || ""));
-  state.lutAutoRange = nd2;
+  // A single-channel 16-bit PNG is fitted like an ND2 channel; RGB images
+  // keep their fixed 0-255 axis.
+  const fitted = /\.nd2$/i.test(String(state.info.name || "")) || (!!state.info.raster && !state.info.rgb);
+  state.lutAutoRange = fitted;
   state.lutAutoPending = state.info.channels.map((_, i) =>
-    nd2 && !state.initialViewHandoff && !state.luts[i]);
+    fitted && !state.initialViewHandoff && !state.luts[i]);
 }
 
 function acceptLutHistograms(channels) {
@@ -556,11 +568,20 @@ function lutParam() {
     .join(",");
 }
 
-function renderParams(q) {
-  // the channel set, the LUT windows and the cache generation, shared by
-  // tiles, plate frames and rendered exports
+function channelQuery(q) {
+  // the visible channel set, the one rule for every request that names it:
+  // omitted when every channel shows, "none" when none does. Tiles and
+  // previews then draw black, as the screen does; exports refuse that case
+  // before they build a URL (downloadRoi)
   if (state.channels.length !== state.info.channels.length)
     q.set("c", state.channels.length ? state.channels.join(",") : "none");
+  return q;
+}
+
+function renderParams(q) {
+  // the channel set, the LUT windows and the cache generation, shared by
+  // tiles, plate frames, rendered exports and the export-scale previews
+  channelQuery(q);
   const win = lutParam();
   if (win) q.set("win", win);
   // the cache generation makes tile URLs immutable: the browser may keep
@@ -705,12 +726,14 @@ function buildViewer() {
     if (!state.viewportRelay.reopening) postViewportState("user");
     refreshAstromapPanel();
   });
+  // OpenSeadragon raises update-viewport in the same frame as both of these,
+  // and that handler redraws the scale bar.
   viewer.addHandler("animation", () => {
-    updateReadout();
+    updateReadout({ scalebar: false });
     scheduleViewportState();
   });
   viewer.addHandler("animation-finish", () => {
-    updateReadout();
+    updateReadout({ scalebar: false });
     scheduleViewportState();
   });
   viewer.addHandler("update-viewport", () => {
@@ -1292,32 +1315,38 @@ function activeLevel() {
   return levelForDensity(deviceZoom());
 }
 
-function updateReadout() {
+// Text written on every animation frame is written only when it changes:
+// an unchanged write still replaces the text node and invalidates style.
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function updateReadout({ scalebar = true } = {}) {
   if (state.plate && state.plate.focus === null) {
-    updateGridReadout();
+    updateGridReadout(scalebar);
     return;
   }
   const dz = deviceZoom();
-  $("zoom-val").textContent =
-    (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %" + (Math.abs(dz - 1) < 0.005 ? " · 1:1" : "");
+  setText($("zoom-val"),
+    (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %" + (Math.abs(dz - 1) < 0.005 ? " · 1:1" : ""));
   const act = activeLevel();
   state.info.levels.forEach((lv, k) => {
     $("lamp-" + lv.path).classList.toggle("active", k === act);
   });
-  updateScalebar(currentImageZoom());
+  if (scalebar) updateScalebar(currentImageZoom());
 }
 
-function updateGridReadout() {
+function updateGridReadout(scalebar = true) {
   // in grid mode the readouts describe a site cell, not the hidden viewer
   const iz = plateCellZoom();
   if (!iz) return;
   const dz = iz * (window.devicePixelRatio || 1);
-  $("zoom-val").textContent = (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %";
+  setText($("zoom-val"), (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %");
   const act = levelForDensity(dz);
   state.info.levels.forEach((lv, k) => {
     $("lamp-" + lv.path).classList.toggle("active", k === act);
   });
-  updateScalebar(iz);
+  if (scalebar) updateScalebar(iz);
 }
 
 function updateCursor(img, elementPt) {
@@ -1490,6 +1519,10 @@ function screenHorizontalUmPerCssPixel() {
   return Number.isFinite(length) && length > 0 ? length / cssLength : null;
 }
 
+// What the scale bar shows. A pan redraws every frame at an unchanged scale;
+// the browser normalizes a written width, so the last value is kept here.
+const scalebarShown = { display: null, width: null, label: null };
+
 function updateScalebar(iz) {
   const ps = pixelSize();
   // The plate grid is unrotated <img> cells, not the hidden OSD viewport.
@@ -1497,16 +1530,20 @@ function updateScalebar(iz) {
     ? ps && ps.every((value) => Number.isFinite(value) && value > 0) && iz > 0
       ? ps[1] / iz : null
     : screenHorizontalUmPerCssPixel();
-  if (!(umPerScreenPx > 0)) {
-    $("scalebar").style.display = "none";
-    $("scalebar-label").textContent = "";
-    return;
+  let shown = { display: "none", width: scalebarShown.width, label: "" };
+  if (umPerScreenPx > 0) {
+    const target = 110 * umPerScreenPx; // aim for a ~110 px bar
+    const nice = niceLength(target);
+    shown = {
+      display: "", width: nice / umPerScreenPx + "px",
+      label: nice >= 1000 ? nice / 1000 + " mm" : nice + " µm",
+    };
   }
-  const target = 110 * umPerScreenPx; // aim for a ~110 px bar
-  const nice = niceLength(target);
-  $("scalebar").style.display = "";
-  $("scalebar").style.width = nice / umPerScreenPx + "px";
-  $("scalebar-label").textContent = nice >= 1000 ? nice / 1000 + " mm" : nice + " µm";
+  const bar = $("scalebar");
+  if (shown.display !== scalebarShown.display) bar.style.display = shown.display;
+  if (shown.width !== scalebarShown.width) bar.style.width = shown.width;
+  if (shown.label !== scalebarShown.label) $("scalebar-label").textContent = shown.label;
+  Object.assign(scalebarShown, shown);
 }
 
 function niceLength(um) {
@@ -1717,15 +1754,29 @@ function wireTools() {
   $("tool-box").title = "Source-aligned rectangle";
   $("tool-box").onclick = () => setTool("box");
 
-  let moveFrom = null; // roi origin at drag start (move mode)
+  let moveFrom = null; // roi and its origin at drag start (move mode)
   let landmarkStart = null; // a click, not a drag, places an alignment point
   const drawStart = () => state.tool === "astromap"
     ? imageToViewerElementPoint(startImg) : start;
+  // Ends a gesture; one that did not finish (a tool change, a lost pointer,
+  // an update freezing the pane) leaves nothing behind: a moved region goes
+  // back, the live ruler goes, and a pending landmark click is dropped.
   const clearDrag = () => {
     const pointer = dragPointer;
-    start = startImg = dragContext = dragPointer = current = moveFrom = null;
+    if (moveFrom && state.roi === moveFrom.roi) {
+      // the size may have changed during the drag (a typed width applied on
+      // blur), so the old origin must still keep the region inside the image
+      state.roi.x = Math.max(0, Math.min(moveFrom.x, state.info.width - state.roi.w));
+      state.roi.y = Math.max(0, Math.min(moveFrom.y, state.info.height - state.roi.h));
+      moveRoiOverlay();
+    }
+    start = startImg = dragContext = dragPointer = current = moveFrom = landmarkStart = null;
     rubber.style.display = "none";
     stage.classList.remove("grabbing");
+    if (state.tempLine) {
+      state.tempLine = null;
+      renderAnnotations();
+    }
     try { if (pointer !== null) stage.releasePointerCapture(pointer); } catch (_) { /* optional */ }
   };
   state.cancelToolDrag = clearDrag;
@@ -1755,7 +1806,7 @@ function wireTools() {
     dragContext = activeFrameContext()?.key;
     dragPointer = ev.pointerId;
     if (state.tool === "move") {
-      moveFrom = { x: state.roi.x, y: state.roi.y };
+      moveFrom = { roi: state.roi, x: state.roi.x, y: state.roi.y };
       stage.classList.add("grabbing");
     }
     if (state.tool === "roi" || state.tool === "box" || state.tool === "astromap") {
@@ -2001,10 +2052,13 @@ function refreshAstromapPanel() {
   const items = astromapItems(), ready = astromapReady();
   if (!items.some((a) => a.id === state.astromap.activeId)) state.astromap.activeId = items[0]?.id || null;
   const list = $("astromap-list"), rows = state.astromap.rows;
+  // Rows follow edits and plate frames while the panel is open; opening it
+  // refreshes them (makeMacWindow onOpen).
+  const rowsShown = !state.windows?.astromap?.isHidden();
   const ids = new Set(items.map((a) => a.id));
-  for (const [id, row] of rows) if (!ids.has(id)) { row.el.remove(); rows.delete(id); }
+  for (const [id, row] of rows) if (rowsShown && !ids.has(id)) { row.el.remove(); rows.delete(id); }
   const size = window.Nd2Astromap.exportSize(state.info.width, state.info.height);
-  items.forEach((a, index) => {
+  if (rowsShown) items.forEach((a, index) => {
     let row = rows.get(a.id);
     if (!row) {
       const el = document.createElement("div"); el.className = "astromap-item";
@@ -2020,7 +2074,11 @@ function refreshAstromapPanel() {
       };
       note.oninput = () => {
         const item = find(); if (!item || !astromapReady()) return;
-        item.text = note.value; annotationsChanged();
+        item.text = note.value;
+        // the label editor open on this region would otherwise write its
+        // older text back when it closes
+        if (state.editingId === item.id && !$("ann-editor").hidden) $("ann-text").value = note.value;
+        annotationsChanged();
       };
       number.onclick = () => selectAstromapRoi(a.id);
       remove.onclick = () => { if (astromapReady() && find()) removeAnnotation(a.id); };
@@ -2351,6 +2409,8 @@ function saveAnnotations(site) {
 
 async function flushAnnotationsForUpdate() {
   if (!$('ann-editor').hidden) closeEditor(true);
+  // A mark still being dragged would land after editing froze, unsaved.
+  state.cancelToolDrag?.();
   state.quitPreparing = true;
   await annotationStore.flushForUpdate();
 }
@@ -2452,8 +2512,11 @@ function retryAutoSave() {
 // keepalive; the store skips a snapshot its 409 recovery draft already holds.
 // The native path (flushAnnotationsForUpdate + lutPersistence.flush) stays
 // the authority: while the shell is preparing to quit, nothing happens here.
+// Text still open in the note editor is committed first, as the native paths
+// do, so it is part of the snapshot that leaves.
 function flushAutoSaveOnPagehide() {
   if (state.quitPreparing) return;
+  if (!$("ann-editor").hidden) closeEditor(true);
   annotationStore.flushOnPagehide({ keepalive: true });
   const lut = state.lutPersistence;
   if (lut && lut.isDirty()) lut.flush({ keepalive: true }).catch(() => {});
@@ -2589,7 +2652,7 @@ const ACCENT = "#0a84ff";
 const ANN_COLORS = ["#0a84ff", "#ffd60a", "#30d158", "#ff453a", "#ff9f0a", "#bf5af2"];
 
 function annColor(a) {
-  return a.color || ACCENT;
+  return typeof a.color === "string" && /^#[0-9a-f]{6}$/i.test(a.color) ? a.color : ACCENT;
 }
 function cycleAnnColor(a) {
   const i = ANN_COLORS.indexOf(annColor(a));
@@ -2610,10 +2673,13 @@ function svgEl(tag, attrs, parent) {
 
 function chip(parent, x, y, text, id) {
   // An annotation's own label opens it through wireAnnotationPointer(); the
-  // live ruler's label has no id and stays inert.
-  const g = svgEl("g", id ? { class: "hit", "data-ann-id": id } : { class: "" }, parent);
+  // live ruler's label has no id and stays inert. The group's translation
+  // places the label, so the annotation frame moves it with one write.
+  const attrs = id ? { class: "hit", "data-ann-id": id } : { class: "" };
+  if (x || y) attrs.transform = `translate(${x} ${y})`;
+  const g = svgEl("g", attrs, parent);
   const t = svgEl("text", {
-    x: x + 7, y: y + 12.5,
+    x: 7, y: 12.5,
     fill: "rgba(255,255,255,0.9)",
     "font-size": "11",
     "font-family": "-apple-system, BlinkMacSystemFont, sans-serif",
@@ -2622,7 +2688,7 @@ function chip(parent, x, y, text, id) {
   const w = Math.max(26, text.length * 6.2 + 14);
   g.insertBefore(
     svgEl("rect", {
-      x, y, width: w, height: 18, rx: 9,
+      x: 0, y: 0, width: w, height: 18, rx: 9,
       fill: "rgba(28,28,30,0.85)", stroke: "rgba(255,255,255,0.25)",
       "stroke-width": "0.5",
     }),
@@ -2631,16 +2697,26 @@ function chip(parent, x, y, text, id) {
   return g;
 }
 
-/* ---- annotation layer: one pointer listener and translate-only pans --------
-   renderAnnotations() draws every mark into one root group of #ann-layer and
-   remembers what it drew from. OpenSeadragon raises update-viewport on every
-   animation frame. When only the camera centre has moved since that full
-   render, the whole picture (screen-fixed labels, end ticks, pins and stroke
-   widths included) moves by one screen-space offset under any rotation or
-   flip, so refreshAnnotationsForViewport() translates the root group instead
-   of rebuilding thousands of nodes. */
+/* ---- annotation layer: image-space outlines and one pointer listener ------
+   renderAnnotations() draws every mark into one root group of #ann-layer.
+   Box outlines and imported GeoJSON shapes are drawn once, in image pixels,
+   inside one image group whose matrix maps image pixels to the element the
+   way toEl() does: OpenSeadragon's mapping is affine, flip and rotation
+   included, so three probes give that matrix exactly up to float rounding.
+   Their strokes keep a screen width (non-scaling-stroke). Labels, pins,
+   imported points, measurement lines and alignment landmarks keep a screen
+   size, so they sit above the image group and the frame places them at their
+   image anchors.
 
-let annotationFrame = null; // the last full render: root group, signatures, mapping probes
+   OpenSeadragon raises update-viewport on every animation frame. When only the
+   camera centre has moved since the frame was placed, the whole picture moves
+   by one screen-space offset under any rotation or flip, so
+   refreshAnnotationsForViewport() translates the root group. Any other camera
+   change (zoom, rotation, flip, resize) rewrites the image matrix and one
+   position per screen-fixed mark, without creating nodes. Only a change of
+   what is drawn rebuilds the layer. */
+
+let annotationFrame = null; // the last full render: root and image groups, marks, signatures, mapping
 
 const ANNOTATION_PROBE_SPAN = 1024; // image px between the mapping probes
 
@@ -2677,11 +2753,56 @@ function annotationMapping() {
   };
 }
 
-function rememberAnnotationFrame(root) {
-  annotationFrame = {
-    root, view: annotationViewSignature(), content: annotationContentSignature(),
-    ...annotationMapping(), transform: "",
-  };
+// marks: the screen-fixed parts of a full render, each with its image anchor:
+//   { node, x, y, dx, dy }  node translated to toEl(x, y) + (dx, dy)
+//   { node, box, dx, dy }   the same from the box's top-left element corner
+//   { line, body, ticks, label }  a measurement drawn in element pixels
+// The root is built detached and shown once it is placed.
+function rememberAnnotationFrame(layer, root, image, marks) {
+  annotationFrame = { root, image, marks, content: annotationContentSignature(), transform: "" };
+  placeAnnotationFrame(annotationFrame, annotationMapping());
+  layer.append(root);
+}
+
+// Fit the image group and every screen-fixed mark to the camera; the root
+// group is left untranslated.
+function placeAnnotationFrame(frame, { origin, axes }) {
+  const span = ANNOTATION_PROBE_SPAN;
+  const xx = axes[0] / span, xy = axes[1] / span, yx = axes[2] / span, yy = axes[3] / span;
+  const at = (x, y) => ({ x: origin.x + xx * x + yx * y, y: origin.y + xy * x + yy * y });
+  frame.image.setAttribute("transform", `matrix(${xx} ${xy} ${yx} ${yy} ${origin.x} ${origin.y})`);
+  for (const mark of frame.marks) placeAnnotationMark(mark, at);
+  if (frame.transform) frame.root.removeAttribute("transform");
+  Object.assign(frame, { view: annotationViewSignature(), origin, axes, transform: "" });
+}
+
+function placeAnnotationMark(mark, at) {
+  if (mark.line) {
+    const p1 = at(mark.line.x1, mark.line.y1), p2 = at(mark.line.x2, mark.line.y2);
+    const segment = (node, x1, y1, x2, y2) => {
+      node.setAttribute("x1", x1); node.setAttribute("y1", y1);
+      node.setAttribute("x2", x2); node.setAttribute("y2", y2);
+    };
+    segment(mark.body, p1.x, p1.y, p2.x, p2.y);
+    // perpendicular end ticks
+    const dx = p2.x - p1.x, dy = p2.y - p1.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = (-dy / len) * 5, ny = (dx / len) * 5;
+    [p1, p2].forEach((p, i) => segment(mark.ticks[i], p.x - nx, p.y - ny, p.x + nx, p.y + ny));
+    const mx = (p1.x + p2.x) / 2 + (-dy / len) * 14 - 20;
+    const my = (p1.y + p2.y) / 2 + (dx / len) * 14 - 9;
+    mark.label.setAttribute("transform", `translate(${mx} ${my})`);
+    return;
+  }
+  let p;
+  if (mark.box) {
+    const { x, y, w, h } = mark.box;
+    const a = at(x, y), b = at(x + w, y), c = at(x + w, y + h), d = at(x, y + h);
+    p = { x: Math.min(a.x, b.x, c.x, d.x), y: Math.min(a.y, b.y, c.y, d.y) };
+  } else {
+    p = at(mark.x, mark.y);
+  }
+  mark.node.setAttribute("transform", `translate(${p.x + mark.dx} ${p.y + mark.dy})`);
 }
 
 function sameAnnotationSignature(a, b) {
@@ -2693,18 +2814,18 @@ function sameAnnotationSignature(a, b) {
 function refreshAnnotationsForViewport() {
   const frame = annotationFrame;
   if (!frame || !state.viewer || frame.root.parentNode !== $("ann-layer") ||
-      !sameAnnotationSignature(frame.view, annotationViewSignature()) ||
       !sameAnnotationSignature(frame.content, annotationContentSignature())) {
     renderAnnotations();
     return;
   }
-  const { origin, axes } = annotationMapping();
+  const mapping = annotationMapping(), { origin, axes } = mapping;
   const dx = origin.x - frame.origin.x, dy = origin.y - frame.origin.y;
   const scale = Math.max(Math.hypot(frame.axes[0], frame.axes[1]), Math.hypot(frame.axes[2], frame.axes[3]));
   // Rounding-level differences only; anything larger is not a pure pan.
-  if (!Number.isFinite(dx) || !Number.isFinite(dy) ||
+  if (!sameAnnotationSignature(frame.view, annotationViewSignature()) ||
+      !Number.isFinite(dx) || !Number.isFinite(dy) ||
       axes.some((value, i) => !(Math.abs(value - frame.axes[i]) <= scale * 1e-9))) {
-    renderAnnotations();
+    placeAnnotationFrame(frame, mapping);
     return;
   }
   const transform = `translate(${dx} ${dy})`;
@@ -2736,33 +2857,23 @@ function renderAnnotations() {
   if (!state.viewer) return;
   layer.replaceChildren();
   // A fresh root carries no pan translation (refreshAnnotationsForViewport).
-  const root = svgEl("g", { "data-ann-root": "" }, layer);
+  const root = svgEl("g", { "data-ann-root": "" });
+  // Outlines in image pixels, below every screen-fixed mark. The screen-fixed
+  // parts are drawn at the origin and listed in marks; rememberAnnotationFrame()
+  // sets the image matrix and places them for the camera.
+  const image = svgEl("g", { "data-ann-image": "" }, root);
+  const marks = [];
   if (state.astromap && !state.annotations.some((a) => a.type === "box" && a.astromap === true && a.id === state.astromap.activeId))
     state.astromap.activeId = state.annotations.find((a) => a.type === "box" && a.astromap === true)?.id || null;
 
   const drawLine = (a, isTemp) => {
     const col = annColor(a);
-    const p1 = toEl(a.x1, a.y1);
-    const p2 = toEl(a.x2, a.y2);
     const g = svgEl("g", {}, root);
-    svgEl("line", {
-      x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
-      stroke: col, "stroke-width": 1.5,
-    }, g);
-    // perpendicular end ticks
-    const dx = p2.x - p1.x, dy = p2.y - p1.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const nx = (-dy / len) * 5, ny = (dx / len) * 5;
-    for (const p of [p1, p2]) {
-      svgEl("line", {
-        x1: p.x - nx, y1: p.y - ny, x2: p.x + nx, y2: p.y + ny,
-        stroke: col, "stroke-width": 1.5,
-      }, g);
-    }
+    // the body, then the perpendicular end ticks
+    const [body, ...ticks] = [0, 1, 2].map(() => svgEl("line", { stroke: col, "stroke-width": 1.5 }, g));
     const label = lineLengthLabel(a) + (a.text ? " · " + a.text : "");
-    const mx = (p1.x + p2.x) / 2 + (-dy / len) * 14 - 20;
-    const my = (p1.y + p2.y) / 2 + (dx / len) * 14 - 9;
-    chip(root, mx, my, label, isTemp ? null : a.id);
+    marks.push({ line: { x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2 }, body, ticks,
+      label: chip(root, 0, 0, label, isTemp ? null : a.id) });
   };
 
   let astromapNumber = 0;
@@ -2771,52 +2882,67 @@ function renderAnnotations() {
     if (a.astromap === true && a.astromapEnabled === false) continue;
     if (a.type === "line") drawLine(a, false);
     else if (a.type === "box") {
-      const corners = [
-        toEl(a.x, a.y), toEl(a.x + a.w, a.y), toEl(a.x + a.w, a.y + a.h), toEl(a.x, a.y + a.h),
-      ];
-      const left = Math.min(...corners.map((c) => c.x));
-      const top = Math.min(...corners.map((c) => c.y));
-      const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, root);
+      const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, image);
       const active = a.astromap === true && a.id === state.astromap.activeId;
       svgEl("polygon", {
-        points: corners.map((c) => c.x + "," + c.y).join(" "),
+        points: `${a.x},${a.y} ${a.x + a.w},${a.y} ${a.x + a.w},${a.y + a.h} ${a.x},${a.y + a.h}`,
         fill: a.astromap === true ? active ? "rgba(255,217,102,.35)" : "rgba(160,166,174,.15)" : hexAlpha(annColor(a), 0.08),
         stroke: a.astromap === true ? active ? "#ffd966" : "#a0a6ae" : annColor(a), "stroke-width": 1.5,
-        "stroke-linejoin": "round",
+        "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke",
       }, g);
       const note = a.astromap === true ? astromapDisplayNote(a) : a.text;
-      chip(root, left, top - 22, a.astromap === true
+      const label = chip(root, 0, 0, a.astromap === true
         ? `${astromapNumber}${note ? " · " + note : ""}` : a.text || "Box", a.id);
+      marks.push({ node: label, box: { x: a.x, y: a.y, w: a.w, h: a.h }, dx: 0, dy: -22 });
     } else if (a.type === "geojson") {
-      renderImportedGeoJSON(a, root);
+      renderImportedGeoJSON(a, image, null, root, marks);
     } else if (a.type === "pin") {
-      const p = toEl(a.x, a.y);
       const g = svgEl("g", { class: "hit", "data-ann-id": a.id }, root);
-      svgEl("circle", { cx: p.x, cy: p.y, r: 6, fill: annColor(a), stroke: "#fff", "stroke-width": 1.5 }, g);
-      svgEl("circle", { cx: p.x, cy: p.y, r: 1.8, fill: "#fff" }, g);
-      if (a.text) chip(root, p.x + 10, p.y - 9, a.text, a.id);
+      svgEl("circle", { r: 6, fill: annColor(a), stroke: "#fff", "stroke-width": 1.5 }, g);
+      svgEl("circle", { r: 1.8, fill: "#fff" }, g);
+      marks.push({ node: g, x: a.x, y: a.y, dx: 0, dy: 0 });
+      if (a.text) marks.push({ node: chip(root, 0, 0, a.text, a.id), x: a.x, y: a.y, dx: 10, dy: -9 });
     }
   }
   if (state.tempLine) drawLine({ ...state.tempLine, text: "" }, true);
-  renderLandmarks(root);
-  rememberAnnotationFrame(root);
+  renderLandmarks(root, marks);
+  rememberAnnotationFrame(layer, root, image, marks);
 }
 
-function renderImportedGeoJSON(item, layer) {
+// One imported feature, drawn through `project` (element pixels by default).
+// renderAnnotations() passes null instead: outlines stay in image pixels in its
+// image group, and the screen-sized points and label go to `fixed` at the
+// origin, listed in `marks` with their image anchors for the frame to place.
+function renderImportedGeoJSON(item, layer, project = toEl, fixed = layer, marks = null) {
   const api = window.Nd2AnnotationGeoJSON;
   try {
-    const parts = api.displayParts(item.geojson.geometry, toEl);
-    const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, layer);
-    for (const path of parts.paths) svgEl("path", {
-      d: path.d, fill: path.closed ? hexAlpha(annColor(item), .08) : "none",
-      "fill-rule": "evenodd", stroke: annColor(item), "stroke-width": 1.5,
-      "stroke-linejoin": "round",
-    }, group);
-    for (const point of parts.points) svgEl("circle", {
-      cx: point.x, cy: point.y, r: 6, fill: annColor(item), stroke: "#fff", "stroke-width": 1.5,
-    }, group);
-    const rect = api.bounds(item.geojson.geometry), anchor = toEl(rect.x, rect.y);
-    chip(layer, anchor.x, anchor.y - 22, api.label(item), item.id);
+    const geometry = item.geojson.geometry;
+    // Image-pixel outlines do not depend on the camera, so they are cached.
+    const parts = project ? api.displayParts(geometry, project) : api.imageParts(geometry);
+    const color = annColor(item);
+    if (parts.paths.length) {
+      const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, layer);
+      for (const path of parts.paths) svgEl("path", {
+        d: path.d, fill: path.closed ? hexAlpha(color, .08) : "none",
+        "fill-rule": "evenodd", stroke: color, "stroke-width": 1.5,
+        "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke",
+      }, group);
+    }
+    if (parts.points.length) {
+      const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, fixed);
+      const dot = { r: 6, fill: color, stroke: "#fff", "stroke-width": 1.5 };
+      for (const point of parts.points) {
+        if (project) svgEl("circle", { transform: `translate(${point.x} ${point.y})`, ...dot }, group);
+        else marks.push({ node: svgEl("circle", dot, group), x: point.x, y: point.y, dx: 0, dy: 0 });
+      }
+    }
+    const text = api.label(item);
+    if (project) {
+      const rect = api.bounds(geometry), anchor = project(rect.x, rect.y);
+      chip(fixed, anchor.x, anchor.y - 22, text, item.id);
+    } else {
+      marks.push({ node: chip(fixed, 0, 0, text, item.id), x: parts.bounds.x, y: parts.bounds.y, dx: 0, dy: -22 });
+    }
   } catch (_) { /* Invalid legacy sidecar geometry must not break other annotations. */ }
 }
 
@@ -2827,24 +2953,23 @@ function renderImportedGeoJSON(item, layer) {
 
 const LANDMARK_COLOR = "#ff9f0a";
 
-function renderLandmarks(layer) {
+// Drawn at the origin and listed in marks for the annotation frame to place.
+function renderLandmarks(layer, marks) {
   const points = state.landmark.points;
   if (!points.length) return;
   const group = svgEl("g", { class: "landmarks" }, layer);
   points.forEach((pt, i) => {
-    const p = toEl(pt.x, pt.y);
     const g = svgEl("g", {}, group);
-    svgEl("circle", {
-      cx: p.x, cy: p.y, r: 9.5, fill: LANDMARK_COLOR, stroke: "#fff", "stroke-width": 1.5,
-    }, g);
-    svgEl("line", { x1: p.x - 14, y1: p.y, x2: p.x + 14, y2: p.y, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
-    svgEl("line", { x1: p.x, y1: p.y - 14, x2: p.x, y2: p.y + 14, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
+    svgEl("circle", { r: 9.5, fill: LANDMARK_COLOR, stroke: "#fff", "stroke-width": 1.5 }, g);
+    svgEl("line", { x1: -14, y1: 0, x2: 14, y2: 0, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
+    svgEl("line", { x1: 0, y1: -14, x2: 0, y2: 14, stroke: "#fff", "stroke-width": 1, opacity: 0.7 }, g);
     const t = svgEl("text", {
-      x: p.x, y: p.y + 3.6, fill: "#1c1c1e", "text-anchor": "middle",
+      x: 0, y: 3.6, fill: "#1c1c1e", "text-anchor": "middle",
       "font-size": "10", "font-weight": "700",
       "font-family": "-apple-system, BlinkMacSystemFont, sans-serif",
     }, g);
     t.textContent = String(i + 1);
+    marks.push({ node: g, x: pt.x, y: pt.y, dx: 0, dy: 0 });
   });
 }
 
@@ -2964,8 +3089,12 @@ function undoLandmark() {
 function openEditor(id) {
   const a = state.annotations.find((x) => x.id === id);
   if (!a) return;
-  state.editingId = id;
   const ed = $("ann-editor");
+  // Reopening the mark being edited keeps the typed label; switching to
+  // another mark, or placing a new one, saves it first.
+  if (!ed.hidden && state.editingId === id) { $("ann-text").focus(); return; }
+  closeEditor(true);
+  state.editingId = id;
   ed.hidden = false;
   $("ann-text").value = a.text || "";
   const p =
@@ -2986,8 +3115,9 @@ function closeEditor(save = true) {
   if ($("ann-editor").hidden) return;
   if (save && state.editingId) {
     const a = state.annotations.find((x) => x.id === state.editingId);
-    if (a) {
-      a.text = $("ann-text").value.trim();
+    const text = $("ann-text").value.trim();
+    if (a && (a.text || "") !== text) {
+      a.text = text;
       annotationsChanged();
     }
   }
@@ -3008,17 +3138,7 @@ function wireAnnotationPanel() {
     ev.stopPropagation();
   });
 
-  $("ann-export").onclick = () => {
-    if (!annotationOwnerReady()) {
-      showToast("Choose a site before exporting annotations");
-      return;
-    }
-    downloadJsonFile(
-      annotationDocument(),
-      state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
-      "application/json"
-    );
-  };
+  $("ann-export").onclick = exportAnnotationsJSON;
   $("ann-geojson").onclick = exportAnnotationsGeoJSON;
   $("ann-open").onclick = () => {
     if (annLocked() || state.quitPreparing) showToast("Annotations are currently locked or unavailable");
@@ -3041,9 +3161,16 @@ async function openAnnotationFile(file) {
     if (request !== state.annImportSeq) return false;
     if (context !== state.annContext || site !== state.annSite || !annotationOwnerReady() ||
         annLocked() || state.quitPreparing) throw new Error("the image or annotation state changed while the file was opening");
-    const { items, verified, append = false } = annotationItemsForThisSlide(JSON.parse(text), /\.geojson$/i.test(file.name));
+    const parsed = annotationItemsForThisSlide(JSON.parse(text), /\.geojson$/i.test(file.name));
+    const { verified, append = false } = parsed;
+    // Checked before anything changes: a file the pane cannot draw is refused.
+    const items = window.Nd2AnnotationStore.normalizeItems(parsed.items,
+      () => "a" + Date.now().toString(36) + annCounter++);
     if (!append && revision !== state.annRevision) throw new Error("annotations changed while the file was opening");
-    const usedIds = new Set(state.annotations.map(item => item.id));
+    // The sidecar's items kept aside stay, for an append and a replace alike:
+    // the user cannot see or edit them, and every save sends them.
+    const kept = state.annForeignItems || [];
+    const usedIds = new Set(state.annotations.concat(kept).map(item => item && item.id));
     const imported = append ? items.map(item => {
       let id;
       do { id = "a" + Date.now().toString(36) + annCounter++; } while (usedIds.has(id));
@@ -3051,7 +3178,7 @@ async function openAnnotationFile(file) {
       return { ...item, id };
     }) : items;
     const combined = append ? state.annotations.concat(imported) : imported;
-    if (new Blob([JSON.stringify({ items: combined })]).size > window.Nd2AnnotationGeoJSON.MAX_BYTES) {
+    if (new Blob([JSON.stringify({ items: combined.concat(kept) })]).size > window.Nd2AnnotationGeoJSON.MAX_BYTES) {
       throw new Error("the combined annotations exceed the 8 MB import limit");
     }
     if (!append) closeEditor(false);
@@ -3059,7 +3186,8 @@ async function openAnnotationFile(file) {
     annotationsChanged();
     setAnnStatus((append ? "Imported " : "Opened ") + file.name + " (" + imported.length + ")" +
       (append ? " · added to existing annotations" : "") +
-      (verified ? "" : " · source not verified"));
+      (verified ? "" : " · source not verified") +
+      (kept.length ? " · " + kept.length + " item(s) this viewer cannot draw stay in the sidecar" : ""));
     return true;
   } catch (error) {
     showToast("could not open annotations: " + error.message);
@@ -3168,13 +3296,39 @@ function exportAnnotationsGeoJSON() {
     showToast("Choose a site before exporting annotations");
     return;
   }
+  if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
   const doc = annotationsToGeoJSON(state.annotations);
   const owner = annotationDocument();
   doc.coordinate_space = owner.coordinate_space;
   doc.source = owner.source;
   doc.selection = owner.selection;
   downloadJsonFile(doc, geojsonFilename(state.info), "application/geo+json");
-  showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON");
+  showToast("exported " + doc.features.length + " annotation" + (doc.features.length === 1 ? "" : "s") + " as GeoJSON" +
+    keptItemsExportNote());
+}
+
+function exportAnnotationsJSON() {
+  if (!annotationOwnerReady()) {
+    showToast("Choose a site before exporting annotations");
+    return;
+  }
+  if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
+  downloadJsonFile(
+    annotationDocument(),
+    state.info.name.replace(/\.(nd2|svs)$/i, "") + ".annotations.json",
+    "application/json"
+  );
+  const note = keptItemsExportNote();
+  if (note) showToast("exported " + state.annotations.length + " annotation" + (state.annotations.length === 1 ? "" : "s") + note);
+}
+
+// Exports hold the marks this viewer draws. A sidecar's items it cannot draw
+// (state.annForeignItems) are left out: opening a file that holds them is
+// refused. The viewer never changes or drops them, opening a file included,
+// so they stay in the sidecar. Say so, so nobody takes the file for all.
+function keptItemsExportNote() {
+  const kept = (state.annForeignItems || []).length;
+  return kept ? " · " + kept + " item(s) this viewer cannot draw are not included; the sidecar keeps them" : "";
 }
 
 function annotationDocument() {
@@ -3272,6 +3426,8 @@ function annotationItemsForThisSlide(data, geojsonFile = false) {
 }
 
 function rebuildAnnList() {
+  // A closed list is rebuilt when its window opens.
+  if (state.windows?.annot?.isHidden()) return;
   const list = $("ann-list");
   list.replaceChildren();
   $("ann-empty").style.display = state.annotations.length ? "none" : "";
@@ -3426,7 +3582,9 @@ function clearRoi() {
   state.roi = null;
   state.roiSite = null;
   state.renderScale = null;
-  scaleSeq += 1;
+  // with no region the strip empties: its pending refresh and requests stop,
+  // and its preview images are released
+  updateScaleStrip();
   if (state.roiOverlayEl) {
     state.roiOverlayEl.remove();
     state.roiOverlayEl = null;
@@ -3493,7 +3651,22 @@ function roiScale() {
 }
 
 let scaleSeq = 0;
+let scaleRequests = null; // aborts the strip's preview and size requests
+let scaleUrls = []; // object URLs of the previews on screen
+const scaleStripRest = debounce(() => updateScaleStrip(), 300);
+
+// A frame step (playback, wheel z-scrubbing): what the strip still loads for
+// the old frame stops now and can no longer land, and the strip refreshes
+// once the frame has rested for 300 ms, as the histograms do.
+function scheduleScaleStrip() {
+  ++scaleSeq;
+  scaleRequests?.abort();
+  scaleRequests = null;
+  scaleStripRest();
+}
+
 function updateScaleStrip() {
+  scaleStripRest.cancel();
   syncScaleBarExportControls();
   const strip = $("roi-scales");
   const dims = $("roi-scale-dims");
@@ -3501,19 +3674,18 @@ function updateScaleStrip() {
   const r = state.roi ? { ...state.roi } : null;
   const opts = scaleOptions();
   const seq = ++scaleSeq;
+  scaleRequests?.abort();
+  const requests = new AbortController();
+  scaleRequests = requests;
+  for (const url of scaleUrls) URL.revokeObjectURL(url);
+  scaleUrls = [];
   strip.innerHTML = "";
   if (!r || !opts.length || !frameOwnsRoi(context)) {
     dims.textContent = "–";
     return;
   }
   const sel = roiScale();
-  const extra = new URLSearchParams();
-  const win = lutParam();
-  if (win) extra.set("win", win);
-  if (state.channels.length !== state.info.channels.length) {
-    extra.set("c", state.channels.join(","));
-  }
-  if (state.info.generation) extra.set("g", state.info.generation);
+  const extra = renderParams(new URLSearchParams());
   appendFrameParams(extra, context.frame);
   const winQ = extra.toString() ? "&" + extra.toString() : "";
   // one shared field, sized to the coarsest scale so every patch is honest
@@ -3527,10 +3699,10 @@ function updateScaleStrip() {
     btn.className = "scale-opt" + (o.d === sel.d ? " sel" : "");
     const img = document.createElement("img");
     const pw = Math.max(1, Math.round(field / o.d));
-    img.src = "api/roi?" + new URLSearchParams({
+    loadScalePreview(img, "api/roi?" + new URLSearchParams({
       level: levelPathFor(o.d), x: Math.max(0, Math.floor(fx / o.d)),
       y: Math.max(0, Math.floor(fy / o.d)), w: pw, h: pw, format: "jpg",
-    }) + winQ;
+    }) + winQ, requests.signal);
     img.alt = "";
     const tag = document.createElement("span");
     tag.className = "tag";
@@ -3546,11 +3718,25 @@ function updateScaleStrip() {
   dims.textContent = fmtInt(sel.w) + " × " + fmtInt(sel.h) + " px";
   const note = $("roi-scale-note");
   note.textContent = "TIFF uses this scale; ND2 stays native.";
-  estimateRenderBytes(sel, winQ, r).then((t) => {
+  estimateRenderBytes(sel, winQ, r, requests.signal).then((t) => {
     if (seq === scaleSeq && activeFrameContext()?.key === context.key && t) {
       note.textContent = t + " · TIFF keeps raw channels at this scale; ND2 stays native.";
     }
   });
+}
+
+// The previews are fetched rather than set as <img src> so a superseded
+// strip can cancel them; an image load cannot be aborted.
+function loadScalePreview(img, url, signal) {
+  fetch(url, { cache: "no-store", signal })
+    .then((res) => (res.ok ? res.blob() : null))
+    .then((blob) => {
+      if (!blob || signal.aborted) return;
+      const src = URL.createObjectURL(blob);
+      scaleUrls.push(src);
+      img.src = src;
+    })
+    .catch(() => {}); // superseded, or the preview failed: the button still works
 }
 
 function levelPathFor(d) {
@@ -3558,23 +3744,34 @@ function levelPathFor(d) {
   return lv ? lv.path : 0;
 }
 
-const sizeSamples = new Map(); // sid-stable cache: level+fmt+win -> bytes/px
-async function estimateRenderBytes(o, winQ, r = state.roi) {
+// Bytes per pixel of one real sample, by pyramid level, format, channel set
+// and where the sample sits. The frame and the LUT stay out of the key: the
+// estimate is approximate, and it should survive playback and contrast edits
+// rather than re-render two samples for every frame.
+const sizeSamples = new Map();
+const SIZE_SAMPLE_LIMIT = 64;
+async function estimateRenderBytes(o, winQ, r = state.roi, signal = undefined) {
   if (!r) return "";
   const side = Math.min(512, o.w, o.h);
   const sx = Math.max(0, Math.floor((r.x + r.w / 2) / o.d) - side / 2);
   const sy = Math.max(0, Math.floor((r.y + r.h / 2) / o.d) - side / 2);
+  const level = levelPathFor(o.d);
+  const channels = channelQuery(new URLSearchParams()).get("c") || "all";
   const parts = [];
   for (const fmt of ["jpg", "png"]) {
-    const key = o.d + ":" + fmt + ":" + winQ + ":" + Math.round(sx / 512);
+    if (signal?.aborted) return "";
+    const key = [level, fmt, channels, state.info.generation || "",
+      Math.round(sx / 512), Math.round(sy / 512)].join(":");
     let bpp = sizeSamples.get(key);
     if (bpp === undefined) {
       try {
         const res = await fetch("api/roi?" + new URLSearchParams({
-          level: levelPathFor(o.d), x: sx, y: sy, w: side, h: side, format: fmt,
-        }) + winQ, { cache: "no-store" });
+          level, x: sx, y: sy, w: side, h: side, format: fmt,
+        }) + winQ, { cache: "no-store", signal });
+        if (!res.ok) throw new Error("HTTP " + res.status);
         const blob = await res.blob();
         bpp = blob.size / (side * side);
+        if (sizeSamples.size >= SIZE_SAMPLE_LIMIT) sizeSamples.delete(sizeSamples.keys().next().value);
         sizeSamples.set(key, bpp);
       } catch (e) { bpp = null; }
     }
@@ -3658,6 +3855,12 @@ function downloadRoi(fmt, scaleBar = false) {
     showToast("Choose a site and mark a region before exporting");
     return;
   }
+  // The screen shows no channel. An omitted channel set would mean all of
+  // them, so no format may silently export what is not on screen.
+  if (!state.channels.length) {
+    showToast("Turn on at least one channel to export");
+    return;
+  }
   scaleBar = scaleBar || fmt === "svg";
   if (scaleBar) {
     const issue = scaleBarExportIssue();
@@ -3667,7 +3870,8 @@ function downloadRoi(fmt, scaleBar = false) {
   // Rendered images use the same selection, bounded by the raster limit.
   let level = 0;
   let d = 1;
-  if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
+  const rendered = fmt === "png" || fmt === "jpg" || fmt === "svg";
+  if (rendered) {
     const sel = roiScale();
     if (!sel) {
       showToast(
@@ -3693,13 +3897,10 @@ function downloadRoi(fmt, scaleBar = false) {
     h: Math.max(1, Math.floor(r.h / d)),
     format: fmt,
   });
-  const all = state.channels.length === state.info.channels.length;
-  if (!all) q.set("c", state.channels.join(","));
-  if (fmt === "png" || fmt === "jpg" || fmt === "svg") {
-    const win = lutParam();
-    if (win) q.set("win", win); // rendered exports match the screen LUTs
-    if (state.info.generation) q.set("g", state.info.generation);
-  }
+  // Rendered exports match the screen LUTs and name the committed pyramid;
+  // ND2 and TIFF carry the channel set alone and keep the source values.
+  if (rendered) renderParams(q);
+  else channelQuery(q);
   if (scaleBar) q.set("scalebar", "1");
   appendFrameParams(q, context.frame); // explicit active frame; never hidden P0
   let job = null;
@@ -3720,51 +3921,80 @@ function downloadRoi(fmt, scaleBar = false) {
   } else showToast("export started — check your downloads");
 }
 
-/* Poll the server's write progress and fill the status-bar export gauge. */
-let exportTimer = null;
+/* Poll the server's write progress and fill the status-bar export gauge.
+   Every export polls on its own timeout chain with one request in flight,
+   so a second export never stops tracking the first and each failure is
+   reported. The gauge follows the newest export that is writing. */
+const exportJobs = new Map(); // job id -> { label, shown }, in start order
+let exportGaugeDone = null; // holds a finished export's "done" for a moment
+
+function exportGaugeOwner() {
+  let owner = null;
+  for (const [job, entry] of exportJobs) if (entry.shown) owner = job;
+  return owner;
+}
+
+function releaseExportGauge() {
+  if (exportGaugeOwner() === null) $("export-cell").hidden = true;
+}
+
 function trackExport(job, label) {
   const cell = $("export-cell");
   const fill = $("export-fill");
   const pct = $("export-pct");
-  clearInterval(exportTimer);
-  let shown = false;
+  const entry = { label, shown: false };
   const t0 = Date.now();
-  exportTimer = setInterval(() => {
-    fetch("api/roi/progress?job=" + job, { cache: "no-store" })
-      .then((r) => r.json())
-      .then((d) => {
-        const p = d.pct || 0;
-        if (d.state === "writing" || d.state === "streaming") {
-          if (!shown) {
-            shown = true;
-            cell.hidden = false;
-            cell.classList.remove("done");
-          }
+  exportJobs.set(job, entry);
+  const poll = () => fetch("api/roi/progress?job=" + job, { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : {}))
+    .catch(() => ({})) // a missed poll is retried by the next one
+    .then((d) => {
+      const elapsed = Date.now() - t0;
+      if (d.state === "writing" || d.state === "streaming") {
+        entry.shown = true;
+        if (exportGaugeOwner() === job && exportGaugeDone === null) {
+          const p = d.pct || 0;
+          cell.hidden = false;
+          cell.classList.remove("done");
           fill.style.width = p + "%";
           pct.textContent =
             d.state === "writing" ? label + " " + p + " %" : label + " saving…";
-        } else if (d.state === "done") {
-          clearInterval(exportTimer);
-          if (shown) {
-            fill.style.width = "100%";
-            cell.classList.add("done");
-            pct.textContent = label + " done";
-            setTimeout(() => { cell.hidden = true; }, 2000);
-          }
-        } else if (d.state === "error") {
-          clearInterval(exportTimer);
-          cell.hidden = true;
-          showToast("export failed: " + (d.error || "unknown error"));
-        } else if (!shown && Date.now() - t0 > 4000) {
-          clearInterval(exportTimer); // job never materialized, stay hidden
         }
-        if (Date.now() - t0 > 15 * 60 * 1000) {
-          clearInterval(exportTimer);
-          cell.hidden = true;
+      } else if (d.state === "done") {
+        // an export that finished before its first poll still says it is done
+        entry.shown = true;
+        const owned = exportGaugeOwner() === job;
+        exportJobs.delete(job);
+        if (owned) {
+          cell.hidden = false;
+          fill.style.width = "100%";
+          cell.classList.add("done");
+          pct.textContent = label + " done";
+          clearTimeout(exportGaugeDone);
+          exportGaugeDone = setTimeout(() => {
+            exportGaugeDone = null;
+            releaseExportGauge();
+          }, 2000);
         }
-      })
-      .catch(() => {});
-  }, 350);
+        return;
+      } else if (d.state === "error") {
+        exportJobs.delete(job);
+        releaseExportGauge();
+        showToast("export failed: " + (d.error || "unknown error"));
+        return;
+      } else if (!entry.shown && elapsed > 30000) {
+        // the request never started writing (refused, or the slide closed)
+        exportJobs.delete(job);
+        return;
+      }
+      if (elapsed > 15 * 60 * 1000) {
+        exportJobs.delete(job);
+        releaseExportGauge();
+        return;
+      }
+      setTimeout(poll, 350);
+    });
+  setTimeout(poll, 350);
 }
 
 /* ---- slide inspector ------------------------------------------------------- */
@@ -4459,6 +4689,8 @@ function wireCompareRelay() {
       receiveCompareLifecycle(event.data);
     } else if (event.data.nd2wsi === "tab-shortcut-state") {
       state.tabCount = Math.max(0, Math.floor(Number(event.data.count) || 0));
+    } else if (event.data.nd2wsi === "pane-visibility") {
+      if (event.data.visible === false) pausePlatePlayback();
     } else if (event.data.nd2wsi === "pane-translucent-open") {
       refreshSpatialContext();
       if (event.data.sid === currentSlideSid() &&
@@ -4694,6 +4926,7 @@ function buildWindows() {
       zoomW: 340,
       toolbarBtn: $("tb-annot"),
       startClosed: true,
+      onOpen: () => rebuildAnnList(),
     }),
     astromap: makeMacWindow($("win-astromap"), {
       key: "astromap",
@@ -5142,9 +5375,12 @@ function buildPlate() {
   renderPlateAuto();
   if (info.Z > 1) loadPlateFocus();
 
-  window.addEventListener("resize", layoutPlate);
+  // #plate is inset in the stage, so its observer sees every window resize
+  // too; the window listener is only the fallback, not a second layout pass.
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(() => layoutPlate()).observe($("plate"));
+  } else {
+    window.addEventListener("resize", layoutPlate);
   }
   layoutPlate();
   paintPlate();
@@ -5196,6 +5432,20 @@ function markFrameLoaded(img) {
   seen.add(key.split("/")[1]);
   pl.loaded.set(tz, seen);
   if (seen.size >= state.info.plate.P && tz.endsWith("/" + plateGroupKey())) renderTimeLine();
+}
+
+// Whether the plate shows the current frame in full: every visible site image
+// (the grid, or the strip beside a focused site) has loaded or failed, and a
+// focused site's own tiles have arrived. Playback waits for this.
+function plateFrameShown() {
+  const pl = state.plate;
+  if (!pl || !pl.gridEls) return true;
+  for (const cell of pl.focus === null ? pl.gridEls : pl.stripEls) {
+    const img = cell?.querySelector("img");
+    if (img && !img.complete) return false;
+  }
+  const item = pl.focus === null ? null : state.viewer?.world?.getItemAt(0);
+  return !item || typeof item.getFullyLoaded !== "function" || item.getFullyLoaded();
 }
 
 function layoutPlate() {
@@ -5276,15 +5526,22 @@ function paintPlate() {
   pl.sharpenTimer = null;
   if (quick && pl.focus === null) {
     const t = pl.t, z = pl.z, auto = pl.auto;
-    pl.sharpenTimer = setTimeout(() => {
+    const sharpen = () => {
       pl.sharpenTimer = null;
       if (pl.t !== t || pl.z !== z || pl.auto !== auto || pl.focus !== null) return;
+      // Playback that waits for a slow frame is not a hand at rest. Look
+      // again later, so a pause during that wait still gets the sharper pass.
+      if (pl.playing) {
+        pl.sharpenTimer = setTimeout(sharpen, 350);
+        return;
+      }
       sites.forEach((site) => {
         const img = pl.gridEls[site.i].querySelector("img");
         const url = plateFrameUrl(t, site.i, plateZFor(site.i), pl.k);
         if (img.getAttribute("src") !== url) img.src = url;
       });
-    }, 350);
+    };
+    pl.sharpenTimer = setTimeout(sharpen, 350);
   }
 }
 
@@ -5292,7 +5549,7 @@ function plateFrameChanged() {
   // every t, z or focus change: frames, readouts, histogram, status bar
   invalidatePixelProbe(true);
   if (state.roi) {
-    if (frameOwnsRoi()) updateScaleStrip();
+    if (frameOwnsRoi()) scheduleScaleStrip();
     else clearRoi();
   }
   refreshTiles();

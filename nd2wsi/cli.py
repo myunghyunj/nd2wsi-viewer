@@ -283,9 +283,8 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "tidy":
-        import shutil
-
         from .cache import ANNOTATIONS_DIR, MANAGED_DIR, sweep_stale_builds
+        from .cache_removal import _delete_verified_cache_tree, rescue_annotations
         from .convert import CACHE_DIR_NAME, tidy_caches
         from .reader import nice_bytes
 
@@ -330,9 +329,19 @@ def _main(argv: list[str] | None = None) -> int:
                         continue
                     if args.dry_run:
                         print(f"would remove {corpse.name}")
-                    else:
-                        shutil.rmtree(corpse)
-                        print(f"removed {corpse.name}")
+                        continue
+                    # Quarantine keeps old stores whole because an older build
+                    # may have put annotations inside; lift them out first.
+                    try:
+                        expected = corpse.stat(follow_symlinks=False)
+                        rescued = rescue_annotations(corpse, folder / MANAGED_DIR / ANNOTATIONS_DIR)
+                        _delete_verified_cache_tree(corpse, expected)
+                    except (OSError, ValueError) as exc:
+                        print(f"kept {corpse.name} ({exc})", file=sys.stderr)
+                        continue
+                    for saved in rescued:
+                        print(f"rescued {saved.name} -> {MANAGED_DIR}/{ANNOTATIONS_DIR}/")
+                    print(f"removed {corpse.name}")
         print(f"{total} store(s) {'to move' if args.dry_run else 'collected'}")
         if swept:
             print(f"swept {swept} AppleDouble files, {nice_bytes(freed)} recovered")

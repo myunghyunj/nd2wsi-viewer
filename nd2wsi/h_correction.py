@@ -356,6 +356,41 @@ def _prepare_bffree_inputs(state, directory, mapping, read_native, check, progre
         raise
 
 
+def _committed_status(state) -> dict:
+    """The committed correction and generation, from the state's metadata only."""
+    correction = state.manifest.get("h_correction") or {}
+    indices = correction.get("channel_indices", [])
+    names = state.attrs.get("omero", {}).get("channels", [])
+    committed = {
+        "applied": bool(correction.get("applied")),
+        "correction_id": correction.get("correction_id"),
+        "channels": [names[i]["label"] for i in indices if 0 <= i < len(names)],
+        "generation": state.generation,
+        "model_schema": correction.get("model_schema"),
+    }
+    if correction.get("applied"):
+        committed["method"] = correction.get("method", "h")
+    return committed
+
+
+def closed_status(state) -> dict:
+    """Status of a slide that closed before it had a controller.
+
+    The same "Slide closed" reply a closed controller gives, so a pane
+    polling status sees one answer either way. Nothing here reads pixels:
+    the slide's root may already be closed.
+    """
+    reason = "Slide closed"
+    status = {
+        "state": "cancelled", "supported": False, "reason": reason, "pct": 0,
+        "operation": None, "frame": None, "method": "bffree",
+        "methods": {method: {"supported": False, "reason": reason} for method in ("h", "bffree")},
+    }
+    status.update(_committed_status(state))
+    status.update(estimated_seconds=None, elapsed_seconds=0, eta_seconds=None, can_cancel=False)
+    return status
+
+
 class ShadingCorrectionController:
     """One asynchronous, source-bound cache transaction for an open slide."""
 
@@ -384,18 +419,7 @@ class ShadingCorrectionController:
             self._status.update(state="ready", pct=100)
 
     def _sync_committed(self):
-        correction = self.state.manifest.get("h_correction") or {}
-        indices = correction.get("channel_indices", [])
-        names = self.state.attrs.get("omero", {}).get("channels", [])
-        self._status.update(
-            applied=bool(correction.get("applied")),
-            correction_id=correction.get("correction_id"),
-            channels=[names[i]["label"] for i in indices if 0 <= i < len(names)],
-            generation=self.state.generation,
-            model_schema=correction.get("model_schema"),
-        )
-        if correction.get("applied"):
-            self._status["method"] = correction.get("method", "h")
+        self._status.update(_committed_status(self.state))
 
     def status(self) -> dict:
         with self._lock:
