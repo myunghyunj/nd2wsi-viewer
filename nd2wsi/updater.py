@@ -338,7 +338,8 @@ def install_sparkle_updater(
         controller = None
 
         def retry():
-            if controller is None or controller.updater is None or not controller.updater.canCheckForUpdates():
+            if (controller is None or controller.updater is None or controller.updater.sessionInProgress()
+                    or not controller.updater.canCheckForUpdates()):
                 return False
             controller.updater.checkForUpdates()
             return True
@@ -350,6 +351,10 @@ def install_sparkle_updater(
 
         card = UpdateCardSession(standard, lambda: window, main, retry=retry, open_notes=open_notes)
         controller = _driver_class(objc.protocolNamed("SPUUserDriver")).alloc().initWithCard_(card)
+        # Sparkle has no generated PyObjC metadata: preserve the NSError out
+        # parameter so a failed start returns its diagnostic as well as BOOL.
+        objc.registerMetaDataForSelector(b"SPUUpdater", b"startUpdater:",
+                                         {"arguments": {2: {"type": b"o^@"}}})
         updater = objc.lookUpClass("SPUUpdater").alloc().initWithHostBundle_applicationBundle_userDriver_delegate_(
             host, host, controller, delegate)
         if updater is None:
@@ -358,7 +363,11 @@ def install_sparkle_updater(
         started = updater.startUpdater_(None)
         success = started[0] if isinstance(started, tuple) else started
         if not success:
-            raise RuntimeError("SPUUpdater could not start")
+            error = started[1] if isinstance(started, tuple) and len(started) > 1 else None
+            if error is not None:
+                logger(f"Sparkle startUpdater failed: {error}")
+                standard.showUpdaterError_acknowledgement_(error, lambda: None)
+            raise RuntimeError(f"SPUUpdater could not start: {error or 'no error details returned'}")
         if window is not None:
             def end_page(*_args):
                 main(card.page_closed)

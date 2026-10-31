@@ -53,7 +53,7 @@ def h():
             displayVersionString=lambda: "2.5.6",
             versionString=lambda: "2.5.6",
             itemDescription=lambda: "<b>Fixes</b><script>bad()</script>",
-            informationOnlyUpdate=lambda: info,
+            isInformationOnlyUpdate=lambda: info,
         )
         session.dispatch(
             "showUpdateFoundWithAppcastItem_state_reply_",
@@ -198,6 +198,8 @@ def test_error_retry_acknowledges_before_new_check_and_notes_html_is_ignored(h):
     h.drain()
     assert h.received == [()] and not h.retry.called
     h.session.dismiss()
+    h.retry.assert_not_called()
+    h.drain()
     h.retry.assert_called_once()
 
 
@@ -223,7 +225,7 @@ def test_manual_no_update_acknowledges_once_after_visible_interval(h):
     assert h.received == [()]
 
 
-def test_page_transport_never_evaluates_on_main_and_hang_retires_channel(monkeypatch):
+def test_page_transport_never_evaluates_on_main_and_recovers_after_stall(monkeypatch):
     monkeypatch.setattr(card, "PAGE_TIMEOUT", 0.03)
     main, replies, called = deque(), [], []
     release = threading.Event()
@@ -231,8 +233,9 @@ def test_page_transport_never_evaluates_on_main_and_hang_retires_channel(monkeyp
     def evaluate(script):
         assert threading.current_thread() is not threading.main_thread()
         called.append(script)
-        release.wait(2)
-        return "late"
+        if script == "probe":
+            release.wait(2)
+        return "healthy"
 
     channel = card.PageChannel(lambda: SimpleNamespace(evaluate_js=evaluate), main.append)
     try:
@@ -247,6 +250,22 @@ def test_page_transport_never_evaluates_on_main_and_hang_retires_channel(monkeyp
         while main:
             main.popleft()()
         assert called == ["probe"] and replies == [None, None, None]
+        channel.submit("cleanup", replies.append, defer=True)
+        assert called == ["probe"]  # cleanup cannot overlap the hung call
+        release.set()
+        deadline = time.monotonic() + 1
+        while (channel._hung or channel._running) and time.monotonic() < deadline:
+            time.sleep(.005)
+        while main:
+            main.popleft()()
+        assert called == ["probe", "cleanup"] and replies[-1] == "healthy"
+        channel.submit("next-session", replies.append)
+        deadline = time.monotonic() + 1
+        while channel._running and time.monotonic() < deadline:
+            time.sleep(.005)
+        while main:
+            main.popleft()()
+        assert called[-1] == "next-session" and replies[-1] == "healthy"
     finally:
         release.set()
 
@@ -303,7 +322,8 @@ def test_manual_download_uses_only_cached_compatible_asset_and_token(monkeypatch
     assert not api.open_update_download(result["token"])["ok"]
 
 
-def test_composite_installs_direct_updater_and_validates_menu_without_standard_controller(monkeypatch, tmp_path):
+@pytest.mark.parametrize("start_error", [None, "Invalid feed URL"])
+def test_composite_installs_direct_updater_and_validates_menu_without_standard_controller(monkeypatch, tmp_path, start_error):
     import sys
 
     from test_updater_delegate import NSObject
@@ -312,7 +332,13 @@ def test_composite_installs_direct_updater_and_validates_menu_without_standard_c
 
     standard = Mock()
     native = Mock()
-    native.startUpdater_.return_value = (True, None)
+    metadata = {}
+
+    def start(_error):
+        assert metadata[b"SPUUpdater", b"startUpdater:"]["arguments"][2]["type"] == b"o^@"
+        return start_error is None, start_error
+
+    native.startUpdater_.side_effect = start
     native.canCheckForUpdates.return_value = True
     host = object()
     standard_type = SimpleNamespace(alloc=lambda: SimpleNamespace(initWithHostBundle_delegate_=lambda *args: standard))
@@ -320,7 +346,8 @@ def test_composite_installs_direct_updater_and_validates_menu_without_standard_c
     updater_type = SimpleNamespace(alloc=lambda: SimpleNamespace(initWithHostBundle_applicationBundle_userDriver_delegate_=updater_init))
     classes = {"SPUStandardUserDriver": standard_type, "SPUUpdater": updater_type}
     monkeypatch.setitem(sys.modules, "objc", SimpleNamespace(super=super, typedSelector=lambda sig: lambda fn: fn,
-                        registerMetaDataForSelector=lambda *args: None, protocolNamed=lambda name: object(),
+                        registerMetaDataForSelector=lambda name, selector, value: metadata.__setitem__((name, selector), value),
+                        protocolNamed=lambda name: object(),
                         lookUpClass=lambda name: classes[name]))
     bundle = SimpleNamespace(load=lambda: True)
     monkeypatch.setitem(sys.modules, "Foundation", SimpleNamespace(NSObject=NSObject,
@@ -332,7 +359,15 @@ def test_composite_installs_direct_updater_and_validates_menu_without_standard_c
     monkeypatch.setattr(updater, "_framework_path", lambda: tmp_path)
     menu = Mock()
     monkeypatch.setattr(updater, "_install_menu_item", menu)
-    handle = updater.install_sparkle_updater(shutdown_coordinator=Mock())
+    logs = []
+    handle = updater.install_sparkle_updater(shutdown_coordinator=Mock(), logger=logs.append)
+    if start_error:
+        assert handle is None and any(start_error in message for message in logs)
+        standard.showUpdaterError_acknowledgement_.assert_called_once()
+        error, acknowledgement = standard.showUpdaterError_acknowledgement_.call_args.args
+        assert error == start_error
+        acknowledgement()
+        return
     assert handle is not None
     updater_init.assert_called_once_with(host, host, handle.user_driver, handle.delegate)
     assert handle.controller.validateMenuItem_(None)
@@ -343,6 +378,13 @@ def test_composite_installs_direct_updater_and_validates_menu_without_standard_c
     handle.check_for_updates()
     native.checkForUpdates.assert_called_once()
     menu.assert_called_once_with(handle.controller)
+    native.canCheckForUpdates.return_value = True
+    native.sessionInProgress.return_value = True
+    assert not handle.card.retry()
+    native.checkForUpdates.assert_called_once()
+    native.sessionInProgress.return_value = False
+    assert handle.card.retry()
+    assert native.checkForUpdates.call_count == 2
 
 
 def test_probe_deadline_includes_queue_wait_and_late_answer_cannot_switch_ui(h):
@@ -357,3 +399,107 @@ def test_probe_deadline_includes_queue_wait_and_late_answer_cannot_switch_ui(h):
     h.found()
     deadline()
     assert h.session.mode == "card"
+
+
+def test_retry_waits_until_sparkle_has_returned_from_dismissal(h):
+    h.found()
+    h.action("download")
+    h.drain()
+    events = []
+    native = SimpleNamespace(showing=True)
+    def check():
+        # Sparkle allows Check while showing an update, but only refocuses it.
+        if native.showing:
+            events.append("refocus")
+            h.session.dispatch("showUpdateInFocus")
+        else:
+            events.append("new-check")
+        return True
+    h.session.retry = check
+    def abort_after_ack():
+        h.session.dismiss()
+        assert not events
+        native.showing = False  # coreDriver abort runs after the UI callback
+    def acknowledge():
+        h.main.append(abort_after_ack)
+    h.session.dispatch("showUpdaterError_acknowledgement_", RuntimeError("broken enclosure"), acknowledge)
+    h.action("retry")
+    h.drain()
+    assert events == ["new-check"] and h.session.mode is None and h.session.model == {}
+
+
+def test_stalled_download_transfers_live_cancel_and_progress_without_cancelling(h):
+    h.found()
+    h.action("download")
+    h.drain()
+    h.received.clear()
+    h.session.dispatch("showDownloadInitiatedWithCancellation_", h.block)
+    h.session.dispatch("showDownloadDidReceiveExpectedContentLength_", 1000)
+    h.session.dispatch("showDownloadDidReceiveDataOfLength_", 125)
+    old_token = h.session.token
+    pending = dict(h.session.model)
+    h.session._fallback(old_token)
+    assert not h.received and h.session.mode == "standard"
+    h.standard.showDownloadInitiatedWithCancellation_.assert_called_once()
+    h.standard.showDownloadDidReceiveExpectedContentLength_.assert_called_once_with(1000)
+    h.standard.showDownloadDidReceiveDataOfLength_.assert_called_once_with(125)
+    assert any("dismiss" in script and old_token in script for script in h.channel.calls)
+    h.session.action({"token": old_token, "prompt": pending["prompt"], "action": "cancel"})
+    h.drain()
+    assert not h.received  # stale card cannot abort the standard driver's download
+    h.session.dispatch("showDownloadDidReceiveDataOfLength_", 40)
+    assert h.standard.showDownloadDidReceiveDataOfLength_.call_args.args == (40,)
+    cancel = h.standard.showDownloadInitiatedWithCancellation_.call_args.args[0]
+    cancel()
+    cancel()
+    assert h.received == [()]
+    h.session.dismiss()
+    h.found()
+    assert h.session.mode == "card" and h.session.token != old_token
+
+
+def test_failed_page_send_uses_standard_ui_but_explicit_reload_cancels(h):
+    h.found()
+    h.action("download")
+    h.drain()
+    h.received.clear()
+    h.session.dispatch("showDownloadInitiatedWithCancellation_", h.block)
+    original = h.channel.submit
+    h.channel.submit = lambda script, complete, **opts: original(script, complete, **opts) if opts.get("defer") else complete(None)
+    h.session.dispatch("showDownloadDidReceiveDataOfLength_", 30)
+    assert h.session.mode == "standard" and not h.received
+    h.session.page_closed(h.session.token)
+    h.session.page_closed(h.session.token)
+    assert h.received == [()]
+
+
+@pytest.mark.parametrize("standard", [False, True])
+def test_dismiss_drops_unanswered_callbacks_instead_of_answering_them(h, standard):
+    h.session.dispatch("showReadyToInstallAndRelaunch_", h.block)
+    h.channel.probe(None if standard else "page")
+    reply = h.session.replies[0]
+    h.session.dismiss()
+    h.found()
+    reply(card.INSTALL)  # a late native control cannot touch the next session
+    assert h.received == [] and h.session.mode == "card"
+
+
+def test_refused_quit_offers_install_retry_but_close_does_not_trigger_it(h):
+    h.found()
+    h.action("download")
+    h.drain()
+    h.received.clear()
+    selector = "showInstallingUpdateWithApplicationTerminated_retryTerminatingApplication_"
+    h.session.dispatch(selector, False, h.block)
+    assert h.session.model["actions"] == ["install"]
+    h.action("install")
+    h.drain()
+    assert h.received == [()]
+    h.session.dispatch(selector, False, h.block)
+    h.session.page_closed()
+    assert h.received == [()]
+
+
+def test_block_notes_keep_heading_bullets_and_inline_spacing():
+    text = card.plain_text("<h2>Changes</h2><ul><li>Fixed <b>save</b> errors</li><li>Faster tiles</li></ul><p>Thanks</p>")
+    assert text == "Changes\n• Fixed save errors\n• Faster tiles\nThanks"

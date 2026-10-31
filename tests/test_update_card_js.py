@@ -12,7 +12,7 @@ function element(id){if(!elements.has(id))elements.set(id,{id,hidden:true,childr
  appendChild(c){this.children.push(c);},addEventListener(k,fn){this[k]=fn;},removeAttribute(k){delete this[k];}});return elements.get(id);}
 let uid=0;
 const doc={getElementById:element,documentElement:{dataset:{updateCardShell:'true'}},createElement:()=>element('button'+ ++uid)};
-const win={setTimeout:(fn,ms)=>timers.push({fn,ms}),crypto:{randomUUID:()=>String(++uid)},addEventListener:(k,fn)=>listeners[k]=fn,
+const win={setTimeout:(fn,ms)=>timers.push({fn,ms}),crypto:{getRandomValues:require('crypto').webcrypto.getRandomValues.bind(require('crypto').webcrypto)},addEventListener:(k,fn)=>listeners[k]=fn,
  pywebview:{api:{update_card_action:async p=>{calls.push(p);return {ok:true};},update_card_closed:async t=>calls.push(t),
  check_for_updates:async flag=>{calls.push(flag);return {ok:true,available:true,mode:'manual-download',token:'manual',version:'2.5.6',message:'Close all windows before installing.'};},
  open_update_download:async token=>{calls.push(token);return {ok:true};},open_update_notes:async token=>{calls.push('notes:'+token);return {ok:true};}}}};
@@ -89,3 +89,68 @@ card.manual({ok:true,available:false});timers[1].fn();
 console.log(JSON.stringify({hidden:element('update-notice').hidden}));
 ''')
     assert result == {"hidden": True}
+
+
+def test_landing_ids_work_without_random_uuid():
+    result = run('''
+assert.equal(win.crypto.randomUUID,undefined);
+doc.documentElement.dataset.updateCardShell='';
+const landing=require(process.argv[1]+'/update-card-v1.js').mount(win,doc);
+await landing.check();
+console.log(JSON.stringify({id:landing.pageId,ready:landing.ready,calls,labels:buttons()}));
+''')
+    assert len(result["id"]) == 32 and int(result["id"], 16) >= 0
+    assert not result["ready"] and result["calls"] == [False]
+    assert result["labels"] == ["Later", "Open download"]
+
+
+def test_landing_button_falls_back_without_card_and_restores_itself_after_sync_failure():
+    from nd2wsi.app import BOOT_HTML
+
+    start = BOOT_HTML.index("  document.getElementById('update').addEventListener('click'")
+    listener = BOOT_HTML[start:BOOT_HTML.index("\n  });", start) + len("\n  });")]
+    result = run("const listener=" + json.dumps(listener) + """
+const statuses=[],fallback=[];
+const ctx={document:doc,window:{},pywebview:{api:{check_for_updates(){fallback.push(true);return Promise.resolve({ok:true});}}},setStatus:t=>statuses.push(t)};
+require('vm').runInNewContext(listener,ctx);
+const button=element('update');button.click({currentTarget:button});
+for(let i=0;i<10;i++)await Promise.resolve();
+assert.equal(button.disabled,false);
+ctx.pywebview.api.check_for_updates=()=>{throw Error('offline');};
+button.click({currentTarget:button});for(let i=0;i<10;i++)await Promise.resolve();
+console.log(JSON.stringify({fallback,disabled:button.disabled,statuses}));
+""")
+    assert result["fallback"] == [True] and not result["disabled"]
+    assert "offline" in result["statuses"][0]
+
+
+def test_answered_actions_stay_removed_and_focus_preserves_export_wait_notice():
+    result = run('''
+show('ready',['later','install'],{on_quit:true});await element('update-notice-actions').children[0].click();
+const afterClick=buttons();show('ready',['later','install'],{on_quit:true});const afterFocus=buttons();
+card.notice('Waiting for 1 export to finish…');show('ready',['later','install'],{on_quit:true});
+const notice=element('update-notice-body').textContent;
+card.show({token:'session',prompt:'new-prompt',state:'error',title:'Error',message:'A new failure',actions:['close','retry']});
+console.log(JSON.stringify({afterClick,afterFocus,notice,next:buttons(),message:element('update-notice-body').textContent}));
+''')
+    assert result == {"afterClick": [], "afterFocus": [], "notice": "Waiting for 1 export to finish…",
+                      "next": ["Close", "Try again"], "message": "A new failure"}
+
+
+def test_focus_during_action_preserves_busy_state_and_retires_answered_buttons():
+    result = run('''
+let resolve;
+win.pywebview.api.update_card_action=()=>new Promise(r=>{resolve=r;});
+show('ready',['later','install'],{on_quit:true});
+const pending=element('update-notice-actions').children[0].click();
+show('ready',['later','install'],{on_quit:true});
+const during=element('update-notice-actions').children.map(b=>b.disabled);
+resolve({ok:true});await pending;
+const after=buttons();
+show('ready',['install'],{prompt:'second'});
+const pending2=element('update-notice-actions').children[0].click();
+show('error',['close','retry'],{prompt:'third'});
+resolve({ok:true});await pending2;
+console.log(JSON.stringify({during,after,next:buttons(),disabled:element('update-notice-actions').children.map(b=>b.disabled)}));
+''')
+    assert result == {"during": [True, True], "after": [], "next": ["Close", "Try again"], "disabled": [False, False]}

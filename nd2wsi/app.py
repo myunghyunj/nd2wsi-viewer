@@ -149,7 +149,8 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   document.getElementById('update').addEventListener('click', ev => {
     const button = ev.currentTarget;
     button.disabled = true;
-    window.nd2wsiUpdateCard.check()
+    Promise.resolve().then(() => typeof window.nd2wsiUpdateCard?.check === 'function'
+      ? window.nd2wsiUpdateCard.check() : pywebview.api.check_for_updates())
       .then(result => { if (result?.ok === false) setStatus(result.message || 'Could not check for updates.'); })
       .catch(error => setStatus('Could not check for updates: ' + error))
       .finally(() => { button.disabled = false; });

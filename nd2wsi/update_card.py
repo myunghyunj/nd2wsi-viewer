@@ -27,13 +27,16 @@ def plain_text(value, limit=600):
         def handle_starttag(self, tag, attrs):
             if tag in ("script", "style"):
                 self.suppressed += 1
-            if tag in ("p", "br", "li", "div"):
-                self.parts.append(" ")
+            if tag in ("p", "br", "li", "div", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "pre"):
+                self.parts.append("\n")
+            if tag == "li":
+                self.parts.append("• ")
 
         def handle_endtag(self, tag):
             if tag in ("script", "style"):
                 self.suppressed = max(0, self.suppressed - 1)
-            self.parts.append(" ")
+            if tag in ("p", "li", "div", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "pre"):
+                self.parts.append("\n")
 
         def handle_data(self, data):
             if not self.suppressed:
@@ -41,7 +44,8 @@ def plain_text(value, limit=600):
 
     parser = Text()
     parser.feed(str(value or "")[:65536])
-    return " ".join("".join(parser.parts).split())[:limit]
+    lines = [" ".join(line.split()) for line in "".join(parser.parts).splitlines()]
+    return "\n".join(line for line in lines if line)[:limit]
 
 
 def property_value(obj, name, default=None):
@@ -50,7 +54,7 @@ def property_value(obj, name, default=None):
 
 
 class PageChannel:
-    """One evaluate_js at a time; a hung call permanently retires this channel."""
+    """One evaluate_js at a time; stalls suspend calls until the page returns."""
     def __init__(self, window, main):
         self.window, self.main = window, main
         self._guard = threading.Lock()
@@ -58,14 +62,14 @@ class PageChannel:
         self._running = False
         self._hung = False
 
-    def submit(self, script, complete, *, coalesce=False):
+    def submit(self, script, complete, *, coalesce=False, defer=False):
         start = False
         with self._guard:
-            rejected = self._hung or len(self._queue) >= 64
+            rejected = (self._hung and not defer) or len(self._queue) >= 64
             if not rejected:
                 if coalesce and self._queue and self._queue[-1][2]:
                     self._queue.pop()  # progress is replaceable, replies never are
-                self._queue.append((script, complete, coalesce))
+                self._queue.append((script, complete, coalesce, defer))
                 if not self._running:
                     self._running = start = True
         if rejected:
@@ -79,7 +83,7 @@ class PageChannel:
                 if not self._queue:
                     self._running = False
                     return
-                script, complete, _ = self._queue.popleft()
+                script, complete, _, _ = self._queue.popleft()
             done, result = threading.Event(), []
 
             def evaluate(script=script, done=done, result=result):
@@ -93,16 +97,25 @@ class PageChannel:
 
             threading.Thread(target=evaluate, name="update-card-evaluate", daemon=True).start()
             finished = done.wait(PAGE_TIMEOUT)
-            value = result[0] if finished and result else None
-            self.main(lambda complete=complete, value=value: complete(value))
-            if not finished:
-                with self._guard:
-                    self._hung = True
-                    queued, self._queue = self._queue, deque()
-                    self._running = False
-                for _, callback, _ in queued:
+            if finished:
+                value = result[0] if result else None
+                self.main(lambda complete=complete, value=value: complete(value))
+                continue
+            with self._guard:
+                self._hung = True
+                queued, self._queue = self._queue, deque()
+                for entry in queued:
+                    if entry[3]:  # token-scoped cleanup must run after recovery
+                        self._queue.append(entry)
+            self.main(lambda complete=complete: complete(None))
+            for _, callback, _, deferred in queued:
+                if not deferred:
                     self.main(lambda callback=callback: callback(None))
-                return
+            # This one worker waits for its one outstanding evaluation. No second
+            # evaluation runs concurrently, and the late result is never accepted.
+            done.wait()
+            with self._guard:
+                self._hung = False
 
 
 class Reply:
@@ -128,7 +141,12 @@ BLOCKS = {
     "showDownloadInitiatedWithCancellation_": (0, (), True),
     "showReadyToInstallAndRelaunch_": (0, (DISMISS,), False),
     "showUpdateInstalledAndRelaunched_acknowledgement_": (1, (), False),
+    "showInstallingUpdateWithApplicationTerminated_retryTerminatingApplication_": (1, None, True),
 }
+
+
+PHASES = set(BLOCKS) | {"showDownloadDidStartExtractingUpdate",
+                       "showInstallingUpdateWithApplicationTerminated_retryTerminatingApplication_"}
 
 
 class UpdateCardSession:
@@ -151,6 +169,8 @@ class UpdateCardSession:
         self.retry_requested = False
         self.received = self.expected = 0
         self.release_url = None
+        self.phase = None
+        self.was_card = False
 
     def _later(self, seconds, callback):
         timer = threading.Timer(seconds, lambda: self.main(callback))
@@ -186,7 +206,10 @@ class UpdateCardSession:
         if self.closed:
             if selector in BLOCKS:
                 reply = wrapped[BLOCKS[selector][0]]
-                reply(*reply.default)
+                if reply.default is None:
+                    reply.retire()
+                else:
+                    reply(*reply.default)
             return
         if self.mode == "probing":
             self.events.append((selector, wrapped))
@@ -200,6 +223,7 @@ class UpdateCardSession:
             return
         self.mode = "card" if isinstance(answer, str) and 0 < len(answer) <= 128 else "standard"
         self.page_id = answer if self.mode == "card" else None
+        self.was_card = self.mode == "card"
         events, self.events = self.events, []
         for selector, args in events:
             self._route(selector, args)
@@ -210,16 +234,17 @@ class UpdateCardSession:
         if self.mode == "standard":
             # Sparkle still calls and receives blocks on main. Wrappers protect
             # against a second call during standard-driver dismissal.
+            if selector in PHASES:
+                if self.pending is not None:
+                    self.pending.retire()
+                self.pending = args[BLOCKS[selector][0]] if selector in BLOCKS else None
             getattr(self.standard, selector)(*args)
             return
         self._card(selector, args)
 
     def _set(self, state, title, message="", *, reply=None, actions=None, **extra):
-        if self.pending is not None and self.pending.block is not None:
-            if self.pending.optional:
-                self.pending.retire()  # normal progress supersedes cancellation
-            else:
-                self.pending(*self.pending.default)
+        if self.pending is not None:
+            self.pending.retire()  # a new phase supersedes the previous UI reply
         self.pending = reply
         self.actions = actions or {}
         self.model = {"state": state, "title": title, "message": message, "token": self.token,
@@ -232,9 +257,38 @@ class UpdateCardSession:
         payload = json.dumps(self.model, ensure_ascii=True, allow_nan=False)
         page = json.dumps(self.page_id)
         script = f"window.nd2wsiUpdateCard?.pageId==={page} && window.nd2wsiUpdateCard.show({payload})===true"
-        self.channel.submit(script, lambda ok: self.page_closed(token) if ok is not True else None, coalesce=True)
+        self.channel.submit(script, lambda ok: self._fallback(token) if ok is not True else None, coalesce=True)
+
+    def _clear_card(self, token):
+        self.channel.submit("window.nd2wsiUpdateCard?.dismiss(" + json.dumps(token) + ")",
+                            lambda _: None, defer=True)
+
+    def _fallback(self, token):
+        """Transfer the current phase and live reply; a slow page is not Cancel."""
+        if token != self.token or self.mode != "card" or self.closed:
+            return
+        self.mode = "standard"
+        self.actions = {}
+        self._clear_card(token)
+        if self.phase is None:
+            return
+        selector, args = self.phase
+        if selector in BLOCKS and args[BLOCKS[selector][0]].block is None:
+            return  # a consumed prompt is awaiting Sparkle's next phase
+        getattr(self.standard, selector)(*args)
+        if selector == "showDownloadInitiatedWithCancellation_":
+            self.standard.showDownloadDidReceiveExpectedContentLength_(self.expected)
+            self.standard.showDownloadDidReceiveDataOfLength_(self.received)
+        elif selector == "showDownloadDidStartExtractingUpdate":
+            self.standard.showExtractionReceivedProgress_(self.model.get("progress", 0))
+
+    def _ack_visible(self, token, reply):
+        if token == self.token and self.mode == "card" and not self.closed and reply is self.pending:
+            reply()
 
     def _card(self, selector, args):
+        if selector in PHASES:
+            self.phase = selector, args
         if selector == "showUserInitiatedUpdateCheckWithCancellation_":
             self._set("checking", "Checking for updates…", reply=args[0], actions={"cancel": ()})
         elif selector == "showUpdateFoundWithAppcastItem_state_reply_":
@@ -243,7 +297,7 @@ class UpdateCardSession:
             version_tag = str(property_value(item, "versionString", version))[:100]
             self.release_url = "https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/" + quote("v" + version_tag.removeprefix("v"), safe="")
             installing = property_value(state, "stage", 0) == 2
-            info_only = bool(property_value(item, "informationOnlyUpdate", False))
+            info_only = bool(property_value(item, "isInformationOnlyUpdate", False))
             self._set("ready" if installing else "available", "Ready to install " + version if installing else "Update available",
                       "The update may install when you quit." if installing else plain_text(property_value(item, "itemDescription", "")),
                       reply=reply, actions={"later": (DISMISS,), **({} if info_only else {"install" if installing else "download": (INSTALL,)})},
@@ -259,7 +313,7 @@ class UpdateCardSession:
                       plain_text(property_value(error, "localizedDescription", str(error))), reply=reply,
                       actions={"close": (), "retry": ()} if failed else {})
             if not failed:
-                self.later(5, lambda: reply())  # leave the manual result visible briefly
+                self.later(5, lambda token=self.token: self._ack_visible(token, reply))  # leave the manual result visible briefly
         elif selector == "showDownloadInitiatedWithCancellation_":
             self.received = self.expected = 0
             self._set("downloading", "Downloading " + self.model.get("version", ""),
@@ -283,10 +337,12 @@ class UpdateCardSession:
                       "Install now to save your work and relaunch. Install on quit keeps the update for when you close the app.",
                       reply=args[0], actions={"later": (DISMISS,), "install": (INSTALL,)}, on_quit=True)
         elif selector == "showInstallingUpdateWithApplicationTerminated_retryTerminatingApplication_":
-            self._set("waiting", "Waiting to install", "Saving your work and preparing to relaunch…")
+            terminated, retry_termination = args
+            self._set("waiting", "Waiting to install", "Saving your work and preparing to relaunch…",
+                      reply=retry_termination, actions={} if terminated else {"install": ()})
         elif selector == "showUpdateInstalledAndRelaunched_acknowledgement_":
             self._set("up_to_date", "Update installed", reply=args[1])
-            self.later(5, lambda: args[1]())
+            self.later(5, lambda token=self.token: self._ack_visible(token, args[1]))
         elif selector == "showUpdateInFocus":
             if self.model:
                 self._show()
@@ -316,38 +372,40 @@ class UpdateCardSession:
         reply(*values)
 
     def page_closed(self, token=None):
-        """Close/reload/transport failure ends card ownership without changing modes."""
+        """Explicit close/reload cancels a card-owned download, even after fallback."""
         if token is not None and token != self.token:
             return
-        if self.mode not in ("card", "probing"):
+        if self.mode not in ("card", "probing") and not self.was_card:
             return
         self.closed = True
         self.events = []
         for reply in self.replies:
-            reply(*reply.default)
+            if reply.default is None:
+                reply.retire()  # closing a window must never retry a refused quit
+            else:
+                reply(*reply.default)
         self.actions = {}
 
     def dismiss(self):
         mode, token = self.mode, self.token
         self.closed = True
-        # Normal Sparkle completion retires optional cancellation handlers; they
-        # are not acknowledgments and calling them here could abort a newer phase.
+        # Sparkle owns teardown. Dropping callbacks matches its standard driver;
+        # invoking a stale reply here can abort a later update session.
         replies, self.replies = self.replies, []
         for reply in replies:
-            if reply.optional:
-                reply.retire()
-            else:
-                reply(*reply.default)
+            reply.retire()
         if mode == "standard":
             self.standard.dismissUpdateInstallation()
-        elif mode == "card":
-            self.channel.submit("window.nd2wsiUpdateCard?.dismiss(" + json.dumps(token) + ")", lambda _: None)
+        if mode == "card" or self.was_card:
+            self._clear_card(token)
         retry = self.retry_requested
         self.token = self.mode = self.page_id = None
         self.events, self.actions, self.model = [], {}, {}
         self.pending, self.retry_requested, self.release_url = None, False, None
+        self.phase, self.was_card = None, False
         if retry:
-            self._retry(20)
+            # Sparkle tears down its core driver after this callback returns.
+            self.main(lambda: self._retry(20))
 
     def _retry(self, remaining):
         if self.token is not None:

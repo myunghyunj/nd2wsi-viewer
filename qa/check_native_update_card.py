@@ -147,7 +147,7 @@ def run():
         click("cancel")
         call("dismissUpdateInstallation")
         item = SimpleNamespace(displayVersionString=lambda: "2.5.6", versionString=lambda: "2.5.6",
-                               itemDescription=lambda: "<p>Viewer improvements and fixes.</p>", informationOnlyUpdate=lambda: False)
+                               itemDescription=lambda: "<p>Viewer improvements and fixes.</p>", isInformationOnlyUpdate=lambda: False)
         call("showUpdateFoundWithAppcastItem_state_reply_", item, SimpleNamespace(stage=lambda: 0), record("found"))
         wait_for(lambda: card.model.get("state") == "available", description="available")
         capture("available")

@@ -137,9 +137,13 @@ The lab edition's existing update guard also disables this path after merging.
 
 `update_card.py` owns the update session on AppKit's main queue. At its first
 callback it probes the shell's `nd2wsiUpdateCard.ready` for up to two seconds,
-then keeps either card or standard UI until `dismissUpdateInstallation`. Landing
-pages and unavailable pages use the standard driver. One bounded page transport
-serializes evaluation off main and stops after a hung call. Each page instance,
+then uses either card or standard UI until `dismissUpdateInstallation`. Landing
+pages and unavailable pages use the standard driver. A later page stall transfers
+the current phase and live reply to the standard driver without cancelling the
+download. One bounded page transport serializes evaluation off main and resumes
+after the stalled call returns; it then clears the stale card. A later session
+can use a healthy page again. Explicitly closing or reloading a card-owned window
+mid-download cancels that download, including after a stall fallback. Each page instance,
 session and action prompt has its own identity; stale buttons cannot answer a
 later choice. Reply blocks are consumed once on main. Normal phase transitions
 retire optional cancellation blocks without invoking them; reload/close ends
