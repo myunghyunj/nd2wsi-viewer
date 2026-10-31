@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 _DELEGATE_TYPE = None
+_DRIVER_TYPE = None
 
 
 class ShutdownCoordinator(Protocol):
@@ -36,6 +37,8 @@ class SparkleHandle:
     controller: Any
     delegate: Any
     menu_item: Any | None
+    user_driver: Any = None
+    card: Any = None
 
     def check_for_updates(self) -> None:
         self.controller.checkForUpdates_(None)
@@ -188,9 +191,115 @@ def _delegate_class(protocol: Any):
     return _DELEGATE_TYPE
 
 
+def _register_driver_metadata(objc):
+    # Objective-C encodes every block as @?; its argument signature is not in
+    # the runtime method encoding. Supply it when forwarding Python wrappers
+    # to SPUStandardUserDriver and when receiving the choice reply blocks.
+    blocks = {
+        "showUpdatePermissionRequest:reply:": (1, b"@"),
+        "showUserInitiatedUpdateCheckWithCancellation:": (0, None),
+        "showUpdateFoundWithAppcastItem:state:reply:": (2, b"q"),
+        "showUpdateNotFoundWithError:acknowledgement:": (1, None),
+        "showUpdaterError:acknowledgement:": (1, None),
+        "showDownloadInitiatedWithCancellation:": (0, None),
+        "showReadyToInstallAndRelaunch:": (0, b"q"),
+        "showInstallingUpdateWithApplicationTerminated:retryTerminatingApplication:": (1, None),
+        "showUpdateInstalledAndRelaunched:acknowledgement:": (1, None),
+    }
+    for selector, (index, argument) in blocks.items():
+        arguments = {0: {"type": b"^v"}}
+        if argument is not None:
+            arguments[1] = {"type": argument}
+        metadata = {"arguments": {index + 2: {"type": b"@?", "callable": {"retval": {"type": b"v"}, "arguments": arguments}}}}
+        for name in (b"Nd2wsiUserDriver", b"SPUStandardUserDriver"):
+            objc.registerMetaDataForSelector(name, selector.encode(), metadata)
+
+
+def _driver_class(protocol):
+    """Explicit Sparkle 2.9.6 selectors retain their protocol block signatures."""
+    global _DRIVER_TYPE
+    if _DRIVER_TYPE is not None:
+        return _DRIVER_TYPE
+    import objc
+    from Foundation import NSObject
+
+    _register_driver_metadata(objc)
+
+    class Nd2wsiUserDriver(NSObject, protocols=[protocol]):
+        def initWithCard_(self, card):
+            self = objc.super(Nd2wsiUserDriver, self).init()
+            if self is not None:
+                self.card = card
+                self.updater = None
+            return self
+
+        def checkForUpdates_(self, sender):
+            if self.updater is not None and self.updater.canCheckForUpdates():
+                self.updater.checkForUpdates()
+
+        @objc.typedSelector(b"Z@:@")
+        def validateMenuItem_(self, item):
+            return self.updater is not None and bool(self.updater.canCheckForUpdates())
+
+        def showUpdatePermissionRequest_reply_(self, request, reply):
+            self.card.dispatch("showUpdatePermissionRequest_reply_", request, reply)
+
+        def showUserInitiatedUpdateCheckWithCancellation_(self, cancellation):
+            self.card.dispatch("showUserInitiatedUpdateCheckWithCancellation_", cancellation)
+
+        def showUpdateFoundWithAppcastItem_state_reply_(self, item, state, reply):
+            self.card.dispatch("showUpdateFoundWithAppcastItem_state_reply_", item, state, reply)
+
+        def showUpdateReleaseNotesWithDownloadData_(self, data):
+            self.card.dispatch("showUpdateReleaseNotesWithDownloadData_", data)
+
+        def showUpdateReleaseNotesFailedToDownloadWithError_(self, error):
+            self.card.dispatch("showUpdateReleaseNotesFailedToDownloadWithError_", error)
+
+        def showUpdateNotFoundWithError_acknowledgement_(self, error, acknowledgement):
+            self.card.dispatch("showUpdateNotFoundWithError_acknowledgement_", error, acknowledgement)
+
+        def showUpdaterError_acknowledgement_(self, error, acknowledgement):
+            self.card.dispatch("showUpdaterError_acknowledgement_", error, acknowledgement)
+
+        def showDownloadInitiatedWithCancellation_(self, cancellation):
+            self.card.dispatch("showDownloadInitiatedWithCancellation_", cancellation)
+
+        def showDownloadDidReceiveExpectedContentLength_(self, length):
+            self.card.dispatch("showDownloadDidReceiveExpectedContentLength_", length)
+
+        def showDownloadDidReceiveDataOfLength_(self, length):
+            self.card.dispatch("showDownloadDidReceiveDataOfLength_", length)
+
+        def showDownloadDidStartExtractingUpdate(self):
+            self.card.dispatch("showDownloadDidStartExtractingUpdate")
+
+        def showExtractionReceivedProgress_(self, progress):
+            self.card.dispatch("showExtractionReceivedProgress_", progress)
+
+        def showReadyToInstallAndRelaunch_(self, reply):
+            self.card.dispatch("showReadyToInstallAndRelaunch_", reply)
+
+        def showInstallingUpdateWithApplicationTerminated_retryTerminatingApplication_(self, terminated, retry):
+            self.card.dispatch("showInstallingUpdateWithApplicationTerminated_retryTerminatingApplication_", terminated, retry)
+
+        def showUpdateInstalledAndRelaunched_acknowledgement_(self, relaunched, acknowledgement):
+            self.card.dispatch("showUpdateInstalledAndRelaunched_acknowledgement_", relaunched, acknowledgement)
+
+        def dismissUpdateInstallation(self):
+            self.card.dispatch("dismissUpdateInstallation")
+
+        def showUpdateInFocus(self):
+            self.card.dispatch("showUpdateInFocus")
+
+    _DRIVER_TYPE = Nd2wsiUserDriver
+    return _DRIVER_TYPE
+
+
 def install_sparkle_updater(
     *,
     shutdown_coordinator: ShutdownCoordinator,
+    window=None,
     logger: Callable[[str], None] = lambda _message: None,
 ) -> SparkleHandle | None:
     """Load the embedded framework and start Sparkle's scheduled checks.
@@ -204,7 +313,9 @@ def install_sparkle_updater(
         return None
     try:
         import objc
-        from Foundation import NSBundle
+        from Foundation import NSBundle, NSOperationQueue
+
+        from .update_card import UpdateCardSession
 
         path = _framework_path()
         if not path.is_dir():
@@ -218,18 +329,54 @@ def install_sparkle_updater(
         delegate = delegate_type.alloc().initWithCoordinator_logger_(
             shutdown_coordinator, logger
         )
-        controller_type = objc.lookUpClass("SPUStandardUpdaterController")
-        controller = (
-            controller_type.alloc()
-            .initWithStartingUpdater_updaterDelegate_userDriverDelegate_(
-                True, delegate, None
-            )
-        )
-        if controller is None:
-            raise RuntimeError("SPUStandardUpdaterController initialization failed")
+        host = NSBundle.mainBundle()
+        standard = objc.lookUpClass("SPUStandardUserDriver").alloc().initWithHostBundle_delegate_(host, None)
+        if standard is None:
+            raise RuntimeError("SPUStandardUserDriver initialization failed")
+        def main(callback):
+            NSOperationQueue.mainQueue().addOperationWithBlock_(callback)
+        controller = None
+
+        def retry():
+            if (controller is None or controller.updater is None or controller.updater.sessionInProgress()
+                    or not controller.updater.canCheckForUpdates()):
+                return False
+            controller.updater.checkForUpdates()
+            return True
+
+        def open_notes(url):
+            import webbrowser
+
+            threading.Thread(target=webbrowser.open, args=(url,), name="update-release-notes", daemon=True).start()
+
+        card = UpdateCardSession(standard, lambda: window, main, retry=retry, open_notes=open_notes)
+        controller = _driver_class(objc.protocolNamed("SPUUserDriver")).alloc().initWithCard_(card)
+        # Sparkle has no generated PyObjC metadata: preserve the NSError out
+        # parameter so a failed start returns its diagnostic as well as BOOL.
+        objc.registerMetaDataForSelector(b"SPUUpdater", b"startUpdater:",
+                                         {"arguments": {2: {"type": b"o^@"}}})
+        updater = objc.lookUpClass("SPUUpdater").alloc().initWithHostBundle_applicationBundle_userDriver_delegate_(
+            host, host, controller, delegate)
+        if updater is None:
+            raise RuntimeError("SPUUpdater initialization failed")
+        controller.updater = updater
+        started = updater.startUpdater_(None)
+        success = started[0] if isinstance(started, tuple) else started
+        if not success:
+            error = started[1] if isinstance(started, tuple) and len(started) > 1 else None
+            if error is not None:
+                logger(f"Sparkle startUpdater failed: {error}")
+                standard.showUpdaterError_acknowledgement_(error, lambda: None)
+            raise RuntimeError(f"SPUUpdater could not start: {error or 'no error details returned'}")
+        if window is not None:
+            def end_page(*_args):
+                main(card.page_closed)
+            window.events.before_load += end_page
+            window.events.closed += end_page
         menu_item = _install_menu_item(controller)
         logger("Sparkle updater started")
-        return SparkleHandle(controller=controller, delegate=delegate, menu_item=menu_item)
+        return SparkleHandle(controller=controller, delegate=delegate, menu_item=menu_item,
+                             user_driver=controller, card=card)
     except Exception as exc:
         logger(f"Sparkle unavailable: {type(exc).__name__}: {exc}")
         return None

@@ -6,7 +6,7 @@
 
 | Channel | Download | Verification |
 | --- | --- | --- |
-| Stable 2.5.5 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.5/nd2wsi-viewer-2.5.5-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.5.5) |
+| Stable 2.5.6 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.6/nd2wsi-viewer-2.5.6-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.5.6) |
 
 Extract the entire ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
 The archive includes Python and the scientific libraries. Builds after 2.5.4
@@ -15,25 +15,24 @@ also include the Microsoft Edge WebView2 Runtime (see
 install WebView2 separately if it is missing. The app also requires .NET
 Framework 4.6.2 or later.
 
-The x64 app targets Windows 10 version 1709 or later and Windows 11 on
-Intel/AMD. Windows 11 ARM64 uses the same executable through x64 emulation;
-this is not a native ARM64 build. Release records identify the exact executable
-and the x64/ARM64 execution targets checked. Windows 10 Education and local
-Parallels were not separately tested for these releases.
+The x64 app targets Windows 11 on Intel/AMD. Windows 11 ARM64 uses the same
+executable through x64 emulation; this is not a native ARM64 build. Release
+records identify the exact executable and the x64/ARM64 execution targets
+checked. Windows 10 is not tested and is not a supported target.
 
 The executable is not Authenticode-signed, so Windows may show an
 unknown-publisher warning. Updates are installed manually from Releases.
 Windows uses the standard title bar and does not use the macOS Sparkle updater.
 Use **Ctrl** for Mac **⌘** shortcuts and **Alt** for **Option**.
 
-Stable 2.5.5 includes Astromap ROI import/export and supported HEVC SDPC viewing.
+Stable 2.5.6 includes Astromap ROI import/export and supported HEVC SDPC viewing.
 Shading Correction assesses supported FITC and CY3 channels; BF and DAPI remain
 unchanged. See the [current method and limits](shading-correction-validation.md).
 
 It has the collapsible top tools and the translucent viewer, with ROI boxes,
 navigation, locking and a 10–100% opacity slider. Windows applies opacity to
 the whole floating window, including its controls and ROI outlines. See the
-[2.5.5 notes](release-notes-2.5.5.md) for what changed in this release.
+[2.5.6 notes](release-notes-2.5.6.md) for what changed in this release.
 
 Older validation records below apply only to the versions named in them.
 
@@ -101,7 +100,7 @@ emulation, not an ARM64-native binary.
 ## Installer build tooling
 
 The Windows app uses a native frame and Microsoft Edge WebView2. Installer
-tooling can produce a versioned Setup executable, but the current stable 2.5.5
+tooling can produce a versioned Setup executable, but the current stable 2.5.6
 download is a portable ZIP; no Setup installer is published for that release. The tooling installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
@@ -121,14 +120,10 @@ Target execution modes (the verified CI environments are listed above):
 
 | Computer | Execution |
 | --- | --- |
-| Windows 10 x64, version 1709/build 16299 or later, including Education | Native x64; 22H2 recommended |
 | Windows 11 on Intel/AMD x64 | Native x64 |
 | Windows 11 on ARM64 | Same x64 EXE through Windows x64 emulation |
 
-Windows 10 ARM64 and 32-bit Windows are not supported. The laboratory target
-is Windows 10 Education x64; its actual edition and build are recorded by the
-supplied verification script. This is a desktop Windows edition even when the
-computer is used as a laboratory server.
+Windows 10 and 32-bit Windows are not supported targets.
 
 There is no GPU compute requirement. ARM64-native packaging is not claimed:
 the locked Python/.NET bridge and some scientific dependencies do not provide
@@ -219,14 +214,14 @@ To bundle the WebView2 runtime as CI does, download the cab pinned in
 to the build command.
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.5.5-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.5.6-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.5.5-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.5.6-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks

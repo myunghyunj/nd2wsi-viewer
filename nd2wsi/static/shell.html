@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html data-update-card-shell="true" lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -7,6 +7,7 @@
 
 <script src="static/early-errors-v1.js"></script>
 <link rel="stylesheet" href="static/native-shell-v1.css" />
+<link rel="stylesheet" href="static/update-card-v1.css">
 </head>
 <body>
 <div id="dropzone" hidden></div>
@@ -207,6 +208,15 @@
 <script src="static/shortcut-router-v1.js"></script>
 <script src="static/native-scope-v1.js"></script>
 <script src="static/shading-correction-v1.js"></script>
+<section id="update-notice" aria-labelledby="update-notice-title" role="status" aria-live="polite" hidden>
+  <h2 id="update-notice-title"></h2>
+  <p id="update-notice-body"></p>
+  <progress id="update-notice-progress" max="1" hidden></progress>
+  <span id="update-notice-detail" hidden></span>
+  <button type="button" id="update-notice-notes" hidden>Release notes</button>
+  <div id="update-notice-actions"></div>
+</section>
+<script src="static/update-card-v1.js"></script>
 <script src="static/shell-v1.js"></script>
 <script src="static/window-controls-v1.js"></script>
 

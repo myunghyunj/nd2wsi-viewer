@@ -15,9 +15,9 @@ Python and scientific libraries are included; no separate Python installation
 or GPU is required. Use the current portable ZIP; the older v1.2.8
 Setup cannot read v2 `.nd2svs` caches.
 
-The x64 app targets Windows 10 version 1709 or later and Windows 11 on
-Intel/AMD. On Windows 11 ARM64, including Snapdragon and Parallels on Apple
-silicon, it uses Windows x64 emulation. See the
+The x64 app targets Windows 11 on Intel/AMD. On Windows 11 ARM64, including
+Snapdragon and Parallels on Apple silicon, it uses Windows x64 emulation.
+Windows 10 is not a supported target. See the
 [release notes](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) for the
 exact source commit, archive checksums, and platform verification results.
 .NET Framework 4.6.2 or later is required. Builds after 2.5.4 include the

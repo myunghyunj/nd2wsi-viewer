@@ -1,0 +1,22 @@
+#update-notice {
+  position: fixed; right: 16px; bottom: 16px; z-index: 1000;
+  box-sizing: border-box; width: min(340px, calc(100vw - 32px)); padding: 16px;
+  border: 1px solid var(--hairline, rgba(255,255,255,.14)); border-radius: 12px;
+  color: var(--label, rgba(255,255,255,.9)); background: rgba(35,36,39,.74);
+  backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+  box-shadow: 0 8px 28px rgba(0,0,0,.2); text-align: left;
+  font: 12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+#update-notice[hidden], #update-notice [hidden] { display: none; }
+:root.light #update-notice { background: rgba(250,250,252,.74); }
+#update-notice h2 { margin: 0 0 7px; font-size: 13px; font-weight: 600; }
+#update-notice p { margin: 0 0 12px; color: var(--label-2, rgba(255,255,255,.65)); overflow-wrap: anywhere; white-space: pre-line; }
+#update-notice progress { display: block; width: 100%; height: 5px; border: 0; border-radius: 3px; accent-color: var(--accent, #0a84ff); overflow: hidden; }
+#update-notice progress::-webkit-progress-bar { background: rgba(128,128,128,.3); }
+#update-notice progress::-webkit-progress-value { background: var(--accent, #0a84ff); }
+#update-notice-detail { display: block; margin-top: 6px; color: var(--label-2, rgba(255,255,255,.65)); }
+#update-notice-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+#update-notice button { font: inherit; padding: 6px 10px; border: 1px solid var(--hairline, rgba(255,255,255,.14)); border-radius: 7px; background: transparent; color: inherit; cursor: pointer; }
+#update-notice button:disabled { opacity: .5; cursor: default; }
+#update-notice .update-primary { color: white; background: var(--accent, #0a84ff); border-color: transparent; }
+#update-notice #update-notice-notes { padding: 0; border: 0; color: var(--accent, #0a84ff); margin-top: 8px; }
