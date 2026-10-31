@@ -46,6 +46,7 @@ class LaserDelivery:
         self._queue = queue.Queue(maxsize=QUEUE_SIZE)
         self._wake = threading.Event()
         self._closed = threading.Event()
+        self._disabled = threading.Event()
         self._pending = None
         self._guard = threading.Lock()
         self._reports = deque()
@@ -54,7 +55,7 @@ class LaserDelivery:
 
     @staticmethod
     def skipped(record, reason):
-        session_log.event("slacs_laser_box", press=record.get("press"), decision="skipped", reason=reason)
+        session_log.event("slacs_laser_box", press=record.get("press"), decision="skipped", reason=reason, status=reason)
 
     def enqueue(self, record):
         if self._closed.is_set():
@@ -71,15 +72,35 @@ class LaserDelivery:
     def close(self):
         self._closed.set()
         self._wake.set()
+        try:
+            self._queue.put_nowait(None)  # wake an idle, blocking queue reader
+        except queue.Full:
+            pass
         # Never join: a web view may be hung, and a caller may hold a lifecycle lock.
 
-    def _timeout(self):
-        self.close()
+    @property
+    def status(self):
+        return "delivery_disabled" if self._disabled.is_set() else "ready"
+
+    def _timeout(self, finished):
+        # Keep only one browser call alive. Observe/log subsequent presses while
+        # it is stalled, then rearm after it returns; never replay skipped shots.
+        self._disabled.set()
+        with self._guard:
+            self._pending = None
         while True:
-            try:
-                self.skipped(self._queue.get_nowait(), "delivery_timeout")
-            except queue.Empty:
-                return
+            while True:
+                try:
+                    record = self._queue.get_nowait()
+                    if record is not None:
+                        self.skipped(record, "delivery_disabled")
+                except queue.Empty:
+                    break
+            if self._closed.is_set() or finished.is_set():
+                break
+            self._wake.clear()
+            self._wake.wait(.1)
+        self._disabled.clear()
 
     def accept(self, payload):
         """Only the current delivery can confirm an annotation; bounded untrusted input."""
@@ -137,10 +158,9 @@ class LaserDelivery:
 
     def _run(self):
         while not self._closed.is_set():
-            try:
-                record = self._queue.get(timeout=.1)
-            except queue.Empty:
-                continue
+            record = self._queue.get()
+            if record is None or self._closed.is_set():
+                return
             deadline = time.monotonic() + VIEW_WAIT
             payload, reason = None, "stale_view"
             while not self._closed.is_set():
@@ -186,8 +206,9 @@ class LaserDelivery:
                     break
                 if time.monotonic() >= deadline:
                     self.skipped(record, "delivery_timeout")
-                    self._timeout()  # no second evaluate_js after a hung call
-                    return
+                    self._timeout(finished)
+                    reply = None  # late acknowledgments belong to the retired token
+                    break
                 self._wake.wait(min(.1, max(0, deadline - time.monotonic())))
             with self._guard:
                 self._pending = None
@@ -196,7 +217,7 @@ class LaserDelivery:
                 session_log.event("slacs_laser_box", **{k: reply.get(k) for k in allowed})
                 if reply.get("item") is not None and self._confirmed is not None:
                     # The same worker relays only acknowledged items, and waits for it
-                    # before the next press. A timeout also disables further delivery.
+                    # before the next press. Stalls suspend delivery until return.
                     done = threading.Event()
 
                     def confirm(value=reply):
@@ -206,7 +227,8 @@ class LaserDelivery:
                             pass
                         finally:
                             done.set()
+                            self._wake.set()
 
                     threading.Thread(target=confirm, name="nd2wsi-laser-confirm", daemon=True).start()
                     if not done.wait(DELIVERY_WAIT):
-                        self._timeout()
+                        self._timeout(done)

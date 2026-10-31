@@ -102,3 +102,36 @@ def test_follow_start_and_discovery_loss_cancel_target_capture():
       return {start,lost:!m.target.calibrating,hidden:h.element('laser-target-capture').hidden};
     """)
     assert result == {"start": True, "lost": True, "hidden": True}
+
+
+@pytest.mark.parametrize("angle", range(0, 360, 15))
+@pytest.mark.parametrize("flip", [False, True])
+def test_nonzero_calibrated_target_and_all_corners_follow_rotation_and_flip(angle, flip):
+    import math
+
+    result = run(f'''
+      const h=followHarness({{initialContext:{{rotation:{angle},flip:{str(flip).lower()},
+        laser_target:{{offset_css:[27,-13],side_um:18,rotation_deg:45,window:[10,20,800,500],dpr:2}}}}}});
+      Object.assign(h.win,{{screenX:10,screenY:20,devicePixelRatio:2}});await h.mounted.pollSlacsDiscovery();
+      const target=require(require('path').join(require('path').dirname(process.argv[1]),'laser-target-v1.js'));
+      const shapes=[];
+      for(let rotation_deg=0;rotation_deg<90;rotation_deg+=15){{
+        const b=target.shape(h.viewer.viewport,{{Point}},{{...h.mounted.target.target,rotation_deg}},{{x:.5,y:2}});
+        shapes.push({{screen:b.corners,image:b.imageCorners}});
+      }}
+      return {{report:h.mounted.target.report(),shapes}};
+    ''')
+    radians = math.radians(angle)
+    def image(point):
+        dx = (point["x"] - 400) * (-1 if flip else 1)
+        dy = point["y"] - 250
+        return [400 + (dx * math.cos(radians) + dy * math.sin(radians)) / 2,
+                250 + (-dx * math.sin(radians) + dy * math.cos(radians)) / 2]
+    assert result["report"]["target_calibrated"]
+    assert result["report"]["target_px"] == pytest.approx(image({"x": 427, "y": 237}))
+    for shape in result["shapes"]:
+        for screen, actual in zip(shape["screen"], shape["image"], strict=True):
+            assert [actual["x"], actual["y"]] == pytest.approx(image(screen))
+        for i, a in enumerate(shape["image"]):
+            b = shape["image"][(i + 1) % 4]
+            assert math.hypot((b["x"] - a["x"]) * .5, (b["y"] - a["y"]) * 2) == pytest.approx(18)

@@ -368,7 +368,7 @@
         polygon.setAttribute("points",points.map(p=>p.x+","+p.y).join(" "));laserLayer.appendChild(polygon);
         const label = doc.createElementNS("http://www.w3.org/2000/svg","text");
         label.setAttribute("x",Math.min(...points.map(p=>p.x))); label.setAttribute("y",Math.min(...points.map(p=>p.y))-5);
-        label.textContent = String(item.text) + " · " + item.slacs.shots + " shots";laserLayer.appendChild(label);
+        label.textContent = String(item.text) + " · " + item.slacs.shots + (item.slacs.shots === 1 ? " shot" : " shots");laserLayer.appendChild(label);
       }
     };
     win.nd2TranslucentLaserItem = item => {
@@ -506,13 +506,15 @@
       const unlocked = live && !state.locked;
       const notInFront = live && !!follow.keys && follow.keys.slacs_in_front === false;
       followStatus.textContent = follow.pending ? "Connecting…" :
+        live && follow.laserDelivery === "delivery_disabled" ? "Laser boxes paused: viewer busy" :
         unlocked ? "Unlocked: align by hand, lock to follow" : notInFront ? "SLACS not in front" :
         follow.status === "following" ? "Following SLACS keys" :
         follow.status === "waiting" ? "Waiting for W/A/S/D in SLACS" :
         follow.status === "paused" ? "Paused" : "Off";
       followStatus.dataset.status = follow.pending ? follow.status : unlocked ? "unlocked" :
         notInFront ? "not-in-front" : follow.status;
-      followStatus.title = follow.message;
+      followStatus.title = follow.laserDelivery === "delivery_disabled" ?
+        "Shots are being skipped. Laser boxes resume when the viewer responds." : follow.message;
       if (followStep) {
         followStep.value = String(state.stepUm);
         // The step is fixed for a run: changing it mid-follow would desync counts.
@@ -549,7 +551,10 @@
         flipBoxes[axis].checked = state.followFlips[axis];
         flipBoxes[axis].disabled = state.flipPending || !flipAvailable;
       }
-      if (followFlipHint) followFlipHint.textContent = state.flipMessage || flipHint;
+      if (followFlipHint) {
+        followFlipHint.textContent = state.flipMessage || flipHint;
+        followFlipHint.hidden = !state.flipMessage;
+      }
       for (const input of Object.values(flipBoxes)) if (input) input.title = state.flipMessage || flipHint;
       followSave.disabled = !follow.enabled || follow.pending || typeof api.save_stage_follow_connection !== "function";
       doc.getElementById("stage-follow-message").textContent = follow.message ||
@@ -610,6 +615,7 @@
       follow.displacement = cumulative.slice();
       follow.seq = result.seq;
       follow.status = result.status;
+      follow.laserDelivery = result.laser_delivery || "ready";
       follow.message = "";
       follow.keys = result.keys && typeof result.keys === "object" ? result.keys : null;
       paintFollow();

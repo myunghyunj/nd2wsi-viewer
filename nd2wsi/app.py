@@ -804,6 +804,7 @@ class Api:
                     raise ValueError("The source viewer is closing")
                 previous = self._translucent_windows.get(sid)
                 if previous is not None:
+                    previous.refresh_context(context)
                     return {"ok": True, "id": previous._window.uid}
                 claim = tracing_claim(self._window_session)
                 try:

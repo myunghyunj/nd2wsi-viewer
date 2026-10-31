@@ -475,6 +475,12 @@ While locked and following, each comma press can create an isolation annotation
 in the source pane. A fresh view must acknowledge the same Follow receiver and
 sequence. After a one-second wait, stale or superseded views are skipped. Period
 remains log-only. Ctrl/Alt+comma counts as comma and retains its logged modifiers.
+Raw Input currently does not track Shift, so Shift+comma is also recorded as a
+shot even though SLACS key 44 is unshifted. Use unshifted comma for shot records.
+A view reported after the press is skipped (`view_after_press`), preventing a
+queued shot from using a later hand alignment. A delivery stall pauses laser
+boxes with a visible status; subsequent presses are logged as skipped and are
+never replayed. Delivery resumes after the stalled browser call returns.
 The most recently locked following overlay is the defensive annotation owner.
 
 A new position creates `isolation #N`; repeated shots within half the target side

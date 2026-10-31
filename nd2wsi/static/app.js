@@ -4675,23 +4675,28 @@ function applyLinkedViewport(message) {
 }
 
 function receiveSlacsLaserBox(box) {
-  const api = window.Nd2SlacsLaser;
-  if (!api) return;
-  const owner = {
-    sid: currentSlideSid(), g: state.info.generation, p: state.plate ? state.annSite : null,
-    ready: annotationOwnerReady(), locked: annLocked(), loadFailed: state.annLoadFailed,
-    quitPreparing: state.quitPreparing, width: state.info.width, height: state.info.height,
-    items: state.annotations, meta: state.annLaserState,
-    add(item) { state.annLaserState = this.meta; return addAnnotation(item); },
-    update(previous, item) {
-      state.annLaserState = this.meta;
-      state.annotations[state.annotations.indexOf(previous)] = item;
-      annotationsChanged();
-    },
-  };
-  const outcome = api.receive(box, owner);
+  let sid, outcome = {token: box?.token, press: box?.press, decision: "skipped", reason: "pane_unavailable"};
   try {
-    const promise = (window.parent !== window ? window.parent : window).pywebview?.api?.report_slacs_laser_box?.({ ...outcome, sid: currentSlideSid() });
+    sid = currentSlideSid();
+    const api = window.Nd2SlacsLaser;
+    if (api) {
+      const owner = {
+        sid, g: state.info.generation, p: state.plate ? state.annSite : null,
+        ready: annotationOwnerReady(), locked: annLocked(), loadFailed: state.annLoadFailed,
+        quitPreparing: state.quitPreparing, width: state.info.width, height: state.info.height,
+        items: state.annotations, meta: state.annLaserState,
+        add(item) { state.annLaserState = this.meta; return addAnnotation(item); },
+        update(previous, item) {
+          state.annLaserState = this.meta;
+          state.annotations[state.annotations.indexOf(previous)] = item;
+          annotationsChanged();
+        },
+      };
+      outcome = api.receive(box, owner);
+    }
+  } catch (_) { outcome.reason = "pane_error"; }
+  try {
+    const promise = (window.parent !== window ? window.parent : window).pywebview?.api?.report_slacs_laser_box?.({ ...outcome, sid });
     promise?.catch?.(() => {});
   } catch (_) { /* A failed acknowledgement cannot overwrite the pane's sidecar. */ }
 }

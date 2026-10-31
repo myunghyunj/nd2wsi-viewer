@@ -465,3 +465,24 @@ def test_older_load_cannot_install_over_a_newer_one():
     assert out["final"]["items"] == ["b"] and out["final"]["ready"] is True
     assert out["final"]["path"] == "/sidecars/b.json" and out["final"]["status"] == "Loaded 1 from b.json"
     assert ["a"] not in out["renders"]
+
+
+@pytest.mark.parametrize("raw", [True, [], "broken", {"unknown": 1},
+    {"isolation_highwater": -1, "presses": {"bad/path": 4}},
+    {"isolation_highwater": 9, "presses": {"good": 3, "bad/path": 4}, "extra": 1}])
+def test_laser_metadata_is_sanitized_on_load_before_the_next_save(raw):
+    from nd2wsi.slacs_laser import metadata
+
+    out = _run("const raw=" + json.dumps(raw) + r''';
+(async()=>{
+ const item={id:'laser',type:'box',x:1,y:2,w:3,h:4,slacs:{kind:'laser_shot',isolation:7}};
+ const server=sidecarServer(new Map([['api/annotations?p=0',{revision:'r0',items:[item],slacs:raw}]]));
+ state.plate.focus=0;await store.load(0);const loaded=state.annLaserState;
+ store.markDirty();await store.save();
+ emit({loaded,saved:server.posted[0].body.slacs,dirty:state.annDirty,items:state.annotations});
+})().catch(e=>{console.error(e);process.exit(1);});
+''')
+    assert metadata(out["saved"])["slacs"] == out["loaded"]
+    assert out["saved"]["isolation_highwater"] == (9 if isinstance(raw, dict) and raw.get("extra") else 7)
+    assert "bad/path" not in out["saved"]["presses"] and not out["dirty"]
+    assert out["items"][0]["slacs"]["isolation"] == 7

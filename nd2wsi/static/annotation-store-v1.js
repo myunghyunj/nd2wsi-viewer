@@ -2,10 +2,9 @@
    queue per pane, revision/context guards, failed-save recovery drafts and
    plate-site owner transitions; no DOM or viewer dependencies. */
 (function (root, factory) {
-  const api = factory();
-  if (typeof module === "object" && module.exports) module.exports = api;
-  else root.Nd2AnnotationStore = api;
-})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+  if (typeof module === "object" && module.exports) module.exports = factory(require("./slacs-laser-v1.js"));
+  else root.Nd2AnnotationStore = factory(root.Nd2SlacsLaser);
+})(typeof globalThis !== "undefined" ? globalThis : this, function (slacsLaser) {
   "use strict";
 
   function basename(p) {
@@ -517,7 +516,7 @@
             () => "a" + now().toString(36) + "s" + loadedIds++);
           state.annotations = items;
           state.annForeignItems = foreign;
-          state.annLaserState = d.slacs || null;
+          state.annLaserState = (d?.slacs || items.some(slacsLaser.laser)) ? slacsLaser.metadata(d?.slacs, items) : null;
           state.annPath = recovered ? null : d.path;
           state.annReady = true;
           state.annDirty = recovered;

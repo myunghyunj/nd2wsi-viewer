@@ -465,6 +465,7 @@ def test_creation_uses_hidden_independent_window_and_waits_for_content(monkeypat
     assert len(window.events.loaded.handlers) == 2
     # A display-only overlay closes at once; only the viewer window has a save veto.
     assert window.events.closing.handlers == []
+    api._did_close()
 
 
 def test_parent_registry_owns_overlay_and_cleans_up_without_touching_source(store, payload, monkeypatch):
@@ -513,7 +514,7 @@ def test_parent_registry_passes_one_flip_store_to_each_overlay(store, payload, m
 
     def create(context, **options):
         created.append(options)
-        return SimpleNamespace(_window=SimpleNamespace(uid=f"trace-{len(created)}"), close_translucent=Mock())
+        return SimpleNamespace(_window=SimpleNamespace(uid=f"trace-{len(created)}"), close_translucent=Mock(), refresh_context=Mock())
 
     monkeypatch.setattr(overlay, "create_translucent_window", create)
     monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
@@ -610,3 +611,90 @@ def test_tracing_claim_released_by_os_after_crash(tmp_path):
             process.kill()
         process.communicate(timeout=5)
         claim.release()
+
+
+def test_laser_route_stamps_owner_sid_and_only_returns_ack_to_that_overlay(store, payload, monkeypatch):
+    import json
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    child = SimpleNamespace(_window=SimpleNamespace(uid="trace"), close_translucent=Mock(),
+                            report_slacs_laser_box=Mock(return_value={"ok": True}))
+    create = Mock(return_value=child)
+    monkeypatch.setattr(overlay, "create_translucent_window", create)
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/token/")
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store))
+    owner = Mock()
+    owner.evaluate_js.return_value = True
+    monkeypatch.setattr(api, "_lut_clipboard_owner", lambda: owner)
+    assert api.open_translucent_viewer("slide", payload)["ok"]
+    options = create.call_args.kwargs
+    try:
+        assert not options["is_active"]()
+        options["on_lock"](True)
+        assert options["is_active"]()
+        message = {"sid": "spoofed", "token": "token", "press": 4}
+        assert options["on_laser_box"](message) is True
+        script = owner.evaluate_js.call_args.args[0]
+        sent = json.loads(script.split("?.(", 1)[1].rsplit(") === true", 1)[0])
+        assert sent == {**message, "sid": "slide"}
+        assert not api.report_slacs_laser_box(None)["ok"]
+        assert not api.report_slacs_laser_box({**message, "sid": "missing"})["ok"]
+        assert api.report_slacs_laser_box(sent)["ok"]
+        child.report_slacs_laser_box.assert_called_once_with(sent)
+    finally:
+        options["on_closed"](child)
+    assert not api.report_slacs_laser_box(sent)["ok"]
+
+
+def test_reuse_refreshes_display_and_focuses_without_another_window():
+    api = overlay.TranslucentApi({"rotation": 0, "flip": False, "query": "?c=0"}, logger=Mock(), on_closed=Mock())
+    api._configured = True
+    api._window = Mock()
+    api._page_url = "http://local/trace"
+    receiver = api._stage_follow = Mock()
+    api._overlay_view = {"target_px": [1, 2]}
+    updated = {"rotation": 90, "flip": True, "query": "?c=1&win=1:200", "center": [20, 30]}
+    api.refresh_context(updated)
+    receiver.close.assert_called_once()
+    assert api._overlay_view is None
+    for key, value in updated.items():
+        assert api.translucent_context()[key] == value
+    api._window.load_url.assert_called_once_with("http://local/trace")
+    api._window.show.assert_called_once()
+    api._did_close()
+
+
+def test_load_timeout_releases_claim_and_late_load_cannot_show_window(store, payload, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(overlay.threading, "Timer", Mock())
+    window = Mock()
+    window.events = SimpleNamespace(loaded=Event(), closed=Event())
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=Mock(return_value=window)))
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/token/")
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store))
+    assert api.open_translucent_viewer("one", payload)["ok"]
+    child = api._translucent_windows["one"]
+    child._initial_load_timeout()
+    assert not api._translucent_windows and api._translucent_claim is None and child._closed
+    monkeypatch.setattr(child, "_dispatch", lambda fn: fn())
+    child._configure_and_show()
+    window.native.Show.assert_not_called()
+    assert api.open_translucent_viewer("two", payload)["ok"]
+    api._translucent_windows["two"]._initial_load_timeout()
+
+
+def test_create_window_failure_disposes_the_api_without_allocating_delivery(monkeypatch):
+    from nd2wsi import slacs_laser
+
+    factory = Mock()
+    monkeypatch.setattr(slacs_laser, "LaserDelivery", factory)
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=Mock(side_effect=RuntimeError("failed"))))
+    closed = Mock()
+    with pytest.raises(RuntimeError, match="failed"):
+        overlay.create_translucent_window({}, url="http://local/trace", title="Tracing", logger=Mock(), on_closed=closed,
+                                          on_laser_box=Mock())
+    factory.assert_not_called()
+    closed.assert_called_once()
+    assert closed.call_args.args[0]._closed

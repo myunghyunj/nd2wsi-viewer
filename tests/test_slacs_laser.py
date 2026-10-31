@@ -40,25 +40,47 @@ def test_ordered_delivery_accepts_only_current_ack_and_relays_confirmed_items():
         worker.close()
 
 
-def test_stale_view_waits_for_fresh_report_and_hung_delivery_drops_remaining(monkeypatch):
-    monkeypatch.setattr(laser, "DELIVERY_WAIT", .05)
-    monkeypatch.setattr(laser, "VIEW_WAIT", .1)
+@pytest.mark.parametrize("stall_phase", ["delivery", "confirmation"])
+def test_stall_logs_all_skipped_presses_then_rearms_without_overlapping_calls(monkeypatch, stall_phase):
+    monkeypatch.setattr(laser, "DELIVERY_WAIT", .04)
     events, sent, fresh = [], [], threading.Event()
     hang = threading.Event()
-    monkeypatch.setattr(laser.session_log, "event", lambda kind, **data: events.append((kind, data)))
+    monkeypatch.setattr(laser.session_log, "event", lambda kind, **data: events.append(data))
+    worker = None
+
+    def deliver(payload):
+        sent.append(payload["press"])
+        if payload["press"] == 1 and stall_phase == "delivery":
+            hang.wait(2)
+        result = worker.accept({"token": payload["token"], "press": payload["press"], "decision": "added",
+            "id": "laser", "item": {"id": "laser", "type": "box", "slacs": {"kind": "laser_shot"}}})
+        if payload["press"] == 1 and stall_phase == "delivery":
+            assert not result["ok"]  # the timed-out token is retired
+        return True
+
+    def confirm(payload):
+        if payload["press"] == 1 and stall_phase == "confirmation":
+            hang.wait(2)
+
     worker = laser.LaserDelivery(prepare=lambda r: (r, None) if fresh.is_set() else (None, "stale_view"),
-                                 deliver=lambda r: (sent.append(r["press"]), hang.wait(2))[1])
+                                 deliver=deliver, confirmed=confirm)
     try:
         worker.enqueue({"press": 1})
         worker.enqueue({"press": 2})
         assert not sent
         fresh.set()
         worker.view_changed()
-        wait_for(lambda: worker._closed.is_set())
-        assert sent == [1]
-        wait_for(lambda: len(events) == 2)
-        assert [e[1]["reason"] for e in events] == ["delivery_timeout", "delivery_timeout"]
-        assert [e[1]["press"] for e in events] == [1, 2]
+        wait_for(lambda: worker.status == "delivery_disabled")
+        for press in (3, 4):
+            worker.enqueue({"press": press})
+        wait_for(lambda: sum(e.get("status") == "delivery_disabled" for e in events) == 3)
+        assert sent == [1] and not worker._closed.is_set()
+        assert [e["press"] for e in events if e.get("status") == "delivery_disabled"] == [2, 3, 4]
+        hang.set()
+        wait_for(lambda: worker.status == "ready")
+        worker.enqueue({"press": 5})
+        wait_for(lambda: any(e.get("press") == 5 and e.get("decision") == "added" for e in events))
+        assert sent == [1, 5]
     finally:
         hang.set()
         worker.close()
@@ -131,3 +153,41 @@ def test_lock_and_realign_baseline_survives_refused_report(monkeypatch):
 def test_receiver_urlsafe_identifier_is_preserved_in_metadata():
     value = {"isolation_highwater": 8, "presses": {"receiver_with-hyphen": 55}}
     assert laser.metadata(value)["slacs"] == value
+
+
+def test_delayed_press_rejects_a_hand_realigned_view_with_the_same_follow_sequence():
+    overlay = TranslucentApi({}, logger=Mock(), on_closed=Mock())
+    overlay._stage_follow = Mock()
+    overlay._stage_follow_receiver_id = "receiver"
+    overlay._locked = True
+    overlay._overlay_view = {"follow_session": "receiver", "follow_seq": 8, "locked": True, "at": 11}
+    record = {"receiver_id": "receiver", "press": 1, "follow_seq": 8, "locked": True, "observed_at": 10}
+    assert overlay._prepare_laser_box(record) == (None, "view_after_press")
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_laser_worker_is_lazy_reused_and_closed_on_failed_start_or_window_exit(monkeypatch, running):
+    from nd2wsi import stage_follow, stage_keys
+
+    receiver = Mock()
+    receiver.start.return_value = {"session_id": "receiver"}
+    follower = Mock()
+    follower.start.return_value = {"running": running}
+    monkeypatch.setattr(stage_follow, "StageFollowReceiver", lambda: receiver)
+    monkeypatch.setattr(stage_keys, "SlacsKeyFollower", lambda *args, **kw: follower)
+    worker = Mock()
+    factory = Mock(return_value=worker)
+    monkeypatch.setattr(laser, "LaserDelivery", factory)
+    overlay = TranslucentApi({"pixel_size_um": [1, 1]}, logger=Mock(), on_closed=Mock(), on_laser_box=Mock())
+    factory.assert_not_called()
+    overlay._slacs_snapshot = {"available": True, "session_id": "process"}
+    result = overlay.start_stage_follow({"source": "keys", "step_source": "manual"})
+    assert result["ok"] is running
+    factory.assert_called_once()
+    if running:
+        overlay.stop_stage_follow()
+        worker.close.assert_not_called()  # keep one serialized channel across Follow runs
+        overlay.start_stage_follow({"source": "keys", "step_source": "manual"})
+        factory.assert_called_once()
+        overlay._did_close()
+    worker.close.assert_called_once()

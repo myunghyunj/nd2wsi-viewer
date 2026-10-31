@@ -241,11 +241,8 @@ class TranslucentApi:
         self._on_lock = on_lock
         self._is_active = is_active or (lambda: True)
         self._laser_delivery = None
-        if on_laser_box is not None:
-            from .slacs_laser import LaserDelivery
-
-            self._laser_delivery = LaserDelivery(prepare=self._prepare_laser_box, deliver=on_laser_box,
-                                                  confirmed=self._confirm_laser_box)
+        self._on_laser_box = on_laser_box
+        self._load_timer = None
         self._target_store = target_store
         self._target_save_lock = threading.Lock()
         self._laser_target = laser_target.validate(laser_target.DEFAULT)
@@ -518,7 +515,14 @@ class TranslucentApi:
                 receiver.close()
                 return {"ok": False, "message": "Could not start the local motion receiver: " + str(exc)}
             follower = controls_error = None
+            made_delivery = False
             if source == "keys":
+                if self._on_laser_box is not None and self._laser_delivery is None:
+                    from .slacs_laser import LaserDelivery
+
+                    made_delivery = True
+                    self._laser_delivery = LaserDelivery(prepare=self._prepare_laser_box,
+                        deliver=self._on_laser_box, confirmed=self._confirm_laser_box)
                 controls = None
                 if step_source == "slacs":
                     controls, controls_error = self._slacs_controls_monitor()
@@ -536,6 +540,9 @@ class TranslucentApi:
                     if follower is not None:
                         follower.stop("start_failed")
                     receiver.close()
+                    if made_delivery:
+                        self._laser_delivery.close()
+                        self._laser_delivery = None
                     message = snapshot.get("error") or "Could not start key following."
                     session_log.event("follow_start", source=source, step_source=step_source, ok=False,
                                       message=message)
@@ -704,8 +711,10 @@ class TranslucentApi:
 
     def _on_mark_record(self, record):
         # Raw Input: bounded enqueue only, no overlay lock, I/O or browser call.
-        if self._laser_delivery is not None:
-            self._laser_delivery.enqueue({**record, "at": dt.datetime.now().astimezone().isoformat(timespec="milliseconds")})
+        delivery = self._laser_delivery
+        if delivery is not None:
+            delivery.enqueue({**record, "observed_at": time.monotonic(),
+                              "at": dt.datetime.now().astimezone().isoformat(timespec="milliseconds")})
 
     def _prepare_laser_box(self, record):
         if self._closed or self._stage_follow is None:
@@ -728,6 +737,8 @@ class TranslucentApi:
             return None, "view_moved"
         if view["follow_seq"] < seq:
             return None, "stale_view"
+        if record.get("observed_at") is not None and view["at"] > record["observed_at"]:
+            return None, "view_after_press"
         if not view["locked"]:
             return None, "unlocked"
         if view.get("target_px") is None or view.get("target_corners_px") is None:
@@ -813,6 +824,8 @@ class TranslucentApi:
             self._stage_follow_status = status
         if changed:
             session_log.event("follow_state", source=source, status=status)
+        if self._laser_delivery is not None:
+            snapshot = {**snapshot, "laser_delivery": self._laser_delivery.status}
         return snapshot
 
     def stop_stage_follow(self):
@@ -1027,6 +1040,8 @@ class TranslucentApi:
             raise RuntimeError("The translucent viewer requires macOS or Windows")
 
     def _configure_and_show(self, *_args):
+        if self._load_timer is not None:
+            self._load_timer.cancel()
         def configure():
             if self._closed or self._configured:
                 return
@@ -1214,6 +1229,34 @@ class TranslucentApi:
 
         return {"ok": self._geometry(resize), "width": width, "height": height}
 
+    def refresh_context(self, context):
+        """Reuse this process's visible tracing window with the source pane's view."""
+        with self._lock:
+            if self._closed or not self._configured:
+                raise ValueError("The tracing window is still opening or closing.")
+        self.stop_stage_follow()
+        with self._lock:
+            self._context = {**copy.deepcopy(context), "opacity": self._context["opacity"],
+                             "opacity_mode": self._context["opacity_mode"]}
+            self._overlay_view = None
+            self._epoch += 1
+        self._window.load_url(self._page_url)
+        self._window.show()
+
+    def _initial_load_timeout(self):
+        with self._lock:
+            if self._closed or self._window.events.loaded.is_set():
+                return
+        self._logger("Tracing page did not load; closing its hidden window")
+        try:
+            self.close_translucent()
+        except Exception as exc:
+            self._logger(f"Tracing load-timeout teardown: {exc!r}")
+        finally:
+            # This window was never shown. _closed prevents a late loaded event
+            # from showing it after its failed-open claim has been released.
+            self._did_close()
+
     def close_translucent(self):
         # Closing/unlocking stays available even when locked.
         with self._lock:
@@ -1238,6 +1281,8 @@ class TranslucentApi:
             if self._close_notified:
                 return
             self._close_notified = True
+            if self._load_timer is not None:
+                self._load_timer.cancel()
             self._closed = True
             self._epoch += 1
         if self._laser_delivery is not None:
@@ -1254,20 +1299,28 @@ def create_translucent_window(context, *, url, title, logger, on_closed, flip_st
 
     api = TranslucentApi(context, logger=logger, on_closed=on_closed, flip_store=flip_store, target_store=target_store,
                          on_laser_box=on_laser_box, is_active=is_active, on_lock=on_lock)
-    window = webview.create_window(
-        title, url=url, js_api=api, width=640, height=480, min_size=MIN_SIZE,
-        frameless=True, easy_drag=False, resizable=False, on_top=True,
-        transparent=sys.platform == "darwin", shadow=False,
-        hidden=True, background_color="#000000",
-    )
-    if window is None:
-        raise RuntimeError("The overlay window could not be created")
+    try:
+        window = webview.create_window(
+            title, url=url, js_api=api, width=640, height=480, min_size=MIN_SIZE,
+            frameless=True, easy_drag=False, resizable=False, on_top=True,
+            transparent=sys.platform == "darwin", shadow=False,
+            hidden=True, background_color="#000000",
+        )
+        if window is None:
+            raise RuntimeError("The overlay window could not be created")
+    except Exception:
+        api._did_close()
+        raise
+    api._page_url = url
     api._window = window
     if sys.platform == "darwin":
         api._drag = _OverlayDrag(api, window, logger=logger)
     window.events.loaded += api._configure_and_show
     window.events.loaded += api._wire_drop
     window.events.closed += api._did_close
+    api._load_timer = threading.Timer(30, api._initial_load_timeout)
+    api._load_timer.daemon = True
+    api._load_timer.start()
     # Dynamic window creation can load before callbacks are registered.
     if window.events.loaded.is_set():
         api._configure_and_show()

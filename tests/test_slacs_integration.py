@@ -203,7 +203,7 @@ def test_a_key_follow_reads_the_controls_of_the_slacs_process_the_overlay_detect
         [monitor] = _ControlsMonitor.instances
         assert session_id == started['session_id']
         assert options == {'step_um': 10.0, 'step_source': 'slacs', 'controls': monitor, 'pixel_size_um': (0.5, 0.5),
-                           'flip_x': False, 'flip_y': False, 'mark_context': api._mark_context}
+                           'flip_x': False, 'flip_y': False, 'mark_context': api._mark_context, 'on_mark': api._on_mark_record}
         assert monitor.pid_provider() == 5150
         detector.slacs_pid.return_value = None  # the detector no longer reports that process
         assert monitor.pid_provider() is None
@@ -328,3 +328,13 @@ def test_slacs_marks_carry_the_overlay_view_while_follow_runs(monkeypatch):
         assert [kind for kind, _ in events].count('follow_key') == 1
     finally:
         api.close_translucent()
+
+
+def test_follower_option_contract_is_also_checked_without_a_loopback_bind(monkeypatch):
+    from nd2wsi import stage_follow
+
+    receiver = Mock()
+    receiver.start.return_value = {"session_id": "receiver-test"}
+    receiver.snapshot.return_value = {"status": "waiting", "seq": 0}
+    monkeypatch.setattr(stage_follow, "StageFollowReceiver", lambda: receiver)
+    test_a_key_follow_reads_the_controls_of_the_slacs_process_the_overlay_detected(monkeypatch)

@@ -41,12 +41,13 @@
     }
     return { isolation_highwater: items.filter(laser).reduce((n, a) => integer(a.slacs.isolation) ? Math.max(n,a.slacs.isolation) : n, highwater), presses };
   }
+  const shotCount = item => (item.slacs.shots || 1) + ((item.slacs.shots || 1) === 1 ? " shot" : " shots");
   const label = (item, count = false) => String(item.text || "isolation #" + item.slacs.isolation) +
-    (count ? " · " + (item.slacs.shots || 1) + " shots" : "");
+    (count ? " · " + shotCount(item) : "");
   function listLabel(item) {
     const date = new Date(item.slacs.at), time = Number.isFinite(date.getTime()) ?
       String(date.getHours()).padStart(2,"0") + ":" + String(date.getMinutes()).padStart(2,"0") : "";
-    return label(item) + " — " + (item.slacs.shots || 1) + " shots" + (time ? " · " + time : "");
+    return label(item) + " — " + shotCount(item) + (time ? " · " + time : "");
   }
   function receive(input, owner) {
     const result = { token: input?.token, press: input?.press, decision: "skipped", reason: "invalid", id: null,
