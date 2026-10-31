@@ -43,7 +43,7 @@ console.log(JSON.stringify({labels,detail:element('update-notice-detail').textCo
     assert result["detail"] == "55.4 MB of 132.1 MB"
     assert abs(result["progress"] - 55.4 / 132.1) < 1e-8
     assert result["text"] == "<img src=x onerror=bad()>" and result["ready"]
-    css = (STATIC / "update-card-v1.css").read_text()
+    css = (STATIC / "update-card-v1.css").read_text(encoding="utf-8")
     assert css.count(".74)") == 2 and "blur(24px)" in css
     assert "#update-notice[hidden]" in css and ":root.light #update-notice" in css
 
@@ -72,7 +72,7 @@ console.log(JSON.stringify({before,calls,labels,landingReady:landing.ready}));
 def test_shell_markup_precedes_card_script_and_boot_reuses_same_module():
     from nd2wsi.app import BOOT_HTML
 
-    html = (STATIC / "shell.html").read_text()
+    html = (STATIC / "shell.html").read_text(encoding="utf-8")
     assert html.index('id="update-notice"') < html.index('src="static/update-card-v1.js"') < html.index('src="static/shell-v1.js"')
     assert 'data-update-card-shell="true"' in html
     assert 'data-update-card-shell="true"' not in BOOT_HTML
