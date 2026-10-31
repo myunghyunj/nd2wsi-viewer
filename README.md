@@ -20,10 +20,8 @@
 
 ## Latest update
 
-- **Safer annotation files:** a file the viewer cannot draw is refused before it replaces your marks, a sidecar keeps items it cannot draw, and a typed label survives clicking another mark.
-- **16-bit PNG:** 16-bit grayscale PNG files keep their stored values in display, pixel readouts and TIFF export.
-- **Sleep-safe caches:** a window opened after macOS sleep no longer removes another window's cache build.
-- **Faster plates:** plate thumbnails fill about 5 times faster, and cached slides serve more tiles per second.
+- **Update card:** updates appear in a translucent card at the bottom right, with download progress and **Install and relaunch** or **Install on quit**.
+- **Windows 11:** the Windows build lists Windows 11 (x64, and ARM64 through x64 emulation) as its supported target.
 
 <p align="center">
   <img src="docs/overview-sdpc.png" alt="Brightfield SDPC slide with Slide Info in the light appearance" width="50%"><img src="docs/overview-nd2.png" alt="Fluorescence ND2 image with Channels &amp; LUTs in the dark appearance" width="50%">
@@ -31,10 +29,10 @@
 
 ## Download
 
-| Platform | Download · 2.5.5 | Requirements |
+| Platform | Download · 2.5.6 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.5/nd2wsi-viewer-2.5.5-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.5/nd2wsi-viewer-2.5.5-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.6/nd2wsi-viewer-2.5.6-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.6/nd2wsi-viewer-2.5.6-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
 
 On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
 and keep `_internal` beside `nd2wsi-viewer.exe`. See the
