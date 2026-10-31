@@ -149,8 +149,8 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   document.getElementById('update').addEventListener('click', ev => {
     const button = ev.currentTarget;
     button.disabled = true;
-    pywebview.api.check_for_updates()
-      .then(result => { if (result.message || !result.ok) setStatus(result.message || 'Could not check for updates.'); })
+    window.nd2wsiUpdateCard.check()
+      .then(result => { if (result?.ok === false) setStatus(result.message || 'Could not check for updates.'); })
       .catch(error => setStatus('Could not check for updates: ' + error))
       .finally(() => { button.disabled = false; });
   });
@@ -166,6 +166,14 @@ BOOT_HTML = BOOT_HTML.replace(
         for name in ("shortcut-router-v1.js", "window-controls-v1.js")
     ) + "</script></body></html>",
 )
+
+
+# The landing page uses the same manual card, but its readiness flag stays false
+# so automatic macOS checks always fall back to the standard Sparkle driver.
+_UPDATE_STATIC = Path(__file__).parent / "static"
+BOOT_HTML = BOOT_HTML.replace("</head>", "<style>" + (_UPDATE_STATIC / "update-card-v1.css").read_text(encoding="utf-8") + "</style></head>")
+BOOT_HTML = BOOT_HTML.replace("</body>", (_UPDATE_STATIC / "update-card.html").read_text(encoding="utf-8") +
+                             "<script>" + (_UPDATE_STATIC / "update-card-v1.js").read_text(encoding="utf-8") + "</script></body>")
 
 
 def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
@@ -471,6 +479,7 @@ def _install_app_updater(api: Api, window) -> None:
             coordinator = UpdateShutdownCoordinator(api, window)
             handle = install_sparkle_updater(
                 shutdown_coordinator=coordinator,
+                window=window,
                 logger=_dlog,
             )
             _UPDATER_COORDINATOR = coordinator
@@ -497,6 +506,8 @@ class Api:
         self._frac = -1.0  # conversion progress, -1 = not converting
         self._httpd = None
         self._updater = None
+        self._manual_update_offer = None
+        self._manual_update_lock = threading.Lock()
         self._startup_error = None
         self._window_session = window_session
         self._handoff_state = None
@@ -698,18 +709,29 @@ class Api:
             "mode": "download" if manual else "sparkle",
         }
 
-    def check_for_updates(self) -> dict:
+    def check_for_updates(self, open_download=True) -> dict:
         """Open Windows release downloads or the macOS Sparkle update window."""
         if self._local_beta:
             return {"ok": False, "message": "Local beta — updates are disabled."}
-        if self._updates_disabled:
+        if type(open_download) is not bool:
+            return {"ok": False, "message": "Invalid update check"}
+        if self._updates_disabled or sys.platform == "win32":
+            import uuid
+
             from .release_selection import check_for_updates
 
-            return check_for_updates()
-        if sys.platform == "win32":
-            from .release_selection import check_for_updates
-
-            return check_for_updates(channel="stable")
+            with self._manual_update_lock:
+                self._manual_update_offer = None
+            options = {} if open_download else {"open_download": False}
+            if sys.platform == "win32" and not self._updates_disabled:
+                options["channel"] = "stable"
+            result = check_for_updates(**options)
+            if result.get("ok") and result.get("available") and not open_download:
+                token = uuid.uuid4().hex
+                with self._manual_update_lock:
+                    self._manual_update_offer = {**result, "token": token}
+                return {**result, "token": token}
+            return result
         handle = self._updater
         if handle is None:
             return {
@@ -726,6 +748,49 @@ class Api:
         except Exception as exc:
             _dlog(f"manual update check failed: {exc!r}")
             return {"ok": False, "message": "Could not open the update window."}
+
+    def update_card_action(self, payload):
+        card = getattr(self._updater, "card", None)
+        return {"ok": card.action(payload) if card is not None else False}
+
+    def update_card_closed(self, token):
+        card = getattr(self._updater, "card", None)
+        if card is None or not isinstance(token, str) or len(token) > 128:
+            return {"ok": False}
+        card.main(lambda: card.page_closed(token))
+        return {"ok": True}
+
+    def _open_manual_update(self, token, *, notes=False):
+        import platform
+        import webbrowser
+
+        from .release_selection import normalize_machine
+
+        with self._manual_update_lock:
+            offer = self._manual_update_offer
+            if (self._local_beta or not isinstance(token, str) or offer is None or token != offer["token"]
+                    or offer.get("platform") != sys.platform
+                    or offer.get("architecture") != normalize_machine(platform.machine())):
+                return {"ok": False, "message": "Check for a compatible update again."}
+            url = offer["release_url" if notes else "download_url"]
+            if not notes:
+                self._manual_update_offer = None  # duplicate clicks never open twice
+        try:
+            opened = bool(webbrowser.open(url))
+        except Exception:
+            opened = False
+        if not opened and not notes:
+            with self._manual_update_lock:
+                if self._manual_update_offer is None:
+                    self._manual_update_offer = offer
+        return {"ok": opened, "message": "Opened the compatible download." if opened else "Could not open the browser. Try again."}
+
+    def open_update_download(self, token):
+        """Open only the exact asset selected by this process's OS/CPU guard."""
+        return self._open_manual_update(token)
+
+    def open_update_notes(self, token):
+        return self._open_manual_update(token, notes=True)
 
     def attach_updater(self, handle) -> None:
         self._updater = handle

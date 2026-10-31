@@ -179,7 +179,9 @@ function showError(message) {
   toastTimer = setTimeout(() => toast.classList.remove("show"), 4200);
 }
 
-window.nd2wsiUpdateNotice = showError;
+window.nd2wsiUpdateNotice = message => {
+  if (!window.nd2wsiUpdateCard?.notice(message)) showError(message);
+};
 
 // pywebview's WKWebView can consume a horizontal NSEvent in its native
 // scroll view without emitting a DOM wheel event. The macOS bridge calls this

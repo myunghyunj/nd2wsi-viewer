@@ -126,3 +126,45 @@ The original desktop, export and browser-controller extraction followed the
 2.1.4 release; the shared direct-reader extraction is part of
 [2.3.1](release-notes-2.3.1.md). Previously published release artifacts and tags
 retain their original source.
+
+### Update card and Sparkle ownership
+
+`updater.py` installs one composite `SPUUserDriver`, retaining a
+`SPUStandardUserDriver` for fallback, and starts `SPUUpdater` directly. Its menu
+target implements `checkForUpdates:` and `validateMenuItem:` using
+`canCheckForUpdates`. `_install_app_updater` remains the sole installation path.
+The lab edition's existing update guard also disables this path after merging.
+
+`update_card.py` owns the update session on AppKit's main queue. At its first
+callback it probes the shell's `nd2wsiUpdateCard.ready` for up to two seconds,
+then keeps either card or standard UI until `dismissUpdateInstallation`. Landing
+pages and unavailable pages use the standard driver. One bounded page transport
+serializes evaluation off main and stops after a hung call. Each page instance,
+session and action prompt has its own identity; stale buttons cannot answer a
+later choice. Reply blocks are consumed once on main. Normal phase transitions
+retire optional cancellation blocks without invoking them; reload/close ends
+outstanding card choices safely. Explicit PyObjC block metadata preserves the
+Sparkle 2.9.6 argument signatures when forwarding to the standard driver.
+
+`static/update-card-v1.js`, its CSS and markup provide the six card states and
+plain-text notes. The shell's existing `nd2wsiUpdateNotice` routes export waits
+and close vetoes into an active card. Ready-state dismissal is labelled
+**Install on quit**, because Sparkle 2.9.6 permits installation after termination.
+A manual no-update result stays visible for five seconds before acknowledgment.
+Permission requests remain with the standard driver. Downloaded HTML release
+notes are ignored; embedded notes are stripped and capped at 600 characters.
+The notes action opens the version's GitHub release page.
+
+The landing page embeds the same card for manual Windows checks, with Sparkle
+readiness disabled. It requests `check_for_updates(False)` only after a click.
+`open_update_download` accepts a one-use token for the exact compatible asset
+returned by the existing OS/CPU selector; it does not accept a URL from JavaScript
+or perform another network lookup. Failed browser opens may be retried.
+
+Regression suites: `test_update_card`, `test_update_card_js`, `test_updater*`,
+`test_shutdown_ownership`, `test_update_cancel_js`, `test_window_close_js`,
+`test_release_selection`, `test_update_guard`, `test_window_close_native` and
+`test_astromap_beta_updates`. `qa/check_native_update_card.py` drives every modern
+user-driver selector using a stand-in protocol in a private Agent window and
+captures all states in both themes without loading Sparkle or installing anything.
+A signed download/install/relaunch remains a separate release acceptance gate.
