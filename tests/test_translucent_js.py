@@ -32,6 +32,11 @@ function fakeViewer(){
     imageToViewportCoordinates(x,y){return typeof x==='object'
       ? new Point(x.x/info.width,x.y/info.width):new Point(x/info.width,y/info.width);},
     viewportToImageCoordinates(point){return new Point(point.x*info.width,point.y*info.width);},
+    viewerElementToImageCoordinates(point){
+      const scale=zoom*width/info.width,angle=rotation*Math.PI/180;
+      const dx=point.x-width/2,dy=point.y-height/2;
+      return new Point(center.x*info.width+(dx*Math.cos(angle)+dy*Math.sin(angle))/scale,
+        center.y*info.width+(-dx*Math.sin(angle)+dy*Math.cos(angle))/scale);},
     imageToViewerElementCoordinates(point){
       const scale=zoom*width/info.width,angle=rotation*Math.PI/180;
       const dx=(point.x-center.x*info.width)*scale,dy=(point.y-center.y*info.width)*scale;
@@ -52,6 +57,7 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
     listeners:{},clientWidth:800,clientHeight:500,disabled:false,hidden:false,
     addEventListener(name,cb){this.listeners[name]=cb;},
     setAttribute(name,value){this.attributes[name]=value;},
+    getAttribute(name){return this.attributes[name]??null;},
     replaceChildren(...children){this.children=children;},
     appendChild(child){this.children=this.children.filter(item=>item!==child);this.children.push(child);return child;},
     get lastElementChild(){return this.children[this.children.length-1];}};}
@@ -1117,8 +1123,8 @@ def test_the_overlay_has_no_orientation_settings_and_two_follow_flips():
                     "stage-follow-flip-lr", "stage-follow-flip-hint"):
         assert f'id="{control}"' in page
     # The flips name their keys: SLACS's own Mirror labels are crossed (Horizontal reverses W/S).
-    assert 'id="stage-follow-flip-ud" type="checkbox" /> Flip up/down (W/S)' in page
-    assert 'id="stage-follow-flip-lr" type="checkbox" /> Flip left/right (A/D)' in page
+    assert 'id="stage-follow-flip-ud" type="checkbox" /> Flip W/S' in page
+    assert 'id="stage-follow-flip-lr" type="checkbox" /> Flip A/D' in page
     assert "never the image" in page
     assert page.index("directions shown on screen") < page.index("stage-follow-flip-ud")
     assert 'id="stage-follow-step-auto" type="checkbox" checked' in page
@@ -1199,7 +1205,7 @@ def test_reading_roughness_is_on_by_default_and_labels_the_step_as_its_fallback(
     """)
     hint = result.pop("hint")
     assert result == {"auto": True, "checked": True, "disabled": False,
-                      "label": "Fallback step if Roughness can't be read",
+                      "label": "Fallback",
                       "roughness": "SLACS Roughness is read while Follow runs", "hidden": False}
     assert "Mirror Horizontal and Mirror Vertical reverse W/S and A/D" in hint
 
@@ -1225,7 +1231,7 @@ def test_turning_roughness_reading_off_is_remembered_fixed_while_following_and_s
         stored:h.storage.get('nd2wsi.stageFollow.stepAuto'),hidden:out.hidden};
     """)
     assert result["accepted"] is True and result["notBoolean"] is False
-    assert result["off"] == {"stored": "false", "label": "Step per key press", "hidden": True, "text": "",
+    assert result["off"] == {"stored": "false", "label": "Step", "hidden": True, "text": "",
                              "hint": "Set this to SLACS's Roughness (1 Roughness = 1 µm per press). "
                                      "Counts W/A/S/D only while SLACS is in front."}
     assert result["startArgs"] == {"source": "keys", "step_um": 10, "step_source": "manual"}
@@ -1274,8 +1280,8 @@ def test_roughness_output_shows_the_slacs_reading_busy_and_unreadable_states_fro
     """)
     assert result["paused"] == "waiting"  # an unreadable Roughness never pauses Follow
     assert result["texts"] == [
-        "SLACS Roughness: 10 µm = 20.0 px · Mirror H off, V off",
-        "SLACS Roughness: 1 µm = 2.0 px · Mirror H on, V unknown",
+        "10 µm · 20.0 px · Mirror off/off",
+        "1 µm · 2.0 px · Mirror on/unknown",
         "SLACS busy — last Roughness 10 µm",
         "SLACS busy — using 2.5 µm",
         "SLACS Roughness unreadable — using 2.5 µm",
@@ -1581,7 +1587,14 @@ def test_view_report_sends_the_image_centre_and_follow_progress():
     assert result["opened"] == 1  # the open handler reports the handed-over view
     assert result["sent"] is True
     # The window frame is unknown in the fake page, so it is reported as null rather than guessed.
-    assert result["idle"] == {"version": 1, "center_px": [400, 250], "zoom": 2, "rotation": 90, "flip": True,
+    idle = result["idle"]
+    assert idle.pop("target_px") == [400, 250]
+    assert idle.pop("target_offset_css") == [0, 0]
+    assert idle.pop("target_side_um") == 18
+    assert idle.pop("target_rotation_deg") == 45
+    assert idle.pop("target_calibrated") is False
+    assert len(idle.pop("target_corners_px")) == 4
+    assert idle == {"version": 1, "center_px": [400, 250], "zoom": 2, "rotation": 90, "flip": True,
                               "locked": False, "follow_session": None, "follow_seq": None,
                               "follow_displacement_um": None, "container": [800, 500], "window": None}
     assert result["following"] == {"seq": 1, "displacement": [10, 20], "session": "session-one", "locked": True}

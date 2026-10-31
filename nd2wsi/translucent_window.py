@@ -8,6 +8,7 @@ which would make it disappear when the parent is minimized.
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import json
 import math
 import os
@@ -18,7 +19,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from . import follow_flips, session_log
+from . import follow_flips, laser_target, session_log
 from .window_chrome import NativeTitlebarDrag
 
 OPACITY = 0.55
@@ -34,12 +35,14 @@ CLIENT_LOG_WINDOW = 10.0
 CLIENT_LOG_FIELD_LIMIT = 1000
 CLIENT_LOG_STACK_LIMIT = 4000
 # What the page may report of its current view (report_overlay_view).
+TARGET_KEYS = ("target_px", "target_offset_css", "target_side_um", "target_rotation_deg",
+               "target_corners_px", "target_calibrated")
 VIEW_KEYS = frozenset(("version", "center_px", "zoom", "rotation", "flip", "locked", "follow_session",
-                       "follow_seq", "follow_displacement_um", "container", "window"))
+                       "follow_seq", "follow_displacement_um", "container", "window", *TARGET_KEYS))
 # The overlay's state in each slacs_key record (_mark_context), in record order.
-MARK_CONTEXT_KEYS = ("slacs_session", "image_name", "source_format", "image_px", "view", "view_age_ms",
+MARK_CONTEXT_KEYS = ("slacs_session", "image_name", "source_format", "image_px", *TARGET_KEYS, "view", "view_age_ms",
                      "view_follow_seq", "view_displacement_um", "locked", "follow_status", "follow_seq",
-                     "displacement_um", "counted", "step_source", "step_um", "roughness_um", "mirror_h",
+                     "displacement_um", "counted", "step_source", "step_um", "effective_step_um", "roughness_um", "mirror_h",
                      "mirror_v", "reading_age_ms", "slacs_busy", "flip_x", "flip_y")
 
 
@@ -198,12 +201,14 @@ class TranslucentApi:
     per image format; without one they last only as long as this overlay.
     """
 
-    def __init__(self, context, *, logger, on_closed, flip_store=None):
+    def __init__(self, context, *, logger, on_closed, flip_store=None, target_store=None,
+                 on_laser_box=None, is_active=None, on_lock=None):
         self._context = copy.deepcopy(context)
         self._context.setdefault("opacity", OPACITY)
         self._context["opacity_mode"] = "native" if sys.platform == "win32" else "layer"
         self._logger = logger
         self._on_closed = on_closed
+        self._close_notified = False
         self._window = None
         self._drag = None
         self._locked = False
@@ -229,7 +234,25 @@ class TranslucentApi:
         self._flip_store = flip_store
         self._flip_save_lock = threading.Lock()
         self._follow_flips = (False, False)  # (flip_x, flip_y); replaced whole, never mutated
+        self._lock_reported = None
+        self._last_locked_center = None
+        self._realign_from = None
         self._overlay_view = None  # the page's last reported view; replaced whole, never mutated
+        self._on_lock = on_lock
+        self._is_active = is_active or (lambda: True)
+        self._laser_delivery = None
+        if on_laser_box is not None:
+            from .slacs_laser import LaserDelivery
+
+            self._laser_delivery = LaserDelivery(prepare=self._prepare_laser_box, deliver=on_laser_box,
+                                                  confirmed=self._confirm_laser_box)
+        self._target_store = target_store
+        self._target_save_lock = threading.Lock()
+        self._laser_target = laser_target.validate(laser_target.DEFAULT)
+        if target_store is not None:
+            self._laser_target, warning = target_store.load()
+            if warning:
+                session_log.event("laser_target_load_failed", message=warning)
         if flip_store is not None:
             self._restore_flips()
 
@@ -355,7 +378,38 @@ class TranslucentApi:
         with self._lock:
             flip_x, flip_y = self._follow_flips
             return {**copy.deepcopy(self._context), "locked": self._locked, "source_format": self._source_format,
-                    "follow_flips": {"flip_x": flip_x, "flip_y": flip_y}}
+                    "follow_flips": {"flip_x": flip_x, "flip_y": flip_y},
+                    "laser_target": copy.deepcopy(self._laser_target)}
+
+    def save_laser_target(self, payload):
+        """Validate and remember a completed calibration or resize/rotation gesture."""
+        try:
+            if (not isinstance(payload, dict) or set(payload) != {"target", "calibrate", "zoom"}
+                    or type(payload["calibrate"]) is not bool):
+                raise ValueError("Invalid laser target request")
+            target = laser_target.validate(payload["target"])
+            zoom = _number(payload["zoom"], "Target scale", 1e-12, 1e6)
+            if payload["calibrate"] and target["window"] is None:
+                raise ValueError("Calibration needs the current window frame")
+        except (ValueError, TypeError) as exc:
+            return {"ok": False, "message": str(exc)}
+        with self._lock:
+            if self._closed or self._locked:
+                return {"ok": False, "message": "Unlock to set the laser target."}
+            self._laser_target = target
+        saved, message = False, None
+        with self._target_save_lock:
+            if self._target_store is not None:
+                try:
+                    self._target_store.save(self._laser_target)
+                    saved = True
+                except (OSError, ValueError) as exc:
+                    message = f"Applied for this window, but could not be remembered: {exc}"
+        if payload["calibrate"]:
+            session_log.event("laser_target_set", **copy.deepcopy(target), zoom=zoom)
+        if message:
+            session_log.event("laser_target_save_failed", message=message)
+        return {"ok": True, "saved": saved, "message": message, "target": copy.deepcopy(target)}
 
     def _stage_follow_options(self, options):
         """Resolve the stage-follow source, per-key step and step source; never raise.
@@ -473,7 +527,8 @@ class TranslucentApi:
                     follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=step_um,
                                                 step_source=step_source, controls=controls,
                                                 pixel_size_um=(float(pixels[1]), float(pixels[0])),
-                                                flip_x=flip_x, flip_y=flip_y, mark_context=self._mark_context)
+                                                flip_x=flip_x, flip_y=flip_y, mark_context=self._mark_context,
+                                                on_mark=self._on_mark_record)
                     snapshot = follower.start()
                 except (ValueError, OSError, RuntimeError) as exc:
                     snapshot = {"running": False, "error": str(exc)}
@@ -493,6 +548,8 @@ class TranslucentApi:
             bound = self._stage_follow_session = detected["session_id"]
             self._stage_follow_receiver_id = descriptor.get("session_id")
             self._stage_follow_lost = ""
+        if self._locked and self._on_lock is not None:
+            self._on_lock(True)
         extra = {"controls_error": controls_error} if controls_error else {}
         session_log.event("follow_start", source=source, step_source=step_source, step_um=step_um, ok=True,
                           slacs_session=bound, source_format=self._source_format, flip_x=flip_x, flip_y=flip_y,
@@ -577,6 +634,24 @@ class TranslucentApi:
             if self._closed:
                 return {"ok": False}
             self._overlay_view = {**view, "at": time.monotonic()}
+            locked = view["locked"]
+            changed = self._lock_reported is not None and self._lock_reported != locked
+            if self._lock_reported is True and not locked:
+                self._realign_from = self._last_locked_center
+            realign = None
+            if locked:
+                if changed and self._realign_from is not None:
+                    realign = {"from_px": self._realign_from, "to_px": view["center_px"],
+                               "delta_px": [b - a for a, b in zip(self._realign_from, view["center_px"])]}
+                    self._realign_from = None
+                self._last_locked_center = view["center_px"]
+            self._lock_reported = locked
+        if changed:
+            session_log.event("overlay_lock", locked=locked, center_px=view["center_px"], target_px=view.get("target_px"))
+        if realign is not None:
+            session_log.event("overlay_realign", **realign)
+        if self._laser_delivery is not None:
+            self._laser_delivery.view_changed()
         return {"ok": True}
 
     def _validated_view(self, payload):
@@ -596,6 +671,26 @@ class TranslucentApi:
         seq = payload.get("follow_seq")
         if seq is not None and (type(seq) is not int or not 0 <= seq <= 2**53 - 1):
             raise ValueError("Invalid Follow sequence number")
+        target = {}
+        if any(key in payload for key in TARGET_KEYS):
+            if not all(key in payload for key in TARGET_KEYS):
+                raise ValueError("Incomplete laser target view")
+            calibrated = payload["target_calibrated"]
+            if type(calibrated) is not bool:
+                raise ValueError("Invalid target calibration flag")
+            point = _optional_numbers(payload["target_px"], 2, "target point", -1e9, 1e9)
+            corners = payload["target_corners_px"]
+            if corners is not None:
+                if not isinstance(corners, list) or len(corners) != 4:
+                    raise ValueError("Invalid target corners")
+                corners = [laser_target.vector(p, 2, -1e9, 1e9) for p in corners]
+            if (point is None) != (corners is None) or (calibrated and point is None):
+                raise ValueError("Incomplete target geometry")
+            target = {"target_px": point,
+                      "target_offset_css": laser_target.vector(payload["target_offset_css"], 2, -16384, 16384),
+                      "target_side_um": _number(payload["target_side_um"], "target side", 2, 200),
+                      "target_rotation_deg": _number(payload["target_rotation_deg"], "target angle", 0, 90) % 90,
+                      "target_corners_px": corners, "target_calibrated": calibrated}
         # The centre is only logged, never used to place a camera, so it is bounded
         # generously: the page can pan the image far outside validate_context's slack.
         return {"center_px": [_number(value, "View centre", -1e9, 1e9) for value in center],
@@ -605,7 +700,53 @@ class TranslucentApi:
                 "follow_displacement_um": _optional_numbers(payload.get("follow_displacement_um"), 2,
                                                             "Follow displacement"),
                 "container": _optional_numbers(payload.get("container"), 2, "view size", 0),
-                "window": _optional_numbers(payload.get("window"), 4, "window frame", -1e6, 1e6)}
+                "window": _optional_numbers(payload.get("window"), 4, "window frame", -1e6, 1e6), **target}
+
+    def _on_mark_record(self, record):
+        # Raw Input: bounded enqueue only, no overlay lock, I/O or browser call.
+        if self._laser_delivery is not None:
+            self._laser_delivery.enqueue({**record, "at": dt.datetime.now().astimezone().isoformat(timespec="milliseconds")})
+
+    def _prepare_laser_box(self, record):
+        if self._closed or self._stage_follow is None:
+            return None, "follow_stopped"
+        if not self._is_active():
+            return None, "not_active_overlay"
+        if record.get("locked") is not True or not self._locked:
+            return None, "unlocked"
+        if record.get("receiver_id") != self._stage_follow_receiver_id:
+            return None, "session_changed"
+        if type(record.get("press")) is not int or record["press"] <= 0:
+            return None, "invalid_press"
+        seq = record.get("follow_seq")
+        if type(seq) is not int:
+            return None, "stale_view"
+        view = self._overlay_view
+        if view is None or view["follow_session"] != record["receiver_id"] or view["follow_seq"] is None:
+            return None, "stale_view"
+        if view["follow_seq"] > seq:
+            return None, "view_moved"
+        if view["follow_seq"] < seq:
+            return None, "stale_view"
+        if not view["locked"]:
+            return None, "unlocked"
+        if view.get("target_px") is None or view.get("target_corners_px") is None:
+            return None, "target_unavailable"
+        query = dict(urllib.parse.parse_qsl(self._context.get("query", "").lstrip("?")))
+        return {**{key: copy.deepcopy(view[key]) for key in TARGET_KEYS},
+                "g": query.get("g", ""), "p": int(query["p"]) if "p" in query else None,
+                "press": record["press"], "receiver_id": record["receiver_id"], "at": record["at"],
+                "slacs_session": record.get("slacs_session"),
+                "pixel_size_um": self._context["pixel_size_um"]}, None
+
+    def _confirm_laser_box(self, outcome):
+        if self._closed or self._window is None:
+            return False
+        script = "window.nd2TranslucentLaserItem?.(" + json.dumps(outcome["item"], allow_nan=False) + "); true"
+        return self._window.evaluate_js(script)
+
+    def report_slacs_laser_box(self, payload):
+        return self._laser_delivery.accept(payload) if self._laser_delivery is not None else {"ok": False}
 
     def _mark_context(self):
         """This overlay's state for a SLACS "," or "." record, or None once closed; never raises.
@@ -626,6 +767,9 @@ class TranslucentApi:
             context.update(slacs_session=self._stage_follow_session, image_name=self._context.get("image_name"),
                            source_format=self._source_format, locked=self._locked, flip_x=flip_x, flip_y=flip_y)
             if view is not None:
+                context.update({key: copy.deepcopy(view.get(key)) for key in TARGET_KEYS})
+                if context["target_px"] is not None:
+                    context["target_px"] = [round(v, 1) + 0.0 for v in context["target_px"]]
                 center_x, center_y = view["center_px"]
                 context.update(image_px=[round(center_x, 1) + 0.0, round(center_y, 1) + 0.0],
                                view={key: view[key] for key in ("zoom", "rotation", "flip", "container", "window")},
@@ -644,6 +788,10 @@ class TranslucentApi:
                 context.update({key: keys.get(key) for key in (
                     "counted", "step_source", "step_um", "roughness_um", "mirror_h", "mirror_v",
                     "reading_age_ms", "slacs_busy")})
+                context["effective_step_um"] = (keys.get("roughness_um")
+                    if keys.get("step_source") == "slacs" and keys.get("controls_ok") is True
+                    and type(keys.get("roughness_um")) in (int, float) and keys["roughness_um"] > 0
+                    else keys.get("step_um"))
             return context
         except Exception as exc:  # noqa: BLE001 - a log record must never break the key observer
             return {"context_error": type(exc).__name__}
@@ -1000,6 +1148,8 @@ class TranslucentApi:
                 self._window.native.setMovable_(not self._locked)
 
         self._dispatch(apply)
+        if self._on_lock is not None:
+            self._on_lock(locked)
         return {"ok": True, "locked": locked}
 
     def start_window_drag(self):
@@ -1071,28 +1221,39 @@ class TranslucentApi:
                 return True
             self._closed = True
             self._epoch += 1
+        if self._laser_delivery is not None:
+            self._laser_delivery.close()
         self.stop_stage_follow()
         if self._discovery is not None:
             self._discovery.stop()
         if self._window is not None:
             self._window.destroy()
-        self._on_closed(self)
+        # Native closed owns claim release; destroy may return before the event.
+        if self._window is None:
+            self._did_close()
         return True
 
     def _did_close(self, *_args):
         with self._lock:
+            if self._close_notified:
+                return
+            self._close_notified = True
             self._closed = True
             self._epoch += 1
+        if self._laser_delivery is not None:
+            self._laser_delivery.close()
         self.stop_stage_follow()
         if self._discovery is not None:
             self._discovery.stop()
         self._on_closed(self)
 
 
-def create_translucent_window(context, *, url, title, logger, on_closed, flip_store=None):
+def create_translucent_window(context, *, url, title, logger, on_closed, flip_store=None, target_store=None,
+                              on_laser_box=None, is_active=None, on_lock=None):
     import webview
 
-    api = TranslucentApi(context, logger=logger, on_closed=on_closed, flip_store=flip_store)
+    api = TranslucentApi(context, logger=logger, on_closed=on_closed, flip_store=flip_store, target_store=target_store,
+                         on_laser_box=on_laser_box, is_active=is_active, on_lock=on_lock)
     window = webview.create_window(
         title, url=url, js_api=api, width=640, height=480, min_size=MIN_SIZE,
         frameless=True, easy_drag=False, resizable=False, on_top=True,

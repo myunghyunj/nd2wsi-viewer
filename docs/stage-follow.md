@@ -448,3 +448,63 @@ tagged `vX.Y.Z_SLACS-module`. Publish it as a pre-release that is not marked lat
 For another build of the same version, raise `REVISION` in `nd2wsi/edition.py` and tag
 `vX.Y.Z_SLACS-module.N`; set it back to 1 when merging a new public version.
 The new tag also runs the `windows` and `realdata` workflows.
+
+## Module 3: laser targets and isolation annotations
+
+Only one tracing window can be open across the viewer's User windows. Reopening
+its slide in the same viewer reuses it; another request shows a translucent
+warning. A kernel file lock lasts until the native window closes and is released
+by the OS after a crash. Agent sessions use independent claims.
+
+When SLACS is detected and the image has a physical pixel size, a red reticle
+marks the laser target. Its exact centre is clear. Unlock to show the target
+outline and resize handles. Drag a corner to set a square from 2 to 200 µm;
+right-click inside it to rotate by 15° (Shift reverses). The default is 18 µm at
+45°. Dragging inside the outline still pans the image. Right-click outside it
+opens the AstroMapper chooser.
+
+Choose **Set laser target**, then click a visible burn to calibrate the offset
+from the window centre. A drag does not calibrate. Escape cancels calibration
+without closing the window; locking, closing or starting Follow also cancels it.
+The offset, size, angle, window frame and display scale persist per computer.
+Moving or resizing the window, or changing display scale, requires recalibration:
+the unlocked outline becomes dashed and the settings show a reminder. Agent
+sessions keep their own settings.
+
+While locked and following, each comma press can create an isolation annotation
+in the source pane. A fresh view must acknowledge the same Follow receiver and
+sequence. After a one-second wait, stale or superseded views are skipped. Period
+remains log-only. Ctrl/Alt+comma counts as comma and retains its logged modifiers.
+The most recently locked following overlay is the defensive annotation owner.
+
+A new position creates `isolation #N`; repeated shots within half the target side
+of the previous laser item's stored target increment its shot count. Counts are
+idempotent per receiver/press. Numbers continue across sessions and are not reused
+after deletion, including deletion of the highest number. Uncalibrated targets
+still create items, labelled `isolation #N_uncalibrated`. These are original-image
+pixel polygons (or axis-aligned boxes), clipped to the image; targets outside the
+image and shapes retaining less than 25% of their area are skipped.
+
+Laser items use gray `#a0a6ae`, a non-scaling 1.5 px stroke and 16% fill. The main
+box label keeps the isolation name; its list row adds `— k shots · HH:MM` using
+the first shot time. The tracing window shows `isolation #N · k shots` for items
+confirmed by the pane during that tracing-window session. It does not preload
+historical items on open. GeoJSON export preserves the `SLACS laser`
+classification and RGB `[160,166,174]`; these are not AstroMapper items.
+
+The pane's existing annotation store owns all saves, revisions and conflict
+recovery. Locked, unloaded, closing, stale-generation or different-site panes
+refuse delivery. Only laser metadata is updated during a burst; manual items
+and user edits to geometry or labels are preserved. A bounded, ordered delivery
+worker stops and drops its queue after a five-second page timeout.
+
+Follow settings now group Auto step and live Roughness, fallback step, movement
+flips, and the target readout. Details holds counters, scale and connection
+export. The lock is at bottom left; opacity and resize controls remain separate.
+
+Additional log records are `laser_target_set`, `slacs_laser_box`,
+`translucent_refused`, `overlay_lock` and `overlay_realign`. Lock records carry
+centre and target pixels. Realignment compares the last locked centre before
+unlocking with the first after relocking. Mark context includes the target
+geometry and calibration flag, plus `effective_step_um`: a good SLACS roughness
+reading when selected, otherwise the manual `step_um`, which remains unchanged.

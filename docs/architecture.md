@@ -128,3 +128,35 @@ The original desktop, export and browser-controller extraction followed the
 2.1.4 release; the shared direct-reader extraction is part of
 [2.3.1](release-notes-2.3.1.md). Previously published release artifacts and tags
 retain their original source.
+
+### SLACS module 3 boundaries
+
+`laser_target.py` validates and atomically persists per-computer target geometry
+under the Follow settings root, with private Agent storage. The translucent
+bridge exposes `save_laser_target` and extends `report_overlay_view` with target
+coordinates and calibration. `static/laser-target-v1.js` owns the fixed-screen
+reticle, capture/resize/rotation gestures and calibration validity; it converts
+all saved geometry through `viewer-geometry-v1.js` into original image pixels.
+It is loaded before `translucent-v1.js`.
+
+`stage_keys.py` invokes a bounded `on_mark` hook for laser presses.
+`slacs_laser.py` serializes delivery outside Raw Input and lifecycle locks, waits
+for the matching view, and accepts one capped, rate-limited acknowledgment per
+pending token. `Api.report_slacs_laser_box` routes that acknowledgment to its
+own overlay. `window.nd2wsiSlacsLaserBox` forwards deliveries through the shell's
+`postToSlide`; `static/slacs-laser-v1.js`, loaded before `app.js`, validates pane
+ownership and geometry, clips, numbers and counts bursts. Existing annotation
+store save/revision/draft rules remain authoritative. Optional sidecar `slacs`
+metadata retains the isolation high-water mark and bounded receiver press history
+when items are deleted. Only acknowledged items are relayed to the tracing page.
+
+`translucent_claim.py` uses `SessionFileLock` for one tracing window across User
+processes; Agent claims live under their individual session roots. The native
+closed callback releases the claim, and process exit releases it after a crash.
+The source pane requests the shell's translucent refusal card when another
+window holds the claim. Claims are never unlinked.
+
+Regression suites: `test_laser_target`, `test_laser_target_js`,
+`test_slacs_laser`, `test_slacs_laser_js`, `test_translucent_window`,
+`test_translucent_stage_follow`, `test_translucent_js`, `test_stage_keys`,
+`test_shell_tools_js`, and the existing annotation store/revision suites.

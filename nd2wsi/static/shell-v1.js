@@ -1167,6 +1167,11 @@ if (typeof ResizeObserver === "function") {
   nativeGestureShellBlockers.forEach((element) => blockerSizes.observe(element));
 }
 
+window.nd2wsiSlacsLaserBox = box => {
+  if (!box || typeof box.sid !== "string" || quitPreparation) return false;
+  return postToSlide(box.sid, { nd2wsi: "slacs-laser-box", version: VIEWPORT_PROTOCOL_VERSION, sid: box.sid, box });
+};
+
 function postToSlide(sid, message) {
   const frame = frames.get(sid);
   if (!frame?.contentWindow) return false;
@@ -3117,3 +3122,18 @@ window.addEventListener("message", (event) => {
 
 refresh();
 bindSlacsDiscovery();
+
+
+function showTranslucentWarning() {
+  $("translucent-warning").hidden = false;
+}
+function hideTranslucentWarning() {
+  $("translucent-warning").hidden = true;
+}
+$("translucent-warning-ok").addEventListener("click", hideTranslucentWarning);
+window.addEventListener("message", event => {
+  const d = event.data;
+  if (event.origin !== location.origin || d?.version !== VIEWPORT_PROTOCOL_VERSION || d.nd2wsi !== "translucent-refused") return;
+  if (frames.get(d.sid)?.contentWindow !== event.source) return;
+  showTranslucentWarning();
+});

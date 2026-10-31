@@ -2259,17 +2259,21 @@ def make_handler(
                     document, rev = registry.annotation_workspace.read(p)
                     items = _sidecar_items(document)
                     return self._json({"items": items, "path": str(p),
+                                       **({"slacs": document["slacs"]} if document and "slacs" in document else {}),
                                        "revision": rev, "window": registry.window_session.as_dict()})
                 except (ValueError, UnicodeError, OSError, TimeoutError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
+            document = {}
             if p.exists():
                 try:
-                    items = _sidecar_items(json.loads(p.read_text(encoding="utf-8")), require_items=True)
+                    document = json.loads(p.read_text(encoding="utf-8"))
+                    items = _sidecar_items(document, require_items=True)
                 except (ValueError, UnicodeError, OSError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             else:
                 items = []
-            self._json({"items": items, "path": str(p)})
+            self._json({"items": items, "path": str(p),
+                        **({"slacs": document["slacs"]} if "slacs" in document else {})})
 
         def _annotations_post(self, st: ViewerState, q: dict | None = None):
             try:
@@ -2284,6 +2288,12 @@ def make_handler(
                 return self._error(400, str(e))
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):
                 return self._error(400, "expected {\"items\": [...]}")
+            from .slacs_laser import metadata
+
+            try:
+                laser_metadata = metadata(data.get("slacs"))
+            except ValueError as e:
+                return self._error(400, str(e))
             meta = st.attrs["nd2wsi"]
             lv0 = meta["levels"][0]
             cal = meta.get("calibration", {})
@@ -2307,6 +2317,7 @@ def make_handler(
                 },
                 "selection": meta.get("selection", {}),
                 "items": data["items"],
+                **laser_metadata,
             }
             if site is not None:
                 payload["selection"] = {"p": site}

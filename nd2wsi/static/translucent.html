@@ -8,18 +8,21 @@
 </head>
 <body>
 <main id="overlay" aria-label="Translucent fluorescence viewer">
-  <div id="translucent-stage" aria-label="Drag to pan; scroll to zoom" title="Right-click or ⌘/Ctrl+O to open an AstroMapper JPG and TXT pair"></div>
+  <div id="translucent-stage" aria-label="Drag to pan; scroll to zoom" title="Right-click the laser target to rotate by 15° (Shift reverses); right-click elsewhere or ⌘/Ctrl+O to open an AstroMapper JPG and TXT pair"></div>
   <svg id="roi-overlay" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+  <svg id="laser-annotations" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+  <svg id="laser-target" xmlns="http://www.w3.org/2000/svg" aria-label="Laser target" hidden></svg>
+  <div id="laser-target-capture" hidden></div>
   <div id="window-drag" title="Drag to move window · Option/Alt-drag anywhere"></div>
   <div id="window-controls">
     <div id="roi-controls" hidden>
-    <button type="button" id="roi-previous" aria-label="Previous ROI" title="Previous ROI (←)" disabled><span class="overlay-glyph roi-previous-glyph" aria-hidden="true"></span></button>
-    <button type="button" id="roi-index" aria-label="Open AstroMapper JPG and TXT pair" title="Open AstroMapper JPG and TXT pair">—</button>
-    <button type="button" id="roi-next" aria-label="Next ROI" title="Next ROI (→)" disabled><span class="overlay-glyph roi-next-glyph" aria-hidden="true"></span></button>
+    <button type="button" class="window-button" id="roi-previous" aria-label="Previous ROI" title="Previous ROI (←)" disabled><span class="overlay-glyph roi-previous-glyph" aria-hidden="true"></span></button>
+    <button type="button" class="window-button" id="roi-index" aria-label="Open AstroMapper JPG and TXT pair" title="Open AstroMapper JPG and TXT pair">—</button>
+    <button type="button" class="window-button" id="roi-next" aria-label="Next ROI" title="Next ROI (→)" disabled><span class="overlay-glyph roi-next-glyph" aria-hidden="true"></span></button>
     </div>
-    <button type="button" id="overlay-lock" aria-label="Lock image and window" aria-pressed="false" title="Lock image and window (L)"><span class="overlay-glyph lock-glyph" aria-hidden="true"></span></button>
-    <button type="button" id="overlay-close" aria-label="Close translucent viewer" title="Close translucent viewer (Esc)"><span class="overlay-glyph close-glyph" aria-hidden="true"></span></button>
+    <button type="button" class="window-button" id="overlay-close" aria-label="Close translucent viewer" title="Close translucent viewer (Esc)"><span class="overlay-glyph close-glyph" aria-hidden="true"></span></button>
   </div>
+  <button type="button" class="window-button" id="overlay-lock" aria-label="Lock image and window" aria-pressed="false" title="Lock image and window (L)"><span class="overlay-glyph lock-glyph" aria-hidden="true"></span></button>
   <div id="stage-follow-control" hidden>
     <button type="button" id="stage-follow" aria-pressed="false" disabled>Follow</button>
     <span id="stage-follow-status" role="status" aria-live="polite">Off</span>
@@ -27,22 +30,28 @@
   </div>
   <p id="stage-follow-disconnected" role="status" aria-live="polite" hidden></p>
   <div id="stage-follow-settings" hidden>
-    <label class="stage-follow-auto-control"><input id="stage-follow-step-auto" type="checkbox" checked /> Read Roughness from SLACS</label>
-    <output id="stage-follow-roughness">SLACS Roughness is read while Follow runs</output>
-    <label class="stage-follow-step-control"><span id="stage-follow-step-label">Fallback step if Roughness can't be read</span> <input id="stage-follow-step" type="number" min="0.001" max="10000" step="0.1" value="10" /> µm</label>
-    <p class="stage-follow-hint" id="stage-follow-step-hint">Each press moves by SLACS's Roughness (1 Roughness = 1 µm), and SLACS's Mirror Horizontal and Mirror Vertical reverse W/S and A/D here too. Counts W/A/S/D only while SLACS is in front.</p>
-    <output id="stage-follow-count">Key presses: 0</output>
-    <p class="stage-follow-hint">W/A/S/D move the image in the directions shown on screen. Set rotation and flip in the main viewer before opening this window.</p>
-    <div class="stage-follow-direction" role="group" aria-label="Follow direction">
-      <label><input id="stage-follow-flip-ud" type="checkbox" /> Flip up/down (W/S)</label>
-      <label><input id="stage-follow-flip-lr" type="checkbox" /> Flip left/right (A/D)</label>
+    <label class="stage-follow-auto-control" title="Read Roughness from SLACS"><input id="stage-follow-step-auto" type="checkbox" checked /> Auto step (SLACS)</label>
+    <output id="stage-follow-roughness">Read while Follow runs</output>
+    <label class="stage-follow-step-control" title="Fallback step if Roughness can't be read"><span id="stage-follow-step-label">Fallback</span> <input id="stage-follow-step" type="number" min="0.001" max="10000" step="0.1" value="10" /> µm</label>
+    <span id="stage-follow-step-hint" hidden></span>
+    <div class="stage-follow-direction" role="group" aria-label="Follow direction" title="W/A/S/D move in the directions shown on screen. Set rotation and flip in the main viewer before opening this window.">
+      <label title="Flip up/down (W/S)"><input id="stage-follow-flip-ud" type="checkbox" /> Flip W/S</label>
+      <label title="Flip left/right (A/D)"><input id="stage-follow-flip-lr" type="checkbox" /> Flip A/D</label>
     </div>
-    <p class="stage-follow-hint" id="stage-follow-flip-hint">Reverses Follow's movement only, never the image.</p>
-    <p class="stage-follow-hint">Follows only while locked. Unlock to align by hand; key presses are ignored until you lock again.</p>
-    <output id="stage-follow-scale"></output>
-    <output id="stage-follow-delta">Last image move: 0.000, 0.000 px</output>
-    <button type="button" id="stage-follow-save" disabled>Save connection…</button>
-    <p id="stage-follow-message" role="status">Commanded motion · moves in on-screen directions</p>
+    <span id="stage-follow-flip-hint" hidden>Reverses Follow's movement only, never the image.</span>
+    <div class="laser-target-row">
+      <output id="laser-target-label">Target 18 µm · 45°</output>
+      <button type="button" id="laser-target-set" disabled>Set laser target</button>
+    </div>
+    <output id="laser-target-status">Uncalibrated</output>
+    <details title="Follows only while locked. Unlock to align by hand; key presses are ignored until you lock again.">
+      <summary>Details</summary>
+      <output id="stage-follow-count">Key presses: 0</output>
+      <output id="stage-follow-scale"></output>
+      <output id="stage-follow-delta">Last image move: 0.000, 0.000 px</output>
+      <button type="button" id="stage-follow-save" disabled>Save connection…</button>
+      <p id="stage-follow-message" role="status">Commanded motion · moves in on-screen directions</p>
+    </details>
   </div>
   <div id="opacity-control">
     <input type="range" id="overlay-opacity" min="10" max="100" step="1" value="55" aria-label="Opacity" aria-valuetext="55%" />
@@ -61,6 +70,7 @@
 <script src="vendor/openseadragon/openseadragon.min.js"></script>
 <script src="astromap-import-v1.js"></script>
 <script src="viewer-geometry-v1.js"></script>
+<script src="laser-target-v1.js"></script>
 <script src="translucent-v1.js"></script>
 </body>
 </html>

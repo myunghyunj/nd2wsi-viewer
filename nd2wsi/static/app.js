@@ -196,7 +196,14 @@ function openTranslucentViewer() {
       }
       const snapshot = captureTranslucentView();
       const result = await native.open_translucent_viewer(currentSlideSid(), snapshot);
-      if (!result?.ok) throw new Error(result?.message || "Could not open the translucent viewer");
+      if (!result?.ok) {
+        if (result?.reason === "another_open" && window.parent !== window) {
+          window.parent.postMessage({ nd2wsi: "translucent-refused", version: VIEWPORT_PROTOCOL_VERSION,
+            sid: currentSlideSid() }, location.origin);
+          return false;
+        }
+        throw new Error(result?.message || "Could not open the translucent viewer");
+      }
       return true;
     } catch (error) {
       showToast(error.message || "Could not open the translucent viewer");
@@ -2886,8 +2893,8 @@ function renderAnnotations() {
       const active = a.astromap === true && a.id === state.astromap.activeId;
       svgEl("polygon", {
         points: `${a.x},${a.y} ${a.x + a.w},${a.y} ${a.x + a.w},${a.y + a.h} ${a.x},${a.y + a.h}`,
-        fill: a.astromap === true ? active ? "rgba(255,217,102,.35)" : "rgba(160,166,174,.15)" : hexAlpha(annColor(a), 0.08),
-        stroke: a.astromap === true ? active ? "#ffd966" : "#a0a6ae" : annColor(a), "stroke-width": 1.5,
+        fill: a.slacs?.kind === "laser_shot" ? "rgba(160,166,174,.16)" : a.astromap === true ? active ? "rgba(255,217,102,.35)" : "rgba(160,166,174,.15)" : hexAlpha(annColor(a), 0.08),
+        stroke: a.slacs?.kind === "laser_shot" ? "#a0a6ae" : a.astromap === true ? active ? "#ffd966" : "#a0a6ae" : annColor(a), "stroke-width": 1.5,
         "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke",
       }, g);
       const note = a.astromap === true ? astromapDisplayNote(a) : a.text;
@@ -2919,11 +2926,11 @@ function renderImportedGeoJSON(item, layer, project = toEl, fixed = layer, marks
     const geometry = item.geojson.geometry;
     // Image-pixel outlines do not depend on the camera, so they are cached.
     const parts = project ? api.displayParts(geometry, project) : api.imageParts(geometry);
-    const color = annColor(item);
+    const color = item.slacs?.kind === "laser_shot" ? "#a0a6ae" : annColor(item);
     if (parts.paths.length) {
       const group = svgEl("g", { class: "hit", "data-ann-id": item.id }, layer);
       for (const path of parts.paths) svgEl("path", {
-        d: path.d, fill: path.closed ? hexAlpha(color, .08) : "none",
+        d: path.d, fill: path.closed ? hexAlpha(color, item.slacs?.kind === "laser_shot" ? .16 : .08) : "none",
         "fill-rule": "evenodd", stroke: color, "stroke-width": 1.5,
         "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke",
       }, group);
@@ -3350,6 +3357,7 @@ function annotationDocument() {
         }
       : { status: "unknown", source: "unknown" },
     selection: currentSelection(),
+    ...(state.annLaserState ? { slacs: state.annLaserState } : {}),
     items: state.annotations,
   };
 }
@@ -3444,6 +3452,7 @@ function rebuildAnnList() {
     const txt = document.createElement("span");
     txt.className = "txt";
     txt.textContent =
+      a.slacs?.kind === "laser_shot" ? window.Nd2SlacsLaser.listLabel(a) :
       a.type === "geojson" ? window.Nd2AnnotationGeoJSON.label(a) :
       a.type === "line" ? (a.text || "Measurement") : (a.text || (a.type === "pin" ? "Pin" : "Box"));
     const meta = document.createElement("span");
@@ -4665,6 +4674,28 @@ function applyLinkedViewport(message) {
   }
 }
 
+function receiveSlacsLaserBox(box) {
+  const api = window.Nd2SlacsLaser;
+  if (!api) return;
+  const owner = {
+    sid: currentSlideSid(), g: state.info.generation, p: state.plate ? state.annSite : null,
+    ready: annotationOwnerReady(), locked: annLocked(), loadFailed: state.annLoadFailed,
+    quitPreparing: state.quitPreparing, width: state.info.width, height: state.info.height,
+    items: state.annotations, meta: state.annLaserState,
+    add(item) { state.annLaserState = this.meta; return addAnnotation(item); },
+    update(previous, item) {
+      state.annLaserState = this.meta;
+      state.annotations[state.annotations.indexOf(previous)] = item;
+      annotationsChanged();
+    },
+  };
+  const outcome = api.receive(box, owner);
+  try {
+    const promise = (window.parent !== window ? window.parent : window).pywebview?.api?.report_slacs_laser_box?.({ ...outcome, sid: currentSlideSid() });
+    promise?.catch?.(() => {});
+  } catch (_) { /* A failed acknowledgement cannot overwrite the pane's sidecar. */ }
+}
+
 function wireCompareRelay() {
   window.addEventListener("message", (event) => {
     if (
@@ -4672,7 +4703,9 @@ function wireCompareRelay() {
       event.origin !== location.origin || !event.data ||
       event.data.version !== VIEWPORT_PROTOCOL_VERSION
     ) return;
-    if (event.data.nd2wsi === "astromap-toggle") {
+    if (event.data.nd2wsi === "slacs-laser-box") {
+      receiveSlacsLaserBox(event.data.box);
+    } else if (event.data.nd2wsi === "astromap-toggle") {
       refreshSpatialContext();
       if (event.data.sid === currentSlideSid() &&
           state.viewportRelay.commandGate.matchesLocal(event.data)) toggleAstromap(event.data.open === true);

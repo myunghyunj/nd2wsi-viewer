@@ -226,7 +226,8 @@ class SlacsKeyFollower:
                  step_source: str = "manual", controls=None,
                  pixel_size_um: tuple[float, float] | None = None,
                  flip_x: bool = False, flip_y: bool = False,
-                 mark_context: Callable[[], dict] | None = None):
+                 mark_context: Callable[[], dict] | None = None,
+                 on_mark: Callable[[dict], None] | None = None):
         if step_source not in STEP_SOURCES:
             raise ValueError("step_source must be 'slacs' or 'manual'")
         self._receiver = receiver
@@ -239,6 +240,7 @@ class SlacsKeyFollower:
         self._flip_x = _validate_flip(flip_x, "flip_x")
         self._flip_y = _validate_flip(flip_y, "flip_y")
         self._mark_context = mark_context
+        self._mark_callback = on_mark
         self._clock = clock
         self._heartbeat_interval = heartbeat_interval
         self._lock = threading.Lock()
@@ -552,6 +554,11 @@ class SlacsKeyFollower:
         for name, value in self._mark_fields().items():
             fields.setdefault(name, value)
         session_log.event("slacs_key", **fields)
+        if action == "laser_shot" and self._mark_callback is not None:
+            try:
+                self._mark_callback({**fields, "receiver_id": self._session_id})
+            except Exception:  # noqa: BLE001 - recording must never affect a key observer
+                pass
 
     def _log_mark_hold(self, key: str, action: str, hold: _MarkHold, *, key_up: bool) -> None:
         session_log.event("slacs_key_hold", key=key, action=action, press=hold.press, repeats=hold.repeats,

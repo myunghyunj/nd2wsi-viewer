@@ -31,6 +31,7 @@ const store = createStore({
   fetch: (url, init = {}) => {
     requests.push({method: init.method || "GET", url, keepalive: init.keepalive === true ? true : undefined,
       body: init.body ? JSON.parse(init.body).items.map((item) => item.id) : null,
+      slacs: init.body ? JSON.parse(init.body).slacs : undefined,
       bytes: init.body ? Buffer.byteLength(init.body) : 0});
     return (server.gate || Promise.resolve()).then(() => {
       const status = server.fail.get(url);
@@ -370,3 +371,21 @@ emit({limit: KEEPALIVE_BODY_LIMIT, lutLimit: lut.KEEPALIVE_BODY_LIMIT, big, smal
     (big_body, big_mode, big_bytes), (small_body, small_mode, small_bytes) = out["requests"]
     assert big_body == ["big"] and big_mode == "plain" and big_bytes > 64 * 1024
     assert small_body == ["small"] and small_mode == "keepalive" and small_bytes < 200
+
+
+def test_isolation_metadata_survives_conflict_recovery_and_stays_with_departing_site():
+    out = _run("""
+const meta={isolation_highwater:8,presses:{'receiver_with-hyphen':55}};
+state.annLaserState=meta;
+server.fail.set('api/annotations?p=0',409);
+edit('laser');runTimers();await tick();
+await switchTo(1);
+state.annLaserState={isolation_highwater:2,presses:{}};
+edit('other');runTimers();await tick();
+store.saveDeparting();store.resetOwner();state.plate.focus=0;await store.load(0);await tick();
+emit({posts:requests.filter(r=>r.method==='POST').map(r=>[r.url,r.slacs]),
+ recovered:state.annLaserState,items:state.annotations.map(a=>a.id),conflict:store.failedSaves().some(e=>e.conflict)});
+""")
+    assert out["recovered"] == {"isolation_highwater": 8, "presses": {"receiver_with-hyphen": 55}}
+    assert out["items"] == ["laser"] and out["conflict"]
+    assert all(meta["isolation_highwater"] == (8 if url.endswith("0") else 2) for url, meta in out["posts"])

@@ -1,13 +1,13 @@
 /* Independent tiled tracing window. Source display is a read-only snapshot. */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
-    module.exports = factory(require("./viewer-geometry-v1.js"));
+    module.exports = factory(require("./viewer-geometry-v1.js"), require("./laser-target-v1.js"));
   } else {
-    const api = factory(root.Nd2ViewerGeometry);
+    const api = factory(root.Nd2ViewerGeometry, root.Nd2LaserTarget);
     root.Nd2Translucent = api;
     api.boot(root);
   }
-})(typeof globalThis !== "undefined" ? globalThis : this, function (geometry) {
+})(typeof globalThis !== "undefined" ? globalThis : this, function (geometry, laserTarget) {
   "use strict";
 
   // The per-key stage step, kept for this app run. SLACS jogs the stage by its
@@ -50,6 +50,7 @@
       opacity: Math.max(.1, Math.min(1, Number.isFinite(value.opacity) ? value.opacity : .55)),
       // An older context without these starts unflipped and names no format.
       source_format: followFormat(value.source_format),
+      laser_target: laserTarget.validate(value.laser_target),
       follow_flips: { flip_x: value.follow_flips?.flip_x === true, flip_y: value.follow_flips?.flip_y === true } };
   }
 
@@ -272,7 +273,7 @@
       opacity: initialOpacity, confirmedOpacity: initialOpacity,
       // Follow's flips as the app last confirmed them (remembered for this format).
       followFlips: { x: context.follow_flips?.flip_x === true, y: context.follow_flips?.flip_y === true },
-      flipPending: false, flipMessage: "" };
+      flipPending: false, flipMessage: "", target: laserTarget.validate(context.laser_target) };
     const follow = state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
       seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "" };
     state.slacs = { available: false, session_id: null, status: "checking" };
@@ -352,6 +353,28 @@
     // arrows) or zoom (+/-, 0). This window shows exactly the main viewer's
     // orientation and is aligned by hand, so none of them may act here.
     viewer.addHandler("canvas-key", event => { event.preventDefaultAction = true; });
+    const laserItems = new Map(), laserLayer = doc.getElementById("laser-annotations");
+    const renderLaserItems = () => {
+      laserLayer.replaceChildren();
+      if (!state.ready) return;
+      const size = viewer.viewport.getContainerSize();
+      laserLayer.setAttribute("viewBox", "0 0 " + size.x + " " + size.y);
+      for (const item of laserItems.values()) {
+        const ring = item.type === "box" ? [[item.x,item.y],[item.x+item.w,item.y],
+          [item.x+item.w,item.y+item.h],[item.x,item.y+item.h]] : item.geojson?.geometry?.coordinates?.[0];
+        if (!Array.isArray(ring) || !ring.every(p=>Array.isArray(p) && p.length >= 2 && p.slice(0,2).every(Number.isFinite))) continue;
+        const points = ring.map(([x,y])=>geometry.imageToViewerElementPoint(viewer.viewport,{x,y},OSD));
+        const polygon = doc.createElementNS("http://www.w3.org/2000/svg","polygon");
+        polygon.setAttribute("points",points.map(p=>p.x+","+p.y).join(" "));laserLayer.appendChild(polygon);
+        const label = doc.createElementNS("http://www.w3.org/2000/svg","text");
+        label.setAttribute("x",Math.min(...points.map(p=>p.x))); label.setAttribute("y",Math.min(...points.map(p=>p.y))-5);
+        label.textContent = String(item.text) + " · " + item.slacs.shots + " shots";laserLayer.appendChild(label);
+      }
+    };
+    win.nd2TranslucentLaserItem = item => {
+      if (disposed || item?.slacs?.kind !== "laser_shot" || typeof item.id !== "string") return false;
+      laserItems.set(item.id, item);renderLaserItems();return true;
+    };
     let drawnRois = null, roiBoxes = [];
     const renderRoiBoxes = () => {
       if (!state.ready) return;
@@ -383,7 +406,7 @@
     // The app keeps the current view so each SLACS laser shot (",") and next
     // well (".") it logs carries the image-pixel centre of this window, with
     // the Follow progress already shown. Reports are never logged themselves.
-    let viewReportTimer = null, viewReportInFlight = false, viewReportAgain = false, reportedFrame = "";
+    let viewReportTimer = null, viewReportInFlight = false, viewReportAgain = false, reportedFrame = "", reportedDpr = null;
     const finiteValues = values => values.every(Number.isFinite) ? values : null;
     const windowFrame = () => finiteValues([win.screenX, win.screenY, win.innerWidth, win.innerHeight]);
     const overlayView = () => {
@@ -396,7 +419,7 @@
         rotation: viewport.getRotation(), flip: viewport.getFlip(), locked: state.locked,
         follow_session: following ? follow.sessionId : null, follow_seq: following ? follow.seq : null,
         follow_displacement_um: following ? follow.displacement.slice() : null,
-        container: finiteValues([size.x, size.y]), window: windowFrame() };
+        container: finiteValues([size.x, size.y]), window: windowFrame(), ...target.report() };
     };
     const reportView = async () => {
       if (disposed || !state.ready || typeof api.report_overlay_view !== "function") return false;
@@ -407,7 +430,7 @@
       try {
         const view = overlayView();
         const ok = (await api.report_overlay_view(view))?.ok === true;
-        if (ok) reportedFrame = JSON.stringify(view.window);
+        if (ok) { reportedFrame = JSON.stringify(view.window); reportedDpr = win.devicePixelRatio; }
         return ok;
       } catch (_) { return false; }
       finally {
@@ -423,8 +446,11 @@
     // Moving the window changes no camera, and a native drag ends outside the
     // page, so the 1 s discovery tick also reports a window frame that changed.
     const reportMovedWindow = () => {
-      if (state.ready && JSON.stringify(windowFrame()) !== reportedFrame) scheduleViewReport();
+      target.render();
+      if (state.ready && (JSON.stringify(windowFrame()) !== reportedFrame || reportedDpr !== win.devicePixelRatio)) scheduleViewReport();
     };
+    const target = laserTarget.mount({ win, doc, viewer, OSD, pixelSize, state, api,
+      frame: windowFrame, changed: scheduleViewReport, message: showStatus });
     const paintRois = () => {
       const hasRois = state.rois.length > 0;
       doc.getElementById("roi-controls").hidden = !hasRois;
@@ -460,6 +486,7 @@
       // element, so it stays visible after the control hides.
       const detected = state.slacs.available === true;
       followControl.hidden = !detected;
+      target.render();
       if (!detected) {
         followSettings.hidden = true;
         doc.getElementById("stage-follow-options").setAttribute("aria-expanded", "false");
@@ -496,16 +523,19 @@
         followStepAuto.disabled = follow.enabled || follow.pending;  // fixed for a run, like the step
       }
       if (followStepLabel) {
-        followStepLabel.textContent = state.stepAuto ? "Fallback step if Roughness can't be read" : "Step per key press";
+        followStepLabel.textContent = state.stepAuto ? "Fallback" : "Step";
       }
       if (followStepHint) {
         followStepHint.textContent = state.stepAuto ?
           "Each press moves by SLACS's Roughness (1 Roughness = 1 µm), and SLACS's Mirror Horizontal and Mirror Vertical reverse W/S and A/D here too. Counts W/A/S/D only while SLACS is in front." :
           "Set this to SLACS's Roughness (1 Roughness = 1 µm per press). Counts W/A/S/D only while SLACS is in front.";
       }
+      if (followStepLabel) followStepLabel.title = followStepHint?.textContent || "";
       if (followRoughness) {
         followRoughness.hidden = !state.stepAuto;
-        followRoughness.textContent = state.stepAuto ? slacsRoughnessText(follow.keys, state.stepUm, pixelSize) : "";
+        followRoughness.title = state.stepAuto ? slacsRoughnessText(follow.keys, state.stepUm, pixelSize) : "";
+        followRoughness.textContent = followRoughness.title.replace("SLACS Roughness: ", "").replace(" = ", " · ")
+          .replace(" · Mirror H ", " · Mirror ").replace(", V ", "/");
       }
       if (followCount) {
         const counted = follow.keys && Number.isFinite(follow.keys.counted) ? follow.keys.counted : 0;
@@ -520,6 +550,7 @@
         flipBoxes[axis].disabled = state.flipPending || !flipAvailable;
       }
       if (followFlipHint) followFlipHint.textContent = state.flipMessage || flipHint;
+      for (const input of Object.values(flipBoxes)) if (input) input.title = state.flipMessage || flipHint;
       followSave.disabled = !follow.enabled || follow.pending || typeof api.save_stage_follow_connection !== "function";
       doc.getElementById("stage-follow-message").textContent = follow.message ||
         (!pixelSize ? "A calibrated pixel size is needed." : "Commanded motion · moves in on-screen directions");
@@ -614,6 +645,7 @@
       followTimer = win.setTimeout(pollStageFollow, 50);
     };
     const startStageFollow = async () => {
+      target.cancel();
       // A discovery reply still on its way decides; Follow needs a detected SLACS.
       if (!state.slacs.available && discoveryTask) await discoveryTask;
       if (disposed || follow.enabled || follow.pending || !state.ready || !pixelSize || !state.slacs.available ||
@@ -806,6 +838,7 @@
       state.locked = !previous;
       lockEpoch++;
       cancelGesture();
+      target.cancel();
       if (state.ready) restoreCamera(viewer, camera(viewer)); // stop any in-flight pan/zoom
       paintLock();
       try {
@@ -819,6 +852,7 @@
       } finally { state.pending = false; lockEpoch++; paintLock(); reportView(); }
     };
     const close = async () => {
+      target.cancel();
       stopStageFollow();
       try { requireSuccess(await api.close_translucent(), "Could not close this window"); }
       catch (error) { showStatus(error.message || "Could not close this window"); }
@@ -862,6 +896,7 @@
     nextRoi.addEventListener("click", () => selectRoi(state.roiIndex + 1));
     roiIndex.addEventListener("click", chooseRois);
     stage.addEventListener("contextmenu", event => {
+      if (target.contextmenu(event)) return;
       event.preventDefault();
       chooseRois();
     });
@@ -895,11 +930,12 @@
     viewer.addHandler("open-failed", () => showStatus("Could not load this image. Close and reopen the translucent viewer."));
     viewer.addHandler("tile-load-failed", () => showStatus("Some image tiles could not load. Close and reopen the translucent viewer."));
     // One handler: the outlines and the view report follow every camera change.
-    viewer.addHandler("update-viewport", () => { renderRoiBoxes(); scheduleViewReport(); });
+    viewer.addHandler("update-viewport", () => { renderRoiBoxes(); renderLaserItems(); target.render(); scheduleViewReport(); });
     const resize = () => {
       if (state.ready) {
         resizePreservingScale(viewer, stage.clientWidth, stage.clientHeight, OSD);
-        renderRoiBoxes();
+        renderRoiBoxes(); renderLaserItems();
+        target.render(); scheduleViewReport();
       }
     };
     const observer = win.ResizeObserver ? new win.ResizeObserver(resize) : null;
@@ -957,7 +993,7 @@
     };
     doc.getElementById("window-drag").addEventListener("pointerdown", event => startGesture(event));
     overlay.addEventListener("pointerdown", event => {
-      if (event.altKey && !event.target.closest("button, input, #opacity-control, #stage-follow-control, #stage-follow-settings, .resize-handle")) startGesture(event);
+      if (event.altKey && !event.target.closest("button, input, #opacity-control, #stage-follow-control, #stage-follow-settings, #laser-target, #laser-target-capture, .resize-handle")) startGesture(event);
     }, true);
     for (const handle of doc.querySelectorAll(".resize-handle")) {
       handle.addEventListener("pointerdown", event => startGesture(event, handle.dataset.edge));
@@ -977,6 +1013,9 @@
     });
     overlay.addEventListener("pointercancel", cancelGesture);
     doc.addEventListener("keydown", event => {
+      if (event.key === "Escape" && target.calibrating) {
+        event.preventDefault(); event.stopImmediatePropagation(); target.cancel(); return;
+      }
       if (event.repeat || event.altKey) return;
       if (event.target?.closest?.("#stage-follow-control, #stage-follow-settings") && event.key !== "Escape") return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o") {
@@ -1016,7 +1055,7 @@
         stack: reason?.stack ? String(reason.stack) : "" });
     });
     win.addEventListener("pagehide", () => {
-      stopStageFollow(); disposed = true;
+      target.cancel(); stopStageFollow(); disposed = true;
       discoveryGeneration++;
       if (discoveryInterval !== null) win.clearInterval(discoveryInterval);
       if (viewReportTimer !== null) win.clearTimeout(viewReportTimer);
@@ -1027,7 +1066,7 @@
     discoveryInterval = win.setInterval(() => { reportMovedWindow(); pollSlacsDiscovery(); }, 1000);
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
       startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, revokeStageFollow,
-      setStepUm, setStepAuto, setFollowFlips, reportView, forwardClientError };
+      setStepUm, setStepAuto, setFollowFlips, reportView, forwardClientError, target };
   }
 
   async function boot(win) {

@@ -396,3 +396,11 @@ def test_background_window_neither_claims_nor_caches_and_a_later_focus_claims(tm
     assert focused["offer"] is True
     assert [s["offer"] for s in cached] == [True, True]  # second claims afresh: the file was gone
     assert refused["offer"] is True  # and keeps that answer from its own cache
+
+
+def test_translucent_warning_shows_hides_and_exists_before_binding():
+    result = run("showTranslucentWarning();const shown=!$('translucent-warning').hidden;hideTranslucentWarning();({shown,hidden:$('translucent-warning').hidden});")
+    assert result == {"shown": True, "hidden": True}
+    html = (STATIC / "shell.html").read_text()
+    assert html.index('id="translucent-warning-ok"') < html.index('src="static/shell-v1.js"')
+    assert "#translucent-warning[hidden]" in (STATIC / "native-shell-v1.css").read_text()

@@ -672,6 +672,8 @@ class Api:
         self._server_lock = threading.Lock()
         self._translucent_lock = threading.RLock()
         self._translucent_windows = {}
+        self._active_translucent_sid = None
+        self._translucent_claim = None
         self._translucent_owner_closed = False
         self._follow_flips_store = None  # built on the first overlay; shared by every overlay
         self._slacs_discovery = None
@@ -781,9 +783,12 @@ class Api:
         """Open a display-only tracing window for this viewer's registered slide."""
         if sys.platform not in ("darwin", "win32"):
             return {"ok": False, "message": "The translucent viewer requires the macOS or Windows app."}
+        claim = None
         try:
             from urllib.parse import quote
 
+            from .laser_target import LaserTargetStore
+            from .translucent_claim import tracing_claim
             from .translucent_window import create_translucent_window, validate_context
 
             with self._server_lock:
@@ -797,28 +802,64 @@ class Api:
             with self._translucent_lock:
                 if self._translucent_owner_closed:
                     raise ValueError("The source viewer is closing")
-                previous = self._translucent_windows.pop(sid, None)
+                previous = self._translucent_windows.get(sid)
                 if previous is not None:
-                    previous.close_translucent()
+                    return {"ok": True, "id": previous._window.uid}
+                claim = tracing_claim(self._window_session)
+                try:
+                    if self._translucent_windows:
+                        raise TimeoutError("another tracing window is open")
+                    claim.acquire()
+                except TimeoutError:
+                    session_log.event("translucent_refused", reason="another_open", sid=sid)
+                    return {"ok": False, "reason": "another_open",
+                            "message": "A tracing window is already open. Close it before opening another."}
+                self._translucent_claim = claim
 
                 def remove(closed):
-                    session_log.event("translucent_closed", sid=sid)
                     with self._translucent_lock:
                         if self._translucent_windows.get(sid) is closed:
                             self._translucent_windows.pop(sid, None)
+                        if self._translucent_claim is claim:
+                            self._translucent_claim = None
+                        claim.release()
+                    session_log.event("translucent_closed", sid=sid)
+
+                def active(locked):
+                    if locked:
+                        self._active_translucent_sid = sid
+
+                def deliver(message):
+                    # Called only by the overlay's bounded delivery worker, without either lock.
+                    owner = self._lut_clipboard_owner()
+                    return owner.evaluate_js("window.nd2wsiSlacsLaserBox?.(" +
+                                             json.dumps({**message, "sid": sid}, allow_nan=False) + ") === true")
 
                 overlay = create_translucent_window(
                     context, url=base_url + "static/translucent.html",
                     title=APP_NAME + " — Translucent", logger=_dlog, on_closed=remove,
-                    flip_store=self._follow_flip_store(),
+                    flip_store=self._follow_flip_store(), target_store=LaserTargetStore(self._window_session),
+                    on_laser_box=deliver, is_active=lambda: self._active_translucent_sid == sid, on_lock=active,
                 )
                 self._translucent_windows[sid] = overlay
             session_log.event("translucent_opened", sid=sid, id=overlay._window.uid)
             return {"ok": True, "id": overlay._window.uid}
         except Exception as exc:
+            if claim is not None:
+                claim.release()
+                with self._translucent_lock:
+                    if self._translucent_claim is claim:
+                        self._translucent_claim = None
             _dlog(f"translucent viewer open failed: {exc!r}")
             session_log.event("translucent_open_failed", sid=sid, ok=False, error=str(exc))
             return {"ok": False, "message": f"Could not open translucent viewer: {exc}"}
+
+    def report_slacs_laser_box(self, payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get("sid"), str):
+            return {"ok": False}
+        with self._translucent_lock:
+            overlay = self._translucent_windows.get(payload["sid"])
+        return overlay.report_slacs_laser_box(payload) if overlay is not None else {"ok": False}
 
     def _follow_flip_store(self):
         """This window process's store of Follow flips per image format.
@@ -850,6 +891,8 @@ class Api:
                 overlay.close_translucent()
             except Exception as exc:
                 _dlog(f"translucent viewer close failed: {exc!r}")
+        # The native closed callback releases the claim. Keep it held if destruction
+        # fails, until the OS reclaims it at process exit.
 
     def open_in_metal(self, sid: str, view_state: dict, retry: bool = False) -> dict:
         """Open only a registered slide in a fresh process of this same role."""

@@ -30,6 +30,7 @@ from nd2wsi.translucent_smoke import (  # noqa: E402
     exercise_translucent_viewer,
     pane_eval,
     save_cocoa_snapshot,
+    snapshot_cocoa,
     wait_for,
 )
 from nd2wsi.window_sessions import create_window_session  # noqa: E402
@@ -154,6 +155,7 @@ def shell_toolbar_checks():
 
 def pair_checks(overlay, child):
     """Use the same native read and canonical JS map as real pair imports."""
+    reticle = forced_target_check(overlay, child)
     text = session.exports_root / "roi-reference.txt"
     image = session.exports_root / "roi-reference.jpg"
     text.write_text("INDEX\tX1\tY1\tX2\tY2\tNOTE\n7\t10\t20\t10\t20\tone pixel\n"
@@ -203,7 +205,27 @@ def pair_checks(overlay, child):
     return {"mapped": state["rois"], "first_camera": after_first, "next_camera": after_second,
             "first_boxes": first_boxes, "next_boxes": next_boxes,
             "inclusive_endpoints": True, "scale_preserved": True, "locked_navigation_blocked": True,
-            "reference_files_unchanged": True, "minimum_size_controls": minimum_layout}
+            "reference_files_unchanged": True, "minimum_size_controls": minimum_layout,
+            "visible_target_center_alpha": reticle}
+
+
+def forced_target_check(overlay, child):
+    """Show the real target with injected discovery and sample its empty centre."""
+    previous = dict(overlay._slacs_snapshot)
+    discovery = overlay._ensure_slacs_discovery()
+    discovery.stop()
+    try:
+        overlay._on_slacs_change({"available": True, "session_id": "synthetic-target", "status": "running"})
+        bridge_result(child, "nd2Translucent.pollSlacsDiscovery()")
+        wait_for(lambda: child.evaluate_js("!document.getElementById('laser-target').hidden"),
+                 description="visible laser reticle")
+        check(child.evaluate_js("nd2Translucent.target.report().target_offset_css.every(v=>v===0)"),
+              "Agent target must start at the centre")
+        return snapshot_cocoa(child, session.exports_root / "translucent-target-center.png",
+                              expected_opacity=child.evaluate_js("nd2Translucent.state.opacity"))
+    finally:
+        overlay._on_slacs_change(previous)
+        bridge_result(child, "nd2Translucent.pollSlacsDiscovery()")
 
 
 def minimum_size_checks(child):
@@ -216,6 +238,7 @@ def minimum_size_checks(child):
       const rect=element=>{const r=element.getBoundingClientRect();return [r.x,r.y,r.width,r.height];};
       return {opacity:rect(document.getElementById('opacity-control')),
         navigation:rect(document.getElementById('window-controls')),
+        lock:rect(document.getElementById('overlay-lock')),
         handles:[...document.querySelectorAll('.resize-handle')].map(rect),
         navVisible:!document.getElementById('roi-controls').hidden};
     })()""")
@@ -223,7 +246,7 @@ def minimum_size_checks(child):
     check(width > 100 and height > 0 and x >= 0 and y >= 0 and x + width <= 220 and y + height <= 160,
           f"Minimum-size opacity control is clipped: {geometry}")
     check(geometry["navVisible"], "Minimum-size check requires visible imported ROI navigation")
-    for rx, ry, rw, rh in [geometry["navigation"], *geometry["handles"]]:
+    for rx, ry, rw, rh in [geometry["navigation"], geometry["lock"], *geometry["handles"]]:
         check(min(x + width, rx + rw) <= max(x, rx) or min(y + height, ry + rh) <= max(y, ry),
               f"Opacity control overlaps navigation or a resize handle: {geometry}")
     time.sleep(.2)

@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>nd2wsi-viewer</title>
+
 <script src="static/early-errors-v1.js"></script>
 <link rel="stylesheet" href="static/native-shell-v1.css" />
 </head>
@@ -196,6 +197,11 @@
     <button id="slacs-offer-open" type="button" disabled>Open SLACS view</button>
   </div>
 </section>
+<aside id="translucent-warning" role="alert" hidden>
+  <strong>Tracing window already open</strong>
+  <p>A tracing window is already open. Close it before opening another.</p>
+  <button type="button" id="translucent-warning-ok">OK</button>
+</aside>
 <div id="shell-toast" role="alert" aria-live="assertive"></div>
 <script src="static/align-v1.js"></script>
 <script src="static/shortcut-router-v1.js"></script>
@@ -203,5 +209,6 @@
 <script src="static/shading-correction-v1.js"></script>
 <script src="static/shell-v1.js"></script>
 <script src="static/window-controls-v1.js"></script>
+
 </body>
 </html>

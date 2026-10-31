@@ -10,16 +10,16 @@ body { user-select: none; -webkit-user-select: none; }
 #roi-overlay, #roi-overlay * { pointer-events: none; }
 #roi-overlay .roi-box { fill: rgba(160,166,174,.15); stroke: #a0a6ae; stroke-width: 1.5px; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
 #roi-overlay .roi-box[data-selected="true"] { fill: rgba(255,217,102,.35); stroke: #ffd966; }
-#window-drag { position: absolute; top: 7px; left: 12px; right: 104px; height: 28px; cursor: move; touch-action: none; }
-[data-has-rois="true"] #window-drag { right: 216px; }
+#window-drag { position: absolute; top: 7px; left: 12px; right: 64px; height: 28px; cursor: move; touch-action: none; }
+[data-has-rois="true"] #window-drag { right: 176px; }
 #roi-controls { display: flex; gap: 4px; }
 #roi-controls[hidden] { display: none; }
 #window-controls { position: absolute; top: 9px; right: 9px; display: flex; gap: 4px; z-index: 3; }
-#window-controls button { display: grid; place-items: center; width: 36px; height: 36px; margin: 0; padding: 6px; border: 0; border-radius: 9px; color: #fff; background: none; cursor: pointer; opacity: .86; -webkit-tap-highlight-color: transparent; }
-#window-controls button:hover, #window-controls button:focus-visible { opacity: 1; }
-#window-controls button:active { opacity: .66; }
-#window-controls button:focus-visible { outline: 1px solid rgba(255,255,255,.9); outline-offset: -2px; }
-#window-controls button:disabled { cursor: default; opacity: .3; }
+.window-button { display: grid; place-items: center; width: 36px; height: 36px; margin: 0; padding: 6px; border: 0; border-radius: 9px; color: #fff; background: none; cursor: pointer; opacity: .86; -webkit-tap-highlight-color: transparent; }
+.window-button:hover, .window-button:focus-visible { opacity: 1; }
+.window-button:active { opacity: .66; }
+.window-button:focus-visible { outline: 1px solid rgba(255,255,255,.9); outline-offset: -2px; }
+.window-button:disabled { cursor: default; opacity: .3; }
 #window-controls #roi-index { width: auto; min-width: 32px; padding-inline: 3px; font: 500 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
 #window-controls #roi-previous, #window-controls #roi-next { width: 24px; padding: 0; }
 .roi-previous-glyph { --glyph: url("vendor/icons8-win10/chevron-left.svg"); }
@@ -29,7 +29,7 @@ body { user-select: none; -webkit-user-select: none; }
 .lock-glyph { --glyph: url("vendor/icons8-win10/unlock-2.svg"); }
 [aria-pressed="true"] .lock-glyph { --glyph: url("vendor/icons8-win10/lock-2.svg"); }
 .close-glyph { --glyph: url("vendor/icons8-win10/close.svg"); width: 20px; height: 20px; }
-#opacity-control { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; width: min(190px, calc(100% - 48px)); height: 24px; z-index: 3; color: #fff; touch-action: none; }
+#opacity-control { position: absolute; left: 60px; bottom: 12px; display: flex; align-items: center; gap: 8px; width: min(190px, calc(100% - 78px)); height: 24px; z-index: 3; color: #fff; touch-action: none; }
 #overlay-opacity { appearance: none; -webkit-appearance: none; flex: 1; min-width: 0; width: 100%; height: 24px; margin: 0; padding: 0; border: 0; background: transparent; color: inherit; cursor: pointer; }
 #overlay-opacity::-webkit-slider-runnable-track { height: 2px; border-radius: 1px; background: rgba(255,255,255,.78); box-shadow: 0 1px 3px rgba(0,0,0,.5); }
 #overlay-opacity::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 10px; height: 10px; margin-top: -4px; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.5); }
@@ -77,4 +77,28 @@ body { user-select: none; -webkit-user-select: none; }
 [data-edge="sw"] { bottom: 0; left: 0; cursor: nesw-resize; }
 [data-locked="true"] .resize-handle, [data-locked="true"] #window-drag { pointer-events: none; }
 [data-locked="true"] #translucent-stage { cursor: default; }
-@media (prefers-reduced-motion: no-preference) { #window-controls button { transition: opacity 100ms ease; } }
+@media (prefers-reduced-motion: no-preference) { .window-button { transition: opacity 100ms ease; } }
+
+#laser-target { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; overflow: hidden; pointer-events: none; }
+#laser-target[hidden], #laser-target-capture[hidden] { display: none; }
+.laser-reticle { stroke: #ff5353; stroke-width: 1.5; fill: none; pointer-events: none; }
+.laser-target-outline { fill: none; stroke: #ff5353; stroke-width: 1; pointer-events: none; }
+.laser-target-outline[data-calibrated="false"] { stroke-dasharray: 4 3; }
+.laser-target-hit { fill: none; stroke: transparent; stroke-width: 8; pointer-events: stroke; }
+.laser-target-handle { fill: #ff5353; stroke: rgba(255,255,255,.8); stroke-width: 1; pointer-events: all; cursor: nwse-resize; }
+#laser-target-capture { position: absolute; inset: 0; z-index: 2; cursor: crosshair; background: transparent; touch-action: none; }
+
+#laser-annotations { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; overflow: hidden; pointer-events: none; }
+#laser-annotations * { pointer-events: none; }
+#laser-annotations polygon { fill: rgba(160,166,174,.16); stroke: #a0a6ae; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+#laser-annotations text { fill: #fff; font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; paint-order: stroke; stroke: rgba(28,28,30,.7); stroke-width: 3; stroke-linejoin: round; }
+
+#overlay-lock { position: absolute; left: 18px; bottom: 8px; z-index: 3; }
+.laser-target-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+.laser-target-row output { margin: 0 !important; }
+#laser-target-status { color: #c9cdd3; }
+#stage-follow-settings details { border-top: 1px solid rgba(255,255,255,.15); padding-top: 5px; }
+#stage-follow-settings summary { cursor: pointer; margin-bottom: 5px; }
+/* Keep the status on the tracing image's bottom-right, clear of the slider. */
+#stage-follow-status { position: fixed; right: 12px; bottom: 44px; max-width: calc(100% - 76px); padding: 4px 8px; border-radius: 12px; background: rgba(25,28,33,.72); }
+@media (min-width: 600px) { #stage-follow-status { bottom: 16px; max-width: calc(100% - 280px); } }

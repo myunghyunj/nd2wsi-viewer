@@ -212,7 +212,8 @@
       const url = urlFor(site);
       if (!url) return null;
       const foreign = state.annForeignItems || [];
-      const payload = { items: foreign.length ? state.annotations.concat(foreign) : state.annotations };
+      const payload = { items: foreign.length ? state.annotations.concat(foreign) : state.annotations,
+        ...(state.annLaserState ? { slacs: state.annLaserState } : {}) };
       if (typeof state.annServerRevision === "string") {
         payload.expected_revision = state.annServerRevision;
       }
@@ -471,6 +472,7 @@
       state.annServerRevision = null;
       state.annotations = [];
       state.annForeignItems = [];
+      state.annLaserState = null;
       state.editingId = null;
       onEditorReset();
       onRender();
@@ -515,6 +517,7 @@
             () => "a" + now().toString(36) + "s" + loadedIds++);
           state.annotations = items;
           state.annForeignItems = foreign;
+          state.annLaserState = d.slacs || null;
           state.annPath = recovered ? null : d.path;
           state.annReady = true;
           state.annDirty = recovered;

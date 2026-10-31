@@ -1525,3 +1525,25 @@ def test_overlays_following_at_once_log_one_press_with_one_number(log_events):
         (",", 1, 2), (",", 1, 2)]
     followers[1].stop()
     assert native.stops == 1
+
+
+def test_laser_hook_is_once_per_physical_comma_and_cannot_break_observation(log_events):
+    marks = make_marks()
+    records = []
+    marks.follower._mark_callback = lambda record: records.append(record)
+    marks.observer.send(VK_COMMA, modifiers=("ctrl", "alt"))
+    marks.observer.send(VK_COMMA)
+    marks.observer.send(VK_COMMA, down=False)
+    marks.observer.send(VK_PERIOD)
+    marks.observer.send(VK_PERIOD, down=False)
+    assert len(records) == 1 and records[0]["action"] == "laser_shot"
+    assert records[0]["modifiers"] == ["alt", "ctrl"]
+    assert records[0]["receiver_id"] == marks.follower._session_id
+
+    def broken(record):
+        raise RuntimeError("unavailable annotation pane")
+
+    marks.follower._mark_callback = broken
+    marks.observer.send(VK_COMMA)
+    assert len(logged(log_events, "slacs_key")) == 3
+    marks.follower.stop()

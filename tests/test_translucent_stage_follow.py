@@ -225,7 +225,7 @@ class FakeFollower:
     instances = []
 
     def __init__(self, receiver, session_id, *, step_um, step_source="manual", controls=None,
-                 pixel_size_um=None, flip_x=False, flip_y=False, mark_context=None, start_ok=True,
+                 pixel_size_um=None, flip_x=False, flip_y=False, mark_context=None, on_mark=None, start_ok=True,
                  order=None):
         self.receiver = receiver
         self.session_id = session_id
@@ -794,12 +794,12 @@ def test_mark_context_never_waits_for_the_overlay_lock(keys_overlay):
     assert context["view_age_ms"] >= 0
     assert {key: value for key, value in context.items() if key != "view_age_ms"} == {
         "slacs_session": "test-process", "image_name": "ITO.nd2", "source_format": "other",
-        "image_px": [100.0, 200.0],
+        "image_px": [100.0, 200.0], **dict.fromkeys(tw.TARGET_KEYS),
         "view": {"zoom": 2.0, "rotation": 90.0, "flip": True, "container": [800.0, 500.0],
                  "window": [10.0, 20.0, 800.0, 500.0]},
         "view_follow_seq": 0, "view_displacement_um": [0.0, 0.0], "locked": False, "follow_status": "waiting",
         "follow_seq": 0, "displacement_um": [0, 0], "counted": 3, "step_source": "slacs",
-        "step_um": tw.DEFAULT_STEP_UM, "roughness_um": 12.5, "mirror_h": False, "mirror_v": True,
+        "step_um": tw.DEFAULT_STEP_UM, "effective_step_um": 12.5, "roughness_um": 12.5, "mirror_h": False, "mirror_v": True,
         "reading_age_ms": 40, "slacs_busy": False, "flip_x": False, "flip_y": False}
     api.report_overlay_view(_view(center_px=[-0.04, 0.04]))
     assert api._mark_context()["image_px"] == [0.0, 0.0]  # never a negative zero

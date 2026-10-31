@@ -15,6 +15,13 @@ from nd2wsi import app
 from nd2wsi import translucent_window as overlay
 
 
+@pytest.fixture(autouse=True)
+def tracing_claims_stay_in_the_test(monkeypatch, tmp_path):
+    monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path / "window-sessions"))
+
+
+
+
 class Event:
     def __init__(self):
         self.handlers = []
@@ -193,6 +200,9 @@ def test_lock_cancels_queued_geometry_keeps_unlock_and_close_available(cocoa_api
     assert q.api.close_translucent()
     assert q.api.close_translucent()
     q.window.destroy.assert_called_once()
+    q.closed.assert_not_called()
+    q.api._did_close()
+    q.api._did_close()
     q.closed.assert_called_once_with(q.api)
 
 
@@ -475,6 +485,7 @@ def test_parent_registry_owns_overlay_and_cleans_up_without_touching_source(stor
     assert create.call_count == 1
     api._close_translucent_windows()
     child.close_translucent.assert_called_once()
+    create.call_args.kwargs["on_closed"](child)
     assert api._translucent_windows == {}
     assert not api.open_translucent_viewer("abc", payload)["ok"]
     assert source_window.mock_calls == []
@@ -510,11 +521,14 @@ def test_parent_registry_passes_one_flip_store_to_each_overlay(store, payload, m
     api = app.Api(None)
     api._httpd = SimpleNamespace(registry=registry)
     assert api.open_translucent_viewer("abc", payload)["ok"]
+    assert api.open_translucent_viewer("def", payload)["reason"] == "another_open"
+    assert api.open_translucent_viewer("abc", payload)["ok"]  # reused
+    created[0]["on_closed"](api._translucent_windows["abc"])
     assert api.open_translucent_viewer("def", payload)["ok"]
-    assert api.open_translucent_viewer("abc", payload)["ok"]  # reopened
     stores = [options["flip_store"] for options in created]
     assert isinstance(stores[0], FollowFlipStore) and all(item is stores[0] for item in stores)
     assert stores[0].path.parent == Path(os.environ["ND2WSI_FOLLOW_FLIPS_ROOT"]).resolve()
+    created[-1]["on_closed"](api._translucent_windows["def"])
     api._close_translucent_windows()
     # An Agent window's overlays remember into its own session folder only.
     created.clear()
@@ -522,6 +536,7 @@ def test_parent_registry_passes_one_flip_store_to_each_overlay(store, payload, m
     agent._httpd = SimpleNamespace(registry=registry)
     assert agent.open_translucent_viewer("abc", payload)["ok"]
     assert created[0]["flip_store"].path == tmp_path / "agent-session" / "stage-follow" / "flips.json"
+    created[-1]["on_closed"](agent._translucent_windows["abc"])
     agent._close_translucent_windows()
 
 
@@ -544,3 +559,54 @@ def test_windows_applies_alpha_once_and_uses_dpi_scaled_geometry(store, payload,
     assert api.resize_window(800, 600)["ok"]
     assert (native.Width, native.Height) == (1200, 900)
     assert not api.start_window_drag()
+
+
+def test_two_user_apis_share_claim_but_agent_is_private(store, payload, monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://local/token/")
+    created = []
+
+    def create(context, **options):
+        child = SimpleNamespace(_window=SimpleNamespace(uid=str(len(created))))
+        child.close_translucent = lambda: options["on_closed"](child)
+        created.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create)
+    server = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store))
+    first, second = app.Api(None), app.Api(None)
+    agent = app.Api(None, window_session=SimpleNamespace(role="agent", root=tmp_path / "agent"))
+    for api in (first, second, agent):
+        api._httpd = server
+    try:
+        assert first.open_translucent_viewer("a", payload)["ok"]
+        assert second.open_translucent_viewer("a", payload)["reason"] == "another_open"
+        assert agent.open_translucent_viewer("a", payload)["ok"]
+        first._close_translucent_windows()
+        assert second.open_translucent_viewer("b", payload)["ok"]
+    finally:
+        for api in (first, second, agent):
+            api._close_translucent_windows()
+
+
+def test_tracing_claim_released_by_os_after_crash(tmp_path):
+    import subprocess
+
+    from nd2wsi.translucent_claim import tracing_claim
+
+    script = "from nd2wsi.translucent_claim import tracing_claim; c=tracing_claim(); c.acquire(); print('ready', flush=True); input()"
+    process = subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    claim = tracing_claim()
+    try:
+        assert process.stdout.readline().strip() == "ready"
+        with pytest.raises(TimeoutError):
+            claim.acquire()
+        process.kill()
+        process.wait(timeout=5)
+        claim.acquire()
+        assert claim.acquired and claim.path.is_file()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+        claim.release()
