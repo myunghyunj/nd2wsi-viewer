@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 import uuid
 from collections import deque
@@ -14,38 +15,153 @@ from html.parser import HTMLParser
 from urllib.parse import quote
 
 PAGE_TIMEOUT = 2.0
-DISMISS, INSTALL = 2, 1  # SPUUserUpdateChoice in Sparkle 2.9.6
+SKIP, INSTALL, DISMISS = 0, 1, 2  # SPUUserUpdateChoice in Sparkle 2.9.6
+RELEASE_NOTE_LIMIT = 8
+RELEASE_NOTE_ITEM_LIMIT = 300
+RELEASE_NOTE_SOURCE_LIMIT = 65536
 
 
-def plain_text(value, limit=600):
+def _text_source(value, *, group_list_items=False):
     class Text(HTMLParser):
         def __init__(self):
             super().__init__(convert_charrefs=True)
             self.parts = []
             self.suppressed = 0
+            self.list_depth = 0
+
+        def boundary(self):
+            self.parts.append(" " if group_list_items and self.list_depth else "\n")
 
         def handle_starttag(self, tag, attrs):
             if tag in ("script", "style"):
                 self.suppressed += 1
-            if tag in ("p", "br", "li", "div", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "pre"):
-                self.parts.append("\n")
             if tag == "li":
-                self.parts.append("• ")
+                self.boundary()
+                if not group_list_items or not self.list_depth:
+                    self.parts.append("• ")
+                self.list_depth += 1
+            elif tag in ("p", "br", "div", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "pre"):
+                self.boundary()
 
         def handle_endtag(self, tag):
             if tag in ("script", "style"):
                 self.suppressed = max(0, self.suppressed - 1)
+            if tag == "li":
+                self.list_depth = max(0, self.list_depth - 1)
             if tag in ("p", "li", "div", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "pre"):
-                self.parts.append("\n")
+                self.boundary()
 
         def handle_data(self, data):
             if not self.suppressed:
+                if group_list_items and self.list_depth:
+                    data = re.sub(r"\s+", " ", data)
                 self.parts.append(data)
 
     parser = Text()
     parser.feed(str(value or "")[:65536])
-    lines = [" ".join(line.split()) for line in "".join(parser.parts).splitlines()]
+    return "".join(parser.parts)
+
+
+def plain_text(value, limit=600):
+    lines = [" ".join(line.split()) for line in _text_source(value).splitlines()]
     return "\n".join(line for line in lines if line)[:limit]
+
+
+def release_note_items(value):
+    """Bound HTML, Markdown or plain release notes to display-only text items.
+
+    Prefer the release's own bullets, without the download/checksum appendix.
+    A prose-only appcast description becomes one item per paragraph. Neither
+    markup nor links are handed to the page for HTML rendering.
+    """
+    if not isinstance(value, str):
+        return []
+    source = value[:RELEASE_NOTE_SOURCE_LIMIT]
+    # Retain heading boundaries through the HTML-to-text pass.
+    source = re.sub(r"<h[1-6]\b[^>]*>", "\n# ", source, flags=re.I)
+    # Loose HTML lists wrap each item's text in paragraphs. Keep those nested
+    # blocks together while preserving a boundary between top-level items.
+    text = _text_source(source, group_list_items=True)
+    bullets, paragraphs = [], []
+    current = paragraph = None
+    fenced = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        fence = re.match(r"^(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence[1][0]
+            if fenced is None:
+                fenced = marker
+            elif fenced == marker:
+                fenced = None
+            continue
+        if fenced or re.match(r"^\[[^]]+\]:", line):
+            continue
+        if not line:
+            current = paragraph = None
+            continue
+        heading = re.match(r"^#{1,6}\s+(.+?)\s*#*$", line)
+        if heading:
+            current = paragraph = None
+            if heading[1].strip().casefold() in {"downloads", "checksums", "assets", "installation"}:
+                break
+            continue
+        if re.fullmatch(r"[-*_]{3,}", line):
+            current = paragraph = None
+            continue
+        item = re.match(r"^(?:[-*+•‣]|\d+[.)])\s+(.+)$", line)
+        if item:
+            bullets.append(item[1])
+            current = len(bullets) - 1
+            paragraph = None
+        elif current is not None:
+            bullets[current] += " " + line
+        elif paragraph is not None:
+            paragraphs[paragraph] += " " + line
+        else:
+            paragraphs.append(line)
+            paragraph = len(paragraphs) - 1
+
+    def clean(item):
+        # Keep a Markdown link's label; never expose its target or an image URL.
+        destination = r"\((?:[^()\n]|\([^()\n]*\))*\)"
+        item = re.sub(r"!\[[^]]*\]" + destination, "", item)
+        item = re.sub(r"\[([^]]+)\]" + destination, r"\1", item)
+        item = re.sub(r"\[([^]]+)\]\[[^]]*\]", r"\1", item)
+        item = re.sub(r"^\[[ xX]\]\s*", "", item)
+        item = re.sub(r"(\*\*|__|~~|\*|_)(.+?)\1", r"\2", item)
+        item = item.replace("`", "")
+        item = re.sub(r"\\([\\*_{}\[\]()#+.!>\-])", r"\1", item)
+        item = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", item)
+        return " ".join(item.split())[:RELEASE_NOTE_ITEM_LIMIT]
+
+    result = []
+    for item in bullets or paragraphs:
+        item = clean(item)
+        if item:
+            result.append(item)
+        if len(result) == RELEASE_NOTE_LIMIT:
+            break
+    return result
+
+
+def _downloaded_note_items(download):
+    """Decode bounded SPUDownloadData bytes; invalid notes keep embedded notes."""
+    data = property_value(download, "data", download)
+    if isinstance(data, str):
+        return release_note_items(data)
+    try:
+        if len(data) > RELEASE_NOTE_SOURCE_LIMIT:
+            return []
+        raw = bytes(data)
+    except (TypeError, ValueError):
+        return []
+    encoding = property_value(download, "textEncodingName", "utf-8") or "utf-8"
+    try:
+        text = raw.decode(encoding, errors="replace")
+    except (LookupError, TypeError, UnicodeError):
+        text = raw.decode("utf-8", errors="replace")
+    return release_note_items(text)
 
 
 def property_value(obj, name, default=None):
@@ -169,6 +285,7 @@ class UpdateCardSession:
         self.retry_requested = False
         self.received = self.expected = 0
         self.release_url = None
+        self.release_notes = []
         self.phase = None
         self.was_card = False
 
@@ -249,7 +366,8 @@ class UpdateCardSession:
         self.actions = actions or {}
         self.model = {"state": state, "title": title, "message": message, "token": self.token,
                       "prompt": uuid.uuid4().hex, "actions": list(self.actions),
-                      "version": self.model.get("version", ""), **extra}
+                      "version": self.model.get("version", ""),
+                      "release_notes": list(self.release_notes), **extra}
         self._show()
 
     def _show(self):
@@ -296,14 +414,22 @@ class UpdateCardSession:
             version = plain_text(property_value(item, "displayVersionString", ""), 80)
             version_tag = str(property_value(item, "versionString", version))[:100]
             self.release_url = "https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/" + quote("v" + version_tag.removeprefix("v"), safe="")
-            installing = property_value(state, "stage", 0) == 2
             info_only = bool(property_value(item, "isInformationOnlyUpdate", False))
+            installing = property_value(state, "stage", 0) == 2 and not info_only
+            self.release_notes = release_note_items(property_value(item, "itemDescription", ""))
+            actions = {"later": (DISMISS,)} if info_only else (
+                {"install": (INSTALL,), "cancel": (SKIP,)} if installing
+                else {"later": (DISMISS,), "download": (INSTALL,)})
             self._set("ready" if installing else "available", "Ready to install " + version if installing else "Update available",
-                      "The update may install when you quit." if installing else plain_text(property_value(item, "itemDescription", "")),
-                      reply=reply, actions={"later": (DISMISS,), **({} if info_only else {"install" if installing else "download": (INSTALL,)})},
-                      version=version, notes=True, on_quit=installing)
+                      ("Cancel stops this installation and hides automatic reminders for this version. "
+                       "You can still use Check for Updates.") if installing else "",
+                      reply=reply, actions=actions, version=version, notes=True)
         elif selector == "showUpdateReleaseNotesWithDownloadData_":
-            pass  # embedded notes are sufficient; never render downloaded HTML
+            items = _downloaded_note_items(args[0])
+            if items and self.release_url is not None and self.model:
+                self.release_notes = items
+                self.model["release_notes"] = list(items)
+                self._show()
         elif selector == "showUpdateReleaseNotesFailedToDownloadWithError_":
             pass
         elif selector in ("showUpdateNotFoundWithError_acknowledgement_", "showUpdaterError_acknowledgement_"):
@@ -334,8 +460,7 @@ class UpdateCardSession:
             self._show()
         elif selector == "showReadyToInstallAndRelaunch_":
             self._set("ready", "Ready to install " + self.model.get("version", ""),
-                      "Install now to save your work and relaunch. Install on quit keeps the update for when you close the app.",
-                      reply=args[0], actions={"later": (DISMISS,), "install": (INSTALL,)}, on_quit=True)
+                      reply=args[0], actions={"install": (INSTALL,), "cancel": (SKIP,)})
         elif selector == "showInstallingUpdateWithApplicationTerminated_retryTerminatingApplication_":
             terminated, retry_termination = args
             self._set("waiting", "Waiting to install", "Saving your work and preparing to relaunch…",
@@ -367,8 +492,15 @@ class UpdateCardSession:
             return
         reply, values = self.pending, self.actions[action]
         self.actions = {}
+        self.model["actions"] = []
         if action == "retry":
             self.retry_requested = True
+        if action == "cancel" and self.model.get("state") == "ready":
+            # Ready's Skip cancels installation; Dismiss may install on quit.
+            # Close now so a focus event cannot revive an answered prompt while
+            # Sparkle asynchronously tears down its installation driver.
+            self.closed = True
+            self._clear_card(self.token)
         reply(*values)
 
     def page_closed(self, token=None):
@@ -402,6 +534,7 @@ class UpdateCardSession:
         self.token = self.mode = self.page_id = None
         self.events, self.actions, self.model = [], {}, {}
         self.pending, self.retry_requested, self.release_url = None, False, None
+        self.release_notes = []
         self.phase, self.was_card = None, False
         if retry:
             # Sparkle tears down its core driver after this callback returns.

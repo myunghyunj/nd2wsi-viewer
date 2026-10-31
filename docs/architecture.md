@@ -185,12 +185,15 @@ outstanding card choices safely. Explicit PyObjC block metadata preserves the
 Sparkle 2.9.6 argument signatures when forwarding to the standard driver.
 
 `static/update-card-v1.js`, its CSS and markup provide the six card states and
-plain-text notes. The shell's existing `nd2wsiUpdateNotice` routes export waits
-and close vetoes into an active card. Ready-state dismissal is labelled
-**Install on quit**, because Sparkle 2.9.6 permits installation after termination.
+plain-text bullet notes. The shell's existing `nd2wsiUpdateNotice` routes export
+waits and close vetoes into an active card. Ready offers **Install and relaunch**
+followed by **Cancel**. Cancel replies with Sparkle's `Skip` choice to stop the
+installation; `Dismiss` could still install on quit. A resumed installation
+also explains that Cancel suppresses automatic reminders for that version.
 A manual no-update result stays visible for five seconds before acknowledgment.
-Permission requests remain with the standard driver. Downloaded HTML release
-notes are ignored; embedded notes are stripped and capped at 600 characters.
+Permission requests remain with the standard driver. Embedded and downloaded
+release notes are stripped to at most eight plain-text items of 300 characters
+each, retained through download and extraction, and rendered as list items.
 The notes action opens the version's GitHub release page.
 
 The landing page embeds the same card for manual Windows checks, with Sparkle

@@ -153,8 +153,15 @@ def select_release_asset(releases, *, platform_name: str, machine: str,
                       "platform": platform_name, "architecture": architecture,
                       "download_architecture": download_arch, "emulated": emulated,
                       "channel": "beta" if beta else "rc" if rc else "stable"}
-            candidates.append((parsed, priority, name, result))
-    return max(candidates, key=lambda item: item[:3])[3] if candidates else None
+            candidates.append((parsed, priority, name, result, release.get("body")))
+    if not candidates:
+        return None
+    from .update_card import release_note_items
+
+    selected = max(candidates, key=lambda item: item[:3])
+    # The notes belong to this compatible offer, from the same bounded metadata
+    # request. Never substitute the installed version's notes or fetch a page.
+    return {**selected[3], "release_notes": release_note_items(selected[4])}
 
 
 def fetch_releases() -> list:

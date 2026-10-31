@@ -9,12 +9,13 @@
     const title = doc.getElementById("update-notice-title"), body = doc.getElementById("update-notice-body");
     const meter = doc.getElementById("update-notice-progress"), detail = doc.getElementById("update-notice-detail");
     const actions = doc.getElementById("update-notice-actions"), notes = doc.getElementById("update-notice-notes");
+    const changes = doc.getElementById("update-notice-changes");
     // getRandomValues is available on pywebview's about:blank landing page;
     // randomUUID is secure-context-only and is absent there on WKWebView.
     const identifier = () => Array.from(win.crypto.getRandomValues(new Uint8Array(16)),
       byte => byte.toString(16).padStart(2, "0")).join("");
     const pageId = identifier();
-    let model = null, busy = false;
+    let model = null, busy = false, renderedNotes = "";
     const bridge = () => win.pywebview?.api;
     const text = (value, max = 600) => typeof value === "string" ? value.slice(0, max) : "";
     const number = value => Number.isFinite(value) && value > 0 ? value : 0;
@@ -40,7 +41,7 @@
           model.actions = []; model.consumed = true;
         }
       } catch (error) {
-        if (samePrompt()) body.textContent = text(error.message);
+        if (samePrompt()) { body.textContent = text(error.message); body.hidden = false; }
       } finally {
         if (samePrompt()) { busy = false; renderActions(); }
       }
@@ -48,21 +49,41 @@
     function renderActions() {
       actions.replaceChildren();
       if (!model) return;
-      const labels = { later: model.on_quit ? "Install on quit" : "Later", download: model.manual ? "Open download" : "Download",
+      const labels = { later: "Later", download: model.manual ? "Open download" : "Download",
         install: "Install and relaunch", cancel: "Cancel", close: "Close", retry: "Try again" };
-      for (const action of model.actions || []) {
+      const offered = Array.isArray(model.actions) ? model.actions : [];
+      const ordered = model.state === "ready"
+        ? ["install", "cancel", ...offered.filter(action => !["install", "cancel"].includes(action))].filter(action => offered.includes(action))
+        : offered;
+      for (const action of ordered) {
         if (!labels[action]) continue;
         const button = doc.createElement("button"); button.type = "button";
-        button.textContent = labels[action]; button.disabled = busy;
+        button.textContent = labels[action]; button.disabled = busy; button.dataset.action = action;
         if (["download", "install", "retry"].includes(action)) button.className = "update-primary";
         button.addEventListener("click", () => act(action)); actions.appendChild(button);
       }
       notes.disabled = busy;
     }
+    function renderChanges() {
+      const items = (Array.isArray(model.release_notes) ? model.release_notes : [])
+        .filter(value => typeof value === "string").map(value => value.trim().slice(0, 300)).filter(Boolean).slice(0, 8);
+      const key = JSON.stringify(items);
+      if (key !== renderedNotes) {
+        changes.replaceChildren();
+        for (const value of items) {
+          const item = doc.createElement("li"); item.textContent = value; changes.appendChild(item);
+        }
+        renderedNotes = key;
+      }
+      changes.hidden = !items.length;
+    }
     function render() {
       if (!model) return;
+      element.dataset.state = model.state;
       title.textContent = text(model.title, 100);
       body.textContent = (model.state === "available" && model.version ? "nd2wsi-viewer " + text(model.version, 80) + ". " : "") + text(model.message);
+      body.hidden = !body.textContent;
+      renderChanges();
       notes.hidden = !model.notes;
       const downloading = model.state === "downloading";
       const fraction = downloading ? (number(model.total) ? number(model.received) / number(model.total) : null) : model.progress;
@@ -91,6 +112,7 @@
         state: available ? "available" : result?.ok ? "up_to_date" : "error",
         title: available ? "Update available" : result?.ok ? "No update available" : "Could not check for updates",
         version: result?.version, message: result?.message || "Please try again.", notes: available,
+        release_notes: available ? result.release_notes : [],
         actions: available ? ["later", "download"] : result?.ok ? [] : ["close", "retry"] });
       if (result?.ok && !available) win.setTimeout(() => dismiss(token), 5000);
       return shown;

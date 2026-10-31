@@ -153,7 +153,7 @@ def _start_session_log(mode: str) -> Path | None:
     return started
 
 BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
-  html,body{height:100%;margin:0;background:#000;color:rgba(255,255,255,.85);
+  html,body{height:100%;margin:0;background:var(--canvas);color:var(--label);
     font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display",sans-serif;
     -webkit-font-smoothing:antialiased;cursor:default;-webkit-user-select:none}
   #drop{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
@@ -163,26 +163,26 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
     box-shadow:inset 0 1px 0 rgba(255,255,255,.35)}
   .pyr .l1{width:26px;background:#7cc0ff}.pyr .l2{width:44px;background:#3fa0ff}
   .pyr .l3{width:62px;background:#0a84ff}
-  h1{font-size:15px;font-weight:600;margin:0;color:rgba(255,255,255,.85)}
-  .sub{color:rgba(255,255,255,.35);font-size:13px;margin-top:7px}
-  .sub b{color:rgba(255,255,255,.55);font-weight:600}
-  #status{margin-top:26px;font-size:12px;color:rgba(255,255,255,.4);min-height:16px;
+  h1{font-size:15px;font-weight:600;margin:0;color:var(--label)}
+  .sub{color:var(--label-3);font-size:13px;margin-top:7px}
+  .sub b{color:var(--label-2);font-weight:600}
+  #status{margin-top:26px;font-size:12px;color:var(--label-2);min-height:16px;
     font-family:ui-monospace,"SF Mono",Menlo,monospace}
   #bar{width:180px;height:4px;border-radius:2px;margin:10px auto 0;
-    background:rgba(255,255,255,.12);overflow:hidden;display:none}
+    background:var(--material-control-active);overflow:hidden;display:none}
   #fill{display:block;height:100%;width:0%;border-radius:2px;background:#b08900;
     transition:width .25s ease}
   #fill.indet{width:40%;transition:none;
     animation:indet 1.1s ease-in-out infinite alternate}
   @keyframes indet{from{margin-left:0}to{margin-left:60%}}
-  #pct{margin-top:7px;font-size:12px;color:rgba(255,255,255,.5);min-height:14px;
+  #pct{margin-top:7px;font-size:12px;color:var(--label-2);min-height:14px;
     font-family:ui-monospace,"SF Mono",Menlo,monospace}
   #drop.over::after{content:"";position:fixed;inset:14px;border-radius:16px;
     border:2px dashed rgba(10,132,255,.9);background:rgba(10,132,255,.06)}
   #update{position:fixed;right:12px;bottom:10px;height:28px;padding:0 11px;
-    border:0;border-radius:7px;background:transparent;color:rgba(255,255,255,.42);
+    border:0;border-radius:7px;background:transparent;color:var(--label-2);
     font:12px -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
-  #update:hover{background:rgba(255,255,255,.07);color:rgba(255,255,255,.78)}
+  #update:hover{background:var(--material-control);color:var(--label)}
   #update:disabled{opacity:.45}
 </style></head><body>
 <div id="drop"><div class="card">
@@ -274,7 +274,12 @@ BOOT_HTML = BOOT_HTML.replace(
 # The landing page uses the same manual card, but its readiness flag stays false
 # so automatic macOS checks always fall back to the standard Sparkle driver.
 _UPDATE_STATIC = Path(__file__).parent / "static"
-BOOT_HTML = BOOT_HTML.replace("</head>", "<style>" + (_UPDATE_STATIC / "update-card-v1.css").read_text(encoding="utf-8") + "</style></head>")
+BOOT_HTML = BOOT_HTML.replace(
+    "</head>", "<style>" + "\n".join(
+        (_UPDATE_STATIC / name).read_text(encoding="utf-8")
+        for name in ("materials-v1.css", "update-card-v1.css")
+    ) + "</style></head>",
+)
 BOOT_HTML = BOOT_HTML.replace("</body>", (_UPDATE_STATIC / "update-card.html").read_text(encoding="utf-8") +
                              "<script>" + (_UPDATE_STATIC / "update-card-v1.js").read_text(encoding="utf-8") + "</script></body>")
 
@@ -2304,7 +2309,7 @@ def create_app_window(initial: Path | None, window_session=None):
         width=1280,
         height=860,
         min_size=(760, 520),
-        background_color="#161618",
+        background_color="#191919",
         # frameless makes pywebview create the NSWindow with
         # FullSizeContentView from birth — the only point where WebKit
         # decides whether the page composites under the title bar. The

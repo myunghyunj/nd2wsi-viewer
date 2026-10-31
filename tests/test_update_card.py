@@ -48,11 +48,11 @@ def h():
         while main:
             main.popleft()()
 
-    def found(stage=0, info=False):
+    def found(stage=0, info=False, description="<b>Fixes</b><script>bad()</script>", version="2.5.6"):
         item = SimpleNamespace(
-            displayVersionString=lambda: "2.5.6",
-            versionString=lambda: "2.5.6",
-            itemDescription=lambda: "<b>Fixes</b><script>bad()</script>",
+            displayVersionString=lambda: version,
+            versionString=lambda: version,
+            itemDescription=lambda: description,
             isInformationOnlyUpdate=lambda: info,
         )
         session.dispatch(
@@ -76,7 +76,8 @@ def test_first_callback_probes_once_and_queues_subsequent_selectors(h):
     h.session.dispatch("showUserInitiatedUpdateCheckWithCancellation_", h.block)
     h.found()  # settles the first probe, replays check then found
     assert h.session.mode == "card" and h.session.model["state"] == "available"
-    assert h.session.model["message"] == "Fixes"
+    assert h.session.model["message"] == ""
+    assert h.session.model["release_notes"] == ["Fixes"]
     assert h.received == []  # checking cancellation was retired, not called
     assert sum("ready===true" in c for c in h.channel.calls) == 1
     h.action("notes")
@@ -93,20 +94,31 @@ def test_first_callback_probes_once_and_queues_subsequent_selectors(h):
     assert h.received == [(card.INSTALL,)]
 
 
-def test_ready_later_means_install_on_quit_and_late_prompt_cannot_answer_it(h):
+def test_ready_cancel_cancels_installation_and_stale_prompt_cannot_answer_it(h):
     h.found()
     old = dict(h.session.model)
     h.action("download")
     h.drain()
     h.session.dispatch("showReadyToInstallAndRelaunch_", h.block)
-    assert h.session.model["on_quit"] is True
+    assert h.session.model["actions"] == ["install", "cancel"]
+    assert h.session.model["message"] == ""
+    assert "on_quit" not in h.session.model
     h.session.action({"token": old["token"], "prompt": old["prompt"], "action": "later"})
     h.drain()
     assert h.received == [(card.INSTALL,)]
-    h.action("later")
+    h.action("later")  # the removed Install on quit action is not accepted
     h.drain()
+    assert h.received == [(card.INSTALL,)]
+    h.action("cancel")
+    h.action("cancel")
+    h.drain()
+    assert h.session.closed and h.session.model["actions"] == []
+    assert any("dismiss" in script and h.session.token in script for script in h.channel.calls)
+    calls = len(h.channel.calls)
+    h.session.dispatch("showUpdateInFocus")
+    assert len(h.channel.calls) == calls  # focus cannot revive a cancelled card
     h.session.dismiss()
-    assert h.received == [(card.INSTALL,), (card.DISMISS,)]
+    assert h.received == [(card.INSTALL,), (card.SKIP,)]
 
 
 def test_download_progress_extraction_ready_and_install_callbacks(h):
@@ -503,3 +515,192 @@ def test_refused_quit_offers_install_retry_but_close_does_not_trigger_it(h):
 def test_block_notes_keep_heading_bullets_and_inline_spacing():
     text = card.plain_text("<h2>Changes</h2><ul><li>Fixed <b>save</b> errors</li><li>Faster tiles</li></ul><p>Thanks</p>")
     assert text == "Changes\n• Fixed save errors\n• Faster tiles\nThanks"
+
+
+def test_release_bullets_survive_download_extract_and_ready(h):
+    notes = ["Save fixes & recovery", "Faster tile display"]
+    h.found(description="<ul><li>Save <b>fixes</b> &amp; recovery</li><li>Faster tile display</li></ul>")
+    assert h.session.model["release_notes"] == notes
+    h.action("download")
+    h.drain()
+    for selector, args in [
+        ("showDownloadInitiatedWithCancellation_", (h.block,)),
+        ("showDownloadDidReceiveExpectedContentLength_", (100,)),
+        ("showDownloadDidReceiveDataOfLength_", (40,)),
+        ("showDownloadDidStartExtractingUpdate", ()),
+        ("showExtractionReceivedProgress_", (.5,)),
+        ("showReadyToInstallAndRelaunch_", (h.block,)),
+        ("showUpdateInFocus", ()),
+    ]:
+        h.session.dispatch(selector, *args)
+        assert h.session.model["release_notes"] == notes, selector
+    assert h.session.model["actions"] == ["install", "cancel"]
+    assert h.session.model["message"] == ""
+    # The list sent to the page is JSON text, never HTML.
+    assert '"release_notes": ["Save fixes & recovery", "Faster tile display"]' in h.channel.calls[-1]
+
+
+def test_notes_reset_when_a_new_update_or_session_replaces_the_old_one(h):
+    h.found(description="<ul><li>Old notes</li></ul>")
+    h.found(description="", version="2.5.7")
+    assert h.session.model["release_notes"] == []
+    assert h.session.model["version"] == "2.5.7"
+    h.found(description="<p>New notes</p>")
+    h.session.dismiss()
+    assert h.session.release_notes == [] and h.session.model == {}
+    h.session.dispatch("showUserInitiatedUpdateCheckWithCancellation_", h.block)
+    h.channel.probe("page-2")
+    assert h.session.model["release_notes"] == []
+
+
+def test_downloaded_sparkle_notes_are_decoded_sanitized_and_retained(h):
+    h.found(description="<p>Embedded summary</p>")
+    download = SimpleNamespace(
+        data=lambda: "<h2>Changes</h2><ul><li>수정 &amp; recovery</li><li><a href='javascript:bad()'>Fast</a> tiles</li></ul><script>bad()</script>".encode(),
+        textEncodingName=lambda: "utf-8",
+    )
+    h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", download)
+    notes = ["수정 & recovery", "Fast tiles"]
+    assert h.session.model["release_notes"] == notes
+    h.session.dispatch("showUpdateReleaseNotesFailedToDownloadWithError_", RuntimeError("offline"))
+    assert h.session.model["release_notes"] == notes
+    h.action("download")
+    h.drain()
+    h.session.dispatch("showReadyToInstallAndRelaunch_", h.block)
+    assert h.session.model["release_notes"] == notes
+
+
+@pytest.mark.parametrize("data", [None, 1234, b"<script>bad()</script>", b"x" * 65537])
+def test_invalid_or_empty_downloaded_notes_preserve_embedded_notes(h, data):
+    h.found(description="<ul><li>Embedded change</li></ul>")
+    h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", SimpleNamespace(data=lambda: data))
+    assert h.session.model["release_notes"] == ["Embedded change"]
+
+
+def test_downloaded_notes_support_reported_charset_without_rendering_markup(h):
+    h.found()
+    h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", SimpleNamespace(
+        data=lambda: b"<ul><li>R\xe9parations</li></ul>", textEncodingName=lambda: "windows-1252"))
+    assert h.session.model["release_notes"] == ["Réparations"]
+    h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", SimpleNamespace(
+        data=lambda: b"<ul><li>Fallback</li></ul>", textEncodingName=lambda: "not-a-charset"))
+    assert h.session.model["release_notes"] == ["Fallback"]
+
+
+def test_resumed_installing_cancel_discloses_reminder_effect_and_cancels_once(h):
+    h.found(stage=2, description="- A real change")
+    assert h.session.model["state"] == "ready"
+    assert h.session.model["actions"] == ["install", "cancel"]
+    assert h.session.model["message"] == (
+        "Cancel stops this installation and hides automatic reminders for this version. "
+        "You can still use Check for Updates."
+    )
+    assert h.session.model["release_notes"] == ["A real change"]
+    h.action("cancel")
+    h.action("install")
+    h.drain()
+    assert h.received == [(card.SKIP,)]
+    assert h.session.closed
+    h.session.dismiss()
+    h.found()
+    assert not h.session.closed and h.session.model["state"] == "available"
+
+
+@pytest.mark.parametrize("stage", [0, 1, 2])
+def test_information_only_update_never_gets_ready_install_or_cancel_actions(h, stage):
+    h.found(stage=stage, info=True, description="<ul><li>Important notice</li></ul>")
+    assert h.session.model["state"] == "available"
+    assert h.session.model["title"] == "Update available"
+    assert h.session.model["actions"] == ["later"]
+    assert h.session.model["release_notes"] == ["Important notice"]
+    h.action("install")
+    h.action("cancel")
+    h.drain()
+    assert not h.received
+
+
+def test_queued_ready_cancel_cannot_cancel_the_next_prompt_or_session(h):
+    h.found()
+    h.session.dispatch("showReadyToInstallAndRelaunch_", h.block)
+    old = {"token": h.session.token, "prompt": h.session.model["prompt"], "action": "cancel"}
+    h.session.action(old)
+    h.session.dispatch("showReadyToInstallAndRelaunch_", h.block)
+    h.drain()
+    assert not h.received and not h.session.closed
+    h.session.dismiss()
+    h.found(stage=2)
+    h.session.action(old)
+    h.drain()
+    assert not h.received and not h.session.closed
+    h.action("cancel")
+    h.drain()
+    assert h.received == [(card.SKIP,)]
+
+
+@pytest.mark.parametrize("value", [None, 12, {}, [], b"notes"])
+def test_release_note_items_reject_non_text(value):
+    assert card.release_note_items(value) == []
+
+
+def test_release_note_items_parse_markdown_bullets_and_omit_download_appendix():
+    assert card.release_note_items("""# Viewer 2.5.6
+
+Introductory prose.
+
+- **Save fixes** with [details](https://example.test/notes).
+  Continued explanation.
+* `Faster` tiles and _clearer_ panels.
+3. [x] Better keyboard support.
+
+## Downloads
+- The executable
+""") == [
+        "Save fixes with details. Continued explanation.",
+        "Faster tiles and clearer panels.",
+        "Better keyboard support.",
+    ]
+    assert card.release_note_items("- A [linked](https://example.test/path_(x)) note") == ["A linked note"]
+
+
+def test_release_note_items_sanitize_html_and_keep_only_actual_list_text():
+    assert card.release_note_items("""<h1>Release</h1><p>Introduction</p>
+<ul><li>Fixed <b>save</b> &amp; retry</li><li><img src=x onerror='bad()'>Fast <a href='javascript:bad()'>tiles</a></li></ul>
+<script>bad()</script><style>bad</style><p>Thanks</p><h2>Checksums</h2><ul><li>Hash</li></ul>""") == [
+        "Fixed save & retry", "Fast tiles",
+    ]
+
+
+@pytest.mark.parametrize("source, expected", [
+    (
+        "<ul><li><p>First change.</p></li><li><p>Second change.</p></li></ul>",
+        ["First change.", "Second change."],
+    ),
+    (
+        "<ul><li>First change.</li><li><p>Second change.</p></li></ul>",
+        ["First change.", "Second change."],
+    ),
+    (
+        """<ul><li>
+          <div><p>First <b>change</b>.</p><p>More detail.</p></div>
+          <p>Last detail.<br>Still the first change.</p>
+        </li><li><p>Second &amp; final change.</p><script>bad()</script></li></ul>""",
+        ["First change. More detail. Last detail. Still the first change.", "Second & final change."],
+    ),
+    (
+        "<ul><li>First change.<ul><li>Nested detail.</li></ul>Final detail.</li><li>Second change.</li></ul>",
+        ["First change. Nested detail. Final detail.", "Second change."],
+    ),
+], ids=["loose", "mixed", "nested-paragraphs", "nested-list"])
+def test_release_note_items_preserve_html_list_item_groups(source, expected):
+    assert card.release_note_items(source) == expected
+
+
+def test_release_note_items_plain_paragraph_fallback_and_code_are_bounded():
+    assert card.release_note_items("<p>One change.</p><p>Another change.</p>") == ["One change.", "Another change."]
+    assert card.release_note_items("# Release\n```js\n- not a release bullet\n```\n- Kept") == ["Kept"]
+    result = card.release_note_items("\n".join("- " + str(i) + "x" * 900 for i in range(20)))
+    assert len(result) == 8
+    assert all(len(item) == 300 for item in result)
+    assert [item[0] for item in result] == list("01234567")
+    assert card.release_note_items("\x00\x01plain\x7f") == ["plain"]
+    assert card.release_note_items("<script>" + "x" * 65536 + "</script>- Not read") == []

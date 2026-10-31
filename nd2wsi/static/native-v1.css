@@ -1,89 +1,65 @@
 /* v1 surface pass. The base sheet keeps layout and behavior; this file narrows
    the visual language to macOS materials, restrained shadows, and clear state. */
 
-:root {
-  color-scheme: dark;
-  --material: rgba(30, 30, 32, 0.76);
-  --material-strong: rgba(27, 27, 29, 0.84);
-  --window-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.11),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.035),
-    0 0 0 0.5px rgba(255, 255, 255, 0.11),
-    0 1px 3px rgba(0, 0, 0, 0.24),
-    0 8px 15px rgba(0, 0, 0, 0.075);
-}
-
-:root.light {
-  color-scheme: light;
-  --material: rgba(248, 248, 250, 0.91);
-  --material-strong: rgba(244, 244, 246, 0.94);
-  --window-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.92),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.025),
-    0 0 0 0.5px rgba(0, 0, 0, 0.12),
-    0 1px 3px rgba(0, 0, 0, 0.10),
-    0 8px 15px rgba(0, 0, 0, 0.055);
-}
-
 #toolbar {
   height: 42px;
   padding: 0 13px;
   gap: 8px;
   border-bottom: 0;
-  background: var(--material-strong);
-  -webkit-backdrop-filter: blur(24px) saturate(165%);
-  backdrop-filter: blur(24px) saturate(165%);
+  background: var(--material-bar);
   box-shadow: inset 0 -0.5px 0 var(--hairline);
+  -webkit-backdrop-filter: var(--material-bar-filter);
+  backdrop-filter: var(--material-bar-filter);
 }
 
-.tb-group { gap: 8px; }
+.tb-group { gap: var(--control-gap); }
 
-.app-mark,
-.meta-badge {
+.app-mark {
   display: inline-flex;
   align-items: center;
   min-height: 20px;
   padding: 0 7px;
-  border-radius: 999px;
+  border-radius: var(--control-radius-small);
   font-size: 10px;
   font-weight: 650;
   color: var(--label-2);
-  background: rgba(255, 255, 255, 0.075);
-  box-shadow:
-    inset 0 0.5px 0 rgba(255, 255, 255, 0.14),
-    0 0 0 0.5px rgba(0, 0, 0, 0.22);
+  background: var(--material-control);
+  box-shadow: none;
 }
 
-:root.light .app-mark,
-:root.light .meta-badge {
-  background: rgba(0, 0, 0, 0.055);
-  box-shadow:
-    inset 0 0.5px 0 rgba(255, 255, 255, 0.75),
-    0 0 0 0.5px rgba(0, 0, 0, 0.10);
+:root.light .app-mark {
+  background: var(--material-control);
+  box-shadow: none;
 }
 
-.meta-badge { font-weight: 500; letter-spacing: 0; text-transform: none; }
-.meta-badge[data-state="warning"] { color: #ffd60a; }
-.meta-badge[data-state="ok"] { color: #30d158; }
+.meta-badge {
+  display: inline-flex; align-items: center;
+  padding: 0; border: 0; border-radius: 0;
+  font-size: 10px; font-weight: 400; letter-spacing: 0; text-transform: none;
+  color: var(--label-2); background: transparent; box-shadow: none;
+}
+.meta-badge[hidden] { display: none; }
+.meta-badge[data-state="warning"] { color: var(--save-warn); }
+.meta-badge[data-state="ok"] { color: var(--label-2); }
 
 #file-name { font-weight: 600; }
 #file-dims { opacity: 0.9; }
 
 .tb-btn {
-  min-height: 27px;
-  border-radius: 7px;
+  height: var(--control-height); min-height: var(--control-height);
+  border-radius: var(--control-radius);
   padding: 0 9px;
   gap: 6px;
 }
 
-.tb-btn:hover { background: rgba(255, 255, 255, 0.075); }
-.tb-btn.active { background: rgba(255, 255, 255, 0.105); }
+.tb-btn:hover { background: var(--material-control); }
+.tb-btn.active { background: var(--material-control-hover); }
 
 .icon-credit { margin: 12px 0 0; font-size: 11px; color: var(--label-2); }
 .icon-credit a { color: inherit; }
 .tb-icon-only { width: 29px; padding: 0; justify-content: center; }
-:root.light .tb-btn:hover { background: rgba(0, 0, 0, 0.05); }
-:root.light .tb-btn.active { background: rgba(0, 0, 0, 0.085); }
+:root.light .tb-btn:hover { background: var(--material-control); }
+:root.light .tb-btn.active { background: var(--material-control-hover); }
 
 .tb-ico {
   display: inline-flex;
@@ -119,10 +95,11 @@
 }
 
 .mac-window {
-  border-radius: 13px;
-  background: var(--material);
-  -webkit-backdrop-filter: blur(24px) saturate(165%);
-  backdrop-filter: blur(24px) saturate(165%);
+  border-radius: var(--panel-radius);
+  background: var(--material-panel);
+  -webkit-backdrop-filter: var(--material-panel-filter);
+  backdrop-filter: var(--material-panel-filter);
+  box-shadow: var(--material-panel-shadow);
 }
 
 .win-titlebar { height: 31px; padding: 0 11px; }
@@ -132,38 +109,14 @@
 .mac-window:not(.focused) { filter: saturate(0.92); }
 .mac-window:not(.focused) .tl { opacity: 0.72; }
 
-.btn {
-  min-height: 25px;
-  padding: 3px 12px;
-  background:
-    linear-gradient(rgba(248, 248, 248, 0.065), rgba(248, 248, 248, 0.018)),
-    rgba(74, 74, 78, 0.48);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.15),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.035),
-    0 0 0 0.5px rgba(0, 0, 0, 0.30),
-    0 1px 2px rgba(0, 0, 0, 0.16);
-}
-.btn:hover { filter: brightness(1.08); }
-.btn:active { transform: translateY(0.5px); filter: brightness(0.94); }
-.btn:disabled { opacity: 0.34; }
-
-:root.light .btn {
-  background: linear-gradient(rgba(255,255,255,.94), rgba(239,239,242,.94));
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,.95),
-    inset 0 -1px 0 rgba(0,0,0,.025),
-    0 0 0 .5px rgba(0,0,0,.14),
-    0 1px 2px rgba(0,0,0,.08);
-}
-
 #zoom-cluster {
   right: 13px;
   bottom: 13px;
   border-radius: 10px;
-  background: var(--material);
-  -webkit-backdrop-filter: blur(24px) saturate(165%);
-  backdrop-filter: blur(24px) saturate(165%);
+  background: var(--material-hud);
+  -webkit-backdrop-filter: var(--material-hud-filter);
+  backdrop-filter: var(--material-hud-filter);
+  box-shadow: var(--material-hud-shadow);
 }
 .zc-btn { width: 32px; height: 30px; }
 
@@ -171,23 +124,20 @@
   height: 27px;
   gap: 14px;
   padding: 0 12px;
-  background: var(--material-strong);
-  -webkit-backdrop-filter: blur(24px) saturate(165%);
-  backdrop-filter: blur(24px) saturate(165%);
+  background: var(--material-bar);
+  -webkit-backdrop-filter: var(--material-bar-filter);
+  backdrop-filter: var(--material-bar-filter);
 }
 
 #ann-editor {
-  border-radius: 13px;
-  background: var(--material-strong);
-  -webkit-backdrop-filter: blur(24px) saturate(165%);
-  backdrop-filter: blur(24px) saturate(165%);
+  border-radius: var(--panel-radius);
+  background: var(--material-popover);
+  -webkit-backdrop-filter: var(--material-popover-filter);
+  backdrop-filter: var(--material-popover-filter);
+  box-shadow: var(--material-popover-shadow);
 }
 
-#toast { box-shadow: var(--window-shadow); }
-
-@media (max-width: 1040px) {
-  #storage-badge, #calibration-badge { display: none; }
-}
+#toast { box-shadow: var(--material-toast-shadow); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -243,15 +193,21 @@
 }
 
 @media (max-width: 860px) {
-  #file-dims { display: none; }
   .tb-btn > span:last-child:not(:first-child) { display: none; }
   .tb-btn { width: 28px; padding: 0; justify-content: center; }
+  #statusbar { gap: 10px; }
+}
+
+@media (max-width: 620px) {
+  #toolbar { gap: 5px; padding: 0 8px; }
+  #file-dims { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .tb-spacer { flex-basis: 0; }
 }
 
 @media (prefers-contrast: more) {
   :root {
     --hairline: rgba(255, 255, 255, 0.24);
-    --label-2: rgba(255, 255, 255, 0.74);
+    --label-2: rgba(255, 255, 255, 0.90);
   }
   :root.light {
     --hairline: rgba(0, 0, 0, 0.24);

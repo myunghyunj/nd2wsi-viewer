@@ -20,7 +20,8 @@
 
 ## Latest update
 
-- **Update card:** updates appear in a translucent card at the bottom right, with download progress and **Install and relaunch** or **Install on quit**.
+- **Theme:** dark `#191919` and light `#FFFFFF` backgrounds, with consistent translucent surfaces and a quieter status bar. Hover over the checkmark for auto-save, cache and calibration details.
+- **Update card:** updates appear in a translucent card at the bottom right, with bullet-point release notes, download progress, and **Install and relaunch** or **Cancel**.
 - **Windows 11:** the Windows build lists Windows 11 (x64, and ARM64 through x64 emulation) as its supported target.
 
 <p align="center">
