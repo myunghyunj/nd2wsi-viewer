@@ -72,7 +72,7 @@
     wrap.className = "lut";
     const canvas = document.createElement("canvas");
     canvas.className = "lut-canvas";
-    canvas.title = "Scroll to zoom at the pointer; scroll sideways or drag empty space to pan. Double-click for full range. Drag triangles or the round handle to adjust contrast.";
+    canvas.title = "Scroll to zoom at the pointer; scroll sideways or drag empty space to pan. Double-click for full range. Drag triangles or the round handle to adjust contrast; Shift-drag adjusts all channels.";
     const ctx = canvas.getContext("2d");
     wrap.append(canvas);
 

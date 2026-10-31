@@ -4,7 +4,8 @@ Updates now appear in a translucent card at the bottom right of the viewer, in t
 same style as its other panels, instead of a separate white window. Displayed and
 exported pixel values, and stored annotation, correction and LUT formats, are unchanged.
 
-- **Update card on macOS.** A found update, download progress, the wait for exports or annotation saves, an update ready to install, errors and "up to date" are shown in one card at the bottom right. A ready update offers **Install and relaunch**, or **Install on quit** to install when you close the viewer. Release notes in the card link to the GitHub release. Where the card cannot be shown, for example on the start page, the standard update window appears as before, and a download that is already running continues there.
+- **Theme.** Dark `#191919` and light `#FFFFFF` backgrounds share consistent translucent surfaces. The toolbar and status bar show essential image details. Hover over the checkmark for auto-save, cache and calibration details; orange indicates a problem.
+- **Update card on macOS.** Updates appear in one card with bullet-point release notes and download progress. When ready, **Install and relaunch** is on the left and **Cancel** is on the right. The card also shows save/export waits and errors. The standard Sparkle window remains the fallback.
 - **Update check on Windows.** The start page's update check uses the same card and opens the download for this PC's build in your browser.
 - **Windows support.** The Windows build lists Windows 11 (x64, and ARM64 through x64 emulation) as its supported target; Windows 10 is not tested.
 

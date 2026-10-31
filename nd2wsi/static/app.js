@@ -242,9 +242,6 @@ async function init() {
 
   document.title = info.name + " — nd2wsi-viewer";
   $("file-name").textContent = info.name;
-  $("file-dims").textContent =
-    fmtInt(info.width) + " × " + fmtInt(info.height) + " px · " + info.dtype +
-    (info.rgb ? " · RGB" : " · " + info.channels.length + " ch");
   fillContextBadges(info);
   $("plane-note").textContent = planeNote(info);
 
@@ -470,7 +467,11 @@ function kindMark(info) {
 function fillContextBadges(info) {
   // the app mark names the kind of file; the details live in Slide Info
   $("source-badge").textContent = kindMark(info);
-  $("file-dims").hidden = info.kind === "plate";
+  const dimensions = $("file-dims");
+  dimensions.textContent = fmtInt(info.width) + " × " + fmtInt(info.height) +
+    " px · " + info.channels.length + " ch";
+  dimensions.hidden = false;
+  dimensions.title = (info.kind === "plate" ? "Dimensions of each site: " : "") + dimensions.textContent;
 
   const storage = $("storage-badge");
   const storageLabels = {
@@ -481,6 +482,8 @@ function fillContextBadges(info) {
   };
   storage.textContent = storageLabels[info.storage] || "";
   storage.hidden = !storage.textContent;
+  const storageRow = storage.closest?.(".status-detail");
+  if (storageRow) storageRow.hidden = storage.hidden;
   storage.dataset.state = info.storage === "overview-degraded" ? "warning" : "";
   storage.title = info.storage === "compact"
     ? "Native pixels come from the ND2; reduced levels live in the cache"
@@ -496,6 +499,7 @@ function fillContextBadges(info) {
   calibration.title = info.calibrated
     ? "Physical measurements use calibration stored in the source"
     : "No physical calibration was found";
+  if (state.saveStatus) renderSaveStatus(state.saveStatus.current());
 }
 
 function planeNote(info) {
@@ -868,17 +872,7 @@ function buildChannelPanel() {
     list.append(row);
     list.append(buildLutRow(i, ch, win));
   });
-  if (info.channels.length > 1) {
-    const hint = document.createElement("div");
-    hint.className = "hint";
-    hint.textContent = "Shift-drag adjusts all channels.";
-    list.append(hint);
-  }
   loadHistograms();
-  const hint = document.createElement("div");
-  hint.className = "hint";
-  hint.textContent = "Scroll to zoom · Drag to pan · Double-click for full range";
-  list.append(hint);
 }
 
 function wireLutToolbar() {
@@ -1291,8 +1285,7 @@ function updateReadout({ scalebar = true } = {}) {
     return;
   }
   const dz = deviceZoom();
-  setText($("zoom-val"),
-    (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %" + (Math.abs(dz - 1) < 0.005 ? " · 1:1" : ""));
+  setText($("zoom-val"), (dz * 100).toFixed(dz >= 0.1 ? 0 : 1) + " %");
   const act = activeLevel();
   state.info.levels.forEach((lv, k) => {
     $("lamp-" + lv.path).classList.toggle("active", k === act);
@@ -1374,21 +1367,15 @@ function renderPixelInspector() {
     return;
   }
 
-  const coords = fmtInt(cursor.x) + " , " + fmtInt(cursor.y) + " px";
+  const coords = fmtInt(cursor.x) + " , " + fmtInt(cursor.y);
   const parts = pixelValueParts(result);
-  let summary = coords;
-  if (parts.length) {
-    summary += " · " + parts.map((p) => p.name + " " + p.value).join(" · ");
-  } else {
-    summary += state.pixel.failed ? " · values –" : " · …";
-  }
-  $("pos-px").textContent = summary;
-  $("pos-px").title = summary;
+  $("pos-px").textContent = coords;
+  $("pos-px").title = coords;
 
   hud.hidden = !state.pixel.hudVisible;
   if (!state.pixel.hudVisible) return;
 
-  $("pixel-hud-coord").textContent = coords;
+  $("pixel-hud-coord").textContent = coords + " px";
   const um = result && Array.isArray(result.um) ? result.um : null;
   const ps = pixelSize();
   $("pixel-hud-stage").textContent = um
@@ -2428,10 +2415,12 @@ function setAnnStatus(msg) {
 
 const AUTO_SAVE_RETRY_MS = 60000; // the user allowed a once-a-minute safety retry
 const SAVE_STATUS_HOVER_MS = 600;
+const SAVE_STATUS_CLOSE_MS = 180;
 // The icon's accessible name follows the tracker state only; the per-second
 // "N s ago" count lives in the tooltip, so assistive technology is not told
 // about every tick for a minute after each save.
 const SAVE_STATUS_LABELS = {
+  idle: "Auto-save: no changes to save",
   saved: "Auto-save: saved",
   saving: "Auto-save: saving",
   dirty: "Auto-save: unsaved changes",
@@ -2486,8 +2475,24 @@ function flushAutoSaveOnPagehide() {
   if (lut && lut.isDirty()) lut.flush({ keepalive: true }).catch(() => {});
 }
 
+function saveStatusPresentation(status = {}) {
+  const info = state.info;
+  return {
+    ...status,
+    state: status.state || "idle",
+    text: status.text || "No changes to save",
+    visible: !!info || !!status.visible || !!status.details,
+    // Tracker details describe unavailable persistence or edits that cannot
+    // yet be saved. Storage and scale warnings also need an inspectable home
+    // before the user makes a first edit; none of these implies a save time.
+    warning: ["failed", "conflict", "invalid", "unavailable"].includes(status.state) ||
+      !!status.details || !!(info && (!info.calibrated || info.storage === "overview-degraded")),
+  };
+}
+
 function saveStatusTooltipText(status) {
-  return status.details ? status.text + "\n" + status.details : status.text;
+  const text = status.text || "No changes to save";
+  return status.details ? text + "\n" + status.details : text;
 }
 
 // The tracker calls this when its state or text changes (every second while a
@@ -2497,70 +2502,151 @@ function saveStatusTooltipText(status) {
 function renderSaveStatus(status) {
   const button = $("save-status");
   if (!button) return;
-  const dataState = status.visible ? status.state : null;
+  const display = saveStatusPresentation(status);
+  const dataState = display.visible ? display.state : null;
+  button.hidden = !display.visible;
   if (button.getAttribute("data-state") !== dataState) {
-    button.hidden = !status.visible;
     if (dataState) button.setAttribute("data-state", dataState);
     else button.removeAttribute("data-state");
-    button.setAttribute("aria-label", dataState ? SAVE_STATUS_LABELS[dataState] : "Auto-save");
   }
-  button.saveStatusTooltip?.render(status);
+  const warning = display.warning ? "true" : null;
+  if (button.getAttribute("data-warning") !== warning) {
+    if (warning) button.setAttribute("data-warning", warning);
+    else button.removeAttribute("data-warning");
+  }
+  const label = (dataState ? SAVE_STATUS_LABELS[dataState] || "Auto-save" : "Auto-save") +
+    (display.warning ? "; warning, see status details" : "");
+  if (button.getAttribute("aria-label") !== label) button.setAttribute("aria-label", label);
+  button.saveStatusTooltip?.render(display);
 }
 
-// A sibling of the LUT toolbar tooltips: shown after a short hover or on
-// keyboard focus, hidden on leave, blur or Escape, placed above the icon and
-// kept inside the window. Its text comes from the tracker on every render.
+// A read-only status popover: hover and keyboard focus reveal live save age
+// alongside the existing metadata nodes. A short leave delay lets the pointer
+// cross the gap to the popover without losing its text or scroll position.
 function wireSaveStatusTooltip(tracker) {
   const button = $("save-status");
   const tooltip = $("save-status-tooltip");
-  let hovered = false, hoverReady = false, focused = false, dismissed = false, disposed = false;
-  let hoverTimer = null;
+  const summary = $("save-status-summary");
+  const details = $("save-status-details");
+  let hovered = false, popupHovered = false, hoverReady = false, focused = false;
+  let dismissed = false, disposed = false;
+  let hoverTimer = null, closeTimer = null;
   const cancelHover = () => {
     clearTimeout(hoverTimer);
     hoverTimer = null;
   };
+  const cancelClose = () => {
+    clearTimeout(closeTimer);
+    closeTimer = null;
+  };
+  const within = (node) => !!node && (node === button || node === tooltip ||
+    button.contains?.(node) || tooltip.contains?.(node));
   const render = (status = tracker.current()) => {
-    tooltip.hidden = disposed || dismissed || !status.visible || !(hoverReady || focused);
+    const display = saveStatusPresentation(status);
+    tooltip.hidden = disposed || dismissed || !display.visible ||
+      !(hoverReady || focused || closeTimer !== null);
+    const expanded = String(!tooltip.hidden);
+    if (button.getAttribute("aria-expanded") !== expanded) button.setAttribute("aria-expanded", expanded);
     if (tooltip.hidden) return;
-    tooltip.textContent = saveStatusTooltipText(status);
+    const lines = saveStatusTooltipText(display).split("\n");
+    const heading = lines.shift(), detail = lines.join("\n");
+    if (summary.textContent !== heading) summary.textContent = heading;
+    if (details.textContent !== detail) details.textContent = detail;
+    details.hidden = !detail;
     const anchor = button.getBoundingClientRect();
     const tip = tooltip.getBoundingClientRect();
-    const left = Math.max(8, Math.min(anchor.left + (anchor.width - tip.width) / 2,
-      window.innerWidth - tip.width - 8));
-    const top = anchor.top - tip.height - 8;
+    // Layout dimensions stay stable while the entry animation scales the
+    // painted rectangle. The fallback also supports non-layout test hosts.
+    const width = tooltip.offsetWidth || tip.width;
+    const height = tooltip.offsetHeight || tip.height;
+    const left = Math.max(8, Math.min(anchor.left + (anchor.width - width) / 2,
+      window.innerWidth - width - 8));
+    const above = anchor.top - height - 8;
+    const below = above < 8;
+    const top = Math.max(8, Math.min(below ? anchor.bottom + 8 : above,
+      window.innerHeight - height - 8));
     tooltip.style.left = `${left}px`;
-    tooltip.style.top = `${Math.max(8, Math.min(top >= 8 ? top : anchor.bottom + 8,
-      window.innerHeight - tip.height - 8))}px`;
+    tooltip.style.top = `${top}px`;
+    tooltip.style.setProperty("--status-origin-x", `${Math.max(0, Math.min(width,
+      anchor.left + anchor.width / 2 - left))}px`);
+    tooltip.style.setProperty("--status-origin-y", `${below ? 0 : height}px`);
+    tooltip.style.setProperty("--status-enter-y", below ? "-6px" : "6px");
+  };
+  const scheduleClose = () => {
+    cancelClose();
+    if (disposed || tooltip.hidden) return;
+    closeTimer = setTimeout(() => {
+      closeTimer = null;
+      if (disposed) return;
+      if (!hovered && !popupHovered && !focused) hoverReady = false;
+      render();
+    }, SAVE_STATUS_CLOSE_MS);
+  };
+  const focus = () => {
+    if (disposed) return;
+    cancelHover();
+    cancelClose();
+    focused = true;
+    if (hovered || popupHovered) hoverReady = true;
+    dismissed = false;
+    render();
+  };
+  const blur = (event) => {
+    if (disposed) return;
+    focused = within(event?.relatedTarget);
+    if (focused) cancelClose();
+    else scheduleClose();
+    render();
   };
   const handlers = {
     pointerenter() {
       if (disposed) return;
       cancelHover();
+      cancelClose();
       hovered = true;
       dismissed = false;
-      hoverReady = focused;
-      if (!focused) hoverTimer = setTimeout(() => {
+      if (focused) hoverReady = true;
+      if (!hoverReady && !focused) hoverTimer = setTimeout(() => {
         hoverTimer = null;
+        if (disposed) return;
         hoverReady = hovered;
         render();
       }, SAVE_STATUS_HOVER_MS);
       render();
     },
-    pointerleave() { cancelHover(); hovered = hoverReady = false; render(); },
-    focus() {
+    pointerleave() {
       if (disposed) return;
       cancelHover();
-      focused = true;
-      dismissed = false;
+      hovered = false;
+      scheduleClose();
       render();
     },
-    blur() { focused = false; render(); },
+    focus,
+    blur,
+  };
+  const popupHandlers = {
+    pointerenter() {
+      if (disposed || tooltip.hidden) return;
+      cancelClose();
+      popupHovered = hoverReady = true;
+      render();
+    },
+    pointerleave() {
+      if (disposed) return;
+      popupHovered = false;
+      scheduleClose();
+      render();
+    },
+    focusin: focus,
+    focusout: blur,
   };
   for (const [event, handler] of Object.entries(handlers)) button.addEventListener(event, handler);
+  for (const [event, handler] of Object.entries(popupHandlers)) tooltip.addEventListener(event, handler);
   const dismiss = (event) => {
-    if (event.key !== "Escape") return;
+    if (disposed || event.key !== "Escape") return;
     cancelHover();
-    hoverReady = false;
+    cancelClose();
+    popupHovered = hoverReady = false;
     dismissed = true;
     render();
   };
@@ -2571,13 +2657,17 @@ function wireSaveStatusTooltip(tracker) {
   const controller = {
     render,
     dispose() {
+      if (disposed) return;
       disposed = true;
       cancelHover();
+      cancelClose();
       render();
       for (const [event, handler] of Object.entries(handlers)) button.removeEventListener(event, handler);
+      for (const [event, handler] of Object.entries(popupHandlers)) tooltip.removeEventListener(event, handler);
       document.removeEventListener("keydown", dismiss, true);
       window.removeEventListener("resize", reposition);
       window.removeEventListener("scroll", reposition, true);
+      if (button.saveStatusTooltip === controller) delete button.saveStatusTooltip;
     },
   };
   button.saveStatusTooltip = controller;
@@ -3885,7 +3975,7 @@ function downloadRoi(fmt, scaleBar = false) {
   } else showToast("export started — check your downloads");
 }
 
-/* Poll the server's write progress and fill the status-bar export gauge.
+/* Poll the server's write progress and fill the status popover export gauge.
    Every export polls on its own timeout chain with one request in flight,
    so a second export never stops tracking the first and each failure is
    reported. The gauge follows the newest export that is writing. */

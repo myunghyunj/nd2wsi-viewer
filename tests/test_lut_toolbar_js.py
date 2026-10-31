@@ -470,11 +470,11 @@ def test_toolbar_html_has_short_auto_fit_label_and_named_controls_in_order():
     css = (STATIC / "style.css").read_text(encoding="utf-8")
     assert not re.search(r'\.lut-toolbar \.lut-type\s*[,\{]', css)  # no yellow pill override
     icon_rule = re.search(r'\.lut-toolbar \.lut-icon\s*\{([^}]+)\}', css).group(1)
-    for declaration in ["width: 28px", "height: 28px", "padding: 6px", "appearance: none",
+    for declaration in ["width: var(--control-height)", "height: var(--control-height)", "padding: 6px", "appearance: none",
                         "border: 0", "background: transparent", "box-shadow: none", "color: var(--label-2)"]:
         assert declaration in icon_rule
-    hover_rule = re.search(r'\.lut-toolbar \.lut-icon:hover\s*\{([^}]+)\}', css).group(1)
-    assert "color: var(--label)" in hover_rule and "background" not in hover_rule
+    hover_rule = re.search(r'\.lut-toolbar \.lut-icon:hover:not\(:disabled\)\s*\{([^}]+)\}', css).group(1)
+    assert "color: var(--label)" in hover_rule and "background: var(--material-control-hover)" in hover_rule
     assert ".lut-icon:focus-visible" in css
     tooltip_rule = re.search(r'\.lut-tooltip\s*\{([^}]+)\}', css).group(1)
     assert "position: fixed" in tooltip_rule and "max-width: calc(100vw - 16px)" in tooltip_rule

@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import traceback
+from html import escape
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,9 +29,23 @@ from nd2wsi.window_sessions import create_window_session  # noqa: E402
 qa = Path(os.environ["ASTROMAP_QA_ROOT"]).resolve()
 session = create_window_session("agent", qa / "sessions")
 api, window = app.create_app_window(None, window_session=session)
-report = {"ok": False, "session": session.as_dict(), "selectors": [], "replies": {}, "screenshots": {}}
+report = {"ok": False, "session": session.as_dict(), "selectors": [], "replies": {}, "screenshots": {}, "ui": {}}
 report_path = qa / os.environ["ASTROMAP_QA_REPORT"]
 static = Path(app.__file__).parent / "static"
+
+
+def release_notes_fixture():
+    notes = Path(__file__).resolve().parents[1] / "docs/release-notes-2.5.6.md"
+    feature_text = notes.read_text(encoding="utf-8").split("\n### Downloads", 1)[0]
+    items = []
+    for line in feature_text.splitlines():
+        if line.startswith("- "):
+            text = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", line[2:])
+            items.append(" ".join(text.replace("**", "").replace("`", "").split()))
+    assert len(items) >= 3, "Release-note fixture must contain the actual feature bullets"
+    return "<ul>" + "".join("<li>" + escape(item) + "</li>" for item in items) + "</ul>", [
+        item[:300] for item in items[:8]
+    ]
 
 
 def on_main(callback):
@@ -73,7 +89,30 @@ class Standard:
         return receive
 
 
-def capture(name):
+def inspect_card(expected_notes=None, ready=False):
+    state = window.evaluate_js("""(() => {
+      const list=document.getElementById('update-notice-changes');
+      return {listTag:list?.tagName, hidden:list?.hidden,
+        bullets:Array.from(list?.children||[],li=>({tag:li.tagName,text:li.textContent})),
+        actions:Array.from(document.querySelectorAll('#update-notice-actions button'),button=>{
+          const rect=button.getBoundingClientRect();
+          return {text:button.textContent,primary:button.classList.contains('update-primary'),
+            disabled:button.disabled,left:rect.left,right:rect.right};
+        })};
+    })()""")
+    if expected_notes is not None:
+        assert state["listTag"] == "UL" and not state["hidden"], state
+        assert state["bullets"] == [{"tag": "LI", "text": item} for item in expected_notes], state
+    if ready:
+        assert [button["text"] for button in state["actions"]] == ["Install and relaunch", "Cancel"], state
+        install, cancel = state["actions"]
+        assert install["primary"] and not cancel["primary"], state
+        assert not install["disabled"] and not cancel["disabled"], state
+        assert install["right"] <= cancel["left"], state
+    return state
+
+
+def capture(name, expected_notes=None):
     expected_title = {
         "available": "Update available", "downloading": "Downloading 2.5.6",
         "ready": "Ready to install 2.5.6", "waiting": "Waiting to install",
@@ -87,6 +126,7 @@ def capture(name):
         wait_for(lambda: window.evaluate_js(
             "document.getElementById('update-notice-detail').textContent==='55.4 MB of 132.1 MB'"),
             description="download progress")
+    report["ui"][name] = inspect_card(expected_notes, ready=name == "ready")
     for theme in ("dark", "light"):
         window.evaluate_js("document.documentElement.className=" + json.dumps(theme) + "; true")
         path = session.exports_root / f"update-card-{name}-{theme}.png"
@@ -101,9 +141,13 @@ def run():
         assert api._updates_disabled and api._updater is None
         assert not any("Sparkle.framework" in str(bundle.bundlePath()) for bundle in NSBundle.allFrameworks())
         html = '<!doctype html><html data-update-card-shell="true"><head><style>'
-        html += (static / "native-shell-v1.css").read_text() + (static / "update-card-v1.css").read_text()
-        html += 'body{background:linear-gradient(125deg,#31586c,#664a70,#2b6854);min-height:100vh}</style></head><body>'
-        html += (static / "update-card.html").read_text() + '<script>' + (static / "update-card-v1.js").read_text() + '</script></body></html>'
+        html += "\n".join((static / name).read_text(encoding="utf-8") for name in
+                          ("materials-v1.css", "native-shell-v1.css", "update-card-v1.css"))
+        html += 'body{background:linear-gradient(125deg,#31586c,#664a70,#2b6854);min-height:100vh}'
+        html += '#qa-preview{position:fixed;top:16px;left:16px;color:var(--label);font:12px system-ui}</style></head><body>'
+        html += '<p id="qa-preview">2.5.6 release notes · Preview</p>'
+        html += (static / "update-card.html").read_text(encoding="utf-8") + '<script>'
+        html += (static / "update-card-v1.js").read_text(encoding="utf-8") + '</script></body></html>'
         window.load_html(html)
         wait_for(lambda: window.evaluate_js("window.nd2wsiUpdateCard?.ready===true"), description="Agent update card")
         standard = Standard()
@@ -141,16 +185,29 @@ def run():
             assert api.update_card_action(value)["ok"]
             on_main(lambda: None)  # drain the action before advancing the protocol
 
+        def click_ready(label, reply_name):
+            assert window.evaluate_js("""(() => {
+              const button=Array.from(document.querySelectorAll('#update-notice-actions button'))
+                .find(button=>button.textContent===""" + json.dumps(label) + """);
+              if(!button||button.disabled)return false;
+              button.click();return true;
+            })()""")
+            wait_for(lambda: report["replies"].get(reply_name), description=reply_name + " native reply")
+
         call("showUpdatePermissionRequest_reply_", None, record("permission"))
         call("showUserInitiatedUpdateCheckWithCancellation_", record("check_cancel"))
         wait_for(lambda: card.mode == "card", description="card choice")
         click("cancel")
         call("dismissUpdateInstallation")
+        notes_html, expected_notes = release_notes_fixture()
+        report["release_notes"] = {"fixture": "docs/release-notes-2.5.6.md", "preview": True,
+                                   "bullets": expected_notes}
         item = SimpleNamespace(displayVersionString=lambda: "2.5.6", versionString=lambda: "2.5.6",
-                               itemDescription=lambda: "<p>Viewer improvements and fixes.</p>", isInformationOnlyUpdate=lambda: False)
+                               itemDescription=lambda: notes_html, isInformationOnlyUpdate=lambda: False)
         call("showUpdateFoundWithAppcastItem_state_reply_", item, SimpleNamespace(stage=lambda: 0), record("found"))
         wait_for(lambda: card.model.get("state") == "available", description="available")
-        capture("available")
+        assert card.model.get("release_notes") == expected_notes
+        capture("available", expected_notes)
         call("showUpdateReleaseNotesWithDownloadData_", None)
         call("showUpdateReleaseNotesFailedToDownloadWithError_", None)
         call("showUpdateInFocus")
@@ -158,16 +215,32 @@ def run():
         call("showDownloadInitiatedWithCancellation_", record("download_cancel"))
         call("showDownloadDidReceiveExpectedContentLength_", 132100000)
         call("showDownloadDidReceiveDataOfLength_", 55400000)
-        capture("downloading")
+        assert card.model.get("release_notes") == expected_notes
+        capture("downloading", expected_notes)
         call("showDownloadDidStartExtractingUpdate")
         call("showExtractionReceivedProgress_", .5)
         call("showReadyToInstallAndRelaunch_", record("ready"))
-        capture("ready")
-        click("install")
+        assert card.model.get("release_notes") == expected_notes
+        capture("ready", expected_notes)
+        click_ready("Install and relaunch", "ready")
         call("showInstallingUpdateWithApplicationTerminated_retryTerminatingApplication_", False, record("retry_termination"))
         window.evaluate_js("window.nd2wsiUpdateCard.notice('Waiting for 1 export to finish…'); true")
         capture("waiting")
         call("showUpdateInstalledAndRelaunched_acknowledgement_", True, record("installed"))
+        call("dismissUpdateInstallation")
+        # Cancel a second ready update through the visible button. Choice 0
+        # cancels this ready installation; choice 2 would install on quit.
+        call("showUpdateFoundWithAppcastItem_state_reply_", item, SimpleNamespace(stage=lambda: 0), record("cancel_found"))
+        wait_for(lambda: card.model.get("state") == "available", description="cancel scenario available")
+        click("download")
+        call("showReadyToInstallAndRelaunch_", record("ready_cancel"))
+        wait_for(lambda: card.model.get("state") == "ready", description="cancel scenario ready")
+        wait_for(lambda: window.evaluate_js("document.getElementById('update-notice-title').textContent==='Ready to install 2.5.6'"),
+                 description="cancel scenario ready card")
+        assert card.model.get("release_notes") == expected_notes
+        report["ui"]["ready-cancel"] = inspect_card(expected_notes, ready=True)
+        click_ready("Cancel", "ready_cancel")
+        assert report["replies"]["ready_cancel"] == [[0]], report["replies"]
         call("dismissUpdateInstallation")
         call("showUpdaterError_acknowledgement_", SimpleNamespace(localizedDescription=lambda: "Could not download. Try again."), record("error"))
         wait_for(lambda: card.model.get("state") == "error", description="error")
@@ -205,8 +278,8 @@ def run():
         if card is not None:
             on_main(card.page_closed)
         payload = json.dumps(report, ensure_ascii=False, indent=2)
-        (session.exports_root / "update-card-report.json").write_text(payload)
-        report_path.write_text(payload)
+        (session.exports_root / "update-card-report.json").write_text(payload, encoding="utf-8")
+        report_path.write_text(payload, encoding="utf-8")
         window.destroy()
 
 

@@ -90,6 +90,37 @@ def test_drafts_are_never_updates(index):
                                         current_version="2.0.0", channel="rc") is None
 
 
+@pytest.mark.parametrize("tag", ["v2.5.6_SLACS-module", "2.5.6_SLACS-module.2"])
+def test_lab_release_tags_are_not_public_versions(tag):
+    assert updates._VERSION.fullmatch(tag) is None
+    assert updates._version_key(tag) is None
+
+
+@pytest.mark.parametrize("tag", ["v2.5.6_SLACS-module", "2.5.6_SLACS-module.2"])
+@pytest.mark.parametrize("current", ["2.5.4", "2.5.5"])
+@pytest.mark.parametrize("machine", ["AMD64", "ARM64"])
+def test_formal_lab_release_never_replaces_public_windows_update(monkeypatch, tag, current, machine):
+    lab = release(tag, f"nd2wsi-viewer-{tag.removeprefix('v')}-windows-x64.zip",
+                  prerelease=False)
+    official = release("v2.5.6", "nd2wsi-viewer-2.5.6-windows-x64.zip")
+    opened = Mock()
+    monkeypatch.setattr(updates.webbrowser, "open", opened)
+    monkeypatch.setattr(updates, "fetch_releases", lambda: [lab])
+    only_lab = updates.check_for_updates(platform_name="win32", machine=machine,
+                                        current_version=current, open_download=False)
+    assert only_lab["ok"] and not only_lab["available"]
+
+    # A newly published formal lab release is first in GitHub's release index.
+    # Its presence must not hide the compatible public release farther down.
+    monkeypatch.setattr(updates, "fetch_releases", lambda: [lab, official])
+    selected = updates.check_for_updates(platform_name="win32", machine=machine,
+                                        current_version=current, open_download=False)
+    assert selected["ok"] and selected["available"] and not selected["opened"]
+    assert selected["tag"] == "v2.5.6" and selected["channel"] == "stable"
+    assert selected["download_url"] == official["assets"][0]["browser_download_url"]
+    opened.assert_not_called()
+
+
 @pytest.mark.parametrize("url", ["http://github.com/malware.exe", "https://evil.invalid/update.dmg",
                                   "https://github.com/other/repo/releases/download/v2.1.0rc1/update.dmg",
                                   "https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.1.0rc1/not-the-asset.dmg"])
@@ -236,6 +267,80 @@ def test_metadata_only_check_never_opens_browser(monkeypatch, index):
     result = updates.check_for_updates(platform_name="darwin", machine="arm64",
                                        current_version="2.0.0", channel="rc", open_download=False)
     assert result["ok"] and result["available"] and not result["opened"]
+    opened.assert_not_called()
+
+
+def test_manual_card_uses_selected_release_notes_and_keeps_download_token_guard(monkeypatch):
+    import platform
+    import sys
+
+    from nd2wsi.app import Api
+
+    installed = release("v2.5.6", "nd2wsi-viewer-2.5.6-windows-x64.zip")
+    installed["body"] = "- Installed release notes must not be shown."
+    selected = release("v2.5.7", "nd2wsi-viewer-2.5.7-windows-x64.zip")
+    selected["body"] = "- **Faster opening.**\n- Updated display controls."
+    incompatible = release("v2.5.8", "nd2wsi-viewer-2.5.8-macos-arm64.dmg")
+    incompatible["body"] = "- Incompatible release notes must not be shown."
+    lab = release("v2.5.8_SLACS-module", "nd2wsi-viewer-2.5.8_SLACS-module-windows-x64.zip")
+    lab["body"] = "- Lab release notes must not be shown."
+    fetch = Mock(return_value=[lab, incompatible, selected, installed])
+    opened = Mock(return_value=True)
+    monkeypatch.setattr(updates, "fetch_releases", fetch)
+    monkeypatch.setattr(updates, "installed_version", lambda: "2.5.6")
+    monkeypatch.setattr(updates.webbrowser, "open", opened)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
+    monkeypatch.delenv("ND2WSI_DISABLE_UPDATES", raising=False)
+
+    api = Api(None)
+    fetch.assert_not_called()
+    offer = api.check_for_updates(False)
+    fetch.assert_called_once_with()
+    assert offer["version"] == "2.5.7"
+    assert offer["release_notes"] == ["Faster opening.", "Updated display controls."]
+    assert api._manual_update_offer["release_notes"] == offer["release_notes"]
+    opened.assert_not_called()
+    assert not api.open_update_download("wrong-token")["ok"]
+
+    newer_offer = api.check_for_updates(False)
+    assert newer_offer["token"] != offer["token"]
+    assert not api.open_update_download(offer["token"])["ok"]
+    assert api.open_update_download(newer_offer["token"])["ok"]
+    assert not api.open_update_download(newer_offer["token"])["ok"]
+    opened.assert_called_once_with(selected["assets"][0]["browser_download_url"])
+    assert fetch.call_count == 2  # one metadata request per explicit check
+
+
+@pytest.mark.parametrize("body", [None, 123, {}, [], ""])
+def test_missing_or_invalid_release_body_does_not_invent_notes_or_hide_offer(body):
+    item = release("v2.5.7", "nd2wsi-viewer-2.5.7-windows-x64.zip")
+    item["body"] = body
+    selected = updates.select_release_asset([item], platform_name="win32", machine="AMD64",
+                                             current_version="2.5.6")
+    assert selected["version"] == "2.5.7"
+    assert selected["release_notes"] == []
+
+
+def test_selected_release_notes_are_bounded_plain_text_without_extra_requests(monkeypatch):
+    item = release("v2.5.7", "nd2wsi-viewer-2.5.7-windows-x64.zip")
+    item["body"] = (
+        "<script>hidden-script()</script><style>hidden-style</style><ul>"
+        "<li>Safe &amp; <b>visible</b><img src=x onerror=unsafe()></li>"
+        + "".join("<li>" + "a" * 400 + "</li>" for _ in range(40)) + "</ul>"
+    )
+    fetch = Mock(return_value=[item])
+    opened = Mock()
+    monkeypatch.setattr(updates, "fetch_releases", fetch)
+    monkeypatch.setattr(updates.webbrowser, "open", opened)
+    result = updates.check_for_updates(platform_name="win32", machine="AMD64",
+                                      current_version="2.5.6", open_download=False)
+    notes = result["release_notes"]
+    assert result["available"] and result["ok"]
+    assert notes[0] == "Safe & visible"
+    assert len(notes) == 8 and all(len(text) <= 300 for text in notes)
+    assert not any(token in " ".join(notes) for token in ("<", "hidden-script", "hidden-style", "unsafe"))
+    fetch.assert_called_once_with()
     opened.assert_not_called()
 
 

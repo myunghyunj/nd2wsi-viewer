@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>nd2wsi-viewer</title>
+<link rel="stylesheet" href="static/materials-v1.css" />
 <link rel="stylesheet" href="static/native-shell-v1.css" />
 <link rel="stylesheet" href="static/update-card-v1.css">
 </head>
@@ -196,6 +197,7 @@
 <section id="update-notice" aria-labelledby="update-notice-title" role="status" aria-live="polite" hidden>
   <h2 id="update-notice-title"></h2>
   <p id="update-notice-body"></p>
+  <ul id="update-notice-changes" aria-label="What's new" hidden></ul>
   <progress id="update-notice-progress" max="1" hidden></progress>
   <span id="update-notice-detail" hidden></span>
   <button type="button" id="update-notice-notes" hidden>Release notes</button>

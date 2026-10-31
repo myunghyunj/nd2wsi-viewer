@@ -1,0 +1,99 @@
+/* Shared display chrome. The tracing window deliberately does not load this sheet. */
+:root {
+  color-scheme: dark;
+  --canvas: #191919;
+  --canvas-rgb: 25, 25, 25;
+  --accent: #0a84ff;
+  --label: rgba(255, 255, 255, 0.88);
+  --label-2: rgba(255, 255, 255, 0.78);
+  --label-3: rgba(255, 255, 255, 0.40);
+
+  --material-sheen: linear-gradient(145deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 58%);
+  --material-bar: rgba(var(--canvas-rgb), 0.84);
+  --material-panel: var(--material-sheen), rgba(var(--canvas-rgb), 0.72);
+  --material-popover: var(--material-sheen), rgba(var(--canvas-rgb), 0.78);
+  --material-hud: rgba(var(--canvas-rgb), 0.76);
+  --material-toast: rgba(var(--canvas-rgb), 0.84);
+  --material-bar-filter: blur(20px) saturate(140%);
+  --material-panel-filter: blur(22px) saturate(145%);
+  --material-popover-filter: blur(26px) saturate(150%);
+  --material-hud-filter: blur(16px) saturate(135%);
+  --material-toast-filter: blur(18px) saturate(140%);
+  --material-hairline: rgba(255, 255, 255, 0.12);
+  --material-panel-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.12),
+    0 10px 26px rgba(0, 0, 0, 0.20);
+  --material-popover-shadow: var(--material-panel-shadow);
+  --material-hud-shadow: 0 3px 12px rgba(0, 0, 0, 0.18);
+  --material-toast-shadow: var(--material-hud-shadow);
+  --material-control: rgba(255, 255, 255, 0.08);
+  --material-control-hover: rgba(255, 255, 255, 0.12);
+  --material-control-active: rgba(255, 255, 255, 0.16);
+  --material-inset: rgba(0, 0, 0, 0.28);
+  --material-button: rgba(255, 255, 255, 0.05);
+  --material-button-hover: rgba(255, 255, 255, 0.075);
+  --material-button-pressed: rgba(0, 0, 0, 0.14);
+  --material-scrim: rgba(0, 0, 0, 0.32);
+
+  --control-height: 28px;
+  --control-height-large: 30px;
+  --control-radius: 8px;
+  --control-radius-small: 6px;
+  --panel-radius: 14px;
+  --control-gap: 6px;
+  --control-edge: var(--hairline);
+  --control-shadow: 0 1px 2px rgba(0, 0, 0, 0.10);
+  --control-disabled-opacity: 0.45;
+  --primary-fill: #0071e3;
+  --primary-hover: #0068d3;
+  --primary-pressed: #005dbd;
+  --primary-edge: rgba(255, 255, 255, 0.14);
+  --primary-ink: #FFFFFF;
+  --level-selected-fill: var(--material-control-hover);
+  --level-selected-ink: var(--label);
+
+  /* Shared aliases for nested controls and accessibility overrides. */
+  --hairline: var(--material-hairline);
+  --material: var(--material-panel);
+  --material-strong: var(--material-popover);
+  --window-shadow: var(--material-panel-shadow);
+  --shadow: var(--material-hud-shadow);
+  --bar: var(--material-bar);
+  --control-bg: var(--material-popover);
+}
+
+:root.light {
+  color-scheme: light;
+  --canvas: #FFFFFF;
+  --canvas-rgb: 255, 255, 255;
+  --label: rgba(0, 0, 0, 0.88);
+  --label-2: rgba(0, 0, 0, 0.68);
+  --label-3: rgba(0, 0, 0, 0.42);
+
+  --material-sheen: linear-gradient(145deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0) 58%);
+  --material-bar: rgba(var(--canvas-rgb), 0.86);
+  --material-panel: var(--material-sheen), rgba(var(--canvas-rgb), 0.76);
+  --material-popover: var(--material-sheen), rgba(var(--canvas-rgb), 0.82);
+  --material-hud: rgba(var(--canvas-rgb), 0.78);
+  --material-toast: rgba(var(--canvas-rgb), 0.86);
+  --material-hairline: rgba(0, 0, 0, 0.10);
+  --material-panel-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.05),
+    0 10px 26px rgba(0, 0, 0, 0.10);
+  --material-hud-shadow: 0 3px 12px rgba(0, 0, 0, 0.08);
+  --material-control: rgba(0, 0, 0, 0.05);
+  --material-control-hover: rgba(0, 0, 0, 0.08);
+  --material-control-active: rgba(0, 0, 0, 0.12);
+  --material-inset: rgba(0, 0, 0, 0.05);
+  --material-button: var(--material-control);
+  --material-button-hover: var(--material-control-hover);
+  --material-button-pressed: var(--material-control-active);
+  --material-scrim: rgba(0, 0, 0, 0.24);
+  --control-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --primary-edge: rgba(0, 55, 120, 0.16);
+}
+
+/* Preserve a readable surface if the host cannot blur the underlying image. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root, :root.light { --material-panel: rgba(var(--canvas-rgb), 0.96); --material-popover: rgba(var(--canvas-rgb), 0.97); }
+}
