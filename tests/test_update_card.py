@@ -570,7 +570,8 @@ def test_downloaded_sparkle_notes_are_decoded_sanitized_and_retained(h):
     assert h.session.model["release_notes"] == notes
 
 
-@pytest.mark.parametrize("data", [None, 1234, b"<script>bad()</script>", b"x" * 65537])
+@pytest.mark.parametrize("data", [None, 1234, b"<script>bad()</script>", b"x" * 65537],
+                         ids=["none", "non-bytes", "script-only", "oversize"])
 def test_invalid_or_empty_downloaded_notes_preserve_embedded_notes(h, data):
     h.found(description="<ul><li>Embedded change</li></ul>")
     h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", SimpleNamespace(data=lambda: data))
