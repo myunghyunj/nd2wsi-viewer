@@ -86,10 +86,10 @@ def test_context_bounds_and_page_hit_targets_leave_the_interior_and_centre_empty
     ''')
     assert result == {"offset_css": [0, 0], "side_um": 200, "rotation_deg": 75, "window": None, "dpr": None}
     from test_translucent_js import MODULE
-    css = (MODULE.parent / "translucent-v1.css").read_text()
+    css = (MODULE.parent / "translucent-v1.css").read_text(encoding="utf-8")
     assert "stroke-width: 8; pointer-events: stroke" in css
     assert ".laser-reticle { stroke:" in css and "fill: none; pointer-events: none" in css
-    page = (MODULE.parent / "translucent.html").read_text()
+    page = (MODULE.parent / "translucent.html").read_text(encoding="utf-8")
     for element in ("laser-target", "laser-target-capture", "laser-target-set", "laser-target-label", "laser-target-status"):
         assert f'id="{element}"' in page
 

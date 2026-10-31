@@ -162,7 +162,7 @@ def test_slacs_offer_is_initially_hidden_nonmodal_and_does_not_gate_normal_trans
     assert shell["slacs-offer"][0]["aria-labelledby"] == "slacs-offer-title"
     assert "aria-modal" not in shell["slacs-offer"][0]
     assert "disabled" in shell["slacs-offer-open"][0]
-    assert "#slacs-offer[hidden] { display:none; }" in (STATIC / "native-shell-v1.css").read_text()
+    assert "#slacs-offer[hidden] { display:none; }" in (STATIC / "native-shell-v1.css").read_text(encoding="utf-8")
     result = run_slacs(CLOUD_SETUP + """
       ({hidden:$('slacs-offer').hidden,running:slacsDiscovery.running,
         timers:getTimerCallbacks().length,accepted:openActiveTranslucent(),messages});
@@ -401,6 +401,6 @@ def test_background_window_neither_claims_nor_caches_and_a_later_focus_claims(tm
 def test_translucent_warning_shows_hides_and_exists_before_binding():
     result = run("showTranslucentWarning();const shown=!$('translucent-warning').hidden;hideTranslucentWarning();({shown,hidden:$('translucent-warning').hidden});")
     assert result == {"shown": True, "hidden": True}
-    html = (STATIC / "shell.html").read_text()
+    html = (STATIC / "shell.html").read_text(encoding="utf-8")
     assert html.index('id="translucent-warning-ok"') < html.index('src="static/shell-v1.js"')
-    assert "#translucent-warning[hidden]" in (STATIC / "native-shell-v1.css").read_text()
+    assert "#translucent-warning[hidden]" in (STATIC / "native-shell-v1.css").read_text(encoding="utf-8")
