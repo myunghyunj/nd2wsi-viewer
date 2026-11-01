@@ -41,22 +41,8 @@ subpath is retained, and the viewBox is cropped to give the standalone X
 appropriate padding. This modification is permitted by the MIT license.
 The similarly named `cancel_2.svg` is a prohibition symbol, so it is not used.
 
-## Cloud
-
-The font snapshot does not contain a cloud glyph. `cloud.png` is the matching
-[Windows 10 Cloud icon](https://icons8.com/icon/17122/cloud), downloaded unchanged
-at 96 × 96 pixels from
-<https://img.icons8.com/windows/96/000000/cloud.png> on 2026-10-23.
-
-The cloud image is **not covered by the MIT license above**. It is used under
-[Icons8's free attribution terms](https://icons8.com/license). Keep the visible
-Icons8 link in the app's information/About area when distributing this asset.
-Icons8 permits free PNG use with attribution; SVG for this additional icon
-requires a separate license. See the
-[renderer format guidance](https://developers.icons8.com/docs/icons-renderer).
-
 ## Rendering
 
 Use these monochrome assets as CSS masks with `background: currentColor`.
-The SVG lock and unlock paths have no background, and the PNG includes alpha.
+The SVG lock and unlock paths have no background.
 The mask keeps the requested lock glyphs white without adding a button plate.

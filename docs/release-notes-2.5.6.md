@@ -7,6 +7,7 @@ exported pixel values, and stored annotation, correction and LUT formats, are un
 - **Theme.** Dark `#191919` and light `#FFFFFF` backgrounds share consistent translucent surfaces. The toolbar and status bar show essential image details. Hover over the checkmark for auto-save, cache and calibration details; orange indicates a problem.
 - **Update card on macOS.** Updates appear in one card with bullet-point release notes and download progress. When ready, **Install and relaunch** is on the left and **Cancel** is on the right. The card also shows save/export waits and errors. The standard Sparkle window remains the fallback.
 - **Update check on Windows.** The start page's update check uses the same card and opens the download for this PC's build in your browser.
+- **Cloud icon.** The toolbar's cloud icon is now the viewer's own drawing, so the icon credit under Slide Info is gone.
 - **Windows support.** The Windows build lists Windows 11 (x64, and ARM64 through x64 emulation) as its supported target; Windows 10 is not tested.
 
 ### Downloads
