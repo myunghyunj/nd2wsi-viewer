@@ -9,8 +9,10 @@ permission to give an Intel Mac or Windows machine an Apple-silicon DMG.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
+import ssl
 import sys
 import urllib.request
 import webbrowser
@@ -20,6 +22,7 @@ from urllib.parse import quote
 REPOSITORY = "myunghyunj/nd2wsi-viewer"
 RELEASES_API = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
 MAX_METADATA_BYTES = 2 * 1024 * 1024
+_DARWIN_CAFILE = "/etc/ssl/cert.pem"
 _VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?(?:(a|b|rc)(\d+))?", re.I)
 _ASSET = re.compile(
     r"nd2wsi-viewer-(\d+\.\d+\.\d+(?:(?:b|rc)\d+)?)-(macos|windows)-"
@@ -169,7 +172,10 @@ def fetch_releases() -> list:
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "nd2wsi-viewer-manual-update-check",
     })
-    with urllib.request.urlopen(request, timeout=8) as response:
+    ctx = ssl.create_default_context()
+    if sys.platform == "darwin" and os.path.isfile(_DARWIN_CAFILE):
+        ctx.load_verify_locations(cafile=_DARWIN_CAFILE)
+    with urllib.request.urlopen(request, timeout=8, context=ctx) as response:
         if response.geturl() != RELEASES_API:
             raise ValueError("unexpected update metadata redirect")
         data = response.read(MAX_METADATA_BYTES + 1)

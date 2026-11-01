@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import ssl
 from unittest.mock import Mock
 
 import pytest
@@ -382,6 +383,47 @@ def test_fetch_is_bounded_https_metadata_only(monkeypatch, index):
     request = open_url.call_args.args[0]
     assert request.full_url == updates.RELEASES_API
     assert open_url.call_args.kwargs["timeout"] == 8
+    ctx = open_url.call_args.kwargs["context"]
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+@pytest.mark.parametrize(
+    "platform_name,ca_exists,expect_load",
+    [
+        ("darwin", True, True),
+        ("darwin", False, False),
+        ("win32", True, False),
+    ],
+)
+def test_fetch_ssl_context_loads_darwin_cafile_only_when_applicable(
+    monkeypatch, index, platform_name, ca_exists, expect_load
+):
+    ctx = ssl.create_default_context()
+    load_calls = []
+    monkeypatch.setattr(
+        ctx,
+        "load_verify_locations",
+        lambda *, cafile=None: load_calls.append(cafile),
+    )
+
+    open_url = Mock(return_value=Response(json.dumps(index).encode()))
+    monkeypatch.setattr(updates.sys, "platform", platform_name)
+    monkeypatch.setattr(
+        updates.os.path,
+        "isfile",
+        lambda path: ca_exists if path == "/etc/ssl/cert.pem" else False,
+    )
+    monkeypatch.setattr(updates.ssl, "create_default_context", lambda: ctx)
+    monkeypatch.setattr(updates.urllib.request, "urlopen", open_url)
+
+    assert updates.fetch_releases() == index
+    passed_ctx = open_url.call_args.kwargs["context"]
+    assert passed_ctx is ctx
+    assert passed_ctx.verify_mode == ssl.CERT_REQUIRED
+    assert passed_ctx.check_hostname is True
+    assert load_calls == (["/etc/ssl/cert.pem"] if expect_load else [])
 
 
 @pytest.mark.parametrize("data,url", [(b"x" * (updates.MAX_METADATA_BYTES + 1), updates.RELEASES_API),
