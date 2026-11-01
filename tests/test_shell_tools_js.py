@@ -46,6 +46,10 @@ def test_tools_share_the_top_group_and_lower_toolbar_has_no_duplicate_proxies():
     assert '#shell-tools-toggle[aria-expanded="true"] .tools-chevron' in style
     assert 'url("vendor/icons8-win10/angle-right.svg")' in style
     assert 'url("vendor/icons8-win10/share.svg")' in style
+    # The cloud is the viewer's own drawing; the Icons8 PNG needed a visible credit.
+    assert 'url("icons/cloud.svg")' in style
+    assert not (STATIC / "vendor/icons8-win10/cloud.png").exists()
+    assert "icon-credit" not in (STATIC / "index.html").read_text(encoding="utf-8")
     assert 'url("vendor/icons8-win10/channels-sliders.svg")' in (STATIC / "native-v1.css").read_text(encoding="utf-8")
 
 

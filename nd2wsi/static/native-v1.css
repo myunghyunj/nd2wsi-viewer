@@ -55,8 +55,6 @@
 .tb-btn:hover { background: var(--material-control); }
 .tb-btn.active { background: var(--material-control-hover); }
 
-.icon-credit { margin: 12px 0 0; font-size: 11px; color: var(--label-2); }
-.icon-credit a { color: inherit; }
 .tb-icon-only { width: 29px; padding: 0; justify-content: center; }
 :root.light .tb-btn:hover { background: var(--material-control); }
 :root.light .tb-btn.active { background: var(--material-control-hover); }
