@@ -116,12 +116,24 @@
     onEditorReset = () => {},
     onRecoveryNotice = () => {},
     onSaveState = () => {},
+    // Sidecar file names (content hashes) mean nothing to a user; the pane
+    // shows them only in Agent windows.
+    showSidecarNames = () => true,
     now = () => Date.now(),
     setTimer = setTimeout,
     clearTimer = clearTimeout,
     debounceMs = 800,
   }) {
     if (!(state.annFailedSaves instanceof Map)) state.annFailedSaves = new Map();
+    function loadedStatus(count, name, foreignCount) {
+      const names = showSidecarNames();
+      const base = count
+        ? "Loaded " + count + (names ? " from " + name : count === 1 ? " annotation" : " annotations")
+        : names ? "Sidecar: " + name : "";
+      const kept = foreignCount ? foreignCount + " item(s) this viewer cannot draw are kept unchanged" : "";
+      return base && kept ? base + " · " + kept : base || kept;
+    }
+
     if (!state.annSaveTail) state.annSaveTail = Promise.resolve();
     for (const field of ["annRevision", "annContext", "annLoadSeq"]) {
       if (typeof state[field] !== "number") state[field] = 0;
@@ -324,7 +336,7 @@
             state.annDirty = false;
           }
           if (state.annContext === entry.context) {
-            onStatus("Saved · " + basename(data.path));
+            onStatus(showSidecarNames() ? "Saved · " + basename(data.path) : "Saved");
           }
           onRecoveryNotice();
           emitSaveState("saved");
@@ -534,10 +546,7 @@
               ? "Recovered unsaved annotations · save will retry"
               : skipped
               ? skipped
-              : (state.annotations.length
-                ? "Loaded " + state.annotations.length + " from " + basename(d.path)
-                : "Sidecar: " + basename(d.path)) +
-                (foreign.length ? " · " + foreign.length + " item(s) this viewer cannot draw are kept unchanged" : "")
+              : loadedStatus(state.annotations.length, basename(d.path), foreign.length)
           );
           onRecoveryNotice();
           onRender();

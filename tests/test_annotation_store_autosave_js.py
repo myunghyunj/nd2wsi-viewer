@@ -43,6 +43,7 @@ const store = createStore({
   activeFrame: () => state.plate.focus === null ? null : {t: 0, p: state.plate.focus, z: 0},
   onStatus: (message) => statuses.push(message),
   onSaveState: (event) => events.push(event),
+  showSidecarNames: () => context.showNames !== false,
   now: () => now,
   setTimer: (fn, ms) => { const id = ++timerId; timers.set(id, {fn, ms}); return id; },
   clearTimer: (id) => timers.delete(id),
@@ -370,3 +371,13 @@ emit({limit: KEEPALIVE_BODY_LIMIT, lutLimit: lut.KEEPALIVE_BODY_LIMIT, big, smal
     (big_body, big_mode, big_bytes), (small_body, small_mode, small_bytes) = out["requests"]
     assert big_body == ["big"] and big_mode == "plain" and big_bytes > 64 * 1024
     assert small_body == ["small"] and small_mode == "keepalive" and small_bytes < 200
+
+
+def test_a_user_window_reports_saved_without_the_sidecar_name():
+    out = _run("""
+context.showNames = false;
+edit("a");
+now += 800; runTimers(); await tick();
+emit({statuses});
+""")
+    assert out["statuses"] == ["Saved"]
