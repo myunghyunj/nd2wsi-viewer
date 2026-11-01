@@ -55,6 +55,7 @@ const store = createStore({
   onRender: () => renders.push(state.annotations.map((item) => item.id)),
   onEditorReset: () => { editor.hidden = true; },
   onRecoveryNotice: () => notices.push(store.recoveryDrafts() ? "drafts" : "no-drafts"),
+  showSidecarNames: () => context.showNames !== false,
   setTimer: (fn, ms) => { const id = ++timerId; timers.set(id, {fn, ms}); return id; },
   clearTimer: (id) => timers.delete(id),
   debounceMs: 800,
@@ -486,3 +487,33 @@ def test_laser_metadata_is_sanitized_on_load_before_the_next_save(raw):
     assert out["saved"]["isolation_highwater"] == (9 if isinstance(raw, dict) and raw.get("extra") else 7)
     assert "bad/path" not in out["saved"]["presses"] and not out["dirty"]
     assert out["items"][0]["slacs"]["isolation"] == 7
+
+
+def test_user_windows_never_see_sidecar_file_names():
+    out = _run(
+        r"""
+(async () => {
+  context.showNames = false;
+  const one = "api/annotations?p=0", two = "api/annotations?p=1";
+  const disk = new Map([
+    [one, {items: [{id: "a", type: "pin", x: 1, y: 2}], path: "/sidecars/0123abcd.json", revision: "a0"}],
+    [two, {items: [{id: "b", type: "pin", x: 1, y: 2}, {id: "c", type: "pin", x: 3, y: 4}], path: "/sidecars/4567ef.json", revision: "b0"}],
+  ]);
+  sidecarServer(disk);
+  const statusAt = async (site) => { state.plate.focus = site; await store.switchOwner(site); await tick(); return statuses[statuses.length - 1]; };
+  const loaded = [await statusAt(0), await statusAt(1)];
+  disk.set(one, {items: [], path: "/sidecars/89ab.json", revision: "a1"});
+  loaded.push(await statusAt(0));
+  disk.set(one, {items: [{id: "a", type: "pin", x: 1, y: 2}], path: "/sidecars/0123abcd.json", revision: "a2"});
+  await statusAt(1);
+  context.showNames = true;
+  const agent = await statusAt(0);
+  emit({loaded, agent});
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    # A user window names neither the content-hash file nor its folder.
+    assert out["loaded"] == ["Loaded 1 annotation", "Loaded 2 annotations", ""]
+    assert all(".json" not in status for status in out["loaded"])
+    # An Agent window keeps the file name for diagnosis.
+    assert out["agent"] == "Loaded 1 from 0123abcd.json"

@@ -44,6 +44,7 @@ const store = createStore({
   activeFrame: () => state.plate.focus === null ? null : {t: 0, p: state.plate.focus, z: 0},
   onStatus: (message) => statuses.push(message),
   onSaveState: (event) => events.push(event),
+  showSidecarNames: () => context.showNames !== false,
   now: () => now,
   setTimer: (fn, ms) => { const id = ++timerId; timers.set(id, {fn, ms}); return id; },
   clearTimer: (id) => timers.delete(id),
@@ -389,3 +390,13 @@ emit({posts:requests.filter(r=>r.method==='POST').map(r=>[r.url,r.slacs]),
     assert out["recovered"] == {"isolation_highwater": 8, "presses": {"receiver_with-hyphen": 55}}
     assert out["items"] == ["laser"] and out["conflict"]
     assert all(meta["isolation_highwater"] == (8 if url.endswith("0") else 2) for url, meta in out["posts"])
+
+
+def test_a_user_window_reports_saved_without_the_sidecar_name():
+    out = _run("""
+context.showNames = false;
+edit("a");
+now += 800; runTimers(); await tick();
+emit({statuses});
+""")
+    assert out["statuses"] == ["Saved"]

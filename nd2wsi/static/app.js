@@ -153,6 +153,7 @@ const annotationStore = window.Nd2AnnotationStore.createStore({
   onEditorReset: () => { $("ann-editor").hidden = true; },
   onRecoveryNotice: () => updateAnnotationRecoveryNotice(),
   onSaveState: (event) => state.saveStatus?.report(event.channel, event),
+  showSidecarNames: () => state.info?.window?.role === "agent",
 });
 
 let frameRequests = null;
