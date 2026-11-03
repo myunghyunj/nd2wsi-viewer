@@ -280,7 +280,7 @@ def test_manual_card_uses_selected_release_notes_and_keeps_download_token_guard(
     installed = release("v2.5.6", "nd2wsi-viewer-2.5.6-windows-x64.zip")
     installed["body"] = "- Installed release notes must not be shown."
     selected = release("v2.5.7", "nd2wsi-viewer-2.5.7-windows-x64.zip")
-    selected["body"] = "- **Faster opening.**\n- Updated display controls."
+    selected["body"] = "- **Faster opening.** Large slides open sooner.\n- Updated display controls."
     incompatible = release("v2.5.8", "nd2wsi-viewer-2.5.8-macos-arm64.dmg")
     incompatible["body"] = "- Incompatible release notes must not be shown."
     lab = release("v2.5.8_SLACS-module", "nd2wsi-viewer-2.5.8_SLACS-module-windows-x64.zip")
@@ -299,7 +299,9 @@ def test_manual_card_uses_selected_release_notes_and_keeps_download_token_guard(
     offer = api.check_for_updates(False)
     fetch.assert_called_once_with()
     assert offer["version"] == "2.5.7"
-    assert offer["release_notes"] == ["Faster opening.", "Updated display controls."]
+    assert offer["release_notes"] == [{"title": "Faster opening", "detail": "Large slides open sooner."},
+                                      {"title": "Updated display controls", "detail": ""}]
+    assert offer["current_version"] == "2.5.6"
     assert api._manual_update_offer["release_notes"] == offer["release_notes"]
     opened.assert_not_called()
     assert not api.open_update_download("wrong-token")["ok"]
@@ -338,9 +340,12 @@ def test_selected_release_notes_are_bounded_plain_text_without_extra_requests(mo
                                       current_version="2.5.6", open_download=False)
     notes = result["release_notes"]
     assert result["available"] and result["ok"]
-    assert notes[0] == "Safe & visible"
-    assert len(notes) == 8 and all(len(text) <= 300 for text in notes)
-    assert not any(token in " ".join(notes) for token in ("<", "hidden-script", "hidden-style", "unsafe"))
+    assert notes[0] == {"title": "Safe & visible", "detail": ""}
+    assert len(notes) == 8 and all(set(note) == {"title", "detail"} for note in notes)
+    assert all(len(note["title"]) <= 80 and len(note["detail"]) <= 300 for note in notes)
+    assert notes[1]["title"].endswith("…") and notes[1]["detail"].startswith("a" * 299)
+    text = json.dumps(notes)
+    assert not any(token in text for token in ("<", "hidden-script", "hidden-style", "unsafe"))
     fetch.assert_called_once_with()
     opened.assert_not_called()
 

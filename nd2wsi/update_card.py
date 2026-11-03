@@ -17,8 +17,10 @@ from urllib.parse import quote
 PAGE_TIMEOUT = 2.0
 SKIP, INSTALL, DISMISS = 0, 1, 2  # SPUUserUpdateChoice in Sparkle 2.9.6
 RELEASE_NOTE_LIMIT = 8
+RELEASE_NOTE_TITLE_LIMIT = 80
 RELEASE_NOTE_ITEM_LIMIT = 300
 RELEASE_NOTE_SOURCE_LIMIT = 65536
+RELEASE_NOTE_STOP_HEADINGS = {"downloads", "checksums", "assets", "installation"}
 
 
 def _text_source(value, *, group_list_items=False):
@@ -67,18 +69,94 @@ def plain_text(value, limit=600):
     return "\n".join(line for line in lines if line)[:limit]
 
 
+def _clean_note(item):
+    # Keep a Markdown link's label; never expose its target or an image URL.
+    destination = r"\((?:[^()\n]|\([^()\n]*\))*\)"
+    item = re.sub(r"!\[[^]]*\]" + destination, "", item)
+    item = re.sub(r"\[([^]]+)\]" + destination, r"\1", item)
+    item = re.sub(r"\[([^]]+)\]\[[^]]*\]", r"\1", item)
+    item = re.sub(r"(\*\*|__|~~|\*|_)(.+?)\1", r"\2", item)
+    item = re.sub(r"\*\*|__", "", item)  # an unclosed <b> or bold run
+    item = item.replace("`", "")
+    item = re.sub(r"\\([\\*_{}\[\]()#+.!>\-])", r"\1", item)
+    item = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", item)
+    return " ".join(item.split())
+
+
+def _shorten(text, limit, *, clause=False):
+    """Cut at a clause or word boundary within ``limit`` characters and mark the cut."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 1]
+    clauses = [match.start() for match in re.finditer(r"[,;] |\s[–—]\s", cut)] if clause else []
+    if clauses and clauses[-1] > limit // 3:
+        cut = cut[:clauses[-1]]
+    elif (space := cut.rfind(" ")) > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.-–—") + "…"
+
+
+def _first_sentence(text):
+    """Split before the first sentence that starts with a non-lowercase word."""
+    for match in re.finditer(r"[.!?][\"'”’)\]]*(?=\s+(\S))", text):
+        if not match[1].islower():  # "e.g. a" and "v2.5. and" stay together
+            return text[:match.end()], text[match.end():].strip()
+    return text, ""
+
+
+def _bold_lead(text):
+    """The bold run and the text after it when that run is the bullet's title."""
+    lead = re.match(r"(\*\*|__)(.+?)\1(.*)", text)
+    if lead is None:
+        return None
+    inner, after = lead[2], lead[3]
+    # A separator sits inside the bold ("**Theme.**") or right after it
+    # ("**Theme**:", "**Theme** — "); "**Sparkle**'s" and "**A**, **B**" run on.
+    separator = re.match(r"\s+[-–—](?=\s|$)|[.:]?(?=\s|$)", after)
+    if separator is None:
+        return None
+    rest = after[separator.end():]
+    following = rest.lstrip()[:1]
+    # Without punctuation the next word must start a sentence:
+    # "**Install** is on the left" and "**SVS** (Aperio) files" are one sentence.
+    if not (separator.group() or inner.rstrip()[-1:] in ".:!?" or not following
+            or following.isupper() or following.isdigit()):
+        return None
+    return inner, rest
+
+
+def _note_item(text):
+    """One bullet as its bold lead, or else its first sentence, and the rest."""
+    text = re.sub(r"^\[[ xX]\]\s*", "", text.strip())
+    lead = _bold_lead(text)
+    if lead:
+        heading, rest = _clean_note(lead[0]), _clean_note(lead[1])
+        if not heading.strip(".: "):
+            heading, rest = _first_sentence(rest)
+    else:
+        heading, rest = _first_sentence(_clean_note(text))
+    title = re.sub(r"\s*[.:]$", "", heading)
+    if len(title) > RELEASE_NOTE_TITLE_LIMIT:
+        # A shortened title keeps the whole text in its detail.
+        title, rest = _shorten(title, RELEASE_NOTE_TITLE_LIMIT, clause=True), (heading + " " + rest).strip()
+    return {"title": title, "detail": _shorten(rest, RELEASE_NOTE_ITEM_LIMIT)}
+
+
 def release_note_items(value):
     """Bound HTML, Markdown or plain release notes to display-only text items.
 
     Prefer the release's own bullets, without the download/checksum appendix.
-    A prose-only appcast description becomes one item per paragraph. Neither
-    markup nor links are handed to the page for HTML rendering.
+    A prose-only appcast description becomes one item per paragraph. Each item
+    is ``{"title": str, "detail": str}``: the bullet's bold lead, or its first
+    sentence, and the rest. Neither markup nor links are handed to the page for
+    HTML rendering.
     """
     if not isinstance(value, str):
         return []
     source = value[:RELEASE_NOTE_SOURCE_LIMIT]
-    # Retain heading boundaries through the HTML-to-text pass.
+    # Retain heading boundaries and bold leads through the HTML-to-text pass.
     source = re.sub(r"<h[1-6]\b[^>]*>", "\n# ", source, flags=re.I)
+    source = re.sub(r"<\s*/?\s*(?:strong|b)\b[^>]*>", "**", source, flags=re.I)
     # Loose HTML lists wrap each item's text in paragraphs. Keep those nested
     # blocks together while preserving a boundary between top-level items.
     text = _text_source(source, group_list_items=True)
@@ -103,7 +181,7 @@ def release_note_items(value):
         heading = re.match(r"^#{1,6}\s+(.+?)\s*#*$", line)
         if heading:
             current = paragraph = None
-            if heading[1].strip().casefold() in {"downloads", "checksums", "assets", "installation"}:
+            if _clean_note(heading[1]).rstrip(":").casefold() in RELEASE_NOTE_STOP_HEADINGS:
                 break
             continue
         if re.fullmatch(r"[-*_]{3,}", line):
@@ -122,23 +200,10 @@ def release_note_items(value):
             paragraphs.append(line)
             paragraph = len(paragraphs) - 1
 
-    def clean(item):
-        # Keep a Markdown link's label; never expose its target or an image URL.
-        destination = r"\((?:[^()\n]|\([^()\n]*\))*\)"
-        item = re.sub(r"!\[[^]]*\]" + destination, "", item)
-        item = re.sub(r"\[([^]]+)\]" + destination, r"\1", item)
-        item = re.sub(r"\[([^]]+)\]\[[^]]*\]", r"\1", item)
-        item = re.sub(r"^\[[ xX]\]\s*", "", item)
-        item = re.sub(r"(\*\*|__|~~|\*|_)(.+?)\1", r"\2", item)
-        item = item.replace("`", "")
-        item = re.sub(r"\\([\\*_{}\[\]()#+.!>\-])", r"\1", item)
-        item = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", item)
-        return " ".join(item.split())[:RELEASE_NOTE_ITEM_LIMIT]
-
     result = []
     for item in bullets or paragraphs:
-        item = clean(item)
-        if item:
+        item = _note_item(item)
+        if item["title"]:
             result.append(item)
         if len(result) == RELEASE_NOTE_LIMIT:
             break
@@ -167,6 +232,13 @@ def _downloaded_note_items(download):
 def property_value(obj, name, default=None):
     value = getattr(obj, name, default)
     return value() if callable(value) else value
+
+
+def _installed_version():
+    from .release_selection import installed_version
+
+    version = plain_text(installed_version(), 80)
+    return version if re.match(r"\d+\.\d+", version) else ""
 
 
 class PageChannel:
@@ -268,8 +340,10 @@ PHASES = set(BLOCKS) | {"showDownloadDidStartExtractingUpdate",
 class UpdateCardSession:
     """All state mutations and block invocations run on the injected main queue."""
     def __init__(self, standard, window, main, *, retry=lambda: False, open_notes=lambda _: None,
-                 channel=None, later=None):
+                 channel=None, later=None, current_version=None):
         self.standard, self.main = standard, main
+        # Shown under the card's title; "development" or a missing package is unknown.
+        self.current_version = _installed_version() if current_version is None else current_version
         self.channel = channel or PageChannel(window, main)
         self.retry, self.open_notes = retry, open_notes
         self.later = later or self._later
@@ -366,8 +440,8 @@ class UpdateCardSession:
         self.actions = actions or {}
         self.model = {"state": state, "title": title, "message": message, "token": self.token,
                       "prompt": uuid.uuid4().hex, "actions": list(self.actions),
-                      "version": self.model.get("version", ""),
-                      "release_notes": list(self.release_notes), **extra}
+                      "version": self.model.get("version", ""), "current_version": self.current_version,
+                      "release_notes": [dict(note) for note in self.release_notes], **extra}
         self._show()
 
     def _show(self):
@@ -420,7 +494,9 @@ class UpdateCardSession:
             actions = {"later": (DISMISS,)} if info_only else (
                 {"install": (INSTALL,), "cancel": (SKIP,)} if installing
                 else {"later": (DISMISS,), "download": (INSTALL,)})
-            self._set("ready" if installing else "available", "Ready to install " + version if installing else "Update available",
+            title = ("Ready to install " + version if installing
+                     else f"nd2wsi-viewer {version} is available" if version else "Update available")
+            self._set("ready" if installing else "available", title,
                       ("Cancel stops this installation and hides automatic reminders for this version. "
                        "You can still use Check for Updates.") if installing else "",
                       reply=reply, actions=actions, version=version, notes=True)
@@ -428,7 +504,7 @@ class UpdateCardSession:
             items = _downloaded_note_items(args[0])
             if items and self.release_url is not None and self.model:
                 self.release_notes = items
-                self.model["release_notes"] = list(items)
+                self.model["release_notes"] = [dict(note) for note in items]
                 self._show()
         elif selector == "showUpdateReleaseNotesFailedToDownloadWithError_":
             pass

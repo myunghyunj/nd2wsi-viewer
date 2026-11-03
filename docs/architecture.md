@@ -151,7 +151,10 @@ outstanding card choices safely. Explicit PyObjC block metadata preserves the
 Sparkle 2.9.6 argument signatures when forwarding to the standard driver.
 
 `static/update-card-v1.js`, its CSS and markup provide the six card states and
-plain-text bullet notes. The shell's existing `nd2wsiUpdateNotice` routes export
+plain-text release notes. `update_card.release_note_items` reduces notes to
+`{"title", "detail"}` items: a bullet's bold lead (or first sentence) and the rest.
+The card lists up to four titles and keeps every entry behind a collapsed
+**Details** button, which closes again for each new offer or state. The shell's existing `nd2wsiUpdateNotice` routes export
 waits and close vetoes into an active card. Ready offers **Install and relaunch**
 followed by **Cancel**. Cancel replies with Sparkle's `Skip` choice to stop the
 installation; `Dismiss` could still install on quit. A resumed installation
