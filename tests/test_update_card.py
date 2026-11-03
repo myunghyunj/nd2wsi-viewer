@@ -3,13 +3,21 @@
 import json
 import threading
 import time
+import xml.etree.ElementTree as ET
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from nd2wsi import update_card as card
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def titles(*values):
+    return [{"title": value, "detail": ""} for value in values]
 
 
 class Channel:
@@ -38,6 +46,7 @@ def h():
         open_notes=notes,
         channel=channel,
         later=lambda seconds, fn: timers.append(fn),
+        current_version="2.5.5",
     )
 
     def block(*args):
@@ -77,7 +86,9 @@ def test_first_callback_probes_once_and_queues_subsequent_selectors(h):
     h.found()  # settles the first probe, replays check then found
     assert h.session.mode == "card" and h.session.model["state"] == "available"
     assert h.session.model["message"] == ""
-    assert h.session.model["release_notes"] == ["Fixes"]
+    assert h.session.model["title"] == "nd2wsi-viewer 2.5.6 is available"
+    assert h.session.model["current_version"] == "2.5.5"
+    assert h.session.model["release_notes"] == titles("Fixes")
     assert h.received == []  # checking cancellation was retired, not called
     assert sum("ready===true" in c for c in h.channel.calls) == 1
     h.action("notes")
@@ -518,7 +529,7 @@ def test_block_notes_keep_heading_bullets_and_inline_spacing():
 
 
 def test_release_bullets_survive_download_extract_and_ready(h):
-    notes = ["Save fixes & recovery", "Faster tile display"]
+    notes = titles("Save fixes & recovery", "Faster tile display")
     h.found(description="<ul><li>Save <b>fixes</b> &amp; recovery</li><li>Faster tile display</li></ul>")
     assert h.session.model["release_notes"] == notes
     h.action("download")
@@ -537,7 +548,7 @@ def test_release_bullets_survive_download_extract_and_ready(h):
     assert h.session.model["actions"] == ["install", "cancel"]
     assert h.session.model["message"] == ""
     # The list sent to the page is JSON text, never HTML.
-    assert '"release_notes": ["Save fixes & recovery", "Faster tile display"]' in h.channel.calls[-1]
+    assert '"release_notes": ' + json.dumps(notes) in h.channel.calls[-1]
 
 
 def test_notes_reset_when_a_new_update_or_session_replaces_the_old_one(h):
@@ -560,7 +571,7 @@ def test_downloaded_sparkle_notes_are_decoded_sanitized_and_retained(h):
         textEncodingName=lambda: "utf-8",
     )
     h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", download)
-    notes = ["수정 & recovery", "Fast tiles"]
+    notes = titles("수정 & recovery", "Fast tiles")
     assert h.session.model["release_notes"] == notes
     h.session.dispatch("showUpdateReleaseNotesFailedToDownloadWithError_", RuntimeError("offline"))
     assert h.session.model["release_notes"] == notes
@@ -575,17 +586,17 @@ def test_downloaded_sparkle_notes_are_decoded_sanitized_and_retained(h):
 def test_invalid_or_empty_downloaded_notes_preserve_embedded_notes(h, data):
     h.found(description="<ul><li>Embedded change</li></ul>")
     h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", SimpleNamespace(data=lambda: data))
-    assert h.session.model["release_notes"] == ["Embedded change"]
+    assert h.session.model["release_notes"] == titles("Embedded change")
 
 
 def test_downloaded_notes_support_reported_charset_without_rendering_markup(h):
     h.found()
     h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", SimpleNamespace(
         data=lambda: b"<ul><li>R\xe9parations</li></ul>", textEncodingName=lambda: "windows-1252"))
-    assert h.session.model["release_notes"] == ["Réparations"]
+    assert h.session.model["release_notes"] == titles("Réparations")
     h.session.dispatch("showUpdateReleaseNotesWithDownloadData_", SimpleNamespace(
         data=lambda: b"<ul><li>Fallback</li></ul>", textEncodingName=lambda: "not-a-charset"))
-    assert h.session.model["release_notes"] == ["Fallback"]
+    assert h.session.model["release_notes"] == titles("Fallback")
 
 
 def test_resumed_installing_cancel_discloses_reminder_effect_and_cancels_once(h):
@@ -596,7 +607,7 @@ def test_resumed_installing_cancel_discloses_reminder_effect_and_cancels_once(h)
         "Cancel stops this installation and hides automatic reminders for this version. "
         "You can still use Check for Updates."
     )
-    assert h.session.model["release_notes"] == ["A real change"]
+    assert h.session.model["release_notes"] == titles("A real change")
     h.action("cancel")
     h.action("install")
     h.drain()
@@ -611,9 +622,9 @@ def test_resumed_installing_cancel_discloses_reminder_effect_and_cancels_once(h)
 def test_information_only_update_never_gets_ready_install_or_cancel_actions(h, stage):
     h.found(stage=stage, info=True, description="<ul><li>Important notice</li></ul>")
     assert h.session.model["state"] == "available"
-    assert h.session.model["title"] == "Update available"
+    assert h.session.model["title"] == "nd2wsi-viewer 2.5.6 is available"
     assert h.session.model["actions"] == ["later"]
-    assert h.session.model["release_notes"] == ["Important notice"]
+    assert h.session.model["release_notes"] == titles("Important notice")
     h.action("install")
     h.action("cancel")
     h.drain()
@@ -656,40 +667,41 @@ Introductory prose.
 ## Downloads
 - The executable
 """) == [
-        "Save fixes with details. Continued explanation.",
-        "Faster tiles and clearer panels.",
-        "Better keyboard support.",
+        {"title": "Save fixes with details", "detail": "Continued explanation."},
+        {"title": "Faster tiles and clearer panels", "detail": ""},
+        {"title": "Better keyboard support", "detail": ""},
     ]
-    assert card.release_note_items("- A [linked](https://example.test/path_(x)) note") == ["A linked note"]
+    assert card.release_note_items("- A [linked](https://example.test/path_(x)) note") == titles("A linked note")
 
 
 def test_release_note_items_sanitize_html_and_keep_only_actual_list_text():
     assert card.release_note_items("""<h1>Release</h1><p>Introduction</p>
 <ul><li>Fixed <b>save</b> &amp; retry</li><li><img src=x onerror='bad()'>Fast <a href='javascript:bad()'>tiles</a></li></ul>
-<script>bad()</script><style>bad</style><p>Thanks</p><h2>Checksums</h2><ul><li>Hash</li></ul>""") == [
+<script>bad()</script><style>bad</style><p>Thanks</p><h2>Checksums</h2><ul><li>Hash</li></ul>""") == titles(
         "Fixed save & retry", "Fast tiles",
-    ]
+    )
 
 
 @pytest.mark.parametrize("source, expected", [
     (
         "<ul><li><p>First change.</p></li><li><p>Second change.</p></li></ul>",
-        ["First change.", "Second change."],
+        titles("First change", "Second change"),
     ),
     (
         "<ul><li>First change.</li><li><p>Second change.</p></li></ul>",
-        ["First change.", "Second change."],
+        titles("First change", "Second change"),
     ),
     (
         """<ul><li>
           <div><p>First <b>change</b>.</p><p>More detail.</p></div>
           <p>Last detail.<br>Still the first change.</p>
         </li><li><p>Second &amp; final change.</p><script>bad()</script></li></ul>""",
-        ["First change. More detail. Last detail. Still the first change.", "Second & final change."],
+        [{"title": "First change", "detail": "More detail. Last detail. Still the first change."},
+         {"title": "Second & final change", "detail": ""}],
     ),
     (
         "<ul><li>First change.<ul><li>Nested detail.</li></ul>Final detail.</li><li>Second change.</li></ul>",
-        ["First change. Nested detail. Final detail.", "Second change."],
+        [{"title": "First change", "detail": "Nested detail. Final detail."}, {"title": "Second change", "detail": ""}],
     ),
 ], ids=["loose", "mixed", "nested-paragraphs", "nested-list"])
 def test_release_note_items_preserve_html_list_item_groups(source, expected):
@@ -697,11 +709,137 @@ def test_release_note_items_preserve_html_list_item_groups(source, expected):
 
 
 def test_release_note_items_plain_paragraph_fallback_and_code_are_bounded():
-    assert card.release_note_items("<p>One change.</p><p>Another change.</p>") == ["One change.", "Another change."]
-    assert card.release_note_items("# Release\n```js\n- not a release bullet\n```\n- Kept") == ["Kept"]
+    assert card.release_note_items("<p>One change.</p><p>Another change.</p>") == titles("One change", "Another change")
+    assert card.release_note_items("# Release\n```js\n- not a release bullet\n```\n- Kept") == titles("Kept")
     result = card.release_note_items("\n".join("- " + str(i) + "x" * 900 for i in range(20)))
-    assert len(result) == 8
-    assert all(len(item) == 300 for item in result)
-    assert [item[0] for item in result] == list("01234567")
-    assert card.release_note_items("\x00\x01plain\x7f") == ["plain"]
+    assert len(result) == card.RELEASE_NOTE_LIMIT == 8
+    assert all(len(item["title"]) == card.RELEASE_NOTE_TITLE_LIMIT and item["title"].endswith("…") for item in result)
+    assert all(len(item["detail"]) == card.RELEASE_NOTE_ITEM_LIMIT and item["detail"].endswith("…") for item in result)
+    assert [item["title"][0] for item in result] == list("01234567")
+    assert card.release_note_items("\x00\x01plain\x7f") == titles("plain")
     assert card.release_note_items("<script>" + "x" * 65536 + "</script>- Not read") == []
+
+
+def test_release_note_items_use_markdown_bold_leads_as_titles():
+    assert card.release_note_items("""
+- **Theme.** Dark and light backgrounds share surfaces. Hover for details.
+- **Update card**: One card with notes.
+- **Windows** — Uses the same card.
+- **Just a title.**
+- __Underscored lead.__ With *emphasis* and a [link](https://example.test/x).
+- **Install and relaunch** is on the left.
+""") == [
+        {"title": "Theme", "detail": "Dark and light backgrounds share surfaces. Hover for details."},
+        {"title": "Update card", "detail": "One card with notes."},
+        {"title": "Windows", "detail": "Uses the same card."},
+        {"title": "Just a title", "detail": ""},
+        {"title": "Underscored lead", "detail": "With emphasis and a link."},
+        # Bold that continues a sentence is emphasis, not a title.
+        {"title": "Install and relaunch is on the left", "detail": ""},
+    ]
+
+
+@pytest.mark.parametrize("source, expected", [
+    # Bold that runs on through punctuation is part of the first sentence.
+    ("- **Sparkle**'s card shows notes.", {"title": "Sparkle's card shows notes", "detail": ""}),
+    ("- **Windows**, **macOS**: faster opening.", {"title": "Windows, macOS: faster opening", "detail": ""}),
+    ("- **SVS** (Aperio) files open faster. More detail.",
+     {"title": "SVS (Aperio) files open faster", "detail": "More detail."}),
+    ("- **Theme**s are shared.", {"title": "Themes are shared", "detail": ""}),
+    # A period, colon or dash right after the bold still makes it a title.
+    ("- **Theme**. Dark.", {"title": "Theme", "detail": "Dark."}),
+    ("- **Theme** - Dark.", {"title": "Theme", "detail": "Dark."}),
+    ("- **Note**: the viewer waits.", {"title": "Note", "detail": "the viewer waits."}),
+    ("- **Theme** Dark.", {"title": "Theme", "detail": "Dark."}),
+    # Unclosed or stray bold markers never reach the page.
+    ("<ul><li><b>Bold never closed. Then text</li></ul>", {"title": "Bold never closed", "detail": "Then text"}),
+    ("<ul><li>Closed early</b>. Then text</li></ul>", {"title": "Closed early", "detail": "Then text"}),
+    ("- Ends with a stray** marker.", {"title": "Ends with a stray marker", "detail": ""}),
+], ids=["possessive", "comma-list", "parenthesis", "suffix", "period-after", "dash-after", "colon-after",
+        "capital-after", "unclosed-b", "unopened-b", "stray"])
+def test_release_note_items_take_a_bold_run_as_title_only_when_it_ends_the_lead(source, expected):
+    assert card.release_note_items(source) == [expected]
+
+
+def test_release_note_items_use_html_strong_and_b_leads_as_titles():
+    items = card.release_note_items("""<h2>Changes</h2><ul>
+<li><strong>Theme.</strong> Dark backgrounds.</li>
+<li><b class="lead">Update card</b>: One card.<br>Second line.</li>
+<li><p><STRONG>Loose item.</STRONG></p><p>Its <a href="https://example.test/">detail</a>.</p></li>
+<li>Plain <strong>inline</strong> emphasis stays in the sentence.</li>
+<li><strong>Blocked.</strong> <img src=x onerror="bad()"><script>bad()</script>Safe text.</li>
+</ul>""")
+    assert items == [
+        {"title": "Theme", "detail": "Dark backgrounds."},
+        {"title": "Update card", "detail": "One card. Second line."},
+        {"title": "Loose item", "detail": "Its detail."},
+        {"title": "Plain inline emphasis stays in the sentence", "detail": ""},
+        {"title": "Blocked", "detail": "Safe text."},
+    ]
+    rendered = json.dumps(items)
+    assert not any(token in rendered for token in ("*", "<", "href", "example.test", "bad()"))
+
+
+def test_release_note_items_without_a_bold_lead_split_at_the_first_sentence():
+    items = card.release_note_items("""
+- Theme. Dark backgrounds share surfaces.
+- Use e.g. the toolbar. Then save.
+- Version 2.5.7 adds plates. More plates.
+- Plate thumbnails fill about 5 times faster, and cached slides serve more tiles per second.
+- A window opened after the Mac slept no longer removes another window's cache build today.
+""")
+    assert items[:3] == [
+        {"title": "Theme", "detail": "Dark backgrounds share surfaces."},
+        {"title": "Use e.g. the toolbar", "detail": "Then save."},
+        {"title": "Version 2.5.7 adds plates", "detail": "More plates."},
+    ]
+    # A long first sentence is cut at a clause or word; the detail keeps all of it.
+    assert items[3] == {
+        "title": "Plate thumbnails fill about 5 times faster…",
+        "detail": "Plate thumbnails fill about 5 times faster, and cached slides serve more tiles per second.",
+    }
+    assert items[4]["title"].endswith("cache…") and len(items[4]["title"]) <= card.RELEASE_NOTE_TITLE_LIMIT
+    assert items[4]["detail"].startswith("A window opened") and items[4]["detail"].endswith("build today.")
+
+
+def test_release_note_items_bound_titles_details_and_count():
+    long_title = "Bold " + "lead " * 40
+    items = card.release_note_items("\n".join(
+        [f"- **{long_title}** Rest of it."] + [f"- **Item {i}.** " + "detail " * 100 for i in range(12)]))
+    assert len(items) == card.RELEASE_NOTE_LIMIT
+    assert len(items[0]["title"]) <= card.RELEASE_NOTE_TITLE_LIMIT and items[0]["title"].endswith("…")
+    assert items[0]["detail"].startswith("Bold lead lead") and items[0]["detail"].endswith("Rest of it.")
+    assert [item["title"] for item in items[1:]] == [f"Item {i}" for i in range(7)]
+    assert all(len(item["detail"]) <= card.RELEASE_NOTE_ITEM_LIMIT for item in items)
+    assert items[1]["detail"].endswith("detail…")
+
+
+@pytest.mark.parametrize("heading", [
+    "## Downloads", "### **Checksums**", "# Assets:", "<h3><b>Installation</b></h3>", "<h2>DOWNLOADS</h2>",
+])
+def test_release_note_items_stop_at_the_download_appendix_heading(heading):
+    assert card.release_note_items(f"- **Kept.** A change.\n\n{heading}\n\n- **Hash.** abc123") == [
+        {"title": "Kept", "detail": "A change."}]
+
+
+def test_published_2_5_6_notes_give_the_same_titles_from_markdown_and_appcast():
+    expected = ["Theme", "Update card on macOS", "Update check on Windows", "Cloud icon",
+                "Annotations panel", "Windows support"]
+    markdown = card.release_note_items((REPO / "docs/release-notes-2.5.6.md").read_text(encoding="utf-8"))
+    item = next(node for node in ET.parse(REPO / "updates/appcast.xml").iter("item")
+                if node.findtext("title") == "2.5.6")
+    appcast = card.release_note_items(item.findtext("description"))
+    assert [note["title"] for note in markdown] == [note["title"] for note in appcast] == expected
+    assert markdown[1]["detail"].startswith("Updates appear in one card")
+    assert "Install and relaunch is on the left" in markdown[1]["detail"]
+    assert markdown == appcast
+
+
+@pytest.mark.parametrize("installed, expected", [("2.5.6", "2.5.6"), ("2.5.7rc1", "2.5.7rc1"),
+                                                 ("development", ""), ("<b>2.5</b>", "2.5")])
+def test_session_shows_only_a_known_installed_version(monkeypatch, installed, expected):
+    from nd2wsi import release_selection
+
+    monkeypatch.setattr(release_selection, "installed_version", lambda: installed)
+    session = card.UpdateCardSession(Mock(), lambda: None, lambda fn: fn(), channel=Channel())
+    assert session.current_version == expected

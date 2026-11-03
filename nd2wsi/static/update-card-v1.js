@@ -4,24 +4,34 @@
   else root.nd2wsiUpdateCard = factory().mount(root, root.document);
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
+  const SUMMARY_LIMIT = 4, NOTE_LIMIT = 8;
   function mount(win, doc) {
     const element = doc.getElementById("update-notice");
     const title = doc.getElementById("update-notice-title"), body = doc.getElementById("update-notice-body");
+    const installed = doc.getElementById("update-notice-installed");
     const meter = doc.getElementById("update-notice-progress"), detail = doc.getElementById("update-notice-detail");
     const actions = doc.getElementById("update-notice-actions"), notes = doc.getElementById("update-notice-notes");
-    const changes = doc.getElementById("update-notice-changes");
+    const changes = doc.getElementById("update-notice-changes"), entries = doc.getElementById("update-notice-entries");
+    const expand = doc.getElementById("update-notice-expand"), links = doc.getElementById("update-notice-links");
     // getRandomValues is available on pywebview's about:blank landing page;
     // randomUUID is secure-context-only and is absent there on WKWebView.
     const identifier = () => Array.from(win.crypto.getRandomValues(new Uint8Array(16)),
       byte => byte.toString(16).padStart(2, "0")).join("");
     const pageId = identifier();
-    let model = null, busy = false, renderedNotes = "";
+    let model = null, busy = false, renderedNotes = "", expanded = false;
     const bridge = () => win.pywebview?.api;
     const text = (value, max = 600) => typeof value === "string" ? value.slice(0, max) : "";
     const number = value => Number.isFinite(value) && value > 0 ? value : 0;
+    const release = value => typeof value === "string" && /^\d+\.\d+/.test(value) ? value.slice(0, 80) : "";
+    // Details start collapsed for every new offer, prompt or state; download
+    // progress for the same prompt keeps the reader's choice.
+    function adopt(next) {
+      if (!model || model.token !== next.token || model.prompt !== next.prompt || model.state !== next.state) expanded = false;
+      model = next;
+    }
     function dismiss(token) {
       if (model && token !== model.token) return false;
-      model = null; element.hidden = true; busy = false; return true;
+      model = null; element.hidden = true; busy = false; expanded = false; return true;
     }
     async function act(action) {
       if (!model || busy) return;
@@ -66,25 +76,43 @@
     }
     function renderChanges() {
       const items = (Array.isArray(model.release_notes) ? model.release_notes : [])
-        .filter(value => typeof value === "string").map(value => value.trim().slice(0, 300)).filter(Boolean).slice(0, 8);
+        .filter(value => value && typeof value === "object")
+        .map(value => ({ title: text(value.title, 300).trim().slice(0, 100), detail: text(value.detail, 600).trim().slice(0, 300) }))
+        .filter(value => value.title).slice(0, NOTE_LIMIT);
       const key = JSON.stringify(items);
       if (key !== renderedNotes) {
-        changes.replaceChildren();
+        changes.replaceChildren(); entries.replaceChildren();
+        for (const value of items.slice(0, SUMMARY_LIMIT)) {
+          const item = doc.createElement("li"); item.textContent = value.title; changes.appendChild(item);
+        }
         for (const value of items) {
-          const item = doc.createElement("li"); item.textContent = value; changes.appendChild(item);
+          const item = doc.createElement("li"), heading = doc.createElement("strong");
+          heading.textContent = value.title; item.appendChild(heading);
+          if (value.detail) {
+            const more = doc.createElement("span"); more.textContent = value.detail; item.appendChild(more);
+          }
+          entries.appendChild(item);
         }
         renderedNotes = key;
       }
-      changes.hidden = !items.length;
+      const more = items.length > SUMMARY_LIMIT || items.some(value => value.detail);
+      if (!more) expanded = false;
+      expand.hidden = !more;
+      expand.setAttribute("aria-expanded", expanded ? "true" : "false");
+      changes.hidden = !items.length || expanded;
+      entries.hidden = !expanded;
     }
     function render() {
       if (!model) return;
       element.dataset.state = model.state;
       title.textContent = text(model.title, 100);
-      body.textContent = (model.state === "available" && model.version ? "nd2wsi-viewer " + text(model.version, 80) + ". " : "") + text(model.message);
+      const current = ["available", "downloading", "ready"].includes(model.state) ? release(model.current_version) : "";
+      installed.textContent = current ? "Installed: " + current : ""; installed.hidden = !current;
+      body.textContent = text(model.message);
       body.hidden = !body.textContent;
       renderChanges();
       notes.hidden = !model.notes;
+      links.hidden = expand.hidden && notes.hidden;
       const downloading = model.state === "downloading";
       const fraction = downloading ? (number(model.total) ? number(model.received) / number(model.total) : null) : model.progress;
       meter.hidden = !downloading && !["waiting", "checking"].includes(model.state);
@@ -103,15 +131,16 @@
         notice: true, state: model.state, title: model.title, message: model.message, actions: model.actions, progress: undefined,
       } : {};
       const answered = samePrompt && model.consumed ? { consumed: true, actions: [] } : {};
-      model = { ...value, ...notice, ...answered }; busy = !!samePrompt && busy; render(); return true;
+      adopt({ ...value, ...notice, ...answered }); busy = !!samePrompt && busy; render(); return true;
     }
     function manual(result) {
       const available = result?.ok && result.available;
-      const token = result?.token || identifier();
+      const token = result?.token || identifier(), version = text(result?.version, 80);
       const shown = show({ token, prompt: identifier(), manual: true,
         state: available ? "available" : result?.ok ? "up_to_date" : "error",
-        title: available ? "Update available" : result?.ok ? "No update available" : "Could not check for updates",
-        version: result?.version, message: result?.message || "Please try again.", notes: available,
+        title: available ? (version ? "nd2wsi-viewer " + version + " is available" : "Update available")
+          : result?.ok ? "No update available" : "Could not check for updates",
+        version, current_version: result?.current_version, message: result?.message || "Please try again.", notes: available,
         release_notes: available ? result.release_notes : [],
         actions: available ? ["later", "download"] : result?.ok ? [] : ["close", "retry"] });
       if (result?.ok && !available) win.setTimeout(() => dismiss(token), 5000);
@@ -126,10 +155,15 @@
     }
     function notice(message) {
       if (!model || model.manual) return false;
-      model = { ...model, notice: true, state: "waiting", title: "Waiting to install", message: text(message), actions: [], progress: undefined };
+      adopt({ ...model, notice: true, state: "waiting", title: "Waiting to install", message: text(message), actions: [], progress: undefined });
       render(); return true;
     }
     notes.addEventListener("click", () => act("notes"));
+    // A native button: Enter and Space activate it as a click, so no key handler.
+    expand.addEventListener("click", () => {
+      if (!model) return;
+      expanded = !expanded; renderChanges();
+    });
     // A reload or native close also ends the Python session via native events;
     // this bridge covers pagehide while those events are still queued.
     win.addEventListener("pagehide", () => {

@@ -30,6 +30,16 @@ if sys.platform == "win32":
     sys.stdout = stream
     sys.stderr = stream
 
+# Explorer marks every file extracted from a downloaded ZIP, and .NET Framework
+# then refuses pythonnet's assemblies. Clear the marks before anything imports clr.
+# ND2WSI_KEEP_DOWNLOAD_MARKS=1 keeps them, to reproduce the blocked start.
+if (sys.platform == "win32" and getattr(sys, "frozen", False)
+        and os.environ.get("ND2WSI_KEEP_DOWNLOAD_MARKS") != "1"):
+    from nd2wsi.windows_bundle import clear_download_marks
+
+    for failure in clear_download_marks(Path(sys._MEIPASS)):
+        print(f"download mark not cleared: {failure}", flush=True)
+
 # run() ends a finished --gui-smoke at once, so no lingering thread can hold it.
 from nd2wsi.app import run  # noqa: E402 - freeze support must run before app imports
 

@@ -35,17 +35,24 @@ static = Path(app.__file__).parent / "static"
 
 
 def release_notes_fixture():
+    """Appcast-style HTML with <strong> leads, and the items expected independently of the app."""
     notes = Path(__file__).resolve().parents[1] / "docs/release-notes-2.5.6.md"
     feature_text = notes.read_text(encoding="utf-8").split("\n### Downloads", 1)[0]
-    items = []
+    html, items = [], []
+
+    def plain(text):
+        return " ".join(re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", text).replace("**", "").replace("`", "").split())
+
     for line in feature_text.splitlines():
         if line.startswith("- "):
-            text = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", line[2:])
-            items.append(" ".join(text.replace("**", "").replace("`", "").split()))
-    assert len(items) >= 3, "Release-note fixture must contain the actual feature bullets"
-    return "<ul>" + "".join("<li>" + escape(item) + "</li>" for item in items) + "</ul>", [
-        item[:300] for item in items[:8]
-    ]
+            lead = re.match(r"\*\*(.+?)\*\*\s*(.*)", line[2:])
+            assert lead, "Each 2.5.6 feature bullet leads with a bold title"
+            title, detail = plain(lead[1]), plain(lead[2])
+            html.append("<li><strong>" + escape(title) + "</strong> " + escape(detail) + "</li>")
+            items.append({"title": title.removesuffix("."), "detail": detail})
+    assert len(items) >= 5, "Release-note fixture must contain the actual feature bullets"
+    assert all(len(item["title"]) <= 80 and len(item["detail"]) <= 300 for item in items)
+    return "<ul>" + "".join(html) + "</ul>", items[:8]
 
 
 def on_main(callback):
@@ -89,11 +96,24 @@ class Standard:
         return receive
 
 
-def inspect_card(expected_notes=None, ready=False):
+def inspect_card(expected_notes=None, ready=False, notes_link=None):
+    # Visibility is the computed display, not the hidden attribute: a later
+    # display rule once showed parts the page had hidden.
     state = window.evaluate_js("""(() => {
-      const list=document.getElementById('update-notice-changes');
-      return {listTag:list?.tagName, hidden:list?.hidden,
+      const byId=id=>document.getElementById(id), shown=element=>!!element && getComputedStyle(element).display!=='none';
+      const list=byId('update-notice-changes'), full=byId('update-notice-entries');
+      const expand=byId('update-notice-expand'), installed=byId('update-notice-installed');
+      const box=element=>{const rect=element.getBoundingClientRect();return {top:rect.top,bottom:rect.bottom,height:rect.height};};
+      return {listTag:list?.tagName,
+        shown:{summary:shown(list), entries:shown(full), details:shown(expand), notes:shown(byId('update-notice-notes')),
+          links:shown(byId('update-notice-links')), installed:shown(installed)},
         bullets:Array.from(list?.children||[],li=>({tag:li.tagName,text:li.textContent})),
+        entries:Array.from(full?.children||[],li=>Array.from(li.children,node=>[node.tagName,node.textContent])),
+        toggle:{tag:expand?.tagName,text:expand?.textContent,expanded:expand?.getAttribute('aria-expanded'),
+          controls:expand?.getAttribute('aria-controls')},
+        installed:shown(installed) ? installed.textContent : null,
+        card:box(byId('update-notice')), viewport:innerHeight,
+        entriesBox:shown(full) ? {...box(full), scrollHeight:full.scrollHeight, clientHeight:full.clientHeight} : null,
         actions:Array.from(document.querySelectorAll('#update-notice-actions button'),button=>{
           const rect=button.getBoundingClientRect();
           return {text:button.textContent,primary:button.classList.contains('update-primary'),
@@ -101,8 +121,22 @@ def inspect_card(expected_notes=None, ready=False):
         })};
     })()""")
     if expected_notes is not None:
-        assert state["listTag"] == "UL" and not state["hidden"], state
-        assert state["bullets"] == [{"tag": "LI", "text": item} for item in expected_notes], state
+        assert state["listTag"] == "UL" and state["shown"]["summary"], state
+        assert state["bullets"] == [{"tag": "LI", "text": item["title"]} for item in expected_notes[:4]], state
+        # Details exists only for more than four notes or notes with detail text.
+        details = len(expected_notes) > 4 or any(item["detail"] for item in expected_notes)
+        assert state["shown"]["details"] == details, state
+        # Every new state arrives collapsed, even after Details was opened.
+        assert state["toggle"] == {"tag": "BUTTON", "text": "Details", "expanded": "false",
+                                   "controls": "update-notice-entries"}, state
+        assert not state["shown"]["entries"], state
+        assert state["card"]["top"] >= 0 and state["card"]["bottom"] <= state["viewport"], state
+    elif notes_link is not None:
+        # No notes: no summary, entries or Details.
+        assert not any(state["shown"][part] for part in ("summary", "entries", "details")), state
+    if notes_link is not None:
+        assert state["shown"]["notes"] == notes_link, state
+        assert state["shown"]["links"] == (notes_link or state["shown"]["details"]), state
     if ready:
         assert [button["text"] for button in state["actions"]] == ["Install and relaunch", "Cancel"], state
         install, cancel = state["actions"]
@@ -112,9 +146,39 @@ def inspect_card(expected_notes=None, ready=False):
     return state
 
 
+def expand_details(name, expected_notes):
+    """Open Details by its button, check every entry, screenshot, and close it again."""
+    assert window.evaluate_js("document.getElementById('update-notice-expand').click(); true")
+    wait_for(lambda: window.evaluate_js(
+        "document.getElementById('update-notice-expand').getAttribute('aria-expanded')==='true'"),
+        description=name + " details")
+    state = inspect_card()
+    assert state["toggle"]["expanded"] == "true" and state["shown"]["entries"] and not state["shown"]["summary"], state
+    assert state["shown"]["details"], state
+    assert state["entries"] == [
+        [["STRONG", item["title"]]] + ([["SPAN", item["detail"]]] if item["detail"] else []) for item in expected_notes
+    ], state
+    assert state["entriesBox"]["clientHeight"] <= 240, state  # scrolls inside the card instead of growing past it
+    assert state["card"]["top"] >= 0 and state["card"]["bottom"] <= state["viewport"], state
+    report["ui"][name + "-details"] = state
+    snapshot(name + "-details")
+    assert window.evaluate_js("document.getElementById('update-notice-expand').click(); true")
+    wait_for(lambda: window.evaluate_js(
+        "document.getElementById('update-notice-expand').getAttribute('aria-expanded')==='false' && "
+        "getComputedStyle(document.getElementById('update-notice-entries')).display==='none'"),
+        description=name + " details closed")
+
+
+def snapshot(name):
+    for theme in ("dark", "light"):
+        window.evaluate_js("document.documentElement.className=" + json.dumps(theme) + "; true")
+        path = session.exports_root / f"update-card-{name}-{theme}.png"
+        report["screenshots"][name + "-" + theme] = str(save_cocoa_snapshot(window, path))
+
+
 def capture(name, expected_notes=None):
     expected_title = {
-        "available": "Update available", "downloading": "Downloading 2.5.6",
+        "available": "nd2wsi-viewer 2.5.6 is available", "downloading": "Downloading 2.5.6",
         "ready": "Ready to install 2.5.6", "waiting": "Waiting to install",
         "error": "Could not update", "up-to-date": "No update available",
     }[name]
@@ -126,11 +190,16 @@ def capture(name, expected_notes=None):
         wait_for(lambda: window.evaluate_js(
             "document.getElementById('update-notice-detail').textContent==='55.4 MB of 132.1 MB'"),
             description="download progress")
-    report["ui"][name] = inspect_card(expected_notes, ready=name == "ready")
-    for theme in ("dark", "light"):
-        window.evaluate_js("document.documentElement.className=" + json.dumps(theme) + "; true")
-        path = session.exports_root / f"update-card-{name}-{theme}.png"
-        report["screenshots"][name + "-" + theme] = str(save_cocoa_snapshot(window, path))
+    # Only the found offer carries the Release notes link; downloading and
+    # ready keep the notes but must hide it.
+    notes_link = None if name == "waiting" else name == "available"
+    report["ui"][name] = inspect_card(expected_notes, ready=name == "ready", notes_link=notes_link)
+    if name in ("available", "downloading", "ready"):
+        # The frozen app must find its own package version for this line.
+        assert report["ui"][name]["installed"] == "Installed: " + report["installed_version"], report["ui"][name]
+    snapshot(name)
+    if expected_notes is not None and name in ("available", "ready"):
+        expand_details(name, expected_notes)
 
 
 def run():
@@ -153,6 +222,8 @@ def run():
         standard = Standard()
         card = UpdateCardSession(standard, lambda: window,
                                  lambda fn: NSOperationQueue.mainQueue().addOperationWithBlock_(fn))
+        report["installed_version"] = card.current_version
+        assert re.match(r"\d+\.\d+", card.current_version), "The packaged app must know its installed version"
         signatures = {
             "showUpdatePermissionRequest:reply:": b"v@:@@?",
             "showUserInitiatedUpdateCheckWithCancellation:": b"v@:@?",
@@ -238,9 +309,25 @@ def run():
         wait_for(lambda: window.evaluate_js("document.getElementById('update-notice-title').textContent==='Ready to install 2.5.6'"),
                  description="cancel scenario ready card")
         assert card.model.get("release_notes") == expected_notes
-        report["ui"]["ready-cancel"] = inspect_card(expected_notes, ready=True)
+        report["ui"]["ready-cancel"] = inspect_card(expected_notes, ready=True, notes_link=False)
         click_ready("Cancel", "ready_cancel")
         assert report["replies"]["ready_cancel"] == [[0]], report["replies"]
+        call("dismissUpdateInstallation")
+        # Two title-only notes fit the summary: Details must not be displayed.
+        short_notes = [{"title": "First change", "detail": ""}, {"title": "Second change", "detail": ""}]
+        short_item = SimpleNamespace(displayVersionString=lambda: "2.5.6", versionString=lambda: "2.5.6",
+                                     itemDescription=lambda: "<ul><li>First change</li><li>Second change</li></ul>",
+                                     isInformationOnlyUpdate=lambda: False)
+        call("showUpdateFoundWithAppcastItem_state_reply_", short_item, SimpleNamespace(stage=lambda: 0), record("short_found"))
+        wait_for(lambda: card.model.get("release_notes") == short_notes, description="short notes available")
+        wait_for(lambda: window.evaluate_js(
+            "!document.getElementById('update-notice').hidden && "
+            "document.querySelector('#update-notice-changes li')?.textContent==='First change'"),
+            description="short notes card")
+        report["ui"]["available-short"] = inspect_card(short_notes, notes_link=True)
+        snapshot("available-short")
+        click("later")
+        assert report["replies"]["short_found"] == [[2]], report["replies"]
         call("dismissUpdateInstallation")
         call("showUpdaterError_acknowledgement_", SimpleNamespace(localizedDescription=lambda: "Could not download. Try again."), record("error"))
         wait_for(lambda: card.model.get("state") == "error", description="error")

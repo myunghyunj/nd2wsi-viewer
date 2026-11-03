@@ -84,6 +84,49 @@ function Assert-AppContainerAccess {
     }
 }
 
+function Invoke-Packaged {
+    param([string]$Executable, [string[]]$Arguments, [int]$Timeout, [string]$Mode)
+    # Use Windows CRT argument quoting with .NET Framework on PS5.1.
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $Executable
+    $start.UseShellExecute = $false
+    $start.Arguments = (($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $process = [System.Diagnostics.Process]::Start($start)
+    if (-not $process.WaitForExit($Timeout)) {
+        $process.Kill()
+        $process.WaitForExit(10000) | Out-Null
+        throw "Packaged --$Mode timed out."
+    }
+    $timer.Stop()
+    $result = @{ mode = $Mode; exit_code = $process.ExitCode; seconds = $timer.Elapsed.TotalSeconds }
+    $process.Dispose()
+    return $result
+}
+
+# Explorer copies a downloaded ZIP's Mark of the Web onto every extracted file;
+# ZipFile extraction does not. Mark the files the way users receive them.
+function Set-DownloadMark {
+    param([string]$Root)
+    Get-ChildItem -LiteralPath $Root -Recurse -File -Force | ForEach-Object {
+        Set-Content -LiteralPath $_.FullName -Stream 'Zone.Identifier' -Value "[ZoneTransfer]`r`nZoneId=3" -Encoding ascii
+    }
+}
+
+function Test-DownloadMark {
+    param([string]$Path)
+    return [bool](Get-Item -LiteralPath $Path -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue)
+}
+
+# The folders nd2wsi/windows_bundle.py clears; build_windows.py keeps every
+# .NET assembly inside them.
+function Get-AssemblyFile {
+    param([string]$AppRoot)
+    foreach ($folder in @('pythonnet\runtime', 'clr_loader\ffi\dlls', 'webview\lib')) {
+        Get-ChildItem -LiteralPath (Join-Path $AppRoot "_internal\$folder") -Recurse -File -Filter '*.dll'
+    }
+}
+
 $expected = ((Get-Content -LiteralPath "$archivePath.sha256" -Raw).Trim() -split '\s+')[0]
 $actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($expected -ne $actual) { throw 'The distributable ZIP checksum does not match.' }
@@ -102,15 +145,29 @@ New-Item -ItemType Directory -Path $testRoot | Out-Null
 # script's $ProgressPreference) and is very slow on a ZIP with a bundled runtime.
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $testRoot)
-$exe = Join-Path $testRoot 'nd2wsi-viewer\nd2wsi-viewer.exe'
+$appRoot = Join-Path $testRoot 'nd2wsi-viewer'
+$exe = Join-Path $appRoot 'nd2wsi-viewer.exe'
+$about = Join-Path $appRoot '_internal\nd2wsi-viewer-about'
 $slide = Join-Path $testRoot ($koreanCell + ' sample.nd2')
 Copy-Item -LiteralPath $sourcePath -Destination $slide
-$manifest = Get-Content -LiteralPath (Join-Path $testRoot 'nd2wsi-viewer\build-info.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+
+# Users see only the executable, the runtime folder and the READ-ME.
+$topLevel = @(Get-ChildItem -LiteralPath $appRoot -Force | ForEach-Object Name | Sort-Object)
+if (($topLevel -join '|') -cne '_internal|nd2wsi-viewer.exe|READ-ME.txt') {
+    throw "Unexpected top-level layout: $($topLevel -join ', ')"
+}
+$pruned = @(Get-ChildItem -LiteralPath (Join-Path $appRoot '_internal') -Recurse -Directory -Force |
+    Where-Object { $_.Name -in @('tests', '__pycache__') })
+if ($pruned.Count) { throw "Test or cache folders were shipped: $($pruned[0].FullName)" }
+$fileCount = @(Get-ChildItem -LiteralPath $appRoot -Recurse -File -Force).Count
+if ($fileCount -gt 3600) { throw "The portable folder holds $fileCount files, more than 3600." }
+
+$manifest = Get-Content -LiteralPath (Join-Path $about 'build-info.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($manifest.binary_architecture -ne 'x64') { throw 'Unexpected executable architecture in the build manifest.' }
 if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.executable_sha256) {
     throw 'The executable checksum does not match the build manifest.'
 }
-$codecManifest = Join-Path $testRoot 'nd2wsi-viewer\sdpc-codec-manifest.json'
+$codecManifest = Join-Path $about 'sdpc-codec-manifest.json'
 if ($manifest.sdpc_codec_bundled -ne $true -or $manifest.distribution_status -ne 'source-built-lgpl-codec') {
     throw 'This release requires the verified source-built LGPL SDPC codec.'
 }
@@ -167,6 +224,8 @@ $webview2Child = $null
 $webview2System = $null
 $webview2NegativeControl = $null
 $stageFollowVerified = $false
+$runtimeAssembly = '_internal\pythonnet\runtime\Python.Runtime.dll'
+$controlRoot = Join-Path $testRoot 'blocked'
 # Each run: its evidence name, the app flag, and an optional WebView2 mode override.
 $plan = @(
     @{ name = 'smoke'; flag = '--smoke'; webview2 = $null },
@@ -186,6 +245,9 @@ try {
         # Windows 10 folder-permission step anyway, on the real extracted runtime.
         if ($RequireBundledWebView2 -and $mode -eq 'gui-smoke') { $env:ND2WSI_SMOKE_WEBVIEW2_ACL = '1' }
         else { $env:ND2WSI_SMOKE_WEBVIEW2_ACL = $previousWebView2Grant }
+        # Each launch clears the assembly marks, so mark the folder before each one.
+        Set-DownloadMark $appRoot
+        if (-not (Test-DownloadMark (Join-Path $appRoot $runtimeAssembly))) { throw 'Could not add the download mark.' }
         $log = Join-Path $evidencePath "$mode.log"
         Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
         $env:ND2WSI_LOG_FILE = $log
@@ -214,6 +276,9 @@ try {
         $timer.Stop()
         if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Encoding UTF8 }
         if ($process.ExitCode -ne 0) { throw "Packaged $mode failed with exit code $($process.ExitCode)." }
+        $stillMarked = @(Get-AssemblyFile $appRoot | Where-Object { Test-DownloadMark $_.FullName })
+        if ($stillMarked.Count) { throw "The app left a download mark on $($stillMarked[0].FullName)." }
+        if (-not (Test-DownloadMark $exe)) { throw 'The app removed the executable''s own download mark.' }
         if ($mode -eq 'gui-smoke-system') {
             if (-not (Test-Path -LiteralPath $guiReport)) { throw 'The system-runtime GUI smoke did not record completion.' }
             $gui = Get-Content -LiteralPath $guiReport -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -267,6 +332,33 @@ try {
         $runs += @{ mode = $mode; exit_code = $process.ExitCode; seconds = $timer.Elapsed.TotalSeconds }
         $process.Dispose()
     }
+
+    # Negative control: with the repair switched off, the marked folder must
+    # fail with the users' startup error and its hint. This proves the marked
+    # runs above exercised the failure; a runner that ignores the mark fails here.
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $controlRoot)
+    $controlApp = Join-Path $controlRoot 'nd2wsi-viewer'
+    Set-DownloadMark $controlApp
+    $blockedLog = Join-Path $evidencePath 'gui-smoke-blocked.log'
+    $blockedReport = Join-Path $evidencePath 'gui-smoke-blocked.json'
+    Remove-Item -LiteralPath $blockedLog, $blockedReport -Force -ErrorAction SilentlyContinue
+    $env:ND2WSI_LOG_FILE = $blockedLog
+    $env:ND2WSI_KEEP_DOWNLOAD_MARKS = '1'
+    try {
+        $blocked = Invoke-Packaged -Executable (Join-Path $controlApp 'nd2wsi-viewer.exe') -Timeout 180000 -Mode 'gui-smoke' `
+            -Arguments @('--gui-smoke', $slide, '--smoke-report', $blockedReport)
+    }
+    finally {
+        Remove-Item Env:ND2WSI_KEEP_DOWNLOAD_MARKS -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $blockedLog) { Get-Content -LiteralPath $blockedLog -Encoding UTF8 }
+    if ($blocked.exit_code -eq 0) { throw 'The app started although its assemblies kept the download mark.' }
+    $blockedResult = Get-Content -LiteralPath $blockedReport -Raw -Encoding UTF8 | ConvertFrom-Json
+    $blockedError = [string](Get-JsonMember $blockedResult @('error'))
+    if ((Get-JsonMember $blockedResult @('ok')) -ne $false -or $blockedError -notmatch 'Python\.Runtime' -or $blockedError -notmatch 'Unblock') {
+        throw "The blocked launch did not report the startup failure with its hint: $blockedError"
+    }
+    if (-not (Test-DownloadMark (Join-Path $controlApp $runtimeAssembly))) { throw 'The blocked control lost its download mark.' }
     $hostArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     $report = @{
         version = $manifest.version
@@ -294,6 +386,9 @@ try {
         webview2_negative_control_browser_executable = $webview2NegativeControl
         webview2_appcontainer_access = $webview2Grant
         stage_follow_verified = $stageFollowVerified
+        download_marked_launches_verified = $true
+        blocked_assembly_failure_reproduced = $true
+        portable_file_count = $fileCount
         runs = $runs
     }
     $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidencePath 'verification.json') -Encoding utf8

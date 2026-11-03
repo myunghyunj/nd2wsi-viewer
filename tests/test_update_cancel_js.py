@@ -187,11 +187,43 @@ def test_abort_unlocks_all_prepared_panes_without_discarding_an_inflight_annotat
     assert out["lateReady"] == []
 
 
-def test_abort_after_successful_flush_still_unlocks_and_reports_closed_images():
+def test_abort_after_teardown_keeps_panes_frozen_and_reports_closed_images():
+    # The server stopped after the panes saved; unlocking them would let edits
+    # pile up that can never be saved, and a later close would then fail on them.
     out = run("""
       const pending=window.nd2wsiPrepareForUpdate('finished-attempt');
       await pump(); const result=await pending;
       const accepted=window.nd2wsiCancelUpdate('finished-attempt',true);
+      await pump();
+      const after={locked:classes.has('preparing-update'),
+        blocked:[...panes.values()].map(p=>p.inputBlocked())};
+      // A later preparation, such as a tab close, cannot unlock them either.
+      const retry=window.nd2wsiPrepareForUpdate('tab-close-later');
+      await pump(); await retry;
+      const later=window.nd2wsiCancelUpdate('tab-close-later');
+      await pump();
+      return {result,accepted,after,later,notices,locked:classes.has('preparing-update'),
+        blocked:[...panes.values()].map(p=>p.inputBlocked()),
+        unlocks:messages.filter(m=>m.nd2wsi==='cancel-quit').length};
+    """)
+    assert out["result"] == {"ok": True, "panes": 2}
+    assert out["accepted"] is True
+    assert out["after"] == {"locked": True, "blocked": [True, True]}
+    assert out["later"] is True
+    assert out["locked"] is True
+    assert out["blocked"] == [True, True]
+    assert out["unlocks"] == 0
+    assert out["notices"] == [
+        "Update stopped after saving annotations and releasing images. "
+        "Reopen the slide or restart the app."
+    ] * 2
+
+
+def test_abort_before_teardown_after_a_successful_flush_still_unlocks():
+    out = run("""
+      const pending=window.nd2wsiPrepareForUpdate('drained-attempt');
+      await pump(); const result=await pending;
+      const accepted=window.nd2wsiCancelUpdate('drained-attempt',false);
       await pump();
       return {result,accepted,notices,locked:classes.has('preparing-update'),
         blocked:[...panes.values()].map(p=>p.inputBlocked())};
@@ -200,10 +232,7 @@ def test_abort_after_successful_flush_still_unlocks_and_reports_closed_images():
     assert out["accepted"] is True
     assert out["locked"] is False
     assert out["blocked"] == [False, False]
-    assert out["notices"] == [
-        "Update stopped after saving annotations and releasing images. "
-        "Reopen the slide or restart the app."
-    ]
+    assert out["notices"] == []
 
 
 def test_normal_close_waits_for_pending_lut_save_before_acknowledging():

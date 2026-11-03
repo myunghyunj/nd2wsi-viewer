@@ -35,7 +35,7 @@ class LifecycleApi(Protocol):
 
     def update_block_reason(self) -> str | None: ...
 
-    def stop_server_for_update(self) -> None: ...
+    def stop_server_for_update(self, timeout: float | None = None) -> None: ...
 
 
 class LifecycleWindow(Protocol):
@@ -57,11 +57,26 @@ class _ShutdownOwnership:
     while it tears down the server. Every coordinator of a window's api claims
     this record before it starts a request and releases it when the request
     ends. It never calls out, so it is safe to use under a coordinator's lock.
+
+    It also records that an update preparation stopped the window's server
+    and then ended without the installer (Sparkle aborted, or the teardown
+    failed). The panes confirmed their saves first and stay frozen, so a
+    later close has nothing left to save.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._holder: tuple[object, str] | None = None
+        self._torn_down = False
+
+    def mark_torn_down(self) -> None:
+        with self._lock:
+            self._torn_down = True
+
+    @property
+    def torn_down(self) -> bool:
+        with self._lock:
+            return self._torn_down
 
     def claim(self, coordinator: object, request_id: str) -> bool:
         """Own the panes for ``request_id`` unless another coordinator does."""
@@ -94,6 +109,16 @@ class UpdateShutdownCoordinator:
     # Notices and editing recovery are tiny scripts; a viewer that cannot run
     # one this quickly is not answering, and the worker must move on.
     _BROWSER_CALL_TIMEOUT = 5.0
+    # Releasing sources waits for running reads. A read from a slow share may
+    # take longer than the first wait, so the update says what it waits for
+    # and keeps waiting; one wedged in native code never returns, so after
+    # the limit the update backs out instead of waiting forever.
+    _TEARDOWN_TIMEOUT = 10.0
+    _TEARDOWN_LIMIT = 60.0
+    _TEARDOWN_WAIT_NOTICE = "Waiting for a slide read to finish before installing the update…"
+    # The close veto's notice while a preparation owns the panes.
+    _UPDATE_PREPARING_NOTICE = ("An update is waiting to install, so this window can't be closed now. "
+                                "The viewer will quit and reopen by itself when the update starts.")
 
     def __init__(self, api: LifecycleApi, window: LifecycleWindow, *, logger: Callable[[str], None]):
         self.api = api
@@ -265,6 +290,18 @@ class UpdateShutdownCoordinator:
                 self._running = False
                 self._wire_request_id = ""
             self._ownership().release(self, request_id)
+        self._clear_preparing_notice()
+
+    def _clear_preparing_notice(self) -> None:
+        """Drop the close veto's notice unless another request owns the panes.
+
+        Otherwise the start page, which polls the status, would still say an
+        update is waiting after Sparkle aborted it.
+        """
+        if self._ownership().held_by_other(self):
+            return
+        if getattr(self.api, "_status", None) == self._UPDATE_PREPARING_NOTICE:
+            self.api._status = ""
 
     def _recover_browser(self, request_id) -> None:
         with self._lock:
@@ -272,6 +309,10 @@ class UpdateShutdownCoordinator:
                 return
             wire_id = self._wire_request_id
             after_teardown = self._teardown_started
+            if after_teardown:
+                # The shell keeps the panes frozen; the close guard stops
+                # asking them to save.
+                self._ownership().mark_torn_down()
         if not wire_id:
             return
         # Queued behind any script the viewer has not finished, so it unlocks
@@ -440,8 +481,37 @@ class UpdateShutdownCoordinator:
             if self._request_id != request_id or cancelled.is_set():
                 return False
             self._teardown_started = True
-        self.api.stop_server_for_update()
+        self._stop_server(cancelled)
         return self._is_current(request_id, cancelled)
+
+    def _stop_server(self, cancelled) -> None:
+        """Stop the server once its reads end, waiting up to _TEARDOWN_LIMIT.
+
+        Each later wait joins the same release, never starts another, and
+        nothing closes under a reader. Waits are _RETRY_DELAY long, so a
+        cancellation is seen between them and a release that finishes ends
+        the wait at once. Past the limit this raises, the worker reports it
+        and the panes stay frozen; Sparkle keeps its install postponed, so
+        quitting is the way on.
+        """
+        deadline = time.monotonic() + self._TEARDOWN_LIMIT
+        wait, waiting = self._TEARDOWN_TIMEOUT, False
+        while True:
+            try:
+                self.api.stop_server_for_update(timeout=max(0.0, min(wait, deadline - time.monotonic())))
+                return
+            except TimeoutError as exc:
+                if cancelled.is_set():
+                    return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"a slide read did not finish within {self._TEARDOWN_LIMIT:g} seconds. "
+                        "Quit and reopen the viewer to install the update."
+                    ) from exc
+                if not waiting:
+                    self._log(f"Sparkle shutdown: {exc}; still waiting")
+                    self._notice(self._TEARDOWN_WAIT_NOTICE)
+                wait, waiting = self._RETRY_DELAY, True
 
 
 class WindowCloseCoordinator(UpdateShutdownCoordinator):
@@ -464,13 +534,13 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
     Sparkle preparation and this guard never own the panes at once. While an
     update is being prepared, a close is vetoed with a notice; an approved or
     forced close still goes through, and so does the quit Sparkle sends once
-    the installer resumes.
+    the installer resumes. A preparation that stopped the server and then
+    ended without the installer leaves the panes saved and frozen, so a close
+    after it needs no handshake against the stopped server.
     """
 
     _DRAIN_TIMEOUT = 30.0
     _UNCONFIRMED_CLOSE_TITLE = "Close without confirmed saves?"
-    _UPDATE_PREPARING_NOTICE = ("An update is waiting to install, so this window can't be closed now. "
-                                "The viewer will quit and reopen by itself when the update starts.")
 
     def __init__(self, api: LifecycleApi, window: LifecycleWindow, *, logger: Callable[[str], None]):
         super().__init__(api, window, logger=logger)
@@ -522,13 +592,17 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
                 return False
             ownership = self._ownership()
             request_id = uuid.uuid4().hex
+            # An aborted update stopped this window's server and no slide
+            # opened a new one: its panes saved before it and stay frozen.
+            torn_down = ownership.torn_down and self.api._httpd is None
             # Sparkle preparation owns the panes until it resumes the
-            # installer. An idle page starts no request, so it only checks.
-            preparing_update = (ownership.held_by_other(self) if idle_page
+            # installer. An idle or torn-down page starts no request, so it
+            # only checks.
+            preparing_update = (ownership.held_by_other(self) if idle_page or torn_down
                                 else not ownership.claim(self, request_id))
             if preparing_update:
                 approved = False
-            elif idle_page:
+            elif idle_page or torn_down:
                 approved = True
             else:
                 approved = False
@@ -542,7 +616,8 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
             self._refuse_close_while_preparing_update()
             return False
         if approved:
-            self._log("Native close allowed: the page never became ready and no slide is open")
+            self._log("Native close allowed: " + ("the page never became ready and no slide is open" if idle_page
+                                                  else "an update already saved the panes and stopped the server"))
             return True
         try:
             threading.Thread(target=self._close_worker, args=(request_id, cancelled, ask_to_force),
@@ -559,10 +634,14 @@ class WindowCloseCoordinator(UpdateShutdownCoordinator):
         Runs on the UI thread, so the notice is sent from its own thread. The
         panes stay frozen for the update. Sparkle's window has no cancel at
         this point; only an aborted installation unlocks them, and the next
-        close then runs the save handshake.
+        close then runs the save handshake (or, after the server stopped,
+        closes at once). The notice is cleared when the preparation ends.
         """
         message = self._UPDATE_PREPARING_NOTICE
         self.api._status = message
+        # The preparation may have ended, and cleared it, since this close
+        # found it owning the panes.
+        self._clear_preparing_notice()
         self._log(f"Window remains open: {message}")
         try:
             threading.Thread(target=self._notice, args=(message,),

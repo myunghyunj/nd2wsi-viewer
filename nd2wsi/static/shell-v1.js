@@ -16,6 +16,9 @@ let toastTimer = null;
 let quitPreparation = null;
 let quitPreparationRequestId = "";
 const quitPreparedPanes = new Map(); // sid -> most recent full preparation id
+// An update stopped this window's server after its panes saved. Nothing
+// edited from then on could be saved, so the panes stay frozen for good.
+let quitTornDown = false;
 const pairPicker = { open: false, mode: "start", replaceSid: null };
 const slacsDiscovery = {
   snapshot: null, offeredSession: null, shownSessions: new Set(),
@@ -1262,6 +1265,14 @@ window.nd2wsiCancelUpdate = (requestId, afterTeardown = false) => {
   if (!id || id !== quitPreparationRequestId) return false;
   quitPreparationRequestId = "";
   finishQuitPreparation({ ok: false, cancelled: true, error: "update cancelled" });
+  // After teardown the panes and tab strip stay locked, also when a later
+  // preparation (a tab close) is cancelled; the window still closes, without
+  // asking the panes again.
+  if (afterTeardown === true) quitTornDown = true;
+  if (quitTornDown) {
+    showError("Update stopped after saving annotations and releasing images. Reopen the slide or restart the app.");
+    return true;
+  }
   // A retry can fail before contacting panes (for example while a new slide
   // is opening), so retain each earlier pane's exact request id until abort.
   for (const [sid, paneRequestId] of quitPreparedPanes) {
@@ -1273,9 +1284,6 @@ window.nd2wsiCancelUpdate = (requestId, afterTeardown = false) => {
   quitPreparedPanes.clear();
   document.documentElement.classList.remove("preparing-update");
   scheduleNativeGestureScopes();
-  if (afterTeardown === true) {
-    showError("Update stopped after saving annotations and releasing images. Reopen the slide or restart the app.");
-  }
   return true;
 };
 

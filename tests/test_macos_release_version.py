@@ -47,6 +47,13 @@ def test_mac_release_versions_preserve_package_and_stage(tmp_path, builder, vers
     assert info["ND2WSIDevelopmentOnly"] is False
 
 
+def test_mac_app_declares_macos_14_minimum(tmp_path):
+    completed, target, _ = write_release_plist(tmp_path, "build_mac_app.sh", "2.5.7")
+    assert completed.returncode == 0, completed.stderr
+    info = plistlib.loads(target.read_bytes())
+    assert info["LSMinimumSystemVersion"] == "14.0"
+
+
 @pytest.mark.parametrize("builder", ["build_mac_app.sh", "build_metal_rc.sh"])
 @pytest.mark.parametrize("version", ["2.5.0b0", "2.5.0b256", "2.5.0b"])
 def test_invalid_prerelease_version_leaves_plist_unchanged(tmp_path, builder, version):

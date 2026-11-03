@@ -209,12 +209,22 @@
 <script src="static/native-scope-v1.js"></script>
 <script src="static/shading-correction-v1.js"></script>
 <section id="update-notice" aria-labelledby="update-notice-title" role="status" aria-live="polite" hidden>
-  <h2 id="update-notice-title"></h2>
+  <div class="update-head">
+    <span class="update-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="16" height="16"><path d="M8 2.5v7.5M4.75 6.75 8 10l3.25-3.25M3.5 13h9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+    <div class="update-heading">
+      <h2 id="update-notice-title"></h2>
+      <span id="update-notice-installed" hidden></span>
+    </div>
+  </div>
   <p id="update-notice-body"></p>
-  <ul id="update-notice-changes" aria-label="What's new" hidden></ul>
+  <ul id="update-notice-changes" role="list" aria-label="What's new" hidden></ul>
+  <ul id="update-notice-entries" role="list" aria-label="Release details" tabindex="0" hidden></ul>
+  <div id="update-notice-links" hidden>
+    <button type="button" id="update-notice-expand" class="update-link" aria-expanded="false" aria-controls="update-notice-entries" hidden>Details<span class="update-chevron" aria-hidden="true"></span></button>
+    <button type="button" id="update-notice-notes" class="update-link" hidden>Release notes</button>
+  </div>
   <progress id="update-notice-progress" max="1" hidden></progress>
   <span id="update-notice-detail" hidden></span>
-  <button type="button" id="update-notice-notes" hidden>Release notes</button>
   <div id="update-notice-actions"></div>
 </section>
 <script src="static/update-card-v1.js"></script>
