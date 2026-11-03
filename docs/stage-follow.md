@@ -484,17 +484,17 @@ boxes with a visible status; subsequent presses are logged as skipped and are
 never replayed. Delivery resumes after the stalled browser call returns.
 The most recently locked following overlay is the defensive annotation owner.
 
-A new position creates `isolation #N`; repeated shots within half the target side
+A new position creates `SLACS_ROI #N`; repeated shots within half the target side
 of the previous laser item's stored target increment its shot count. Counts are
 idempotent per receiver/press. Numbers continue across sessions and are not reused
 after deletion, including deletion of the highest number. Uncalibrated targets
-still create items, labelled `isolation #N_uncalibrated`. These are original-image
+still create items with the same label; `slacs.calibrated` records which. These are original-image
 pixel polygons (or axis-aligned boxes), clipped to the image; targets outside the
 image and shapes retaining less than 25% of their area are skipped.
 
 Laser items use gray `#a0a6ae`, a non-scaling 1.5 px stroke and 16% fill. The main
-box label keeps the isolation name; its list row adds `— k shots · HH:MM` using
-the first shot time. The tracing window shows `isolation #N · k shots` for items
+box label keeps the ROI name; its list row adds `— k shots · HH:MM` using
+the first shot time. The tracing window shows `SLACS_ROI #N · k shots` for items
 confirmed by the pane during that tracing-window session. It does not preload
 historical items on open. GeoJSON export preserves the `SLACS laser`
 classification and RGB `[160,166,174]`; these are not AstroMapper items.

@@ -49,9 +49,9 @@ def test_fifty_five_press_replay_makes_eight_numbered_bursts_and_retries_do_not_
       console.log(JSON.stringify({items,ninth,last:h.owner.items[0]}));
     ''')
     assert [item["slacs"]["shots"] for item in result["items"]] == [5, 6, 7, 8, 7, 8, 7, 7]
-    assert [item["text"] for item in result["items"]] == [f"isolation #{i}" for i in range(1, 9)]
-    assert result["ninth"]["text"] == "isolation #9_uncalibrated"
-    assert result["last"]["text"] == "isolation #10"
+    assert [item["text"] for item in result["items"]] == [f"SLACS_ROI #{i}" for i in range(1, 9)]
+    assert result["ninth"]["text"] == "SLACS_ROI #9" and result["ninth"]["slacs"]["calibrated"] is False
+    assert result["last"]["text"] == "SLACS_ROI #10"
     assert all(item["type"] == "geojson" and item["color"] == "#a0a6ae" and "astromap" not in item for item in result["items"])
 
 

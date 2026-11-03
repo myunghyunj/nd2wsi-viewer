@@ -11,11 +11,11 @@ def test_main_viewer_laser_style_does_not_change_user_annotations():
 const f=fixture(),c=f.c,drawn=[];
 c.state.viewer={};c.state.annotations=[];
 for(const kind of ['box','geojson'])for(const laser of [true,false]){
-  c.state.annotations.push({id:kind+laser,type:kind,x:10,y:20,w:3,h:4,text:'isolation #1',
+  c.state.annotations.push({id:kind+laser,type:kind,x:10,y:20,w:3,h:4,text:'SLACS_ROI #1',
     ...(laser?{slacs:{kind:'laser_shot'}}:{}),geojson:{geometry:{},properties:{}}});
 }
 c.window.Nd2AnnotationGeoJSON={imageParts:()=>({paths:[{d:'M 10 20 L 13 20 L 13 24 Z',closed:true}],points:[]}),
- label:()=> 'isolation #1',bounds:()=>({x:10,y:20})};
+ label:()=> 'SLACS_ROI #1',bounds:()=>({x:10,y:20})};
 c.annColor=()=> '#123456';c.hexAlpha=(col,alpha)=>col+':'+alpha;
 c.svgEl=(tag,attrs)=>{if(['polygon','path'].includes(tag))drawn.push(attrs);return {};};
 c.chip=()=>({});c.renderLandmarks=()=>{};c.rememberAnnotationFrame=()=>{};c.toEl=(x,y)=>({x,y});
@@ -55,7 +55,7 @@ def test_tracing_draws_only_confirmed_items_and_updates_one_id_in_image_coordina
     result = run(f'''
       const h=followHarness({{initialContext:{{rotation:{angle},flip:{str(flip).lower()}}}}}),layer=h.element('laser-annotations');
       const empty=layer.children.length,foreign=h.win.nd2TranslucentLaserItem({{id:'user',type:'box',x:1,y:2,w:3,h:4}});
-      const item={{id:'laser',type:'box',x:410,y:260,w:10,h:20,text:'isolation #7',slacs:{{kind:'laser_shot',shots:2}}}};
+      const item={{id:'laser',type:'box',x:410,y:260,w:10,h:20,text:'SLACS_ROI #7',slacs:{{kind:'laser_shot',shots:2}}}};
       h.win.nd2TranslucentLaserItem(item);h.win.nd2TranslucentLaserItem({{...item,slacs:{{...item.slacs,shots:3}}}});
       const before=JSON.stringify(item),polygon=layer.children[0].attributes.points,label=layer.children[1].textContent;
       h.viewer.viewport.panTo(new Point(.45,.25));h.viewer.handlers['update-viewport']();
@@ -69,7 +69,7 @@ def test_tracing_draws_only_confirmed_items_and_updates_one_id_in_image_coordina
         sx, sy = dx * math.cos(angle_rad) - dy * math.sin(angle_rad), dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
         assert point == pytest.approx([400 + sx * (-1 if flip else 1), 250 + sy])
     assert result["empty"] == 0 and not result["foreign"] and result["count"] == 2 and result["unchanged"]
-    assert result["label"] == "isolation #7 · 3 shots" and result["polygon"] != result["after"]
+    assert result["label"] == "SLACS_ROI #7 · 3 shots" and result["polygon"] != result["after"]
     css = (MODULE.parent / "translucent-v1.css").read_text()
     rule = re.search(r"#laser-annotations polygon\s*\{([^}]+)", css)[1]
     assert "rgba(160,166,174,.16)" in rule and "stroke: #a0a6ae" in rule and "stroke-width: 1.5" in rule
@@ -91,12 +91,12 @@ def test_singular_shot_labels_and_visible_flip_save_error():
     result = run('''
       const h=followHarness({bridgeOverrides:{async set_stage_follow_flips(){return {ok:true,saved:false,message:'Could not remember direction'};}}});
       await h.mounted.setFollowFlips({x:true,y:false});
-      const item={id:'one',type:'box',x:10,y:10,w:2,h:2,text:'isolation #1',slacs:{kind:'laser_shot',shots:1,at:'2026-01-01T10:00:00Z'}};
+      const item={id:'one',type:'box',x:10,y:10,w:2,h:2,text:'SLACS_ROI #1',slacs:{kind:'laser_shot',shots:1,at:'2026-01-01T10:00:00Z'}};
       h.win.nd2TranslucentLaserItem(item);
       const pure=require(require('path').join(require('path').dirname(process.argv[1]),'slacs-laser-v1.js'));
       return {label:h.element('laser-annotations').children[1].textContent,pure:pure.label(item,true),list:pure.listLabel(item),
         hidden:h.element('stage-follow-flip-hint').hidden,error:h.element('stage-follow-flip-hint').textContent};
     ''')
-    assert result["label"] == result["pure"] == "isolation #1 · 1 shot"
+    assert result["label"] == result["pure"] == "SLACS_ROI #1 · 1 shot"
     assert " — 1 shot · " in result["list"] and "shots" not in result["list"]
     assert not result["hidden"] and result["error"] == "Could not remember direction"

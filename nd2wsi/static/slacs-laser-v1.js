@@ -41,8 +41,9 @@
     }
     return { isolation_highwater: items.filter(laser).reduce((n, a) => integer(a.slacs.isolation) ? Math.max(n,a.slacs.isolation) : n, highwater), presses };
   }
+  const ROI_LABEL = "SLACS_ROI #";
   const shotCount = item => (item.slacs.shots || 1) + ((item.slacs.shots || 1) === 1 ? " shot" : " shots");
-  const label = (item, count = false) => String(item.text || "isolation #" + item.slacs.isolation) +
+  const label = (item, count = false) => String(item.text || ROI_LABEL + item.slacs.isolation) +
     (count ? " · " + shotCount(item) : "");
   function listLabel(item) {
     const date = new Date(item.slacs.at), time = Number.isFinite(date.getTime()) ?
@@ -99,7 +100,8 @@
     const isolation = meta.isolation_highwater + 1;
     if (!Number.isSafeInteger(isolation)) return skip("number_limit");
     meta.isolation_highwater = isolation;
-    const text = "isolation #" + isolation + (input.target_calibrated ? "" : "_uncalibrated");
+    // Calibration is recorded in slacs.calibrated; the label stays short.
+    const text = ROI_LABEL + isolation;
     const slacs = { kind: "laser_shot", version: 1, isolation, press: input.press, target_px: input.target_px.slice(),
       side_um: input.target_side_um, rotation_deg: input.target_rotation_deg, calibrated: input.target_calibrated,
       at: input.at, last_at: input.at, slacs_session: input.slacs_session, receiver_id: receiver,
