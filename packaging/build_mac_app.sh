@@ -120,6 +120,9 @@ info["CFBundleVersion"] = bundle
 info["ND2WSIPackageVersion"] = version
 info["ND2WSISdpcBundled"] = True
 info["ND2WSIDevelopmentOnly"] = False
+# The README promises macOS 14 or later; older systems refuse to launch it
+# with a clear message instead of failing inside the frozen runtime.
+info["LSMinimumSystemVersion"] = "14.0"
 
 info["UTImportedTypeDeclarations"] = [
     {

@@ -116,6 +116,43 @@ def test_exits_nothing_hard_ends_keep_the_strict_unbounded_teardown(monkeypatch,
     assert not unfinished.is_set()
 
 
+def test_exit_after_an_update_gave_up_on_a_wedged_read_waits_for_that_release(monkeypatch, unfinished, under_run):
+    # Sparkle's teardown stops the server and gives up at its deadline while
+    # a read is wedged. The stopped server still holds that source, so the
+    # exit teardown must wait for the same release, and end the process after
+    # its own bound, instead of finding no server and returning at once.
+    from http_fixture import serving
+
+    from nd2wsi.direct_common import _Root
+    from nd2wsi.server import ViewerState, create_server
+
+    monkeypatch.setattr(app, "_EXIT_TEARDOWN_TIMEOUT", 0.2)
+    st = ViewerState({}, {"nd2wsi": {"source": "example.nd2", "levels": [{"path": "0", "width": 8, "height": 8}]},
+                          "omero": {"channels": [{}]}})
+    closed = []
+    st.root = _Root({}, closer=lambda: closed.append(st.busy.active))
+    api = app.Api(None)
+    with serving(create_server([], port=0)) as httpd:
+        httpd.registry.slides["12345678"] = st
+        api._httpd = httpd
+        st.busy.__enter__()  # the wedged read
+        try:
+            with pytest.raises(TimeoutError, match="slide read did not finish"):
+                api.stop_server_for_update(timeout=0.2)
+            assert api._httpd is None and api._releasing_httpd is httpd
+            app._stop_server_at_exit(api, diagnostic=False)
+            assert unfinished.is_set()
+            assert closed == []
+        finally:
+            st.busy.__exit__(None, None, None)
+        exit_teardowns = [thread for thread in threading.enumerate() if thread.name == "exit-teardown"]
+        for thread in exit_teardowns:
+            thread.join(5)
+        assert exit_teardowns and not any(thread.is_alive() for thread in exit_teardowns)
+    assert closed == [0]
+    assert api._releasing_httpd is None
+
+
 def run_native_main(monkeypatch, tmp_path, api, argv):
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path))

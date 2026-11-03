@@ -511,6 +511,7 @@ class Api:
         self._status = ""
         self._frac = -1.0  # conversion progress, -1 = not converting
         self._httpd = None
+        self._releasing_httpd = None  # stopped for an update, its sources not yet released
         self._updater = None
         self._manual_update_offer = None
         self._manual_update_lock = threading.Lock()
@@ -814,15 +815,34 @@ class Api:
             return f"Waiting for {count} {noun} to finish…"
         return None
 
-    def stop_server_for_update(self) -> None:
-        """Synchronously release sockets, ND2 handles, and plate writers."""
+    def stop_server_for_update(self, timeout: float | None = None) -> None:
+        """Synchronously release sockets, ND2 handles, and plate writers.
+
+        With ``timeout``, raise TimeoutError if slide reads still hold their
+        sources after that many seconds. The server has stopped either way
+        and the release goes on; a later call, such as the exit teardown,
+        waits for that same release again.
+        """
         self._close_translucent_windows()
         with self._server_lock:
             server, self._httpd = self._httpd, None
+            if server is None:
+                server, self._releasing_httpd = self._releasing_httpd, None
         if server is None:
             return
-        shutdown = getattr(server, "shutdown_for_relaunch", server.shutdown)
-        shutdown()
+        shutdown = getattr(server, "shutdown_for_relaunch", None)
+        try:
+            if shutdown is None:
+                server.shutdown()
+            elif timeout is None:
+                shutdown()
+            else:
+                shutdown(timeout=timeout)
+        except TimeoutError:
+            with self._server_lock:
+                self._releasing_httpd = server
+            server.server_close()
+            raise
         server.server_close()
 
     def open_slide(self):

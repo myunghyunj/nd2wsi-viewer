@@ -120,6 +120,7 @@ class Api:
         self.probed = threading.Event()
         self.closed = threading.Event()
         self.close_threads = []
+        self.close_timeouts = []
         self.close_error = None
         self.close_entered = threading.Event()
         self.close_release = None
@@ -129,7 +130,8 @@ class Api:
         self.probed.set()
         return self.reason
 
-    def stop_server_for_update(self):
+    def stop_server_for_update(self, timeout=None):
+        self.close_timeouts.append(timeout)
         self.close_threads.append(threading.current_thread())
         self.trace.append("close-server")
         self.close_entered.set()
@@ -199,6 +201,7 @@ def test_prepare_returns_without_blocking_main_and_relaunches_on_main(driver):
     driver.main.until(lambda: bool(driver.completions))
     assert driver.trace.index("flush") < driver.trace.index("close-server")
     assert driver.trace.index("close-server") < driver.trace.index("completion")
+    assert driver.api.close_timeouts == [driver.coordinator._TEARDOWN_TIMEOUT] == [10.0]
     assert driver.completions == [threading.main_thread()]
     assert all(thread is not threading.main_thread() for thread in driver.api.close_threads)
     assert all(thread is not threading.main_thread() for _, thread in driver.window.calls)
@@ -249,7 +252,7 @@ def test_active_exports_or_conversion_are_drained_before_server_close(driver):
     exports = SimpleNamespace(count=2)
     shutdown_threads = []
 
-    def shutdown():
+    def shutdown(timeout=None):
         shutdown_threads.append(threading.current_thread())
         driver.trace.append("shutdown-server")
 
@@ -278,6 +281,114 @@ def test_active_exports_or_conversion_are_drained_before_server_close(driver):
     assert driver.trace.index("shutdown-server") < driver.trace.index("server-close")
     assert driver.trace.index("server-close") < driver.trace.index("completion")
     assert driver.window.main_calls == []
+
+
+def wedged_read(driver):
+    """A real Api and registry whose one slide has a read holding its busy lease."""
+    from nd2wsi.direct_common import _Lifecycle
+    from nd2wsi.server import SlideRegistry
+
+    registry = SlideRegistry()
+    busy, closed = _Lifecycle(), []
+    registry.slides["slide"] = SimpleNamespace(
+        busy=busy, exports=_Lifecycle(), plate=None, close_shading=lambda: None,
+        root=SimpleNamespace(close=lambda delay=5.0: closed.append((delay, busy.active))),
+    )
+    server = SimpleNamespace(
+        registry=registry,
+        shutdown_for_relaunch=lambda timeout=None: registry.close_all_for_relaunch(timeout=timeout),
+        server_close=lambda: driver.trace.append("server-close"),
+    )
+    real_api = app.Api(None)
+    real_api._httpd = server
+    driver.coordinator.api = real_api
+    busy.__enter__()
+    return SimpleNamespace(api=real_api, server=server, registry=registry, busy=busy, closed=closed)
+
+
+def teardown_wait_noticed(driver):
+    return any("Waiting for a slide read to finish before installing the update" in script
+               for script, _ in driver.window.calls)
+
+
+def test_a_read_that_outlasts_the_first_wait_still_lets_the_update_install(driver):
+    # A read from a slow share holds its source past the first wait. The
+    # update says what it waits for, keeps waiting on the same release, and
+    # installs once the read ends; the root never closes under it.
+    read = wedged_read(driver)
+    driver.coordinator._TEARDOWN_TIMEOUT = 0.1
+    driver.coordinator._TEARDOWN_LIMIT = 10.0
+    try:
+        driver.prepare()
+        driver.main.until(lambda: len(driver.window.flushes) == 1)
+        driver.window.reply(0, {"ok": True, "panes": 1})
+        driver.main.until(lambda: teardown_wait_noticed(driver))
+        assert driver.completions == [] and driver.failures == []
+        assert read.closed == [] and read.registry.slides == {}
+        assert sum(thread.name == "nd2wsi-relaunch-release" for thread in threading.enumerate()) == 1
+    finally:
+        read.busy.__exit__(None, None, None)
+    driver.main.until(lambda: bool(driver.completions))
+    assert read.closed == [(0, 0)]
+    assert driver.completions == [threading.main_thread()]
+    assert driver.failures == []
+    assert driver.window.cancellations == []
+    assert read.api._httpd is None and read.api._releasing_httpd is None
+    assert driver.coordinator._ownership().torn_down is False
+
+
+def test_a_read_that_never_ends_fails_the_update_after_the_limit_with_what_to_do(driver):
+    # A read wedged in native code never lets go. The update gives up after
+    # its limit and tells the user how to install, and nothing closes under
+    # the read; the exit teardown later waits for that same release.
+    read = wedged_read(driver)
+    driver.coordinator._TEARDOWN_TIMEOUT = 0.1
+    driver.coordinator._TEARDOWN_LIMIT = 0.4
+    try:
+        driver.prepare()
+        driver.main.until(lambda: len(driver.window.flushes) == 1)
+        started = time.monotonic()
+        driver.window.reply(0, {"ok": True, "panes": 1})
+        driver.main.until(lambda: bool(driver.failures) and not driver.coordinator._running)
+        assert 0.4 <= time.monotonic() - started < 2.5
+        assert driver.failures == [
+            "Update could not close the viewer safely: a slide read did not finish within 0.4 seconds. "
+            "Quit and reopen the viewer to install the update."
+        ]
+        assert teardown_wait_noticed(driver)
+        assert driver.completions == []
+        assert driver.main.native_callbacks == []
+        # Recovery tells the shell the server is gone, so it keeps the panes frozen.
+        assert driver.window.cancellations == [[driver.window.flushes[0].request_id, True]]
+        assert driver.coordinator._ownership().torn_down is True
+        assert read.api._httpd is None and read.api._releasing_httpd is read.server
+        assert "server-close" in driver.trace
+        assert read.registry.slides == {} and read.closed == []
+    finally:
+        read.busy.__exit__(None, None, None)
+    read.api.stop_server_for_update()
+    assert read.closed == [(0, 0)]
+    assert read.api._releasing_httpd is None
+
+
+def test_a_cancel_while_waiting_for_a_slow_read_stops_waiting(driver):
+    read = wedged_read(driver)
+    driver.coordinator._TEARDOWN_TIMEOUT = 0.1
+    driver.coordinator._TEARDOWN_LIMIT = 30.0
+    try:
+        driver.prepare()
+        driver.main.until(lambda: len(driver.window.flushes) == 1)
+        driver.window.reply(0, {"ok": True, "panes": 1})
+        driver.main.until(lambda: teardown_wait_noticed(driver))
+        started = time.monotonic()
+        driver.coordinator.cancel_preparation()
+        driver.main.until(lambda: not driver.coordinator._running)
+        assert time.monotonic() - started < 2.5
+        assert driver.failures == [] and driver.completions == []
+        assert driver.window.cancellations == [[driver.window.flushes[0].request_id, True]]
+        assert read.closed == []
+    finally:
+        read.busy.__exit__(None, None, None)
 
 
 def test_duplicate_preparation_reports_failure_outside_the_coordinator_lock(driver):

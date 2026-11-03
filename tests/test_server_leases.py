@@ -1009,6 +1009,72 @@ def test_shutdown_waits_for_a_slide_closed_while_a_read_finishes(shutdown):
     assert closed == [0]
 
 
+def test_relaunch_close_gives_up_on_a_wedged_read_at_its_deadline_and_releases_after_it():
+    # A read wedged in native code (a share that went away) never lets go of
+    # its busy lease. An update must not wait for it forever, but the root
+    # still closes only once the read has finished.
+    from nd2wsi.direct_common import _Root
+
+    st = state()
+    closed = []
+    st.root = _Root({}, closer=lambda: closed.append(st.busy.active))
+    registry = window_registry(st)
+    st.busy.__enter__()  # the wedged read
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match=r"slide read did not finish within 0\.2 seconds"):
+            registry.close_all_for_relaunch(timeout=0.2)
+        assert 0.2 <= time.monotonic() - started < 2.0
+        assert registry.slides == {}  # barred from new requests at once
+        assert st.busy.closed is True
+        assert closed == []  # never under the reader
+        # A second bounded wait joins the same release instead of starting
+        # another, and gives up at its own deadline.
+        with pytest.raises(TimeoutError):
+            registry.close_all_for_relaunch(timeout=0.05)
+    finally:
+        st.busy.__exit__(None, None, None)
+    # The exit teardown's unbounded wait returns once the read has ended.
+    registry.close_all_for_relaunch()
+    assert closed == [0]
+
+
+def test_relaunch_close_reports_a_release_error_to_every_waiter():
+    st = state()
+
+    class Root(dict):
+        def close(self, delay=None):
+            raise OSError("source handle could not close")
+
+    st.root = Root()
+    registry = window_registry(st)
+    for _ in range(2):
+        with pytest.raises(OSError, match="source handle could not close"):
+            registry.close_all_for_relaunch(timeout=2.0)
+
+
+def test_relaunch_close_without_a_release_thread_releases_on_the_caller(monkeypatch):
+    st = state()
+    closed = []
+
+    class Root(dict):
+        def close(self, delay=None):
+            closed.append((delay, threading.current_thread()))
+
+    st.root = Root()
+    registry = window_registry(st)
+    start = threading.Thread.start
+
+    def no_release_thread(thread):
+        if thread.name == "nd2wsi-relaunch-release":
+            raise RuntimeError("can't start new thread")
+        return start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", no_release_thread)
+    registry.close_all_for_relaunch(timeout=0.2)
+    assert closed == [(0, threading.current_thread())]
+
+
 def test_a_window_close_without_a_closer_thread_still_closes_the_root(monkeypatch):
     st = state()
     closed = []

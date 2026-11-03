@@ -80,13 +80,15 @@ class Shell:
 
     Like ``nd2wsiPrepareForUpdate``/``nd2wsiCancelUpdate`` it remembers one
     current request id, and a cancellation unlocks the panes only while its
-    id is still that one.
+    id is still that one. One sent after the server's teardown keeps them
+    frozen for good.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self.current = ""
         self.frozen = False
+        self.torn_down = False
         self.prepares = []
         self.cancels = []
         self.notices = []
@@ -105,7 +107,7 @@ class Shell:
                 self.notices.append(json.loads(notice.group(1)))
             return None
         prepare = re.search(r'nd2wsiPrepareForUpdate\(("[^"]+")\)', script)
-        cancel = re.search(r'nd2wsiCancelUpdate\(("[^"]+")', script)
+        cancel = re.search(r'nd2wsiCancelUpdate\(("[^"]+"), (true|false)\)', script)
         with self._lock:
             if prepare:
                 wire_id = json.loads(prepare.group(1))
@@ -119,7 +121,8 @@ class Shell:
                 wire_id = json.loads(cancel.group(1))
                 honoured = wire_id == self.current
                 if honoured:
-                    self.current, self.frozen = "", False
+                    self.torn_down = self.torn_down or cancel.group(2) == "true"
+                    self.current, self.frozen = "", self.torn_down
                 self.cancels.append((wire_id, honoured))
                 return None
             else:
@@ -147,13 +150,18 @@ class Api:
         self._status = ""
         self.exports = 0
         self.frozen_at_teardown = None
+        self.teardown_timeouts = []
+        self.teardown_error = None
 
     def update_block_reason(self):
         return EXPORT_WAIT if self.exports else None
 
-    def stop_server_for_update(self):
+    def stop_server_for_update(self, timeout=None):
+        self.teardown_timeouts.append(timeout)
         self.frozen_at_teardown = self.shell.frozen
         self._httpd = None
+        if self.teardown_error is not None:
+            raise self.teardown_error
 
 
 @pytest.fixture()
@@ -235,6 +243,7 @@ def test_close_runs_its_save_handshake_once_the_cancelled_update_lets_go(pair):
     until_the_update_lets_go(p)
     assert p.shell.cancels == [(update_wire, True)]
     assert not p.shell.frozen
+    until(lambda: p.api._status == "")
 
     p.api.exports = 0
     assert p.ui.call(p.close.on_closing) is False  # the handshake, not the veto
@@ -361,6 +370,88 @@ def test_sparkle_quit_after_the_installer_resumes_reaches_the_close_guard(pair):
     assert NOTICE not in p.shell.notices
     assert p.api.frozen_at_teardown is True
     assert p.update._running is True  # still waiting for Sparkle to end the process
+
+
+def test_close_after_sparkle_aborts_past_teardown_needs_no_save_handshake(pair):
+    p = pair
+    resumed = threading.Event()
+    assert p.update.prepare_for_update(resumed.set, p.failures.append) is True
+    until(resumed.is_set)
+    update_wire = p.shell.prepares[0]
+    assert p.api.frozen_at_teardown is True and p.api._httpd is None
+
+    # Sparkle aborts after the server stopped: the shell keeps the panes
+    # frozen, since nothing edited now could be saved.
+    p.update.cancel_preparation()
+    until_the_update_lets_go(p)
+    assert p.shell.cancels == [(update_wire, True)]
+    assert p.shell.frozen
+
+    # So the next close asks the panes nothing and the window closes at once.
+    assert p.ui.call(p.close.on_closing) is True
+    assert p.close._running is False
+    assert p.shell.prepares == [update_wire]
+    assert any("an update already saved the panes and stopped the server" in line for line in p.logs)
+    assert p.failures == []
+
+    # A slide opened since would have started a new server with new edits.
+    p.api._httpd = object()
+    assert p.ui.call(p.close.on_closing) is False
+    assert p.shell.destroyed.wait(5)
+    until(lambda: not p.close._running)
+    assert len(p.shell.prepares) == 2
+
+
+def test_a_teardown_that_times_out_is_reported_and_the_window_still_closes(pair):
+    p = pair
+    p.update._TEARDOWN_TIMEOUT = 0.05
+    p.update._TEARDOWN_LIMIT = 0.2
+    p.api.teardown_error = TimeoutError("a slide read did not finish within 0.05 seconds")
+    assert p.update.prepare_for_update(p.complete, p.failures.append) is True
+    until_the_update_lets_go(p)
+    message = ("Update could not close the viewer safely: a slide read did not finish within 0.2 seconds. "
+               "Quit and reopen the viewer to install the update.")
+    assert p.failures == [message]
+    assert p.shell.notices.count("Waiting for a slide read to finish before installing the update…") == 1
+    assert message in p.shell.notices
+    assert p.completions == []
+    assert p.api.teardown_timeouts[0] == 0.05
+    assert all(timeout <= 0.2 for timeout in p.api.teardown_timeouts)
+    assert p.shell.cancels == [(p.shell.prepares[0], True)] and p.shell.frozen
+
+    assert p.ui.call(p.close.on_closing) is True
+    assert p.shell.prepares[1:] == []
+
+
+def test_the_close_veto_notice_clears_when_sparkle_aborts(pair):
+    p = pair
+    # The start page polls the status; after an abort it must not keep saying
+    # an update is about to install.
+    p.shell.events = SimpleNamespace(_pywebviewready=threading.Event())
+    p.api._httpd = SimpleNamespace(registry=SimpleNamespace(slides={}))
+    start_update_waiting_for_an_export(p)
+    assert p.ui.call(p.close.on_closing) is False
+    assert p.api._status == NOTICE
+
+    p.update.cancel_preparation()
+    until_the_update_lets_go(p)
+    until(lambda: p.api._status == "")
+
+    # A veto that found the preparation still owning the panes, but sets its
+    # notice only after the preparation let go, does not leave it behind.
+    p.close._refuse_close_while_preparing_update()
+    assert p.api._status == ""
+
+
+def test_the_close_veto_notice_clear_keeps_any_other_status(pair):
+    p = pair
+    start_update_waiting_for_an_export(p)
+    assert p.ui.call(p.close.on_closing) is False
+    p.api._status = "could not open slide.nd2: file is missing"
+    p.update.cancel_preparation()
+    until(lambda: not any(thread.name == "updater-safe-relaunch" and thread.is_alive()
+                          for thread in threading.enumerate()))
+    assert p.api._status == "could not open slide.nd2: file is missing"
 
 
 def test_veto_does_not_wait_for_a_viewer_that_cannot_show_the_notice(pair):

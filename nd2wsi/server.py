@@ -640,6 +640,8 @@ class SlideRegistry:
         # States that left the registry and whose roots have not closed yet,
         # mostly while a read finishes; shutdown and relaunch wait for them.
         self._closing: list[ViewerState] = []
+        # close_all_for_relaunch's release: (done, errors), once it started.
+        self._relaunch_release: tuple[threading.Event, list[Exception]] | None = None
         self.max_render_mpx = max_render_mpx
         self._lock = threading.Lock()
         self._closing_done = threading.Condition(self._lock)
@@ -1259,17 +1261,53 @@ class SlideRegistry:
             states = [*self.slides.values(), *self._retired]
         return sum(st.exports.active for st in states)
 
-    def close_all_for_relaunch(self) -> None:
+    def close_all_for_relaunch(self, timeout: float | None = None) -> None:
         """Synchronously release every source and writer before an update.
 
         Unlike ordinary tab closure, this path may not leave delayed native
         teardown behind: Sparkle is about to replace the application bundle
         and relaunch the process.  Removing the states first bars new requests;
         the lifecycle guards then drain work which already obtained a state.
+
+        ``timeout`` bounds the whole wait. A read wedged in native code (a
+        share that went away) never returns, and an update waiting for it
+        would never install, so after ``timeout`` seconds this raises
+        TimeoutError and the update backs out. Nothing closes under a reader:
+        the release goes on, in the same order, on its own thread until the
+        reads let go, and a later call waits for that same release instead
+        of starting another.
         """
         with self._lock:
-            states = list(self.slides.values())
-            self.slides.clear()
+            release = self._relaunch_release
+            started = release is None
+            if started:
+                states = list(self.slides.values())
+                self.slides.clear()
+                release = self._relaunch_release = (threading.Event(), [])
+        done, errors = release
+        if started:
+            def release_all() -> None:
+                try:
+                    self._release_for_relaunch(states)
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    done.set()
+
+            try:
+                threading.Thread(
+                    target=release_all, name="nd2wsi-relaunch-release", daemon=True
+                ).start()
+            except Exception:
+                # No thread to wait on: release here, without the bound,
+                # rather than leave a source or writer open.
+                release_all()
+        if not done.wait(timeout):
+            raise TimeoutError(f"a slide read did not finish within {timeout:g} seconds")
+        if errors:
+            raise errors[0]
+
+    def _release_for_relaunch(self, states: list[ViewerState]) -> None:
         for st in states:
             st.close_shading()
             st.busy.close(timeout=None)
@@ -2566,14 +2604,19 @@ def create_server(
             super().shutdown()
             self._close_registry()
 
-        def shutdown_for_relaunch(self) -> None:
-            """Stop accepting work and synchronously release update locks."""
+        def shutdown_for_relaunch(self, timeout: float | None = None) -> None:
+            """Stop accepting work and synchronously release update locks.
+
+            With ``timeout``, raise TimeoutError while reads still hold
+            sources after it. The release goes on, and calling this again
+            waits for it again.
+            """
             super().shutdown()
-            if getattr(self, "_registry_closed", False):
-                return
-            self._registry_closed = True
-            registry.astromap_downloads.close()
-            registry.close_all_for_relaunch()
+            if not getattr(self, "_registry_closed", False):
+                self._registry_closed = self._released_for_relaunch = True
+                registry.astromap_downloads.close()
+            if getattr(self, "_released_for_relaunch", False):
+                registry.close_all_for_relaunch(timeout=timeout)
 
         def server_close(self) -> None:
             self._close_registry()
