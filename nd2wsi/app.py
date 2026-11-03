@@ -1766,8 +1766,13 @@ def main(argv: list[str] | None = None) -> int:
             report = getattr(api, "_browser_replay_report", {"ok": False, "error": "Replay did not complete"})
             result = 0 if report.get("ok") else 4
     except Exception as exc:
+        import traceback
+
         from .windows_bundle import startup_hint
 
+        detail = traceback.format_exc().rstrip()
+        _dlog(detail)
+        print(detail, file=sys.stderr)
         message = f"Could not start {APP_NAME}: {exc}"
         if hint := startup_hint(message):
             message += "\n\n" + hint

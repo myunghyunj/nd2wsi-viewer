@@ -146,29 +146,24 @@ try {
         $runs += $run
     }
 
-    # Negative control: when the marks cannot be removed, the users' startup
-    # failure must appear with its hint. This proves the marked runs above
-    # exercised it. If the deny does not hold, the app starts and this fails.
+    # Negative control: with the repair switched off, the marked folder must
+    # fail with the users' startup error and its hint. This proves the marked
+    # runs above exercised the failure; a runner that ignores the mark fails here.
     Expand-Archive -LiteralPath $archivePath -DestinationPath $controlRoot
     $controlApp = Join-Path $controlRoot 'nd2wsi-viewer'
     Set-DownloadMark $controlApp
-    $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $assemblies = @(Get-AssemblyFile $controlApp)
-    foreach ($assembly in $assemblies) {
-        & attrib.exe +R $assembly.FullName
-        & icacls.exe $assembly.FullName /deny "${user}:(D)" /Q | Out-Null
-        if ($LASTEXITCODE) { throw "Could not protect $($assembly.FullName)." }
-    }
-    foreach ($folder in @($assemblies | ForEach-Object DirectoryName | Sort-Object -Unique)) {
-        & icacls.exe $folder /deny "${user}:(DC)" /Q | Out-Null
-        if ($LASTEXITCODE) { throw "Could not protect $folder." }
-    }
     $blockedLog = Join-Path $evidencePath 'gui-smoke-blocked.log'
     $blockedReport = Join-Path $evidencePath 'gui-smoke-blocked.json'
     Remove-Item -LiteralPath $blockedLog, $blockedReport -Force -ErrorAction SilentlyContinue
     $env:ND2WSI_LOG_FILE = $blockedLog
-    $blocked = Invoke-Packaged -Executable (Join-Path $controlApp 'nd2wsi-viewer.exe') -Timeout 180000 -Mode 'gui-smoke' `
-        -Arguments @('--gui-smoke', $slide, '--smoke-report', $blockedReport)
+    $env:ND2WSI_KEEP_DOWNLOAD_MARKS = '1'
+    try {
+        $blocked = Invoke-Packaged -Executable (Join-Path $controlApp 'nd2wsi-viewer.exe') -Timeout 180000 -Mode 'gui-smoke' `
+            -Arguments @('--gui-smoke', $slide, '--smoke-report', $blockedReport)
+    }
+    finally {
+        Remove-Item Env:ND2WSI_KEEP_DOWNLOAD_MARKS -ErrorAction SilentlyContinue
+    }
     if (Test-Path -LiteralPath $blockedLog) { Get-Content -LiteralPath $blockedLog -Encoding UTF8 }
     if ($blocked.exit_code -eq 0) { throw 'The app started although its assemblies kept the download mark.' }
     $blockedResult = Get-Content -LiteralPath $blockedReport -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -203,10 +198,6 @@ try {
 }
 finally {
     $env:ND2WSI_LOG_FILE = $previousLog
-    if (Test-Path -LiteralPath $controlRoot) {
-        & icacls.exe $controlRoot /reset /T /C /Q | Out-Null
-        & attrib.exe -R "$controlRoot\*" /S /D
-    }
     # Only this invocation's private fixture/extraction directory is disposable.
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

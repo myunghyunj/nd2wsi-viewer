@@ -134,7 +134,8 @@ def test_the_verifier_reproduces_and_checks_the_download_mark():
     verifier = (ROOT / "packaging/verify_windows.ps1").read_text(encoding="utf-8")
     assert "-Stream 'Zone.Identifier'" in verifier and "ZoneId=3" in verifier
     assert verifier.index("Set-DownloadMark $appRoot") < verifier.index("Invoke-Packaged -Executable $exe")
-    assert '/deny "${user}:(D)"' in verifier and '/deny "${user}:(DC)"' in verifier
+    control = verifier.index("$env:ND2WSI_KEEP_DOWNLOAD_MARKS = '1'")
+    assert verifier.index("Set-DownloadMark $controlApp") < control
+    assert verifier.index("Remove-Item Env:ND2WSI_KEEP_DOWNLOAD_MARKS", control) > control
     assert "-notmatch 'Python\\.Runtime'" in verifier and "-notmatch 'Unblock'" in verifier
     assert "_internal|nd2wsi-viewer.exe|READ-ME.txt" in verifier
-    assert "/reset /T" in verifier

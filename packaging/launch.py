@@ -32,7 +32,9 @@ if sys.platform == "win32":
 
 # Explorer marks every file extracted from a downloaded ZIP, and .NET Framework
 # then refuses pythonnet's assemblies. Clear the marks before anything imports clr.
-if sys.platform == "win32" and getattr(sys, "frozen", False):
+# ND2WSI_KEEP_DOWNLOAD_MARKS=1 keeps them, to reproduce the blocked start.
+if (sys.platform == "win32" and getattr(sys, "frozen", False)
+        and os.environ.get("ND2WSI_KEEP_DOWNLOAD_MARKS") != "1"):
     from nd2wsi.windows_bundle import clear_download_marks
 
     for failure in clear_download_marks(Path(sys._MEIPASS)):

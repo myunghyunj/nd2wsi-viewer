@@ -89,9 +89,13 @@ def test_the_launcher_clears_marks_before_anything_imports_the_app():
     launcher = (ROOT / "packaging/launch.py").read_text(encoding="utf-8")
     assert launcher.index("clear_download_marks(Path(sys._MEIPASS))") < launcher.index("from nd2wsi.app import run")
     assert 'sys.platform == "win32" and getattr(sys, "frozen", False)' in launcher
+    # Support and CI can keep the marks to reproduce the blocked start.
+    assert 'os.environ.get("ND2WSI_KEEP_DOWNLOAD_MARKS") != "1"' in launcher
 
 
 def test_the_startup_error_carries_the_hint():
     source = (ROOT / "nd2wsi/app.py").read_text(encoding="utf-8")
     failure = source.index('message = f"Could not start {APP_NAME}: {exc}"')
     assert source.index("startup_hint(message)", failure) < source.index("_startup_error(message", failure)
+    # The traceback reaches both logs, so a support report shows where it failed.
+    assert source.rindex("traceback.format_exc()", 0, failure) > source.rindex("except Exception as exc:", 0, failure)
