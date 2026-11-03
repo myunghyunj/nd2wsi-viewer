@@ -20,6 +20,8 @@ from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parents[1]
 APP = "nd2wsi-viewer"
+# Provenance and licences ship inside the runtime folder (see build_windows.py).
+ABOUT = "_internal/nd2wsi-viewer-about"
 RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
 }
@@ -85,7 +87,7 @@ def extract_payload(archive: Path, destination: Path) -> dict[str, str]:
             if any(str(parent).casefold() in file_names
                    for parent in relative.parents if str(parent) != "."):
                 raise ValueError(f"File/directory collision: {relative}")
-        required = {f"{APP}.exe", "build-info.json", "LICENSE.txt", "READ-ME.txt"}
+        required = {f"{APP}.exe", "READ-ME.txt", f"{ABOUT}/build-info.json", f"{ABOUT}/LICENSE.txt"}
         if not required.issubset({str(relative) for _, relative in entries}):
             raise ValueError("Archive is missing required executable/provenance files")
         destination.mkdir(parents=True)
@@ -172,7 +174,7 @@ def main() -> int:
     readme_bytes = readme.read_bytes()
     (payload / "READ-ME.txt").write_bytes(readme_bytes)
     files["READ-ME.txt"] = hashlib.sha256(readme_bytes).hexdigest()
-    info = json.loads((payload / "build-info.json").read_text(encoding="utf-8"))
+    info = json.loads((payload / ABOUT / "build-info.json").read_text(encoding="utf-8"))
     version = info["version"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("Installer requires a three-part numeric app version")

@@ -26,7 +26,8 @@ def test_reject_windows_unsafe_paths(name):
 
 def make_archive(path, extra):
     with zipfile.ZipFile(path, "w") as archive:
-        for name in ("nd2wsi-viewer.exe", "build-info.json", "LICENSE.txt", "READ-ME.txt"):
+        for name in ("nd2wsi-viewer.exe", "READ-ME.txt", "_internal/nd2wsi-viewer-about/build-info.json",
+                     "_internal/nd2wsi-viewer-about/LICENSE.txt"):
             archive.writestr("nd2wsi-viewer/" + name, b"test")
         for name, content in extra:
             archive.writestr(name, content)
@@ -34,7 +35,7 @@ def make_archive(path, extra):
 
 @pytest.mark.parametrize("extra", [
     [("nd2wsi-viewer/../outside", b"bad")],
-    [("nd2wsi-viewer/LICENSE.TXT", b"duplicate")],
+    [("nd2wsi-viewer/READ-ME.TXT", b"duplicate")],
     [("nd2wsi-viewer/UNINSTALL.EXE", b"conflict")],
     [("nd2wsi-viewer/.nd2wsi-install.ini", b"conflict")],
     [("nd2wsi-viewer/a", b"file"), ("nd2wsi-viewer/a/b", b"child")],
@@ -46,6 +47,16 @@ def test_rejected_archive_leaves_no_payload(tmp_path, extra):
         builder.extract_payload(archive, payload)
     assert not payload.exists()
     assert not (tmp_path / "outside").exists()
+
+
+def test_an_archive_with_the_old_top_level_layout_is_rejected(tmp_path):
+    archive, payload = tmp_path / "input.zip", tmp_path / "payload"
+    with zipfile.ZipFile(archive, "w") as source:
+        for name in ("nd2wsi-viewer.exe", "build-info.json", "LICENSE.txt", "READ-ME.txt"):
+            source.writestr("nd2wsi-viewer/" + name, b"test")
+    with pytest.raises(ValueError, match="missing required"):
+        builder.extract_payload(archive, payload)
+    assert not payload.exists()
 
 
 def test_uninstall_lists_only_verified_files_and_empty_directories(tmp_path):

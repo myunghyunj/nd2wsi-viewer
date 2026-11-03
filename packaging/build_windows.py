@@ -25,6 +25,19 @@ from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parents[1]
 APP = "nd2wsi-viewer"
+# Users see only the executable, PyInstaller's runtime folder and the READ-ME.
+# Licences, provenance and codec notices ship inside _internal; the hyphen keeps
+# that folder from being importable as a package from _internal on sys.path.
+ABOUT = "nd2wsi-viewer-about"
+TOP_LEVEL = {f"{APP}.exe", "_internal", "READ-ME.txt"}
+MAX_BUNDLE_FILES = 3200
+# Collected from the build environment, never used by the app at runtime.
+# "testing" packages stay: numpy.testing and zarr.testing can be imported.
+EXCLUDED_MODULES = ("tkinter", "_tkinter", "pytest", "_pytest")
+PRUNED_DIRS = {"tests", "__pycache__"}
+SHIPPED_EXTRAS = ("app", "legacy", "nd2export", "sdpc", "svs")
+# The PyInstaller bootloader and runtime hooks are inside the executable.
+SHIPPED_BUILD_TOOLS = ("pyinstaller", "pyinstaller-hooks-contrib")
 
 
 def sdpc_bundle_options() -> tuple[Path, list[str]]:
@@ -114,6 +127,125 @@ def source_provenance(source_manifest: Path | None) -> dict:
     return result
 
 
+def prune_bundle(internal: Path) -> int:
+    """Remove test suites and bytecode caches; return how many files went."""
+    root = internal.resolve(strict=True)
+    removed = 0
+    for current, dirs, _files in os.walk(root):
+        for name in [name for name in dirs if name in PRUNED_DIRS]:
+            path = Path(current, name)
+            dirs.remove(name)
+            linked = path.is_symlink() or getattr(path, "is_junction", lambda: False)()
+            if linked or not path.resolve().is_relative_to(root):
+                raise RuntimeError(f"Refusing to prune a linked folder: {path}")
+            removed += sum(1 for item in path.rglob("*") if item.is_file())
+            shutil.rmtree(path)
+    return removed
+
+
+def is_dotnet_assembly(path: Path) -> bool:
+    """True for a PE image whose CLR runtime header (data directory 14) is set."""
+    try:
+        with path.open("rb") as source:
+            head = source.read(65536)
+        if head[:2] != b"MZ":
+            return False
+        pe = struct.unpack_from("<I", head, 0x3C)[0]
+        if head[pe:pe + 4] != b"PE\0\0":
+            return False
+        optional = pe + 24
+        magic = struct.unpack_from("<H", head, optional)[0]
+        directories = optional + {0x10B: 96, 0x20B: 112}[magic]
+        if struct.unpack_from("<I", head, directories - 4)[0] <= 14:
+            return False
+        rva, size = struct.unpack_from("<II", head, directories + 14 * 8)
+        return bool(rva and size)
+    except (OSError, KeyError, struct.error):
+        return False
+
+
+def check_assembly_locations(internal: Path) -> None:
+    """Every .NET assembly must sit where the download-mark repair clears it."""
+    from nd2wsi.windows_bundle import ASSEMBLY_DIRS
+
+    allowed = [internal / folder for folder in ASSEMBLY_DIRS]
+    stray = sorted(path.relative_to(internal).as_posix() for path in internal.rglob("*")
+                   if path.suffix.lower() in {".dll", ".exe"} and path.is_file()
+                   and not any(path.is_relative_to(folder) for folder in allowed)
+                   and is_dotnet_assembly(path))
+    if stray:
+        raise RuntimeError(f".NET assemblies outside {ASSEMBLY_DIRS} would keep a download mark: {stray}")
+
+
+def shipped_distributions() -> set[str]:
+    """Canonical names of the app's runtime dependency closure in this environment."""
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    done: dict[str, set[str]] = {}
+    pending = [("nd2wsi-viewer", set(SHIPPED_EXTRAS))]
+    while pending:
+        name, extras = pending.pop()
+        key = canonicalize_name(name)
+        if key in done and extras <= done[key]:
+            continue
+        done[key] = done.get(key, set()) | extras
+        try:
+            requirements = importlib.metadata.distribution(name).requires or ()
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        for text in requirements:
+            requirement = Requirement(text)
+            if requirement.marker is None or any(
+                    requirement.marker.evaluate({"extra": extra}) for extra in (extras or {""})):
+                pending.append((requirement.name, set(requirement.extras)))
+    return set(done) | {canonicalize_name(name) for name in SHIPPED_BUILD_TOOLS}
+
+
+def copy_licenses(internal: Path, target: Path) -> None:
+    """Licence and notice files of every shipped distribution, plus CPython's."""
+    from packaging.utils import canonicalize_name
+
+    shipped = shipped_distributions()
+    unexpected = sorted(info.name for info in internal.glob("*.dist-info")
+                        if canonicalize_name(info.name.removesuffix(".dist-info").rsplit("-", 1)[0])
+                        not in shipped)
+    if unexpected:
+        raise RuntimeError(f"Bundled distributions outside the app's dependencies: {unexpected}")
+    for distribution in importlib.metadata.distributions():
+        if canonicalize_name(distribution.metadata["Name"] or "") not in shipped:
+            continue
+        for item in distribution.files or ():
+            lowered = str(item).lower()
+            if ".dist-info/" in str(item) and any(word in lowered for word in ("license", "copying", "notice")):
+                origin = Path(distribution.locate_file(item))
+                if origin.is_file():
+                    destination = target / str(item)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(origin, destination)
+    python_license = Path(sys.base_prefix) / "LICENSE.txt"
+    if not python_license.is_file():
+        raise RuntimeError("CPython's LICENSE.txt is missing from the build interpreter")
+    destination = target / f"python-{platform.python_version()}" / "LICENSE.txt"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(python_license, destination)
+
+
+def check_layout(bundle: Path) -> int:
+    """The tidy folder users see; return the number of files it holds."""
+    top = {path.name for path in bundle.iterdir()}
+    if top != TOP_LEVEL:
+        raise RuntimeError(f"Unexpected top-level layout: {sorted(top ^ TOP_LEVEL)}")
+    leftovers = sorted(path.relative_to(bundle).as_posix() for path in (bundle / "_internal").rglob("*")
+                       if path.is_dir() and path.name in PRUNED_DIRS)
+    if leftovers:
+        raise RuntimeError(f"Pruned folders came back: {leftovers[:10]}")
+    count = sum(1 for path in bundle.rglob("*") if path.is_file())
+    if count > MAX_BUNDLE_FILES:
+        raise RuntimeError(f"The bundle holds {count} files, more than {MAX_BUNDLE_FILES}")
+    return count
+
+
 def smoke(exe: Path, source: Path, evidence: Path) -> None:
     """Exercise the actual windowed EXE, including the WebView2 renderer."""
     evidence.mkdir(parents=True, exist_ok=True)
@@ -163,9 +295,11 @@ def main() -> int:
     version = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     sdpc_manifest, sdpc_options = sdpc_bundle_options()
 
-    # Fail before packaging if either scientific export or image codecs is absent.
-    run(sys.executable, "-c", "import _tkinter, limnd2, imagecodecs, clr, webview, reportlab, pypdf; "
-        "assert imagecodecs.JPEG.available and imagecodecs.JPEG2K.available")
+    # Fail before packaging if either scientific export or image codecs is absent,
+    # or if the app's imports would need the Tk runtime the bundle excludes.
+    run(sys.executable, "-c", "import sys, limnd2, imagecodecs, clr, webview, reportlab, pypdf, nd2wsi.app; "
+        "assert imagecodecs.JPEG.available and imagecodecs.JPEG2K.available; "
+        "assert 'tkinter' not in sys.modules and '_tkinter' not in sys.modules")
     from PIL import Image
 
     icon = build / "AppIcon.ico"
@@ -183,6 +317,8 @@ def main() -> int:
         "pythonnet", "clr_loader", "reportlab", "pypdf", "charset_normalizer",
     ):
         command += ["--collect-all", package]
+    for module in EXCLUDED_MODULES:
+        command += ["--exclude-module", module]
     command += sdpc_options
     command += [str(REPO / "packaging" / "launch.py")]
     run(*command)
@@ -190,9 +326,13 @@ def main() -> int:
     exe = bundle / f"{APP}.exe"
     if not exe.is_file():
         raise RuntimeError("PyInstaller did not create the Windows executable")
+    internal = bundle / "_internal"
+    print(f"Pruned {prune_bundle(internal)} test and cache files")
+    check_assembly_locations(internal)
+    about = internal / ABOUT
     from bundle_sdpc_codec import stage
 
-    sdpc_source = stage(sdpc_manifest, bundle, out, version)
+    sdpc_source = stage(sdpc_manifest, about, out, version)
     manifest = {
         "app": APP,
         "version": version,
@@ -213,23 +353,15 @@ def main() -> int:
                                 for d in importlib.metadata.distributions()
                                 if d.metadata["Name"])),
     }
-    (bundle / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    shutil.copy2(REPO / "LICENSE", bundle / "LICENSE.txt")
+    (about / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    shutil.copy2(REPO / "LICENSE", about / "LICENSE.txt")
     shutil.copy2(REPO / "packaging" / "WINDOWS-README.txt", bundle / "READ-ME.txt")
-    # Include dependency licenses and metadata (useful on machines with no Python).
-    licenses = bundle / "licenses"
-    for distribution in importlib.metadata.distributions():
-        for item in distribution.files or ():
-            if ".dist-info/" not in str(item):
-                continue
-            if "license" in str(item).lower() or "copying" in str(item).lower():
-                origin = Path(distribution.locate_file(item))
-                if origin.is_file():
-                    target = licenses / str(item)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(origin, target)
+    # Licences of what actually ships (useful on machines with no Python).
+    copy_licenses(internal, about / "licenses")
+    check_layout(bundle)
     smoke(exe, source, out / "build-smoke")
     verify_source_files(provenance)
+    print(f"Bundle holds {check_layout(bundle)} files")
     archive = out / f"{APP}-{version}-windows-x64.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as target:
         for path in sorted(bundle.rglob("*")):

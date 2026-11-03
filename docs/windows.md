@@ -9,6 +9,9 @@
 | Stable 2.5.6 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.6/nd2wsi-viewer-2.5.6-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.5.6) |
 
 Extract the entire ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
+From 2.5.7 the extracted `nd2wsi-viewer` folder holds only `nd2wsi-viewer.exe`,
+`_internal` and `READ-ME.txt`. Licences, build provenance, and the SDPC decoder's
+LGPL notice and source information are in `_internal\nd2wsi-viewer-about`.
 The archive includes Python and the scientific libraries. Install Microsoft
 Edge WebView2 Runtime separately if it is missing. The app also requires .NET
 Framework 4.6.2 or later.
@@ -31,6 +34,17 @@ It has the collapsible top tools and the translucent viewer, with ROI boxes,
 navigation, locking and a 10–100% opacity slider. Windows applies opacity to
 the whole floating window, including its controls and ROI outlines. See the
 [2.5.6 notes](release-notes-2.5.6.md) for what changed in this release.
+
+### If the viewer won't start
+
+Explorer marks every file extracted from a downloaded ZIP. In 2.5.6 and earlier,
+.NET Framework then refused the bundled pythonnet library and the app stopped
+with "Failed to resolve Python.Runtime.Loader.Initialize". From 2.5.7 the app
+clears that mark from its own .NET libraries at launch, which needs a writable
+local folder. For an older build, or a read-only or network folder, right-click
+the ZIP, choose **Properties**, tick **Unblock**, and extract the whole ZIP again
+to a folder on this computer. For an already extracted folder, run
+`Get-ChildItem -Recurse "<folder>" | Unblock-File` in PowerShell.
 
 Older validation records below apply only to the versions named in them.
 
