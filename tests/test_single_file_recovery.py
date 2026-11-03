@@ -29,23 +29,27 @@ def _seed(path):
 
 
 def _crash_write(path):
-    # A tiny page cache spills dirty pages and a durable journal to disk before
-    # the process dies. An unspilled BEGIN/UPDATE is not a recovery regression.
+    # A page cache far smaller than the ~300 dirtied pages spills them and a
+    # durable journal to disk before the process dies. An unspilled BEGIN/UPDATE
+    # is not a recovery regression. 64 pages (not 4) keeps Windows disk syncs low
+    # enough that slow CI runners do not time out.
     child = subprocess.run([sys.executable, "-c", """
 import os, sqlite3, sys
 connection = sqlite3.connect(sys.argv[1], isolation_level=None)
-connection.execute('PRAGMA cache_size=4')
+connection.execute('PRAGMA cache_size=64')
 connection.execute('PRAGMA synchronous=FULL')
 connection.execute('BEGIN IMMEDIATE')
 connection.execute('UPDATE entries SET value=? WHERE key=?', (b'{"complete":false}', 'manifest.json'))
 for key, in connection.execute("SELECT key FROM entries WHERE key != 'manifest.json'").fetchall():
     connection.execute('UPDATE entries SET value=? WHERE key=?', (b'pending' * 4096, key))
 os._exit(23)
-""", str(path)], check=False, capture_output=True, timeout=20)
+""", str(path)], check=False, capture_output=True, timeout=60)
     assert child.returncode == 23, child.stderr.decode()
     journal = Path(str(path) + "-journal")
     assert journal.stat().st_size > 512
     assert journal.read_bytes()[:8] == bytes.fromhex("d9d505f920a163d7")
+    # The first journal header records spilled pages, so the crash left a hot journal.
+    assert int.from_bytes(journal.read_bytes()[8:12], "big", signed=True) > 0
     return journal
 
 
