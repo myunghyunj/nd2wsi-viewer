@@ -93,7 +93,7 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
 </div></div>
 <button id="update" type="button">Check for Updates…</button>
 <script>
-  let busy = false, polling = null;
+  let busy = false, polling = null, queuedDrops = [];
   const drop = document.getElementById('drop');
   function setStatus(t){ document.getElementById('status').textContent = t || ''; }
   const bar = document.getElementById('bar'), fill = document.getElementById('fill');
@@ -117,16 +117,29 @@ BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
   }
   function begin(){ busy = true; polling = setInterval(poll, 400); }
   function end(msg){ clearInterval(polling); busy = false; setStatus(msg || ''); bar.style.display='none'; document.getElementById('pct').textContent=''; }
+  async function drainQueued(lastUrl){
+    let url = lastUrl;
+    while (queuedDrops.length) {
+      const next = queuedDrops.splice(0);
+      const u = await pywebview.api.open_paths(next);
+      if (u) url = u;
+    }
+    return url;
+  }
   function go(promise){
     begin();
-    promise.then(url => { if (url) location.replace(url); else end(''); })
+    promise.then(url => drainQueued(url))
+      .then(url => { if (url) location.replace(url); else end(''); })
       .catch(e => end('failed: ' + e));
   }
   drop.addEventListener('click', () => { if (!busy) go(pywebview.api.open_slide()); });
   // pywebview 6 delivers dropped-file paths through a Python-side DOM
   // handler, which calls __pydrop with the real path. The JS listeners
   // below only run the visuals.
-  window.__pydrop_multi = paths => { if (!busy) go(pywebview.api.open_paths(paths)); };
+  window.__pydrop_multi = paths => {
+    if (busy) { queuedDrops.push(...(paths || [])); return; }
+    go(pywebview.api.open_paths(paths));
+  };
   window.__pydrop = path => window.__pydrop_multi([path]);
   document.addEventListener('dragover', ev => ev.preventDefault(), true);
   document.addEventListener('drop', ev => ev.preventDefault(), true);

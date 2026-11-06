@@ -1147,6 +1147,13 @@ function resetTiledImage(item) {
   // unchanged clip is the public call that schedules that pass.
   item.reset();
   if (item.tilesMatrix) item.tilesMatrix = {};
+  if (
+    typeof item._setFullyLoaded === "function" &&
+    typeof item.getDrawArea === "function" &&
+    item.getDrawArea() !== null
+  ) {
+    item._setFullyLoaded(false);
+  }
   if (typeof item.setClip === "function" && typeof item.getClip === "function") {
     item.setClip(item.getClip());
   }
@@ -2682,7 +2689,7 @@ function pixelSize() {
 }
 
 function basename(p) {
-  return p ? String(p).split("/").pop() : "";
+  return p ? String(p).split(/[\\/]/).pop() : "";
 }
 
 function lineLengthUm(a) {
@@ -3340,7 +3347,7 @@ function geojsonFilename(info) {
   const name = basename(info && info.name);
   const stem = name
     .replace(/\.ome\.zarr$/i, "")
-    .replace(/\.(nd2|svs)$/i, "");
+    .replace(/\.(nd2|svs|sdpc|nd2svs|jpe?g|png)$/i, "");
   const selection = info === state.info ? currentSelection() : info && info.selection;
   return safeFilenamePart(stem, "slide") + "--" +
     selectionFilenameTag(selection) + ".geojson";

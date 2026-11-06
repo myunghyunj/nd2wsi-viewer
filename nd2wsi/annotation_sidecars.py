@@ -163,7 +163,7 @@ def annotations_sidecar(
             store_path.parent / f"annotations_{stem}.json",
         )
         for old in old_paths:
-            if old == new or not old.exists():
+            if old == new or old.is_symlink() or not old.exists():
                 continue
             if not _legacy_sidecar_matches(old, source_name, home):
                 note = (

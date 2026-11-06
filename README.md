@@ -20,10 +20,10 @@
 
 ## Latest update
 
-- **Windows startup fix:** the viewer starts from a ZIP extracted with Windows Explorer, instead of stopping with "Failed to resolve Python.Runtime.Loader.Initialize".
-- **Tidier Windows download:** the extracted folder shows only `nd2wsi-viewer.exe`, `_internal` and `READ-ME.txt`.
-- **Compact update card:** updates show a few summary lines, with the full notes under **Details**.
-- **macOS updates:** installing no longer waits indefinitely for a stuck slide read, and a cancelled update leaves the window in a clear state.
+- **Windows external drives and paths:** launching from an exFAT or FAT32 drive no longer logs false download-mark warnings, and tab titles and sidecar status messages show only the file name for Windows paths.
+- **Opening multiple slides:** dropping additional files while the first slide is opening keeps every file in the queue, and concurrent conversions each keep their own progress tab.
+- **Session locks and sidecars:** closed or terminated windows clean up their `.window-live` lock files, and legacy annotation sidecar migration skips symbolic links.
+- **Update card and recovery:** release notes remain accessible while an update downloads, manual update retries lock their buttons while checking, and slides can be reopened if an update is cancelled after teardown.
 
 <p align="center">
   <img src="docs/overview-sdpc.png" alt="Brightfield SDPC slide with Slide Info in the light appearance" width="50%"><img src="docs/overview-nd2.png" alt="Fluorescence ND2 image with Channels &amp; LUTs in the dark appearance" width="50%">
@@ -31,10 +31,10 @@
 
 ## Download
 
-| Platform | Download · 2.5.7 | Requirements |
+| Platform | Download · 2.5.8 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.7/nd2wsi-viewer-2.5.7-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.7/nd2wsi-viewer-2.5.7-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.8/nd2wsi-viewer-2.5.8-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.8/nd2wsi-viewer-2.5.8-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
 
 On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
 and keep `_internal` beside `nd2wsi-viewer.exe`. See the

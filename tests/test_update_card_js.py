@@ -385,3 +385,18 @@ def test_hidden_attribute_outranks_every_card_display_rule():
     markup = (STATIC / "update-card.html").read_text(encoding="utf-8")
     for name in ("update-notice-expand", "update-notice-notes", "update-notice-links"):
         assert re.search(r'id="' + name + r'"[^>]* hidden>', markup), name
+
+
+def test_manual_retry_disables_buttons_while_check_is_in_flight():
+    result = run('''
+let resolveCheck;
+win.pywebview.api.check_for_updates=()=>new Promise(r=>{resolveCheck=r;});
+card.manual({ok:false,message:'Network timeout'});
+const retryBtn=element('update-notice-actions').children[1];
+const pending=retryBtn.click();
+const during=element('update-notice-actions').children.map(b=>b.disabled);
+resolveCheck({ok:true,available:false,mode:'manual-download',message:'Up to date'});
+await pending;
+console.log(JSON.stringify({during,title:element('update-notice-title').textContent}));
+''')
+    assert result == {"during": [True, True], "title": "No update available"}

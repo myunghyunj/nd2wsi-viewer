@@ -441,6 +441,7 @@ class UpdateCardSession:
         self.model = {"state": state, "title": title, "message": message, "token": self.token,
                       "prompt": uuid.uuid4().hex, "actions": list(self.actions),
                       "version": self.model.get("version", ""), "current_version": self.current_version,
+                      "notes": bool(self.release_url),
                       "release_notes": [dict(note) for note in self.release_notes], **extra}
         self._show()
 
