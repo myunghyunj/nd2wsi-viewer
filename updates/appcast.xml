@@ -17,7 +17,7 @@
 <li><strong>Update card and recovery.</strong> Both the start page and open slides use the bottom-right translucent update card on macOS, release notes remain accessible while an update downloads, manual update retries lock their buttons until the check finishes, and slides can be reopened by drag-and-drop if an update is cancelled after teardown.</li>
 </ul>
 ]]></description>
-            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.8/nd2wsi-viewer-2.5.8-macos-arm64.dmg" length="134372652" type="application/octet-stream" sparkle:edSignature="J2SW5knGJhRGNtiPOI9RUV6pCp1KLfrZNo2knpwRvl99XBeYIg6OkYDuIQHIA3aSJBfBuHaFLR4igEvHnfaxBg=="/>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.8/nd2wsi-viewer-2.5.8-macos-arm64.dmg" length="136402145" type="application/octet-stream" sparkle:edSignature="uy8kj1BBR56nha87xAWBHOK6s1DGoBBsajAB2dkFhR6sqWCoduFxokfXkk3I2LT/Qr386Ba78MrEWcn0cDWMAg=="/>
         </item>
         <item>
             <title>2.5.7</title>
