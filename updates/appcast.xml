@@ -3,6 +3,23 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.5.8</title>
+            <pubDate>Sat, 07 Nov 2026 01:17:00 +0900</pubDate>
+            <sparkle:version>2.5.8</sparkle:version>
+            <sparkle:shortVersionString>2.5.8</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Windows external drives and paths, reliable multi-slide opening, session lock cleanup</h2>
+<ul>
+<li><strong>Windows external drives and paths.</strong> Launching from an exFAT or FAT32 drive no longer logs false download-mark warnings, and tab titles and sidecar status messages show only the file name for Windows paths.</li>
+<li><strong>Opening multiple slides.</strong> Dropping additional files while the first slide is opening keeps every file in the queue, and concurrent conversions each keep their own progress tab.</li>
+<li><strong>Session locks and sidecars.</strong> Closed or terminated windows clean up their <code>.window-live</code> lock files, and legacy annotation sidecar migration skips symbolic links.</li>
+<li><strong>Update card and recovery.</strong> Release notes remain accessible while an update downloads, manual update retries lock their buttons until the check finishes, and slides can be reopened by drag-and-drop if an update is cancelled after teardown.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.8/nd2wsi-viewer-2.5.8-macos-arm64.dmg" length="134372652" type="application/octet-stream" sparkle:edSignature="J2SW5knGJhRGNtiPOI9RUV6pCp1KLfrZNo2knpwRvl99XBeYIg6OkYDuIQHIA3aSJBfBuHaFLR4igEvHnfaxBg=="/>
+        </item>
+        <item>
             <title>2.5.7</title>
             <pubDate>Tue, 03 Nov 2026 20:34:07 +0900</pubDate>
             <sparkle:version>2.5.7</sparkle:version>
