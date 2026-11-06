@@ -3,6 +3,23 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.5.7</title>
+            <pubDate>Tue, 03 Nov 2026 20:34:07 +0900</pubDate>
+            <sparkle:version>2.5.7</sparkle:version>
+            <sparkle:shortVersionString>2.5.7</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Windows startup fix, tidier download, compact update card</h2>
+<ul>
+<li><strong>Windows startup fix.</strong> The viewer starts from a ZIP extracted with Windows Explorer. It no longer stops with "Failed to resolve Python.Runtime.Loader.Initialize".</li>
+<li><strong>Tidier Windows download.</strong> The extracted folder shows only <code>nd2wsi-viewer.exe</code>, <code>_internal</code> and <code>READ-ME.txt</code>. The ZIP holds about 40% fewer files.</li>
+<li><strong>Compact update card.</strong> Updates show a few summary lines. Select <strong>Details</strong> to read the full notes.</li>
+<li><strong>macOS updates.</strong> Installing an update no longer waits indefinitely for a stuck slide read. A cancelled update leaves the window in a clear state, and the app declares macOS 14 as its minimum.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.7/nd2wsi-viewer-2.5.7-macos-arm64.dmg" length="133644862" type="application/octet-stream" sparkle:edSignature="J2Jz7odorV1j4zg0JhVTeFDlI8t8Rs+9phQGjIo2FZOaQvCh9gi4B9fZpm+8Tgr6UAtfdRCERNX++76yXFqlDQ=="/>
+        </item>
+        <item>
             <title>2.5.6</title>
             <pubDate>Sun, 01 Nov 2026 14:00:35 +0900</pubDate>
             <sparkle:version>2.5.6</sparkle:version>

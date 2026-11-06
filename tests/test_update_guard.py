@@ -26,6 +26,7 @@ def test_existing_windows_keep_work_until_the_user_closes_them(tmp_path, monkeyp
     assert not guard.gate.acquired
     assert json.loads((peer.root/'session.json').read_text())['state'] == 'starting'
     peer.mark_closed()
+    assert not (tmp_path / f'.window-live-{peer.id}.lock').exists()
     assert guard.acquire() is None
     try:
         with pytest.raises(RuntimeError, match='update is being installed'):
@@ -60,6 +61,7 @@ def test_process_death_releases_liveness_without_rewriting_recovery_record(tmp_p
         while (blocked := guard.acquire()) is not None and time.monotonic() < deadline:
             time.sleep(0.05)
         assert blocked is None
+        assert not (tmp_path / f'.window-live-{dead_id}.lock').exists()
         assert record.exists()
         assert json.loads(record.read_text())['state'] == 'starting'
     finally:

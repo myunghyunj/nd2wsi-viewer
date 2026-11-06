@@ -242,6 +242,7 @@ class TranslucentApi:
         self._is_active = is_active or (lambda: True)
         self._laser_delivery = None
         self._on_laser_box = on_laser_box
+        self._laser_items = {}
         self._load_timer = None
         self._target_store = target_store
         self._target_save_lock = threading.Lock()
@@ -376,7 +377,8 @@ class TranslucentApi:
             flip_x, flip_y = self._follow_flips
             return {**copy.deepcopy(self._context), "locked": self._locked, "source_format": self._source_format,
                     "follow_flips": {"flip_x": flip_x, "flip_y": flip_y},
-                    "laser_target": copy.deepcopy(self._laser_target)}
+                    "laser_target": copy.deepcopy(self._laser_target),
+                    "laser_items": copy.deepcopy(list(self._laser_items.values()))}
 
     def save_laser_target(self, payload):
         """Validate and remember a completed calibration or resize/rotation gesture."""
@@ -402,8 +404,7 @@ class TranslucentApi:
                     saved = True
                 except (OSError, ValueError) as exc:
                     message = f"Applied for this window, but could not be remembered: {exc}"
-        if payload["calibrate"]:
-            session_log.event("laser_target_set", **copy.deepcopy(target), zoom=zoom)
+        session_log.event("laser_target_set", calibrated=payload["calibrate"], **copy.deepcopy(target), zoom=zoom)
         if message:
             session_log.event("laser_target_save_failed", message=message)
         return {"ok": True, "saved": saved, "message": message, "target": copy.deepcopy(target)}
@@ -753,6 +754,10 @@ class TranslucentApi:
     def _confirm_laser_box(self, outcome):
         if self._closed or self._window is None:
             return False
+        item = outcome.get("item")
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            with self._lock:
+                self._laser_items[item["id"]] = copy.deepcopy(item)
         script = "window.nd2TranslucentLaserItem?.(" + json.dumps(outcome["item"], allow_nan=False) + "); true"
         return self._window.evaluate_js(script)
 
@@ -1236,6 +1241,8 @@ class TranslucentApi:
                 raise ValueError("The tracing window is still opening or closing.")
         self.stop_stage_follow()
         with self._lock:
+            if context.get("slide_url") != self._context.get("slide_url"):
+                self._laser_items = {}
             self._context = {**copy.deepcopy(context), "opacity": self._context["opacity"],
                              "opacity_mode": self._context["opacity_mode"]}
             self._overlay_view = None

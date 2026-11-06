@@ -332,3 +332,19 @@ def test_frontend_conflict_keeps_dirty_site_draft_and_never_adopts_other_revisio
     assert result["gets"].count("api/annotations?p=0") == 1
     assert [item["expected_revision"] for item in result["posted"]] == ["r0", "r0"]
     assert result["failed"] == 1 and any("Recovery draft:" in text for text in result["statuses"])
+
+
+def test_legacy_sidecar_migration_skips_symlinks(tmp_path, symlink_support):
+    from nd2wsi.annotation_sidecars import annotations_sidecar
+
+    store = tmp_path / "nd2wsi" / "slide.ome.zarr"
+    store.mkdir(parents=True)
+    secret = tmp_path / "outside.json"
+    secret.write_text('{"source":"slide.nd2","items":[{"id":"secret"}]}', encoding="utf-8")
+    legacy_link = tmp_path / "annotations_slide.json"
+    legacy_link.symlink_to(secret)
+
+    sidecar = annotations_sidecar(store, {"nd2wsi": {"source": "slide.nd2"}})
+    assert not sidecar.exists()
+    assert legacy_link.is_symlink()
+    assert secret.exists()

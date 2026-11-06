@@ -648,20 +648,27 @@ def test_laser_route_stamps_owner_sid_and_only_returns_ack_to_that_overlay(store
 
 
 def test_reuse_refreshes_display_and_focuses_without_another_window():
-    api = overlay.TranslucentApi({"rotation": 0, "flip": False, "query": "?c=0"}, logger=Mock(), on_closed=Mock())
+    api = overlay.TranslucentApi({"slide_url": "http://local/s/1/", "rotation": 0, "flip": False, "query": "?c=0"},
+                                 logger=Mock(), on_closed=Mock())
     api._configured = True
     api._window = Mock()
     api._page_url = "http://local/trace"
     receiver = api._stage_follow = Mock()
     api._overlay_view = {"target_px": [1, 2]}
-    updated = {"rotation": 90, "flip": True, "query": "?c=1&win=1:200", "center": [20, 30]}
+    item = {"id": "laser-1", "type": "box", "x": 1, "y": 2, "w": 3, "h": 4, "text": "SLACS_ROI #1",
+            "slacs": {"kind": "laser_shot", "shots": 1}}
+    api._confirm_laser_box({"item": item})
+    updated = {"slide_url": "http://local/s/1/", "rotation": 90, "flip": True, "query": "?c=1&win=1:200", "center": [20, 30]}
     api.refresh_context(updated)
     receiver.close.assert_called_once()
     assert api._overlay_view is None
     for key, value in updated.items():
         assert api.translucent_context()[key] == value
-    api._window.load_url.assert_called_once_with("http://local/trace")
-    api._window.show.assert_called_once()
+    assert api.translucent_context()["laser_items"] == [item]
+    api.refresh_context({**updated, "slide_url": "http://local/s/2/"})
+    assert api.translucent_context()["laser_items"] == []
+    assert api._window.load_url.call_count == 2
+    assert api._window.show.call_count == 2
     api._did_close()
 
 

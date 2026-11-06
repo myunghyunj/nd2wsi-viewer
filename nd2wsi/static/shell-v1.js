@@ -10,6 +10,7 @@ let shadingCommandSeq = 0;
 let shadingConfirmation = null;
 let slides = [];
 let active = null;
+const busyTabs = [];
 let busyTab = null;
 let busyTimer = null;
 let toastTimer = null;
@@ -708,8 +709,12 @@ function render() {
   }
 
   slides.forEach((slide) => makeTab(slide, false));
-  if (busyTab) makeTab(busyTab, true);
-  $("empty").hidden = slides.length > 0 || Boolean(busyTab);
+  if (busyTabs.length) {
+    busyTabs.forEach((entry) => makeTab(entry, true));
+  } else if (busyTab) {
+    makeTab(busyTab, true);
+  }
+  $("empty").hidden = slides.length > 0 || busyTabs.length > 0 || Boolean(busyTab);
   const compareToggle = $("compare-toggle");
   compareToggle.disabled = slides.length < 2;
   compareToggle.classList.toggle("active", compare.enabled);
@@ -955,29 +960,44 @@ function refresh(selectSid) {
 }
 
 function openMany(paths) {
+  if (quitTornDown && window.pywebview?.api?.open_paths) {
+    return window.pywebview.api.open_paths(paths).then((url) => {
+      if (url) location.replace(url);
+    });
+  }
   return paths.reduce((chain, path) => chain.then(() => openPath(path)), Promise.resolve());
+}
+
+function finishBusyEntry(entry) {
+  clearInterval(entry.timer);
+  const idx = busyTabs.indexOf(entry);
+  if (idx !== -1) busyTabs.splice(idx, 1);
+  busyTab = busyTabs[busyTabs.length - 1] || null;
+  busyTimer = busyTab ? busyTab.timer : null;
 }
 
 function openPath(path) {
   const job = Math.random().toString(36).slice(2, 10);
-  const name = path.split("/").pop();
-  busyTab = { name: `Opening ${name}…`, job, pct: null };
+  const name = String(path).split(/[\\/]/).pop();
+  const entry = { name: `Opening ${name}…`, job, pct: null, timer: null };
+  busyTabs.push(entry);
+  busyTab = entry;
   render();
 
-  clearInterval(busyTimer);
-  busyTimer = setInterval(() => {
+  entry.timer = setInterval(() => {
     fetch(`api/roi/progress?job=${job}`, { cache: "no-store" })
       .then((response) => response.json())
       .then((data) => {
-        if (!busyTab || data.state !== "converting") return;
-        busyTab.pct = data.pct || 0;
-        busyTab.name = busyTab.pct > 0
-          ? `Converting ${name} ${busyTab.pct} %`
+        if (!busyTabs.includes(entry) || data.state !== "converting") return;
+        entry.pct = data.pct || 0;
+        entry.name = entry.pct > 0
+          ? `Converting ${name} ${entry.pct} %`
           : `Preparing ${name}…`;
         render();
       })
       .catch(() => {});
   }, 400);
+  busyTimer = entry.timer;
 
   return fetch("api/open", {
     method: "POST",
@@ -986,8 +1006,7 @@ function openPath(path) {
   })
     .then((response) => response.json())
     .then((data) => {
-      clearInterval(busyTimer);
-      busyTab = null;
+      finishBusyEntry(entry);
       if (data.error) {
         render();
         showError(data.error);
@@ -996,8 +1015,7 @@ function openPath(path) {
       return refresh(data.sid);
     })
     .catch((error) => {
-      clearInterval(busyTimer);
-      busyTab = null;
+      finishBusyEntry(entry);
       render();
       showError(`Open failed: ${error}`);
     });

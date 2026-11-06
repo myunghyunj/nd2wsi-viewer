@@ -100,3 +100,13 @@ def test_singular_shot_labels_and_visible_flip_save_error():
     assert result["label"] == result["pure"] == "SLACS_ROI #1 · 1 shot"
     assert " — 1 shot · " in result["list"] and "shots" not in result["list"]
     assert not result["hidden"] and result["error"] == "Could not remember direction"
+
+
+def test_initial_context_hydrates_confirmed_laser_items():
+    result = run('''
+      const item={id:'one',type:'box',x:410,y:260,w:10,h:20,text:'SLACS_ROI #1',slacs:{kind:'laser_shot',shots:2}};
+      const h=followHarness({initialContext:{laser_items:[item,{id:'ignored',type:'box',x:1,y:2,w:3,h:4}]}});
+      const layer=h.element('laser-annotations');
+      return {count:layer.children.length,label:layer.children[1]?.textContent};
+    ''')
+    assert result == {"count": 2, "label": "SLACS_ROI #1 · 2 shots"}

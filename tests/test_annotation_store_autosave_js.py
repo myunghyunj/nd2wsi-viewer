@@ -400,3 +400,17 @@ now += 800; runTimers(); await tick();
 emit({statuses});
 """)
     assert out["statuses"] == ["Saved"]
+
+
+def test_windows_backslash_paths_show_only_the_sidecar_basename():
+    out = _run(r"""
+const {basename} = require(process.argv[1]);
+emit({
+  win: basename("C:\\Users\\lab\\nd2wsi\\annotations\\slide--t0-p0-zmid.annotations.json"),
+  posix: basename("/Users/lab/nd2wsi/annotations/slide--t0-p0-zmid.annotations.json"),
+});
+""")
+    assert out == {
+        "win": "slide--t0-p0-zmid.annotations.json",
+        "posix": "slide--t0-p0-zmid.annotations.json",
+    }

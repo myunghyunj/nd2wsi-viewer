@@ -50,6 +50,19 @@ def test_a_mark_that_cannot_be_removed_is_reported_not_raised(tmp_path, monkeypa
     assert len(failures) == 1 and "Python.Runtime.dll" in failures[0] and "denied" in failures[0]
 
 
+@pytest.mark.parametrize("winerror", [1, 50, 87, 123])
+def test_filesystems_without_alternate_data_streams_are_ignored(tmp_path, monkeypatch, winerror):
+    internal = make_internal(tmp_path)
+
+    def remove(path):
+        err = OSError(22, "The parameter is incorrect", path)
+        err.winerror = winerror
+        raise err
+
+    monkeypatch.setattr(windows_bundle.os, "remove", remove)
+    assert windows_bundle.clear_download_marks(internal, platform="win32") == []
+
+
 def test_a_missing_bundle_folder_is_not_an_error(tmp_path):
     assert windows_bundle.clear_download_marks(tmp_path / "missing", platform="win32") == []
 

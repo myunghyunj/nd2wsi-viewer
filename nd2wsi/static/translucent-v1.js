@@ -354,6 +354,13 @@
     // orientation and is aligned by hand, so none of them may act here.
     viewer.addHandler("canvas-key", event => { event.preventDefaultAction = true; });
     const laserItems = new Map(), laserLayer = doc.getElementById("laser-annotations");
+    if (Array.isArray(context.laser_items)) {
+      for (const item of context.laser_items) {
+        if (item?.slacs?.kind === "laser_shot" && typeof item.id === "string") {
+          laserItems.set(item.id, item);
+        }
+      }
+    }
     const renderLaserItems = () => {
       laserLayer.replaceChildren();
       if (!state.ready) return;

@@ -8,7 +8,7 @@
   "use strict";
 
   function basename(p) {
-    return p ? String(p).split("/").pop() : "";
+    return p ? String(p).split(/[\\/]/).pop() : "";
   }
 
   // The Fetch spec lets a page keep at most 64 KiB of keepalive request bodies
@@ -639,5 +639,5 @@
     };
   }
 
-  return { createStore, normalizeItems, splitItems, KEEPALIVE_BODY_LIMIT };
+  return { createStore, normalizeItems, splitItems, basename, KEEPALIVE_BODY_LIMIT };
 });

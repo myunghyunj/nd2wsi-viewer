@@ -11,6 +11,7 @@ cleared, before anything imports ``clr``.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from pathlib import Path
@@ -22,6 +23,9 @@ from .platform_io import filesystem_path
 # anywhere else.
 ASSEMBLY_DIRS = ("pythonnet/runtime", "clr_loader/ffi/dlls", "webview/lib")
 MARK_STREAM = ":Zone.Identifier"
+# Filesystems without NTFS Alternate Data Streams (such as exFAT and FAT32 on
+# portable SSDs) reject ":Zone.Identifier" paths with these Win32 errors.
+_NO_STREAM_WINERRORS = frozenset({1, 50, 87, 123})
 STARTUP_HINT = (
     "Windows may have blocked the files extracted from the downloaded ZIP. "
     "Right-click the ZIP, choose Properties, tick Unblock, then extract the whole "
@@ -52,6 +56,8 @@ def clear_download_marks(internal: Path, *, platform: str | None = None) -> list
             except FileNotFoundError:
                 pass
             except OSError as exc:
+                if getattr(exc, "winerror", None) in _NO_STREAM_WINERRORS or exc.errno == errno.EINVAL:
+                    continue
                 failures.append(f"{assembly}: {exc}")
     return failures
 

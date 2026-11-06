@@ -67,7 +67,9 @@ def test_bridge_saves_only_unlocked_and_report_round_trips(monkeypatch):
     payload = {"target": target(), "calibrate": True, "zoom": 2}
     assert overlay.save_laser_target(payload)["saved"]
     assert overlay.translucent_context()["laser_target"] == store.load()[0]
-    assert events[-1][0] == "laser_target_set" and events[-1][1]["zoom"] == 2
+    assert events[-1][0] == "laser_target_set" and events[-1][1]["zoom"] == 2 and events[-1][1]["calibrated"] is True
+    assert overlay.save_laser_target({"target": target(), "calibrate": False, "zoom": 3})["saved"]
+    assert events[-1][0] == "laser_target_set" and events[-1][1]["zoom"] == 3 and events[-1][1]["calibrated"] is False
     overlay._locked = True
     assert not overlay.save_laser_target(payload)["ok"]
     overlay._locked = False

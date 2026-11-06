@@ -8,6 +8,7 @@ This separates app state, not the operating system's mouse/keyboard focus.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import os
@@ -97,6 +98,8 @@ class WindowSession:
         finally:
             if self._lifetime_lock is not None:
                 self._lifetime_lock.release()
+                with contextlib.suppress(OSError):
+                    self._lifetime_lock.path.unlink(missing_ok=True)
 
 
 def create_window_session(role: str, base_path: str | Path | None = None) -> WindowSession:
@@ -140,5 +143,7 @@ def _create_session(role: str, base: Path) -> WindowSession:
         })
     except BaseException:
         session._lifetime_lock.release()
+        with contextlib.suppress(OSError):
+            session._lifetime_lock.path.unlink(missing_ok=True)
         raise
     return session

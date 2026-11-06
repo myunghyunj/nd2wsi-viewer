@@ -38,8 +38,11 @@
       const current = model;
       const samePrompt = () => model && model.token === current.token && model.prompt === current.prompt;
       if (current.manual && (action === "close" || action === "later")) { dismiss(current.token); return; }
-      if (current.manual && action === "retry") { await check(); return; }
       busy = true; render();
+      if (current.manual && action === "retry") {
+        try { await check(); } finally { if (samePrompt()) { busy = false; renderActions(); } }
+        return;
+      }
       try {
         let result;
         if (current.manual && action === "download") result = await bridge()?.open_update_download(current.token);

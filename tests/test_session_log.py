@@ -605,3 +605,27 @@ def test_slides_opened_from_the_shell_are_recorded_with_their_outcome(tmp_path):
     assert opened["ok"] is True and opened["sid"] == sid and opened["seconds"] >= 0
     assert failed["path"] == str(tmp_path / "missing.nd2") and failed["format"] == "nd2"
     assert failed["ok"] is False and failed["error"]
+
+
+def test_build_info_reads_internal_about_folder_and_includes_edition(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    exe = tmp_path / "nd2wsi-viewer" / "nd2wsi-viewer.exe"
+    about = exe.parent / "_internal" / "nd2wsi-viewer-about"
+    about.mkdir(parents=True)
+    (about / "build-info.json").write_text(json.dumps({
+        "version": "2.5.8",
+        "edition": "SLACS-module",
+        "release_version": "2.5.8_SLACS-module",
+        "commit": "abc1234",
+        "binary_architecture": "x64",
+        "webview2_runtime": {"version": "146.0.3856.109", "distribution": "fixed-version"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(sys, "executable", str(exe))
+    assert app._build_info() == {
+        "version": "2.5.8",
+        "edition": "SLACS-module",
+        "release_version": "2.5.8_SLACS-module",
+        "commit": "abc1234",
+        "binary_architecture": "x64",
+        "webview2_runtime": "fixed-version",
+    }

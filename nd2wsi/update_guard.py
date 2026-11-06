@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from .session_lock import SessionFileLock
@@ -87,13 +87,18 @@ class UpdateInstallGuard:
                 if match is None or match[1] == self.session.id:
                     continue
                 probe = SessionFileLock(path)
+                dead = False
                 try:
                     probe.acquire()
+                    dead = True
                 except TimeoutError:
                     self.release()
                     return "Close the other viewer windows before installing. Their unsaved work will be checked when you close them."
                 finally:
                     probe.release()
+                if dead:
+                    with suppress(OSError):
+                        path.unlink(missing_ok=True)
             # Older builds have no lifetime lock. AppKit's current process list
             # is authoritative for them, not retained session.json PID values.
             if self.bundle_peers():
