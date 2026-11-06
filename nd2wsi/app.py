@@ -50,7 +50,7 @@ def _dlog(msg: str) -> None:
     except OSError:
         pass
 
-BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
+BOOT_HTML = """<!doctype html><html data-update-card-shell="true" lang="en"><head><meta charset="utf-8"><style>
   html,body{height:100%;margin:0;background:var(--canvas);color:var(--label);
     font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display",sans-serif;
     -webkit-font-smoothing:antialiased;cursor:default;-webkit-user-select:none}
@@ -182,8 +182,8 @@ BOOT_HTML = BOOT_HTML.replace(
 )
 
 
-# The landing page uses the same manual card, but its readiness flag stays false
-# so automatic macOS checks always fall back to the standard Sparkle driver.
+# The landing page mounts the same translucent update card as the loaded slide
+# shell so macOS Sparkle checks and manual Windows checks both use the card.
 _UPDATE_STATIC = Path(__file__).parent / "static"
 BOOT_HTML = BOOT_HTML.replace(
     "</head>", "<style>" + "\n".join(

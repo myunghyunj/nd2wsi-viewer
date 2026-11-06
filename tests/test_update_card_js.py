@@ -90,7 +90,7 @@ def test_shell_markup_precedes_card_script_and_boot_reuses_same_module():
     html = (STATIC / "shell.html").read_text(encoding="utf-8")
     assert html.index('id="update-notice"') < html.index('src="static/update-card-v1.js"') < html.index('src="static/shell-v1.js"')
     assert 'data-update-card-shell="true"' in html
-    assert 'data-update-card-shell="true"' not in BOOT_HTML
+    assert 'data-update-card-shell="true"' in BOOT_HTML
     assert 'window.nd2wsiUpdateCard.check()' in BOOT_HTML
 
 
