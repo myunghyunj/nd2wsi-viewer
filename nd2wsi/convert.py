@@ -314,7 +314,11 @@ def _percentile_windows(
     windows = []
     for ci in range(small.shape[0]):
         if src.rgb:
-            start, end = 0.0, 255.0
+            start, end = (
+                (0.0, float(info.max))
+                if info and src.dtype != np.dtype(np.uint8)
+                else (0.0, 255.0)
+            )
         else:
             start, end = auto_window(small[ci], dtype=src.dtype)
         windows.append({"start": start, "end": end, "min": lo_all, "max": hi_all})
@@ -425,6 +429,7 @@ def convert(
     import nd2
 
     from .cache import commit_container
+    from .czi import is_czi, open_czi
     from .sdpc import is_sdpc
     from .svs import is_svs, open_svs
 
@@ -460,6 +465,10 @@ def convert(
                     if overview:
                         raise ValueError("overview stores are for ND2 sources only")
                     src = open_svs(stack, source_path, tile=tile)
+                elif is_czi(source_path):
+                    if overview:
+                        raise ValueError("overview stores are for ND2 sources only")
+                    src = open_czi(stack, source_path, selection=selection, tile=tile)
                 else:
                     handle = stack.enter_context(nd2.ND2File(str(source_path)))
                     # Coarsening a 2*tile source block yields one tile-sized
@@ -684,6 +693,9 @@ def estimate_store_bytes(
     the sample grid covers background as well as tissue, so the ratio is the
     slide's own rather than one hardcoded number.
     """
+    from contextlib import ExitStack
+
+    from .czi import is_czi, open_czi
     from .reader import PlaneSelection, level_shapes, nice_bytes, open_plane
     from .sdpc import is_sdpc
     from .svs import is_svs, sample_planes
@@ -703,6 +715,18 @@ def estimate_store_bytes(
             c = min(3, int(series.shape[-1]))
             dtype = np.dtype(series.dtype)
         blocks = [b[:c] for b in sample_planes(path, tile=tile, points=points)]
+    elif is_czi(path):
+        with ExitStack() as stack:
+            src = open_czi(stack, path, PlaneSelection(), tile=tile)
+            c, h, w = src.shape
+            dtype = src.dtype
+            side = max(1, int(round(points**0.5)))
+            for i in range(side):
+                for j in range(side):
+                    y = int((i + 0.5) / side * max(1, h - tile))
+                    x = int((j + 0.5) / side * max(1, w - tile))
+                    block = src.data[:, y : y + tile, x : x + tile]
+                    blocks.append(np.asarray(block.compute()))
     else:
         import nd2 as nd2lib
 
@@ -1033,7 +1057,7 @@ def _legacy_store_matches_source(
             for item in slide.parent.iterdir()
             if item.is_file()
             and item.stem == slide.stem
-            and item.suffix.lower() in (".nd2", ".svs", ".sdpc")
+            and item.suffix.lower() in (".nd2", ".czi", ".svs", ".sdpc")
         ]
     except OSError:
         return False

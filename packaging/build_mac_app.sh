@@ -132,6 +132,12 @@ info["UTImportedTypeDeclarations"] = [
         "UTTypeTagSpecification": {"public.filename-extension": ["nd2"]},
     },
     {
+        "UTTypeIdentifier": "com.zeiss.czi",
+        "UTTypeDescription": "Zeiss CZI microscopy image",
+        "UTTypeConformsTo": ["public.data"],
+        "UTTypeTagSpecification": {"public.filename-extension": ["czi"]},
+    },
+    {
         "UTTypeIdentifier": "com.aperio.svs",
         "UTTypeDescription": "Aperio SVS whole-slide image",
         "UTTypeConformsTo": ["public.data"],
@@ -154,6 +160,12 @@ info["CFBundleDocumentTypes"] = [
     {
         "CFBundleTypeName": "Nikon ND2 slide scan",
         "LSItemContentTypes": ["com.nikon.nis-elements.nd2"],
+        "CFBundleTypeRole": "Viewer",
+        "LSHandlerRank": "Default",
+    },
+    {
+        "CFBundleTypeName": "Zeiss CZI microscopy image",
+        "LSItemContentTypes": ["com.zeiss.czi"],
         "CFBundleTypeRole": "Viewer",
         "LSHandlerRank": "Default",
     },
