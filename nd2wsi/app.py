@@ -406,6 +406,7 @@ class Api:
 
     def __init__(self, initial: Path | None, native_gesture_scopes=None, window_session=None):
         self._initial = initial
+        self._window = None
         self._launch_source = initial
         self._status = ""
         self._frac = -1.0  # conversion progress, -1 = not converting
@@ -767,7 +768,7 @@ class Api:
     def _dialog_window(self):
         import webview
 
-        if self._window is not None:
+        if getattr(self, "_window", None) is not None:
             return self._window
         owners = [window for window in webview.windows if getattr(window, "_js_api", None) is self]
         if len(owners) == 1:
@@ -780,10 +781,15 @@ class Api:
         if self._initial is not None:
             path, self._initial = self._initial, None
         else:
-            picked = self._dialog_window().create_file_dialog(
-                webview.OPEN_DIALOG,
-                allow_multiple=True,
-                file_types=OPEN_FILE_TYPES,
+            window = self._dialog_window()
+            picked = (
+                window.create_file_dialog(
+                    webview.OPEN_DIALOG,
+                    allow_multiple=True,
+                    file_types=OPEN_FILE_TYPES,
+                )
+                if window is not None
+                else None
             )
             if not picked:
                 self._status = ""
@@ -815,10 +821,15 @@ class Api:
         """Native open dialog for the tab shell's '+' button (no convert)."""
         import webview
 
-        picked = self._dialog_window().create_file_dialog(
-            webview.OPEN_DIALOG,
-            allow_multiple=True,
-            file_types=OPEN_FILE_TYPES,
+        window = self._dialog_window()
+        picked = (
+            window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=OPEN_FILE_TYPES,
+            )
+            if window is not None
+            else None
         )
         return [str(p) for p in picked] if picked else None
 
