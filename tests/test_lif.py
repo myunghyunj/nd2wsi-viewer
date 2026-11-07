@@ -408,3 +408,67 @@ def test_lif_cli_info_and_crop_rejection(tmp_path: Path, capsys: pytest.CaptureF
         )
     err = capsys.readouterr().err
     assert "open the LIF with 'view' and use ROI export" in err
+
+
+def test_lif_zstack_plate_mode_viewer_and_roi_export(tmp_path: Path):
+    from nd2wsi.plate import is_plate_file
+
+    rng = np.random.default_rng(88)
+    h, w, n_z, n_c = 128, 128, 4, 2
+    arr = rng.integers(10, 240, size=(n_z, n_c, h, w), dtype=np.uint8)
+    lif_path = build_synthetic_lif(
+        tmp_path / "confocal_zstack.lif",
+        [
+            {
+                "name": "Confocal_3D",
+                "payload": arr.tobytes(),
+                "dims_xml": [
+                    f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="1" Length="1.0e-4" Unit="m"/>',
+                    f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w}" Length="1.0e-4" Unit="m"/>',
+                    f'<DimensionDescription DimID="3" NumberOfElements="{n_z}" BytesInc="{h * w * n_c}" Length="8.0e-6" Unit="m"/>',
+                ],
+                "chans_xml": [
+                    '<ChannelDescription DataType="0" ChannelTag="0" Resolution="8" LUTName="Green" BytesInc="0"/>',
+                    f'<ChannelDescription DataType="0" ChannelTag="0" Resolution="8" LUTName="Red" BytesInc="{h * w}"/>',
+                ],
+            }
+        ],
+    )
+    assert is_plate_file(lif_path) is True
+
+    httpd = create_server([])
+    base = server_url(httpd)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        req = urllib.request.Request(
+            base + "api/open",
+            data=json.dumps({"path": str(lif_path)}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            opened = json.loads(resp.read())
+        sid = opened["sid"]
+
+        with urllib.request.urlopen(f"{base}s/{sid}/api/info") as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+        assert info["kind"] == "plate"
+        assert info["plate"]["Z"] == n_z
+        assert info["plate"]["P"] == 1
+        assert info["plate"]["zHome"] == 2
+        assert abs(info["plate"]["zStepUm"] - 2.0) < 1e-6
+
+        with urllib.request.urlopen(f"{base}s/{sid}/api/plate/frame/0/0/3.jpg?k=8") as resp:
+            thumb = Image.open(io.BytesIO(resp.read()))
+            assert thumb.size == (16, 16)
+
+        with urllib.request.urlopen(
+            f"{base}s/{sid}/api/roi?level=0&x=10&y=12&w=32&h=24&format=tiff&t=0&p=0&z=3"
+        ) as resp:
+            tif_z3 = tifffile.imread(io.BytesIO(resp.read()))
+        assert np.array_equal(tif_z3[0], arr[3, 0, 12:36, 10:42])
+        assert np.array_equal(tif_z3[1], arr[3, 1, 12:36, 10:42])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

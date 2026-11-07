@@ -727,7 +727,7 @@ class SlideRegistry:
         )
         if is_raster(store_path):
             return self.add_direct(store_path)
-        if store_path.suffix.lower() == ".nd2" and store_path.is_file():
+        if store_path.suffix.lower() in (".nd2", ".czi", ".lif") and store_path.is_file():
             from .plate import is_plate_file
 
             if is_plate_file(store_path):
@@ -999,7 +999,7 @@ class SlideRegistry:
         from .cache import fingerprints_match, quick_fingerprint
 
         source = _manifest_source_path(cache_path, manifest)
-        if source is None or source.suffix.lower() != ".nd2" or not source.is_file():
+        if source is None or source.suffix.lower() not in (".nd2", ".czi", ".lif") or not source.is_file():
             raise ValueError("plate cache needs its original ND2 source; restore the source first")
         if not fingerprints_match(manifest.get("source", {}), quick_fingerprint(source)):
             raise ValueError("plate cache source has changed; open the original ND2 to rebuild")
@@ -1103,7 +1103,7 @@ class SlideRegistry:
                     return self.add_direct(path)
                 except NotImplementedError:
                     pass  # untiled or off-ladder file: build a store instead
-            if path.suffix.lower() == ".nd2":
+            if path.suffix.lower() in (".nd2", ".czi", ".lif"):
                 from .plate import is_plate_file
 
                 if is_plate_file(path):

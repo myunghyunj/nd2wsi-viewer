@@ -403,3 +403,57 @@ def test_czi_apotome_raw_demodulation(tmp_path: Path):
     finally:
         if hasattr(root, "close"):
             root.close()
+
+
+def test_czi_zstack_plate_mode_viewer_and_roi_export(tmp_path: Path):
+    from nd2wsi.plate import is_plate_file
+
+    rng = np.random.default_rng(77)
+    z0 = rng.integers(100, 1000, size=(128, 128), dtype=np.uint16)
+    z1 = rng.integers(1100, 2000, size=(128, 128), dtype=np.uint16)
+    z2 = rng.integers(2100, 3000, size=(128, 128), dtype=np.uint16)
+    czi_path = build_synthetic_czi(
+        tmp_path / "confocal_zstack.czi",
+        {(0, 0, 0): z0, (1, 0, 0): z1, (2, 0, 0): z2},
+        pixel_type=1,
+        compression=5,
+        channels=[("GFP", "#FF00FF00")],
+    )
+    assert is_plate_file(czi_path) is True
+
+    httpd = create_server([])
+    base = server_url(httpd)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        req = urllib.request.Request(
+            base + "api/open",
+            data=json.dumps({"path": str(czi_path)}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            opened = json.loads(resp.read())
+        sid = opened["sid"]
+
+        with urllib.request.urlopen(f"{base}s/{sid}/api/info") as resp:
+            info = json.loads(resp.read())
+        assert info["kind"] == "plate"
+        assert info["plate"]["Z"] == 3
+        assert info["plate"]["P"] == 1
+        assert info["plate"]["zHome"] == 1
+
+        # Fetch reduced frame for Z-slider preview
+        with urllib.request.urlopen(f"{base}s/{sid}/api/plate/frame/0/0/2.jpg?k=8") as resp:
+            thumb = Image.open(io.BytesIO(resp.read()))
+            assert thumb.size == (16, 16)
+
+        # Export ROI from z=2 plane and verify exact pixel match
+        with urllib.request.urlopen(
+            f"{base}s/{sid}/api/roi?level=0&x=4&y=8&w=32&h=24&format=tiff&t=0&p=0&z=2"
+        ) as resp:
+            tif_z2 = tifffile.imread(io.BytesIO(resp.read()))
+        assert np.array_equal(tif_z2.squeeze(), z2[8:32, 4:36])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
