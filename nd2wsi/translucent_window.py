@@ -82,8 +82,6 @@ def validate_context(store, payload, *, slide_url):
     if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
         raise ValueError("Unsupported translucent-viewer state")
     meta = store.attrs["nd2wsi"]
-    if meta.get("rgb") and meta.get("raster") is not True:
-        raise ValueError("The translucent viewer requires a fluorescence slide")
     width, height = (meta["levels"][0][key] for key in ("width", "height"))
     center = payload.get("center")
     if not isinstance(center, list) or len(center) != 2:

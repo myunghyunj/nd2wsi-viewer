@@ -22,7 +22,9 @@
   // Follow's two flips are remembered per file format by the app
   // (follow_flips.py), never in this page's storage: its origin changes with
   // every launch. "other" names every format not listed here.
-  const FOLLOW_FORMAT_LABELS = { nd2: "ND2", svs: "SVS", sdpc: "SDPC", jpeg: "JPEG", png: "PNG" };
+  const FOLLOW_FORMAT_LABELS = {
+    nd2: "ND2", czi: "CZI", lif: "LIF", svs: "SVS", sdpc: "SDPC", jpeg: "JPEG", png: "PNG"
+  };
   // The current view is reported at most this often, for SLACS laser-shot records.
   const VIEW_REPORT_MS = 200;
 
@@ -55,9 +57,9 @@
   }
 
   function makeTileSource(info, context, OSD) {
-    if ((info.rgb && !info.raster) || !Number.isFinite(info.width) || info.width <= 0 ||
+    if (!Number.isFinite(info.width) || info.width <= 0 ||
         !Number.isFinite(info.height) || info.height <= 0 || !info.levels?.length) {
-      throw new Error("Open a fluorescence image to use the translucent viewer");
+      throw new Error("Open an image to use the translucent viewer");
     }
     const requestedGeneration = new URLSearchParams(context.query).get("g");
     if (requestedGeneration && requestedGeneration !== info.generation) {

@@ -22,7 +22,7 @@ def launch(**options):
     const viewport={getCenter:()=>({x:0.4,y:0.3}),
       viewportToImageCoordinates:()=>({x:123.5,y:240.25}),getZoom:()=>2,
       viewportToImageZoom:()=>0.75,getRotation:()=>90,getFlip:()=>true};
-    const state={info:{rgb:!!config.rgb,raster:!!config.raster},plate:config.plate?{focus:config.grid?null:2}:null,
+    const state={info:config.noInfo?null:{rgb:!!config.rgb,raster:!!config.raster},plate:config.plate?{focus:config.grid?null:2}:null,
       viewer:{viewport},quitPreparing:!!config.closing,
       roi:{x:1,y:2,w:3,h:4},annotations:config.annotations||[{id:'must-not-copy'}],
       annReady:!!config.annotations,astromap:{activeId:config.selected}};
@@ -51,7 +51,7 @@ def launch(**options):
 
 
 @pytest.mark.parametrize("options", [{}, {"plate": True}, {"standalone": True},
-                                     {"rgb": True, "raster": True}])
+                                     {"rgb": True}, {"rgb": True, "raster": True}])
 def test_opens_once_with_current_camera_lut_and_plane_without_roi(options):
     result = launch(**options)
     assert len(result["calls"]) == 1
@@ -66,7 +66,7 @@ def test_opens_once_with_current_camera_lut_and_plane_without_roi(options):
 
 @pytest.mark.parametrize("options,reason", [
     ({"plate": True, "grid": True}, "Choose a site"),
-    ({"rgb": True}, "fluorescence"),
+    ({"noInfo": True}, "image first"),
     ({"ready": False}, "finish opening"),
     ({"closing": True}, "closing"),
     ({"browser": True}, "desktop app"),

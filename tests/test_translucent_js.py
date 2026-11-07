@@ -327,15 +327,14 @@ def test_initial_import_handoff_keeps_source_camera_until_explicit_navigation(se
     assert result["after"] == {"center": {"x": .0005, "y": .0005}, "zoom": 2}
 
 
-def test_rgb_raster_uses_existing_tile_source_while_brightfield_remains_unsupported():
+def test_rgb_slides_and_rasters_use_existing_tile_source():
     result = run("""
-      let rejected=false;
-      try{api.makeTileSource({...info,rgb:true},context,{Point});}catch(_){rejected=true;}
+      const brightfield=api.makeTileSource({...info,rgb:true},context,{Point});
       const raster=api.makeTileSource({...info,rgb:true,raster:true},context,{Point});
-      return {rejected,url:raster.getTileUrl(1,0,0)};
+      return {bfUrl:brightfield.getTileUrl(1,0,0),rasterUrl:raster.getTileUrl(1,0,0)};
     """)
-    assert result["rejected"] is True
-    assert "/api/tile/0/0/0.jpg?" in result["url"]
+    assert "/api/tile/0/0/0.jpg?" in result["bfUrl"]
+    assert "/api/tile/0/0/0.jpg?" in result["rasterUrl"]
 
 
 @pytest.mark.parametrize("mode,opacity", [("layer", .55), ("layer", .73), ("native", .73)])
@@ -1432,6 +1431,8 @@ def test_follow_flips_show_the_context_and_name_the_format():
         bridgeOverrides:bridge});
       const odd=followHarness({initialContext:{source_format:'bmp',follow_flips:{flip_x:'yes',flip_y:1}},
         bridgeOverrides:bridge});
+      const czi=followHarness({initialContext:{source_format:'czi'},bridgeOverrides:bridge});
+      const lif=followHarness({initialContext:{source_format:'lif'},bridgeOverrides:bridge});
       const sdpc=followHarness({initialContext:{source_format:'sdpc'},bridgeOverrides:bridge});
       const plain=followHarness();  // an older context and a bridge without the method
       const show=h=>({ud:h.element('stage-follow-flip-ud').checked,lr:h.element('stage-follow-flip-lr').checked,
@@ -1439,20 +1440,23 @@ def test_follow_flips_show_the_context_and_name_the_format():
         hint:h.element('stage-follow-flip-hint').textContent});
       const check=value=>{const v=api.validateContext({...context,...value},context.slide_url);
         return [v.source_format,v.follow_flips];};
-      return {nd2:show(nd2),odd:show(odd),sdpc:show(sdpc).hint,plain:show(plain),
+      return {nd2:show(nd2),odd:show(odd),czi:show(czi).hint,lif:show(lif).hint,sdpc:show(sdpc).hint,plain:show(plain),
         validated:check({source_format:'constructor',follow_flips:{flip_x:true,flip_y:'true'}}),
-        older:check({}),formats:['nd2','svs','sdpc','jpeg','png','other','PNG',7].map(f=>check({source_format:f})[0])};
+        older:check({}),
+        formats:['nd2','czi','lif','svs','sdpc','jpeg','png','other','PNG',7].map(f=>check({source_format:f})[0])};
     """)
     assert result["nd2"] == {"ud": True, "lr": False, "disabled": [False, False],
                              "hint": "Reverses Follow's movement only, never the image. "
                                      "Remembered for ND2 files on this PC."}
     assert result["odd"]["ud"] is False and result["odd"]["lr"] is False
     assert result["odd"]["hint"].endswith("Remembered for other image types on this PC.")
+    assert result["czi"].endswith("Remembered for CZI files on this PC.")
+    assert result["lif"].endswith("Remembered for LIF files on this PC.")
     assert result["sdpc"].endswith("Remembered for SDPC files on this PC.")
     assert result["plain"]["disabled"] == [True, True] and result["plain"]["ud"] is False
     assert result["validated"] == ["other", {"flip_x": True, "flip_y": False}]
     assert result["older"] == ["other", {"flip_x": False, "flip_y": False}]
-    assert result["formats"] == ["nd2", "svs", "sdpc", "jpeg", "png", "other", "other", "other"]
+    assert result["formats"] == ["nd2", "czi", "lif", "svs", "sdpc", "jpeg", "png", "other", "other", "other"]
 
 
 def test_a_flip_toggle_calls_the_bridge_stays_live_while_following_and_never_turns_the_image():

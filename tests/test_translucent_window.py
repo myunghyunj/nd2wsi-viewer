@@ -86,14 +86,16 @@ def test_plate_requires_explicit_valid_site_and_planes(store, payload):
         overlay.validate_context(store, payload, slide_url="local/")
 
 
-def test_rgb_is_not_a_fluorescence_overlay(store, payload):
-    store.attrs["nd2wsi"]["rgb"] = True
-    with pytest.raises(ValueError, match="fluorescence"):
-        overlay.validate_context(store, payload, slide_url="local/")
-
-
-def test_registered_raster_jpg_can_open_with_its_current_display_state(store, payload):
-    store.attrs["nd2wsi"].update(rgb=True, raster=True)
+@pytest.mark.parametrize("extra_meta", [
+    {"rgb": True},
+    {"rgb": True, "source": "slide.svs"},
+    {"rgb": True, "source": "scan.sdpc", "source_format": "sdpc"},
+    {"rgb": True, "source": "brightfield.czi"},
+    {"rgb": True, "source": "brightfield.lif"},
+    {"rgb": True, "raster": True},
+])
+def test_rgb_and_raster_slides_of_any_format_can_open_with_current_display_state(store, payload, extra_meta):
+    store.attrs["nd2wsi"].update(extra_meta)
     result = overlay.validate_context(store, payload, slide_url="local/")
     assert result["query"] == payload["query"]
     assert result["center"] == payload["center"]
@@ -494,6 +496,9 @@ def test_parent_registry_owns_overlay_and_cleans_up_without_touching_source(stor
 
 @pytest.mark.parametrize("source, source_path, expected", [
     ("slide.nd2", None, "nd2"), ("slide.nd2", "/cache/slide--t0-p0-zmid.nd2svs", "nd2"),
+    ("brain.czi", None, "czi"), (None, "/cache/brain.czi--t0-p0-zmid.nd2svs", "czi"),
+    ("sample.lif", None, "lif"), (None, "/cache/sample.lif--s0--t0-p0-zmid.nd2svs", "lif"),
+    ("scan.sdpc", None, "sdpc"),
     (None, "/data/x.PNG", "png"), ("scan.svs", None, "svs"), (None, None, "other"),
 ])
 def test_context_names_the_follow_format(store, payload, source, source_path, expected):
@@ -604,7 +609,7 @@ def test_tracing_claim_released_by_os_after_crash(tmp_path):
             claim.acquire()
         process.kill()
         process.wait(timeout=5)
-        claim.acquire()
+        claim.acquire(timeout=2.0)
         assert claim.acquired and claim.path.is_file()
     finally:
         if process.poll() is None:

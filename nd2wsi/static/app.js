@@ -163,7 +163,7 @@ window.nd2CaptureViewState = () => window.Nd2ViewState.capture(state);
 // Copy display state and validated imported regions; never edit source annotations.
 function captureTranslucentView() {
   if (state.quitPreparing) throw new Error("The viewer is closing");
-  if (!state.info || (state.info.rgb && !state.info.raster)) throw new Error("Open a fluorescence image first");
+  if (!state.info) throw new Error("Open an image first");
   if (state.plate && !activeFrameParams()) throw new Error("Choose a site before opening the translucent viewer");
   if (!spatialImageReady()) throw new Error("Wait for the image to finish opening");
   const viewport = state.viewer.viewport;
@@ -4593,7 +4593,7 @@ function viewportSnapshot() {
   const identity = {
     ...spatialIdentity(), imageReady: spatialImageReady(),
     imagePx: { x: state.info?.width, y: state.info?.height },
-    translucentAvailable: !!state.info && (!state.info.rgb || !!state.info.raster),
+    translucentAvailable: !!state.info,
     translucentOpening: !!state.translucentOpening,
     infoOpen: !!state.windows?.info && !state.windows.info.isHidden(),
     plateGrid: Boolean(state.plate && state.plate.focus === null),

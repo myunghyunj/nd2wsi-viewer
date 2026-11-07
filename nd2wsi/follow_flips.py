@@ -24,10 +24,10 @@ from .session_lock import SessionFileLock
 from .window_sessions import _atomic_json
 
 FORMAT_RECORD = "nd2wsi-follow-flips/1"
-FORMATS = ("nd2", "svs", "sdpc", "jpeg", "png", "other")
+FORMATS = ("nd2", "czi", "lif", "svs", "sdpc", "jpeg", "png", "other")
 MAX_BYTES = 16 * 1024
-_SUFFIXES = {".nd2": "nd2", ".nd2svs": "nd2", ".svs": "svs", ".sdpc": "sdpc",
-             ".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png"}
+_SUFFIXES = {".nd2": "nd2", ".nd2svs": "nd2", ".czi": "czi", ".lif": "lif",
+             ".svs": "svs", ".sdpc": "sdpc", ".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png"}
 # A flips file that exists but whose content is not a record: the only kind a save replaces.
 _INVALID = (ValueError, TypeError, UnicodeError, RecursionError)
 
@@ -36,17 +36,24 @@ def source_format(attrs, source_path=None) -> str:
     """The format whose remembered flips apply: the original file's, not its cache's.
 
     ``attrs["nd2wsi"]["source"]`` is the original file name for every reader,
-    so an ``.nd2svs`` cache or an OME-Zarr built from an ND2 counts as ``nd2``
-    even when its source is missing; ``source_path`` is only the fallback.
+    so an ``.nd2svs`` cache or an OME-Zarr built from an ND2, CZI, LIF, or SVS
+    counts as its original format even when opened from the cache; ``source_path``
+    is only the fallback.
     """
     meta = attrs.get("nd2wsi", {}) if isinstance(attrs, Mapping) else {}
     if not isinstance(meta, Mapping):
         meta = {}
-    if meta.get("source_format") == "sdpc":
-        return "sdpc"
+    explicit = meta.get("source_format")
+    if isinstance(explicit, str) and explicit in FORMATS and explicit != "other":
+        return explicit
     for name in (meta.get("source"), source_path):
         if isinstance(name, (str, os.PathLike)):
-            suffix = Path(name).suffix.lower()
+            path = Path(name)
+            suffix = path.suffix.lower()
+            if suffix == ".nd2svs":
+                inner_suffix = Path(path.name.split("--", 1)[0]).suffix.lower()
+                if inner_suffix in _SUFFIXES:
+                    return _SUFFIXES[inner_suffix]
             if suffix in _SUFFIXES:
                 return _SUFFIXES[suffix]
     return "other"
