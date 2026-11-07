@@ -362,6 +362,8 @@ class UpdateCardSession:
         self.release_notes = []
         self.phase = None
         self.was_card = False
+        self._handing_off = False
+        self._handoff_id = 0
 
     def _later(self, seconds, callback):
         timer = threading.Timer(seconds, lambda: self.main(callback))
@@ -445,11 +447,17 @@ class UpdateCardSession:
         self._show()
 
     def _show(self):
+        if self._handing_off:
+            return
         token = self.token
         payload = json.dumps(self.model, ensure_ascii=True, allow_nan=False)
         page = json.dumps(self.page_id)
         script = f"window.nd2wsiUpdateCard?.pageId==={page} && window.nd2wsiUpdateCard.show({payload})===true"
-        self.channel.submit(script, lambda ok: self._fallback(token) if ok is not True else None, coalesce=True)
+        self.channel.submit(
+            script,
+            lambda ok: self._fallback(token) if ok is not True and not self._handing_off else None,
+            coalesce=True,
+        )
 
     def _clear_card(self, token):
         self.channel.submit("window.nd2wsiUpdateCard?.dismiss(" + json.dumps(token) + ")",
@@ -579,6 +587,52 @@ class UpdateCardSession:
             self._clear_card(self.token)
         reply(*values)
 
+    def prepare_handoff(self, page_id=None):
+        """Keep a card session alive while the window navigates to the slide shell."""
+        if self.closed or self.token is None or self.mode not in ("card", "probing"):
+            return
+        if page_id is not None and self.page_id not in (None, page_id):
+            return
+        self._handing_off = True
+        self._handoff_id += 1
+        token, handoff_id = self.token, self._handoff_id
+        self.later(PAGE_TIMEOUT, lambda: self._finish_handoff(token, handoff_id, None))
+
+    def before_load(self):
+        """Re-bind the card after an in-window shell handoff; otherwise close the page."""
+        if self.closed or self.token is None:
+            return
+        if self._handing_off or self.mode == "probing":
+            token, handoff_id = self.token, self._handoff_id
+            self.channel.submit(
+                "window.nd2wsiUpdateCard?.ready===true ? window.nd2wsiUpdateCard.pageId : null",
+                lambda answer: self._finish_handoff(token, handoff_id, answer),
+            )
+            return
+        self.page_closed()
+
+    def page_ready(self, page_id):
+        if (not self.closed and self.token is not None and self._handing_off
+                and isinstance(page_id, str) and 0 < len(page_id) <= 128):
+            self._finish_handoff(self.token, self._handoff_id, page_id)
+
+    def _finish_handoff(self, token, handoff_id, answer):
+        if self.closed or token != self.token or handoff_id != self._handoff_id:
+            return
+        if not self._handing_off and self.mode != "probing":
+            return
+        self._handing_off = False
+        self._handoff_id += 1
+        if self.mode == "probing":
+            self._choose(token, answer)
+            return
+        if isinstance(answer, str) and 0 < len(answer) <= 128:
+            self.page_id = answer
+            if self.model:
+                self._show()
+        else:
+            self._fallback(token)
+
     def page_closed(self, token=None):
         """Explicit close/reload cancels a card-owned download, even after fallback."""
         if token is not None and token != self.token:
@@ -586,6 +640,8 @@ class UpdateCardSession:
         if self.mode not in ("card", "probing") and not self.was_card:
             return
         self.closed = True
+        self._handing_off = False
+        self._handoff_id += 1
         self.events = []
         for reply in self.replies:
             if reply.default is None:
@@ -597,6 +653,8 @@ class UpdateCardSession:
     def dismiss(self):
         mode, token = self.mode, self.token
         self.closed = True
+        self._handing_off = False
+        self._handoff_id += 1
         # Sparkle owns teardown. Dropping callbacks matches its standard driver;
         # invoking a stale reply here can abort a later update session.
         replies, self.replies = self.replies, []

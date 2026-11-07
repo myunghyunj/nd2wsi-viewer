@@ -665,10 +665,13 @@ def test_reuse_refreshes_display_and_focuses_without_another_window():
     for key, value in updated.items():
         assert api.translucent_context()[key] == value
     assert api.translucent_context()["laser_items"] == [item]
+    api.refresh_context({**updated, "query": "?c=1&p=1&win=1:200"})
+    assert api.translucent_context()["laser_items"] == []
+    api._confirm_laser_box({"item": item})
     api.refresh_context({**updated, "slide_url": "http://local/s/2/"})
     assert api.translucent_context()["laser_items"] == []
-    assert api._window.load_url.call_count == 2
-    assert api._window.show.call_count == 2
+    assert api._window.load_url.call_count == 3
+    assert api._window.show.call_count == 3
     api._did_close()
 
 
@@ -705,3 +708,56 @@ def test_create_window_failure_disposes_the_api_without_allocating_delivery(monk
     factory.assert_not_called()
     closed.assert_called_once()
     assert closed.call_args.args[0]._closed
+
+
+def test_cancelled_update_and_individual_tab_close_manage_translucent_windows(store, payload, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    children = {}
+
+    def make_child(context, **kwargs):
+        sid = context["slide_url"].rstrip("/").split("/")[-1]
+        child = SimpleNamespace(_window=SimpleNamespace(uid=f"trace-{sid}"))
+        child.close_translucent = Mock(side_effect=lambda: kwargs["on_closed"](child))
+        children[sid] = child
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", make_child)
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    api = app.Api(None)
+    api._window = Mock()
+    api._httpd = SimpleNamespace(
+        registry=SimpleNamespace(
+            get=lambda sid: store if sid in ("s1", "s2") else None,
+            close_all_for_relaunch=Mock(),
+        ),
+        shutdown=Mock(),
+        server_close=Mock(),
+    )
+    assert api.open_translucent_viewer("s1", payload) == {"ok": True, "id": "trace-s1"}
+    assert api.close_translucent_viewer("s1") == {"ok": True, "closed": True}
+    children["s1"].close_translucent.assert_called_once()
+    assert "s1" not in api._translucent_windows
+    assert api.open_translucent_viewer("s2", payload) == {"ok": True, "id": "trace-s2"}
+    api.stop_server_for_update()
+    children["s2"].close_translucent.assert_called_once()
+    assert api._translucent_owner_closed is False
+
+
+def test_boot_html_preserves_backend_error_status_and_hides_pill_under_card():
+    assert "body:has(#update-notice:not([hidden])) #update{visibility:hidden;pointer-events:none}" in app.BOOT_HTML
+    assert "window.nd2wsiUpdateCard.handoff()" in app.BOOT_HTML
+    assert "pywebview.api.status()" in app.BOOT_HTML
+    assert "else end('');" not in app.BOOT_HTML
+
+
+def test_dialog_window_prefers_bound_window_and_open_paths_resets_stale_status(monkeypatch):
+    webview = pytest.importorskip("webview")
+    other = SimpleNamespace(uid="other")
+    bound = SimpleNamespace(uid="bound")
+    monkeypatch.setattr(webview, "windows", [other, bound])
+    api = app.Api(None)
+    api._window = bound
+    assert api._dialog_window() is bound
+    api._status = "stale error"
+    assert api.open_paths([]) is None
+    assert api._status == ""

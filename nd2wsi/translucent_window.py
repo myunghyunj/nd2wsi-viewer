@@ -210,6 +210,7 @@ class TranslucentApi:
         self._on_closed = on_closed
         self._close_notified = False
         self._window = None
+        self._page_url = None
         self._drag = None
         self._locked = False
         self._closed = False
@@ -243,6 +244,7 @@ class TranslucentApi:
         self._laser_delivery = None
         self._on_laser_box = on_laser_box
         self._laser_items = {}
+        self._pending_laser_scope = None
         self._load_timer = None
         self._target_store = target_store
         self._target_save_lock = threading.Lock()
@@ -334,6 +336,8 @@ class TranslucentApi:
                 message = self._stage_follow_lost = "SLACS program stopped or changed. Follow stopped; reconnect manually."
         self._log_detection(logged)
         if receiver is not None:
+            if self._laser_delivery is not None:
+                self._laser_delivery.view_changed()
             self._revoke_follow_in_page(revoked, message)
             if follower is not None:
                 follower.stop("slacs_lost")
@@ -744,6 +748,7 @@ class TranslucentApi:
             return None, "unlocked"
         if view.get("target_px") is None or view.get("target_corners_px") is None:
             return None, "target_unavailable"
+        self._pending_laser_scope = self._laser_scope(self._context)
         query = dict(urllib.parse.parse_qsl(self._context.get("query", "").lstrip("?")))
         return {**{key: copy.deepcopy(view[key]) for key in TARGET_KEYS},
                 "g": query.get("g", ""), "p": int(query["p"]) if "p" in query else None,
@@ -751,12 +756,20 @@ class TranslucentApi:
                 "slacs_session": record.get("slacs_session"),
                 "pixel_size_um": self._context["pixel_size_um"]}, None
 
+    @staticmethod
+    def _laser_scope(context: dict) -> tuple[str | None, str, str]:
+        query = dict(urllib.parse.parse_qsl(str(context.get("query", "")).lstrip("?")))
+        return (context.get("slide_url"), query.get("p", ""), query.get("g", ""))
+
     def _confirm_laser_box(self, outcome):
         if self._closed or self._window is None:
             return False
         item = outcome.get("item")
-        if isinstance(item, dict) and isinstance(item.get("id"), str):
-            with self._lock:
+        with self._lock:
+            if (self._pending_laser_scope is not None
+                    and self._pending_laser_scope != self._laser_scope(self._context)):
+                return False
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
                 self._laser_items[item["id"]] = copy.deepcopy(item)
         script = "window.nd2TranslucentLaserItem?.(" + json.dumps(outcome["item"], allow_nan=False) + "); true"
         return self._window.evaluate_js(script)
@@ -842,6 +855,8 @@ class TranslucentApi:
             self._stage_follow_session = None
             self._stage_follow_receiver_id = None
             self._stage_follow_lost = ""
+        if self._laser_delivery is not None:
+            self._laser_delivery.view_changed()
         if follower is not None:
             follower.stop("stopped")
         if receiver is not None:
@@ -862,14 +877,21 @@ class TranslucentApi:
             if self._client_log_count >= CLIENT_LOG_MAX:
                 return {"ok": True, "rate_limited": True}
             self._client_log_count += 1
+            slide_url = self._context.get("slide_url")
+            page_url = self._page_url
         if not isinstance(payload, dict):
             return {"ok": False}
+        slide_base = slide_url.split("/s/", 1)[0] + "/" if isinstance(slide_url, str) and "/s/" in slide_url else slide_url
+        page_base = page_url.split("/static/", 1)[0] + "/" if isinstance(page_url, str) and "/static/" in page_url else page_url
 
-        def capped(key, limit):
+        def capped(key, limit, *, redact=False):
             value = payload.get(key)
             if value is None:
                 return None
-            return str(value)[:limit]
+            text = str(value)
+            if redact:
+                text = session_log.redact_capability_urls(text, slide_base, page_base)
+            return text[:limit]
 
         # "client_kind" rather than "kind": session_log.event's first positional
         # parameter is itself named "kind", so a "kind" field would collide.
@@ -877,9 +899,9 @@ class TranslucentApi:
             "client_error",
             source=capped("source", CLIENT_LOG_FIELD_LIMIT),
             client_kind=capped("kind", CLIENT_LOG_FIELD_LIMIT),
-            message=capped("message", CLIENT_LOG_FIELD_LIMIT),
-            where=capped("where", CLIENT_LOG_FIELD_LIMIT),
-            stack=capped("stack", CLIENT_LOG_STACK_LIMIT),
+            message=capped("message", CLIENT_LOG_FIELD_LIMIT, redact=True),
+            where=capped("where", CLIENT_LOG_FIELD_LIMIT, redact=True),
+            stack=capped("stack", CLIENT_LOG_STACK_LIMIT, redact=True),
         )
         return {"ok": True}
 
@@ -1241,7 +1263,7 @@ class TranslucentApi:
                 raise ValueError("The tracing window is still opening or closing.")
         self.stop_stage_follow()
         with self._lock:
-            if context.get("slide_url") != self._context.get("slide_url"):
+            if self._laser_scope(context) != self._laser_scope(self._context):
                 self._laser_items = {}
             self._context = {**copy.deepcopy(context), "opacity": self._context["opacity"],
                              "opacity_mode": self._context["opacity_mode"]}

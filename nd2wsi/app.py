@@ -22,6 +22,7 @@ import uuid
 from pathlib import Path
 
 from . import edition, session_log
+from . import gui_smoke as _gui_smoke_mod
 from . import window_chrome as _window_chrome
 from . import window_lifecycle as _window_lifecycle
 
@@ -157,149 +158,37 @@ def _start_session_log(mode: str) -> Path | None:
     _dlog(f"session log: {started}")
     return started
 
-BOOT_HTML = """<!doctype html><html><head><meta charset="utf-8"><style>
-  html,body{height:100%;margin:0;background:var(--canvas);color:var(--label);
-    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display",sans-serif;
-    -webkit-font-smoothing:antialiased;cursor:default;-webkit-user-select:none}
-  #drop{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
-  .card{text-align:center;pointer-events:none}
-  .pyr{width:64px;margin:0 auto 26px;opacity:.9}
-  .pyr div{height:11px;border-radius:6px;margin:4px auto;
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.35)}
-  .pyr .l1{width:26px;background:#7cc0ff}.pyr .l2{width:44px;background:#3fa0ff}
-  .pyr .l3{width:62px;background:#0a84ff}
-  h1{font-size:15px;font-weight:600;margin:0;color:var(--label)}
-  .sub{color:var(--label-3);font-size:13px;margin-top:7px}
-  .sub b{color:var(--label-2);font-weight:600}
-  #status{margin-top:26px;font-size:12px;color:var(--label-2);min-height:16px;
-    font-family:ui-monospace,"SF Mono",Menlo,monospace}
-  #bar{width:180px;height:4px;border-radius:2px;margin:10px auto 0;
-    background:var(--material-control-active);overflow:hidden;display:none}
-  #fill{display:block;height:100%;width:0%;border-radius:2px;background:#b08900;
-    transition:width .25s ease}
-  #fill.indet{width:40%;transition:none;
-    animation:indet 1.1s ease-in-out infinite alternate}
-  @keyframes indet{from{margin-left:0}to{margin-left:60%}}
-  #pct{margin-top:7px;font-size:12px;color:var(--label-2);min-height:14px;
-    font-family:ui-monospace,"SF Mono",Menlo,monospace}
-  #drop.over::after{content:"";position:fixed;inset:14px;border-radius:16px;
-    border:2px dashed rgba(10,132,255,.9);background:rgba(10,132,255,.06)}
-  #update{position:fixed;right:12px;bottom:10px;height:28px;padding:0 11px;
-    border:0;border-radius:7px;background:transparent;color:var(--label-2);
-    font:12px -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
-  #update:hover{background:var(--material-control);color:var(--label)}
-  #update:disabled{opacity:.45}
-</style></head><body>
-<div id="drop"><div class="card">
-  <div class="pyr"><div class="l1"></div><div class="l2"></div><div class="l3"></div></div>
-  <h1>Drop a slide to open</h1>
-  <div class="sub"><b>.nd2</b>, <b>.svs</b>, <b>.sdpc</b>, <b>.nd2svs</b>, or <b>JPEG/PNG</b> &nbsp;·&nbsp; click anywhere to browse</div>
-  <div id="status"></div>
-  <div id="bar"><span id="fill"></span></div>
-  <div id="pct"></div>
-</div></div>
-<button id="update" type="button">Check for Updates…</button>
-<script>
-  let busy = false, polling = null, queuedDrops = [];
-  const drop = document.getElementById('drop');
-  function setStatus(t){ document.getElementById('status').textContent = t || ''; }
-  const bar = document.getElementById('bar'), fill = document.getElementById('fill');
-  function poll(){
-    pywebview.api.status().then(s => { if (s) setStatus(s); });
-    pywebview.api.progress().then(f => {
-      const pctEl = document.getElementById('pct');
-      if (f === 0) {            /* alive, before the first real tick */
-        bar.style.display = 'block';
-        fill.style.width = '';
-        fill.classList.add('indet');
-        pctEl.textContent = '';
-      } else if (f > 0) {
-        bar.style.display = 'block';
-        fill.classList.remove('indet');
-        const p = Math.round(f * 100);
-        fill.style.width = p + '%';
-        pctEl.textContent = p + ' %';
-      } else { bar.style.display = 'none'; fill.classList.remove('indet'); pctEl.textContent = ''; }
-    });
-  }
-  function begin(){ busy = true; polling = setInterval(poll, 400); }
-  function end(msg){ clearInterval(polling); busy = false; setStatus(msg || ''); bar.style.display='none'; document.getElementById('pct').textContent=''; }
-  async function drainQueued(lastUrl){
-    let url = lastUrl;
-    while (queuedDrops.length) {
-      const next = queuedDrops.splice(0);
-      const u = await pywebview.api.open_paths(next);
-      if (u) url = u;
-    }
-    return url;
-  }
-  function go(promise){
-    begin();
-    promise.then(url => drainQueued(url))
-      .then(url => { if (url) location.replace(url); else end(''); })
-      .catch(e => end('failed: ' + e));
-  }
-  drop.addEventListener('click', () => { if (!busy) go(pywebview.api.open_slide()); });
-  // pywebview 6 delivers dropped-file paths through a Python-side DOM
-  // handler, which calls __pydrop with the real path. The JS listeners
-  // below only run the visuals.
-  window.__pydrop_multi = paths => {
-    if (busy) { queuedDrops.push(...(paths || [])); return; }
-    go(pywebview.api.open_paths(paths));
-  };
-  window.__pydrop = path => window.__pydrop_multi([path]);
-  document.addEventListener('dragover', ev => ev.preventDefault(), true);
-  document.addEventListener('drop', ev => ev.preventDefault(), true);
-  window.addEventListener('dragover', ev => { ev.preventDefault(); drop.classList.add('over'); });
-  window.addEventListener('dragleave', () => drop.classList.remove('over'));
-  window.addEventListener('drop', ev => {
-    ev.preventDefault();
-    drop.classList.remove('over');
-  });
-  window.addEventListener('pywebviewready', () => {
-    pywebview.api.pending().then(p => { if (p) go(pywebview.api.open_slide()); });
-    const refreshUpdates = () => pywebview.api.update_status().then(s => {
-        const button = document.getElementById('update');
-        button.disabled = !s.available;
-        if (s.mode === 'download') button.textContent = 'Download Updates…';
-      });
-    refreshUpdates();
-    setTimeout(refreshUpdates, 600);
-  });
-  document.getElementById('update').addEventListener('click', ev => {
-    const button = ev.currentTarget;
-    button.disabled = true;
-    Promise.resolve().then(() => typeof window.nd2wsiUpdateCard?.check === 'function'
-      ? window.nd2wsiUpdateCard.check() : pywebview.api.check_for_updates())
-      .then(result => { if (result?.ok === false) setStatus(result.message || 'Could not check for updates.'); })
-      .catch(error => setStatus('Could not check for updates: ' + error))
-      .finally(() => { button.disabled = false; });
-  });
-</script></body></html>"""
 
-
-# The empty entry page has no server URL or menu, but uses the same native-window
-# controller and keyboard classification as the loaded slide shell.
-BOOT_HTML = BOOT_HTML.replace(
-    "</body></html>",
-    "<script>" + "\n".join(
-        (Path(__file__).parent / "static" / name).read_text(encoding="utf-8")
-        for name in ("shortcut-router-v1.js", "window-controls-v1.js")
-    ) + "</script></body></html>",
-)
-
-
-# The landing page uses the same manual card, but its readiness flag stays false
-# so automatic macOS checks always fall back to the standard Sparkle driver.
 _UPDATE_STATIC = Path(__file__).parent / "static"
-BOOT_HTML = BOOT_HTML.replace(
-    "</head>", "<style>" + "\n".join(
-        (_UPDATE_STATIC / name).read_text(encoding="utf-8")
-        for name in ("materials-v1.css", "update-card-v1.css")
-    ) + "</style></head>",
-)
-BOOT_HTML = BOOT_HTML.replace("</body>", (_UPDATE_STATIC / "update-card.html").read_text(encoding="utf-8") +
-                             "<script>" + (_UPDATE_STATIC / "update-card-v1.js").read_text(encoding="utf-8") + "</script></body>")
+
+
+def _build_boot_html() -> str:
+    """Assemble the standalone entry page with shared window and update-card assets."""
+    html = (_UPDATE_STATIC / "boot.html").read_text(encoding="utf-8").rstrip()
+    html = html.replace(
+        "</body></html>",
+        "<script>" + "\n".join(
+            (_UPDATE_STATIC / name).read_text(encoding="utf-8")
+            for name in ("shortcut-router-v1.js", "window-controls-v1.js")
+        ) + "</script></body></html>",
+    )
+    html = html.replace(
+        "</head>",
+        "<style>" + "\n".join(
+            (_UPDATE_STATIC / name).read_text(encoding="utf-8")
+            for name in ("materials-v1.css", "update-card-v1.css")
+        ) + "</style></head>",
+    )
+    return html.replace(
+        "</body>",
+        (_UPDATE_STATIC / "update-card.html").read_text(encoding="utf-8")
+        + "<script>"
+        + (_UPDATE_STATIC / "update-card-v1.js").read_text(encoding="utf-8")
+        + "</script></body>",
+    )
+
+
+BOOT_HTML = _build_boot_html()
 
 
 def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
@@ -351,7 +240,6 @@ def _dispatch_open(paths):
     to the page when __pydrop_multi is ready.
     """
     global _FLUSHER_ALIVE
-    import time
 
     # a launch from a terminal hands the process its own arguments as open
     # events too, so the file opening right now would open twice at once;
@@ -411,7 +299,6 @@ def _flush_opens():
     still queued; the next open starts a new flusher that delivers them.
     """
     import json as _json
-    import time
 
     import webview
 
@@ -758,8 +645,7 @@ class Api:
             server = self._httpd
         base = _server_url(server) if server is not None else None
         for name in ("message", "where", "stack"):
-            if base:
-                fields[name] = fields[name].replace(base, "")
+            fields[name] = session_log.redact_capability_urls(fields[name], base)
         extra = {"dropped": dropped} if dropped else {}
         session_log.event("client_error", source=fields["source"], client_kind=fields["kind"],
                           message=fields["message"], where=fields["where"], stack=fields["stack"], **extra)
@@ -910,9 +796,22 @@ class Api:
                 self._follow_flips_store = FollowFlipStore(self._window_session)
             return self._follow_flips_store
 
-    def _close_translucent_windows(self, *_args):
+    def close_translucent_viewer(self, sid: str) -> dict:
+        """Close the translucent tracing window for one slide tab, if open."""
         with self._translucent_lock:
-            self._translucent_owner_closed = True
+            overlay = self._translucent_windows.pop(sid, None) if isinstance(sid, str) else None
+        if overlay is not None:
+            try:
+                overlay.close_translucent()
+            except Exception as exc:
+                _dlog(f"translucent viewer close failed: {exc!r}")
+                return {"ok": False, "message": str(exc)}
+        return {"ok": True, "closed": overlay is not None}
+
+    def _close_translucent_windows(self, *_args, owner_closing: bool = True):
+        with self._translucent_lock:
+            if owner_closing:
+                self._translucent_owner_closed = True
             overlays = list(self._translucent_windows.values())
             self._translucent_windows.clear()
             detector, self._slacs_discovery = self._slacs_discovery, None
@@ -1123,6 +1022,13 @@ class Api:
         card.main(lambda: card.page_closed(token))
         return {"ok": True}
 
+    def update_card_handoff(self, page_id=None):
+        card = getattr(self._updater, "card", None)
+        if card is None or (page_id is not None and (not isinstance(page_id, str) or len(page_id) > 128)):
+            return {"ok": False}
+        card.main(lambda: card.prepare_handoff(page_id))
+        return {"ok": True}
+
     def _open_manual_update(self, token, *, notes=False):
         import platform
         import webbrowser
@@ -1179,7 +1085,7 @@ class Api:
         and the release goes on; a later call, such as the exit teardown,
         waits for that same release again.
         """
-        self._close_translucent_windows()
+        self._close_translucent_windows(owner_closing=False)
         with self._server_lock:
             server, self._httpd = self._httpd, None
             if server is None:
@@ -1201,18 +1107,29 @@ class Api:
             raise
         server.server_close()
 
+    def _dialog_window(self):
+        import webview
+
+        if self._window is not None:
+            return self._window
+        owners = [window for window in webview.windows if getattr(window, "_js_api", None) is self]
+        if len(owners) == 1:
+            return owners[0]
+        return webview.windows[0] if webview.windows else None
+
     def open_slide(self):
         import webview
 
         if self._initial is not None:
             path, self._initial = self._initial, None
         else:
-            picked = webview.windows[0].create_file_dialog(
+            picked = self._dialog_window().create_file_dialog(
                 webview.OPEN_DIALOG,
                 allow_multiple=True,
                 file_types=OPEN_FILE_TYPES,
             )
             if not picked:
+                self._status = ""
                 return None
             return self._launch_many([Path(p) for p in picked])
         return self._launch(path)
@@ -1223,6 +1140,7 @@ class Api:
 
     def open_paths(self, paths):
         """Several slides at once, converted one by one."""
+        self._status = ""
         good = []
         for raw in paths or []:
             p = Path(raw)
@@ -1242,7 +1160,7 @@ class Api:
         """Native open dialog for the tab shell's '+' button (no convert)."""
         import webview
 
-        picked = webview.windows[0].create_file_dialog(
+        picked = self._dialog_window().create_file_dialog(
             webview.OPEN_DIALOG,
             allow_multiple=True,
             file_types=OPEN_FILE_TYPES,
@@ -1307,7 +1225,7 @@ class Api:
             from Foundation import NSOperationQueue
         except Exception:
             return "none"
-        window = webview.windows[0]
+        window = self._dialog_window()
 
         def act():
             try:
@@ -1329,6 +1247,8 @@ class Api:
         return action
 
     def _open_registered(self, path: Path, note, frac) -> str:
+        with self._translucent_lock:
+            self._translucent_owner_closed = False
         if self._window_session is not None and self._window_session.role == "agent":
             # Do not call open_or_convert/ensure_cache before the registry can
             # apply Agent policy. Existing ND2 caches, native SVS/SDPC and plates
@@ -1337,6 +1257,9 @@ class Api:
             with self._server_lock:
                 if self._httpd is None:
                     self._httpd, _ = start_server([], window_session=self._window_session)
+                registry = getattr(self._httpd, "registry", None)
+                if registry is not None:
+                    registry.on_remove = self.close_translucent_viewer
                 self._httpd.registry.open_path(path, on_progress=frac)
                 self._prepare_handoff()
                 return _server_url(self._httpd)
@@ -1348,6 +1271,9 @@ class Api:
             else:
                 self._httpd.registry.add_store(store)
                 url = _server_url(self._httpd)
+            registry = getattr(self._httpd, "registry", None)
+            if registry is not None:
+                registry.on_remove = self.close_translucent_viewer
         self._prepare_handoff()
         return url
 
@@ -1436,554 +1362,25 @@ def _startup_error(message: str, *, show_dialog: bool = True) -> None:
             pass
 
 
-def _gui_smoke_appkit_key(api: Api, window, context: dict, key: str, *, repeat: bool = False) -> dict:
-    """Send one process-local key through AppKit, only to this Agent key window.
-
-    Deliberately use NSApplication.sendEvent_ so native key equivalents and the
-    responder chain participate. This is not a physical/global keyboard event.
-    """
-    import AppKit
-    from Foundation import NSOperationQueue, NSThread
-
-    finished, cancelled = threading.Event(), threading.Event()
-    outcome = {}
-
-    def send():
-        try:
-            if cancelled.is_set():
-                return
-            current = api.window_context()
-            if (not current.get("enabled") or current.get("role") != "agent" or
-                    not current.get("id") or current.get("id") != context.get("id") or
-                    current.get("pid") != os.getpid() or getattr(window, "_js_api", None) is not api):
-                raise RuntimeError("Native keyboard smoke requires the same bound Agent session")
-            native = getattr(window, "native", None)
-            application = AppKit.NSApplication.sharedApplication()
-            if native is None or application.keyWindow() != native:
-                raise RuntimeError("Native keyboard smoke Agent window is not the exact key window")
-            number = int(native.windowNumber())
-            codes = {"a": 0, "c": 8, "e": 14, "i": 34}
-            modifiers = 0 if key == "e" else AppKit.NSEventModifierFlagCommand
-            outcome.update(window_number=number, key=key, command=key != "e", repeat=repeat)
-            for event_type in (AppKit.NSEventTypeKeyDown, AppKit.NSEventTypeKeyUp):
-                if cancelled.is_set():
-                    return
-                if application.keyWindow() != native or getattr(window, "native", None) != native:
-                    raise RuntimeError("Native keyboard smoke lost its Agent key window")
-                event = AppKit.NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(
-                    event_type, (0, 0), modifiers, time.monotonic(), number, None,
-                    key, key, repeat and event_type == AppKit.NSEventTypeKeyDown, codes[key])
-                if event is None:
-                    raise RuntimeError("AppKit did not create the smoke key event")
-                application.sendEvent_(event)
-        except Exception as exc:
-            outcome["error"] = str(exc)
-        finally:
-            finished.set()
-
-    if NSThread.isMainThread():
-        send()
-    else:
-        NSOperationQueue.mainQueue().addOperationWithBlock_(send)
-    if not finished.wait(5):
-        cancelled.set()  # A late main-queue callback must never inject a key.
-        raise TimeoutError("Native keyboard smoke main queue timed out")
-    if outcome.get("error"):
-        raise RuntimeError(outcome["error"])
-    return outcome
-
-
-_GUI_SMOKE_KEYBOARD_SETUP = """(() => {
-  const frame = document.querySelector('#frames iframe.active');
-  const view = frame && frame.contentWindow, page = frame && frame.contentDocument;
-  const toolbar = document.getElementById('newtab');
-  const ids = {annot:'tb-annot', channels:'tb-channels', region:'tb-region'};
-  const panelNames = [...Object.keys(ids), 'info'];
-  if (!page || !toolbar || Object.values(ids).some(id => !page.getElementById(id)))
-    throw new Error('Native keyboard smoke controls are unavailable');
-  const panels = view.eval('state.windows');
-  const original = Object.fromEntries(panelNames.map(id => [id, panels[id].isHidden()]));
-  const focused = document.activeElement;
-  const input = document.createElement('input');
-  input.id = 'nd2wsi-native-keyboard-smoke-input'; input.type = 'text';
-  input.style.cssText = 'position:fixed;bottom:0;left:0;width:180px;z-index:99999';
-  document.body.appendChild(input);
-  const counts = Object.fromEntries(panelNames.map(id => [id, 0]));
-  const listeners = Object.entries(ids).map(([id, button]) => {
-    const element = page.getElementById(button), listener = () => { counts[id]++; };
-    element.addEventListener('click', listener); return [element, listener];
-  });
-  // Info lives in the shell tools row; its pane action has no proxy button.
-  const infoActions = Object.fromEntries(['open', 'close'].map(action => [action, panels.info[action]]));
-  for (const [action, originalAction] of Object.entries(infoActions)) {
-    panels.info[action] = function(...args) { counts.info++; return originalAction.apply(this, args); };
-  }
-  let events = [];
-  const observe = event => { events.push({key:event.key, code:event.code, repeat:event.repeat,
-    trusted:event.isTrusted, target:event.target.id || event.target.tagName}); };
-  window.addEventListener('keydown', observe, true);
-  window.__nd2wsiNativeKeyboardSmoke = {
-    prepare(editable, key) {
-      events = []; window.getSelection()?.removeAllRanges(); view.getSelection()?.removeAllRanges();
-      if (editable) {
-        input.value = key === 'c' || key === 'e' ? '' : 'native smoke';
-        input.focus(); input.setSelectionRange(0, 0);
-      } else toolbar.focus();
-      if (document.activeElement !== (editable ? input : toolbar))
-        throw new Error('Native keyboard smoke could not focus its target');
-      return this.snapshot();
-    },
-    snapshot() { return {counts:{...counts},
-      hidden:Object.fromEntries(panelNames.map(id => [id, panels[id].isHidden()])),
-      events:[...events], focused:document.activeElement.id, value:input.value,
-      selection:[input.selectionStart, input.selectionEnd]}; },
-    cleanup() {
-      window.removeEventListener('keydown', observe, true);
-      for (const [element, listener] of listeners) element.removeEventListener('click', listener);
-      Object.assign(panels.info, infoActions);
-      for (const [id, hidden] of Object.entries(original)) {
-        if (panels[id].isHidden() !== hidden) panels[id][hidden ? 'close' : 'open']();
-      }
-      input.remove(); if (focused?.isConnected) focused.focus();
-      delete window.__nd2wsiNativeKeyboardSmoke;
-      return true;
-    },
-  };
-  return {ready:true};
-})()"""
+_GUI_SMOKE_KEYBOARD_SETUP = _gui_smoke_mod._GUI_SMOKE_KEYBOARD_SETUP
+_gui_smoke_appkit_key = _gui_smoke_mod._gui_smoke_appkit_key
+_gui_smoke_close = _gui_smoke_mod._gui_smoke_close
 
 
 def _gui_smoke_native_keyboard(api: Api, window, *, slide: bool) -> dict:
     """Bounded native menu/renderer check in the disposable macOS Agent only."""
-    report = {"status": "not_assessed", "scope": "process-local AppKit synthetic Latin keys; not physical input"}
-    if sys.platform != "darwin":
-        return {**report, "reason": "Native keyboard smoke is implemented for macOS only"}
-    context = api.window_context()
-    if not slide or not context.get("enabled") or context.get("role") != "agent":
-        return {**report, "reason": "Requires a loaded slide in a fresh Agent smoke window"}
-    report.update(status="failed", session_id=context.get("id"), steps=[])
-    setup = False
-    try:
-        if not context.get("id") or context.get("pid") != os.getpid() or getattr(window, "_js_api", None) is not api:
-            raise RuntimeError("Native keyboard smoke Agent identity is not bound to this window")
-        window.evaluate_js(_GUI_SMOKE_KEYBOARD_SETUP)
-        setup = True
-        for editable in (False, True):
-            for key, panel in (("a", "annot"), ("c", "channels"), ("e", "region"), ("i", "info")):
-                for repeat in ((False,) if editable else (False, True)):
-                    before = window.evaluate_js(
-                        f"window.__nd2wsiNativeKeyboardSmoke.prepare({str(editable).lower()}, {json.dumps(key)})")
-                    native = _gui_smoke_appkit_key(api, window, context, key, repeat=repeat)
-                    # WKWebView handles native input asynchronously. Give ignored
-                    # repeats/text shortcuts the same bounded observation window.
-                    deadline = time.monotonic() + 0.5
-                    while True:
-                        after = window.evaluate_js("window.__nd2wsiNativeKeyboardSmoke.snapshot()")
-                        if time.monotonic() >= deadline:
-                            break
-                        time.sleep(0.025)
-                    toggled = not editable and not repeat
-                    expected_counts = {name: count + int(toggled and name == panel)
-                                       for name, count in before["counts"].items()}
-                    expected_hidden = {name: (not hidden if toggled and name == panel else hidden)
-                                       for name, hidden in before["hidden"].items()}
-                    passed = after["counts"] == expected_counts and after["hidden"] == expected_hidden
-                    if editable:
-                        if key == "e":
-                            passed = passed and after["value"] == "e"
-                        elif key == "a":
-                            passed = passed and after["selection"] == [0, len(before["value"])]
-                        else:
-                            passed = passed and after["value"] == before["value"]
-                    report["steps"].append({**native, "focus": "editable" if editable else "shell-toolbar",
-                                            "panel": panel, "passed": passed, "before": before, "after": after})
-        report["status"] = "passed" if all(step["passed"] for step in report["steps"]) else "failed"
-        if report["status"] == "failed":
-            report["error"] = "Native keyboard routing, repeat suppression or editable protection failed"
-    except Exception as exc:
-        report["error"] = str(exc)
-    finally:
-        if setup:
-            try:
-                window.evaluate_js("window.__nd2wsiNativeKeyboardSmoke.cleanup()")
-            except Exception as exc:
-                report.update(status="failed", cleanup_error=str(exc))
-    return report
-
-
-def _gui_smoke_close(api: Api, window, report: dict, *, timeout: float) -> None:
-    """Close the smoke window and settle ``report`` before the GUI loop returns.
-
-    main() writes ``api._gui_smoke_report`` as soon as ``webview.start``
-    returns, which can be the moment the window closes. So every outcome is
-    recorded before the close that ends the loop: by this thread before a
-    direct or forced destroy, or by the coordinator's UI-thread listener after
-    its approved destroy was requested and before the loop can return.
-    """
-    api._gui_smoke_report = report
-    coordinator = getattr(api, "_close_coordinator", None)
-    if coordinator is None:
-        report["close"] = {"path": "direct"}
-        window.destroy()
-        return
-    if not report.get("ok"):
-        # A failed or unready viewer cannot answer the save protocol; never
-        # let the veto turn a failure report into a CI timeout.
-        reason = f"GUI smoke failed in phase {report.get('phase')}"
-        report["close"] = {"path": "forced", "reason": reason}
-        coordinator.approve_close(reason)
-        window.destroy()
-        return
-
-    started = time.monotonic()
-    phase = report.get("phase")
-    lock = threading.Lock()
-    outcome = []
-    confirmed = threading.Event()
-
-    def saved_close():
-        with lock:
-            if outcome:
-                return
-            outcome.append("coordinated")
-            report.pop("error", None)
-            report.update(ok=True, phase=phase, close={
-                "path": "coordinated", "seconds": round(time.monotonic() - started, 2)})
-        confirmed.set()
-
-    # Exercise the real veto -> acknowledged flush -> UI-thread approval ->
-    # destroy path once. Until it confirms, a closed window is a failure.
-    report.update(ok=False, phase="close", error="The window closed without the save handshake",
-                  close={"path": "coordinated", "confirmed": False})
-    coordinator.add_close_listener(saved_close)
-    try:
-        coordinator.request_native_close()
-    except Exception as exc:
-        failure = f"Could not start the native close: {exc}"
-    else:
-        if confirmed.wait(timeout):
-            return
-        failure = f"Native close did not complete the save handshake within {timeout:g} seconds"
-    with lock:
-        if outcome:
-            return
-        outcome.append("forced")
-        if api._status:
-            failure += f" (last status: {api._status})"
-        report.update(ok=False, phase="close", error=failure, close={
-            "path": "forced", "reason": failure, "seconds": round(time.monotonic() - started, 2)})
-    coordinator.approve_close(failure)
-    window.destroy()
+    return _gui_smoke_mod._gui_smoke_native_keyboard(
+        api, window, slide=slide, appkit_key=_gui_smoke_appkit_key,
+    )
 
 
 def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 90,
               close_timeout: float = 30) -> dict:
     """Exercise the real renderer, bridge and slide DOM, then close the app."""
-    started = time.monotonic()
-    report = {"ok": False, "platform": sys.platform, "renderer": None, "phase": "app-loading"}
-    # The opt-in round trip replaces clipboard text. Enable only on disposable
-    # Windows CI desktops, never during local macOS packaged verification.
-    clipboard_check = sys.platform == "win32" and os.environ.get("ND2WSI_SMOKE_LUT_CLIPBOARD") == "1"
-    expected = getattr(api, "_requested_handoff", None)
-    try:
-        import webview
-
-        report["window_context"] = api.window_context()
-        if expected is not None:
-            report["handoff_requested"] = expected
-            source = Path(api._launch_source).resolve()
-            info = source.stat()
-            report["handoff_source"] = {"path": str(source), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
-        report["renderer"] = webview.renderer
-        if sys.platform == "win32" and webview.renderer != "edgechromium":
-            raise RuntimeError("GUI smoke requires the Edge WebView2 renderer")
-        if sys.platform == "win32":
-            from .webview2_runtime import required as webview2_required
-
-            # The renderer name cannot tell the bundled copy from the system
-            # runtime; the per-window evidence below can.
-            report["webview2_runtime"] = {"selection": getattr(api, "_webview2_runtime", None),
-                                          "required": webview2_required()}
-        while time.monotonic() - started < timeout:
-            if api._status.startswith("could not open"):
-                raise RuntimeError(api._status)
-            started_webview2 = getattr(api, "_webview2_init", None)
-            if started_webview2 is not None and "webview2_runtime" in report:
-                report["webview2_runtime"]["initialization"] = started_webview2
-            if started_webview2 is not None and not started_webview2.get("ok"):
-                # Fail fast: a WebView2 that cannot start leaves a blank window.
-                raise RuntimeError(f"WebView2 failed to start: {started_webview2.get('error')}")
-            result = None
-            try:
-                result = window.evaluate_js("""(() => {
-                  const api = window.pywebview && window.pywebview.api;
-                  if (!api || !api.update_status || document.readyState !== 'complete')
-                    return {phase: 'app-bridge', document_ready: document.readyState};
-                  if (!window.__nd2wsiSmokeBridge) {
-                    window.__nd2wsiSmokeBridge = 'pending';
-                    api.update_status().then(status => { window.__nd2wsiSmokeBridge = status; })
-                      .catch(() => { window.__nd2wsiSmokeBridge = 'failed'; });
-                  }
-                  const bridge = window.__nd2wsiSmokeBridge;
-                  if (!bridge || typeof bridge !== 'object' || !bridge.version)
-                    return {phase: 'app-bridge', bridge_status: bridge || 'unavailable'};
-                  const frame = document.querySelector('#frames iframe.active');
-                  const page = frame && frame.contentDocument;
-                  const canvas = page && page.querySelector('#stage canvas');
-                  const plate = page && page.querySelector('#plate img');
-                  const slide = !!(frame && typeof readyFrames !== 'undefined' &&
-                    readyFrames.has(frame.dataset.sid) &&
-                    ((canvas && canvas.width > 0 && canvas.height > 0) ||
-                    (plate && plate.complete && plate.naturalWidth > 0)));
-                  if (slide && !frame.__nd2wsiSmokeLut) {
-                    const view = frame.contentWindow;
-                    const progress = frame.__nd2wsiSmokeLut = {pending: true, phase: 'lut-toolbar'};
-                    const step = async (phase, run, timeoutMs = 10000) => {
-                      progress.phase = phase;
-                      progress.step_timeout_ms = timeoutMs;
-                      let timer;
-                      try {
-                        return await Promise.race([Promise.resolve().then(run), new Promise((_, reject) => {
-                          timer = setTimeout(() => reject(new Error('LUT smoke ' + phase + ' timed out after ' + timeoutMs + ' ms')), timeoutMs);
-                        })]);
-                      } finally { clearTimeout(timer); }
-                    };
-                    frame.__nd2wsiSmokeLutTask = (async () => {
-                      const transfer = view.Nd2LutTransfer;
-                      if (!transfer || ['encode', 'planPaste', 'fitsChannel'].some(name => typeof transfer[name] !== 'function'))
-                        throw new Error('Packaged LUT transfer module is unavailable');
-                      const buttons = ['lut-type', 'lut-copy', 'lut-paste'].map(id => page.getElementById(id));
-                      if (buttons.some(button => !button || typeof button.onclick !== 'function') ||
-                          !page.getElementById('lut-dialog') || !page.getElementById('lut-copy-tooltip'))
-                        throw new Error('Packaged LUT toolbar is not wired');
-                      const shadingButton = document.getElementById('shading-correction');
-                      if (!shadingButton || document.getElementById('update-check') ||
-                          !document.getElementById('shading-progress-bar') ||
-                          !document.getElementById('shading-progress-title') ||
-                          !document.getElementById('shading-cancel') ||
-                          !['shading-confirm-title', 'shading-confirm-persistence', 'shading-confirm-estimate',
-                            'shading-confirm-continue', 'shading-confirm-cancel'].every(id => document.getElementById(id)) ||
-                          typeof document.getElementById('shading-confirm')?.showModal !== 'function' ||
-                          !window.Nd2ShadingCorrection || !view.Nd2ShadingCorrection ||
-                          typeof window.Nd2ShadingCorrection.nextAction !== 'function' ||
-                          typeof view.Nd2ShadingCorrection.nextAction !== 'function' ||
-                          typeof window.Nd2ShadingCorrection.methodSupport !== 'function')
-                        throw new Error('Packaged Shading Correction controls are unavailable');
-                      if (document.getElementById('shading-methods') || document.getElementById('shading-confirm-message'))
-                        throw new Error('Packaged Shading Correction contains obsolete method controls');
-                      await step('shading-status', async () => {
-                        const deadline = Date.now() + 10000;
-                        while (!view.eval('state.shading && !state.shading.snapshot().refreshing && !state.shading.snapshot().view_stale && state.shading.snapshot().state !== "checking"') ||
-                            !shadingStates.has(frame.dataset.sid)) {
-                          if (Date.now() >= deadline) throw new Error('Shading Correction status did not arrive');
-                          await new Promise(resolve => setTimeout(resolve, 50));
-                        }
-                      });
-                      const shadingStatus = view.eval('state.shading.snapshot()');
-                      if (typeof shadingStatus.applied !== 'boolean' || typeof shadingStatus.can_cancel !== 'boolean' ||
-                          !(shadingStatus.operation === null || ['apply', 'revoke'].includes(shadingStatus.operation)) ||
-                          shadingStatus.generation !== view.eval('state.info.generation') || shadingStatus.state === 'failed' ||
-                          !shadingButton.title.includes('Shading Correction'))
-                        throw new Error('Shading Correction did not initialize its committed pyramid state');
-                      const shading = window.Nd2ShadingCorrection;
-                      const persistentActions = {
-                        apply: shading.nextAction({state: 'idle', supported: true, applied: false, methods: {bffree: {supported: true}}}),
-                        revoke: shading.nextAction({state: 'ready', supported: true, applied: true, method: 'h'}),
-                        unavailable: shading.nextAction({state: 'idle', supported: true, applied: false, methods: {h: {supported: true}, bffree: {supported: false}}}),
-                        cancel: shading.nextAction({state: 'rebuilding', operation: 'revoke', applied: true, can_cancel: true}),
-                        publishing: shading.nextAction({state: 'publishing', operation: 'revoke', applied: true, can_cancel: false}),
-                      };
-                      if (persistentActions.apply !== 'start' || persistentActions.revoke !== 'revoke' || persistentActions.unavailable !== null ||
-                          persistentActions.cancel !== 'cancel' || persistentActions.publishing !== null)
-                        throw new Error('Persistent Shading Correction actions are unavailable');
-                      const progressCheck = window.Nd2ShadingCorrection.progress({
-                        state: 'preparing_display', operation: 'apply', can_cancel: true, pct: 63, eta_seconds: 75});
-                      const revokeProgress = window.Nd2ShadingCorrection.progress({
-                        state: 'rebuilding', operation: 'revoke', applied: true, can_cancel: true, pct: 41, eta_seconds: 64});
-                      if (!progressCheck.visible || progressCheck.pct !== 63 ||
-                          progressCheck.stage !== 'Building corrected pyramid' || !progressCheck.canCancel ||
-                          !progressCheck.eta.includes('remaining') || !revokeProgress.visible ||
-                          revokeProgress.title !== 'Revoke Shading Correction' ||
-                          revokeProgress.stage !== 'Rebuilding original pyramid' || !revokeProgress.canCancel ||
-                          !revokeProgress.eta.includes('remaining'))
-                        throw new Error('Shading Correction progress display is unavailable');
-                      if (__CLIPBOARD_CHECK__) {
-                        progress.phase = 'clipboard-transport';
-                        const native = view.parent?.pywebview;
-                        if (native?.platform !== 'edgechromium' ||
-                            typeof native.api?.write_lut_clipboard !== 'function' ||
-                            typeof native.api?.read_lut_clipboard !== 'function')
-                          throw new Error('Native Windows LUT clipboard bridge is unavailable');
-                        progress.clipboard_transport = 'native-winforms';
-                      }
-                      // Auto-LUT loading must settle before a same-values round trip.
-                      if (__CLIPBOARD_CHECK__) await step('autolut', async () => {
-                        const deadline = Date.now() + 15000;
-                        while (view.eval('state.lutAutoPending.some(Boolean)')) {
-                          if (Date.now() >= deadline) throw new Error('LUT smoke autolut timed out after 15000 ms');
-                          await new Promise(resolve => setTimeout(resolve, 50));
-                        }
-                      }, 15000);
-                      const assets = ['fluent-edit-20-regular.svg', 'fluent-copy-20-regular.svg', 'fluent-clipboard-paste-20-regular.svg',
-                        'fluent-checkmark-20-regular.svg', 'fluent-circle-highlight-20-regular.svg'];
-                      await step('icons', () => Promise.all(assets.map(async name => {
-                        const response = await view.fetch(new URL('../../static/icons/' + name, page.baseURI));
-                        if (!response.ok) throw new Error('LUT icon ' + name + ': HTTP ' + response.status);
-                        const svg = new view.DOMParser().parseFromString(await response.text(), 'image/svg+xml');
-                        if (svg.documentElement.tagName !== 'svg' || svg.documentElement.getAttribute('viewBox') !== '0 0 20 20' ||
-                            !svg.querySelector('path')) throw new Error('Invalid packaged LUT icon: ' + name);
-                      })));
-                      const infoImages = await step('info-images', async () => {
-                        const inspector = view.eval('state.windows.info');
-                        const wasHidden = inspector.isHidden();
-                        await view.loadSlideInspector();
-                        inspector.open();
-                        const names = view.eval('state.inspect && state.inspect.associated');
-                        if (!Array.isArray(names)) throw new Error('Slide Info metadata did not load');
-                        const images = [...page.querySelectorAll('#info-associated img')];
-                        if (images.length !== names.length) throw new Error('Slide Info omitted embedded images');
-                        const loaded = async () => {
-                          const deadline = Date.now() + 8000;
-                          while (images.some(image => !image.complete || !image.naturalWidth)) {
-                            if (Date.now() >= deadline) throw new Error('Slide Info image did not load');
-                            await new Promise(resolve => setTimeout(resolve, 40));
-                          }
-                        };
-                        await loaded();
-                        const dimensions = images.map(image => [image.naturalWidth, image.naturalHeight]);
-                        let enlarged = null;
-                        if (images.length) {
-                          const image = images.find(item => !item.src.includes('/thumbnail.jpg')) || images[0];
-                          const button = image.parentElement;
-                          button.click();
-                          await loaded();
-                          if (button.getAttribute('aria-expanded') !== 'true' ||
-                              !image.src.includes('detail=1') ||
-                              Math.max(image.naturalWidth, image.naturalHeight) > 2048)
-                            throw new Error('Slide Info enlargement is unavailable');
-                          enlarged = [image.naturalWidth, image.naturalHeight];
-                          button.click();
-                        }
-                        if (wasHidden) inspector.close();
-                        return {names, dimensions, enlarged};
-                      });
-                      const outcome = {ok: true, phase: 'complete', module: true, handlers: true, icons: assets,
-                        info_images: infoImages,
-                        shading_correction: {state: shadingStatus.state, applied: shadingStatus.applied,
-                          method: shadingStatus.method, methods: shadingStatus.methods,
-                          operation: shadingStatus.operation, can_cancel: shadingStatus.can_cancel,
-                          generation: shadingStatus.generation, actions: persistentActions,
-                          progress: progressCheck, revoke_progress: revokeProgress, toolbar: true, confirmation: true},
-                        clipboard_api: {write: typeof view.navigator.clipboard?.writeText === 'function',
-                          read: typeof view.navigator.clipboard?.readText === 'function'}};
-                      if (__CLIPBOARD_CHECK__) {
-                        const current = () => view.eval('window.Nd2LutTransfer.encode(state.info.channels, state.luts, state.info.dtype)');
-                        const before = current();
-                        const expected = view.eval('window.Nd2LutTransfer.planPaste(window.Nd2LutTransfer.encode(state.info.channels, state.luts, state.info.dtype), state.info.channels, state.info.dtype).updates.length');
-                        if (!expected) throw new Error('LUT clipboard fixture has no uniquely named compatible channels');
-                        const [, copy, paste] = buttons;
-                        const toast = () => page.getElementById('toast')?.textContent || 'No result reported';
-                        await step('copy', () => copy.onclick());
-                        if (copy.disabled || !copy.classList.contains('is-copied') || toast() !== 'Channel LUTs copied')
-                          throw new Error('LUT clipboard copy failed: ' + toast());
-                        await step('paste', () => paste.onclick());
-                        if (paste.disabled || !toast().startsWith('Pasted ' + expected + ' channel LUT'))
-                          throw new Error('LUT clipboard paste failed: ' + toast());
-                        if (current() !== before) throw new Error('LUT clipboard round trip changed effective channel values');
-                        outcome.clipboard_roundtrip = {ok: true, channels: expected, effective_values_unchanged: true,
-                          transport: progress.clipboard_transport};
-                      }
-                      return outcome;
-                    })().then(value => { frame.__nd2wsiSmokeLut = value; })
-                      .catch(error => { frame.__nd2wsiSmokeLut = {...progress, pending: false, ok: false,
-                        error: error.message || String(error)}; });
-                  }
-                  const handoff = __HANDOFF_CHECK__ && frame?.contentWindow.nd2HandoffApplied === true;
-                  return {bridge: true, version: bridge.version,
-                    phase: slide ? frame.__nd2wsiSmokeLut?.phase || 'lut-toolbar' : frame ? 'slide-render' : 'slide-load',
-                    ...(__HANDOFF_CHECK__ ? {handoff_applied:handoff,
-                      observed_display:handoff ? frame.contentWindow.nd2CaptureViewState() : null} : {}),
-                    boot: !!document.getElementById('drop'),
-                    slide, lut_toolbar: frame?.__nd2wsiSmokeLut || null};
-                })()""".replace("__HANDOFF_CHECK__", "true" if expected is not None else "false")
-                    .replace("__CLIPBOARD_CHECK__", "true" if clipboard_check else "false"))
-                if result:
-                    report["last_result"] = result
-                    report["phase"] = result.get("phase", (result.get("lut_toolbar") or {}).get("phase", report["phase"]))
-                if result and result.get("bridge") and result.get("slide" if expect_slide else "boot"):
-                    if expect_slide and (result.get("lut_toolbar") or {}).get("ok") is not True:
-                        if (result.get("lut_toolbar") or {}).get("ok") is False:
-                            report.update(result)
-                            report["error"] = result["lut_toolbar"]["error"]
-                            break
-                        time.sleep(0.05)
-                        continue
-                    if expected is not None:
-                        from .view_state import matches_view_state
-
-                        if not result.get("handoff_applied"):
-                            time.sleep(0.05)
-                            continue
-                        report.update(result)
-                        if not matches_view_state(expected, result.get("observed_display")):
-                            raise ValueError("Actual browser display state differs from the requested handoff")
-                    if sys.platform == "win32":
-                        from .translucent_smoke import native_call
-                        from .webview2_runtime import window_evidence
-
-                        # The bridge answered, so CoreWebView2 exists. This
-                        # thread is not the UI thread, which native_call needs.
-                        evidence = window_evidence(window, native_call)
-                        report["webview2_runtime"]["main"] = evidence
-                        if report["webview2_runtime"]["required"] and not evidence.get("bundled"):
-                            report.update(result, ok=False, phase="webview2-runtime",
-                                          error=evidence.get("error") or
-                                          "Main window was not rendered by the bundled WebView2 runtime")
-                            break
-                    native_keyboard = _gui_smoke_native_keyboard(api, window, slide=bool(result.get("slide")))
-                    report.update(result, native_keyboard=native_keyboard,
-                                  ok=native_keyboard["status"] != "failed", phase="complete")
-                    if native_keyboard["status"] == "failed":
-                        report.update(phase="native-keyboard", error=native_keyboard.get("error") or
-                                      native_keyboard.get("cleanup_error"))
-                    elif expect_slide:
-                        from .translucent_smoke import exercise_translucent_viewer
-
-                        tracing = exercise_translucent_viewer(api, window)
-                        report["translucent_viewer"] = tracing
-                        if sys.platform == "win32":
-                            report["webview2_runtime"]["translucent"] = tracing.get("webview2_runtime")
-                        if not tracing.get("ok"):
-                            report.update(ok=False, phase="translucent-viewer",
-                                          error=tracing.get("error", "Translucent viewer check failed"))
-                        elif (sys.platform == "win32" and report["webview2_runtime"]["required"]
-                              and not (tracing.get("webview2_runtime") or {}).get("bundled")):
-                            # Also catches an overlay check that skipped the proof.
-                            report.update(ok=False, phase="translucent-viewer",
-                                          error="Translucent overlay was not rendered by the bundled WebView2 runtime")
-                    if report["ok"] and expect_slide and sys.platform == "win32":
-                        from .window_smoke import exercise_independent_window
-
-                        # A forced bundled child starts its own cold Fixed Version runtime.
-                        child_timeout = 240 if report.get("webview2_runtime", {}).get("required") else 100
-                        independent = exercise_independent_window(api, timeout=child_timeout)
-                        report["independent_window"] = independent
-                        if not independent.get("ok"):
-                            report.update(ok=False, phase="independent-window",
-                                          error=independent.get("error", "Independent window check failed"))
-                    break
-            except Exception as exc:
-                report["last_error"] = str(exc)
-            time.sleep(0.25)
-        else:
-            raise TimeoutError(f"GUI did not finish within {timeout:g} seconds (last phase: {report['phase']})")
-    except Exception as exc:
-        report["error"] = str(exc)
-    finally:
-        report["elapsed_seconds"] = round(time.monotonic() - started, 2)
-        # The GUI's main loop can return as soon as the window closes.
-        _gui_smoke_close(api, window, report, timeout=close_timeout)
-    return report
+    return _gui_smoke_mod.gui_smoke(
+        api, window, expect_slide=expect_slide, timeout=timeout,
+        close_timeout=close_timeout, native_keyboard=_gui_smoke_native_keyboard,
+    )
 
 
 class _PywebviewDaemonThread(threading.Thread):
@@ -2320,8 +1717,6 @@ def _main(args) -> int:
 
 def create_app_window(initial: Path | None, window_session=None):
     """The app window and its bridge, ready for ``webview.start``."""
-    import time
-
     import webview
 
     global _LAUNCH_PATH, _LAUNCH_AT

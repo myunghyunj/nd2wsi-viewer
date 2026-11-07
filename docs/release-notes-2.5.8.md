@@ -7,7 +7,7 @@ and exported pixel values, and stored annotation, correction and LUT formats, ar
 - **Windows external drives and paths.** Launching from an exFAT or FAT32 drive no longer logs false download-mark warnings, and tab titles and sidecar status messages show only the file name for Windows paths.
 - **Opening multiple slides.** Dropping additional files while the first slide is opening keeps every file in the queue, and concurrent conversions each keep their own progress tab.
 - **Session locks and sidecars.** Closed or terminated windows clean up their `.window-live` lock files, and legacy annotation sidecar migration skips symbolic links.
-- **Update card and recovery.** Release notes remain accessible while an update downloads, manual update retries lock their buttons until the check finishes, and slides can be reopened by drag-and-drop if an update is cancelled after teardown.
+- **Update card and recovery.** Both the start page and open slides use the bottom-right translucent update card on macOS, release notes remain accessible while an update downloads, manual update retries lock their buttons until the check finishes, and slides can be reopened by drag-and-drop if an update is cancelled after teardown.
 
 ### Downloads
 

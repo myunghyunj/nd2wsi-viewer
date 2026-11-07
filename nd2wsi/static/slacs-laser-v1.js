@@ -84,13 +84,14 @@
     // Use the last numbered item, never the centre of a clipped or rotated bounding box.
     const previous = items.filter(a => laser(a) && pair(a.slacs.target_px)).reduce((last,a) =>
       !last || (a.slacs.isolation || 0) > (last.slacs.isolation || 0) ? a : last, null);
+    const [py, px] = input.pixel_size_um;
     const distance = previous ? Math.hypot(x - previous.slacs.target_px[0], y - previous.slacs.target_px[1]) : null;
-    const halfSide = input.target_side_um / Math.min(...input.pixel_size_um) / 2;
+    const distanceUm = previous ? Math.hypot((x - previous.slacs.target_px[0]) * px, (y - previous.slacs.target_px[1]) * py) : null;
     result.distance_px = distance;
     meta.presses[receiver] = input.press;
     // Bound receiver history without ever truncating this session's idempotency.
     meta.presses = Object.fromEntries(Object.entries(meta.presses).slice(-256));
-    if (previous && distance < halfSide) {
+    if (previous && distanceUm < input.target_side_um / 2) {
       const updated = { ...previous, slacs: { ...previous.slacs, shots: (previous.slacs.shots || 1) + 1,
         last_at: input.at, presses: { ...previous.slacs.presses, [receiver]: input.press } } };
       owner.meta = meta;

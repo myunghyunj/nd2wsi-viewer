@@ -843,3 +843,34 @@ def test_session_shows_only_a_known_installed_version(monkeypatch, installed, ex
     monkeypatch.setattr(release_selection, "installed_version", lambda: installed)
     session = card.UpdateCardSession(Mock(), lambda: None, lambda fn: fn(), channel=Channel())
     assert session.current_version == expected
+
+
+def test_page_handoff_preserves_active_download_and_renders_on_new_page(h):
+    h.found(description="<ul><li>Landing to shell handoff</li></ul>")
+    h.action("download")
+    h.drain()
+    h.session.dispatch("showDownloadInitiatedWithCancellation_", h.block)
+    h.session.dispatch("showDownloadDidReceiveExpectedContentLength_", 100)
+    h.session.dispatch("showDownloadDidReceiveDataOfLength_", 45)
+    h.session.prepare_handoff("page-1")
+    h.drain()
+    h.session.before_load()
+    assert h.received == [(card.INSTALL,)]
+    assert h.session.mode == "card" and not h.session.closed
+    h.session.page_ready("page-2")
+    assert h.session.page_id == "page-2"
+    assert '"state": "downloading"' in h.channel.calls[-1]
+    h.session.dispatch("showReadyToInstallAndRelaunch_", h.block)
+    h.action("install")
+    h.drain()
+    assert h.received == [(card.INSTALL,), (card.INSTALL,)]
+
+
+def test_unannounced_before_load_still_closes_session_and_cancels_download(h):
+    h.found()
+    h.action("download")
+    h.drain()
+    h.session.dispatch("showDownloadInitiatedWithCancellation_", h.block)
+    h.session.before_load()
+    assert h.received == [(card.INSTALL,), ()]
+    assert h.session.closed

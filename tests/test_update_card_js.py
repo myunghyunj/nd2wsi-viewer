@@ -90,7 +90,7 @@ def test_shell_markup_precedes_card_script_and_boot_reuses_same_module():
     html = (STATIC / "shell.html").read_text(encoding="utf-8")
     assert html.index('id="update-notice"') < html.index('src="static/update-card-v1.js"') < html.index('src="static/shell-v1.js"')
     assert 'data-update-card-shell="true"' in html
-    assert 'data-update-card-shell="true"' not in BOOT_HTML
+    assert 'data-update-card-shell="true"' in BOOT_HTML
     assert 'window.nd2wsiUpdateCard.check()' in BOOT_HTML
 
 
@@ -400,3 +400,16 @@ await pending;
 console.log(JSON.stringify({during,title:element('update-notice-title').textContent}));
 ''')
     assert result == {"during": [True, True], "title": "No update available"}
+
+
+def test_handoff_suppresses_pagehide_close_across_navigation():
+    result = run('''
+const handoffs=[];
+win.pywebview.api.update_card_handoff=id=>{handoffs.push(id);return Promise.resolve(true);};
+show('downloading',['cancel'],{received:50,total:100});
+const beforeCalls=calls.length;
+await card.handoff();
+listeners.pagehide();
+console.log(JSON.stringify({handoffs:handoffs.length,afterCalls:calls.length-beforeCalls,pageMatch:handoffs[0]===card.pageId}));
+''')
+    assert result == {"handoffs": 1, "afterCalls": 0, "pageMatch": True}

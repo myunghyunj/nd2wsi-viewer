@@ -170,9 +170,9 @@ target implements `checkForUpdates:` and `validateMenuItem:` using
 The lab edition's existing update guard also disables this path after merging.
 
 `update_card.py` owns the update session on AppKit's main queue. At its first
-callback it probes the shell's `nd2wsiUpdateCard.ready` for up to two seconds,
-then uses either card or standard UI until `dismissUpdateInstallation`. Landing
-pages and unavailable pages use the standard driver. A later page stall transfers
+callback it probes the page's `nd2wsiUpdateCard.ready` for up to two seconds,
+then uses either card or standard UI until `dismissUpdateInstallation`. Unavailable
+pages use the standard driver. A later page stall transfers
 the current phase and live reply to the standard driver without cancelling the
 download. One bounded page transport serializes evaluation off main and resumes
 after the stalled call returns; it then clears the stale card. A later session
@@ -199,8 +199,8 @@ release notes are stripped to at most eight plain-text items of 300 characters
 each, retained through download and extraction, and rendered as list items.
 The notes action opens the version's GitHub release page.
 
-The landing page embeds the same card for manual Windows checks, with Sparkle
-readiness disabled. It requests `check_for_updates(False)` only after a click.
+The landing page embeds the same card with Sparkle readiness enabled, and uses
+`check_for_updates(False)` after a click on Windows or when Sparkle is disabled.
 `open_update_download` accepts a one-use token for the exact compatible asset
 returned by the existing OS/CPU selector; it does not accept a URL from JavaScript
 or perform another network lookup. Failed browser opens may be retried.

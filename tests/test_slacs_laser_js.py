@@ -107,3 +107,17 @@ def test_shell_routes_only_to_an_existing_pane_and_quit_freezes_delivery():
       host.quitPreparation={};assert.equal(host.window.nd2wsiSlacsLaserBox({sid:'slide'}),false);
       assert.equal(sent.length,1);assert.equal(sent[0][0].nd2wsi,'slacs-laser-box');
     ''')
+
+
+def test_anisotropic_pixel_size_uses_physical_micrometre_distance_for_burst_merge():
+    result = run('''
+      const h=harness();
+      // pixel_size_um is [py=2.0, px=0.5] and target_side_um is 10 (halfSide = 5 um).
+      // A second shot at dx=0, dy=4 px is 8 um away in Y (> 5 um), so it must start a new burst
+      // even though 4 px < 10 / 0.5 / 2 = 10 px.
+      const r1=h.shot(1,1000,1000,{pixel_size_um:[2.0,0.5],target_side_um:10});
+      const r2=h.shot(2,1000,1004,{pixel_size_um:[2.0,0.5],target_side_um:10});
+      const r3=h.shot(3,1006,1004,{pixel_size_um:[2.0,0.5],target_side_um:10}); // dx=6 px -> 3 um < 5 um
+      console.log(JSON.stringify({d1:r1.decision,d2:r2.decision,d3:r3.decision,count:h.owner.items.length}));
+    ''')
+    assert result == {"d1": "added", "d2": "added", "d3": "updated", "count": 2}

@@ -369,9 +369,11 @@ def install_sparkle_updater(
                 standard.showUpdaterError_acknowledgement_(error, lambda: None)
             raise RuntimeError(f"SPUUpdater could not start: {error or 'no error details returned'}")
         if window is not None:
+            def before_load(*_args):
+                main(card.before_load)
             def end_page(*_args):
                 main(card.page_closed)
-            window.events.before_load += end_page
+            window.events.before_load += before_load
             window.events.closed += end_page
         menu_item = _install_menu_item(controller)
         logger("Sparkle updater started")

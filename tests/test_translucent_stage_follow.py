@@ -558,16 +558,19 @@ def test_log_client_event_caps_and_rate_limits(monkeypatch):
     events = []
     monkeypatch.setattr(tw.session_log, "event", lambda kind, **fields: events.append((kind, fields)))
     api = make_overlay()
+    api._context["slide_url"] = "http://127.0.0.1:8123/k/secret-token/s/slide1/"
     events.clear()  # the injected detection is logged; only client events matter here
     result = api.log_client_event({"source": "x" * 5000, "kind": "error",
-                                   "message": "boom", "where": "a.js:1", "stack": "y" * 9000,
+                                   "message": "boom at http://127.0.0.1:8123/k/secret-token/static/translucent-v1.js",
+                                   "where": "http://127.0.0.1:8123/k/secret-token/a.js:1", "stack": "y" * 9000,
                                    "ignored": "drop me"})
     assert result["ok"] and events[0][0] == "client_error"
     fields = events[0][1]
     assert set(fields) == {"source", "client_kind", "message", "where", "stack"}
     assert len(fields["source"]) == tw.CLIENT_LOG_FIELD_LIMIT
     assert len(fields["stack"]) == tw.CLIENT_LOG_STACK_LIMIT
-    assert fields["message"] == "boom" and fields["client_kind"] == "error"
+    assert fields["message"] == "boom at static/translucent-v1.js" and fields["client_kind"] == "error"
+    assert "secret-token" not in fields["where"]
     assert "ignored" not in fields
     for _ in range(tw.CLIENT_LOG_MAX * 2):
         last = api.log_client_event({"kind": "error", "message": "again"})

@@ -69,6 +69,16 @@ _RESERVED = ("t", "uptime", "kind", "thread")
 _INSTALLED_MARKERS = ("Uninstall.exe", ".nd2wsi-install.ini")
 _SESSION_NAME = re.compile(r"(session-\d{8}-\d{6}-\d+(?:-\d+)?)\.jsonl")
 _FATAL_NAME = re.compile(r"(session-\d{8}-\d{6}-\d+(?:-\d+)?)-fatal\.txt")
+_CAPABILITY_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):\d+/k/[A-Za-z0-9_-]+/?")
+
+
+def redact_capability_urls(text: str, *urls: str | None) -> str:
+    """Strip local capability URLs before writing client diagnostics."""
+    result = str(text)
+    for url in urls:
+        if isinstance(url, str) and url:
+            result = result.replace(url, "")
+    return _CAPABILITY_URL_RE.sub("", result)
 
 _lock = threading.RLock()  # re-entrant: a signal handler may log mid-write
 _path: Path | None = None
