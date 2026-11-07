@@ -3,6 +3,21 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.1</title>
+            <pubDate>Sat, 07 Nov 2026 16:07:00 +0900</pubDate>
+            <sparkle:version>2.6.1</sparkle:version>
+            <sparkle:shortVersionString>2.6.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Interactive Z-stack, time-series, and multi-series navigation for Zeiss CZI (.czi) and Leica LIF (.lif)</h2>
+<ul>
+<li><strong>Interactive Z-axis slider (<code>#z-knob</code>) for confocal <code>.czi</code> and <code>.lif</code> Z-stacks.</strong> Confocal <code>.czi</code> and <code>.lif</code> Z-stack acquisitions now open directly in interactive multi-plane navigation mode with the right-hand Z-axis slider (<code>#z-knob</code>), home-plane indicator, physical micrometer Z-step offset readout, and <code>F</code> autofocus.</li>
+<li><strong>Time-series, LambdaScan &amp; multi-series container navigation.</strong> Multi-frame time-series and spectral LambdaScan <code>.czi</code> / <code>.lif</code> files expose the bottom timeline scrubber (<code>#t-track</code>), and multi-series <code>.lif</code> containers with uniform series dimensions open as a position grid with instant series switching.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.1/nd2wsi-viewer-2.6.1-macos-arm64.dmg" length="131816287" type="application/octet-stream" sparkle:edSignature="cqh5pAkIrP3Mk2stZsZLXrOfUfm5pe1zgKD+Us44Ih1Ca7uY0FRkv0N9KB2kx+5kN0JdzK/9imYNBnMF1aL+Bg=="/>
+        </item>
+        <item>
             <title>2.6.0</title>
             <pubDate>Sat, 07 Nov 2026 14:04:00 +0900</pubDate>
             <sparkle:version>2.6.0</sparkle:version>
