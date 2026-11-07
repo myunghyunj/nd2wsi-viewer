@@ -7,7 +7,7 @@
 <p align="center">
   <strong>Browse whole slides. Inspect channels. Export the region you need.</strong><br>
   A local microscopy viewer for macOS and Windows.<br>
-  <strong>Supported formats:</strong> JPG · PNG · ND2 · SVS · <a href="docs/sdpc-support.md">SDPC</a>
+  <strong>Supported formats:</strong> JPG · PNG · ND2 · CZI · SVS · <a href="docs/sdpc-support.md">SDPC</a>
 </p>
 
 <p align="center">
@@ -20,6 +20,7 @@
 
 ## Latest update
 
+- **Zeiss CZI support (`.czi`):** open 2D plane scans, stitched mosaic acquisitions, and multi-channel / Z-stack confocal `.czi` files with `.nd2svs` pyramid caching, physical micrometer calibration (`Scaling/Distance`), objective magnification, fluorophore channel names and colors, LUT adjustment, sidecar annotations, and native-value ROI export.
 - **Update card across slide opens:** opening the first slide from the start window keeps an active update offer or download visible in the bottom-right update card instead of cancelling it, and hides the start window's update button while the card is shown.
 - **Translucent tracing windows:** closing a slide tab closes its translucent tracing window automatically, and reopening a slide after a cancelled update allows the translucent viewer to open again.
 - **Slide opening feedback:** unsupported or missing files keep their error message visible on the start window and after update recovery, and the opening progress tab remains visible until the new slide tab appears.
@@ -31,10 +32,10 @@
 
 ## Download
 
-| Platform | Download · 2.5.9 | Requirements |
+| Platform | Download · 2.6.0 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.9/nd2wsi-viewer-2.5.9-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.9/nd2wsi-viewer-2.5.9-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.0/nd2wsi-viewer-2.6.0-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.0/nd2wsi-viewer-2.6.0-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
 
 On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
 and keep `_internal` beside `nd2wsi-viewer.exe`. See the

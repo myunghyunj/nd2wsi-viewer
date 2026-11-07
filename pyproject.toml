@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nd2wsi-viewer"
-version = "2.5.9"
-description = "Local whole-slide viewing for stitched Nikon ND2, Aperio SVS, and SDPC, with native-value ROI export"
+version = "2.6.0"
+description = "Local whole-slide viewing for stitched Nikon ND2, Zeiss CZI, Aperio SVS, and SDPC, with native-value ROI export"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Myunghyun Jeong" }]
-keywords = ["nd2", "nikon", "nis-elements", "svs", "sdpc", "ome-zarr", "ngff", "whole-slide", "microscopy", "openseadragon"]
+keywords = ["nd2", "nikon", "nis-elements", "czi", "zeiss", "svs", "sdpc", "ome-zarr", "ngff", "whole-slide", "microscopy", "openseadragon"]
 dependencies = [
   "nd2>=0.10",
   "numpy>=1.24",

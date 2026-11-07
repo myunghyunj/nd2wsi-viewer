@@ -227,13 +227,15 @@ def _main(argv: list[str] | None = None) -> int:
     command_args = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(command_args)
 
+    from .czi import collect_czi_info, format_czi_info, is_czi
     from .raster import is_raster
     from .sdpc import is_sdpc
 
     if args.cmd == "convert" and is_sdpc(args.nd2):
         parser.error("SDPC supports direct viewing and ROI export, not pyramid conversion; use 'view' to open it")
-    if args.cmd == "crop" and is_sdpc(args.nd2):
-        parser.error("'crop' reads native ND2 files only; open the SDPC with 'view' and use ROI export")
+    if args.cmd == "crop" and (is_sdpc(args.nd2) or is_czi(args.nd2)):
+        fmt = "SDPC" if is_sdpc(args.nd2) else "CZI"
+        parser.error(f"'crop' reads native ND2 files only; open the {fmt} with 'view' and use ROI export")
     if args.cmd == "view" and any(is_sdpc(path) or is_raster(path) for path in args.nd2):
         conversion_flags = {"--store", "--overwrite", "--t", "--position", "--z", "--tile", "--workers", "--yes", "-y"}
         if any(argument.split("=", 1)[0] in conversion_flags for argument in command_args):
@@ -253,6 +255,8 @@ def _main(argv: list[str] | None = None) -> int:
             return 0
         elif is_svs(args.nd2):
             collect_info, format_info = collect_svs_info, format_svs_info
+        elif is_czi(args.nd2):
+            collect_info, format_info = collect_czi_info, format_czi_info
         else:
             from .inspect_nd2 import collect_info, format_info
 
