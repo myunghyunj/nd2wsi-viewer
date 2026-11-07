@@ -3,6 +3,23 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.5.9</title>
+            <pubDate>Sat, 07 Nov 2026 11:15:00 +0900</pubDate>
+            <sparkle:version>2.5.9</sparkle:version>
+            <sparkle:shortVersionString>2.5.9</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Update card across slide opens, translucent tracing windows, multi-window dialog targeting</h2>
+<ul>
+<li><strong>Update card across slide opens.</strong> Opening the first slide from the start window keeps an active update offer or download visible in the bottom-right update card instead of cancelling it, and hides the start window's update button while the card is shown.</li>
+<li><strong>Translucent tracing windows.</strong> Closing a slide tab closes its translucent tracing window automatically, and reopening a slide after a cancelled update allows the translucent viewer to open again.</li>
+<li><strong>Slide opening feedback.</strong> Unsupported or missing files keep their error message visible on the start window and after update recovery, and the opening progress tab remains visible until the new slide tab appears.</li>
+<li><strong>Multiple windows.</strong> File dialogs and title-bar zoom actions target the active viewer window instead of always using the first window.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.9/nd2wsi-viewer-2.5.9-macos-arm64.dmg" length="132467638" type="application/octet-stream" sparkle:edSignature="BuErgJve1szepvJeRI5Ty4pq8LEfuUszhQY5gLg6dEBl03FCXIIEw2VmcYPhSWbSHZqt97uvkR6ruo1jQimHCw=="/>
+        </item>
+        <item>
             <title>2.5.8</title>
             <pubDate>Sat, 07 Nov 2026 01:17:00 +0900</pubDate>
             <sparkle:version>2.5.8</sparkle:version>
