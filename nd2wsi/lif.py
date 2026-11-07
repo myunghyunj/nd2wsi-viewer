@@ -98,6 +98,7 @@ class _LifSeriesSpec:
     magnification: float | None
     objective_name: str | None
     tile_positions_px: list[tuple[int, int]] | None
+    z_step_um: float | None = None
 
 
 def _read_lif_header_and_blocks(
@@ -340,6 +341,7 @@ def _parse_series_element(
     # Physical pixel calibration in micrometers (LIF stores Length in meters when Unit == "m")
     px_um = _axis_pixel_size_um(dims[1])
     py_um = _axis_pixel_size_um(dims[2])
+    z_step_um = _axis_pixel_size_um(dims[3]) if (3 in dims and dims[3]["n"] > 1) else None
     if px_um is not None and py_um is not None:
         pixel_size_um: tuple[float, float] | None = (py_um, px_um)
         cal_source = "lif-dimension"
@@ -411,6 +413,7 @@ def _parse_series_element(
         magnification=magnification,
         objective_name=objective_name,
         tile_positions_px=tile_positions_px,
+        z_step_um=z_step_um,
     )
 
 

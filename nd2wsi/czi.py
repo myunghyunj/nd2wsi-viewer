@@ -200,6 +200,19 @@ def _read_czi_header_and_index(
     return entries, xml_root
 
 
+def _extract_czi_z_step_um(xml_root: ET.Element | None) -> float | None:
+    if xml_root is None:
+        return None
+    for dist in xml_root.findall(".//Scaling/Items/Distance"):
+        if dist.get("Id") == "Z":
+            val_text = dist.findtext("Value")
+            if _finite_positive(val_text):
+                um = float(val_text) * 1e6
+                if _finite_positive(um):
+                    return um
+    return None
+
+
 def _extract_czi_metadata(
     xml_root: ET.Element | None, n_channels: int, rgb: bool
 ) -> tuple[tuple[float, float] | None, str, float | None, list[ChannelInfo]]:

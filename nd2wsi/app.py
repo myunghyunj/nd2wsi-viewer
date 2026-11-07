@@ -105,7 +105,7 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
         return nd2_path  # Direct sources need no cache creation or migration.
     if is_svs(nd2_path) and existing_cache_store(nd2_path) is None:
         return nd2_path  # the registry serves it straight from the file
-    if nd2_path.suffix.lower() == ".nd2" and is_plate_file(nd2_path):
+    if is_plate_file(nd2_path):
         if on_status:
             on_status(f"opening {nd2_path.name} … (plate)")
         return nd2_path  # camera fields over time are served from the file

@@ -71,6 +71,8 @@ from .reader import (
 from .session_lock import SessionFileLock
 
 PLATE_MAX_FRAME_PX = 4_500_000  # a camera field, not a stitched scan
+CZI_LIF_PLATE_MAX_DIM = 8192  # keeps level_shapes within PLATE_K=(2, 4, 8, 16) at tile=512
+CZI_LIF_PLATE_MAX_FRAME_PX = 40_000_000  # confocal / lightsheet Z-stacks and time series
 PLATE_CACHE_BYTES = 768 * 1024 * 1024  # reduced frames kept in memory
 FRAME_CACHE_BYTES = 320 * 1024 * 1024  # whole frames kept for the focused site
 PLATE_K = (2, 4, 8, 16)  # box mean factors the grid may ask for
@@ -182,11 +184,63 @@ def _file_identity(st: os.stat_result) -> tuple[int, int, int, int]:
 
 
 def is_plate_file(path: str | Path) -> bool:
-    """True for an uncompressed ND2 of camera fields with a T, P or Z loop."""
+    """True for an ND2, CZI, or LIF of camera fields with a T, P or Z loop."""
     try:
         path = Path(path)
-        if path.suffix.lower() != ".nd2" or not path.is_file():
+        suffix = path.suffix.lower()
+        if suffix not in (".nd2", ".czi", ".lif") or not path.is_file():
             return False
+        if suffix == ".czi":
+            from .czi import _level0_entries, _read_czi_header_and_index
+
+            file_size = path.stat().st_size
+            fd = os.open(str(path), os.O_RDONLY | BINARY)
+            try:
+                entries, _ = _read_czi_header_and_index(fd, file_size)
+            finally:
+                os.close(fd)
+            lvl0 = _level0_entries(entries)
+            s_values = sorted({e.s for e in lvl0})
+            s0_entries = [e for e in lvl0 if e.s == s_values[0]] if s_values else lvl0
+            x0 = min(e.x_start for e in s0_entries)
+            y0 = min(e.y_start for e in s0_entries)
+            width = max(e.x_start + e.x_size for e in s0_entries) - x0
+            height = max(e.y_start + e.y_size for e in s0_entries) - y0
+            if not (THUMB_K <= width <= CZI_LIF_PLATE_MAX_DIM and THUMB_K <= height <= CZI_LIF_PLATE_MAX_DIM):
+                return False
+            if width * height > CZI_LIF_PLATE_MAX_FRAME_PX:
+                return False
+            n_z = len({e.z for e in s0_entries})
+            n_t = len({e.t for e in s0_entries})
+            return n_z > 1 or n_t > 1
+        if suffix == ".lif":
+            from .lif import _list_lif_series, _read_lif_header_and_blocks
+
+            file_size = path.stat().st_size
+            fd = os.open(str(path), os.O_RDONLY | BINARY)
+            try:
+                root, blocks = _read_lif_header_and_blocks(fd, file_size)
+            finally:
+                os.close(fd)
+            all_series = _list_lif_series(root, blocks)
+            s0 = all_series[0]
+            if s0.tile_positions_px and s0.n_m > 1:
+                width = max(tx + s0.width for tx, _ty in s0.tile_positions_px)
+                height = max(ty + s0.height for _tx, ty in s0.tile_positions_px)
+            else:
+                width, height = s0.width, s0.height
+            if not (THUMB_K <= width <= CZI_LIF_PLATE_MAX_DIM and THUMB_K <= height <= CZI_LIF_PLATE_MAX_DIM):
+                return False
+            if width * height > CZI_LIF_PLATE_MAX_FRAME_PX:
+                return False
+            if s0.n_z > 1 or s0.n_t > 1:
+                return True
+            sig0 = (s0.width, s0.height, s0.n_z, s0.n_t, s0.n_m, len(s0.channels), s0.dtype, s0.rgb)
+            matching = [
+                s for s in all_series
+                if (s.width, s.height, s.n_z, s.n_t, s.n_m, len(s.channels), s.dtype, s.rgb) == sig0
+            ]
+            return len(matching) > 1
         import nd2
 
         with warnings.catch_warnings():
@@ -1652,11 +1706,15 @@ class PlateSource:
         self._pf_thread: threading.Thread | None = None
         self._fd = -1
         self._fg = 0  # foreground reads in flight; the prefetch worker yields to them
+        self._f: Any = None
+        suffix = self.path.suffix.lower()
+        self._backend = "czi" if suffix == ".czi" else "lif" if suffix == ".lif" else "nd2"
         self._source_file = open(self.path, "rb")
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                self._f = nd2.ND2File(self._source_file)
+            if self._backend == "nd2":
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    self._f = nd2.ND2File(self._source_file)
             # The Windows positional-read fallback owns its file position;
             # dup would share that position with nd2's buffered source reader.
             self._fd = (
@@ -1673,7 +1731,12 @@ class PlateSource:
                 raise ValueError(
                     "the source file changed while it was opening; retry the open"
                 )
-            self._init_from_file(self._f)
+            if self._backend == "czi":
+                self._init_from_czi()
+            elif self._backend == "lif":
+                self._init_from_lif()
+            else:
+                self._init_from_file(self._f)
             self._check_source()
             if store:
                 opened_store = None
@@ -1702,7 +1765,7 @@ class PlateSource:
             if self._fd >= 0:
                 os.close(self._fd)
                 self._fd = -1
-            if hasattr(self, "_f"):
+            if self._f is not None:
                 self._f.close()
             self._source_file.close()
             raise
@@ -1816,6 +1879,140 @@ class PlateSource:
             self.exposure_ms = _exposure_ms(dict(f.text_info or {}))
         except Exception:
             self.exposure_ms = None
+
+        _, H, W = self.frame_shape
+        shapes = level_shapes(H, W, self.tile)
+        self.levels = [
+            {"path": str(k), "width": w, "height": h, "downsample": 2**k}
+            for k, (h, w) in enumerate(shapes)
+        ]
+        self.attrs = self._build_attrs(shapes)
+
+    def _init_from_czi(self) -> None:
+        from .czi import (
+            _PIXEL_TYPES,
+            _extract_czi_metadata,
+            _extract_czi_z_step_um,
+            _level0_entries,
+            _read_czi_header_and_index,
+        )
+
+        st = os.fstat(self._fd)
+        self._ident = _file_identity(st)
+        entries, xml_root = _read_czi_header_and_index(self._fd, st.st_size)
+        lvl0 = _level0_entries(entries)
+        s_values = sorted({e.s for e in lvl0})
+        s0_entries = [e for e in lvl0 if e.s == s_values[0]] if s_values else lvl0
+
+        x0 = min(e.x_start for e in s0_entries)
+        y0 = min(e.y_start for e in s0_entries)
+        width = max(e.x_start + e.x_size for e in s0_entries) - x0
+        height = max(e.y_start + e.y_size for e in s0_entries) - y0
+
+        ptype = s0_entries[0].pixel_type
+        dtype, samples, rgb = _PIXEL_TYPES[ptype]
+        c_values = sorted({e.c for e in s0_entries})
+        z_values = sorted({e.z for e in s0_entries})
+        t_values = sorted({e.t for e in s0_entries})
+        n_c = 3 if rgb else len(c_values)
+
+        self.T = max(1, len(t_values))
+        self.P = 1
+        self.Z = max(1, len(z_values))
+        self.sizes = {"T": self.T, "P": self.P, "Z": self.Z, "C": n_c, "Y": height, "X": width}
+        self._coord_axes = ["T", "P", "Z"]
+        self.frame_shape = (n_c, height, width)
+        self.dtype = np.dtype(dtype)
+        self.rgb = bool(rgb)
+
+        self._czi_origin = (x0, y0)
+        self._czi_samples = samples
+        self._czi_c_values = c_values
+        self._czi_z_values = z_values
+        self._czi_t_values = t_values
+        by_tz: dict[tuple[int, int], list[Any]] = {}
+        by_tzc: dict[tuple[int, int, int], list[Any]] = {}
+        for sb in s0_entries:
+            by_tz.setdefault((sb.t, sb.z), []).append(sb)
+            by_tzc.setdefault((sb.t, sb.z, sb.c), []).append(sb)
+        self._czi_by_tz = by_tz
+        self._czi_by_tzc = by_tzc
+
+        pixel_size_um, cal_source, magnification, channels = _extract_czi_metadata(
+            xml_root, n_c, self.rgb
+        )
+        self.channels = channels
+        self.pixel_size_um = pixel_size_um
+        self.calibration_source = cal_source
+        self.magnification = magnification
+        self.sites = [{"i": 0, "name": "Site 1", "row": 0, "col": 0, "stageUm": None}]
+        self.rows = 1
+        self.cols = 1
+        self.z_home = self.Z // 2
+        self.z_step_um = _extract_czi_z_step_um(xml_root)
+        self.bottom_to_top = True if self.z_step_um is not None else None
+        self.period_ms = None
+        self.times_ms = [float(t) for t in range(self.T)]
+        self.exposure_ms = None
+
+        _, H, W = self.frame_shape
+        shapes = level_shapes(H, W, self.tile)
+        self.levels = [
+            {"path": str(k), "width": w, "height": h, "downsample": 2**k}
+            for k, (h, w) in enumerate(shapes)
+        ]
+        self.attrs = self._build_attrs(shapes)
+
+    def _init_from_lif(self) -> None:
+        from .lif import _list_lif_series, _read_lif_header_and_blocks
+        from .reader import ChannelInfo
+
+        st = os.fstat(self._fd)
+        self._ident = _file_identity(st)
+        root, blocks = _read_lif_header_and_blocks(self._fd, st.st_size)
+        all_series = _list_lif_series(root, blocks)
+        s0 = all_series[0]
+        if s0.n_z > 1 or s0.n_t > 1:
+            selected = [s0]
+        else:
+            sig0 = (s0.width, s0.height, s0.n_z, s0.n_t, s0.n_m, len(s0.channels), s0.dtype, s0.rgb)
+            selected = [
+                s for s in all_series
+                if (s.width, s.height, s.n_z, s.n_t, s.n_m, len(s.channels), s.dtype, s.rgb) == sig0
+            ]
+        self._lif_series = selected
+
+        if s0.tile_positions_px and s0.n_m > 1:
+            width = max(tx + s0.width for tx, _ty in s0.tile_positions_px)
+            height = max(ty + s0.height for _tx, ty in s0.tile_positions_px)
+        else:
+            width, height = s0.width, s0.height
+        n_c = len(s0.channels)
+
+        self.T = max(1, int(s0.n_t))
+        self.P = len(selected)
+        self.Z = max(1, int(s0.n_z))
+        self.sizes = {"T": self.T, "P": self.P, "Z": self.Z, "C": n_c, "Y": height, "X": width}
+        self._coord_axes = ["T", "P", "Z"]
+        self.frame_shape = (n_c, height, width)
+        self.dtype = np.dtype(s0.dtype)
+        self.rgb = bool(s0.rgb)
+        self.channels = [ChannelInfo(ch.name, ch.color) for ch in s0.channels]
+        self.pixel_size_um = s0.pixel_size_um
+        self.calibration_source = s0.calibration_source
+        self.magnification = s0.magnification
+        self.sites = [
+            {"i": p, "name": ser.name or f"Series {p + 1}", "row": 0, "col": p, "stageUm": None}
+            for p, ser in enumerate(selected)
+        ]
+        self.rows = 1
+        self.cols = self.P
+        self.z_home = self.Z // 2
+        self.z_step_um = s0.z_step_um
+        self.bottom_to_top = True if self.z_step_um is not None else None
+        self.period_ms = None
+        self.times_ms = [float(t) for t in range(self.T)]
+        self.exposure_ms = None
 
         _, H, W = self.frame_shape
         shapes = level_shapes(H, W, self.tile)
@@ -1944,11 +2141,64 @@ class PlateSource:
 
     def frame_view(self, t: int, p: int, z: int) -> np.ndarray:
         """(C, H, W) zero copy view onto the memory map. Valid until close."""
+        if self._backend in ("czi", "lif"):
+            return self.frame(t, p, z)
         with self._life:
             self._check_source()
             seq = self.seq(t, p, z)
             view, _ = _frame_to_cyx(self._f.read_frame(seq), self.sizes)
         return view
+
+    def _read_czi_frame(self, t: int, p: int, z: int) -> np.ndarray:
+        from .czi import _read_subblock_window
+
+        if not (0 <= t < self.T and 0 <= p < self.P and 0 <= z < self.Z):
+            raise ValueError(f"frame ({t}, {p}, {z}) out of range")
+        t_val = self._czi_t_values[t]
+        z_val = self._czi_z_values[z]
+        x0, y0 = self._czi_origin
+        n_c, height, width = self.frame_shape
+        if self.rgb:
+            bg_fill = 65535 if self.dtype.itemsize == 2 else 255
+            out = np.full((3, height, width), bg_fill, dtype=self.dtype)
+            for sb in self._czi_by_tz.get((t_val, z_val), ()):
+                sx0 = sb.x_start - x0
+                sy0 = sb.y_start - y0
+                patch = _read_subblock_window(
+                    self._fd, sb, self.dtype, self._czi_samples, 0, sb.y_size, 0, sb.x_size
+                )
+                out[:, sy0 : sy0 + sb.y_size, sx0 : sx0 + sb.x_size] = np.moveaxis(patch, -1, 0)
+            return out
+        out = np.zeros((n_c, height, width), dtype=self.dtype)
+        for ci, c_val in enumerate(self._czi_c_values):
+            for sb in self._czi_by_tzc.get((t_val, z_val, c_val), ()):
+                sx0 = sb.x_start - x0
+                sy0 = sb.y_start - y0
+                patch = _read_subblock_window(
+                    self._fd, sb, self.dtype, 1, 0, sb.y_size, 0, sb.x_size
+                )
+                out[ci, sy0 : sy0 + sb.y_size, sx0 : sx0 + sb.x_size] = patch
+        return out
+
+    def _read_lif_frame(self, t: int, p: int, z: int) -> np.ndarray:
+        from .lif import _read_lif_channel_window
+
+        if not (0 <= t < self.T and 0 <= p < self.P and 0 <= z < self.Z):
+            raise ValueError(f"frame ({t}, {p}, {z}) out of range")
+        series = self._lif_series[p]
+        tile_coords = (
+            series.tile_positions_px
+            if (series.tile_positions_px and series.n_m > 1)
+            else [(0, 0)]
+        )
+        out = np.zeros(self.frame_shape, dtype=self.dtype)
+        for ci, ch_spec in enumerate(series.channels):
+            for m_idx, (tx0, ty0) in enumerate(tile_coords):
+                patch = _read_lif_channel_window(
+                    self._fd, series, ch_spec, z, t, m_idx, 0, series.height, 0, series.width
+                )
+                out[ci, ty0 : ty0 + series.height, tx0 : tx0 + series.width] = patch
+        return out
 
     def _read_raw(self, seq: int) -> np.ndarray:
         """The frame's pixels as an array that owns its memory.
@@ -1991,13 +2241,26 @@ class PlateSource:
             hit = _FRAME_CACHE.get(key)
             if hit is not None:
                 return hit
-            seq = self.seq(t, p, z)
-            self._fg += 1
-            try:
-                raw = self._read_raw(seq)
-            finally:
-                self._fg -= 1
-            cyx, _ = _frame_to_cyx(raw, self.sizes)
+            if self._backend == "czi":
+                self._fg += 1
+                try:
+                    cyx = self._read_czi_frame(int(t), int(p), int(z))
+                finally:
+                    self._fg -= 1
+            elif self._backend == "lif":
+                self._fg += 1
+                try:
+                    cyx = self._read_lif_frame(int(t), int(p), int(z))
+                finally:
+                    self._fg -= 1
+            else:
+                seq = self.seq(t, p, z)
+                self._fg += 1
+                try:
+                    raw = self._read_raw(seq)
+                finally:
+                    self._fg -= 1
+                cyx, _ = _frame_to_cyx(raw, self.sizes)
             cyx = np.ascontiguousarray(cyx)
             if not self._closed:
                 _FRAME_CACHE.put(key, cyx)
@@ -2278,7 +2541,8 @@ class PlateSource:
             except Exception:  # pragma: no cover - defensive
                 pass
             try:
-                self._f.close()
+                if self._f is not None:
+                    self._f.close()
             except Exception:  # pragma: no cover - defensive
                 pass
             try:
