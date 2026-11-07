@@ -3,6 +3,22 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.0</title>
+            <pubDate>Sat, 07 Nov 2026 14:04:00 +0900</pubDate>
+            <sparkle:version>2.6.0</sparkle:version>
+            <sparkle:shortVersionString>2.6.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Zeiss CZI (.czi) and Leica LIF (.lif) plane scan &amp; confocal support</h2>
+<ul>
+<li><strong>Zeiss CZI plane scan &amp; confocal support (<code>.czi</code>).</strong> Open 8-bit/16-bit/float32 fluorescence and 24-bit/48-bit RGB <code>.czi</code> acquisitions (uncompressed, Zstd0, Zstd1 HiLo, JPEG-XR, JPEG, LZW, and ApoTomeRaw) with automatic <code>.nd2svs</code> OME-Zarr pyramid caching, multi-tile mosaic stitching, and Z-plane selection (<code>mid</code>, <code>max</code> projection, or integer Z index).</li>
+<li><strong>Leica LIF fluorescence &amp; confocal support (<code>.lif</code>).</strong> Open LAS AF / LAS X <code>.lif</code> multi-series containers (8-bit/16-bit/float32 fluorescence, LIGHTNING deconvolved 16-bit Z-stacks, spectral LambdaScan series, and RGB snapshots) with <code>.nd2svs</code> pyramid caching, physical micrometer calibration, <code>ATLConfocalSettingDefinition</code> objective magnification, and fluorophore/LUT channel colors.</li>
+<li><strong>Metadata, LUTs, annotations &amp; ROI export.</strong> Full multi-channel LUT window/gamma adjustment and persistence, sidecar ROI annotations, and native-value TIFF/ND2 and rendered PNG/JPEG/SVG/Astromap ROI exports work seamlessly on <code>.czi</code> and <code>.lif</code> slides.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.0/nd2wsi-viewer-2.6.0-macos-arm64.dmg" length="130743466" type="application/octet-stream" sparkle:edSignature="g05dK0FY3kwNGuMk6Ms6FwIfyRKVQP0rEV7bHFbZEbjTkh9gGBLLznK8Wx/F5j2J6QF+DuW9lAE7zTivKDqoCA=="/>
+        </item>
+        <item>
             <title>2.5.9</title>
             <pubDate>Sat, 07 Nov 2026 11:15:00 +0900</pubDate>
             <sparkle:version>2.5.9</sparkle:version>
