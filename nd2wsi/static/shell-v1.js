@@ -732,11 +732,12 @@ function reloadIfRestoredFromCache(event) {
 }
 window.addEventListener("pageshow", reloadIfRestoredFromCache);
 
-function refresh(selectSid) {
+function refresh(selectSid, beforeActivate) {
   return fetch("api/slides", { cache: "no-store" })
     .then((response) => response.json())
     .then((data) => {
       slides = data.slides || [];
+      if (typeof beforeActivate === "function") beforeActivate();
       const openSids = new Set(slides.map((slide) => slide.sid));
       for (const [key, frame] of [...frames]) {
         if (!openSids.has(key)) {
@@ -779,9 +780,20 @@ function refresh(selectSid) {
 
 function openMany(paths) {
   if (quitTornDown && window.pywebview?.api?.open_paths) {
-    return window.pywebview.api.open_paths(paths).then((url) => {
-      if (url) location.replace(url);
-    });
+    return window.pywebview.api
+      .open_paths(paths)
+      .then(async (url) => {
+        if (url) {
+          if (window.nd2wsiUpdateCard?.handoff) {
+            await window.nd2wsiUpdateCard.handoff();
+          }
+          location.replace(url);
+          return;
+        }
+        const status = await Promise.resolve(window.pywebview.api.status?.()).catch(() => "");
+        if (status) showError(status);
+      })
+      .catch((error) => showError(`Open failed: ${error.message || error}`));
   }
   return paths.reduce((chain, path) => chain.then(() => openPath(path)), Promise.resolve());
 }
@@ -824,13 +836,15 @@ function openPath(path) {
   })
     .then((response) => response.json())
     .then((data) => {
-      finishBusyEntry(entry);
       if (data.error) {
+        finishBusyEntry(entry);
         render();
         showError(data.error);
         return;
       }
-      return refresh(data.sid);
+      return refresh(data.sid, () => finishBusyEntry(entry)).finally(() => {
+        finishBusyEntry(entry);
+      });
     })
     .catch((error) => {
       finishBusyEntry(entry);
@@ -880,6 +894,9 @@ async function closeTab(sid) {
     const data = await response.json();
     if (!response.ok || data.error || data.ok !== true) {
       throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    if (api?.close_translucent_viewer) {
+      await Promise.resolve(api.close_translucent_viewer(sid)).catch(() => {});
     }
     await refresh();
     return true;

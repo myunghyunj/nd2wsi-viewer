@@ -18,7 +18,7 @@
     const identifier = () => Array.from(win.crypto.getRandomValues(new Uint8Array(16)),
       byte => byte.toString(16).padStart(2, "0")).join("");
     const pageId = identifier();
-    let model = null, busy = false, renderedNotes = "", expanded = false;
+    let model = null, busy = false, renderedNotes = "", expanded = false, handingOff = false;
     const bridge = () => win.pywebview?.api;
     const text = (value, max = 600) => typeof value === "string" ? value.slice(0, max) : "";
     const number = value => Number.isFinite(value) && value > 0 ? value : 0;
@@ -161,6 +161,10 @@
       adopt({ ...model, notice: true, state: "waiting", title: "Waiting to install", message: text(message), actions: [], progress: undefined });
       render(); return true;
     }
+    async function handoff() {
+      handingOff = true;
+      try { await bridge()?.update_card_handoff?.(pageId); } catch {}
+    }
     notes.addEventListener("click", () => act("notes"));
     // A native button: Enter and Space activate it as a click, so no key handler.
     expand.addEventListener("click", () => {
@@ -170,9 +174,9 @@
     // A reload or native close also ends the Python session via native events;
     // this bridge covers pagehide while those events are still queued.
     win.addEventListener("pagehide", () => {
-      if (model && !model.manual) bridge()?.update_card_closed?.(model.token)?.catch?.(() => {});
+      if (!handingOff && model && !model.manual) bridge()?.update_card_closed?.(model.token)?.catch?.(() => {});
     });
-    return { ready: doc.documentElement.dataset.updateCardShell === "true", pageId, show, dismiss, manual, check, notice };
+    return { ready: doc.documentElement.dataset.updateCardShell === "true", pageId, show, dismiss, manual, check, notice, handoff };
   }
   return { mount };
 });

@@ -653,6 +653,21 @@ class SlideRegistry:
         if window_session is not None:
             from .annotation_workspace import AnnotationWorkspace
             self.annotation_workspace = AnnotationWorkspace(window_session)
+        self.on_remove = None
+
+    def _apply_window_policy(self, st: ViewerState) -> None:
+        if self.agent_window:
+            private = getattr(self.window_session, "exports_root", None)
+            st.correction_write_allowed = bool(
+                private and st.cache_path and st.cache_path.is_relative_to(private.resolve())
+            )
+
+    def _notify_removed(self, sid: str) -> None:
+        if self.on_remove is not None:
+            try:
+                self.on_remove(sid)
+            except Exception:
+                pass
 
     @property
     def agent_window(self) -> bool:
@@ -805,16 +820,9 @@ class SlideRegistry:
                     manifest=manifest,
                 )
             except BaseException:
-                close = getattr(root, "close", None)
-                if close is not None:
-                    try:
-                        close(delay=0)
-                    except TypeError:
-                        close()
+                ViewerState._close_root(root)
                 raise
-            if self.agent_window:
-                private = getattr(self.window_session, "exports_root", None)
-                st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
+            self._apply_window_policy(st)
             self.slides[sid] = st
             self._retire(stale, closing=True)
         self._close_state(stale)
@@ -908,9 +916,7 @@ class SlideRegistry:
             except BaseException:
                 ViewerState._close_root(root)
                 raise
-            if self.agent_window:
-                private = getattr(self.window_session, "exports_root", None)
-                st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
+            self._apply_window_policy(st)
             self.slides[sid] = st
             self._retire(stale, closing=True)
         self._close_state(stale)
@@ -983,9 +989,7 @@ class SlideRegistry:
             except BaseException:
                 ViewerState._close_root(root)
                 raise
-            if self.agent_window:
-                private = getattr(self.window_session, "exports_root", None)
-                st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
+            self._apply_window_policy(st)
             self.slides[sid] = st
             self._retire(stale, closing=True)
         self._close_state(stale)
@@ -1072,9 +1076,7 @@ class SlideRegistry:
             except BaseException:
                 source.close()
                 raise
-            if self.agent_window:
-                private = getattr(self.window_session, "exports_root", None)
-                st.correction_write_allowed = bool(private and st.cache_path and st.cache_path.is_relative_to(private.resolve()))
+            self._apply_window_policy(st)
             self.slides[sid] = st
             self._retire(stale, closing=True)
         self._close_state(stale)
@@ -1139,6 +1141,8 @@ class SlideRegistry:
             st = self.slides.pop(sid, None)
             self._retire(st, closing=True)
         self._close_state(st)
+        if st is not None:
+            self._notify_removed(sid)
         return st is not None
 
     def close_all(self, *, immediate: bool = False) -> None:
@@ -1155,16 +1159,12 @@ class SlideRegistry:
         for st in states:
             st.close_shading()
             st.busy.close(timeout=30)
-            close = getattr(st.root, "close", None)
-            if close is None:
-                continue
             if immediate:
-                try:
-                    close(delay=0)
-                    continue
-                except TypeError:
-                    pass
-            close()
+                ViewerState._close_root(st.root)
+                continue
+            close = getattr(st.root, "close", None)
+            if close is not None:
+                close()
         if immediate:
             self._wait_for_closing(timeout=30)
 
@@ -1314,13 +1314,7 @@ class SlideRegistry:
             if st.plate is not None:
                 st.plate.close(timeout=None)
                 continue
-            close = getattr(st.root, "close", None)
-            if close is None:
-                continue
-            try:
-                close(delay=0)
-            except TypeError:
-                close()
+            ViewerState._close_root(st.root)
         # Slides closed just before, whose last reads are still finishing,
         # close their roots the same way once those reads end.
         self._wait_for_closing(timeout=None)
@@ -1508,12 +1502,7 @@ class SlideRegistry:
                                 "read-only plate unexpectedly held a writer"
                             )
                     else:
-                        close = getattr(st.root, "close", None)
-                        if close:  # source-backed roots own native file handles
-                            try:
-                                close(delay=0)
-                            except TypeError:
-                                close()
+                        ViewerState._close_root(st.root)
                 except BaseException:
                     # PlateSource restores itself when a pre-teardown drain times
                     # out. Once any backend close became irreversible, unregister
