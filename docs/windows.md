@@ -29,7 +29,7 @@ unknown-publisher warning. Updates are installed manually from Releases.
 Windows uses the standard title bar and does not use the macOS Sparkle updater.
 Use **Ctrl** for Mac **⌘** shortcuts and **Alt** for **Option**.
 
-Stable 2.6.0 includes Zeiss CZI support, Astromap ROI import/export, and supported HEVC SDPC viewing.
+Stable 2.6.0 includes Zeiss CZI (`.czi`) and Leica LIF (`.lif`) support, Astromap ROI import/export, and supported HEVC SDPC viewing.
 Shading Correction assesses supported FITC and CY3 channels; BF and DAPI remain
 unchanged. See the [current method and limits](shading-correction-validation.md).
 

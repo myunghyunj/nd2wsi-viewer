@@ -52,6 +52,7 @@ info.update(CFBundleShortVersionString=match[1], CFBundleVersion=bundle_version,
             ND2WSISdpcBundled=True, ND2WSIDevelopmentOnly=False)
 types = [('nd2', 'com.nikon.nis-elements.nd2', 'Nikon ND2 slide scan'),
          ('czi', 'com.zeiss.czi', 'Zeiss CZI microscopy image'),
+         ('lif', 'com.leica.lif', 'Leica LIF microscopy image'),
          ('svs', 'com.aperio.svs', 'Aperio SVS slide'),
          ('sdpc', 'com.sqray.sdpc', 'SQRAY SDPC slide'),
          ('nd2svs', 'com.nd2wsi.nd2svs', 'nd2svs single-file viewing cache')]

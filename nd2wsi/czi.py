@@ -48,6 +48,7 @@ _COMPRESSION_NAMES: dict[int, str] = {
     4: "JPEG-XR",
     5: "Zstd0",
     6: "Zstd1",
+    121: "ApoTomeRaw",
 }
 
 _DEFAULT_PALETTE: tuple[tuple[int, int, int], ...] = (
@@ -359,6 +360,29 @@ def _decode_subblock_bytes(
             return arr[:, :, 0]
         return np.ascontiguousarray(arr[:, :, :3][:, :, ::-1])
 
+    plane_bytes = h * w * samples * dtype.itemsize
+    if comp >= 100 and plane_bytes > 0 and len(raw) % plane_bytes == 0:
+        n_phases = len(raw) // plane_bytes
+        phases = np.frombuffer(raw, dtype=dtype).reshape(n_phases, h, w, samples)
+        if n_phases == 1:
+            arr = phases[0]
+        elif n_phases == 3 and samples == 1:
+            # Zeiss ApoTome 3-phase (0, 120, 240 deg) optical sectioning demodulation
+            f0 = phases[0, :, :, 0].astype(np.float32)
+            f1 = phases[1, :, :, 0].astype(np.float32)
+            f2 = phases[2, :, :, 0].astype(np.float32)
+            sec = (np.float32(0.47140452) * np.sqrt((f0 - f1) ** 2 + (f1 - f2) ** 2 + (f2 - f0) ** 2))
+            if np.issubdtype(dtype, np.integer):
+                info_i = np.iinfo(dtype)
+                return np.clip(np.rint(sec), info_i.min, info_i.max).astype(dtype)
+            return sec.astype(dtype)
+        else:
+            mean = phases.astype(np.float32).mean(axis=0)
+            arr = mean.astype(dtype)
+        if samples == 1:
+            return arr[:, :, 0]
+        return np.ascontiguousarray(arr[:, :, :3][:, :, ::-1])
+
     raise NotImplementedError(
         f"unsupported CZI compression code {comp} ({_COMPRESSION_NAMES.get(comp, 'unknown')})"
     )
@@ -484,10 +508,11 @@ def open_czi(
     def make_z_dask(z_val: int) -> Any:
         if rgb:
             z_sbs = by_zc.get((z_val, c_values[0]), [])
+            bg_fill = (255 if dtype == np.uint8 else 65535) if len(m_values) > 1 else 0
 
             def fetch_rgb(block_info=None):
                 (_, _), (by0, by1), (bx0, bx1) = block_info[None]["array-location"]
-                out = np.zeros((3, by1 - by0, bx1 - bx0), dtype=dtype)
+                out = np.full((3, by1 - by0, bx1 - bx0), bg_fill, dtype=dtype)
                 for sb in z_sbs:
                     sx0 = sb.x_start - x0_origin
                     sy0 = sb.y_start - y0_origin
@@ -592,17 +617,18 @@ def collect_czi_info(path: str | Path) -> dict[str, Any]:
     finally:
         os.close(fd)
     lvl0 = _level0_entries(entries)
-    x0 = min(e.x_start for e in lvl0)
-    y0 = min(e.y_start for e in lvl0)
-    width = max(e.x_start + e.x_size for e in lvl0) - x0
-    height = max(e.y_start + e.y_size for e in lvl0) - y0
-    ptype = lvl0[0].pixel_type
-    dtype, _samples, rgb = _PIXEL_TYPES.get(ptype, (np.dtype("uint16"), 1, False))
-    c_values = sorted({e.c for e in lvl0})
-    z_values = sorted({e.z for e in lvl0})
-    t_values = sorted({e.t for e in lvl0})
     s_values = sorted({e.s for e in lvl0})
-    m_values = sorted({e.m for e in lvl0})
+    s0_entries = [e for e in lvl0 if e.s == s_values[0]] if s_values else lvl0
+    x0 = min(e.x_start for e in s0_entries)
+    y0 = min(e.y_start for e in s0_entries)
+    width = max(e.x_start + e.x_size for e in s0_entries) - x0
+    height = max(e.y_start + e.y_size for e in s0_entries) - y0
+    ptype = s0_entries[0].pixel_type
+    dtype, _samples, rgb = _PIXEL_TYPES.get(ptype, (np.dtype("uint16"), 1, False))
+    c_values = sorted({e.c for e in s0_entries})
+    z_values = sorted({e.z for e in s0_entries})
+    t_values = sorted({e.t for e in s0_entries})
+    m_values = sorted({e.m for e in s0_entries})
     n_channels = 3 if rgb else len(c_values)
     pixel_size_um, cal_source, magnification, channels = _extract_czi_metadata(
         xml_root, n_channels, rgb

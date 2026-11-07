@@ -138,6 +138,12 @@ info["UTImportedTypeDeclarations"] = [
         "UTTypeTagSpecification": {"public.filename-extension": ["czi"]},
     },
     {
+        "UTTypeIdentifier": "com.leica.lif",
+        "UTTypeDescription": "Leica LIF microscopy image",
+        "UTTypeConformsTo": ["public.data"],
+        "UTTypeTagSpecification": {"public.filename-extension": ["lif"]},
+    },
+    {
         "UTTypeIdentifier": "com.aperio.svs",
         "UTTypeDescription": "Aperio SVS whole-slide image",
         "UTTypeConformsTo": ["public.data"],
@@ -166,6 +172,12 @@ info["CFBundleDocumentTypes"] = [
     {
         "CFBundleTypeName": "Zeiss CZI microscopy image",
         "LSItemContentTypes": ["com.zeiss.czi"],
+        "CFBundleTypeRole": "Viewer",
+        "LSHandlerRank": "Default",
+    },
+    {
+        "CFBundleTypeName": "Leica LIF microscopy image",
+        "LSItemContentTypes": ["com.leica.lif"],
         "CFBundleTypeRole": "Viewer",
         "LSHandlerRank": "Default",
     },

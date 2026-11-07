@@ -62,6 +62,12 @@ def build_synthetic_czi(
             payload = bytes([3, 1, 1]) + imagecodecs.zstd_encode(packed)
         elif compression == 4:
             payload = imagecodecs.jpegxr_encode(np.ascontiguousarray(arr))
+        elif compression == 121:
+            # 3-phase ApoTomeRaw payload
+            p0 = raw_arr
+            p1 = (raw_arr + 300).astype(raw_arr.dtype)
+            p2 = (raw_arr + 600).astype(raw_arr.dtype)
+            payload = np.stack([p0, p1, p2], axis=0).tobytes()
         else:
             raise ValueError(f"Unsupported test compression {compression}")
 
@@ -376,3 +382,24 @@ def test_czi_server_view_lut_and_annotations_end_to_end(tmp_path: Path, monkeypa
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_czi_apotome_raw_demodulation(tmp_path: Path):
+    base_plane = np.full((64, 64), 1000, dtype=np.uint16)
+    czi_path = build_synthetic_czi(
+        tmp_path / "apotome.czi",
+        {(0, 0, 0): base_plane},
+        pixel_type=1,
+        compression=121,
+    )
+    info = collect_czi_info(czi_path)
+    assert info["compression"] == "ApoTomeRaw"
+    store = ensure_cache(czi_path, tile=64)
+    root, _attrs = open_store(store)
+    try:
+        arr = np.asarray(root["0"][0])
+        # For I0=1000, I1=1300, I2=1600: sqrt(2)/3 * sqrt(300^2 + 300^2 + 600^2) = 346
+        assert np.all(arr == 346)
+    finally:
+        if hasattr(root, "close"):
+            root.close()
