@@ -20,10 +20,10 @@
 
 ## Latest update
 
-- **Windows external drives and paths:** launching from an exFAT or FAT32 drive no longer logs false download-mark warnings, and tab titles and sidecar status messages show only the file name for Windows paths.
-- **Opening multiple slides:** dropping additional files while the first slide is opening keeps every file in the queue, and concurrent conversions each keep their own progress tab.
-- **Session locks and sidecars:** closed or terminated windows clean up their `.window-live` lock files, and legacy annotation sidecar migration skips symbolic links.
-- **Update card and recovery:** release notes remain accessible while an update downloads, manual update retries lock their buttons while checking, and slides can be reopened if an update is cancelled after teardown.
+- **Update card across slide opens:** opening the first slide from the start window keeps an active update offer or download visible in the bottom-right update card instead of cancelling it, and hides the start window's update button while the card is shown.
+- **Translucent tracing windows:** closing a slide tab closes its translucent tracing window automatically, and reopening a slide after a cancelled update allows the translucent viewer to open again.
+- **Slide opening feedback:** unsupported or missing files keep their error message visible on the start window and after update recovery, and the opening progress tab remains visible until the new slide tab appears.
+- **Multiple windows:** file dialogs and title-bar zoom actions target the active viewer window instead of always using the first window.
 
 <p align="center">
   <img src="docs/overview-sdpc.png" alt="Brightfield SDPC slide with Slide Info in the light appearance" width="50%"><img src="docs/overview-nd2.png" alt="Fluorescence ND2 image with Channels &amp; LUTs in the dark appearance" width="50%">
@@ -31,10 +31,10 @@
 
 ## Download
 
-| Platform | Download · 2.5.8 | Requirements |
+| Platform | Download · 2.5.9 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.8/nd2wsi-viewer-2.5.8-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.8/nd2wsi-viewer-2.5.8-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.9/nd2wsi-viewer-2.5.9-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.5.9/nd2wsi-viewer-2.5.9-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
 
 On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
 and keep `_internal` beside `nd2wsi-viewer.exe`. See the
