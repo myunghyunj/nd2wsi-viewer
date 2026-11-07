@@ -752,10 +752,15 @@ def test_boot_html_preserves_backend_error_status_and_hides_pill_under_card():
 
 def test_dialog_window_prefers_bound_window_and_open_paths_resets_stale_status(monkeypatch):
     webview = pytest.importorskip("webview")
-    other = SimpleNamespace(uid="other")
-    bound = SimpleNamespace(uid="bound")
-    monkeypatch.setattr(webview, "windows", [other, bound])
     api = app.Api(None)
+    assert api._window is None
+    other = SimpleNamespace(uid="other", _js_api=object())
+    owned = SimpleNamespace(uid="owned", _js_api=api, create_file_dialog=Mock(return_value=[]))
+    monkeypatch.setattr(webview, "windows", [other, owned])
+    assert api._dialog_window() is owned
+    assert api.open_slide() is None
+    owned.create_file_dialog.assert_called_once()
+    bound = SimpleNamespace(uid="bound")
     api._window = bound
     assert api._dialog_window() is bound
     api._status = "stale error"
