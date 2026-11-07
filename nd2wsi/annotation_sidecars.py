@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-SLIDE_SUFFIXES = {".nd2", ".czi", ".svs", ".sdpc"}
+SLIDE_SUFFIXES = {".nd2", ".czi", ".lif", ".svs", ".sdpc"}
 
 def _slide_folder(container: Path) -> Path:
     """The slide's folder, for a cache or store in any layout the app writes."""

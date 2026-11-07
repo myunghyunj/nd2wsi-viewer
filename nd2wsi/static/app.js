@@ -411,10 +411,10 @@ async function initializeDisplayLuts() {
 }
 
 function initializeLutAuto() {
-  // A single-channel 16-bit PNG is fitted like an ND2/CZI channel; RGB images
+  // A single-channel 16-bit PNG is fitted like an ND2/CZI/LIF channel; RGB images
   // keep their fixed 0-255 axis.
   const fitted = /\.nd2$/i.test(String(state.info.name || "")) ||
-    (/\.czi$/i.test(String(state.info.name || "")) && !state.info.rgb) ||
+    (/\.(czi|lif)$/i.test(String(state.info.name || "")) && !state.info.rgb) ||
     (!!state.info.raster && !state.info.rgb);
   state.lutAutoRange = fitted;
   state.lutAutoPending = state.info.channels.map((_, i) =>
@@ -3349,7 +3349,7 @@ function geojsonFilename(info) {
   const name = basename(info && info.name);
   const stem = name
     .replace(/\.ome\.zarr$/i, "")
-    .replace(/\.(nd2|czi|svs|sdpc|nd2svs|jpe?g|png)$/i, "");
+    .replace(/\.(nd2|czi|lif|svs|sdpc|nd2svs|jpe?g|png)$/i, "");
   const selection = info === state.info ? currentSelection() : info && info.selection;
   return safeFilenamePart(stem, "slide") + "--" +
     selectionFilenameTag(selection) + ".geojson";
@@ -3379,7 +3379,7 @@ function exportAnnotationsJSON() {
   if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
   downloadJsonFile(
     annotationDocument(),
-    state.info.name.replace(/\.(nd2|czi|svs)$/i, "") + ".annotations.json",
+    state.info.name.replace(/\.(nd2|czi|lif|svs)$/i, "") + ".annotations.json",
     "application/json"
   );
   const note = keptItemsExportNote();

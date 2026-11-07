@@ -430,6 +430,7 @@ def convert(
 
     from .cache import commit_container
     from .czi import is_czi, open_czi
+    from .lif import is_lif, open_lif
     from .sdpc import is_sdpc
     from .svs import is_svs, open_svs
 
@@ -469,6 +470,10 @@ def convert(
                     if overview:
                         raise ValueError("overview stores are for ND2 sources only")
                     src = open_czi(stack, source_path, selection=selection, tile=tile)
+                elif is_lif(source_path):
+                    if overview:
+                        raise ValueError("overview stores are for ND2 sources only")
+                    src = open_lif(stack, source_path, selection=selection, tile=tile)
                 else:
                     handle = stack.enter_context(nd2.ND2File(str(source_path)))
                     # Coarsening a 2*tile source block yields one tile-sized
@@ -696,6 +701,7 @@ def estimate_store_bytes(
     from contextlib import ExitStack
 
     from .czi import is_czi, open_czi
+    from .lif import is_lif, open_lif
     from .reader import PlaneSelection, level_shapes, nice_bytes, open_plane
     from .sdpc import is_sdpc
     from .svs import is_svs, sample_planes
@@ -715,9 +721,10 @@ def estimate_store_bytes(
             c = min(3, int(series.shape[-1]))
             dtype = np.dtype(series.dtype)
         blocks = [b[:c] for b in sample_planes(path, tile=tile, points=points)]
-    elif is_czi(path):
+    elif is_czi(path) or is_lif(path):
+        opener = open_czi if is_czi(path) else open_lif
         with ExitStack() as stack:
-            src = open_czi(stack, path, PlaneSelection(), tile=tile)
+            src = opener(stack, path, PlaneSelection(), tile=tile)
             c, h, w = src.shape
             dtype = src.dtype
             side = max(1, int(round(points**0.5)))
@@ -1057,7 +1064,7 @@ def _legacy_store_matches_source(
             for item in slide.parent.iterdir()
             if item.is_file()
             and item.stem == slide.stem
-            and item.suffix.lower() in (".nd2", ".czi", ".svs", ".sdpc")
+            and item.suffix.lower() in (".nd2", ".czi", ".lif", ".svs", ".sdpc")
         ]
     except OSError:
         return False

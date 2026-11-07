@@ -7,7 +7,7 @@
 <p align="center">
   <strong>Browse whole slides. Inspect channels. Export the region you need.</strong><br>
   A local microscopy viewer for macOS and Windows.<br>
-  <strong>Supported formats:</strong> JPG · PNG · ND2 · CZI · SVS · <a href="docs/sdpc-support.md">SDPC</a>
+  <strong>Supported formats:</strong> JPG · PNG · ND2 · CZI · LIF · SVS · <a href="docs/sdpc-support.md">SDPC</a>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 ## Latest update
 
-- **Zeiss CZI support (`.czi`):** open 2D plane scans, stitched mosaic acquisitions, and multi-channel / Z-stack confocal `.czi` files with `.nd2svs` pyramid caching, physical micrometer calibration (`Scaling/Distance`), objective magnification, fluorophore channel names and colors, LUT adjustment, sidecar annotations, and native-value ROI export.
+- **Zeiss CZI (`.czi`) & Leica LIF (`.lif`) support:** open 2D plane scans, stitched mosaic acquisitions, spectral LambdaScan series, and multi-channel / Z-stack confocal & LIGHTNING deconvolution `.czi` and `.lif` files with `.nd2svs` pyramid caching, physical micrometer calibration, objective magnification, fluorophore channel names and colors, LUT adjustment, sidecar annotations, and native-value ROI export.
 - **Update card across slide opens:** opening the first slide from the start window keeps an active update offer or download visible in the bottom-right update card instead of cancelling it, and hides the start window's update button while the card is shown.
 - **Translucent tracing windows:** closing a slide tab closes its translucent tracing window automatically, and reopening a slide after a cancelled update allows the translucent viewer to open again.
 - **Slide opening feedback:** unsupported or missing files keep their error message visible on the start window and after update recovery, and the opening progress tab remains visible until the new slide tab appears.
