@@ -213,3 +213,25 @@ def plate_annotations_sidecar(
     if create_directory:
         target_dir.mkdir(parents=True, exist_ok=True)
     return target_dir / f"annotations_{safe_source}--site{int(p)}.json"
+
+
+def confocal_annotations_sidecar(
+    path: str | Path, attrs: dict[str, Any], frame: tuple[int, int, int],
+) -> tuple[Path, Path | None]:
+    """Discover a CZI/LIF plane and a non-destructive legacy fallback.
+
+    Reuse the pre-plate T/P/Z identity, so converted selections and interactive
+    planes see the same marks. A 2.6.1 site-wide document is a fallback only;
+    callers copy it (never move or merge it) into a missing plane document.
+    Discovery itself must remain read-only for Agent window snapshots.
+    """
+    t, p, z = frame
+    selected = {**attrs, "nd2wsi": {**attrs["nd2wsi"], "selection": {"t": t, "p": p, "z": z}}}
+    legacy: list[Path] = []
+    canonical = annotations_sidecar(path, selected, migrate=False, legacy_paths=legacy)
+    if canonical.exists():
+        return canonical, None
+    shared = plate_annotations_sidecar(path, attrs, p, create_directory=False)
+    if shared.is_file() and not shared.is_symlink():
+        return canonical, shared
+    return canonical, legacy[0] if legacy else None

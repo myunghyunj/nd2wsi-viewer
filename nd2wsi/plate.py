@@ -169,18 +169,51 @@ def _stored_windows(manifest: dict[str, Any], source: Any) -> list[dict[str, flo
     entries = record.get("windows")
     if not isinstance(entries, list) or len(entries) != int(source.frame_shape[0]):
         return None
+    expected_rgb_end = (
+        float(np.iinfo(source.dtype).max)
+        if source.rgb and np.issubdtype(source.dtype, np.integer) and source.dtype != np.dtype(np.uint8)
+        else None
+    )
     windows = []
     for entry in entries:
         values = [entry.get(field) for field in _WINDOW_FIELDS] if isinstance(entry, dict) else []
         if len(values) != len(_WINDOW_FIELDS) or not all(_finite_number(v) for v in values):
             return None
-        windows.append({field: float(v) for field, v in zip(_WINDOW_FIELDS, values)})
+        win = {field: float(v) for field, v in zip(_WINDOW_FIELDS, values)}
+        if expected_rgb_end is not None and (
+            win["start"] != 0.0 or win["end"] != expected_rgb_end or win["max"] != expected_rgb_end
+        ):
+            return None
+        windows.append(win)
     return windows
 
 
 def _file_identity(st: os.stat_result) -> tuple[int, int, int, int]:
     """Stable identity used to detect same-size, timestamp-preserving swaps."""
     return (int(st.st_dev), int(st.st_ino), int(st.st_size), int(st.st_mtime_ns))
+
+
+def _lif_plate_series(all_series: list[Any]) -> list[Any]:
+    """Only combine series that share the plate's geometry and metadata.
+
+    Do not filter a subset: site indices must still identify the original LIF
+    series (including in existing annotation sidecars). Heterogeneous 2D
+    containers use the ordinary, explicitly selected-series conversion path.
+    """
+    first = all_series[0]
+    if first.n_z > 1 or first.n_t > 1:
+        return [first]
+
+    def signature(s):
+        return (
+            s.width, s.height, s.n_z, s.n_t, s.n_m, s.dtype, s.rgb,
+            tuple(s.tile_positions_px or [(0, 0)]),
+            s.pixel_size_um, s.calibration_source, s.magnification, s.objective_name,
+            tuple((ch.name, ch.color, ch.data_type, ch.resolution) for ch in s.channels),
+        )
+
+    expected = signature(first)
+    return all_series if all(signature(s) == expected for s in all_series) else []
 
 
 def is_plate_file(path: str | Path) -> bool:
@@ -235,12 +268,7 @@ def is_plate_file(path: str | Path) -> bool:
                 return False
             if s0.n_z > 1 or s0.n_t > 1:
                 return True
-            sig0 = (s0.width, s0.height, s0.n_z, s0.n_t, s0.n_m, len(s0.channels), s0.dtype, s0.rgb)
-            matching = [
-                s for s in all_series
-                if (s.width, s.height, s.n_z, s.n_t, s.n_m, len(s.channels), s.dtype, s.rgb) == sig0
-            ]
-            return len(matching) > 1
+            return len(_lif_plate_series(all_series)) > 1
         import nd2
 
         with warnings.catch_warnings():
@@ -873,11 +901,27 @@ class PlateStore:
     @staticmethod
     def _matches(manifest: dict, fingerprint: dict, shape: tuple, source: PlateSource) -> bool:
         thumbs = manifest.get("thumbs") or {}
+        ch_dtypes = [
+            str(dt)
+            for dt in (
+                getattr(source, "_channel_dtypes", None)
+                or [str(source.dtype)] * int(shape[3])
+            )
+        ]
+        stored_ch_dtypes = thumbs.get("channel_dtypes")
+        requires_ch_dtypes = len(set(ch_dtypes)) > 1 or any(
+            "+" in dt or dt in ("Bgr96Float", "Bgra32") for dt in ch_dtypes
+        )
+        if requires_ch_dtypes:
+            ch_dtypes_ok = stored_ch_dtypes == ch_dtypes
+        else:
+            ch_dtypes_ok = stored_ch_dtypes in (None, ch_dtypes)
         return (
             fingerprints_match(manifest.get("source") or {}, fingerprint)
             and (manifest.get('source') or {}).get('name') == Path(source.path).name
             and list(thumbs.get("shape") or []) == list(shape)
             and thumbs.get("dtype") == str(source.dtype)
+            and ch_dtypes_ok
             and thumbs.get("k") == THUMB_K
             and (Path(source.path).parent / (container_name := manifest.get("thumbs_name", THUMBS_NAME)))
             is not None
@@ -950,6 +994,14 @@ class PlateStore:
         )
         ensure_digest_array(root, shape[:3])
         PlateStore._make_focus(root, shape)
+        thumbs_meta: dict[str, Any] = {
+            "k": THUMB_K,
+            "shape": list(shape),
+            "dtype": str(source.dtype),
+        }
+        ch_dtypes = getattr(source, "_channel_dtypes", None)
+        if ch_dtypes:
+            thumbs_meta["channel_dtypes"] = [str(dt) for dt in ch_dtypes]
         manifest = {
             "format": PLATE_FORMAT if is_file_container(container) else LEGACY_PLATE_FORMAT,
             "kind": "plate",
@@ -959,7 +1011,7 @@ class PlateStore:
                 **fingerprint,
                 "relative_path": Path(os.path.relpath(source.path, source_base(container))).as_posix(),
             },
-            "thumbs": {"k": THUMB_K, "shape": list(shape), "dtype": str(source.dtype)},
+            "thumbs": thumbs_meta,
             "thumbs_name": THUMBS_NAME,
             "integrity": {
                 "algorithm": DIGEST_ALGORITHM,
@@ -1890,11 +1942,11 @@ class PlateSource:
 
     def _init_from_czi(self) -> None:
         from .czi import (
-            _PIXEL_TYPES,
             _extract_czi_metadata,
             _extract_czi_z_step_um,
             _level0_entries,
             _read_czi_header_and_index,
+            _resolve_czi_entries_spec,
         )
 
         st = os.fstat(self._fd)
@@ -1909,8 +1961,8 @@ class PlateSource:
         width = max(e.x_start + e.x_size for e in s0_entries) - x0
         height = max(e.y_start + e.y_size for e in s0_entries) - y0
 
-        ptype = s0_entries[0].pixel_type
-        dtype, samples, rgb = _PIXEL_TYPES[ptype]
+        dtype, rgb, channel_dtypes = _resolve_czi_entries_spec(s0_entries)
+        samples = 3 if rgb else 1
         c_values = sorted({e.c for e in s0_entries})
         z_values = sorted({e.z for e in s0_entries})
         t_values = sorted({e.t for e in s0_entries})
@@ -1924,6 +1976,7 @@ class PlateSource:
         self.frame_shape = (n_c, height, width)
         self.dtype = np.dtype(dtype)
         self.rgb = bool(rgb)
+        self._channel_dtypes = channel_dtypes
 
         self._czi_origin = (x0, y0)
         self._czi_samples = samples
@@ -1939,7 +1992,7 @@ class PlateSource:
         self._czi_by_tzc = by_tzc
 
         pixel_size_um, cal_source, magnification, channels = _extract_czi_metadata(
-            xml_root, n_c, self.rgb
+            xml_root, n_c, self.rgb, c_values=c_values
         )
         self.channels = channels
         self.pixel_size_um = pixel_size_um
@@ -1952,7 +2005,9 @@ class PlateSource:
         self.z_step_um = _extract_czi_z_step_um(xml_root)
         self.bottom_to_top = True if self.z_step_um is not None else None
         self.period_ms = None
-        self.times_ms = [float(t) for t in range(self.T)]
+        # Frame indices are not acquisition times. Until timing metadata is
+        # decoded, leave it explicitly unknown rather than inventing 1 ms.
+        self.times_ms = []
         self.exposure_ms = None
 
         _, H, W = self.frame_shape
@@ -1972,14 +2027,12 @@ class PlateSource:
         root, blocks = _read_lif_header_and_blocks(self._fd, st.st_size)
         all_series = _list_lif_series(root, blocks)
         s0 = all_series[0]
-        if s0.n_z > 1 or s0.n_t > 1:
-            selected = [s0]
-        else:
-            sig0 = (s0.width, s0.height, s0.n_z, s0.n_t, s0.n_m, len(s0.channels), s0.dtype, s0.rgb)
-            selected = [
-                s for s in all_series
-                if (s.width, s.height, s.n_z, s.n_t, s.n_m, len(s.channels), s.dtype, s.rgb) == sig0
-            ]
+        selected = _lif_plate_series(all_series)
+        if not selected:
+            raise ValueError(
+                "LIF series have different geometry, calibration or channels; "
+                "open the original LIF or an individually converted series instead"
+            )
         self._lif_series = selected
 
         if s0.tile_positions_px and s0.n_m > 1:
@@ -1997,6 +2050,7 @@ class PlateSource:
         self.frame_shape = (n_c, height, width)
         self.dtype = np.dtype(s0.dtype)
         self.rgb = bool(s0.rgb)
+        self._channel_dtypes = [str(ch.dtype) for ch in s0.channels]
         self.channels = [ChannelInfo(ch.name, ch.color) for ch in s0.channels]
         self.pixel_size_um = s0.pixel_size_um
         self.calibration_source = s0.calibration_source
@@ -2011,7 +2065,7 @@ class PlateSource:
         self.z_step_um = s0.z_step_um
         self.bottom_to_top = True if self.z_step_um is not None else None
         self.period_ms = None
-        self.times_ms = [float(t) for t in range(self.T)]
+        self.times_ms = []
         self.exposure_ms = None
 
         _, H, W = self.frame_shape
@@ -2063,6 +2117,7 @@ class PlateSource:
         meta["direct"] = True
         meta["kind"] = "plate"
         meta["plate"] = {
+            "annotationScope": "plane" if self._backend in ("czi", "lif") else "site",
             "T": self.T,
             "P": self.P,
             "Z": self.Z,
@@ -2115,7 +2170,12 @@ class PlateSource:
         windows = []
         for ci in range(small.shape[0]):
             if self.rgb:
-                start, end = 0.0, 255.0
+                if np.issubdtype(self.dtype, np.integer):
+                    start, end = (
+                        (0.0, hi_all) if self.dtype != np.dtype(np.uint8) else (0.0, 255.0)
+                    )
+                else:
+                    start, end = (lo_all, hi_all if hi_all > lo_all else lo_all + 1.0)
             else:
                 start, end = auto_window(small[ci], dtype=self.dtype, background_mode=False)
             windows.append({"start": start, "end": end, "min": lo_all, "max": hi_all})
@@ -2159,9 +2219,14 @@ class PlateSource:
         x0, y0 = self._czi_origin
         n_c, height, width = self.frame_shape
         if self.rgb:
-            bg_fill = 65535 if self.dtype.itemsize == 2 else 255
+            z_sbs = self._czi_by_tz.get((t_val, z_val), ())
+            bg_fill = (
+                (65535 if self.dtype == np.uint16 else (255 if self.dtype == np.uint8 else 0))
+                if len(z_sbs) > 1
+                else 0
+            )
             out = np.full((3, height, width), bg_fill, dtype=self.dtype)
-            for sb in self._czi_by_tz.get((t_val, z_val), ()):
+            for sb in z_sbs:
                 sx0 = sb.x_start - x0
                 sy0 = sb.y_start - y0
                 patch = _read_subblock_window(

@@ -143,6 +143,65 @@ def test_app_wrappers_delegate_to_the_store_and_the_module_loads_first():
         assert f"state.{field} =" not in block and f"state.{field} +=" not in block
 
 
+@pytest.mark.parametrize("axis", ["t", "z"])
+def test_confocal_plane_changes_capture_old_owner_and_serialize_return_load(axis):
+    out = _run(r"""
+(async () => {
+  state.info.plate = {P: 1, T: 2, Z: 2, annotationScope: 'plane'};
+  state.plate.focus = 0;
+  let frame = {t: 0, p: 0, z: 0};
+  context.activeFrameParams = () => frame;
+  const a = 'api/annotations?p=0&t=0&z=0';
+  const b = 'api/annotations?p=0&t=' + (AXIS === 't' ? 1 : 0) + '&z=' + (AXIS === 'z' ? 1 : 0);
+  const mark = id => ({id, type: 'pin', x: 1.25, y: 2.5});
+  const disk = new Map([[a,{items:[mark('original')]}],[b,{items:[mark('other')]}]]);
+  const server = sidecarServer(disk);
+  await store.load();
+  state.annotations = [mark('edited-A')];store.markDirty();store.scheduleSave();
+  server.hold = true;
+  frame = {...frame, [AXIS]: 1};
+  const needsLoad = store.needsFrameLoad(), oldOwnsNew = store.ownsFrame(frame);
+  const going = store.switchOwner();
+  await tick();
+  const pending = snapshot();
+  frame = {t:0,p:0,z:0};
+  const returning = store.switchOwner();
+  await tick();
+  server.hold = false;server.release();
+  await Promise.all([going, returning]);
+  emit({needsLoad, oldOwnsNew, pending, final:snapshot(),
+    requests:server.requests, a:disk.get(a).items.map(x=>x.id), b:disk.get(b).items.map(x=>x.id),
+    owns:store.ownsFrame(frame), url:store.urlFor()});
+})();
+""".replace("AXIS", json.dumps(axis)))
+    assert out["needsLoad"] is True and out["oldOwnsNew"] is False
+    assert out["pending"]["items"] == [] and out["pending"]["ready"] is False
+    assert out["pending"]["pendingTimers"] == 0
+    assert out["final"]["items"] == ["edited-A"] and out["final"]["ready"] is True
+    assert out["a"] == ["edited-A"] and out["b"] == ["other"]
+    assert out["owns"] is True
+    assert out["requests"] == ["GET " + out["url"], "POST " + out["url"], "GET " + out["url"]]
+
+
+def test_late_confocal_load_cannot_install_after_z_changes():
+    out = _run(r"""
+(async () => {
+  state.info.plate = {P:1, T:1, Z:2, annotationScope:'plane'};
+  state.plate.focus = 0;
+  let frame = {t:0,p:0,z:0};context.activeFrameParams = () => frame;
+  const disk = new Map([0,1].map(z=>['api/annotations?p=0&t=0&z='+z,
+    {items:[{id:'z'+z,type:'pin',x:1,y:2}]}]));
+  const server = sidecarServer(disk);server.hold = true;
+  const old = store.load();await tick();
+  frame = {t:0,p:0,z:1};
+  const next = store.switchOwner();await tick();
+  server.hold = false;server.release();await Promise.all([old,next]);
+  emit({items:state.annotations.map(x=>x.id),url:store.urlFor(),owns:store.ownsFrame(frame)});
+})();
+""")
+    assert out == {"items": ["z1"], "url": "api/annotations?p=0&t=0&z=1", "owns": True}
+
+
 def test_null_empty_and_grid_sites_never_fall_back_to_plate_zero():
     out = _run(
         r"""

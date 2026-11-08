@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import struct
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack
@@ -29,7 +30,8 @@ _PIXEL_TYPES: dict[int, tuple[np.dtype, int, bool]] = {
     2: (np.dtype("float32"), 1, False),  # Gray32Float
     3: (np.dtype("uint8"), 3, True),     # Bgr24
     4: (np.dtype("uint16"), 3, True),    # Bgr48
-    8: (np.dtype("uint8"), 4, True),     # Bgra32
+    8: (np.dtype("float32"), 3, True),   # Bgr96Float
+    9: (np.dtype("uint8"), 4, True),     # Bgra32
 }
 
 _PIXEL_TYPE_NAMES: dict[int, str] = {
@@ -38,7 +40,8 @@ _PIXEL_TYPE_NAMES: dict[int, str] = {
     2: "Gray32Float",
     3: "Bgr24",
     4: "Bgr48",
-    8: "Bgra32",
+    8: "Bgr96Float",
+    9: "Bgra32",
 }
 
 _COMPRESSION_NAMES: dict[int, str] = {
@@ -213,9 +216,57 @@ def _extract_czi_z_step_um(xml_root: ET.Element | None) -> float | None:
     return None
 
 
+_CHANNEL_ID_RE = re.compile(r"(?:^|:)(\d+)$")
+
+
+def _czi_channel_index(ch: ET.Element) -> int | None:
+    raw = (ch.get("Id") or "").strip()
+    m = _CHANNEL_ID_RE.search(raw)
+    return int(m.group(1)) if m else None
+
+
+def _map_czi_channels(
+    ch_list: list[ET.Element], actual_c_values: list[int]
+) -> list[ET.Element | None]:
+    n_channels = len(actual_c_values)
+    if not ch_list or n_channels == 0:
+        return [None] * n_channels
+    indexed = [(_czi_channel_index(ch), ch) for ch in ch_list]
+    if any(idx is not None for idx, _ in indexed):
+        by_id: dict[int, ET.Element] = {}
+        for idx, ch in indexed:
+            if idx is not None and idx not in by_id:
+                by_id[idx] = ch
+        used: set[int] = set()
+        mapped: list[ET.Element | None] = []
+        for c_idx in actual_c_values:
+            ch = by_id.get(c_idx) if c_idx not in used else None
+            if ch is not None:
+                used.add(c_idx)
+            mapped.append(ch)
+        return mapped
+    if (
+        len(set(actual_c_values)) == n_channels
+        and len(ch_list) > n_channels
+        and all(0 <= c_idx < len(ch_list) for c_idx in actual_c_values)
+    ):
+        return [ch_list[c_idx] for c_idx in actual_c_values]
+    if len(ch_list) == n_channels:
+        return list(ch_list)
+    return [None] * n_channels
+
+
 def _extract_czi_metadata(
-    xml_root: ET.Element | None, n_channels: int, rgb: bool
+    xml_root: ET.Element | None,
+    n_channels: int,
+    rgb: bool,
+    c_values: list[int] | None = None,
 ) -> tuple[tuple[float, float] | None, str, float | None, list[ChannelInfo]]:
+    actual_c_values = (
+        list(c_values)
+        if c_values is not None and not rgb and len(c_values) == n_channels
+        else list(range(n_channels))
+    )
     if rgb:
         channels = [
             ChannelInfo("Red", (255, 0, 0)),
@@ -227,9 +278,13 @@ def _extract_czi_metadata(
 
     if xml_root is None:
         if not channels:
-            for i in range(n_channels):
-                color = (255, 255, 255) if n_channels == 1 else _DEFAULT_PALETTE[i % len(_DEFAULT_PALETTE)]
-                channels.append(ChannelInfo(f"Channel {i}", color))
+            for slot_idx, c_idx in enumerate(actual_c_values):
+                color = (
+                    (255, 255, 255)
+                    if n_channels == 1
+                    else _DEFAULT_PALETTE[slot_idx % len(_DEFAULT_PALETTE)]
+                )
+                channels.append(ChannelInfo(f"Channel {c_idx}", color))
         return None, "unknown", None, channels
 
     # 1. Pixel calibration in micrometers (CZI stores Distance Value in meters)
@@ -264,20 +319,20 @@ def _extract_czi_metadata(
             ch for ch in disp_channels
             if (ch.get("IsSelected") or "true").strip().lower() != "false"
         ]
-        if len(disp_channels) == n_channels:
-            chosen = disp_channels
-        elif len(selected_disp) == n_channels:
+        if c_values is None and len(selected_disp) == n_channels and len(disp_channels) != n_channels:
             chosen = selected_disp
-        elif len(dim_channels) == n_channels:
-            chosen = dim_channels
         else:
             chosen = disp_channels or dim_channels
 
-        for i in range(n_channels):
-            name = f"Channel {i}"
+        mapped_chosen = _map_czi_channels(chosen, actual_c_values)
+        mapped_dim = _map_czi_channels(dim_channels, actual_c_values)
+
+        for slot_idx, c_idx in enumerate(actual_c_values):
+            default_name = f"Channel {c_idx}"
+            name = default_name
             color: tuple[int, int, int] | None = None
-            if i < len(chosen):
-                ch = chosen[i]
+            ch = mapped_chosen[slot_idx]
+            if ch is not None:
                 cand_name = (
                     ch.findtext("ShortName")
                     or ch.get("Name")
@@ -288,9 +343,9 @@ def _extract_czi_metadata(
                 if cand_name and cand_name.strip():
                     name = cand_name.strip()
                 color = _parse_hex_color(ch.findtext("Color") or ch.get("Color"))
-            if color is None and i < len(dim_channels):
-                ch_dim = dim_channels[i]
-                if name == f"Channel {i}":
+            ch_dim = mapped_dim[slot_idx]
+            if color is None and ch_dim is not None:
+                if name == default_name:
                     cand_name = (
                         ch_dim.get("Name")
                         or ch_dim.findtext("Fluor")
@@ -303,7 +358,7 @@ def _extract_czi_metadata(
                 color = (
                     (255, 255, 255)
                     if n_channels == 1
-                    else _DEFAULT_PALETTE[i % len(_DEFAULT_PALETTE)]
+                    else _DEFAULT_PALETTE[slot_idx % len(_DEFAULT_PALETTE)]
                 )
             channels.append(ChannelInfo(name, color))
 
@@ -401,6 +456,46 @@ def _decode_subblock_bytes(
     )
 
 
+def _resolve_czi_entries_spec(
+    entries: list[_SubBlockEntry],
+) -> tuple[np.dtype, bool, list[str]]:
+    """Validate SubBlock pixel types and return (promoted_dtype, rgb, channel_dtypes)."""
+    if not entries:
+        raise ValueError("CZI selection contains no SubBlocks")
+    rgb_flags: set[bool] = set()
+    by_c: dict[int, set[np.dtype]] = {}
+    all_dtypes: list[np.dtype] = []
+    for e in entries:
+        if e.pixel_type not in _PIXEL_TYPES:
+            raise NotImplementedError(f"unsupported CZI PixelType code {e.pixel_type}")
+        dt, _samples, is_rgb = _PIXEL_TYPES[e.pixel_type]
+        rgb_flags.add(is_rgb)
+        by_c.setdefault(e.c, set()).add(dt)
+        all_dtypes.append(dt)
+    if len(rgb_flags) > 1:
+        raise ValueError("unsupported CZI layout: mixing RGB and grayscale SubBlocks")
+    rgb = next(iter(rgb_flags))
+    promoted = all_dtypes[0]
+    for dt in all_dtypes[1:]:
+        promoted = np.promote_types(promoted, dt)
+    if rgb:
+        raw_ptypes = sorted({_PIXEL_TYPE_NAMES[e.pixel_type] for e in entries})
+        if len(raw_ptypes) > 1 or any(e.pixel_type in (8, 9) for e in entries):
+            sig = "+".join(raw_ptypes)
+            channel_dtypes = [sig] * 3
+        else:
+            channel_dtypes = [str(promoted)] * 3
+    else:
+        channel_dtypes = []
+        for c_val in sorted(by_c):
+            c_dts = sorted(by_c[c_val], key=lambda d: str(np.dtype(d)))
+            if len(c_dts) == 1:
+                channel_dtypes.append(str(np.dtype(c_dts[0])))
+            else:
+                channel_dtypes.append("+".join(str(np.dtype(d)) for d in c_dts))
+    return np.dtype(promoted), rgb, channel_dtypes
+
+
 def _read_subblock_window(
     fd: int,
     sb: _SubBlockEntry,
@@ -412,29 +507,46 @@ def _read_subblock_window(
     rx1: int,
 ) -> np.ndarray:
     """Read [ry0:ry1, rx0:rx1] within a single Level-0 SubBlock."""
-    sb_hdr = read_at(fd, 48, sb.file_pos)
+    if sb.pixel_type not in _PIXEL_TYPES:
+        raise NotImplementedError(f"unsupported CZI PixelType code {sb.pixel_type}")
+    sb_dtype, sb_samples, sb_rgb = _PIXEL_TYPES[sb.pixel_type]
+    if sb_rgb != (samples > 1):
+        raise ValueError("CZI SubBlock RGB/grayscale mode does not match plane expectation")
+
+    sb_hdr = read_at(fd, 64, sb.file_pos)
     if not sb_hdr[:14].startswith(b"ZISRAWSUBBLOCK"):
         raise ValueError(f"invalid CZI SubBlock header at offset {sb.file_pos}")
     meta_size, _att_size, data_size = struct.unpack("<IIQ", sb_hdr[32:48])
+    if len(sb_hdr) >= 54 and sb_hdr[48:50] == b"DV":
+        hdr_ptype = struct.unpack_from("<i", sb_hdr, 50)[0]
+        if hdr_ptype != sb.pixel_type:
+            raise ValueError(
+                f"CZI SubBlock header PixelType ({hdr_ptype}) disagrees with directory ({sb.pixel_type})"
+            )
     header_len = max(256, 16 + 32 + 20 * sb.ndims)
     data_offset = sb.file_pos + 32 + header_len + meta_size
 
     # Fast path for uncompressed SubBlocks: read only the intersecting row span
     if sb.compression == 0 and sb.x_stored == sb.x_size and sb.y_stored == sb.y_size:
-        row_bytes = sb.x_stored * samples * dtype.itemsize
+        row_bytes = sb.x_stored * sb_samples * sb_dtype.itemsize
+        expected_total = sb.y_stored * row_bytes
+        if int(data_size) < expected_total:
+            raise ValueError(
+                f"CZI SubBlock payload ({data_size} B) smaller than expected ({expected_total} B)"
+            )
         span_offset = data_offset + ry0 * row_bytes
         span_bytes = (ry1 - ry0) * row_bytes
         raw = read_at(fd, span_bytes, span_offset)
-        rows = np.frombuffer(raw, dtype=dtype).reshape(ry1 - ry0, sb.x_stored, samples)
-        if samples == 1:
-            return np.ascontiguousarray(rows[:, rx0:rx1, 0])
-        return np.ascontiguousarray(rows[:, rx0:rx1, :3][:, :, ::-1])
+        rows = np.frombuffer(raw, dtype=sb_dtype).reshape(ry1 - ry0, sb.x_stored, sb_samples)
+        if sb_samples == 1:
+            return np.ascontiguousarray(rows[:, rx0:rx1, 0], dtype=dtype)
+        return np.ascontiguousarray(rows[:, rx0:rx1, :3][:, :, ::-1], dtype=dtype)
 
     raw = read_at(fd, int(data_size), data_offset)
-    decoded = _decode_subblock_bytes(raw, sb, dtype, samples)
+    decoded = _decode_subblock_bytes(raw, sb, sb_dtype, sb_samples)
     if decoded.ndim == 2:
-        return np.ascontiguousarray(decoded[ry0:ry1, rx0:rx1])
-    return np.ascontiguousarray(decoded[ry0:ry1, rx0:rx1, :3])
+        return np.ascontiguousarray(decoded[ry0:ry1, rx0:rx1], dtype=dtype)
+    return np.ascontiguousarray(decoded[ry0:ry1, rx0:rx1, :3], dtype=dtype)
 
 
 def _level0_entries(entries: list[_SubBlockEntry]) -> list[_SubBlockEntry]:
@@ -495,10 +607,8 @@ def open_czi(
     m_values = sorted({e.m for e in st_entries})
     n_z = len(z_values)
 
-    first_ptype = st_entries[0].pixel_type
-    if first_ptype not in _PIXEL_TYPES:
-        raise NotImplementedError(f"unsupported CZI PixelType code {first_ptype}")
-    dtype, samples, rgb = _PIXEL_TYPES[first_ptype]
+    dtype, rgb, channel_dtypes = _resolve_czi_entries_spec(st_entries)
+    samples = 3 if rgb else 1
 
     x0_origin = min(e.x_start for e in st_entries)
     y0_origin = min(e.y_start for e in st_entries)
@@ -521,7 +631,11 @@ def open_czi(
     def make_z_dask(z_val: int) -> Any:
         if rgb:
             z_sbs = by_zc.get((z_val, c_values[0]), [])
-            bg_fill = (255 if dtype == np.uint8 else 65535) if len(m_values) > 1 else 0
+            bg_fill = (
+                (255 if dtype == np.uint8 else (65535 if dtype == np.uint16 else 0))
+                if len(m_values) > 1
+                else 0
+            )
 
             def fetch_rgb(block_info=None):
                 (_, _), (by0, by1), (bx0, bx1) = block_info[None]["array-location"]
@@ -600,7 +714,7 @@ def open_czi(
 
     n_channels = 3 if rgb else len(c_values)
     pixel_size_um, cal_source, magnification, channels = _extract_czi_metadata(
-        xml_root, n_channels, rgb
+        xml_root, n_channels, rgb, c_values=c_values
     )
     if pixel_size_um is None:
         notes.append("no pixel calibration in the file; measurements are in pixels")
@@ -617,6 +731,7 @@ def open_czi(
         notes=notes,
         magnification=magnification,
         calibration_source=cal_source,
+        channel_dtypes=channel_dtypes,
     )
 
 
@@ -637,14 +752,18 @@ def collect_czi_info(path: str | Path) -> dict[str, Any]:
     width = max(e.x_start + e.x_size for e in s0_entries) - x0
     height = max(e.y_start + e.y_size for e in s0_entries) - y0
     ptype = s0_entries[0].pixel_type
-    dtype, _samples, rgb = _PIXEL_TYPES.get(ptype, (np.dtype("uint16"), 1, False))
+    try:
+        dtype, rgb, _channel_dtypes = _resolve_czi_entries_spec(s0_entries)
+    except Exception:
+        dtype, _samples, rgb = _PIXEL_TYPES.get(ptype, (np.dtype("uint16"), 1, False))
+    ptypes = sorted({_PIXEL_TYPE_NAMES.get(e.pixel_type, str(e.pixel_type)) for e in s0_entries})
     c_values = sorted({e.c for e in s0_entries})
     z_values = sorted({e.z for e in s0_entries})
     t_values = sorted({e.t for e in s0_entries})
     m_values = sorted({e.m for e in s0_entries})
     n_channels = 3 if rgb else len(c_values)
     pixel_size_um, cal_source, magnification, channels = _extract_czi_metadata(
-        xml_root, n_channels, rgb
+        xml_root, n_channels, rgb, c_values=c_values
     )
     compressions = sorted({_COMPRESSION_NAMES.get(e.compression, str(e.compression)) for e in lvl0})
     return {
@@ -659,7 +778,7 @@ def collect_czi_info(path: str | Path) -> dict[str, Any]:
         "scenes": len(s_values),
         "mosaic_tiles": len(m_values),
         "dtype": str(dtype),
-        "pixel_type": _PIXEL_TYPE_NAMES.get(ptype, str(ptype)),
+        "pixel_type": ", ".join(ptypes) if ptypes else _PIXEL_TYPE_NAMES.get(ptype, str(ptype)),
         "rgb": rgb,
         "compression": ", ".join(compressions),
         "pixel_size_um": list(pixel_size_um) if pixel_size_um else None,

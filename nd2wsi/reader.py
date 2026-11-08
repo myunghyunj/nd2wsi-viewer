@@ -67,6 +67,7 @@ class PlaneSource:
     notes: list[str] = field(default_factory=list)
     magnification: float | None = None  # objective magnification, if recorded
     calibration_source: str = "unknown"  # nd2-voxel-size | aperio-mpp | unknown
+    channel_dtypes: list[str] | None = None
 
 
 class _OpaqueView:

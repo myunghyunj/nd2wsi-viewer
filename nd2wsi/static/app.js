@@ -462,8 +462,10 @@ function kindMark(info) {
   // positions. A plate file reports its loops; a converted scan keeps the
   // counts in its notes ("file has 7 Z planes", "file has 6 positions").
   const notes = (info.notes || []).join("\n");
-  const zPlanes = info.plate ? Number(info.plate.Z) : Number((notes.match(/file has (\d+) Z planes/) || [])[1] || 1);
-  const positions = info.plate ? Number(info.plate.P) : Number((notes.match(/file has (\d+) positions/) || [])[1] || 1);
+  const zMatch = notes.match(/(?:file|series) has (\d+) Z planes|projection over (\d+) planes|LambdaScan: (\d+) spectral/);
+  const pMatch = notes.match(/(?:file|series) has (\d+) (?:positions|scenes|series)/);
+  const zPlanes = info.plate ? Number(info.plate.Z) : Number((zMatch && (zMatch[1] || zMatch[2] || zMatch[3])) || 1);
+  const positions = info.plate ? Number(info.plate.P) : Number((pMatch && pMatch[1]) || 1);
   return (zPlanes > 1 ? "3D" : "2D") + " " + (positions > 1 ? "PLATE" : "SLIDE");
 }
 
@@ -1546,6 +1548,7 @@ function annotationOwnerReady() {
   if (!state.annReady) return false;
   if (!state.plate) return true;
   const frame = activeFrameParams();
+  if (state.info.plate.annotationScope === "plane") return annotationStore.ownsFrame(frame);
   return window.Nd2LatestRequest.frameOwnsSite(frame, state.annSite);
 }
 
@@ -3423,6 +3426,9 @@ function currentSelection() {
   // site, an ordinary slide's is the plane the cache was built from
   if (state.plate) {
     const frame = activeFrameParams();
+    if (state.info.plate.annotationScope === "plane") {
+      return annotationStore.ownsFrame(frame) ? { t: frame.t, p: frame.p, z: frame.z } : null;
+    }
     return frame && frame.p === state.annSite ? { p: frame.p } : null;
   }
   return state.info.selection || {};
@@ -5116,7 +5122,7 @@ function plateInspectionRows(plate) {
   const times = plate.timesMs || [];
   const period = platePeriodMs();
   rows.push(["Time", plate.T + " frames" +
-    (times.length ? " · " + fmtClock(times[times.length - 1]) : "") +
+    (times.length ? " · " + fmtClock(times[times.length - 1]) : " · timing unavailable") +
     (period ? " · every " + fmtPeriod(period) : "")]);
   if (plate.exposureMs !== null && plate.exposureMs !== undefined) {
     rows.push(["Exposure", rawValueLabel(Number(plate.exposureMs)) + " ms"]);
@@ -5582,7 +5588,8 @@ function paintPlate() {
     img.dataset.group = group;
     shown.dataset.shown = img.dataset.frame;
     shown.classList.remove("failed");
-    if (img.getAttribute("src") !== url) img.src = url;
+    const stripHidden = pl.focus !== null && Number(state.info.plate.P) === 1 && Number(state.info.plate.T) <= 1;
+    if (!stripHidden && img.getAttribute("src") !== url) img.src = url;
     pl.stripEls[site.i].classList.toggle("current", pl.focus === site.i);
     pl.gridEls[site.i].classList.toggle("current", pl.focus === site.i);
   });
@@ -5611,6 +5618,13 @@ function paintPlate() {
 
 function plateFrameChanged() {
   // every t, z or focus change: frames, readouts, histogram, status bar
+  if (annotationStore.needsFrameLoad()) {
+    closeEditor(true);
+    state.cancelToolDrag?.();
+    // Save the departing owner's captured T/P/Z, then clear the marks
+    // synchronously while the new plane loads (including autofocus).
+    annotationStore.switchOwner();
+  }
   invalidatePixelProbe(true);
   if (state.roi) {
     if (frameOwnsRoi()) scheduleScaleStrip();

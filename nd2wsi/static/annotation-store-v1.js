@@ -211,12 +211,33 @@
       return p;
     }
 
-    function urlFor(site) {
-      // a plate keeps one sidecar per site, shared across time and z; the
-      // coordinates inside are level-0 pixels of the frame, as for any slide
+    function planeScoped() {
+      return !!state.plate && state.info.plate.annotationScope === "plane";
+    }
+
+    function sameFrame(a, b) {
+      return a === b || !!(a && b && a.t === b.t && a.p === b.p && a.z === b.z);
+    }
+
+    function ownsFrame(frame) {
+      return !!frame && frame.p === state.annSite &&
+        (!planeScoped() || sameFrame(frame, state.annFrame));
+    }
+
+    function needsFrameLoad() {
+      return planeScoped() && !sameFrame(activeFrame() || null, state.annFrame || null);
+    }
+
+    function urlFor(site, frame = state.annFrame) {
+      // ND2 retains site-wide annotations. Confocal planes capture T/P/Z in
+      // the owner, so a late save never reads the newly selected frame.
       if (!state.plate) return "api/annotations";
       const p = normalizeAnnotationSite(site === undefined ? state.annSite : site);
       if (p === null) return null;
+      if (planeScoped()) {
+        if (!frame || frame.p !== p || !Number.isInteger(frame.t) || !Number.isInteger(frame.z)) return null;
+        return "api/annotations?p=" + p + "&t=" + frame.t + "&z=" + frame.z;
+      }
       return "api/annotations?p=" + p;
     }
 
@@ -475,8 +496,10 @@
         : null;
       const context = state.annContext;
       const revision = state.annRevision;
-      const url = urlFor(targetSite);
+      const targetFrame = planeScoped() && frame && frame.p === targetSite ? { ...frame } : null;
+      const url = urlFor(targetSite, targetFrame);
       state.annSite = Number.isInteger(targetSite) ? targetSite : null;
+      state.annFrame = targetFrame;
       state.annReady = false;
       state.annLoadFailed = false;
       state.annPath = null;
@@ -495,7 +518,8 @@
         const currentFrame = activeFrame();
         return !!(
           seq === state.annLoadSeq && context === state.annContext &&
-          (!state.plate || (currentFrame && currentFrame.p === targetSite && state.annSite === targetSite))
+          (!state.plate || (currentFrame && currentFrame.p === targetSite && state.annSite === targetSite &&
+            (!planeScoped() || sameFrame(currentFrame, targetFrame))))
         );
       };
       // A fast A -> B -> A transition must not GET A before the captured A save
@@ -590,6 +614,7 @@
       state.annDirty = false;
       state.annReady = false;
       state.annSite = null;
+      state.annFrame = null;
     }
 
     // The whole transition in one call: save departing, reset, load next.
@@ -620,6 +645,8 @@
       saveDeparting,
       resetOwner,
       switchOwner,
+      ownsFrame,
+      needsFrameLoad,
       // recovery drafts
       failedSaves,
       recoveryDrafts,

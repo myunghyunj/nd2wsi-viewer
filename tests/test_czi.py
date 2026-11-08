@@ -25,7 +25,7 @@ from nd2wsi.server import create_server, server_url
 
 def build_synthetic_czi(
     path: Path,
-    planes: dict[tuple[int, int, int], np.ndarray],
+    planes: dict[tuple[int, int, int] | tuple[int, int, int, int], np.ndarray],
     *,
     pixel_type: int = 1,
     compression: int = 0,
@@ -36,19 +36,26 @@ def build_synthetic_czi(
     magnification: float = 40.0,
     channels: list[tuple[str, str]] | None = None,
 ) -> Path:
-    """Write a synthetic Zeiss CZI (ZISRAW) file from {(z, c, m): array}."""
-    # Each item: (fpos, x_start, x_size, y_start, y_size, z, c, m)
-    dir_records: list[tuple[int, int, int, int, int, int, int, int]] = []
+    """Write a CZI from {(z, c, m): array} or {(t, z, c, m): array}."""
+    # Each item: (fpos, x_start, x_size, y_start, y_size, t, z, c, m)
+    dir_records: list[tuple[int, ...]] = []
 
     buf = bytearray(512)  # Reserve 512 bytes for ZISRAWFILE header segment
-    for (z, c, m), arr in planes.items():
+    for coords, arr in planes.items():
+        t, z, c, m = (0, *coords) if len(coords) == 3 else coords
+        sb_ptype = pixel_type[c] if isinstance(pixel_type, dict) else int(pixel_type)
         if arr.ndim == 2:
             h, w = arr.shape
             raw_arr = arr
         else:
-            h, w, _ = arr.shape
-            # Store as BGR order for uncompressed/zstd, RGB for jpegxr
-            raw_arr = arr[:, :, ::-1] if compression != 4 else arr
+            h, w, s = arr.shape
+            # Store as BGR/BGRA order for uncompressed/zstd, RGB for jpegxr
+            if compression == 4:
+                raw_arr = arr
+            elif s == 4:
+                raw_arr = arr[:, :, [2, 1, 0, 3]]
+            else:
+                raw_arr = arr[:, :, ::-1]
         raw_bytes = np.ascontiguousarray(raw_arr).tobytes()
         if compression == 0:
             payload = raw_bytes
@@ -76,7 +83,7 @@ def build_synthetic_czi(
         ys = y_offset + my
 
         fpos = len(buf)
-        ndims = 5  # X, Y, C, Z, M
+        ndims = 6  # X, Y, C, Z, M, T
         hdr_len = max(256, 16 + 32 + 20 * ndims)
         used_size = hdr_len + len(payload)
         alloc_size = (used_size + 31) // 32 * 32
@@ -89,7 +96,7 @@ def build_synthetic_czi(
             sb_prefix,
             16,
             b"DV",
-            pixel_type,
+            sb_ptype,
             fpos,
             0,
             compression,
@@ -104,6 +111,7 @@ def build_synthetic_czi(
             (b"C\x00\x00\x00", c, 1, 0.0, 1),
             (b"Z\x00\x00\x00", z, 1, 0.0, 1),
             (b"M\x00\x00\x00", m, 1, 0.0, 1),
+            (b"T\x00\x00\x00", t, 1, 0.0, 1),
         ]
         for idx, (dname, st_i, sz_i, st_f, st_sz) in enumerate(dims):
             struct.pack_into("<4siifi", sb_prefix, 48 + idx * 20, dname, st_i, sz_i, st_f, st_sz)
@@ -113,19 +121,19 @@ def build_synthetic_czi(
         buf.extend(payload)
         if alloc_size > used_size:
             buf.extend(b"\x00" * (alloc_size - used_size))
-        dir_records.append((fpos, xs, w, ys, h, z, c, m))
+        dir_records.append((fpos, xs, w, ys, h, t, z, c, m, sb_ptype))
 
     # Write ZISRAWDIRECTORY segment
     dir_pos = len(buf)
     dir_payload = bytearray(128)
     struct.pack_into("<i", dir_payload, 0, len(dir_records))
-    for fpos, xs, w, ys, h, z, c, m in dir_records:
-        ndims = 5
+    for fpos, xs, w, ys, h, t, z, c, m, sb_ptype in dir_records:
+        ndims = 6
         dir_payload.extend(
             struct.pack(
                 "<2siqiiBB4si",
                 b"DV",
-                pixel_type,
+                sb_ptype,
                 fpos,
                 0,
                 compression,
@@ -141,6 +149,7 @@ def build_synthetic_czi(
             (b"C\x00\x00\x00", c, 1),
             (b"Z\x00\x00\x00", z, 1),
             (b"M\x00\x00\x00", m, 1),
+            (b"T\x00\x00\x00", t, 1),
         ):
             dir_payload.extend(struct.pack("<4siifi", dname, st_i, sz_i, float(st_i), sz_i))
     dir_used = len(dir_payload)
@@ -317,7 +326,7 @@ def test_czi_server_view_lut_and_annotations_end_to_end(tmp_path: Path, monkeypa
         channels=[("DAPI", "#FF00A0FF"), ("GFP", "#FF00FF00")],
     )
 
-    httpd = create_server([])
+    httpd = create_server([], port=0)
     base = server_url(httpd)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -421,7 +430,7 @@ def test_czi_zstack_plate_mode_viewer_and_roi_export(tmp_path: Path):
     )
     assert is_plate_file(czi_path) is True
 
-    httpd = create_server([])
+    httpd = create_server([], port=0)
     base = server_url(httpd)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

@@ -28,6 +28,7 @@ def test_direction_metadata_and_frame_indices_survive_plate_initialization(
     monkeypatch.setattr(plate, "_nd2_pixel_size", lambda _: (None, None))
     monkeypatch.setattr(plate, "objective_magnification", lambda _: None)
     source = plate.PlateSource.__new__(plate.PlateSource)
+    source._backend = "nd2"
     source.tile = 256
     source.path = tmp_path / "metadata-only-fixture.nd2"
     source.path.write_bytes(b"isolated metadata test")
@@ -37,6 +38,7 @@ def test_direction_metadata_and_frame_indices_survive_plate_initialization(
         source._fd = stream.fileno()
         source._init_from_file(f)
     meta = source.attrs["nd2wsi"]["plate"]
+    assert meta["annotationScope"] == "site"
     assert meta["bottomToTop"] is (direction if isinstance(direction, bool) else None)
     assert meta["zHome"] == 2
     assert meta["zStepUm"] == 2.0

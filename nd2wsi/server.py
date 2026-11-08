@@ -47,6 +47,7 @@ from .annotation_sidecars import (
     SLIDE_SUFFIXES,
     _manifest_source_path,
     annotations_sidecar,
+    confocal_annotations_sidecar,
     plate_annotations_sidecar,
 )
 from .astromap_export import (
@@ -673,7 +674,22 @@ class SlideRegistry:
     def agent_window(self) -> bool:
         return self.window_session is not None and self.window_session.role == "agent"
 
-    def annotation_path(self, path: Path, attrs: dict, *, site: int | None = None) -> Path:
+    def annotation_path(
+        self, path: Path, attrs: dict, *, site: int | None = None,
+        frame: tuple[int, int, int] | None = None,
+    ) -> Path:
+        if frame is not None:
+            from .annotation_workspace import _atomic_write, annotation_lock
+
+            canonical, legacy = confocal_annotations_sidecar(path, attrs, frame)
+            if self.agent_window:
+                return self.annotation_workspace.snapshot(canonical, source=legacy)
+            with annotation_lock(canonical):
+                # Recheck under the writer lock: another window may already
+                # have saved this plane. Never replace it with shared marks.
+                if not canonical.exists() and legacy is not None:
+                    _atomic_write(canonical, legacy.read_bytes())
+            return canonical
         if self.annotation_workspace is None:
             return (annotations_sidecar(path, attrs) if site is None
                     else plate_annotations_sidecar(path, attrs, site))
@@ -806,6 +822,44 @@ class SlideRegistry:
             if st is not None:  # keep the old state usable if opening fails
                 stale = st
             root, attrs = open_store(store_path)
+            if (
+                registered_source is not None
+                and registered_source.is_file()
+                and manifest.get("kind") in (None, "full")
+            ):
+                from .cache import cache_container
+                from .convert import _store_matches_source_semantics, ensure_cache
+                from .reader import PlaneSelection
+
+                raw_sel = (manifest.get("selection") if manifest else None) or (
+                    (attrs.get("nd2wsi") or {}).get("selection") or {}
+                )
+                try:
+                    sel = PlaneSelection(
+                        t=int(raw_sel.get("t", 0) or 0),
+                        p=int(raw_sel.get("p", 0) or 0),
+                        z=raw_sel.get("z", "mid"),
+                    )
+                except (TypeError, ValueError):
+                    sel = PlaneSelection()
+                if not _store_matches_source_semantics(registered_source, sel, attrs):
+                    ViewerState._close_root(root)
+                    if (
+                        not self.agent_window
+                        and container_path is not None
+                        and container_path == cache_container(registered_source, sel)
+                    ):
+                        tile_opt = int((attrs.get("nd2wsi") or {}).get("tile") or 0) or None
+                        store_path = ensure_cache(
+                            registered_source, selection=sel, tile=tile_opt, kind="full"
+                        )
+                        manifest = read_manifest(container_path, recover=True) or {}
+                        gen = store_generation(store_path)
+                        root, attrs = open_store(store_path)
+                    else:
+                        raise ValueError(
+                            f"cache {store_path.name} is outdated; open {registered_source.name} to rebuild"
+                        )
             try:
                 st = ViewerState(
                     root,
@@ -999,10 +1053,15 @@ class SlideRegistry:
         from .cache import fingerprints_match, quick_fingerprint
 
         source = _manifest_source_path(cache_path, manifest)
+        fmt = (
+            source.suffix[1:].upper()
+            if source is not None and source.suffix.lower() in (".czi", ".lif")
+            else "ND2"
+        )
         if source is None or source.suffix.lower() not in (".nd2", ".czi", ".lif") or not source.is_file():
-            raise ValueError("plate cache needs its original ND2 source; restore the source first")
+            raise ValueError(f"plate cache needs its original {fmt} source; restore the source first")
         if not fingerprints_match(manifest.get("source", {}), quick_fingerprint(source)):
-            raise ValueError("plate cache source has changed; open the original ND2 to rebuild")
+            raise ValueError(f"plate cache source has changed; open the original {fmt} to rebuild")
         return self.add_plate(source, cache_path=cache_path)
 
     def add_plate(self, slide_path: str | Path, *, cache_path: Path | None = None) -> str:
@@ -1057,7 +1116,11 @@ class SlideRegistry:
                 root = _Root(
                     source.root_for(0, 0, source.z_home), closer=source.close
                 )
-                annotations = self.annotation_path(slide_path, source.attrs, site=0)
+                annotations = self.annotation_path(
+                    slide_path, source.attrs, site=0,
+                    frame=(0, 0, source.z_home)
+                    if source.attrs["nd2wsi"]["plate"].get("annotationScope") == "plane" else None,
+                )
                 stale = self.slides.get(sid)
                 container = source.store.container if source.store is not None else None
                 st = ViewerState(
@@ -2245,6 +2308,11 @@ def make_handler(
             """(sidecar path, site index) for the annotations routes."""
             if st.plate is None:
                 return st.annotations_path, None
+            if st.attrs["nd2wsi"]["plate"].get("annotationScope") == "plane":
+                frame = _frame_args(st, q, require_p=True)
+                if st.source_path is None:
+                    return None, frame[1]
+                return registry.annotation_path(st.source_path, st.attrs, frame=frame), frame[1]
             raw = (q.get("p") or [None])[0]
             if st.plate.P > 1 and (raw is None or raw == ""):
                 raise ValueError("p is required; choose a plate site first")
@@ -2324,7 +2392,11 @@ def make_handler(
                 "items": data["items"],
             }
             if site is not None:
-                payload["selection"] = {"p": site}
+                if meta["plate"].get("annotationScope") == "plane":
+                    t, site, z = _frame_args(st, q or {}, require_p=True)
+                    payload["selection"] = {"t": t, "p": site, "z": z}
+                else:
+                    payload["selection"] = {"p": site}
                 sites = (meta.get("plate") or {}).get("sites") or []
                 payload["site"] = sites[site]["name"] if site < len(sites) else None
             if registry.annotation_workspace is not None:
