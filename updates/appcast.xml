@@ -3,6 +3,22 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.2</title>
+            <pubDate>Sun, 08 Nov 2026 22:55:00 +0900</pubDate>
+            <sparkle:version>2.6.2</sparkle:version>
+            <sparkle:shortVersionString>2.6.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>CZI and LIF pixel decoding, physical calibration, and cache-provenance fixes</h2>
+<ul>
+<li><strong>Mixed-depth and float/BGRA pixel decoding (<code>.czi</code> and <code>.lif</code>).</strong> Leica <code>.lif</code> mixed 8-bit/16-bit channels decode at each channel's declared bit depth with lossless <code>dtype</code> promotion, and Zeiss <code>.czi</code> <code>PixelType 8</code> (<code>Bgr96Float</code>), <code>PixelType 9</code> (<code>Bgra32</code>), and mixed-depth SubBlocks decode with per-SubBlock <code>DV</code> header validation.</li>
+<li><strong>Full-range integer RGB windows, channel identity mapping, and LIF calibration.</strong> <code>uint16</code>/<code>uint32</code> RGB images use full data-range display windows, sparse <code>.czi</code> channels map by <code>Channel:N</code> ID, and <code>.lif</code> physical step calibration divides span by <code>NumberOfElements - 1</code>.</li>
+<li><strong>Plane-isolated T/P/Z annotations and verified cache reuse.</strong> Confocal annotations are isolated per <code>(T, P, Z)</code> plane with non-destructive 2.6.1 migration, and existing <code>.nd2svs</code> caches validate source fingerprint, selected plane, channel labels/dtypes, and physical calibration before reuse.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.2/nd2wsi-viewer-2.6.2-macos-arm64.dmg" length="131758170" type="application/octet-stream" sparkle:edSignature="yI+8XjbUiGas00Y3IM6+DvcyuAokmJ5Nu9SvN5aQ8vr+1+UrsYNGVSQ6X10tDPT/ZPNKQToc6IT7M7TQ7e7pAw=="/>
+        </item>
+        <item>
             <title>2.6.1</title>
             <pubDate>Sat, 07 Nov 2026 16:07:00 +0900</pubDate>
             <sparkle:version>2.6.1</sparkle:version>
