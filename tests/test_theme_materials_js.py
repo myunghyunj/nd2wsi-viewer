@@ -594,10 +594,10 @@ TRACING_BASELINES = {
         "../translucent_window.py": "f748a4263c927ea3b6eece87dd9f06078e475a2ed0a875418f2a863d8a8f3483",
     },
     "SLACS-module": {
-        "translucent.html": "b5c65681de88c19a027d99957084a678205338b862a3d51bc9b84c087864a6a5",
+        "translucent.html": "263cc7c814b4122156d321799b0cb021f5a177bc7ca835bcd8aa04f89075a1ee",
         "translucent-v1.css": "b6ce0a9bb851acdd7168ca65408d1a62e82c218cc3d4add8baf2dd79b7a38511",
         "translucent-v1.js": "63914eea1ccf688683c4f0db6b0bd15b99bcc99cddfcc3800c3d379405cc5156",
-        "../translucent_window.py": "c690d04eb0074db4166157664700b7900eb2034172bb6280ae4350a51d53a23e",
+        "../translucent_window.py": "9fb902f1e21dcab23f523c8f82687122000428dcce3c80978f105d16191bdd41",
     },
 }
 

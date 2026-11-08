@@ -51,9 +51,11 @@ def source_format(attrs, source_path=None) -> str:
             path = Path(name)
             suffix = path.suffix.lower()
             if suffix == ".nd2svs":
-                inner_suffix = Path(path.name.split("--", 1)[0]).suffix.lower()
-                if inner_suffix in _SUFFIXES:
-                    return _SUFFIXES[inner_suffix]
+                parts = path.stem.split("--")
+                for idx in range(len(parts) - 1, 0, -1):
+                    inner_suffix = Path("--".join(parts[:idx])).suffix.lower()
+                    if inner_suffix in _SUFFIXES:
+                        return _SUFFIXES[inner_suffix]
             if suffix in _SUFFIXES:
                 return _SUFFIXES[suffix]
     return "other"

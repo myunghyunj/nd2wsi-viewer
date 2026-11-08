@@ -1,4 +1,4 @@
-"""Window-owned, display-only fluorescence tracing overlays.
+"""Window-owned, display-only tracing overlays.
 
 The overlay uses the owning viewer's gated tile server, but has its own native
 top-level window. It never joins the parent's native child-window hierarchy,
@@ -12,6 +12,7 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -77,6 +78,103 @@ def validate_roi(store, payload):
     return rectangle
 
 
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _polygon_area(points):
+    return abs(sum(
+        points[i][0] * points[(i + 1) % len(points)][1]
+        - points[(i + 1) % len(points)][0] * points[i][1]
+        for i in range(len(points))
+    )) / 2.0
+
+
+def validate_laser_item(store, payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid laser annotation")
+    slacs = payload.get("slacs")
+    is_slacs_dict = isinstance(slacs, dict) and slacs.get("kind") == "laser_shot"
+    if not is_slacs_dict and payload.get("kind") != "laser_shot":
+        raise ValueError("Invalid laser annotation kind")
+    item_id = payload.get("id")
+    if not isinstance(item_id, str) or not 1 <= len(item_id) <= 256:
+        raise ValueError("Invalid laser annotation id")
+    raw_text = payload.get("text") if "text" in payload else payload.get("label", "")
+    if not isinstance(raw_text, str) or len(raw_text) > 65536:
+        raise ValueError("Invalid laser annotation label")
+    raw_label = payload.get("label", raw_text)
+    if not isinstance(raw_label, str) or len(raw_label) > 65536:
+        raise ValueError("Invalid laser annotation label")
+    raw_note = payload.get("note", "")
+    if not isinstance(raw_note, str) or len(raw_note) > 65536:
+        raise ValueError("Invalid laser annotation note")
+    display_text = (raw_text or raw_label)[:1000]
+    display_label = (raw_label or raw_text)[:1000]
+    display_note = raw_note[:1000]
+    color = payload.get("color", "#a0a6ae")
+    if not isinstance(color, str) or not _HEX_COLOR_RE.match(color):
+        raise ValueError("Invalid laser annotation color")
+    shots = slacs.get("shots", 1) if isinstance(slacs, dict) else payload.get("shots", 1)
+    if type(shots) is not int or not 1 <= shots <= 1_000_000:
+        raise ValueError("Invalid laser shot count")
+    cleaned_slacs = {"kind": "laser_shot", "shots": shots}
+    if isinstance(slacs, dict) and "isolation" in slacs:
+        isolation = slacs["isolation"]
+        if type(isolation) is not int or not 1 <= isolation <= 2**53 - 1:
+            raise ValueError("Invalid laser isolation number")
+        cleaned_slacs["isolation"] = isolation
+    item_type = payload.get("type")
+    level = store.attrs["nd2wsi"]["levels"][0]
+    width, height = level["width"], level["height"]
+    if item_type == "box":
+        rectangle = validate_roi(store, payload)
+        return {
+            "id": item_id,
+            "kind": "laser_shot",
+            "type": "box",
+            **rectangle,
+            "text": display_text,
+            "label": display_label,
+            "note": display_note,
+            "color": color,
+            "slacs": cleaned_slacs,
+        }
+    if item_type == "geojson":
+        geojson = payload.get("geojson")
+        geometry = geojson.get("geometry") if isinstance(geojson, dict) else None
+        coords = geometry.get("coordinates") if isinstance(geometry, dict) else None
+        if (not isinstance(geojson, dict) or geojson.get("type") != "Feature"
+                or not isinstance(geometry, dict) or geometry.get("type") != "Polygon"
+                or not isinstance(coords, list) or len(coords) != 1
+                or not isinstance(coords[0], list) or not 4 <= len(coords[0]) <= 32):
+            raise ValueError("Invalid laser polygon geometry")
+        ring = []
+        for point in coords[0]:
+            if not isinstance(point, list) or len(point) != 2:
+                raise ValueError("Invalid laser polygon vertex")
+            px = _number(point[0], "Laser vertex", 0, width)
+            py = _number(point[1], "Laser vertex", 0, height)
+            ring.append([px, py])
+        if ring[0] != ring[-1] or _polygon_area(ring[:-1]) <= 0:
+            raise ValueError("Invalid laser polygon ring")
+        return {
+            "id": item_id,
+            "kind": "laser_shot",
+            "type": "geojson",
+            "text": display_text,
+            "label": display_label,
+            "note": display_note,
+            "color": color,
+            "slacs": cleaned_slacs,
+            "geojson": {
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "properties": {"name": display_text},
+            },
+        }
+    raise ValueError("Invalid laser annotation type")
+
+
 def validate_context(store, payload, *, slide_url):
     """Accept only a camera and tile-render settings for a registered slide."""
     if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
@@ -139,13 +237,37 @@ def validate_context(store, payload, *, slide_url):
     elif set(params) & {"t", "p", "z"}:
         raise ValueError("Plane selection does not match this slide")
     cleaned = urllib.parse.urlencode(pairs)
+    plate_meta = meta.get("plate") if isinstance(meta.get("plate"), dict) else {}
+    store_scope = "plane" if plate is not None and plate_meta.get("annotationScope") == "plane" else "site"
+    if "annotation_scope" in payload and payload["annotation_scope"] is not None:
+        if payload["annotation_scope"] not in ("plane", "site"):
+            raise ValueError("Invalid annotation scope")
+        if plate is None and payload["annotation_scope"] != "site":
+            raise ValueError("Invalid annotation scope")
+        if plate is not None and "annotationScope" in plate_meta and payload["annotation_scope"] != store_scope:
+            raise ValueError("Annotation scope does not match this slide")
+        annotation_scope = payload["annotation_scope"]
+    else:
+        annotation_scope = store_scope
+    source_path = getattr(store, "source_path", None)
+    raw_source = meta.get("source")
+    image_name = (
+        Path(str(source_path)).name
+        if isinstance(source_path, (str, os.PathLike)) and str(source_path)
+        else (
+            Path(str(raw_source)).name
+            if isinstance(raw_source, (str, os.PathLike)) and str(raw_source)
+            else "image"
+        )
+    )
     context = {"version": 1, "slide_url": slide_url, "query": "?" + cleaned if cleaned else "",
                "center": center, "zoom": zoom, "rotation": rotation, "flip": flip,
                "dimensions": [width, height],
                "pixel_size_um": copy.deepcopy(meta.get("pixel_size_um")),
-               "image_name": Path(str(getattr(store, "source_path", "") or "image")).name,
+               "image_name": image_name,
                # Follow's flips are remembered per format of the original file.
                "source_format": follow_flips.source_format(store.attrs, getattr(store, "source_path", None)),
+               "annotation_scope": annotation_scope,
                "opacity": OPACITY, "opacity_mode": "native" if sys.platform == "win32" else "layer",
                "locked": False}
     if payload.get("roi") is not None:
@@ -170,6 +292,18 @@ def validate_context(store, payload, *, slide_url):
         if type(selected) is not int or not 0 <= selected < len(context.get("rois", [])):
             raise ValueError("Invalid selected ROI")
         context["roiIndex"] = selected
+    if "laser_items" in payload and payload["laser_items"] is not None:
+        laser_items = payload["laser_items"]
+        if not isinstance(laser_items, list) or len(laser_items) > 10000:
+            raise ValueError("The translucent viewer supports at most 10000 laser annotations")
+        cleaned_laser, laser_ids = [], set()
+        for item in laser_items:
+            cleaned_item = validate_laser_item(store, item)
+            if cleaned_item["id"] in laser_ids:
+                raise ValueError("Laser annotation IDs must be unique")
+            laser_ids.add(cleaned_item["id"])
+            cleaned_laser.append(cleaned_item)
+        context["laser_items"] = cleaned_laser
     return context
 
 
@@ -242,7 +376,11 @@ class TranslucentApi:
         self._laser_delivery = None
         self._on_laser_box = on_laser_box
         self._laser_items = {}
+        for item in self._context.pop("laser_items", None) or ():
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                self._laser_items[item["id"]] = copy.deepcopy(item)
         self._pending_laser_scope = None
+        self._pending_laser_epoch = None
         self._load_timer = None
         self._target_store = target_store
         self._target_save_lock = threading.Lock()
@@ -525,7 +663,7 @@ class TranslucentApi:
 
                     made_delivery = True
                     self._laser_delivery = LaserDelivery(prepare=self._prepare_laser_box,
-                        deliver=self._on_laser_box, confirmed=self._confirm_laser_box)
+                        deliver=self._deliver_laser_box, confirmed=self._confirm_laser_box)
                 controls = None
                 if step_source == "slacs":
                     controls, controls_error = self._slacs_controls_monitor()
@@ -720,20 +858,27 @@ class TranslucentApi:
                               "at": dt.datetime.now().astimezone().isoformat(timespec="milliseconds")})
 
     def _prepare_laser_box(self, record):
-        if self._closed or self._stage_follow is None:
+        with self._lock:
+            closed = self._closed
+            stage_follow = self._stage_follow
+            locked = self._locked
+            receiver_id = self._stage_follow_receiver_id
+            view = self._overlay_view
+            context = copy.deepcopy(self._context)
+            epoch = self._epoch
+        if closed or stage_follow is None:
             return None, "follow_stopped"
         if not self._is_active():
             return None, "not_active_overlay"
-        if record.get("locked") is not True or not self._locked:
+        if record.get("locked") is not True or not locked:
             return None, "unlocked"
-        if record.get("receiver_id") != self._stage_follow_receiver_id:
+        if record.get("receiver_id") != receiver_id:
             return None, "session_changed"
         if type(record.get("press")) is not int or record["press"] <= 0:
             return None, "invalid_press"
         seq = record.get("follow_seq")
         if type(seq) is not int:
             return None, "stale_view"
-        view = self._overlay_view
         if view is None or view["follow_session"] != record["receiver_id"] or view["follow_seq"] is None:
             return None, "stale_view"
         if view["follow_seq"] > seq:
@@ -746,17 +891,38 @@ class TranslucentApi:
             return None, "unlocked"
         if view.get("target_px") is None or view.get("target_corners_px") is None:
             return None, "target_unavailable"
-        self._pending_laser_scope = self._laser_scope(self._context)
-        query = dict(urllib.parse.parse_qsl(self._context.get("query", "").lstrip("?")))
+        scope = self._laser_scope(context)
+        with self._lock:
+            if self._epoch == epoch:
+                self._pending_laser_scope = scope
+                self._pending_laser_epoch = epoch
+        query = dict(urllib.parse.parse_qsl(context.get("query", "").lstrip("?")))
         return {**{key: copy.deepcopy(view[key]) for key in TARGET_KEYS},
-                "g": query.get("g", ""), "p": int(query["p"]) if "p" in query else None,
+                "g": query.get("g", ""),
+                "t": int(query["t"]) if "t" in query else None,
+                "p": int(query["p"]) if "p" in query else None,
+                "z": int(query["z"]) if "z" in query else None,
                 "press": record["press"], "receiver_id": record["receiver_id"], "at": record["at"],
                 "slacs_session": record.get("slacs_session"),
-                "pixel_size_um": self._context["pixel_size_um"]}, None
+                "pixel_size_um": context["pixel_size_um"]}, None
+
+    def _deliver_laser_box(self, payload):
+        if self._on_laser_box is None:
+            return False
+        with self._lock:
+            if (self._closed or self._stage_follow is None or not self._locked
+                    or payload.get("receiver_id") != self._stage_follow_receiver_id
+                    or (self._pending_laser_epoch is not None and self._pending_laser_epoch != self._epoch)
+                    or (self._pending_laser_scope is not None
+                        and self._pending_laser_scope != self._laser_scope(self._context))):
+                return False
+        return self._on_laser_box(payload)
 
     @staticmethod
-    def _laser_scope(context: dict) -> tuple[str | None, str, str]:
+    def _laser_scope(context: dict) -> tuple:
         query = dict(urllib.parse.parse_qsl(str(context.get("query", "")).lstrip("?")))
+        if context.get("annotation_scope") == "plane":
+            return (context.get("slide_url"), query.get("t", ""), query.get("p", ""), query.get("z", ""), query.get("g", ""))
         return (context.get("slide_url"), query.get("p", ""), query.get("g", ""))
 
     def _confirm_laser_box(self, outcome):
@@ -764,6 +930,9 @@ class TranslucentApi:
             return False
         item = outcome.get("item")
         with self._lock:
+            if (self._pending_laser_epoch is not None
+                    and self._pending_laser_epoch != self._epoch):
+                return False
             if (self._pending_laser_scope is not None
                     and self._pending_laser_scope != self._laser_scope(self._context)):
                 return False
@@ -1260,13 +1429,51 @@ class TranslucentApi:
             if self._closed or not self._configured:
                 raise ValueError("The tracing window is still opening or closing.")
         self.stop_stage_follow()
+        was_locked = False
         with self._lock:
-            if self._laser_scope(context) != self._laser_scope(self._context):
+            scope_changed = self._laser_scope(context) != self._laser_scope(self._context)
+            next_context = copy.deepcopy(context)
+            incoming_laser = next_context.pop("laser_items", None)
+            if incoming_laser is not None:
+                self._laser_items = {
+                    item["id"]: copy.deepcopy(item)
+                    for item in incoming_laser
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                }
+            elif scope_changed:
                 self._laser_items = {}
-            self._context = {**copy.deepcopy(context), "opacity": self._context["opacity"],
+            if "source_format" in next_context:
+                new_format = next_context.get("source_format")
+                new_format = new_format if new_format in follow_flips.FORMATS else "other"
+                format_changed = new_format != self._source_format
+                self._source_format = new_format
+            else:
+                format_changed = False
+            self._context = {**next_context, "opacity": self._context["opacity"],
                              "opacity_mode": self._context["opacity_mode"]}
             self._overlay_view = None
+            self._lock_reported = None
+            self._last_locked_center = None
+            self._realign_from = None
+            if self._locked:
+                self._locked = False
+                was_locked = True
             self._epoch += 1
+        if format_changed:
+            self._follow_flips = (False, False)
+            if self._flip_store is not None:
+                self._restore_flips()
+        if was_locked:
+            def unlock():
+                if not self._closed and sys.platform == "darwin" and getattr(self._window, "native", None) is not None:
+                    self._window.native.setMovable_(True)
+
+            try:
+                self._dispatch(unlock)
+            except Exception:
+                pass
+            if self._on_lock is not None:
+                self._on_lock(False)
         self._window.load_url(self._page_url)
         self._window.show()
 

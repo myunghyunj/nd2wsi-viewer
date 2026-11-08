@@ -58,6 +58,32 @@ console.log(JSON.stringify({disabled:$('t-play').disabled,playing:state.plate.pl
     assert out == {"disabled": True, "playing": False, "timers": 0, "t": 0}
 
 
+def test_unknown_acquisition_timing_uses_frame_scrubbing_without_a_fake_clock():
+    result = run_node(r"""
+const {createController}=require(process.argv[1]+'/plate-controller-v1.js');
+const nodes={};
+const $=id=>id==='t-auto' ? null : nodes[id]||(nodes[id]={style:{},events:{},attrs:{},children:[],
+ classList:{toggle(){}},append(el){this.children.push(el)},setAttribute(k,v){this.attrs[k]=v},
+ addEventListener(k,v){this.events[k]=v},querySelectorAll(){return []},
+ getBoundingClientRect(){return {left:0,width:100}}});
+const state={info:{plate:{T:3,P:1,Z:1,timesMs:[],periodMs:null}},
+ plate:{t:0,z:0,focus:0,auto:false,loaded:new Map()}};
+const control=createController({state,$,clamp:(v,a,b)=>Math.max(a,Math.min(b,v)),
+ plateFrameChanged(){},platePeriodMs:()=>null,plateGroupKey:()=>'',
+ fmtHm:()=>{throw Error('unknown time must not be formatted')},fmtPeriodWords:()=>{throw Error('unknown period')}},
+ {document:{createElement:()=>({style:{},classList:{toggle(){}}})}});
+control.buildTimeLine();
+$('t-track').events.pointerdown({clientX:100,preventDefault(){}});
+control.renderTimeLine();
+console.log(JSON.stringify({t:state.plate.t,clock:$('t-read-clock').textContent,
+ frame:$('t-read-frame').textContent,aria:$('t-track').attrs['aria-valuetext'],labels:$('t-labels').children}));
+""", STATIC, check=True)
+    assert json.loads(result.stdout) == {
+        "t": 2, "clock": "Timing unavailable", "frame": "frame 3 of 3",
+        "aria": "frame 3 of 3", "labels": [],
+    }
+
+
 def test_unavailable_storage_does_not_prevent_startup_or_manual_z_handoff():
     out = run(r"""
 Object.defineProperty(host,'localStorage',{get(){throw new Error('Storage denied')}});

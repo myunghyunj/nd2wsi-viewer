@@ -771,3 +771,227 @@ def test_dialog_window_prefers_bound_window_and_open_paths_resets_stale_status(m
     api._status = "stale error"
     assert api.open_paths([]) is None
     assert api._status == ""
+
+
+def test_image_name_falls_back_to_source_meta_before_default(store, payload):
+    assert overlay.validate_context(store, payload, slide_url="local/")["image_name"] == "image"
+    store.attrs["nd2wsi"]["source"] = "/data/confocal/brain.czi"
+    assert overlay.validate_context(store, payload, slide_url="local/")["image_name"] == "brain.czi"
+    store.source_path = Path("/Users/lab/slides/override.nd2")
+    assert overlay.validate_context(store, payload, slide_url="local/")["image_name"] == "override.nd2"
+
+
+def test_refresh_context_updates_source_format_flips_and_resets_lock_realign_state(tmp_path):
+    from nd2wsi.follow_flips import FollowFlipStore
+
+    flip_store = FollowFlipStore(root=tmp_path)
+    flip_store.save("nd2", True, False)
+    flip_store.save("czi", False, True)
+    lock_events = []
+    api = overlay.TranslucentApi(
+        {"slide_url": "http://local/s/1/", "rotation": 0, "flip": False, "query": "?c=0", "source_format": "nd2"},
+        logger=Mock(), on_closed=Mock(), flip_store=flip_store, on_lock=lock_events.append,
+    )
+    api._configured = True
+    api._window = Mock()
+    api._page_url = "http://local/trace"
+    assert api.translucent_context()["source_format"] == "nd2"
+    assert api.translucent_context()["follow_flips"] == {"flip_x": True, "flip_y": False}
+    api._locked = True
+    api._lock_reported = True
+    api._last_locked_center = [100.0, 200.0]
+    api._realign_from = [100.0, 200.0]
+    api.refresh_context({
+        "slide_url": "http://local/s/2/", "rotation": 0, "flip": False,
+        "query": "?c=0&t=0&p=0&z=0", "source_format": "czi", "annotation_scope": "plane",
+    })
+    assert api._locked is False
+    assert api._lock_reported is None
+    assert api._last_locked_center is None
+    assert api._realign_from is None
+    assert lock_events == [False]
+    assert api.translucent_context()["source_format"] == "czi"
+    assert api.translucent_context()["follow_flips"] == {"flip_x": False, "flip_y": True}
+    api._did_close()
+
+
+def test_plane_scoped_laser_items_sync_on_open_refresh_deletion_and_plane_change(store, payload):
+    store.plate = SimpleNamespace(T=3, P=2, Z=4)
+    store.attrs["nd2wsi"]["plate"] = {"annotationScope": "plane", "T": 3, "P": 2, "Z": 4}
+    payload = {**payload, "query": "?c=1&g=pixels-2&t=1&p=0&z=2"}
+    laser_1 = {
+        "id": "slacs-laser-r-1", "kind": "laser_shot", "type": "box",
+        "x": 100, "y": 200, "w": 20, "h": 30, "text": "SLACS_ROI #1",
+        "color": "#a0a6ae", "slacs": {"kind": "laser_shot", "shots": 2, "isolation": 1},
+    }
+    laser_2 = {
+        "id": "slacs-laser-r-2", "kind": "laser_shot", "type": "box",
+        "x": 300, "y": 400, "w": 25, "h": 25, "label": "SLACS_ROI #2",
+        "color": "#a0a6ae",
+    }
+    initial = overlay.validate_context(store, {**payload, "laser_items": [laser_1, laser_2]}, slide_url="http://local/s/1/")
+    assert initial["annotation_scope"] == "plane"
+    assert len(initial["laser_items"]) == 2
+    api = overlay.TranslucentApi(initial, logger=Mock(), on_closed=Mock())
+    api._configured = True
+    api._window = Mock()
+    api._page_url = "http://local/trace"
+    assert [item["id"] for item in api.translucent_context()["laser_items"]] == ["slacs-laser-r-1", "slacs-laser-r-2"]
+
+    # Deleting laser_1 in the main viewer and refreshing on the same plane removes it.
+    after_delete = overlay.validate_context(store, {**payload, "laser_items": [laser_2]}, slide_url="http://local/s/1/")
+    api.refresh_context(after_delete)
+    assert [item["id"] for item in api.translucent_context()["laser_items"]] == ["slacs-laser-r-2"]
+
+    # Changing Z or T on a plane-scoped slide changes _laser_scope and rejects late confirmations.
+    api._pending_laser_scope = api._laser_scope(api._context)
+    z_changed = overlay.validate_context(
+        store, {**payload, "query": "?c=1&g=pixels-2&t=1&p=0&z=3"}, slide_url="http://local/s/1/"
+    )
+    api.refresh_context(z_changed)
+    assert api.translucent_context()["laser_items"] == []
+    assert api._confirm_laser_box({"item": laser_1}) is False
+    assert api.translucent_context()["laser_items"] == []
+
+    # By contrast, a site-scoped (ND2) plate keeps _laser_items across Z changes on the same site.
+    store.attrs["nd2wsi"]["plate"]["annotationScope"] = "site"
+    site_ctx = overlay.validate_context(store, {**payload, "laser_items": [laser_1]}, slide_url="http://local/s/1/")
+    assert site_ctx["annotation_scope"] == "site"
+    api.refresh_context(site_ctx)
+    assert len(api.translucent_context()["laser_items"]) == 1
+    site_z_changed = overlay.validate_context(
+        store, {**payload, "query": "?c=1&g=pixels-2&t=1&p=0&z=3"}, slide_url="http://local/s/1/"
+    )
+    api.refresh_context(site_z_changed)
+    assert [item["id"] for item in api.translucent_context()["laser_items"]] == ["slacs-laser-r-1"]
+    api._did_close()
+
+
+@pytest.mark.parametrize("bad_laser", [
+    "not-a-list",
+    [{"id": "a", "kind": "not_laser", "type": "box", "x": 1, "y": 1, "w": 2, "h": 2}],
+    [{"id": "", "kind": "laser_shot", "type": "box", "x": 1, "y": 1, "w": 2, "h": 2}],
+    [{"id": "a", "kind": "laser_shot", "type": "pin", "x": 1, "y": 1, "w": 2, "h": 2}],
+    [{"id": "a", "kind": "laser_shot", "type": "box", "x": 7999, "y": 1, "w": 5, "h": 2}],
+    [{"id": "a", "kind": "laser_shot", "type": "box", "x": 1, "y": 1, "w": 0, "h": 2}],
+    [{"id": "a", "kind": "laser_shot", "type": "box", "x": 1, "y": 1, "w": 2, "h": 2, "color": "red"}],
+    [{"id": "dup", "kind": "laser_shot", "type": "box", "x": 1, "y": 1, "w": 2, "h": 2},
+     {"id": "dup", "kind": "laser_shot", "type": "box", "x": 4, "y": 4, "w": 2, "h": 2}],
+    [{"id": "a", "kind": "laser_shot", "type": "box", "x": 1, "y": 1, "w": 2, "h": 2, "text": 123}],
+    [{"id": f"i-{i}", "kind": "laser_shot", "type": "box", "x": 1, "y": 1, "w": 2, "h": 2} for i in range(10001)],
+])
+def test_validate_context_rejects_malformed_laser_items(store, payload, bad_laser):
+    with pytest.raises(ValueError):
+        overlay.validate_context(store, {**payload, "laser_items": bad_laser}, slide_url="local/")
+
+
+def test_slacs_1_1_and_1_2_refresh_interleaving_and_large_annotation_history(store, payload):
+    import threading
+    from unittest.mock import patch
+
+    # slacs-1-2: 513 saved laser annotations and a 1001-char edited label must
+    # succeed in validate_context (with the overlay display label bounded to 1000 chars).
+    many_items = [
+        {
+            "id": f"slacs-laser-r-{i}",
+            "kind": "laser_shot",
+            "type": "box",
+            "x": 10 + (i % 100) * 20,
+            "y": 10 + (i // 100) * 20,
+            "w": 18,
+            "h": 18,
+            "text": "x" * 1001 if i == 0 else f"SLACS_ROI #{i + 1}",
+            "color": "#a0a6ae",
+            "slacs": {"kind": "laser_shot", "shots": 1, "isolation": i + 1},
+        }
+        for i in range(513)
+    ]
+    ctx_many = overlay.validate_context(store, {**payload, "laser_items": many_items}, slide_url="http://local/s/1/")
+    assert len(ctx_many["laser_items"]) == 513
+    assert len(ctx_many["laser_items"][0]["text"]) == 1000
+    assert len(many_items[0]["text"]) == 1001
+
+    # slacs-1-1: Interleaving _prepare_laser_box with refresh_context(z=0 -> z=1)
+    # must never tag old z=0 target coordinates with the new z=1 plane.
+    race_ctx = {
+        "slide_url": "http://local/s/slide/",
+        "query": "?g=pixels&t=0&p=0&z=0",
+        "pixel_size_um": [1.0, 1.0],
+        "annotation_scope": "plane",
+        "source_format": "czi",
+    }
+    delivered = []
+    api = overlay.TranslucentApi(
+        race_ctx, logger=Mock(), on_closed=Mock(), on_laser_box=lambda p: (delivered.append(p) or True)
+    )
+    api._configured = True
+    api._window = Mock(native=None)
+    api._dispatch = Mock(return_value=True)
+    api._page_url = "http://local/trace"
+    api._stage_follow = Mock()
+    api._stage_follow_receiver_id = "receiver-old"
+    api._locked = True
+    view = {
+        "version": 1,
+        "center_px": [100, 100],
+        "zoom": 1,
+        "locked": True,
+        "follow_session": "receiver-old",
+        "follow_seq": 8,
+        "target_px": [100, 100],
+        "target_offset_css": [0, 0],
+        "target_side_um": 18,
+        "target_rotation_deg": 0,
+        "target_calibrated": True,
+        "target_corners_px": [[91, 91], [109, 91], [109, 109], [91, 109]],
+    }
+    assert api.report_overlay_view(view)["ok"]
+    record = {
+        "receiver_id": "receiver-old",
+        "press": 1,
+        "follow_seq": 8,
+        "locked": True,
+        "at": "2026-11-08T10:00:00Z",
+        "slacs_session": "synthetic",
+    }
+    reached, resume = threading.Event(), threading.Event()
+
+    class BarrierView(dict):
+        def get(self, key, default=None):
+            if key == "target_corners_px":
+                reached.set()
+                assert resume.wait(5)
+            return super().get(key, default)
+
+    api._overlay_view = BarrierView(api._overlay_view)
+    result = {}
+
+    def prepare():
+        result["payload"], result["reason"] = api._prepare_laser_box(record)
+
+    with patch("nd2wsi.translucent_window.session_log.event"):
+        worker = threading.Thread(target=prepare)
+        worker.start()
+        assert reached.wait(5)
+        try:
+            api.refresh_context({**race_ctx, "query": "?g=pixels&t=0&p=0&z=1", "laser_items": []})
+        finally:
+            resume.set()
+            worker.join(5)
+    assert result["payload"]["z"] == 0
+    assert api._deliver_laser_box(result["payload"]) is False
+    assert delivered == []
+    api._did_close()
+
+
+def test_format_neutral_translucent_wording(payload, monkeypatch):
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda _sid: None))
+    res = api.open_translucent_viewer("missing", payload)
+    assert not res["ok"]
+    assert "Open an image before opening the translucent viewer" in res["message"]
+    assert "fluorescence" not in res["message"]
+    html = (Path(__file__).resolve().parents[1] / "nd2wsi/static/translucent.html").read_text(encoding="utf-8")
+    assert 'aria-label="Translucent viewer"' in html
+    assert "fluorescence" not in html

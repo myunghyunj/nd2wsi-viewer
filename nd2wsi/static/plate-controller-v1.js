@@ -450,7 +450,7 @@
       const pct = timePct(pl.t);
       $("t-playhead").style.left = pct + "%";
       $("t-fill").style.width = pct + "%";
-      $("t-read-clock").textContent = fmtHm(times.length ? times[pl.t] - times[0] : 0);
+      $("t-read-clock").textContent = times.length ? fmtHm(times[pl.t] - times[0]) : "Timing unavailable";
       const period = platePeriodMs();
       $("t-read-frame").textContent = "frame " + (pl.t + 1) + " of " + info.T +
         (period ? " · every " + fmtPeriodWords(period) : "");

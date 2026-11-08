@@ -160,6 +160,10 @@ let frameRequests = null;
 
 window.nd2CaptureViewState = () => window.Nd2ViewState.capture(state);
 
+function plateAnnotationScope() {
+  return state.plate && state.info?.plate?.annotationScope === "plane" ? "plane" : "site";
+}
+
 // Copy display state and validated imported regions; never edit source annotations.
 function captureTranslucentView() {
   if (state.quitPreparing) throw new Error("The viewer is closing");
@@ -168,12 +172,17 @@ function captureTranslucentView() {
   if (!spatialImageReady()) throw new Error("Wait for the image to finish opening");
   const viewport = state.viewer.viewport;
   const center = viewport.viewportToImageCoordinates(viewport.getCenter(true));
+  const annotationScope = typeof plateAnnotationScope === "function"
+    ? plateAnnotationScope()
+    : (state.plate && state.info?.plate?.annotationScope === "plane" ? "plane" : "site");
   const snapshot = {
     version: 1, query: tileQuery(), center: [center.x, center.y],
     zoom: viewport.viewportToImageZoom(viewport.getZoom(true)),
     rotation: viewport.getRotation(), flip: viewport.getFlip(),
+    ...(annotationScope === "plane" ? { annotation_scope: "plane" } : {}),
   };
-  const imported = state.annReady && annotationOwnerReady()
+  const ownerReady = Boolean(state.annReady && annotationOwnerReady());
+  const imported = ownerReady
     ? state.annotations.filter(item => item.type === "box" && item.astromap === true &&
       Number.isSafeInteger(item.astromapImportIndex) && item.astromapImportIndex > 0) : [];
   if (imported.length) {
@@ -181,6 +190,38 @@ function captureTranslucentView() {
       index: index + 1, label: String(item.text || item.astromapImportIndex) }));
     const selected = imported.findIndex(item => item.id === state.astromap.activeId);
     if (selected >= 0) snapshot.roiIndex = selected;
+  }
+  if (ownerReady) {
+    snapshot.laser_items = state.annotations
+      .filter(item => window.Nd2SlacsLaser?.laser ? window.Nd2SlacsLaser.laser(item)
+        : (item?.slacs?.kind === "laser_shot" || item?.kind === "laser_shot"))
+      .map(item => {
+        const shots = Number.isSafeInteger(item.slacs?.shots) && item.slacs.shots > 0 ? item.slacs.shots : 1;
+        const text = String(item.text ?? item.label ?? "");
+        const base = {
+          id: String(item.id || ""),
+          kind: "laser_shot",
+          type: item.type === "geojson" ? "geojson" : "box",
+          text,
+          label: String(item.label ?? item.text ?? ""),
+          note: String(item.note ?? ""),
+          color: String(item.color || "#a0a6ae"),
+          slacs: {
+            kind: "laser_shot",
+            shots,
+            ...(Number.isSafeInteger(item.slacs?.isolation) && item.slacs.isolation > 0
+              ? { isolation: item.slacs.isolation } : {}),
+          },
+        };
+        if (item.type === "geojson" && item.geojson) {
+          return { ...base, geojson: JSON.parse(JSON.stringify(item.geojson)) };
+        }
+        return {
+          ...base,
+          x: Number(item.x), y: Number(item.y), w: Number(item.w), h: Number(item.h),
+          ...(item.geojson ? { geojson: JSON.parse(JSON.stringify(item.geojson)) } : {}),
+        };
+      });
   }
   return snapshot;
 }
@@ -505,8 +546,10 @@ function kindMark(info) {
   // positions. A plate file reports its loops; a converted scan keeps the
   // counts in its notes ("file has 7 Z planes", "file has 6 positions").
   const notes = (info.notes || []).join("\n");
-  const zPlanes = info.plate ? Number(info.plate.Z) : Number((notes.match(/file has (\d+) Z planes/) || [])[1] || 1);
-  const positions = info.plate ? Number(info.plate.P) : Number((notes.match(/file has (\d+) positions/) || [])[1] || 1);
+  const zMatch = notes.match(/(?:file|series) has (\d+) Z planes|projection over (\d+) planes|LambdaScan: (\d+) spectral/);
+  const pMatch = notes.match(/(?:file|series) has (\d+) (?:positions|scenes|series)/);
+  const zPlanes = info.plate ? Number(info.plate.Z) : Number((zMatch && (zMatch[1] || zMatch[2] || zMatch[3])) || 1);
+  const positions = info.plate ? Number(info.plate.P) : Number((pMatch && pMatch[1]) || 1);
   return (zPlanes > 1 ? "3D" : "2D") + " " + (positions > 1 ? "PLATE" : "SLIDE");
 }
 
@@ -1589,6 +1632,7 @@ function annotationOwnerReady() {
   if (!state.annReady) return false;
   if (!state.plate) return true;
   const frame = activeFrameParams();
+  if (state.info.plate.annotationScope === "plane") return annotationStore.ownsFrame(frame);
   return window.Nd2LatestRequest.frameOwnsSite(frame, state.annSite);
 }
 
@@ -3467,6 +3511,9 @@ function currentSelection() {
   // site, an ordinary slide's is the plane the cache was built from
   if (state.plate) {
     const frame = activeFrameParams();
+    if (state.info.plate.annotationScope === "plane") {
+      return annotationStore.ownsFrame(frame) ? { t: frame.t, p: frame.p, z: frame.z } : null;
+    }
     return frame && frame.p === state.annSite ? { p: frame.p } : null;
   }
   return state.info.selection || {};
@@ -4780,8 +4827,16 @@ function receiveSlacsLaserBox(box) {
     sid = currentSlideSid();
     const api = window.Nd2SlacsLaser;
     if (api) {
+      const frame = state.plate
+        ? (typeof activeFrameParams === "function" ? activeFrameParams()
+          : (typeof activeFrameContext === "function" ? activeFrameContext()?.frame : state.annFrame))
+        : null;
+      const annotationScope = typeof plateAnnotationScope === "function"
+        ? plateAnnotationScope()
+        : (state.plate && state.info?.plate?.annotationScope === "plane" ? "plane" : "site");
       const owner = {
-        sid, g: state.info.generation, p: state.plate ? state.annSite : null,
+        sid, g: state.info.generation, annotationScope,
+        t: frame ? frame.t : null, p: state.plate ? state.annSite : null, z: frame ? frame.z : null,
         ready: annotationOwnerReady(), locked: annLocked(), loadFailed: state.annLoadFailed,
         quitPreparing: state.quitPreparing, width: state.info.width, height: state.info.height,
         items: state.annotations, meta: state.annLaserState,
@@ -5190,7 +5245,7 @@ function plateInspectionRows(plate) {
   const times = plate.timesMs || [];
   const period = platePeriodMs();
   rows.push(["Time", plate.T + " frames" +
-    (times.length ? " · " + fmtClock(times[times.length - 1]) : "") +
+    (times.length ? " · " + fmtClock(times[times.length - 1]) : " · timing unavailable") +
     (period ? " · every " + fmtPeriod(period) : "")]);
   if (plate.exposureMs !== null && plate.exposureMs !== undefined) {
     rows.push(["Exposure", rawValueLabel(Number(plate.exposureMs)) + " ms"]);
@@ -5656,7 +5711,8 @@ function paintPlate() {
     img.dataset.group = group;
     shown.dataset.shown = img.dataset.frame;
     shown.classList.remove("failed");
-    if (img.getAttribute("src") !== url) img.src = url;
+    const stripHidden = pl.focus !== null && Number(state.info.plate.P) === 1 && Number(state.info.plate.T) <= 1;
+    if (!stripHidden && img.getAttribute("src") !== url) img.src = url;
     pl.stripEls[site.i].classList.toggle("current", pl.focus === site.i);
     pl.gridEls[site.i].classList.toggle("current", pl.focus === site.i);
   });
@@ -5685,6 +5741,13 @@ function paintPlate() {
 
 function plateFrameChanged() {
   // every t, z or focus change: frames, readouts, histogram, status bar
+  if (annotationStore.needsFrameLoad()) {
+    closeEditor(true);
+    state.cancelToolDrag?.();
+    // Save the departing owner's captured T/P/Z, then clear the marks
+    // synchronously while the new plane loads (including autofocus).
+    annotationStore.switchOwner();
+  }
   invalidatePixelProbe(true);
   if (state.roi) {
     if (frameOwnsRoi()) scheduleScaleStrip();

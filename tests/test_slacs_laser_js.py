@@ -121,3 +121,36 @@ def test_anisotropic_pixel_size_uses_physical_micrometre_distance_for_burst_merg
       console.log(JSON.stringify({d1:r1.decision,d2:r2.decision,d3:r3.decision,count:h.owner.items.length}));
     ''')
     assert result == {"d1": "added", "d2": "added", "d3": "updated", "count": 2}
+
+
+def test_plane_scoped_owner_isolates_by_t_p_z_while_site_scoped_owner_shares_t_z():
+    result = run('''
+      const h=harness();
+      Object.assign(h.owner,{annotationScope:'plane',t:1,p:2,z:3});
+      const wrongT=h.shot(1,1000,1000,{t:0,p:2,z:3});
+      const wrongZ=h.shot(2,1000,1000,{t:1,p:2,z:4});
+      const missingZ=h.shot(3,1000,1000,{t:1,p:2,z:null});
+      const wrongP=h.shot(4,1000,1000,{t:1,p:0,z:3});
+      const matched=h.shot(5,1000,1000,{t:1,p:2,z:3});
+      // Site-scoped (ND2) owner accepts different t/z on the same site p=2:
+      const s=harness();
+      Object.assign(s.owner,{annotationScope:'site',t:1,p:2,z:3});
+      const siteDiffZ=s.shot(1,1000,1000,{t:0,p:2,z:9});
+      const siteWrongP=s.shot(2,1000,1000,{t:1,p:1,z:3});
+      console.log(JSON.stringify({
+        wrongT:wrongT.reason,wrongZ:wrongZ.reason,missingZ:missingZ.reason,wrongP:wrongP.reason,
+        matched:matched.decision,planeCount:h.owner.items.length,
+        siteDiffZ:siteDiffZ.decision,siteWrongP:siteWrongP.reason,siteCount:s.owner.items.length,
+      }));
+    ''')
+    assert result == {
+        "wrongT": "plane_changed",
+        "wrongZ": "plane_changed",
+        "missingZ": "plane_changed",
+        "wrongP": "site_changed",
+        "matched": "added",
+        "planeCount": 1,
+        "siteDiffZ": "added",
+        "siteWrongP": "site_changed",
+        "siteCount": 1,
+    }

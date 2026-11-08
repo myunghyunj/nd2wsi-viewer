@@ -718,7 +718,7 @@ class Api:
                 server = self._httpd
                 store = server.registry.get(sid) if server is not None and isinstance(sid, str) else None
                 if store is None:
-                    raise ValueError("Open a fluorescence slide before opening the translucent viewer")
+                    raise ValueError("Open an image before opening the translucent viewer")
                 base_url = _server_url(server).rstrip("/") + "/"
                 context = validate_context(store, payload, slide_url=base_url + "s/" + quote(sid, safe="") + "/")
 

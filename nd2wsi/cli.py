@@ -406,7 +406,14 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "view":
         from .cache import SINGLE_FILE_SUFFIX
-        from .convert import convert, default_store_path, ensure_cache, existing_cache_store
+        from .convert import (
+            _store_matches_selection,
+            convert,
+            default_store_path,
+            ensure_cache,
+            existing_cache_store,
+            open_store,
+        )
         from .plate import is_plate_file
         from .server import serve
         from .svs import is_svs
@@ -436,10 +443,61 @@ def _main(argv: list[str] | None = None) -> int:
                     stores.append(ensure_cache(slide, selection=_selection(args)))
                 continue
             # explicit knobs mean a deliberate, portable store
+            selection = _selection(args)
             store = default_store_path(slide)
             if args.store and len(args.nd2) == 1:
                 store = Path(args.store)
-            if args.overwrite or not store.exists():
+            store_matches = False
+            if not args.overwrite and store.exists():
+                try:
+                    root, attrs = open_store(store)
+                    close = getattr(root, "close", None)
+                    if close is not None:
+                        close()
+                    slide_resolved = Path(slide).resolve()
+                    from .cache import (
+                        fingerprints_match,
+                        manifest_container,
+                        quick_fingerprint,
+                        read_manifest,
+                    )
+
+                    m_cont = manifest_container(store)
+                    m_data = read_manifest(m_cont) if m_cont is not None else None
+                    has_manifest_fp = False
+                    manifest_fp_ok = True
+                    if isinstance(m_data, dict) and isinstance(m_data.get("source"), dict):
+                        has_manifest_fp = True
+                        src_rec = m_data["source"]
+                        if (
+                            src_rec.get("name") != slide_resolved.name
+                            or not fingerprints_match(src_rec, quick_fingerprint(slide_resolved))
+                        ):
+                            manifest_fp_ok = False
+                    store_matches = manifest_fp_ok and _store_matches_selection(
+                        slide_resolved,
+                        attrs,
+                        selection,
+                        tile=args.tile,
+                        require_provenance=bool(args.store) and not has_manifest_fp,
+                    )
+                except (ValueError, FileNotFoundError, OSError):
+                    store_matches = False
+            if store_matches:
+                print(f"reusing existing pyramid {store} (use --overwrite to rebuild)")
+            elif not args.overwrite and store.exists() and not args.store:
+                if existing_cache_store(slide, selection) is None and not confirm_pyramid(slide, args.yes):
+                    print(f"skipped {Path(slide).name}")
+                    continue
+                store = ensure_cache(slide, tile=args.tile, selection=selection)
+            elif not args.overwrite and store.exists():
+                print(
+                    f"error: {store} exists for a different source, plane selection, or tile size "
+                    "(use --overwrite to replace it)",
+                    file=sys.stderr,
+                )
+                return 1
+            else:
                 if not confirm_pyramid(slide, args.yes):
                     print(f"skipped {Path(slide).name}")
                     continue
@@ -447,12 +505,10 @@ def _main(argv: list[str] | None = None) -> int:
                     slide,
                     store,
                     tile=args.tile,
-                    selection=_selection(args),
+                    selection=selection,
                     overwrite=args.overwrite,
                     workers=args.workers,
                 )
-            else:
-                print(f"reusing existing pyramid {store} (use --overwrite to rebuild)")
             stores.append(store)
         if not stores:
             return 0

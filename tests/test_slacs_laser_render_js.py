@@ -110,3 +110,33 @@ def test_initial_context_hydrates_confirmed_laser_items():
       return {count:layer.children.length,label:layer.children[1]?.textContent};
     ''')
     assert result == {"count": 2, "label": "SLACS_ROI #1 · 2 shots"}
+
+
+def test_pane_adapter_enforces_plane_scope_on_czi_lif_plates():
+    result = _run_export(r'''
+const f=fixture(),c=f.c,replies=[];
+c.state.annotations=[];
+c.state.plate={focus:2};
+c.state.annSite=2;
+c.state.info={generation:'g',width:100,height:100,plate:{annotationScope:'plane',T:3,P:4,Z:5}};
+c.activeFrameParams=()=>({t:1,p:2,z:3});
+c.currentSlideSid=()=> 'slide';
+c.window.Nd2SlacsLaser=require(path.join(path.dirname(process.argv[1]),'slacs-laser-v1.js'));
+c.window.parent={pywebview:{api:{report_slacs_laser_box:r=>{replies.push(r);return Promise.resolve({ok:true});}}}};
+c.addAnnotation=a=>{c.state.annotations.push(a);return a;};
+c.annotationsChanged=()=>{};
+vm.runInContext(production('plateAnnotationScope')+'\n'+production('receiveSlacsLaserBox'),c);
+const base={sid:'slide',g:'g',t:1,p:2,z:3,token:'t1',press:1,receiver_id:'receiver',at:'2026-01-01T00:00:00Z',
+ target_px:[20,30],target_corners_px:[[15,25],[25,25],[25,35],[15,35]],pixel_size_um:[1,1],
+ target_side_um:10,target_rotation_deg:0,target_calibrated:true};
+c.receiveSlacsLaserBox({...base,z:4,press:1});
+c.receiveSlacsLaserBox({...base,t:0,press:2});
+c.receiveSlacsLaserBox({...base,press:3});
+return {replies:replies.map(r=>({decision:r.decision,reason:r.reason})),count:c.state.annotations.length};
+''')
+    assert result["replies"] == [
+        {"decision": "skipped", "reason": "plane_changed"},
+        {"decision": "skipped", "reason": "plane_changed"},
+        {"decision": "added", "reason": "new_burst"},
+    ]
+    assert result["count"] == 1

@@ -91,8 +91,8 @@ def test_lif_multichannel_confocal_zstack_xycz_and_xyzc_pyramid(tmp_path: Path):
     # Series 0: 8-bit XYCZ memory order (like raw confocal Z-stack)
     s0_arr = rng.integers(10, 240, size=(n_z, n_c, h, w), dtype=np.uint8)
     s0_dims = [
-        f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="1" Length="{w * 0.18e-6:.9e}" Unit="m"/>',
-        f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w}" Length="{h * 0.18e-6:.9e}" Unit="m"/>',
+        f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="1" Length="{(w - 1) * 0.18e-6:.9e}" Unit="m"/>',
+        f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w}" Length="{(h - 1) * 0.18e-6:.9e}" Unit="m"/>',
         f'<DimensionDescription DimID="3" NumberOfElements="{n_z}" BytesInc="{h * w * n_c}" Length="1.0e-5" Unit="m"/>',
     ]
     s0_chans = [
@@ -112,8 +112,8 @@ def test_lif_multichannel_confocal_zstack_xycz_and_xyzc_pyramid(tmp_path: Path):
     # Series 1: 16-bit XYZC memory order (like Leica LIGHTNING deconvolved Z-stack)
     s1_arr = rng.integers(200, 12000, size=(n_c, n_z, h, w), dtype=np.uint16)
     s1_dims = [
-        f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="2" Length="{w * 0.05e-6:.9e}" Unit="m"/>',
-        f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w * 2}" Length="{h * 0.05e-6:.9e}" Unit="m"/>',
+        f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="2" Length="{(w - 1) * 0.05e-6:.9e}" Unit="m"/>',
+        f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w * 2}" Length="{(h - 1) * 0.05e-6:.9e}" Unit="m"/>',
         f'<DimensionDescription DimID="3" NumberOfElements="{n_z}" BytesInc="{h * w * 2}" Length="5.0e-6" Unit="m"/>',
     ]
     s1_chans = [
@@ -206,8 +206,8 @@ def test_lif_lambdascan_and_rgb_snapshot(tmp_path: Path):
                 "name": "Convallaria_Lambda",
                 "payload": lambda_arr.tobytes(),
                 "dims_xml": [
-                    f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="2" Length="{w * 1.5e-6:.9e}" Unit="m"/>',
-                    f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w * 2}" Length="{h * 1.5e-6:.9e}" Unit="m"/>',
+                    f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="2" Length="{(w - 1) * 1.5e-6:.9e}" Unit="m"/>',
+                    f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w * 2}" Length="{(h - 1) * 1.5e-6:.9e}" Unit="m"/>',
                     f'<DimensionDescription DimID="5" NumberOfElements="{n_lambda}" BytesInc="{h * w * 2}" Length="2.0e-7" Unit="m"/>',
                 ],
                 "chans_xml": [
@@ -267,8 +267,8 @@ def test_lif_server_viewer_luts_annotations_and_export(tmp_path: Path, monkeypat
                 "name": "Cortex_40x",
                 "payload": payload,
                 "dims_xml": [
-                    f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="2" Length="{w * 0.25e-6:.9e}" Unit="m"/>',
-                    f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w * 2}" Length="{h * 0.25e-6:.9e}" Unit="m"/>',
+                    f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="2" Length="{(w - 1) * 0.25e-6:.9e}" Unit="m"/>',
+                    f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w * 2}" Length="{(h - 1) * 0.25e-6:.9e}" Unit="m"/>',
                 ],
                 "chans_xml": [
                     '<ChannelDescription DataType="0" ChannelTag="0" Resolution="16" LUTName="Green" BytesInc="0"/>',
@@ -278,7 +278,7 @@ def test_lif_server_viewer_luts_annotations_and_export(tmp_path: Path, monkeypat
         ],
     )
 
-    httpd = create_server([])
+    httpd = create_server([], port=0)
     base = server_url(httpd)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -425,7 +425,7 @@ def test_lif_zstack_plate_mode_viewer_and_roi_export(tmp_path: Path):
                 "dims_xml": [
                     f'<DimensionDescription DimID="1" NumberOfElements="{w}" BytesInc="1" Length="1.0e-4" Unit="m"/>',
                     f'<DimensionDescription DimID="2" NumberOfElements="{h}" BytesInc="{w}" Length="1.0e-4" Unit="m"/>',
-                    f'<DimensionDescription DimID="3" NumberOfElements="{n_z}" BytesInc="{h * w * n_c}" Length="8.0e-6" Unit="m"/>',
+                    f'<DimensionDescription DimID="3" NumberOfElements="{n_z}" BytesInc="{h * w * n_c}" Length="6.0e-6" Unit="m"/>',
                 ],
                 "chans_xml": [
                     '<ChannelDescription DataType="0" ChannelTag="0" Resolution="8" LUTName="Green" BytesInc="0"/>',
@@ -436,7 +436,7 @@ def test_lif_zstack_plate_mode_viewer_and_roi_export(tmp_path: Path):
     )
     assert is_plate_file(lif_path) is True
 
-    httpd = create_server([])
+    httpd = create_server([], port=0)
     base = server_url(httpd)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

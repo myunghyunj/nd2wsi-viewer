@@ -71,6 +71,7 @@ class _LifChannelSpec:
     bytes_inc: int
     name: str
     color: tuple[int, int, int]
+    dtype: np.dtype = np.dtype("uint8")
 
 
 @dataclass(frozen=True)
@@ -161,24 +162,85 @@ def _read_lif_header_and_blocks(
     return root, blocks
 
 
-def _channel_dtype(ch_elems: list[ET.Element]) -> np.dtype:
-    max_res = 8
-    is_float = False
-    for c in ch_elems:
-        try:
-            res = int(c.attrib.get("Resolution", "8") or 8)
-        except ValueError:
-            res = 8
-        max_res = max(max_res, res)
-        if c.attrib.get("DataType", "0") == "1":
-            is_float = True
-    if is_float and max_res == 32:
+def _single_channel_dtype(data_type: int, resolution: int) -> np.dtype:
+    if data_type == 1:
+        if resolution == 32:
+            return np.dtype("<f4")
+        raise ValueError(f"unsupported LIF float channel resolution: {resolution}")
+    if data_type == 0:
+        if 0 < resolution <= 8:
+            return np.dtype("uint8")
+        if 8 < resolution <= 16:
+            return np.dtype("<u2")
+        raise ValueError(
+            f"unsupported LIF integer channel resolution {resolution} "
+            "(>16-bit integer channels are not supported)"
+        )
+    raise ValueError(f"unsupported LIF channel DataType: {data_type}")
+
+
+def _series_dtype(ch_dtypes: list[np.dtype]) -> np.dtype:
+    if any(dt == np.dtype("<f4") for dt in ch_dtypes):
         return np.dtype("<f4")
-    if max_res <= 8:
-        return np.dtype("uint8")
-    if max_res <= 16:
+    if any(dt == np.dtype("<u2") for dt in ch_dtypes):
         return np.dtype("<u2")
-    return np.dtype("<u4")
+    return np.dtype("uint8")
+
+
+def _validate_lif_channel_layout(
+    channels: list[_LifChannelSpec],
+    *,
+    width: int,
+    height: int,
+    inc_x: int,
+    inc_y: int,
+    n_z: int,
+    inc_z: int,
+    n_t: int,
+    inc_t: int,
+    n_m: int,
+    inc_m: int,
+    declared_size: int,
+    block_size: int,
+) -> None:
+    if inc_y < width * inc_x:
+        raise ValueError(
+            f"invalid LIF dimension strides: row stride ({inc_y}) < width * pixel stride ({width * inc_x})"
+        )
+    if (n_z > 1 and inc_z <= 0) or (n_t > 1 and inc_t <= 0) or (n_m > 1 and inc_m <= 0):
+        raise ValueError("invalid LIF dimension strides: non-positive stride for multi-plane axis")
+    max_plane_offset = (
+        (n_z - 1) * max(0, inc_z)
+        + (n_t - 1) * max(0, inc_t)
+        + (n_m - 1) * max(0, inc_m)
+    )
+    pixel_intervals: list[tuple[int, int]] = []
+    for ch in channels:
+        itemsize = ch.dtype.itemsize
+        if ch.bytes_inc < 0:
+            raise ValueError(f"invalid LIF channel BytesInc: {ch.bytes_inc}")
+        if inc_x < itemsize:
+            raise ValueError(
+                f"invalid LIF channel layout: pixel stride ({inc_x}) < channel itemsize ({itemsize})"
+            )
+        if ch.bytes_inc < inc_x:
+            if ch.bytes_inc + itemsize > inc_x:
+                raise ValueError(
+                    f"invalid LIF pixel-interleaved channel: offset {ch.bytes_inc} + {itemsize} exceeds pixel stride {inc_x}"
+                )
+            for lo, hi in pixel_intervals:
+                if not (ch.bytes_inc + itemsize <= lo or ch.bytes_inc >= hi):
+                    raise ValueError("invalid LIF pixel-interleaved layout: overlapping channel offsets")
+            pixel_intervals.append((ch.bytes_inc, ch.bytes_inc + itemsize))
+        max_end = (
+            max_plane_offset
+            + ch.bytes_inc
+            + (height - 1) * inc_y
+            + (width - 1) * inc_x
+            + itemsize
+        )
+        if max_end > block_size or max_end > declared_size:
+            raise ValueError("invalid LIF channel layout: channel data exceeds memory block bounds")
 
 
 def _extract_dye_names(elem: ET.Element, n_channels: int) -> list[str | None]:
@@ -269,9 +331,7 @@ def _parse_series_element(
     n_m = dims[10]["n"] if 10 in dims else 1
     inc_m = dims[10]["inc"] if 10 in dims else 0
 
-    dtype = _channel_dtype(ch_elems)
-
-    raw_chans: list[tuple[int, int, str, int]] = []
+    raw_chans: list[tuple[int, int, str, int, int, np.dtype]] = []
     for c in ch_elems:
         try:
             dt = int(c.attrib.get("DataType", "0") or 0)
@@ -280,11 +340,14 @@ def _parse_series_element(
             b_inc = int(c.attrib.get("BytesInc", "0") or 0)
         except ValueError:
             continue
+        ch_dtype = _single_channel_dtype(dt, res)
         lut = (c.attrib.get("LUTName") or "").strip()
-        raw_chans.append((dt, tag, lut, b_inc, res))
+        raw_chans.append((dt, tag, lut, b_inc, res, ch_dtype))
 
     if not raw_chans:
         return None
+
+    dtype = _series_dtype([rc[5] for rc in raw_chans])
 
     tags = {rc[1] for rc in raw_chans}
     rgb = len(raw_chans) == 3 and tags == {1, 2, 3}
@@ -306,6 +369,7 @@ def _parse_series_element(
                 bytes_inc=by_tag[tag][3],
                 name=cname,
                 color=ccolor,
+                dtype=by_tag[tag][5],
             )
             for tag, cname, ccolor in rgb_defs
         ]
@@ -313,7 +377,7 @@ def _parse_series_element(
         dyes = _extract_dye_names(elem, len(raw_chans))
         channels = []
         used_names: set[str] = set()
-        for idx, (dt, tag, lut, b_inc, res) in enumerate(raw_chans):
+        for idx, (dt, tag, lut, b_inc, res, ch_dtype) in enumerate(raw_chans):
             color = _LUT_COLORS.get(lut.lower())
             if color is None:
                 color = (
@@ -335,8 +399,25 @@ def _parse_series_element(
                     bytes_inc=b_inc,
                     name=cname,
                     color=color,
+                    dtype=ch_dtype,
                 )
             )
+
+    _validate_lif_channel_layout(
+        channels,
+        width=width,
+        height=height,
+        inc_x=inc_x,
+        inc_y=inc_y,
+        n_z=n_z,
+        inc_z=inc_z,
+        n_t=n_t,
+        inc_t=inc_t,
+        n_m=n_m,
+        inc_m=inc_m,
+        declared_size=declared_size,
+        block_size=block_size,
+    )
 
     # Physical pixel calibration in micrometers (LIF stores Length in meters when Unit == "m")
     px_um = _axis_pixel_size_um(dims[1])
@@ -420,8 +501,8 @@ def _parse_series_element(
 def _axis_pixel_size_um(dim_info: dict[str, Any]) -> float | None:
     unit = (dim_info.get("unit") or "").lower()
     length_raw = dim_info.get("length")
-    n_el = dim_info.get("n", 1)
-    if n_el <= 0 or length_raw is None:
+    n_el = int(dim_info.get("n", 1) or 0)
+    if n_el <= 1 or length_raw is None:
         return None
     try:
         span = abs(float(length_raw))
@@ -429,12 +510,13 @@ def _axis_pixel_size_um(dim_info: dict[str, Any]) -> float | None:
         return None
     if not math.isfinite(span) or span <= 0:
         return None
+    denom = n_el - 1
     if unit == "m":
-        um = (span * 1e6) / n_el
+        um = (span * 1e6) / denom
     elif unit in ("um", "µm", "μm"):
-        um = span / n_el
+        um = span / denom
     elif unit == "mm":
-        um = (span * 1e3) / n_el
+        um = (span * 1e3) / denom
     else:
         return None
     return um if _finite_positive(um) else None
@@ -468,7 +550,8 @@ def _read_lif_channel_window(
     """Read [ry0:ry1, rx0:rx1] for one channel in a single series/tile plane."""
     h_win = ry1 - ry0
     w_win = rx1 - rx0
-    itemsize = series.dtype.itemsize
+    ch_dtype = ch.dtype
+    ch_itemsize = ch_dtype.itemsize
     plane_base = (
         series.data_offset
         + z_idx * series.inc_z
@@ -476,41 +559,44 @@ def _read_lif_channel_window(
         + m_idx * series.inc_m
     )
 
-    # Fast path 1: planar channel with contiguous X pixels
-    if series.inc_x == itemsize and series.inc_y == series.width * itemsize:
+    # Fast path 1: planar channel with contiguous X pixels of ch_dtype
+    if series.inc_x == ch_itemsize and series.inc_y == series.width * ch_itemsize:
         span_offset = plane_base + ch.bytes_inc + ry0 * series.inc_y
         span_bytes = h_win * series.inc_y
         raw = read_at(fd, span_bytes, span_offset)
-        rows = np.frombuffer(raw, dtype=series.dtype).reshape(h_win, series.width)
-        return np.ascontiguousarray(rows[:, rx0:rx1])
+        rows = np.frombuffer(raw, dtype=ch_dtype).reshape(h_win, series.width)
+        return np.ascontiguousarray(rows[:, rx0:rx1], dtype=series.dtype)
 
-    # Fast path 2: pixel-interleaved channels (e.g. RGB snapshots where inc_x == C * itemsize)
-    n_c = len(series.channels)
+    # Fast path 2: pixel-interleaved channels (homogeneous or mixed-depth)
     if (
-        series.inc_x == n_c * itemsize
-        and series.inc_y == series.width * series.inc_x
-        and ch.bytes_inc < series.inc_x
-        and ch.bytes_inc % itemsize == 0
+        series.inc_y == series.width * series.inc_x
+        and 0 <= ch.bytes_inc
+        and ch.bytes_inc + ch_itemsize <= series.inc_x
     ):
         span_offset = plane_base + ry0 * series.inc_y
         span_bytes = h_win * series.inc_y
         raw = read_at(fd, span_bytes, span_offset)
-        slot = ch.bytes_inc // itemsize
-        rows = np.frombuffer(raw, dtype=series.dtype).reshape(h_win, series.width, n_c)
-        return np.ascontiguousarray(rows[:, rx0:rx1, slot])
+        strided = np.ndarray(
+            shape=(h_win, w_win),
+            dtype=ch_dtype,
+            buffer=raw,
+            offset=ch.bytes_inc + rx0 * series.inc_x,
+            strides=(series.inc_y, series.inc_x),
+        )
+        return np.array(strided, dtype=series.dtype, copy=True)
 
-    # General stride path: read each row span and step by inc_x
+    # General stride path: read each row span with ch_dtype and step by inc_x
     out = np.empty((h_win, w_win), dtype=series.dtype)
-    row_span_bytes = (w_win - 1) * series.inc_x + itemsize
+    row_span_bytes = (w_win - 1) * series.inc_x + ch_itemsize
     for r_i, y in enumerate(range(ry0, ry1)):
         row_offset = plane_base + ch.bytes_inc + y * series.inc_y + rx0 * series.inc_x
         raw_row = read_at(fd, row_span_bytes, row_offset)
-        if series.inc_x == itemsize:
-            out[r_i] = np.frombuffer(raw_row, dtype=series.dtype, count=w_win)
+        if series.inc_x == ch_itemsize:
+            out[r_i] = np.frombuffer(raw_row, dtype=ch_dtype, count=w_win)
         else:
             strided = np.ndarray(
                 shape=(w_win,),
-                dtype=series.dtype,
+                dtype=ch_dtype,
                 buffer=raw_row,
                 strides=(series.inc_x,),
             )
@@ -642,6 +728,7 @@ def open_lif(
         notes=notes,
         magnification=series.magnification,
         calibration_source=series.calibration_source,
+        channel_dtypes=[str(ch.dtype) for ch in series.channels],
     )
 
 

@@ -87,7 +87,7 @@ def test_stall_logs_all_skipped_presses_then_rearms_without_overlapping_calls(mo
 
 
 def test_prepare_uses_fresh_view_not_press_coordinates_and_checks_receiver_lock_sequence():
-    overlay = TranslucentApi({"query": "?g=pixels&p=2", "pixel_size_um": [2, .5]}, logger=Mock(), on_closed=Mock())
+    overlay = TranslucentApi({"query": "?g=pixels&t=1&p=2&z=3", "pixel_size_um": [2, .5]}, logger=Mock(), on_closed=Mock())
     overlay._stage_follow = Mock()
     overlay._stage_follow_receiver_id = "receiver"
     overlay._locked = True
@@ -102,7 +102,8 @@ def test_prepare_uses_fresh_view_not_press_coordinates_and_checks_receiver_lock_
     assert overlay._prepare_laser_box(record) == (None, "stale_view")
     assert overlay.report_overlay_view({**view, "follow_seq": 8})["ok"]
     payload, reason = overlay._prepare_laser_box(record)
-    assert reason is None and payload["target_px"] == [25, 35] and payload["p"] == 2
+    assert reason is None and payload["target_px"] == [25, 35]
+    assert (payload["t"], payload["p"], payload["z"]) == (1, 2, 3)
     assert payload["pixel_size_um"] == [2, .5]
     overlay.report_overlay_view({**view, "follow_seq": 9})
     assert overlay._prepare_laser_box(record) == (None, "view_moved")

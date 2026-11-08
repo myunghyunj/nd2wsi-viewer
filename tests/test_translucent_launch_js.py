@@ -22,7 +22,9 @@ def launch(**options):
     const viewport={getCenter:()=>({x:0.4,y:0.3}),
       viewportToImageCoordinates:()=>({x:123.5,y:240.25}),getZoom:()=>2,
       viewportToImageZoom:()=>0.75,getRotation:()=>90,getFlip:()=>true};
-    const state={info:config.noInfo?null:{rgb:!!config.rgb,raster:!!config.raster},plate:config.plate?{focus:config.grid?null:2}:null,
+    const state={info:config.noInfo?null:{rgb:!!config.rgb,raster:!!config.raster,
+      ...(config.annotationScope?{plate:{annotationScope:config.annotationScope}}:{})},
+      plate:config.plate?{focus:config.grid?null:2}:null,
       viewer:{viewport},quitPreparing:!!config.closing,
       roi:{x:1,y:2,w:3,h:4},annotations:config.annotations||[{id:'must-not-copy'}],
       annReady:!!config.annotations,astromap:{activeId:config.selected}};
@@ -99,3 +101,23 @@ def test_only_current_frame_imported_roi_snapshot_is_passed_without_mutation():
     assert result["annotations"] == annotations
     other_frame = launch(annotations=annotations, ownerReady=False)
     assert "rois" not in other_frame["calls"][0]["value"]
+    assert "laser_items" not in other_frame["calls"][0]["value"]
+
+
+def test_plane_scope_and_existing_laser_shots_sync_only_when_owner_ready():
+    annotations = [
+        {"id": "manual", "type": "box", "x": 1, "y": 2, "w": 3, "h": 4},
+        {"id": "laser-1", "type": "box", "x": 15, "y": 25, "w": 10, "h": 12,
+         "text": "SLACS_ROI #1", "color": "#a0a6ae", "slacs": {"kind": "laser_shot", "shots": 3, "isolation": 1}},
+    ]
+    result = launch(plate=True, annotationScope="plane", annotations=annotations)
+    snapshot = result["calls"][0]["value"]
+    assert snapshot["annotation_scope"] == "plane"
+    assert len(snapshot["laser_items"]) == 1
+    assert snapshot["laser_items"][0]["id"] == "laser-1"
+    assert snapshot["laser_items"][0]["slacs"] == {"kind": "laser_shot", "shots": 3, "isolation": 1}
+    assert (snapshot["laser_items"][0]["x"], snapshot["laser_items"][0]["y"],
+            snapshot["laser_items"][0]["w"], snapshot["laser_items"][0]["h"]) == (15, 25, 10, 12)
+    unready = launch(plate=True, annotationScope="plane", annotations=annotations, ownerReady=False)
+    assert unready["calls"][0]["value"]["annotation_scope"] == "plane"
+    assert "laser_items" not in unready["calls"][0]["value"]

@@ -223,7 +223,7 @@ def test_slacs_offer_guides_missing_image_then_explicitly_opens_current_eligible
       ({unavailable,before,accepted,messages,hidden:$('slacs-offer').hidden});
     """.replace("DETECTED", DETECTED))
     assert result["unavailable"] == {"disabled": True, "hint":
-                                    "Open a fluorescence image with +, then choose Open SLACS view.",
+                                    "Open an image with +, then choose Open SLACS view.",
                                     "opened": False}
     assert result["before"] == 0
     assert result["accepted"] is True

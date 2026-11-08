@@ -33,13 +33,19 @@
     }
     return ring;
   }
+  function isolationIndex(item) {
+    if (integer(item?.slacs?.isolation)) return item.slacs.isolation;
+    const match = /^SLACS_ROI #(\d+)$/.exec(String(item?.text || item?.label || ""));
+    const parsed = match ? Number(match[1]) : 0;
+    return integer(parsed) ? parsed : 0;
+  }
   function metadata(value, items = []) {
     const highwater = Number.isSafeInteger(value?.isolation_highwater) && value.isolation_highwater >= 0 ? value.isolation_highwater : 0;
     const presses = {};
     for (const [receiver, press] of Object.entries(value?.presses || {}).slice(-256)) {
       if (/^[a-zA-Z0-9_-]{1,128}$/.test(receiver) && integer(press)) presses[receiver] = press;
     }
-    return { isolation_highwater: items.filter(laser).reduce((n, a) => integer(a.slacs.isolation) ? Math.max(n,a.slacs.isolation) : n, highwater), presses };
+    return { isolation_highwater: items.filter(laser).reduce((n, a) => Math.max(n, isolationIndex(a)), highwater), presses };
   }
   const ROI_LABEL = "SLACS_ROI #";
   const shotCount = item => (item.slacs.shots || 1) + ((item.slacs.shots || 1) === 1 ? " shot" : " shots");
@@ -70,6 +76,9 @@
     if (owner.quitPreparing) return skip("quit_preparing");
     if (input.g !== owner.g) return skip("generation_changed");
     if (input.p !== owner.p) return skip("site_changed");
+    if (owner.annotationScope === "plane" &&
+        (input.t === null || input.t === undefined || input.z === null || input.z === undefined ||
+         input.t !== owner.t || input.z !== owner.z)) return skip("plane_changed");
     const { width, height, items } = owner;
     if (!(width > 0 && height > 0) || !Array.isArray(items)) return skip("owner_not_ready");
     const [x,y] = input.target_px;

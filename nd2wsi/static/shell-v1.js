@@ -200,7 +200,7 @@ function refreshShellToolButtons() {
   cloud.title = !native ? "The translucent viewer is available in the desktop app" :
     !ready ? "Open an image to use the translucent viewer" : state.plateGrid ?
     "Choose a site before opening the translucent viewer" : !state.translucentAvailable ?
-    "Open a fluorescence image to use the translucent viewer" : state.translucentOpening ?
+    "Open an image to use the translucent viewer" : state.translucentOpening ?
     "Opening translucent viewer…" : "Open translucent viewer · Right-click its image to load an AstroMapper JPG and TXT pair";
 }
 
@@ -231,7 +231,7 @@ function refreshSlacsOffer() {
   $("slacs-offer-open").disabled = cloud.disabled;
   $("slacs-offer-message").textContent = cloud.disabled ?
     (needsImage ?
-      "Open a fluorescence image with +, then choose Open SLACS view." : cloud.title) :
+      "Open an image with +, then choose Open SLACS view." : cloud.title) :
     "Sniper Cell Sorter is running. Open a translucent view to set up stage following.";
 }
 

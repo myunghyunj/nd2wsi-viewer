@@ -38,6 +38,10 @@ from nd2wsi.follow_flips import FORMAT_RECORD, FollowFlipStore, source_format
     ({}, "/cache/brain.czi--t0-p0-zmid.nd2svs", "czi"),
     ({}, "/cache/sample.lif--s0--t0-p0-zmid.nd2svs", "lif"),
     ({}, "/cache/slide.svs--t0-p0-zmid.nd2svs", "svs"),
+    ({}, "/cache/exp--01.czi--t0-p0-zmid.nd2svs", "czi"),
+    ({}, "/cache/exp--01.lif--s0--t0-p0-zmid.nd2svs", "lif"),
+    ({}, "/cache/patient--case--2.svs--t0-p0-zmid.nd2svs", "svs"),
+    ({}, "/cache/slide--01--t0-p0-zmid.nd2svs", "nd2"),
     # The original file name wins over the cache the store was opened from.
     ({"source": "slide.nd2"}, "/data/nd2wsi/caches/slide--t0-p0-zmid.png", "nd2"),
     ({"source": "brain.czi"}, "/data/nd2wsi/caches/brain.czi--t0-p0-zmid.nd2svs", "czi"),
