@@ -13,6 +13,7 @@ import stat
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Any
 
 from .reader import PlaneSelection, parse_z
 
@@ -93,6 +94,133 @@ def _add_serve_args(p: argparse.ArgumentParser) -> None:
 
 def _selection(args: argparse.Namespace) -> PlaneSelection:
     return PlaneSelection(t=args.t, p=args.position, z=parse_z(args.z))
+
+
+def _collect_store_info(path: Path) -> dict[str, Any]:
+    from .cache import read_manifest
+    from .convert import open_store
+
+    manifest = (
+        read_manifest(path)
+        if path.is_file() or (path / "manifest.json").is_file()
+        else None
+    )
+    size_bytes = (
+        path.stat().st_size
+        if path.is_file()
+        else sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    )
+    if isinstance(manifest, dict) and manifest.get("kind") == "plate":
+        thumbs = manifest.get("thumbs") or {}
+        shape = list(thumbs.get("shape") or [])
+        return {
+            "file": str(path),
+            "size_bytes": size_bytes,
+            "format": manifest.get("format") or "nd2wsi-plate/2",
+            "kind": "plate",
+            "source": (manifest.get("source") or {}).get("name"),
+            "selection": {},
+            "shape": shape,
+            "levels": [],
+            "tile": None,
+            "dtype": thumbs.get("dtype"),
+            "rgb": False,
+            "channels": [],
+            "pixel_size_um": None,
+            "objective_magnification": None,
+        }
+    store_target = (
+        path / "store.ome.zarr"
+        if path.is_dir()
+        and (path / "store.ome.zarr").is_dir()
+        and not (path / ".zattrs").is_file()
+        else path
+    )
+    root, attrs = open_store(store_target)
+    try:
+        meta = attrs.get("nd2wsi") or {}
+        omero_channels = list((attrs.get("omero") or {}).get("channels") or [])
+        levels = list(meta.get("levels") or [])
+        ov = meta.get("overview_of")
+        if isinstance(ov, dict):
+            width = int(ov.get("width") or 0)
+            height = int(ov.get("height") or 0)
+        elif levels:
+            width = int(levels[0].get("width") or 0)
+            height = int(levels[0].get("height") or 0)
+        else:
+            width = height = 0
+        fmt = (
+            manifest.get("format")
+            if isinstance(manifest, dict) and manifest.get("format")
+            else (
+                "nd2svs"
+                if path.suffix.lower() == ".nd2svs"
+                else "OME-Zarr (nd2wsi)"
+            )
+        )
+        return {
+            "file": str(path),
+            "size_bytes": size_bytes,
+            "format": fmt,
+            "kind": meta.get("kind")
+            or (manifest.get("kind") if isinstance(manifest, dict) else None)
+            or "full",
+            "source": meta.get("source"),
+            "selection": meta.get("selection") or {},
+            "width": width,
+            "height": height,
+            "levels": levels,
+            "tile": meta.get("tile"),
+            "dtype": meta.get("dtype"),
+            "rgb": bool(meta.get("rgb")),
+            "channels": [
+                {
+                    "label": c.get("label"),
+                    "color": f"#{str(c.get('color') or '').lstrip('#')}",
+                }
+                for c in omero_channels
+            ],
+            "pixel_size_um": meta.get("pixel_size_um"),
+            "objective_magnification": meta.get("objective_magnification"),
+        }
+    finally:
+        close = getattr(root, "close", None)
+        if close is not None:
+            close()
+
+
+def _format_store_info(info: dict[str, Any]) -> str:
+    from .reader import nice_bytes
+
+    lines = [
+        f"File          : {info['file']} ({nice_bytes(int(info.get('size_bytes') or 0))})",
+        f"Format        : {info['format']} ({info.get('kind', 'full')})",
+        f"Source        : {info.get('source') or 'unknown'}",
+        f"Selection     : {info.get('selection')}",
+    ]
+    if info.get("kind") == "plate":
+        lines.append(f"Thumb shape   : {info.get('shape')}, dtype={info.get('dtype')}")
+        return "\n".join(lines)
+    lvl_count = len(info.get("levels") or [])
+    lines.append(
+        f"Dimensions    : {info['width']} x {info['height']} px, "
+        f"levels={lvl_count}, tile={info.get('tile')}"
+    )
+    lines.append(
+        f"Pixel type    : {info.get('dtype')} ({'RGB' if info.get('rgb') else 'grayscale'})"
+    )
+    if info.get("pixel_size_um"):
+        py, px = info["pixel_size_um"]
+        lines.append(f"Pixel size    : {px:.4f} x {py:.4f} µm/px")
+    else:
+        lines.append("Pixel size    : uncalibrated")
+    if info.get("objective_magnification"):
+        lines.append(f"Objective     : {info['objective_magnification']:g}x")
+    lines.append("Channels      :")
+    for ch in info.get("channels") or []:
+        lines.append(f"  - {ch['label']} ({ch['color']})")
+    return "\n".join(lines)
 
 
 class _WindowsPipeStdout:
@@ -244,12 +372,31 @@ def _main(argv: list[str] | None = None) -> int:
             parser.error(f"{source_format} supports direct viewing only; conversion and T/Z/position options are unavailable")
 
     if args.cmd == "info":
+        import json
+
         from .sdpc import sdpc_info
         from .svs import collect_svs_info, format_svs_info, is_svs
 
+        info_path = Path(args.nd2)
+        is_store_target = (
+            info_path.suffix.lower() == ".nd2svs"
+            or info_path.name.lower().endswith(".ome.zarr")
+            or (
+                info_path.is_dir()
+                and (
+                    (info_path / ".zattrs").is_file()
+                    or (info_path / "store.ome.zarr").is_dir()
+                )
+            )
+        )
+        if is_store_target:
+            info = _collect_store_info(info_path)
+            if args.json:
+                print(json.dumps(info, indent=2, default=str))
+            else:
+                print(_format_store_info(info))
+            return 0
         if is_sdpc(args.nd2):
-            import json
-
             # SDPC carries nested header/pyramid metadata. Preserve that
             # structure in both human-readable and --json inspection output.
             print(json.dumps(sdpc_info(args.nd2), indent=2, ensure_ascii=False))
@@ -265,8 +412,6 @@ def _main(argv: list[str] | None = None) -> int:
 
         info = collect_info(args.nd2)
         if args.json:
-            import json
-
             print(json.dumps(info, indent=2, default=str))
         else:
             print(format_info(info))
@@ -448,6 +593,7 @@ def _main(argv: list[str] | None = None) -> int:
             if args.store and len(args.nd2) == 1:
                 store = Path(args.store)
             store_matches = False
+            plane_matches = False
             if not args.overwrite and store.exists():
                 try:
                     root, attrs = open_store(store)
@@ -481,15 +627,36 @@ def _main(argv: list[str] | None = None) -> int:
                         tile=args.tile,
                         require_provenance=bool(args.store) and not has_manifest_fp,
                     )
+                    plane_matches = manifest_fp_ok and _store_matches_selection(
+                        slide_resolved,
+                        attrs,
+                        selection,
+                        tile=None,
+                        require_provenance=bool(args.store) and not has_manifest_fp,
+                    )
                 except (ValueError, FileNotFoundError, OSError):
                     store_matches = False
+                    plane_matches = False
             if store_matches:
                 print(f"reusing existing pyramid {store} (use --overwrite to rebuild)")
             elif not args.overwrite and store.exists() and not args.store:
-                if existing_cache_store(slide, selection) is None and not confirm_pyramid(slide, args.yes):
-                    print(f"skipped {Path(slide).name}")
-                    continue
-                store = ensure_cache(slide, tile=args.tile, selection=selection)
+                existing_exact = existing_cache_store(slide, selection, tile=args.tile)
+                if existing_exact is not None:
+                    store = existing_exact
+                elif args.tile is not None and (
+                    plane_matches or existing_cache_store(slide, selection, tile=None) is not None
+                ):
+                    print(
+                        f"error: {store} exists for a different source, plane selection, or tile size "
+                        "(use --overwrite or --store PATH to replace or redirect it)",
+                        file=sys.stderr,
+                    )
+                    return 1
+                else:
+                    if not confirm_pyramid(slide, args.yes):
+                        print(f"skipped {Path(slide).name}")
+                        continue
+                    store = ensure_cache(slide, tile=args.tile, selection=selection)
             elif not args.overwrite and store.exists():
                 print(
                     f"error: {store} exists for a different source, plane selection, or tile size "

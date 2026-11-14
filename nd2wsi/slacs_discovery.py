@@ -201,6 +201,54 @@ def _kernel32():
     return ctypes, wintypes, kernel32
 
 
+def _process_creation_filetime(pid: int) -> int | None:
+    """100-ns Windows creation FILETIME of ``pid`` via ``GetProcessTimes``, or None."""
+    if sys.platform != "win32" or type(pid) is not int or pid <= 0:
+        return None
+    try:
+        ctypes, wintypes, kernel32 = _kernel32()
+    except Exception:  # noqa: BLE001 - unavailable off Windows or when mocked out
+        return None
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+            return None
+        return int((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _bound_process_identifier(bound_pid: int, bound_created: int | None = None):
+    """Return an ``identifier(pid, created=None)`` callback pinned to one SLACS process."""
+    expected_pid = int(bound_pid)
+    expected_created = int(bound_created) if bound_created is not None else None
+
+    def identify(pid, created=None) -> bool:
+        if isinstance(pid, (bool, float)):
+            return False
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid_int != expected_pid:
+            return False
+        if expected_created is not None and created is not None:
+            if isinstance(created, (bool, float)):
+                return False
+            try:
+                created_int = int(created)
+            except (TypeError, ValueError):
+                return False
+            if created_int != expected_created:
+                return False
+        return True
+
+    return identify
+
+
 def _windows_process_alive(pid: int, created: str) -> bool | None:
     """Whether that exact process still runs: True, False once it has exited or its
     pid belongs to another process, None when Windows cannot tell. Read-only."""
@@ -294,6 +342,28 @@ class SlacsDiscovery:
             return None
         return found["pid"]
 
+    def slacs_creation_filetime(self) -> int | None:
+        """The 100-ns creation FILETIME of the currently reported SLACS process, or None."""
+        with self._lock:
+            found, snapshot = self._found, self._snapshot
+        if found is None or snapshot.get("session_id") != found["session_id"]:
+            return None
+        created = found.get("creation_filetime")
+        return created if type(created) is int and created >= 0 else None
+
+    def process_identifier(self):
+        """Bound ``(pid, created=None) -> bool`` callback for the currently reported SLACS, or None."""
+        with self._lock:
+            found, snapshot = self._found, self._snapshot
+        if found is None or snapshot.get("session_id") != found["session_id"]:
+            return None
+        pid = found.get("pid")
+        if type(pid) is not int or pid <= 0:
+            return None
+        created = found.get("creation_filetime")
+        bound_created = created if type(created) is int and created >= 0 else None
+        return _bound_process_identifier(pid, bound_created)
+
     def _log(self, kind, **fields):
         session_log.event(kind, monitor=self._name, **fields)
 
@@ -358,7 +428,8 @@ class SlacsDiscovery:
                 self._log("slacs_exit_seen", session_id=found["session_id"])
         state, process = self._search()
         if state["status"] == "running":
-            self._found = {"session_id": state["session_id"], **process}
+            self._found = {"session_id": state["session_id"], **process,
+                           "creation_filetime": _process_creation_filetime(process["pid"])}
             self._check_recovered(now)
             return state
         if state["status"] == "error" and found is not None:

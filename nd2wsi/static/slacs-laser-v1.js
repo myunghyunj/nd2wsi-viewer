@@ -39,11 +39,38 @@
     const parsed = match ? Number(match[1]) : 0;
     return integer(parsed) ? parsed : 0;
   }
+  const plainObject = value => Boolean(value) && Object.prototype.toString.call(value) === "[object Object]";
+  const safeReceiver = key => typeof key === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(key) &&
+    key !== "__proto__" && key !== "constructor" && key !== "prototype";
+  // Same acceptance rule as metadata() and slacs_laser.metadata(): anything else is ignored, never clamped
+  // (a clamped 2^53-1 mark would exhaust numbering, and the mark can only rise).
+  function clampSafeNonNegativeInt(value) {
+    return Number.isSafeInteger(value) && value >= 0 && value < Number.MAX_SAFE_INTEGER ? value : 0;
+  }
+  function normalizeState(raw, items = []) {
+    const source = plainObject(raw) ? raw : null;
+    let highwater = source ? clampSafeNonNegativeInt(source.isolation_highwater) : 0;
+    const presses = {};
+    if (source && plainObject(source.presses)) {
+      for (const [receiver, press] of Object.entries(source.presses).slice(-256)) {
+        if (!safeReceiver(receiver) || typeof press !== "number" || !Number.isFinite(press)) continue;
+        const clamped = clampSafeNonNegativeInt(press);
+        if (clamped > 0) presses[receiver] = clamped;
+      }
+    }
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (laser(item)) highwater = Math.max(highwater, isolationIndex(item));
+      }
+    }
+    if (highwater === 0 && Object.keys(presses).length === 0) return null;
+    return { isolation_highwater: highwater, presses };
+  }
   function metadata(value, items = []) {
     const highwater = Number.isSafeInteger(value?.isolation_highwater) && value.isolation_highwater >= 0 ? value.isolation_highwater : 0;
     const presses = {};
     for (const [receiver, press] of Object.entries(value?.presses || {}).slice(-256)) {
-      if (/^[a-zA-Z0-9_-]{1,128}$/.test(receiver) && integer(press)) presses[receiver] = press;
+      if (safeReceiver(receiver) && integer(press)) presses[receiver] = press;
     }
     return { isolation_highwater: items.filter(laser).reduce((n, a) => Math.max(n, isolationIndex(a)), highwater), presses };
   }
@@ -129,5 +156,5 @@
     const added = owner.add(item);
     return { ...result, decision: "added", reason: "new_burst", box: bounds, item: added || item };
   }
-  return { COLOR, RGB, laser, area, clip, metadata, label, listLabel, receive };
+  return { COLOR, RGB, laser, area, clip, normalizeState, metadata, label, listLabel, receive };
 });

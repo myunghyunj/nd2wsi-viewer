@@ -349,6 +349,7 @@ class TranslucentApi:
         self._configured = False
         self._drop_document = None
         self._epoch = 0
+        self._context_epoch = 0
         self._lock = threading.RLock()
         self._stage_follow = None
         self._stage_follower = None
@@ -381,6 +382,7 @@ class TranslucentApi:
                 self._laser_items[item["id"]] = copy.deepcopy(item)
         self._pending_laser_scope = None
         self._pending_laser_epoch = None
+        self._pending_laser_context_epoch: int | None = None
         self._load_timer = None
         self._target_store = target_store
         self._target_save_lock = threading.Lock()
@@ -599,6 +601,24 @@ class TranslucentApi:
             return None
         return pid if type(pid) is int and pid > 0 else None
 
+    def _slacs_identifier(self):
+        """Process-identity callback bound to the detected SLACS at Follow start, or None."""
+        from .slacs_discovery import _bound_process_identifier
+
+        bound_pid = self._slacs_pid()
+        if bound_pid is None:
+            return None
+        bound_created = None
+        discovery = self._discovery
+        if discovery is not None:
+            try:
+                created = discovery.slacs_creation_filetime()
+            except Exception:  # noqa: BLE001 - optional creation timestamp
+                created = None
+            if type(created) is int and created >= 0:
+                bound_created = created
+        return _bound_process_identifier(bound_pid, bound_created)
+
     def _slacs_controls_monitor(self):
         """A read-only monitor of SLACS's Roughness and Mirror controls, or None and why not.
 
@@ -667,13 +687,15 @@ class TranslucentApi:
                 controls = None
                 if step_source == "slacs":
                     controls, controls_error = self._slacs_controls_monitor()
+                identifier = self._slacs_identifier()
+                identifier_kwargs = {"identifier": identifier} if identifier is not None else {}
                 try:
                     # The context's calibration is [Y, X]; the follower takes (X, Y).
                     follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=step_um,
                                                 step_source=step_source, controls=controls,
                                                 pixel_size_um=(float(pixels[1]), float(pixels[0])),
                                                 flip_x=flip_x, flip_y=flip_y, mark_context=self._mark_context,
-                                                on_mark=self._on_mark_record)
+                                                on_mark=self._on_mark_record, **identifier_kwargs)
                     snapshot = follower.start()
                 except (ValueError, OSError, RuntimeError) as exc:
                     snapshot = {"running": False, "error": str(exc)}
@@ -866,6 +888,7 @@ class TranslucentApi:
             view = self._overlay_view
             context = copy.deepcopy(self._context)
             epoch = self._epoch
+            context_epoch = self._context_epoch
         if closed or stage_follow is None:
             return None, "follow_stopped"
         if not self._is_active():
@@ -893,9 +916,9 @@ class TranslucentApi:
             return None, "target_unavailable"
         scope = self._laser_scope(context)
         with self._lock:
-            if self._epoch == epoch:
-                self._pending_laser_scope = scope
-                self._pending_laser_epoch = epoch
+            self._pending_laser_scope = scope
+            self._pending_laser_epoch = epoch
+            self._pending_laser_context_epoch = context_epoch
         query = dict(urllib.parse.parse_qsl(context.get("query", "").lstrip("?")))
         return {**{key: copy.deepcopy(view[key]) for key in TARGET_KEYS},
                 "g": query.get("g", ""),
@@ -913,6 +936,8 @@ class TranslucentApi:
             if (self._closed or self._stage_follow is None or not self._locked
                     or payload.get("receiver_id") != self._stage_follow_receiver_id
                     or (self._pending_laser_epoch is not None and self._pending_laser_epoch != self._epoch)
+                    or (self._pending_laser_context_epoch is not None
+                        and self._pending_laser_context_epoch != self._context_epoch)
                     or (self._pending_laser_scope is not None
                         and self._pending_laser_scope != self._laser_scope(self._context))):
                 return False
@@ -930,11 +955,16 @@ class TranslucentApi:
             return False
         item = outcome.get("item")
         with self._lock:
-            if (self._pending_laser_epoch is not None
-                    and self._pending_laser_epoch != self._epoch):
-                return False
-            if (self._pending_laser_scope is not None
-                    and self._pending_laser_scope != self._laser_scope(self._context)):
+            pending_context_epoch = self._pending_laser_context_epoch
+            pending_scope = self._pending_laser_scope
+            self._pending_laser_epoch = None
+            self._pending_laser_context_epoch = None
+            self._pending_laser_scope = None
+            if (self._closed or self._window is None
+                    or (pending_context_epoch is not None
+                        and pending_context_epoch != self._context_epoch)
+                    or (pending_scope is not None
+                        and pending_scope != self._laser_scope(self._context))):
                 return False
             if isinstance(item, dict) and isinstance(item.get("id"), str):
                 self._laser_items[item["id"]] = copy.deepcopy(item)
@@ -1459,6 +1489,7 @@ class TranslucentApi:
                 self._locked = False
                 was_locked = True
             self._epoch += 1
+            self._context_epoch += 1
         if format_changed:
             self._follow_flips = (False, False)
             if self._flip_store is not None:
@@ -1498,6 +1529,10 @@ class TranslucentApi:
                 return True
             self._closed = True
             self._epoch += 1
+            self._context_epoch += 1
+            self._pending_laser_epoch = None
+            self._pending_laser_context_epoch = None
+            self._pending_laser_scope = None
         if self._laser_delivery is not None:
             self._laser_delivery.close()
         self.stop_stage_follow()
@@ -1519,6 +1554,10 @@ class TranslucentApi:
                 self._load_timer.cancel()
             self._closed = True
             self._epoch += 1
+            self._context_epoch += 1
+            self._pending_laser_epoch = None
+            self._pending_laser_context_epoch = None
+            self._pending_laser_scope = None
         if self._laser_delivery is not None:
             self._laser_delivery.close()
         self.stop_stage_follow()

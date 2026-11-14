@@ -1,17 +1,28 @@
 #requires -Version 5.1
 <#
 Build the local source snapshot entirely inside a Windows VM, without uploading
-source or artifacts. Run in Windows PowerShell 5.1 or later:
+source or artifacts. Run from an x64 MSVC developer shell in Windows PowerShell 5.1 or later:
   powershell -NoProfile -ExecutionPolicy Bypass -File build_windows_local.ps1 -SourceZip path\source.zip
 
+Prerequisites when building the LGPL SDPC codec from source (`-SdpcCodecManifest` and
+`ND2WSI_SDPC_CODEC_MANIFEST` unset): an x64 MSVC developer shell (`cl.exe` in `PATH`)
+and MSYS2 with `make` and `diffutils` (pass `-MsysBash` or set `MSYS2_LOCATION` if
+installed outside `C:\msys64`). On a Windows 11 ARM VM, supply a prebuilt x64 codec
+manifest via `-SdpcCodecManifest` or `ND2WSI_SDPC_CODEC_MANIFEST`.
+
 The ZIP must have pyproject.toml and SOURCE-MANIFEST.json at its root. A sibling
-source.zip.sha256 is required. Results and logs are copied back next to the ZIP.
+source.zip.sha256 is required. Results and logs are copied back next to the ZIP, and
+optional `-OutputZip` writes a hash-verified portable archive copy and `.sha256` sidecar.
 The build stays under LOCALAPPDATA, on the guest's local filesystem. This script
 does not change the user's PATH, execution policy, Python registry or settings.
 #>
 param(
     [Parameter(Mandatory = $true)][string]$SourceZip,
-    [string]$ResultsDir
+    [string]$ResultsDir,
+    [string]$OutputZip,
+    [string]$SdpcCodecManifest,
+    [string]$MsysBash,
+    [string]$WebView2FixedRuntime
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,7 +31,7 @@ $sourceArchive = (Resolve-Path -LiteralPath $SourceZip).Path
 if (-not $ResultsDir) {
     $ResultsDir = Join-Path (Split-Path -Parent $sourceArchive) ([IO.Path]::GetFileNameWithoutExtension($sourceArchive) + '-results')
 }
-$resultPath = [IO.Path]::GetFullPath($ResultsDir)
+$resultPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ResultsDir)
 New-Item -ItemType Directory -Force -Path $resultPath | Out-Null
 $buildRoot = Join-Path $env:LOCALAPPDATA 'nd2wsi-windows-build'
 $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -35,7 +46,7 @@ $stepLogs = Join-Path $resultPath (Join-Path 'steps' $runId)
 New-Item -ItemType Directory -Force -Path $stepLogs | Out-Null
 $script:stepNumber = 0
 $environmentBefore = @{}
-foreach ($name in @('UV_CACHE_DIR', 'UV_PYTHON_INSTALL_DIR', 'UV_PYTHON_BIN_DIR', 'UV_LINK_MODE', 'PYTHONUTF8', 'PYTHONIOENCODING', 'PYTHONUNBUFFERED', 'PATH')) {
+foreach ($name in @('UV_CACHE_DIR', 'UV_PYTHON_INSTALL_DIR', 'UV_PYTHON_BIN_DIR', 'UV_LINK_MODE', 'PYTHONUTF8', 'PYTHONIOENCODING', 'PYTHONUNBUFFERED', 'ND2WSI_SDPC_CODEC_MANIFEST', 'ND2WSI_WEBVIEW2_RUNTIME', 'PATH')) {
     $environmentBefore[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 $tlsBefore = [Net.ServicePointManager]::SecurityProtocol
@@ -118,6 +129,12 @@ function Get-VerifiedDownload {
 try {
     Start-Transcript -LiteralPath $log -Force | Out-Null
     $transcriptStarted = $true
+    $outputZipPath = if ($OutputZip) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputZip) } else { $null }
+    $requestedCodecManifest = if ($SdpcCodecManifest) { $SdpcCodecManifest } else { $env:ND2WSI_SDPC_CODEC_MANIFEST }
+    $resolvedCodecManifest = if ($requestedCodecManifest) { (Resolve-Path -LiteralPath $requestedCodecManifest).Path } else { $null }
+    $resolvedMsysBash = if ($MsysBash) { (Resolve-Path -LiteralPath $MsysBash).Path } else { $null }
+    $requestedWebView2Runtime = if ($WebView2FixedRuntime) { $WebView2FixedRuntime } else { $env:ND2WSI_WEBVIEW2_FIXED_RUNTIME }
+    $resolvedWebView2Runtime = if ($requestedWebView2Runtime) { (Resolve-Path -LiteralPath $requestedWebView2Runtime).Path } else { $null }
     @{ state = 'running'; stage = $stage; started = (Get-Date).ToUniversalTime().ToString('o') } |
         ConvertTo-Json | Set-Content -LiteralPath $status -Encoding UTF8
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -172,17 +189,77 @@ try {
     $python = Join-Path $repo '.venv\Scripts\python.exe'
     Invoke-Checked $python @('-c', 'import _tkinter, platform, struct; assert struct.calcsize(chr(80)) == 8; print(platform.python_version(), platform.python_compiler(), _tkinter.TK_VERSION)')
     Invoke-Checked $uv @('pip', 'install', '--python', $python, '--require-hashes', '--no-config', '--default-index', 'https://pypi.org/simple', '-r', 'packaging/windows-build-requirements.txt')
+    $msysBashPath = if ($resolvedMsysBash) {
+        $resolvedMsysBash
+    }
+    elseif ($env:MSYS2_LOCATION) {
+        Join-Path $env:MSYS2_LOCATION 'usr\bin\bash.exe'
+    }
+    else {
+        'C:\msys64\usr\bin\bash.exe'
+    }
+    if (-not $resolvedCodecManifest) {
+        Invoke-Checked $python @('packaging/build_sdpc_codec.py', '--preflight', '--msys-bash', $msysBashPath)
+    }
     Invoke-Checked $python @('-m', 'pytest', 'tests', '-q', '-m', 'not realdata')
     Invoke-Checked $python @('scripts/fetch_testdata.py')
     Invoke-Checked $python @('-m', 'pytest', 'tests', '-q', '-m', 'realdata')
     # Windows 11 normally has WebView2. This per-user bootstrapper is only used
     # if it is absent, and does not request elevation or change system policies.
     & (Join-Path $repo 'packaging\ensure_webview2.ps1')
-    Invoke-Checked $python @('packaging/build_windows.py', '--smoke-file', 'docs/example_cell.nd2', '--source-manifest', $manifestPath, '--out', $output)
-    $archives = @(Get-ChildItem -LiteralPath $output -Filter '*.zip')
+    if ($resolvedCodecManifest) {
+        $codecManifest = $resolvedCodecManifest
+    }
+    else {
+        $codecOutput = Join-Path $stage 'sdpc-codec'
+        $codecSourceCache = Join-Path $toolsRoot 'sdpc-sources'
+        Invoke-Checked $python @('packaging/build_sdpc_codec.py', '--output', $codecOutput, '--source-cache', $codecSourceCache, '--jobs', '6', '--msys-bash', $msysBashPath)
+        $codecManifest = Join-Path $codecOutput 'sdpc-codec-manifest.json'
+    }
+    $codecMetadata = Get-Content -LiteralPath $codecManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    $codecWheel = Join-Path (Split-Path -Parent $codecManifest) $codecMetadata.wheel_file
+    Invoke-Checked $python @('packaging/verify_sdpc_codec.py', '--manifest', $codecManifest, '--wheel-only')
+    Invoke-Checked $uv @('pip', 'install', '--python', $python, '--no-deps', '--reinstall', $codecWheel)
+    Invoke-Checked $python @('packaging/verify_sdpc_codec.py', '--manifest', $codecManifest)
+    $env:ND2WSI_SDPC_CODEC_MANIFEST = $codecManifest
+    $buildArgs = @('packaging/build_windows.py', '--smoke-file', 'docs/example_cell.nd2', '--source-manifest', $manifestPath, '--out', $output)
+    if ($resolvedWebView2Runtime) {
+        $env:ND2WSI_WEBVIEW2_RUNTIME = 'bundled'
+        $buildArgs += @('--webview2-fixed-runtime', $resolvedWebView2Runtime)
+    }
+    Invoke-Checked $python $buildArgs
+    $archives = @(Get-ChildItem -LiteralPath $output -Filter 'nd2wsi-viewer-*-windows-x64.zip')
     if ($archives.Count -ne 1) { throw 'Expected exactly one completed portable ZIP.' }
+    $codecSourceZip = Join-Path $output 'sdpc-codec-sources-windows-x64.zip'
+    if (-not (Test-Path -LiteralPath $codecSourceZip -PathType Leaf)) {
+        throw 'Expected sdpc-codec-sources-windows-x64.zip alongside the portable ZIP.'
+    }
+    if (-not (Test-Path -LiteralPath ($codecSourceZip + '.sha256') -PathType Leaf)) {
+        throw 'Expected sdpc-codec-sources-windows-x64.zip.sha256 alongside the portable ZIP.'
+    }
     $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    Invoke-Checked $powershell @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'packaging\verify_windows.ps1'), '-Archive', $archives[0].FullName, '-SmokeFile', (Join-Path $repo 'docs\example_cell.nd2'), '-Evidence', (Join-Path $output 'verification'))
+    $verifyArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'packaging\verify_windows.ps1'), '-Archive', $archives[0].FullName, '-SmokeFile', (Join-Path $repo 'docs\example_cell.nd2'), '-Evidence', (Join-Path $output 'verification'))
+    if ($resolvedWebView2Runtime) {
+        $verifyArgs += '-RequireBundledWebView2'
+    }
+    Invoke-Checked $powershell $verifyArgs
+    if ($outputZipPath) {
+        $outputZipDir = Split-Path -Parent $outputZipPath
+        if ($outputZipDir) { New-Item -ItemType Directory -Force -Path $outputZipDir | Out-Null }
+        $archiveSha = $archives[0].FullName + '.sha256'
+        if (-not (Test-Path -LiteralPath $archiveSha -PathType Leaf)) {
+            throw 'Expected portable ZIP SHA-256 sidecar alongside archive.'
+        }
+        $expectedPortable = ((Get-Content -LiteralPath $archiveSha -Raw).Trim() -split '\s+')[0]
+        Copy-Item -LiteralPath $archives[0].FullName -Destination $outputZipPath -Force
+        $portableHash = (Get-FileHash -LiteralPath $outputZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($expectedPortable -cnotmatch '^[0-9a-f]{64}$' -or $portableHash -ne $expectedPortable) {
+            throw "Copied portable ZIP checksum mismatch: $outputZipPath"
+        }
+        ("$portableHash  " + [IO.Path]::GetFileName($outputZipPath) + "`n") | Set-Content -LiteralPath ($outputZipPath + '.sha256') -NoNewline -Encoding ASCII
+        Copy-Item -LiteralPath $codecSourceZip -Destination (Join-Path $outputZipDir 'sdpc-codec-sources-windows-x64.zip') -Force
+        Copy-Item -LiteralPath ($codecSourceZip + '.sha256') -Destination (Join-Path $outputZipDir 'sdpc-codec-sources-windows-x64.zip.sha256') -Force
+    }
     $completed = @{
         state = 'complete'; stage = $stage; source_zip_sha256 = $sourceHash
         base_commit = $manifest.base_commit; working_tree_dirty = $manifest.working_tree_dirty

@@ -256,6 +256,13 @@ def _map_czi_channels(
     return [None] * n_channels
 
 
+def _first_nonempty(*values: str | None) -> str:
+    for v in values:
+        if v and v.strip():
+            return v.strip()
+    return ""
+
+
 def _extract_czi_metadata(
     xml_root: ET.Element | None,
     n_channels: int,
@@ -330,29 +337,37 @@ def _extract_czi_metadata(
         for slot_idx, c_idx in enumerate(actual_c_values):
             default_name = f"Channel {c_idx}"
             name = default_name
+            named = False
             color: tuple[int, int, int] | None = None
             ch = mapped_chosen[slot_idx]
             if ch is not None:
-                cand_name = (
-                    ch.findtext("ShortName")
-                    or ch.get("Name")
-                    or ch.findtext("Name")
-                    or ch.findtext("Fluor")
-                    or ch.get("Id")
+                cand_name = _first_nonempty(
+                    ch.findtext("ShortName"),
+                    ch.get("Name"),
+                    ch.findtext("Name"),
+                    ch.findtext("Fluor"),
                 )
-                if cand_name and cand_name.strip():
-                    name = cand_name.strip()
+                if cand_name:
+                    name, named = cand_name, True
                 color = _parse_hex_color(ch.findtext("Color") or ch.get("Color"))
             ch_dim = mapped_dim[slot_idx]
+            if not named and ch_dim is not None:
+                cand_dim_name = _first_nonempty(
+                    ch_dim.findtext("ShortName"),
+                    ch_dim.get("Name"),
+                    ch_dim.findtext("Name"),
+                    ch_dim.findtext("Fluor"),
+                )
+                if cand_dim_name:
+                    name, named = cand_dim_name, True
+            if not named:
+                cand_id = _first_nonempty(
+                    ch.get("Id") if ch is not None else None,
+                    ch_dim.get("Id") if ch_dim is not None else None,
+                )
+                if cand_id:
+                    name = cand_id
             if color is None and ch_dim is not None:
-                if name == default_name:
-                    cand_name = (
-                        ch_dim.get("Name")
-                        or ch_dim.findtext("Fluor")
-                        or ch_dim.get("Id")
-                    )
-                    if cand_name and cand_name.strip():
-                        name = cand_name.strip()
                 color = _parse_hex_color(ch_dim.findtext("Color") or ch_dim.get("Color"))
             if color is None:
                 color = (
@@ -363,6 +378,54 @@ def _extract_czi_metadata(
             channels.append(ChannelInfo(name, color))
 
     return pixel_size_um, cal_source, magnification, channels
+
+
+_ZSTD_FRAME_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _zstd1_payload_bytes(raw: bytes, itemsize: int, expected_bytes: int) -> bytes:
+    """CZI Zstd1 payload -> pixel bytes using only ``imagecodecs.zstd_decode``.
+
+    Layout (libCZI): byte 0 = header size, then chunks; chunk type 1 carries the
+    hi/lo byte-packing flag. A bare Zstd frame (no Zstd1 header) is accepted too.
+    """
+    import imagecodecs
+
+    if raw[:4] == _ZSTD_FRAME_MAGIC:
+        hilo = False
+        zbytes = raw
+    else:
+        hdr = raw[0]
+        if hdr < 1 or hdr >= len(raw):
+            raise ValueError(f"invalid CZI Zstd1 header size {hdr} for a {len(raw)} B payload")
+        if hdr == 1:
+            hilo = False
+        elif hdr >= 3 and raw[1] == 1:
+            hilo = bool(raw[2] & 1)
+        else:
+            raise ValueError(f"unsupported CZI Zstd1 chunk layout (header_size={hdr})")
+        zbytes = raw[hdr:]
+
+    zstd_err = getattr(imagecodecs, "ZstdError", ValueError)
+    try:
+        data = imagecodecs.zstd_decode(zbytes)
+    except (zstd_err, RuntimeError, MemoryError, ValueError) as exc:
+        raise ValueError(f"invalid CZI Zstd1 SubBlock payload: {exc}") from exc
+
+    if len(data) < expected_bytes:
+        raise ValueError(
+            f"CZI Zstd1 SubBlock decoded payload ({len(data)} B) "
+            f"smaller than expected ({expected_bytes} B)"
+        )
+    if len(data) > expected_bytes:
+        raise ValueError(
+            f"CZI Zstd1 SubBlock decoded payload ({len(data)} B) "
+            f"larger than expected ({expected_bytes} B)"
+        )
+    if hilo and itemsize > 1:
+        planes = np.frombuffer(data, dtype=np.uint8).reshape(itemsize, -1)
+        data = np.ascontiguousarray(planes.T).tobytes()
+    return data
 
 
 def _decode_subblock_bytes(
@@ -383,31 +446,32 @@ def _decode_subblock_bytes(
 
     import imagecodecs
 
-    if comp in (5, 6):  # Zstd0 (5) or Zstd1 (6)
-        hi_lo = False
-        payload = raw
-        if comp == 6:
-            if not raw:
-                raise ValueError("empty Zstd1 SubBlock payload")
-            hdr_len = raw[0]
-            if hdr_len == 3 and len(raw) >= 3 and raw[1] == 1:
-                hi_lo = bool(raw[2] & 1)
-                payload = raw[3:]
-            elif hdr_len == 1:
-                payload = raw[1:]
-            else:
-                payload = raw[min(hdr_len, len(raw)) :]
-        decomp = imagecodecs.zstd_decode(payload)
-        if hi_lo and dtype.itemsize == 2:
-            u8 = np.frombuffer(decomp, dtype=np.uint8)
-            half = len(u8) // 2
-            u16 = u8[:half].astype(np.uint16) | (u8[half : half * 2].astype(np.uint16) << 8)
-            arr = u16.view(dtype).reshape(h, w, samples)
-        else:
-            arr = np.frombuffer(decomp, dtype=dtype).reshape(h, w, samples)
+    if comp == 5:  # Zstd0
+        zstd_err = getattr(imagecodecs, "ZstdError", ValueError)
+        try:
+            decomp = imagecodecs.zstd_decode(raw)
+        except (zstd_err, RuntimeError, MemoryError, ValueError) as exc:
+            raise ValueError(f"invalid CZI Zstd0 SubBlock payload: {exc}") from exc
+        expected_bytes = h * w * samples * dtype.itemsize
+        if len(decomp) != expected_bytes:
+            raise ValueError(
+                f"CZI Zstd0 SubBlock decoded payload ({len(decomp)} B) "
+                f"does not match expected ({expected_bytes} B)"
+            )
+        arr = np.frombuffer(decomp, dtype=dtype).reshape(h, w, samples)
         if samples == 1:
             return arr[:, :, 0]
         return np.ascontiguousarray(arr[:, :, :3][:, :, ::-1])
+
+    if comp == 6:  # Zstd1
+        if not raw:
+            raise ValueError("empty CZI Zstd1 SubBlock payload")
+        expected_bytes = h * w * samples * dtype.itemsize
+        decomp = _zstd1_payload_bytes(raw, dtype.itemsize, expected_bytes)
+        arr = np.frombuffer(decomp, dtype=dtype).reshape(h, w, samples)
+        if samples > 1:
+            return np.ascontiguousarray(arr[:, :, :3][:, :, ::-1])
+        return arr[:, :, 0].copy()
 
     if comp == 4:  # JPEG-XR (jxrlib already outputs RGB channel order)
         arr = np.asarray(imagecodecs.jpegxr_decode(raw))
@@ -482,17 +546,18 @@ def _resolve_czi_entries_spec(
         raw_ptypes = sorted({_PIXEL_TYPE_NAMES[e.pixel_type] for e in entries})
         if len(raw_ptypes) > 1 or any(e.pixel_type in (8, 9) for e in entries):
             sig = "+".join(raw_ptypes)
-            channel_dtypes = [sig] * 3
         else:
-            channel_dtypes = [str(promoted)] * 3
+            sig = str(promoted)
+        channel_dtypes = [sig] * 3
     else:
         channel_dtypes = []
         for c_val in sorted(by_c):
             c_dts = sorted(by_c[c_val], key=lambda d: str(np.dtype(d)))
             if len(c_dts) == 1:
-                channel_dtypes.append(str(np.dtype(c_dts[0])))
+                ch_sig = str(np.dtype(c_dts[0]))
             else:
-                channel_dtypes.append("+".join(str(np.dtype(d)) for d in c_dts))
+                ch_sig = "+".join(str(np.dtype(d)) for d in c_dts)
+            channel_dtypes.append(ch_sig)
     return np.dtype(promoted), rgb, channel_dtypes
 
 
@@ -513,17 +578,26 @@ def _read_subblock_window(
     if sb_rgb != (samples > 1):
         raise ValueError("CZI SubBlock RGB/grayscale mode does not match plane expectation")
 
-    sb_hdr = read_at(fd, 64, sb.file_pos)
-    if not sb_hdr[:14].startswith(b"ZISRAWSUBBLOCK"):
+    sb_hdr = read_at(fd, 80, sb.file_pos)
+    if len(sb_hdr) < 48 or not sb_hdr[:14].startswith(b"ZISRAWSUBBLOCK"):
         raise ValueError(f"invalid CZI SubBlock header at offset {sb.file_pos}")
     meta_size, _att_size, data_size = struct.unpack("<IIQ", sb_hdr[32:48])
-    if len(sb_hdr) >= 54 and sb_hdr[48:50] == b"DV":
+    hdr_ndims = sb.ndims
+    if len(sb_hdr) >= 80 and sb_hdr[48:50] == b"DV":
         hdr_ptype = struct.unpack_from("<i", sb_hdr, 50)[0]
         if hdr_ptype != sb.pixel_type:
             raise ValueError(
                 f"CZI SubBlock header PixelType ({hdr_ptype}) disagrees with directory ({sb.pixel_type})"
             )
-    header_len = max(256, 16 + 32 + 20 * sb.ndims)
+        hdr_comp = struct.unpack_from("<i", sb_hdr, 66)[0]
+        if hdr_comp != sb.compression:
+            raise ValueError(
+                f"CZI SubBlock header Compression ({hdr_comp}) disagrees with directory ({sb.compression})"
+            )
+        hdr_ndims = struct.unpack_from("<i", sb_hdr, 76)[0]
+        if not (0 <= hdr_ndims <= 64):
+            raise ValueError(f"invalid CZI SubBlock dimension count {hdr_ndims}")
+    header_len = max(256, 16 + 32 + 20 * hdr_ndims)
     data_offset = sb.file_pos + 32 + header_len + meta_size
 
     # Fast path for uncompressed SubBlocks: read only the intersecting row span
@@ -585,18 +659,19 @@ def open_czi(
     lvl0 = _level0_entries(entries)
 
     s_values = sorted({e.s for e in lvl0})
-    t_values = sorted({e.t for e in lvl0})
     n_p = len(s_values)
-    n_t = len(t_values)
-
-    if not 0 <= selection.t < n_t:
-        raise ValueError(f"--t {selection.t} out of range (T={n_t})")
     if not 0 <= selection.p < n_p:
         raise ValueError(f"--position {selection.p} out of range (P={n_p})")
 
     s_target = s_values[selection.p]
+    s_entries = [e for e in lvl0 if e.s == s_target]
+    t_values = sorted({e.t for e in s_entries})
+    n_t = len(t_values)
+    if not 0 <= selection.t < n_t:
+        raise ValueError(f"--t {selection.t} out of range (T={n_t})")
+
     t_target = t_values[selection.t]
-    st_entries = [e for e in lvl0 if e.s == s_target and e.t == t_target]
+    st_entries = [e for e in s_entries if e.t == t_target]
     if not st_entries:
         raise ValueError(
             f"no CZI SubBlocks found for scene={selection.p} (S={s_target}), t={selection.t} (T={t_target})"
@@ -732,6 +807,7 @@ def open_czi(
         magnification=magnification,
         calibration_source=cal_source,
         channel_dtypes=channel_dtypes,
+        czi_scene_t=[int(s_target), int(t_target)],
     )
 
 

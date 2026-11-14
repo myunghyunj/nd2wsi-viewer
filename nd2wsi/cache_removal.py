@@ -19,7 +19,12 @@ from typing import Any
 
 def _validate_file_cache_for_trash(path: Path, manifest: dict[str, Any]) -> None:
     """Fail closed on embedded user work, unfamiliar formats, or active journals."""
-    from .cache import MANIFEST_NAME, SINGLE_FILE_FORMAT, STORE_NAME
+    from .cache import (
+        CORRECTED_SINGLE_FILE_FORMAT,
+        MANIFEST_NAME,
+        SINGLE_FILE_FORMAT,
+        STORE_NAME,
+    )
     from .storage.single_file import SQLiteStore
 
     for suffix in ("-journal", "-wal", "-shm"):
@@ -31,8 +36,14 @@ def _validate_file_cache_for_trash(path: Path, manifest: dict[str, Any]) -> None
         if not isinstance(current, dict) or not current.get("complete"):
             raise ValueError("refusing to delete an incomplete cache")
         kind = current.get("kind")
-        expected_format = "nd2wsi-plate/2" if kind == "plate" else SINGLE_FILE_FORMAT
-        if kind not in ("full", "overview", "plate") or current.get("format") != expected_format:
+        fmt = current.get("format")
+        if kind == "plate":
+            fmt_ok = fmt == "nd2wsi-plate/2"
+        elif kind in ("full", "overview"):
+            fmt_ok = fmt in {SINGLE_FILE_FORMAT, CORRECTED_SINGLE_FILE_FORMAT}
+        else:
+            fmt_ok = False
+        if not fmt_ok:
             raise ValueError("refusing to delete an unfamiliar cache format")
         if not manifest.get("generation") or current.get("generation") != manifest.get("generation"):
             raise ValueError("cache generation changed; reopen before deleting")
@@ -41,15 +52,25 @@ def _validate_file_cache_for_trash(path: Path, manifest: dict[str, Any]) -> None
         for key in store.list_keys():
             if key == MANIFEST_NAME:
                 continue
+            if fmt == CORRECTED_SINGLE_FILE_FORMAT and key in (
+                "h-correction/model.npz",
+                "h-correction/provenance.json",
+            ):
+                continue
             parts = key.split("/")
             owned = len(parts) == 2 and parts[0] == prefix and parts[1] in (
                 ".zattrs", ".zgroup", ".zmetadata",
             )
             if len(parts) == 3 and parts[0] == prefix:
                 array = parts[1] in arrays if arrays is not None else parts[1].isdigit()
+                chunk_pat = (
+                    r"\d+(?:\.\d+)*(?:\.corrupt-(?:[0-9a-f]{32}|[0-9a-fA-FT-]+))?"
+                    if kind == "plate" and parts[1] == "thumbs"
+                    else r"\d+(?:\.\d+)*"
+                )
                 owned = array and (
                     parts[2] in (".zarray", ".zattrs")
-                    or re.fullmatch(r"\d+(?:\.\d+)*", parts[2]) is not None
+                    or re.fullmatch(chunk_pat, parts[2]) is not None
                 )
             if not owned:
                 raise ValueError(f"unknown or user-owned embedded entry; cache preserved: {key}")

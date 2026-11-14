@@ -28,11 +28,13 @@ GET/POST /s/<sid>/api/annotations   sidecar annotations
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
 import os
 import re
+import shlex
 import stat
 import threading
 import time
@@ -143,10 +145,12 @@ class ViewerState:
         container_path: Path | None = None,
         manifest: dict[str, Any] | None = None,
         plate: Any = None,
+        managed_cache: bool = True,
     ):
         self.root = root
         self.attrs = attrs
         self.plate = plate  # a PlateSource when the slide is a time series of sites
+        self.managed_cache = managed_cache
         self.max_render_mpx = max_render_mpx
         self.histograms: list | None = None  # computed lazily, once
         self.annotations_path = annotations_path
@@ -273,6 +277,8 @@ class ViewerState:
         self._cache_usage_ready = False
         self._cache_usage = None
         self._cache_identity = self._pyramid_identity()
+        if hasattr(self._lut_settings_store, "refresh_attrs"):
+            self._lut_settings_store.refresh_attrs(attrs)
 
     def replace_pyramid(self, replacement):
         """Validate, drain readers, atomically publish, then reopen the new pixels."""
@@ -654,6 +660,7 @@ class SlideRegistry:
         if window_session is not None:
             from .annotation_workspace import AnnotationWorkspace
             self.annotation_workspace = AnnotationWorkspace(window_session)
+        self._annotation_claim_lock = threading.Lock()
         self.on_remove = None
 
     def _apply_window_policy(self, st: ViewerState) -> None:
@@ -662,6 +669,8 @@ class SlideRegistry:
             st.correction_write_allowed = bool(
                 private and st.cache_path and st.cache_path.is_relative_to(private.resolve())
             )
+            if st.correction_write_allowed and st.manifest.get("origin") != "export":
+                st.managed_cache = True
 
     def _notify_removed(self, sid: str) -> None:
         if self.on_remove is not None:
@@ -677,32 +686,75 @@ class SlideRegistry:
     def annotation_path(
         self, path: Path, attrs: dict, *, site: int | None = None,
         frame: tuple[int, int, int] | None = None,
-    ) -> Path:
+    ) -> Path | None:
+        readonly_errnos = (errno.EACCES, errno.EPERM, errno.EROFS)
         if frame is not None:
             from .annotation_workspace import _atomic_write, annotation_lock
 
             canonical, legacy = confocal_annotations_sidecar(path, attrs, frame)
+            usable_legacy: Path | None = None
+            raw: bytes | None = None
+            if legacy is not None:
+                try:
+                    raw = legacy.read_bytes()
+                    _sidecar_items(json.loads(raw.decode("utf-8")), require_items=True)
+                    usable_legacy = legacy
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    usable_legacy = None
+                    raw = None
             if self.agent_window:
-                return self.annotation_workspace.snapshot(canonical, source=legacy)
-            with annotation_lock(canonical):
-                # Recheck under the writer lock: another window may already
-                # have saved this plane. Never replace it with shared marks.
-                if not canonical.exists() and legacy is not None:
-                    _atomic_write(canonical, legacy.read_bytes())
+                return self.annotation_workspace.snapshot(canonical, source=usable_legacy)
+            if canonical.exists():
+                return canonical
+            if usable_legacy is None:
+                probe = canonical.parent
+                while not probe.exists() and probe != probe.parent:
+                    probe = probe.parent
+                return canonical if (probe.is_dir() and os.access(probe, os.W_OK | os.X_OK)) else None
+            assert raw is not None
+            try:
+                with annotation_lock(canonical):
+                    # Recheck under the writer lock: another window may already
+                    # have saved this plane. Never replace it with shared marks.
+                    if not canonical.exists():
+                        _atomic_write(canonical, raw)
+            except OSError as exc:
+                if exc.errno in readonly_errnos:
+                    return None
+                raise
             return canonical
         if self.annotation_workspace is None:
-            return (annotations_sidecar(path, attrs) if site is None
-                    else plate_annotations_sidecar(path, attrs, site))
+            try:
+                with self._annotation_claim_lock:
+                    return (annotations_sidecar(path, attrs) if site is None
+                            else plate_annotations_sidecar(path, attrs, site))
+            except OSError as exc:
+                if exc.errno in readonly_errnos:
+                    fallback = (
+                        annotations_sidecar(path, attrs, migrate=False)
+                        if site is None
+                        else plate_annotations_sidecar(path, attrs, site, create_directory=False)
+                    )
+                    return fallback if fallback.is_file() else None
+                raise
         from .annotation_workspace import annotation_lock
-        legacy: list[Path] = []
-        canonical = (annotations_sidecar(path, attrs, migrate=False, legacy_paths=legacy)
-                     if site is None else plate_annotations_sidecar(path, attrs, site, create_directory=False))
+        legacy_list: list[Path] = []
+        canonical = (
+            annotations_sidecar(path, attrs, migrate=False, legacy_paths=legacy_list)
+            if site is None
+            else plate_annotations_sidecar(path, attrs, site, create_directory=False)
+        )
         if self.agent_window:
-            return self.annotation_workspace.snapshot(canonical, source=legacy[0] if legacy else None)
+            return self.annotation_workspace.snapshot(canonical, source=legacy_list[0] if legacy_list else None)
         # Legacy migration is a write too; new user-window servers serialize it.
-        with annotation_lock(canonical):
-            return (annotations_sidecar(path, attrs) if site is None
-                    else plate_annotations_sidecar(path, attrs, site))
+        try:
+            with self._annotation_claim_lock, annotation_lock(canonical):
+                return (annotations_sidecar(path, attrs) if site is None
+                        else plate_annotations_sidecar(path, attrs, site))
+        except OSError as exc:
+            if exc.errno in readonly_errnos:
+                return canonical if canonical.is_file() else None
+            raise
 
     @staticmethod
     def sid_for(store_path: Path) -> str:
@@ -726,7 +778,10 @@ class SlideRegistry:
         from .cache import (
             CACHE_SUFFIX,
             SINGLE_FILE_SUFFIX,
+            CacheLock,
+            is_managed_cache_path,
             manifest_container,
+            quarantine,
             read_manifest,
         )
         from .convert import CACHE_DIR_NAME, is_nd2wsi_store, open_store
@@ -752,9 +807,14 @@ class SlideRegistry:
                 f"{store_path.name} is not a time series of sites; open it "
                 "through open_path so its pyramid store is built first"
             )
+        explicit_trash = trash_path is not None
         if trash_path is not None:
             trash_path = Path(trash_path).resolve()
-        elif store_path.suffix.lower() == SINGLE_FILE_SUFFIX:
+        elif (
+            store_path.suffix.lower() == SINGLE_FILE_SUFFIX
+            and store_path.is_file()
+            and is_managed_cache_path(store_path)
+        ):
             trash_path = store_path
         elif store_path.parent.name.endswith(CACHE_SUFFIX):
             trash_path = store_path.parent
@@ -776,19 +836,19 @@ class SlideRegistry:
             except NotImplementedError:
                 if self.agent_window:
                     raise PermissionError("Agent windows cannot build a shared cache; open an existing cache instead")
-                from .convert import convert as _convert
-                from .convert import default_store_path as _dsp
+                from .convert import ensure_cache as _ensure_cache
 
-                built = _dsp(slide_path)
-                if not built.exists():
-                    _convert(slide_path, built, progress=False)
-                store_path = built
-                trash_path = built
+                # the same verified route open_path takes: a valid legacy
+                # pyramids/ store is reused, a stale one is never served
+                store_path = Path(_ensure_cache(slide_path)).resolve()
+                trash_path = store_path
                 registered_source = registered_source or slide_path
         manifest: dict[str, Any] = {}
         container_path = manifest_container(store_path)
         if container_path is not None:
             manifest = read_manifest(container_path, recover=not self.agent_window) or {}
+            if not explicit_trash and manifest.get("origin") == "export":
+                trash_path = None
             if store_path.suffix.lower() == SINGLE_FILE_SUFFIX and not manifest:
                 raise ValueError("single-file cache has no complete manifest")
             if store_path.suffix.lower() == SINGLE_FILE_SUFFIX:
@@ -810,25 +870,25 @@ class SlideRegistry:
                 )
         sid = self.sid_for(store_path)
         gen = store_generation(store_path)
-        stale = None
         with self._lock:
-            st = self.slides.get(sid)
+            initial_st = self.slides.get(sid)
             if (
-                st is not None
-                and st.generation == gen
-                and (registered_source is None or st.source_path == registered_source)
+                initial_st is not None
+                and initial_st.generation == gen
+                and (registered_source is None or initial_st.source_path == registered_source)
             ):
                 return sid
-            if st is not None:  # keep the old state usable if opening fails
-                stale = st
-            root, attrs = open_store(store_path)
+
+        root, attrs = open_store(store_path)
+        stale = None
+        try:
             if (
                 registered_source is not None
                 and registered_source.is_file()
                 and manifest.get("kind") in (None, "full")
             ):
-                from .cache import cache_container
-                from .convert import _store_matches_source_semantics, ensure_cache
+                from .cache import cache_container, fingerprints_match, quick_fingerprint
+                from .convert import SourceUnreadable, _store_matches_source_semantics, ensure_cache
                 from .reader import PlaneSelection
 
                 raw_sel = (manifest.get("selection") if manifest else None) or (
@@ -842,43 +902,105 @@ class SlideRegistry:
                     )
                 except (TypeError, ValueError):
                     sel = PlaneSelection()
-                if not _store_matches_source_semantics(registered_source, sel, attrs):
+                unreadable_same_fp = False
+                try:
+                    matches = _store_matches_source_semantics(
+                        registered_source, sel, attrs, raise_unreadable=True
+                    )
+                except SourceUnreadable as exc:
+                    recorded = manifest.get("source") if manifest else None
+                    changed = not (
+                        isinstance(recorded, dict)
+                        and fingerprints_match(recorded, quick_fingerprint(registered_source))
+                    )
+                    if changed and manifest:
+                        # the file beside this self-contained cache is not the one it was
+                        # built from (still copying, damaged, replaced): serve the cache,
+                        # never set it aside on the strength of an unreadable source
+                        meta = attrs.setdefault("nd2wsi", {})
+                        meta["notes"] = list(meta.get("notes") or []) + [
+                            f"{registered_source.name} could not be read ({exc}); "
+                            "showing the cache as it was built"
+                        ]
+                        matches = True
+                    else:
+                        matches = False
+                        unreadable_same_fp = bool(manifest and not changed)
+                if not matches:
                     ViewerState._close_root(root)
+                    root = None
                     if (
                         not self.agent_window
                         and container_path is not None
                         and container_path == cache_container(registered_source, sel)
                     ):
                         tile_opt = int((attrs.get("nd2wsi") or {}).get("tile") or 0) or None
-                        store_path = ensure_cache(
-                            registered_source, selection=sel, tile=tile_opt, kind="full"
-                        )
+                        try:
+                            store_path = ensure_cache(
+                                registered_source, selection=sel, tile=tile_opt, kind="full"
+                            )
+                        except (ValueError, NotImplementedError, RuntimeError) as rebuild_exc:
+                            if unreadable_same_fp:
+                                with CacheLock(container_path):
+                                    if container_path.exists():
+                                        set_aside = quarantine(container_path)
+                                        raise ValueError(
+                                            f"{rebuild_exc} (corrupt cache set aside as {set_aside.name})"
+                                        ) from rebuild_exc
+                            raise
                         manifest = read_manifest(container_path, recover=True) or {}
                         gen = store_generation(store_path)
+                        sid = self.sid_for(store_path)
                         root, attrs = open_store(store_path)
+                    elif sel != PlaneSelection():
+                        raise ValueError(
+                            f"cache {store_path.name} is outdated; rebuild with: "
+                            f"nd2wsi convert --overwrite --position {sel.p} --t {sel.t} --z {sel.z} "
+                            f"{shlex.quote(registered_source.name)} {shlex.quote(store_path.name)}"
+                        )
                     else:
                         raise ValueError(
                             f"cache {store_path.name} is outdated; open {registered_source.name} to rebuild"
                         )
-            try:
+            annotations = self.annotation_path(store_path, attrs)
+            with self._lock:
+                current = self.slides.get(sid)
+                if current is not None and (
+                    current is not initial_st
+                    or (
+                        current.generation == gen
+                        and (registered_source is None or current.source_path == registered_source)
+                    )
+                ):
+                    ViewerState._close_root(root)
+                    root = None
+                    return sid
+                stale = current
                 st = ViewerState(
                     root,
                     attrs,
                     max_render_mpx=self.max_render_mpx,
-                    annotations_path=self.annotation_path(store_path, attrs),
+                    annotations_path=annotations,
                     generation=gen,
                     trash_path=Path(trash_path) if trash_path is not None else None,
                     source_path=registered_source,
                     store_path=store_path,
                     container_path=container_path,
                     manifest=manifest,
+                    managed_cache=bool(
+                        container_path is not None
+                        and store_path.suffix.lower() == SINGLE_FILE_SUFFIX
+                        and is_managed_cache_path(container_path, manifest)
+                    ),
                 )
-            except BaseException:
+                root = None
+                self._apply_window_policy(st)
+                self.slides[sid] = st
+                self._retire(stale, closing=True)
+        except BaseException:
+            if root is not None:
                 ViewerState._close_root(root)
-                raise
-            self._apply_window_policy(st)
-            self.slides[sid] = st
-            self._retire(stale, closing=True)
+            raise
         self._close_state(stale)
         return sid
 
@@ -895,7 +1017,13 @@ class SlideRegistry:
         runtime, the stored overview still shows — at half resolution,
         with a note saying why — rather than failing to open at all.
         """
-        from .cache import fingerprints_match, manifest_container, quick_fingerprint
+        from .cache import (
+            CACHE_SUFFIX,
+            fingerprints_match,
+            is_managed_cache_path,
+            manifest_container,
+            quick_fingerprint,
+        )
         from .convert import open_store
         from .direct import open_nd2_backed
 
@@ -951,6 +1079,10 @@ class SlideRegistry:
                         f"{reason}; showing the stored overview at half resolution"
                     ]
                 annotations = None if degraded else self.annotation_path(store_path, attrs)
+                is_managed_ov = (
+                    is_managed_cache_path(container, manifest)
+                    or container.name.endswith(CACHE_SUFFIX)
+                )
                 st = ViewerState(
                     root,
                     attrs,
@@ -961,11 +1093,12 @@ class SlideRegistry:
                     # the two modes map levels differently, so tiles cached as
                     # immutable in one must never be revived in the other
                     generation=gen + ("-degraded" if degraded else ""),
-                    trash_path=container,
+                    trash_path=container if is_managed_ov else None,
                     source_path=source,
                     store_path=store_path,
                     container_path=container,
                     manifest=manifest,
+                    managed_cache=is_managed_ov,
                 )
             except BaseException:
                 ViewerState._close_root(root)
@@ -1812,7 +1945,14 @@ def make_handler(
                 raise
 
         def _json(self, obj: Any, code: int = 200):
-            self._send(code, json.dumps(obj).encode(), "application/json")
+            try:
+                body = json.dumps(obj, allow_nan=False).encode()
+            except ValueError:
+                body = json.dumps(
+                    {"error": "internal server error: non-finite value in response"}
+                ).encode()
+                code = 500
+            self._send(code, body, "application/json")
 
         def _error(self, code: int, msg: str):
             if self._response_started:
@@ -1828,7 +1968,12 @@ def make_handler(
             n = int(self.headers.get("Content-Length") or 0)
             if not 0 < n <= limit:
                 raise ValueError("payload missing or too large")
-            return json.loads(self.rfile.read(n))
+            return json.loads(
+                self.rfile.read(n),
+                parse_constant=lambda c: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON constant {c} is not allowed")
+                ),
+            )
 
         def log_message(self, fmt, *args):  # quieter default log
             pass
@@ -1853,14 +1998,27 @@ def make_handler(
             Host header must name loopback, and any Origin present must be
             this server itself.
             """
+            if getattr(self, "request_version", "") == "HTTP/0.9":
+                self._error(404, "not found")
+                return None
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
-            raw_host = self.headers.get("Host") or ""
+            get_all = getattr(self.headers, "get_all", None)
+            host_headers = get_all("Host", []) if get_all is not None else []
+            raw_host = (host_headers[0] if len(host_headers) == 1 else "").strip()
+            host: str | None = None
             if raw_host.startswith("["):  # bracketed IPv6, maybe with a port
-                host = raw_host[: raw_host.find("]") + 1]
-            else:
-                host = raw_host.rsplit(":", 1)[0]
-            if host.lower() not in ("127.0.0.1", "localhost", "[::1]", ""):
+                if "]" in raw_host:
+                    bracket, rest = raw_host.split("]", 1)
+                    if rest == "" or (rest.startswith(":") and rest[1:].isascii() and rest[1:].isdigit()):
+                        host = (bracket + "]").lower()
+            elif ":" in raw_host:
+                h, port = raw_host.rsplit(":", 1)
+                if h != "" and port.isascii() and port.isdigit():
+                    host = h.lower()
+            elif raw_host:
+                host = raw_host.lower()
+            if host not in ("127.0.0.1", "localhost", "[::1]"):
                 self._error(404, "not found")
                 return None
             origin = self.headers.get("Origin")
@@ -2225,6 +2383,10 @@ def make_handler(
             calibration.setdefault("status", "unknown")
             calibration.setdefault("source", "unknown")
             calibration["pixel_size_um"] = meta.get("pixel_size_um")
+            from .reader import _finite_positive
+
+            mag = meta.get("objective_magnification")
+            clean_mag = mag if _finite_positive(mag) else None
             payload = {
                 **self._info_payload(st),
                 "source_path": str(st.source_path) if st.source_path else None,
@@ -2243,8 +2405,8 @@ def make_handler(
                 ),
                 "storage_details": storage_details,
                 "calibration": calibration,
-                "objective": meta.get("objective_magnification"),
-                "objective_magnification": meta.get("objective_magnification"),
+                "objective": clean_mag,
+                "objective_magnification": clean_mag,
                 "selection": dict(meta.get("selection") or {}),
                 "associated": _associated_names(st),
             }
@@ -2347,12 +2509,32 @@ def make_handler(
                 return self._error(400, str(e))
             if p is None:
                 return self._json({"items": [], "path": None})
+            lv0 = st.attrs["nd2wsi"]["levels"][0]
+
+            def _same_geometry(document: Any) -> None:
+                src = document.get("source") if isinstance(document, dict) else None
+                if not isinstance(src, dict):
+                    return
+                w, h = src.get("width"), src.get("height")
+                if (
+                    isinstance(w, int)
+                    and not isinstance(w, bool)
+                    and isinstance(h, int)
+                    and not isinstance(h, bool)
+                    and (w, h) != (int(lv0["width"]), int(lv0["height"]))
+                ):
+                    raise ValueError(
+                        f"these annotations were drawn on a {w} x {h} image; this image is "
+                        f"{lv0['width']} x {lv0['height']}"
+                    )
+
             # A sidecar that is not an object with an items list is refused,
             # never read as empty: the pane's next save would replace it.
             if registry.annotation_workspace is not None:
                 try:
                     document, rev = registry.annotation_workspace.read(p)
                     items = _sidecar_items(document)
+                    _same_geometry(document)
                     return self._json({"items": items, "path": str(p),
                                        **({"slacs": document["slacs"]} if document and "slacs" in document else {}),
                                        "revision": rev, "window": registry.window_session.as_dict()})
@@ -2363,6 +2545,7 @@ def make_handler(
                 try:
                     document = json.loads(p.read_text(encoding="utf-8"))
                     items = _sidecar_items(document, require_items=True)
+                    _same_geometry(document)
                 except (ValueError, UnicodeError, OSError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             else:
@@ -2422,6 +2605,10 @@ def make_handler(
                     payload["selection"] = {"p": site}
                 sites = (meta.get("plate") or {}).get("sites") or []
                 payload["site"] = sites[site]["name"] if site < len(sites) else None
+            try:
+                raw = json.dumps(payload, indent=1, allow_nan=False).encode("utf-8")
+            except ValueError as e:
+                return self._error(400, str(e))
             if registry.annotation_workspace is not None:
                 from .annotation_workspace import AnnotationConflict
                 try:
@@ -2434,16 +2621,36 @@ def make_handler(
                 except (ValueError, UnicodeError, OSError, TimeoutError) as e:
                     return self._error(500, f"could not save {p.name}: {e}")
                 return self._json({"ok": True, "path": str(p), "count": len(data["items"]), "revision": rev})
-            from .annotation_workspace import _atomic_write
+            from contextlib import ExitStack
 
-            # unique, fsynced temp + per-slide lock: two tabs saving at once
-            # cannot interleave, and a crash leaves the old or the new file
-            raw = json.dumps(payload, indent=1).encode("utf-8")
-            try:
-                with st.lock:
-                    _atomic_write(p, raw)
-            except OSError as e:
-                return self._error(500, f"could not save {p.name}: {e}")
+            from .annotation_workspace import _atomic_write, annotation_lock
+
+            # unique, fsynced temp + per-slide and window lock: two tabs or
+            # windows saving at once cannot interleave or clobber each other.
+            # The window lock is advisory: when it cannot be used here (another
+            # account's file, no flock on this filesystem, ...) the atomic
+            # write proceeds as in 2.6.2; only real contention is refused.
+            lock_path = p.with_name("." + p.name + ".window-lock")
+            failure: tuple[int, str] | None = None
+            with st.lock, ExitStack() as held:
+                if lock_path.exists():
+                    try:
+                        held.enter_context(annotation_lock(p))
+                    except TimeoutError as e:
+                        if e.errno is None:  # SessionFileLock contention, not ETIMEDOUT
+                            failure = (409, "annotations are open in another window")
+                    except OSError:
+                        pass
+                if failure is None:
+                    try:
+                        _atomic_write(p, raw)
+                    except OSError as e:
+                        failure = (500, f"could not save {p.name}: {e}")
+            if failure is not None:
+                code, message = failure
+                if code == 409:
+                    return self._json({"error": message}, code=409)
+                return self._error(code, message)
             self._json({"ok": True, "path": str(p), "count": len(data["items"])})
 
         def _histogram(self, st: ViewerState, q: dict | None = None):

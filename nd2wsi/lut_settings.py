@@ -174,6 +174,16 @@ class LutSettingsStore:
             self.identity = None
             self._warning = "LUT settings unavailable: " + str(exc)
 
+    def refresh_attrs(self, attrs: dict) -> None:
+        with self._lock:
+            if self.identity is None:
+                return
+            try:
+                self.identity["context"] = _context(attrs)
+            except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
+                self.identity = None
+                self._warning = "LUT settings unavailable: " + str(exc)
+
     def _require_current(self) -> None:
         try:
             current = self.identity is not None and _stat_signature(self.source) == self._source_stat

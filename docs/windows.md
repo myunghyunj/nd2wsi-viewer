@@ -6,7 +6,7 @@
 
 | Channel | Download | Verification |
 | --- | --- | --- |
-| Stable 2.6.2 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.2/nd2wsi-viewer-2.6.2-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.6.2) |
+| Stable 2.6.3 | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.3/nd2wsi-viewer-2.6.3-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.6.3) |
 
 Extract the entire ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
 From 2.5.7 the extracted `nd2wsi-viewer` folder holds only `nd2wsi-viewer.exe`,
@@ -29,14 +29,14 @@ unknown-publisher warning. Updates are installed manually from Releases.
 Windows uses the standard title bar and does not use the macOS Sparkle updater.
 Use **Ctrl** for Mac **⌘** shortcuts and **Alt** for **Option**.
 
-Stable 2.6.2 includes interactive Z-stack & time-series viewing for Zeiss CZI (`.czi`) and Leica LIF (`.lif`) confocal acquisitions, Astromap ROI import/export, and supported HEVC SDPC viewing.
+Stable 2.6.3 includes interactive Z-stack & time-series viewing for Zeiss CZI (`.czi`) and Leica LIF (`.lif`) confocal acquisitions, Astromap ROI import/export, and supported HEVC SDPC viewing.
 Shading Correction assesses supported FITC and CY3 channels; BF and DAPI remain
 unchanged. See the [current method and limits](shading-correction-validation.md).
 
 It has the collapsible top tools and the translucent viewer, with ROI boxes,
 navigation, locking and a 10–100% opacity slider. Windows applies opacity to
 the whole floating window, including its controls and ROI outlines. See the
-[2.6.2 notes](release-notes-2.6.2.md) for what changed in this release.
+[2.6.3 notes](release-notes-2.6.3.md) for what changed in this release.
 
 ### If the viewer won't start
 
@@ -115,7 +115,7 @@ emulation, not an ARM64-native binary.
 ## Installer build tooling
 
 The Windows app uses a native frame and Microsoft Edge WebView2. Installer
-tooling can produce a versioned Setup executable, but the current stable 2.6.2
+tooling can produce a versioned Setup executable, but the current stable 2.6.3
 download is a portable ZIP; no Setup installer is published for that release. The tooling installs the app
 for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
 It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
@@ -212,13 +212,19 @@ packaging. The packaging script requires the frozen executable to pass:
 - A wired LUT toolbar, its transfer module, and the five packaged Fluent SVG icons, including Shading Correction.
 
 To reproduce in Windows with x64 Python 3.13.14, uv 0.12.10, Node.js 22, and
-Microsoft Edge WebView2 Runtime:
+Microsoft Edge WebView2 Runtime (plus an x64 MSVC developer environment and MSYS2 `make`/`diffutils` to build the LGPL SDPC codec from source, or a prebuilt x64 manifest in `ND2WSI_SDPC_CODEC_MANIFEST`):
 
 ```powershell
 uv sync --frozen --all-extras --python 3.13.14
 uv pip install --python .venv/Scripts/python.exe --require-hashes --no-config --default-index https://pypi.org/simple -r packaging/windows-build-requirements.txt
 .venv/Scripts/python.exe scripts/fetch_testdata.py
 .venv/Scripts/python.exe -m pytest tests -q
+.venv/Scripts/python.exe packaging/build_sdpc_codec.py --output dist/sdpc-codec --msys-bash C:\msys64\usr\bin\bash.exe
+$env:ND2WSI_SDPC_CODEC_MANIFEST = (Resolve-Path dist/sdpc-codec/sdpc-codec-manifest.json).Path
+.venv/Scripts/python.exe packaging/verify_sdpc_codec.py --manifest $env:ND2WSI_SDPC_CODEC_MANIFEST --wheel-only
+$codecWheel = (Get-Content $env:ND2WSI_SDPC_CODEC_MANIFEST | ConvertFrom-Json).wheel_file
+uv pip install --python .venv/Scripts/python.exe --no-deps --reinstall (Join-Path dist/sdpc-codec $codecWheel)
+.venv/Scripts/python.exe packaging/verify_sdpc_codec.py --manifest $env:ND2WSI_SDPC_CODEC_MANIFEST
 .venv/Scripts/python.exe packaging/build_windows.py --smoke-file docs/example_cell.nd2
 ```
 
@@ -229,14 +235,14 @@ To bundle the WebView2 runtime as CI does, download the cab pinned in
 to the build command.
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.6.2-windows-x64.zip` and its `.sha256`.
+`dist/windows/nd2wsi-viewer-2.6.3-windows-x64.zip` and its `.sha256`.
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.6.2-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.6.3-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks
@@ -247,9 +253,14 @@ a passing ARM virtual-machine run does not establish a separate x64-hardware
 test result.
 
 The local snapshot runner (`packaging/build_windows_local.ps1`) performs this
-extracted-archive check automatically before reporting completion. Its
-`output/verification` evidence includes both native GUI and scientific smoke
-results from the extracted EXE, including Korean and space-containing paths.
+extracted-archive check automatically before reporting completion. When
+`ND2WSI_SDPC_CODEC_MANIFEST` / `-SdpcCodecManifest` is unset, it runs an early
+preflight check and builds the LGPL SDPC codec from source (requiring an x64
+MSVC developer shell and MSYS2 `make`/`diffutils` on native x64 Windows; on a
+Windows 11 ARM virtual machine, pass a prebuilt x64 codec manifest via
+`-SdpcCodecManifest` or `ND2WSI_SDPC_CODEC_MANIFEST`). Its `output/verification`
+evidence includes both native GUI and scientific smoke results from the
+extracted EXE, including Korean and space-containing paths.
 
 ## CI workflow
 

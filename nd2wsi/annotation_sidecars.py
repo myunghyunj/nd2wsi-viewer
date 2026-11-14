@@ -6,6 +6,7 @@ window isolation and optimistic write conflicts remain in AnnotationWorkspace.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -186,8 +187,16 @@ def annotations_sidecar(
                 and str(raw_selection.get("z", "mid")) in ("mid", "0")
             )
             try:
+                if new.exists():
+                    break
                 if claim:
-                    old.rename(new)
+                    try:
+                        os.link(old, new)
+                        old.unlink()
+                    except OSError:
+                        if new.exists():
+                            break
+                        old.rename(new)
                 else:
                     shutil.copy2(old, new)
                 break

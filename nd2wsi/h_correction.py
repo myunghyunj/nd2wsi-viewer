@@ -102,6 +102,10 @@ def _basic_reason(state: Any, method="h") -> str:
         meta = state.attrs["nd2wsi"]
         if not getattr(state, "correction_write_allowed", True):
             return "Agent windows can replace pyramids only in their private exports folder"
+        if (getattr(state, "manifest", None) or {}).get("origin") == "export" or not getattr(
+            state, "managed_cache", True
+        ):
+            return "Shading Correction requires a managed .nd2svs cache; open the original ND2"
         if state.plate is not None or meta.get("plate"):
             return ("Plate/time-series correction is not yet supported. The current method "
                     "requires spatial repetition within a stitched single-frame ND2 slide; "

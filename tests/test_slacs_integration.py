@@ -202,6 +202,8 @@ def test_a_key_follow_reads_the_controls_of_the_slacs_process_the_overlay_detect
         [(session_id, options, made)] = followers
         [monitor] = _ControlsMonitor.instances
         assert session_id == started['session_id']
+        identifier = options.pop('identifier')
+        assert callable(identifier) and identifier(5150, None) is True and identifier(9999, None) is False
         assert options == {'step_um': 10.0, 'step_source': 'slacs', 'controls': monitor, 'pixel_size_um': (0.5, 0.5),
                            'flip_x': False, 'flip_y': False, 'mark_context': api._mark_context, 'on_mark': api._on_mark_record}
         assert monitor.pid_provider() == 5150

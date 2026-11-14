@@ -391,7 +391,7 @@ async function refreshShadingPyramid(generation, captured) {
   if (next.generation !== generation) throw new Error("The pyramid changed again while loading; retrying");
   if (next.width !== info.width || next.height !== info.height || next.kind !== info.kind ||
       !Array.isArray(next.channels) || next.channels.length !== info.channels.length ||
-      next.channels.some((channel, index) => channel.name !== info.channels[index].name)) {
+      next.channels.some((channel, index) => channel.label !== info.channels[index].label)) {
     throw new Error("The rebuilt pyramid does not match this slide's geometry or channels");
   }
   // Preserve effective LUT values even if a channel still uses its defaults.
@@ -1693,19 +1693,18 @@ function syncFrameScopedControls() {
 
 function setTool(tool) {
   const turningOff = tool === null || state.tool === tool;
+  const annotationTool = tool === "measure" || tool === "pin" || tool === "box" || tool === "astromap";
+  if (!turningOff && state.quitPreparing) return;
   if (!turningOff && state.plate && !activeFrameParams()) {
     showToast("Choose a site before using Export or Annotations");
     return;
   }
-  if (
-    !turningOff && (tool === "measure" || tool === "pin" || tool === "box" || tool === "astromap") &&
-    !annotationOwnerReady()
-  ) {
+  if (!turningOff && annotationTool && !annotationOwnerReady()) {
     setAnnStatus("Choose a site and wait for its annotations to load");
     return;
   }
   if (!turningOff && tool === "move" && !frameOwnsRoi()) return;
-  if (annLocked() && (tool === "measure" || tool === "pin" || tool === "box" || tool === "astromap")) {
+  if (!turningOff && annotationTool && annLocked()) {
     setAnnStatus("Annotation is locked while the source file is missing");
     return;
   }
@@ -1793,14 +1792,30 @@ function wireTools() {
   let dragPointer = null;
   let current = null;
 
+  const isAnnotationTool = (tool) =>
+    tool === "measure" || tool === "pin" || tool === "box" || tool === "astromap";
+  const annotationToolBlocked = () =>
+    (typeof annotationOwnerReady === "function" && !annotationOwnerReady()) ||
+    (typeof annLocked === "function" && annLocked()) ||
+    Boolean(state.quitPreparing);
+
   $("roi-toggle").onclick = () => setTool("roi");
   $("roi-move").onclick = () => {
     if (state.roi) setTool("move");
   };
-  $("tool-measure").onclick = () => setTool("measure");
-  $("tool-pin").onclick = () => setTool("pin");
+  $("tool-measure").onclick = () => {
+    if (state.tool !== "measure" && annotationToolBlocked()) return;
+    setTool("measure");
+  };
+  $("tool-pin").onclick = () => {
+    if (state.tool !== "pin" && annotationToolBlocked()) return;
+    setTool("pin");
+  };
   $("tool-box").title = "Source-aligned rectangle";
-  $("tool-box").onclick = () => setTool("box");
+  $("tool-box").onclick = () => {
+    if (state.tool !== "box" && annotationToolBlocked()) return;
+    setTool("box");
+  };
 
   let moveFrom = null; // roi and its origin at drag start (move mode)
   let landmarkStart = null; // a click, not a drag, places an alignment point
@@ -1847,6 +1862,10 @@ function wireTools() {
     }
     if (!state.tool || ev.button !== 0) return;
     if (state.tool === "astromap" && (!astromapDrag || !astromapReady())) return;
+    if (isAnnotationTool(state.tool) && annotationToolBlocked()) {
+      setTool(null);
+      return;
+    }
     if (state.tool === "move" && !state.roi) return;
     start = current = elementPoint(ev, stage);
     // A camera change during the drag must not move its source-image anchor.
@@ -1915,7 +1934,9 @@ function wireTools() {
       finishSelection(rectangle);
     } else if (tool === "measure") {
       state.tempLine = null;
-      if (moved >= 6) {
+      if (annotationToolBlocked()) {
+        setTool(null);
+      } else if (moved >= 6) {
         addAnnotation({
           type: "line",
           x1: startImg.x, y1: startImg.y, x2: endImg.x, y2: endImg.y,
@@ -1925,16 +1946,20 @@ function wireTools() {
       }
       renderAnnotations();
     } else if (tool === "astromap") {
-      if (moved >= 6) addAstromapRoi(rectangle);
+      if (moved >= 6 && astromapReady()) addAstromapRoi(rectangle);
       setTool(null);
     } else if (tool === "box") {
-      if (moved >= 6 && rectangle && rectangle.w > 0 && rectangle.h > 0) {
+      if (annotationToolBlocked()) {
+        setTool(null);
+      } else if (moved >= 6 && rectangle && rectangle.w > 0 && rectangle.h > 0) {
         const item = addAnnotation({ type: "box", ...rectangle, text: "" });
         setTool(null);
         openEditor(item.id);
       }
     } else if (tool === "pin") {
-      if (moved < 8) {
+      if (annotationToolBlocked()) {
+        setTool(null);
+      } else if (moved < 8) {
         const item = addAnnotation({ type: "pin", x: endImg.x, y: endImg.y, text: "" });
         setTool(null);
         openEditor(item.id);
@@ -3329,11 +3354,15 @@ async function openAnnotationFile(file) {
       return { ...item, id };
     }) : items;
     const combined = append ? state.annotations.concat(imported) : imported;
+    const incomingSlacs = normalizedLaserState(parsed.slacs, imported);
+    // The isolation high-water mark only rises: an Open (append or replace) never lowers or clears it.
+    const nextLaserState = mergeLaserStates(state.annLaserState, incomingSlacs, combined);
     if (new Blob([JSON.stringify({ items: combined.concat(kept) })]).size > window.Nd2AnnotationGeoJSON.MAX_BYTES) {
       throw new Error("the combined annotations exceed the 8 MB import limit");
     }
     if (!append) closeEditor(false);
     state.annotations = combined;
+    state.annLaserState = nextLaserState;
     annotationsChanged();
     setAnnStatus((append ? "Imported " : "Opened ") + file.name + " (" + imported.length + ")" +
       (append ? " · added to existing annotations" : "") +
@@ -3511,7 +3540,7 @@ function currentSelection() {
   // site, an ordinary slide's is the plane the cache was built from
   if (state.plate) {
     const frame = activeFrameParams();
-    if (state.info.plate.annotationScope === "plane") {
+    if (state.info?.plate?.annotationScope === "plane") {
       return annotationStore.ownsFrame(frame) ? { t: frame.t, p: frame.p, z: frame.z } : null;
     }
     return frame && frame.p === state.annSite ? { p: frame.p } : null;
@@ -3528,22 +3557,68 @@ function normalizedSelection(selection) {
   };
 }
 
+function selectionMatchesCurrent(current, fileSelection) {
+  if (!current || !fileSelection || typeof fileSelection !== "object" || Array.isArray(fileSelection)) {
+    return false;
+  }
+  if (Number(current.p || 0) !== Number(fileSelection.p || 0)) return false;
+  if (fileSelection.t !== undefined && fileSelection.t !== null) {
+    if (Number(current.t || 0) !== Number(fileSelection.t || 0)) return false;
+  }
+  if (fileSelection.z !== undefined && fileSelection.z !== null) {
+    if (Number.isInteger(current.z_resolved) && Number.isInteger(fileSelection.z_resolved)) {
+      return current.z_resolved === fileSelection.z_resolved;
+    }
+    const zMatches =
+      String(current.z === undefined ? "mid" : current.z) === String(fileSelection.z) ||
+      (Number.isInteger(fileSelection.z_resolved) && String(current.z) === String(fileSelection.z_resolved)) ||
+      (Number.isInteger(current.z_resolved) && String(current.z_resolved) === String(fileSelection.z));
+    if (!zMatches) return false;
+  }
+  return true;
+}
+
+function normalizedLaserState(raw, items) {
+  return typeof window.Nd2SlacsLaser?.normalizeState === "function"
+    ? window.Nd2SlacsLaser.normalizeState(raw, items)
+    : null;
+}
+
+function mergeLaserStates(previous, incoming, items) {
+  const prev = normalizedLaserState(previous, []);
+  const next = normalizedLaserState(incoming, []);
+  if (!prev && !next) return normalizedLaserState(null, items);
+  const presses = { ...(prev?.presses || {}) };
+  for (const [receiver, press] of Object.entries(next?.presses || {})) {
+    presses[receiver] = Math.max(presses[receiver] || 0, press);
+  }
+  const highwater = Math.max(prev?.isolation_highwater || 0, next?.isolation_highwater || 0);
+  return normalizedLaserState({ isolation_highwater: highwater, presses }, items);
+}
+
 function annotationItemsForThisSlide(data, geojsonFile = false) {
+  const planeScoped = !!state.plate && state.info?.plate?.annotationScope === "plane";
   if (geojsonFile || window.Nd2AnnotationGeoJSON.isGeoJSON(data)) {
     const items = window.Nd2AnnotationGeoJSON.parse(data, state.info);
     if (data.selection) {
       const current = currentSelection();
       if (!current) throw new Error("choose a plate site first");
-      const expected = normalizedSelection(current), actual = normalizedSelection(data.selection);
-      if (expected.t !== actual.t || expected.p !== actual.p || expected.z !== actual.z) {
-        throw new Error("annotations belong to a different T/P/Z plane");
+      if (planeScoped) {
+        if (!selectionMatchesCurrent(current, data.selection)) {
+          throw new Error("annotations belong to a different T/P/Z plane");
+        }
+      } else {
+        const expected = normalizedSelection(current), actual = normalizedSelection(data.selection);
+        if (expected.t !== actual.t || expected.p !== actual.p || expected.z !== actual.z) {
+          throw new Error("annotations belong to a different T/P/Z plane");
+        }
       }
     }
     const { verified } = annotationItemsForThisSlide({ items: [], source: data.source,
       coordinate_space: data.coordinate_space, selection: data.selection });
-    return { items, verified, append: true };
+    return { items, verified, append: true, slacs: normalizedLaserState(data?.slacs, items) };
   }
-  if (Array.isArray(data)) return { items: data, verified: false };
+  if (Array.isArray(data)) return { items: data, verified: false, slacs: normalizedLaserState(null, data) };
   if (!data || !Array.isArray(data.items)) throw new Error("no items array");
 
   const source = data.source;
@@ -3551,10 +3626,10 @@ function annotationItemsForThisSlide(data, geojsonFile = false) {
     if (source !== state.info.name) {
       throw new Error("this file belongs to " + source);
     }
-    return { items: data.items, verified: true };
+    return { items: data.items, verified: true, slacs: normalizedLaserState(data.slacs, data.items) };
   }
   if (!source || typeof source !== "object") {
-    return { items: data.items, verified: false };
+    return { items: data.items, verified: false, slacs: normalizedLaserState(data.slacs, data.items) };
   }
   if (source.name && source.name !== state.info.name) {
     throw new Error("this file belongs to " + source.name);
@@ -3571,13 +3646,19 @@ function annotationItemsForThisSlide(data, geojsonFile = false) {
   if (data.selection) {
     const current = currentSelection();
     if (!current) throw new Error("choose a plate site first");
-    const expected = normalizedSelection(current);
-    const actual = normalizedSelection(data.selection);
-    if (expected.t !== actual.t || expected.p !== actual.p || expected.z !== actual.z) {
-      throw new Error("annotations belong to a different T/P/Z plane");
+    if (planeScoped) {
+      if (!selectionMatchesCurrent(current, data.selection)) {
+        throw new Error("annotations belong to a different T/P/Z plane");
+      }
+    } else {
+      const expected = normalizedSelection(current);
+      const actual = normalizedSelection(data.selection);
+      if (expected.t !== actual.t || expected.p !== actual.p || expected.z !== actual.z) {
+        throw new Error("annotations belong to a different T/P/Z plane");
+      }
     }
   }
-  return { items: data.items, verified: true };
+  return { items: data.items, verified: true, slacs: normalizedLaserState(data.slacs, data.items) };
 }
 
 function rebuildAnnList() {
@@ -5743,7 +5824,11 @@ function plateFrameChanged() {
   // every t, z or focus change: frames, readouts, histogram, status bar
   if (annotationStore.needsFrameLoad()) {
     closeEditor(true);
-    state.cancelToolDrag?.();
+    if (state.tool === "pin" || state.tool === "box" || state.tool === "measure" || state.tool === "astromap") {
+      setTool(null);
+    } else {
+      state.cancelToolDrag?.();
+    }
     // Save the departing owner's captured T/P/Z, then clear the marks
     // synchronously while the new plane loads (including autofocus).
     annotationStore.switchOwner();

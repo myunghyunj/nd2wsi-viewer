@@ -20,6 +20,7 @@ import re
 import shutil
 import time
 import uuid
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,10 @@ from .reader import PlaneSelection, PlaneSource, level_shapes, nice_bytes, open_
 from .storage import DEFAULT_STORAGE, StorageBackend
 
 NGFF_VERSION = "0.4"
+
+
+class SourceUnreadable(Exception):
+    """Raised when cached semantics check finds an unreadable or corrupt source."""
 
 
 class _StoreProgress:
@@ -316,11 +321,18 @@ def _percentile_windows(
     for ci in range(small.shape[0]):
         if src.rgb:
             if info:
-                start, end = (
-                    (0.0, float(info.max))
-                    if src.dtype != np.dtype(np.uint8)
-                    else (0.0, 255.0)
-                )
+                if (
+                    src.dtype != np.dtype(np.uint8)
+                    and src.bit_depth is not None
+                    and 0 < src.bit_depth < np.dtype(src.dtype).itemsize * 8
+                ):
+                    start, end = (0.0, float((1 << src.bit_depth) - 1))
+                else:
+                    start, end = (
+                        (0.0, float(info.max))
+                        if src.dtype != np.dtype(np.uint8)
+                        else (0.0, 255.0)
+                    )
             else:
                 start, end = (lo_all, hi_all if hi_all > lo_all else lo_all + 1.0)
         else:
@@ -405,6 +417,8 @@ def build_group_attrs(
     }
     if src.channel_dtypes:
         nd2wsi["channel_dtypes"] = [str(dt) for dt in src.channel_dtypes]
+    if src.czi_scene_t is not None:
+        nd2wsi["czi_scene_t"] = [int(v) for v in src.czi_scene_t]
     return {"multiscales": multiscales, "omero": omero, "nd2wsi": nd2wsi}
 
 
@@ -434,7 +448,12 @@ def convert(
     import dask
     import nd2
 
-    from .cache import commit_container
+    from .cache import (
+        SINGLE_FILE_SUFFIX,
+        _refuse_database_companions,
+        commit_container,
+        quick_fingerprint,
+    )
     from .czi import is_czi, open_czi
     from .lif import is_lif, open_lif
     from .sdpc import is_sdpc
@@ -444,6 +463,7 @@ def convert(
     if is_sdpc(source_path):
         raise ValueError("SDPC supports direct viewing and ROI export, not pyramid conversion")
     final_path = Path(out_path)
+    single_file_out = final_path.suffix.lower() == SINGLE_FILE_SUFFIX
     storage = storage or DEFAULT_STORAGE
     if tile is None:
         tile = auto_tile(final_path, storage)
@@ -455,13 +475,45 @@ def convert(
         if progress:
             print(f"hardware: {os.cpu_count()} CPU cores -> {workers} worker threads")
 
+    _refuse_database_companions(final_path)
+    if final_path.is_symlink():
+        raise ValueError("cache publication refuses symbolic links")
     if final_path.exists() and not overwrite:
         raise FileExistsError(f"{final_path} exists (use --overwrite)")
+    if (
+        single_file_out
+        and overwrite
+        and final_path.is_dir()
+        and not (
+            (final_path / ".zattrs").is_file() or (final_path / ".zgroup").is_file()
+        )
+    ):
+        raise IsADirectoryError(
+            f"refusing to overwrite non-Zarr directory {final_path}"
+        )
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    staging_path = final_path.parent / (
-        f".{final_path.name}.building-{uuid.uuid4().hex[:12]}"
-    )
-    shutil.rmtree(staging_path, ignore_errors=True)
+    before_fp: dict[str, Any] | None = None
+    src_resolved = source_path.resolve()
+    if single_file_out:
+        final_path = final_path.parent.resolve() / final_path.name
+        before_fp = quick_fingerprint(src_resolved)
+        staging_path = final_path.with_name(
+            f".{final_path.name}.building-{uuid.uuid4().hex}"
+        )
+        packed_file: Path | None = final_path.with_name(
+            f".{final_path.name}.packed-{uuid.uuid4().hex}"
+        )
+        shutil.rmtree(staging_path, ignore_errors=True)
+        packed_file.unlink(missing_ok=True)
+        staging_path.mkdir(parents=True, exist_ok=False)
+        store_build_dir = staging_path / "store.ome.zarr"
+    else:
+        staging_path = final_path.parent / (
+            f".{final_path.name}.building-{uuid.uuid4().hex[:12]}"
+        )
+        packed_file = None
+        shutil.rmtree(staging_path, ignore_errors=True)
+        store_build_dir = staging_path
 
     started = time.time()
     swept = freed = 0
@@ -510,7 +562,7 @@ def convert(
                     label = "overview levels 1.." if overview else "levels 0.."
                     print(f"  pyramid: {label}{len(shapes) - 1}, tile {tile}")
 
-                root = storage.create_group(staging_path)
+                root = storage.create_group(store_build_dir)
                 arrays: dict[int, Any] = {}
                 for level in range(first_level, len(shapes)):
                     level_height, level_width = shapes[level]
@@ -615,15 +667,73 @@ def convert(
                     on_progress(1.0)
 
         swept, freed = sweep_appledouble(staging_path)
-        if final_path.exists() and not overwrite:
-            raise FileExistsError(f"{final_path} exists (use --overwrite)")
-        commit_container(staging_path, final_path)
+        if single_file_out:
+            assert packed_file is not None
+            from .cache import quick_fingerprint, write_manifest
+            from .migration import pack_directory
+
+            meta = attrs["nd2wsi"]
+            ov = meta.get("overview_of")
+            if ov:
+                shape = (ov["channels"], ov["height"], ov["width"])
+            else:
+                lv0 = meta["levels"][0]
+                shape = (len(attrs["omero"]["channels"]), lv0["height"], lv0["width"])
+            after_fp = quick_fingerprint(src_resolved)
+            if after_fp != before_fp:
+                raise RuntimeError(
+                    f"{src_resolved.name} changed while exporting "
+                    "(still copying, or being written by the scanner?) — "
+                    "try again once the file is settled"
+                )
+            write_manifest(
+                staging_path,
+                src_resolved,
+                after_fp,
+                selection.describe(),
+                meta.get("selection", {}).get("z"),
+                meta["tile"],
+                shape,
+                meta["dtype"],
+                kind="overview" if ov else "full",
+                storage=meta.get("storage"),
+                origin="export",
+            )
+            pack_directory(staging_path, packed_file, source=src_resolved)
+            r_val, _ = open_store(packed_file)
+            close_val = getattr(r_val, "close", None)
+            if close_val is not None:
+                close_val()
+            if final_path.exists() and not overwrite:
+                raise FileExistsError(f"{final_path} exists (use --overwrite)")
+            if final_path.is_symlink():
+                raise ValueError("cache publication refuses symbolic links")
+            if overwrite and final_path.is_dir():
+                if not (
+                    (final_path / ".zattrs").is_file()
+                    or (final_path / ".zgroup").is_file()
+                ):
+                    raise IsADirectoryError(
+                        f"refusing to overwrite non-Zarr directory {final_path}"
+                    )
+            commit_container(packed_file, final_path)
+            shutil.rmtree(staging_path, ignore_errors=True)
+        else:
+            if final_path.exists() and not overwrite:
+                raise FileExistsError(f"{final_path} exists (use --overwrite)")
+            commit_container(staging_path, final_path)
     except BaseException:
         shutil.rmtree(staging_path, ignore_errors=True)
+        if packed_file is not None:
+            packed_file.unlink(missing_ok=True)
         raise
 
     if progress:
-        size = sum(path.stat().st_size for path in final_path.rglob("*") if path.is_file())
+        size = (
+            final_path.stat().st_size
+            if final_path.is_file()
+            else sum(path.stat().st_size for path in final_path.rglob("*") if path.is_file())
+        )
         print(
             f"  done in {time.time() - started:.1f}s -> {final_path} "
             f"({nice_bytes(size)} on disk)"
@@ -893,10 +1003,12 @@ def ensure_cache(
         close = getattr(root, "close", None)
         if close:
             close()
+        if tile is not None and int((attrs.get("nd2wsi") or {}).get("tile") or 0) != int(tile):
+            raise ValueError("cached tile size does not match requested tile")
         if not _store_matches_source_semantics(slide, selection, attrs):
             raise ValueError("cached decoder or channel metadata semantics are outdated")
 
-    if cache_matches(container, slide, selection, kind=want) and store.exists():
+    if cache_matches(container, slide, selection, kind=want, tile=tile) and store.exists():
         try:
             validate(store)
             return store
@@ -914,7 +1026,10 @@ def ensure_cache(
         legacy_cache_container(slide, selection),
     ):
         old_store = container_store(old_container)
-        if cache_matches(old_container, slide, selection, kind=want) and old_store.is_dir():
+        if (
+            cache_matches(old_container, slide, selection, kind=want, tile=tile)
+            and old_store.is_dir()
+        ):
             try:
                 validate(old_store)
                 old_valid = old_container
@@ -923,7 +1038,7 @@ def ensure_cache(
                 pass  # old cache remains preserved
 
     if old_valid is None:
-        legacy = _legacy_store(slide, selection)
+        legacy = _legacy_store(slide, selection, tile=tile)
         if legacy is not None:
             return legacy
 
@@ -931,7 +1046,7 @@ def ensure_cache(
         # someone else may have finished it while this process waited, and
         # quarantining under the lock means two openers cannot both grab
         # the same stale container
-        if cache_matches(container, slide, selection, kind=want) and store.exists():
+        if cache_matches(container, slide, selection, kind=want, tile=tile) and store.exists():
             try:
                 validate(store)
                 return store
@@ -939,17 +1054,19 @@ def ensure_cache(
                 pass
         if container.exists():
             refuse_if_newer()  # it may have appeared while we waited
-            quarantine(container)
         if old_valid is not None:
             from .migration import pack_directory
 
             packed = container.with_name(f"{container.name}.building-{uuid.uuid4().hex}")
             with CacheLock(old_valid):
-                if not cache_matches(old_valid, slide, selection, kind=want):
+                if not cache_matches(old_valid, slide, selection, kind=want, tile=tile):
                     raise RuntimeError("legacy cache changed before import; reopen the slide")
                 try:
                     pack_directory(old_valid, packed, source=slide, on_progress=on_progress)
                     validate(packed)
+                    if container.exists():
+                        refuse_if_newer()
+                        quarantine(container)
                     commit_container(packed, container)
                 except FileExistsError:
                     raise  # do not remove a competing or pre-existing artifact
@@ -1007,6 +1124,9 @@ def ensure_cache(
             try:
                 pack_directory(staging, packed, source=slide)
                 validate(packed)
+                if container.exists():
+                    refuse_if_newer()
+                    quarantine(container)
                 commit_container(packed, container)
             except FileExistsError:
                 raise
@@ -1021,7 +1141,11 @@ def ensure_cache(
 
 
 def existing_cache_store(
-    slide: str | Path, selection: PlaneSelection | None = None, *, read_only: bool = False
+    slide: str | Path,
+    selection: PlaneSelection | None = None,
+    *,
+    read_only: bool = False,
+    tile: int | None = None,
 ) -> Path | None:
     """A valid, already-built store, or None. Never builds.
 
@@ -1044,18 +1168,20 @@ def existing_cache_store(
         legacy_cache_container(slide, selection),
     ):
         store = container_store(container)
-        if cache_matches(container, slide, selection) and store.exists():
+        if cache_matches(container, slide, selection, tile=tile) and store.exists():
             try:
                 root, attrs = open_store(store)
                 close = getattr(root, "close", None)
                 if close:
                     close()
+                if tile is not None and int((attrs.get("nd2wsi") or {}).get("tile") or 0) != int(tile):
+                    continue
                 if not _store_matches_source_semantics(slide, selection, attrs):
                     continue
             except Exception:
                 continue
             return store
-    legacy = _legacy_store(slide, selection, read_only=read_only)
+    legacy = _legacy_store(slide, selection, read_only=read_only, tile=tile)
     if legacy is not None:
         return legacy
     return None
@@ -1166,7 +1292,12 @@ def _store_matches_source_semantics(
     slide: Path,
     selection: PlaneSelection | None,
     attrs: dict[str, Any],
+    *,
+    raise_unreadable: bool = False,
 ) -> bool:
+    import struct
+    import xml.etree.ElementTree as ET
+
     if not slide.is_file():
         return True
     selection = selection or PlaneSelection()
@@ -1184,6 +1315,31 @@ def _store_matches_source_semantics(
                 end = win.get("end")
                 if isinstance(end, (int, float)) and float(end) <= 255.0 < hi:
                     return False
+
+    ov = meta.get("overview_of")
+    if isinstance(ov, dict):
+        stored_wh: tuple[int, int] | None = (
+            int(ov.get("width") or 0),
+            int(ov.get("height") or 0),
+        )
+    elif meta.get("levels"):
+        lv0 = meta["levels"][0]
+        stored_wh = (int(lv0.get("width") or 0), int(lv0.get("height") or 0))
+    else:
+        stored_wh = None
+
+    def _px_matches(
+        stored_px: Any, expected_px_tuple: tuple[float, float] | None
+    ) -> bool:
+        if expected_px_tuple is None:
+            return stored_px is None
+        expected_px = list(expected_px_tuple)
+        return (
+            isinstance(stored_px, list)
+            and len(stored_px) == 2
+            and bool(np.allclose(stored_px, expected_px, rtol=1e-6, atol=1e-9))
+        )
+
     suffix = slide.suffix.lower()
     try:
         if suffix == ".lif":
@@ -1200,26 +1356,45 @@ def _store_matches_source_semantics(
             if not (0 <= p_idx < len(all_series)):
                 return False
             series = all_series[p_idx]
+            if not (0 <= int(selection.t) < int(series.n_t)):
+                return False
+            if series.tile_positions_px and series.n_m > 1:
+                exp_w = max(tx + series.width for tx, _ty in series.tile_positions_px)
+                exp_h = max(ty + series.height for _tx, ty in series.tile_positions_px)
+            else:
+                exp_w, exp_h = int(series.width), int(series.height)
+            if stored_wh is not None and stored_wh != (exp_w, exp_h):
+                return False
+            if (
+                str(meta.get("dtype") or "") != str(series.dtype)
+                or bool(meta.get("rgb")) != bool(series.rgb)
+            ):
+                return False
             expected_dtypes = [str(ch.dtype) for ch in series.channels]
             stored_dtypes = meta.get("channel_dtypes")
-            if len(set(expected_dtypes)) > 1 and stored_dtypes != expected_dtypes:
+            requires_ch_dtypes = len(set(expected_dtypes)) > 1 or any(
+                "+" in dt or ":" in dt or dt in ("Bgr96Float", "Bgra32")
+                for dt in expected_dtypes
+            )
+            if requires_ch_dtypes and stored_dtypes != expected_dtypes:
                 return False
             expected_labels = [ch.name for ch in series.channels]
             stored_labels = [str((c or {}).get("label") or "") for c in omero_channels]
             if stored_labels != expected_labels:
                 return False
-            expected_px = list(series.pixel_size_um) if series.pixel_size_um is not None else None
-            stored_px = meta.get("pixel_size_um")
-            if expected_px is None:
-                if stored_px is not None:
-                    return False
-            else:
-                if (
-                    not isinstance(stored_px, list)
-                    or len(stored_px) != 2
-                    or not np.allclose(stored_px, expected_px, rtol=1e-6, atol=1e-9)
+            if not _px_matches(meta.get("pixel_size_um"), series.pixel_size_um):
+                return False
+            exp_mag = getattr(
+                series, "magnification", getattr(series, "objective_magnification", None)
+            )
+            stored_mag = meta.get("objective_magnification")
+            if exp_mag is not None:
+                if not isinstance(stored_mag, (int, float)) or not np.isclose(
+                    float(stored_mag), float(exp_mag), rtol=1e-6, atol=1e-9
                 ):
                     return False
+            elif stored_mag is not None:
+                return False
         elif suffix == ".czi":
             from .czi import (
                 _extract_czi_metadata,
@@ -1237,15 +1412,33 @@ def _store_matches_source_semantics(
             lvl0 = _level0_entries(entries)
             if lvl0:
                 s_vals = sorted({e.s for e in lvl0})
-                t_vals = sorted({e.t for e in lvl0})
                 p_idx = int(selection.p)
                 t_idx = int(selection.t)
-                if not (0 <= p_idx < len(s_vals) and 0 <= t_idx < len(t_vals)):
+                if not (0 <= p_idx < len(s_vals)):
                     return False
                 s_pick = s_vals[p_idx]
+                s_entries = [e for e in lvl0 if e.s == s_pick]
+                t_vals = sorted({e.t for e in s_entries})
+                if not (0 <= t_idx < len(t_vals)):
+                    return False
                 t_pick = t_vals[t_idx]
-                st_entries = [e for e in lvl0 if e.s == s_pick and e.t == t_pick]
+                if "czi_scene_t" in meta:
+                    if meta.get("czi_scene_t") != [int(s_pick), int(t_pick)]:
+                        return False
+                else:
+                    legacy_t = sorted({e.t for e in lvl0})
+                    if not (0 <= t_idx < len(legacy_t) and legacy_t[t_idx] == t_pick):
+                        return False
+                st_entries = [e for e in s_entries if e.t == t_pick]
                 if not st_entries:
+                    return False
+                exp_w = max(e.x_start + e.x_size for e in st_entries) - min(
+                    e.x_start for e in st_entries
+                )
+                exp_h = max(e.y_start + e.y_size for e in st_entries) - min(
+                    e.y_start for e in st_entries
+                )
+                if stored_wh is not None and stored_wh != (exp_w, exp_h):
                     return False
                 expected_dtype, expected_rgb, expected_ch_dtypes = _resolve_czi_entries_spec(
                     st_entries
@@ -1256,7 +1449,8 @@ def _store_matches_source_semantics(
                 ):
                     return False
                 requires_ch_dtypes = len(set(expected_ch_dtypes)) > 1 or any(
-                    "+" in dt or dt in ("Bgr96Float", "Bgra32") for dt in expected_ch_dtypes
+                    "+" in dt or ":" in dt or dt in ("Bgr96Float", "Bgra32")
+                    for dt in expected_ch_dtypes
                 )
                 if (
                     requires_ch_dtypes
@@ -1265,9 +1459,11 @@ def _store_matches_source_semantics(
                     return False
                 c_vals = sorted({e.c for e in st_entries})
                 n_c = 3 if expected_rgb else max(1, len(c_vals))
-                _, _, _, expected_channels = _extract_czi_metadata(
+                expected_px_tuple, _, _, expected_channels = _extract_czi_metadata(
                     xml_root, n_c, expected_rgb, c_values=c_vals
                 )
+                if not _px_matches(meta.get("pixel_size_um"), expected_px_tuple):
+                    return False
                 expected_pairs = [
                     (ch.name, _hex_color(ch.color)) for ch in expected_channels
                 ]
@@ -1280,8 +1476,110 @@ def _store_matches_source_semantics(
                 ]
                 if stored_pairs != expected_pairs:
                     return False
-    except Exception:
+        elif suffix == ".nd2":
+            import nd2
+
+            if nd2.is_supported_file(str(slide)):
+                with nd2.ND2File(str(slide)) as f:
+                    sizes = dict(f.sizes)
+                    n_t = int(sizes.get("T", 1))
+                    n_p = int(sizes.get("P", 1))
+                    n_z = int(sizes.get("Z", 1))
+                    if not (
+                        0 <= int(selection.t) < n_t and 0 <= int(selection.p) < n_p
+                    ):
+                        return False
+                    if selection.z not in ("mid", "max"):
+                        try:
+                            z_req = int(selection.z)
+                        except (TypeError, ValueError):
+                            return False
+                        if not (0 <= z_req < n_z):
+                            return False
+                    n_c = int(sizes.get("C", 1))
+                    n_s = int(sizes.get("S", 1))
+                    if n_c > 1 and n_s > 1:
+                        return False
+                    exp_rgb = n_s > 1
+                    exp_channels = n_s if exp_rgb else n_c
+                    exp_w = int(sizes.get("X", 0))
+                    exp_h = int(sizes.get("Y", 0))
+                    if stored_wh is not None and stored_wh != (exp_w, exp_h):
+                        return False
+                    if len(omero_channels) != exp_channels:
+                        return False
+                    if (
+                        str(meta.get("dtype") or "") != str(np.dtype(f.dtype))
+                        or bool(meta.get("rgb")) != exp_rgb
+                    ):
+                        return False
+                    from .reader import _channel_infos, _nd2_pixel_size
+
+                    exp_px, _ = _nd2_pixel_size(f)
+                    if not _px_matches(meta.get("pixel_size_um"), exp_px):
+                        return False
+                    exp_labels = [ch.name for ch in _channel_infos(f, exp_channels, exp_rgb)]
+                    stored_labels = [str((ch or {}).get("label") or "") for ch in omero_channels]
+                    if stored_labels != exp_labels:
+                        return False
+        elif suffix == ".svs":
+            with open(slide, "rb") as fh:
+                magic = fh.read(4)
+            if magic in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"):
+                import tifffile
+
+                from .svs import _aperio_meta
+
+                try:
+                    with tifffile.TiffFile(str(slide)) as tf:
+                        if not tf.series:
+                            return False
+                        series = tf.series[0]
+                        if series.ndim != 3 or series.shape[-1] not in (3, 4):
+                            return False
+                        exp_h, exp_w = int(series.shape[0]), int(series.shape[1])
+                        if stored_wh is not None and stored_wh != (exp_w, exp_h):
+                            return False
+                        if len(omero_channels) != 3:
+                            return False
+                        if (
+                            str(meta.get("dtype") or "")
+                            != str(np.dtype(series.dtype))
+                            or not bool(meta.get("rgb"))
+                        ):
+                            return False
+                        svs_meta = _aperio_meta(tf.pages[0].description or "")
+                        mpp = svs_meta.get("mpp")
+                        exp_px = (
+                            (float(mpp), float(mpp))
+                            if (mpp is not None and mpp > 0)
+                            else None
+                        )
+                        if not _px_matches(meta.get("pixel_size_um"), exp_px):
+                            return False
+                except tifffile.TiffFileError as exc:
+                    if raise_unreadable:
+                        raise SourceUnreadable(str(exc)) from exc
+                    return False
+    except OSError:
         return True
+    except (
+        ValueError,
+        NotImplementedError,
+        ET.ParseError,
+        struct.error,
+        KeyError,
+        IndexError,
+        TypeError,
+        AttributeError,
+        ZeroDivisionError,
+        OverflowError,
+        EOFError,
+        zlib.error,
+    ) as exc:
+        if raise_unreadable:
+            raise SourceUnreadable(f"{type(exc).__name__}: {exc}") from exc
+        return False
     return True
 
 
@@ -1329,6 +1627,7 @@ def _legacy_store(
     selection: PlaneSelection | None = None,
     *,
     read_only: bool = False,
+    tile: int | None = None,
 ) -> Path | None:
     """A complete portable store found beside this source.
 
@@ -1366,7 +1665,16 @@ def _legacy_store(
             continue
         if not _legacy_store_matches_source(cand, slide, attrs):
             continue
-        if not _store_matches_selection(slide, attrs, selection):
+        if (
+            not isinstance((attrs.get("nd2wsi") or {}).get("source_fingerprint"), dict)
+            and slide.is_file()
+        ):
+            try:
+                if (cand / ".zattrs").stat().st_mtime_ns < slide.stat().st_mtime_ns:
+                    continue
+            except OSError:
+                continue
+        if not _store_matches_selection(slide, attrs, selection, tile=tile):
             # built for another timepoint, position, or Z plane/projection
             continue
         return cand
@@ -1453,7 +1761,7 @@ def open_store(path: str | Path) -> tuple[Any, dict[str, Any]]:
 
         root = _ClosableGroup(open_zarr_group(path, prefix="store.ome.zarr", mode="r"))
     else:
-        root = zarr.open_group(filesystem_path(path), mode="r")
+        root = zarr.open_group(Path(filesystem_path(path)), mode="r")
     try:
         attrs = json.loads(json.dumps(dict(root.attrs)))
         if "nd2wsi" not in attrs or "multiscales" not in attrs:

@@ -25,6 +25,7 @@ read with a loud warning.
 from __future__ import annotations
 
 import math
+import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Any
@@ -68,6 +69,8 @@ class PlaneSource:
     magnification: float | None = None  # objective magnification, if recorded
     calibration_source: str = "unknown"  # nd2-voxel-size | aperio-mpp | unknown
     channel_dtypes: list[str] | None = None
+    czi_scene_t: list[int] | None = None  # [resolved S, resolved T] for CZI sources
+    bit_depth: int | None = None  # significant bits per sample if below dtype width
 
 
 class _OpaqueView:
@@ -98,6 +101,18 @@ def _mid(n: int) -> int:
     return n // 2
 
 
+def _nd2_raw_has_invalid_calibration(f: Any) -> bool:
+    """True when raw ND2 metadata explicitly records a non-finite/non-positive dCalibration."""
+    try:
+        rdr = getattr(f, "_rdr", None)
+        raw = rdr._cached_raw_metadata() if rdr is not None else None
+    except Exception:
+        return False
+    if isinstance(raw, dict) and "dCalibration" in raw:
+        return not _finite_positive(raw["dCalibration"])
+    return False
+
+
 def _nd2_pixel_size(f: Any) -> tuple[tuple[float, float] | None, str]:
     """The file's own (y, x) pixel size in um, or None when it has none.
 
@@ -105,9 +120,9 @@ def _nd2_pixel_size(f: Any) -> tuple[tuple[float, float] | None, str]:
     missing calibration, exactly the fabrication this tool refuses to pass
     on. The per-axis ``axesCalibrated`` flags carry the truth, so when they
     are present they decide; when the metadata lacks them, the voxel size
-    is taken at its word.
+    is taken at its word only when channel metadata is actually populated.
     """
-    flags = None
+    flags: tuple[bool, bool] | None = None
     structured_ok = True
     try:
         channels = f.metadata.channels
@@ -117,32 +132,46 @@ def _nd2_pixel_size(f: Any) -> tuple[tuple[float, float] | None, str]:
         # same calibration fields, so take them from there under the same rule
         structured_ok = False
         channels = None
-    if structured_ok:
+
+    if structured_ok and channels:
         try:
-            flags = channels[0].volume.axesCalibrated
+            cal = channels[0].volume.axesCalibrated
+            if isinstance(cal, (list, tuple)) and len(cal) >= 2:
+                flags = (bool(cal[0]), bool(cal[1]))
         except (AttributeError, IndexError, TypeError):
             flags = None  # metadata variant without the flags: fall through
-    else:
-        vol = _nd2_global_volume(f)
-        if vol is not None:
-            flags = vol.get("axesCalibrated")
-            calib = vol.get("axesCalibration")
-            if flags is not None and not (bool(flags[0]) and bool(flags[1])):
-                return None, "unknown"
-            if (
-                isinstance(calib, (list, tuple)) and len(calib) >= 2
-                and _finite_positive(calib[0]) and _finite_positive(calib[1])
-            ):
-                return (float(calib[1]), float(calib[0])), "nd2-volume-calibration"
+
+    vol = _nd2_global_volume(f) if flags is None or not structured_ok or not channels else None
+    if flags is None and vol is not None:
+        cal = vol.get("axesCalibrated")
+        if isinstance(cal, (list, tuple)) and len(cal) >= 2:
+            flags = (bool(cal[0]), bool(cal[1]))
+
+    if flags is not None and not (flags[0] and flags[1]):
         return None, "unknown"
-    if flags is not None and not (bool(flags[0]) and bool(flags[1])):
+
+    if _nd2_raw_has_invalid_calibration(f):
         return None, "unknown"
-    try:
-        vs = f.voxel_size()
-    except Exception:
-        return None, "unknown"
-    if structured_ok and vs is not None and _finite_positive(vs.x) and _finite_positive(vs.y):
-        return (float(vs.y), float(vs.x)), "nd2-voxel-size"
+
+    if (not structured_ok or not channels) and vol is not None:
+        calib = vol.get("axesCalibration")
+        if (
+            isinstance(calib, (list, tuple))
+            and len(calib) >= 2
+            and _finite_positive(calib[0])
+            and _finite_positive(calib[1])
+            and (flags == (True, True) or (not structured_ok and flags is None))
+        ):
+            return (float(calib[1]), float(calib[0])), "nd2-volume-calibration"
+
+    if structured_ok and channels:
+        try:
+            vs = f.voxel_size()
+        except Exception:
+            vs = None
+        if vs is not None and _finite_positive(vs.x) and _finite_positive(vs.y):
+            return (float(vs.y), float(vs.x)), "nd2-voxel-size"
+
     return None, "unknown"
 
 
@@ -165,8 +194,14 @@ def _nd2_raw_planes(f: Any) -> list[tuple[str | None, int | None]]:
         planes = raw.get("sPicturePlanes") if isinstance(raw, dict) else None
         table = (planes.get("sPlaneNew") or planes.get("sPlane") or {}) if isinstance(planes, dict) else {}
         out = []
-        for key in sorted(table, key=lambda k: str(k)):
-            v = table[key]
+        for _key, v in sorted(
+            table.items(),
+            key=lambda kv: (
+                (0, int(m.group(1)))
+                if (m := re.fullmatch(r"[A-Za-z_]*?(\d+)", str(kv[0])))
+                else (1, "")
+            ),
+        ):
             if isinstance(v, dict):
                 out.append((v.get("sDescription"), v.get("uiColor")))
         return out
@@ -283,9 +318,9 @@ def open_plane(
     n_p = sizes.get("P", 1)
     n_z = sizes.get("Z", 1)
 
-    if selection.t >= n_t:
+    if not (0 <= selection.t < n_t):
         raise ValueError(f"--t {selection.t} out of range (T={n_t})")
-    if selection.p >= n_p:
+    if not (0 <= selection.p < n_p):
         raise ValueError(f"--position {selection.p} out of range (P={n_p})")
     if n_p > 1:
         notes.append(
@@ -379,6 +414,12 @@ def plane_view(f: Any, selection: PlaneSelection) -> tuple[np.ndarray, bool]:
     The view is only valid while ``f`` is open. Returns ``(view, rgb)``.
     """
     sizes = dict(f.sizes)
+    n_t = sizes.get("T", 1)
+    n_p = sizes.get("P", 1)
+    if not (0 <= selection.t < n_t):
+        raise ValueError(f"--t {selection.t} out of range (T={n_t})")
+    if not (0 <= selection.p < n_p):
+        raise ValueError(f"--position {selection.p} out of range (P={n_p})")
     coord_axes = [a for a in sizes if a not in FRAME_AXES]
     z_index = resolve_z(selection, sizes.get("Z", 1))
     seq = _seq_index(
@@ -428,7 +469,7 @@ def objective_magnification(f: Any) -> float | None:
     try:
         for ch in f.metadata.channels or []:
             mag = getattr(ch.microscope, "objectiveMagnification", None)
-            if mag:
+            if _finite_positive(mag):
                 return float(mag)
     except Exception:  # pragma: no cover - metadata parsing is best effort
         pass

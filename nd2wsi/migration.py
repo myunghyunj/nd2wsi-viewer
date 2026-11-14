@@ -46,10 +46,15 @@ def cache_entries(container: Path) -> list[tuple[str, Path]]:
             if name.startswith("._") or name == ".DS_Store":
                 continue
             key = path.relative_to(container).as_posix()
+            chunk_pat = (
+                r"\d+(?:\.\d+)*(?:\.corrupt-[0-9a-fA-FT-]+)?"
+                if key.startswith("thumbs.zarr/")
+                else r"\d+(?:\.\d+)*"
+            )
             owned = key == MANIFEST_NAME or (
                 key.startswith((STORE_NAME + "/", "thumbs.zarr/"))
                 and (name in (".zgroup", ".zattrs", ".zarray", ".zmetadata")
-                     or re.fullmatch(r"\d+(?:\.\d+)*", name))
+                     or re.fullmatch(chunk_pat, name))
             )
             if not owned:
                 raise ValueError(f"unknown or user-owned file in cache; preserved: {path}")
@@ -107,9 +112,12 @@ def pack_directory(
     manifest["format"] = (
         "nd2wsi-plate/2" if manifest.get("kind") == "plate" else SINGLE_FILE_FORMAT
     )
-    manifest["source"]["relative_path"] = Path(
-        os.path.relpath(source, target.parent)
-    ).as_posix()
+    try:
+        manifest["source"]["relative_path"] = Path(
+            os.path.relpath(source, target.parent)
+        ).as_posix()
+    except ValueError:  # Windows: source and container on different mounts
+        manifest["source"]["relative_path"] = ""
     manifest.setdefault("storage", {})["container"] = f"nd2svs-sqlite/{storage_version}"
     manifest["migration"] = {
         "from_format": old_format, "nd2wsi_version": __version__,

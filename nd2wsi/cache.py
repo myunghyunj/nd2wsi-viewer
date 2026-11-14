@@ -307,6 +307,15 @@ def is_file_container(path: str | Path) -> bool:
     )
 
 
+def is_managed_cache_path(
+    path: Path | None, manifest: dict[str, Any] | None = None
+) -> bool:
+    """True when ``path`` sits in an auto-managed ``nd2wsi/caches`` folder."""
+    if path is None or (manifest or {}).get("origin") == "export":
+        return False
+    return path.parent.name == CACHES_DIR and path.parent.parent.name == MANAGED_DIR
+
+
 def container_store(container: str | Path) -> Path:
     return Path(container) if is_file_container(container) else Path(container) / STORE_NAME
 
@@ -375,10 +384,15 @@ def write_manifest(
     dtype: str,
     kind: str = "full",
     storage: dict[str, Any] | None = None,
+    origin: str | None = None,
 ) -> None:
     from . import __version__
 
-    manifest = {
+    try:
+        rel_path = Path(os.path.relpath(slide, source_base(container))).as_posix()
+    except ValueError:
+        rel_path = ""
+    manifest: dict[str, Any] = {
         "format": SINGLE_FILE_FORMAT if is_file_container(container) else (
             MANIFEST_FORMAT if kind == "full" else OVERVIEW_FORMAT
         ),
@@ -387,7 +401,7 @@ def write_manifest(
         "generation": uuid.uuid4().hex,
         "source": {
             **fingerprint,
-            "relative_path": Path(os.path.relpath(slide, source_base(container))).as_posix(),
+            "relative_path": rel_path,
         },
         "selection": {**selection, "z_resolved": resolved_z},
         "image": {"shape_cyx": list(shape_cyx), "dtype": dtype},
@@ -401,6 +415,8 @@ def write_manifest(
         },
         "created_by": {"nd2wsi_version": __version__},
     }
+    if origin is not None:
+        manifest["origin"] = origin
     if is_file_container(container):
         from .storage.single_file import write_entry
 
@@ -422,7 +438,11 @@ def read_manifest(container: str | Path, *, recover: bool = False) -> dict[str, 
 
 
 def cache_matches(
-    container: Path, slide: Path, selection: Any, kind: str | None = None
+    container: Path,
+    slide: Path,
+    selection: Any,
+    kind: str | None = None,
+    tile: int | None = None,
 ) -> bool:
     """A cache is valid for this slide and selection, or it is stale.
 
@@ -432,6 +452,8 @@ def cache_matches(
     if m is None or m.get("format") not in KNOWN_FORMATS:
         return False
     if m.get("pyramid", {}).get("algorithm") != ALGORITHM:
+        return False
+    if tile is not None and int((m.get("pyramid") or {}).get("tile") or 0) != int(tile):
         return False
     if kind is not None and m.get("kind", "full") != kind:
         return False

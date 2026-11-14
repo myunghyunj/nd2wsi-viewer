@@ -374,7 +374,7 @@ def _parse_series_element(
             for tag, cname, ccolor in rgb_defs
         ]
     else:
-        dyes = _extract_dye_names(elem, len(raw_chans))
+        dyes = _extract_dye_names(img, len(raw_chans))
         channels = []
         used_names: set[str] = set()
         for idx, (dt, tag, lut, b_inc, res, ch_dtype) in enumerate(raw_chans):
@@ -433,7 +433,7 @@ def _parse_series_element(
     # Objective magnification & lens name
     magnification: float | None = None
     objective_name: str | None = None
-    atl = elem.find(".//ATLConfocalSettingDefinition")
+    atl = img.find(".//ATLConfocalSettingDefinition")
     if atl is not None:
         mag_text = atl.attrib.get("Magnification")
         if _finite_positive(mag_text):
@@ -445,20 +445,23 @@ def _parse_series_element(
     # Optional TileScanInfo positions for stage mosaics (DimID=10)
     tile_positions_px: list[tuple[int, int]] | None = None
     if n_m > 1:
-        tiles = elem.findall(".//Attachment[@Name='TileScanInfo']/Tile")
+        tiles = img.findall("./Attachment[@Name='TileScanInfo']/Tile")
+        if not tiles:
+            tiles = img.findall(".//Attachment[@Name='TileScanInfo']/Tile")
         if len(tiles) == n_m:
             try:
                 if px_um and py_um and all("PosX" in t.attrib and "PosY" in t.attrib for t in tiles):
                     xs_m = [float(t.attrib["PosX"]) for t in tiles]
                     ys_m = [float(t.attrib["PosY"]) for t in tiles]
-                    min_x, min_y = min(xs_m), min(ys_m)
-                    tile_positions_px = [
-                        (
-                            int(round((xm - min_x) * 1e6 / px_um)),
-                            int(round((ym - min_y) * 1e6 / py_um)),
-                        )
-                        for xm, ym in zip(xs_m, ys_m)
-                    ]
+                    if all(math.isfinite(v) for v in xs_m + ys_m):
+                        min_x, min_y = min(xs_m), min(ys_m)
+                        tile_positions_px = [
+                            (
+                                int(round((xm - min_x) * 1e6 / px_um)),
+                                int(round((ym - min_y) * 1e6 / py_um)),
+                            )
+                            for xm, ym in zip(xs_m, ys_m)
+                        ]
                 elif all("FieldX" in t.attrib and "FieldY" in t.attrib for t in tiles):
                     fxs = [int(t.attrib["FieldX"]) for t in tiles]
                     fys = [int(t.attrib["FieldY"]) for t in tiles]
@@ -467,7 +470,7 @@ def _parse_series_element(
                         ((fx - min_fx) * width, (fy - min_fy) * height)
                         for fx, fy in zip(fxs, fys)
                     ]
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, OverflowError):
                 tile_positions_px = None
 
     return _LifSeriesSpec(

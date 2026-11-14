@@ -618,6 +618,7 @@
         geometry.centerOnPreservingZoom(viewer.viewport, target, OSD);
         viewer.forceRedraw();
         renderRoiBoxes();
+        renderLaserItems();
         follow.lastDelta = imageDelta;
       }
       const seqChanged = result.seq !== follow.seq;
