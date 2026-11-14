@@ -3,6 +3,27 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.3</title>
+            <pubDate>Sun, 15 Nov 2026 02:34:08 +0900</pubDate>
+            <sparkle:version>2.6.3</sparkle:version>
+            <sparkle:shortVersionString>2.6.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Path #/? data-loss fix, stitched hierarchical LIFs, CZI/SVS refinements, and single-file convert</h2>
+<ul>
+<li><strong>Path <code>#</code> and <code>?</code> cache and convert data-loss fix (<code>0.8.0–2.6.2</code>).</strong> Slides or output stores whose path contains <code>#</code> or <code>?</code> no longer truncate the Zarr 3 store URL at <code>#</code> or <code>?</code> and delete parent-folder contents during cache creation or <code>nd2wsi convert</code>.</li>
+<li><strong>One-time cache rebuilds on first open.</strong> Caches rebuild once for renamed CZI channels, scene-scoped CZI <code>--t</code>, nested LIFs, 2.6.1 RGB CZI plates missing <code>channel_dtypes</code>, 11+ channel ND2 fallback metadata, and changed semantics. Rebuilds need free disk space and retain superseded caches with a <code>.corrupt-</code> suffix (<code>nd2wsi tidy</code>).</li>
+<li><strong>Saved LUT settings reset for affected scans.</strong> Saved display window and LUT settings reset once for renamed CZI channels, nested LIF parent series, and affected 11+ channel fallback-metadata ND2 scans.</li>
+<li><strong>Hierarchical Leica <code>.lif</code> tile scans.</strong> Nested LIF tile scans open stitched instead of only tile 0. Prior <code>2.6.0–2.6.2</code> sidecars with mismatched dimensions vs level 0 are refused, coordinate-matched marks may be offset, and LIFs opening as a slide leave old plane/site sidecars unreachable.</li>
+<li><strong>CZI scene-scoped <code>--t</code> indexing.</strong> <code>--t</code> now counts timepoints within the selected scene (<code>--position</code>) for Zeiss <code>.czi</code> files instead of using global indices across scenes.</li>
+<li><strong>Single-file <code>.nd2svs</code> output from <code>nd2wsi convert</code>.</strong> <code>nd2wsi convert</code> writes a single-file SQLite <code>.nd2svs</code> container instead of a directory store, with cross-drive and symlinked output support. Re-run <code>nd2wsi convert --overwrite</code> to convert a 2.6.2 directory export safely; user-named exports are protected from <code>Remove cache</code> and in-place shading rewrites.</li>
+<li><strong>16-bit RGB SVS precision and default window.</strong> 16-bit RGB SVS slides preserve <code>uint16</code> precision across direct viewing, histograms, and TIFF ROI export (correcting the <code>2.6.2</code> release notes). Sub-16-bit tags (<code>BitsPerSample &lt; 16</code>, such as 12-bit) open at <code>[0, 2^BitsPerSample - 1]</code>, full 16-bit data opens at <code>[0, 65535]</code>, and <strong>Auto</strong> fits the active range.</li>
+<li><strong>Annotation save and Zstd1 compatibility.</strong> Saves preserve non-finite third-party extension keys, fall back if <code>.window-lock</code> cannot lock on shared mounts, serialize legacy claims, and isolate corrupt legacy site sidecars. Zstd1 CZIs with content sizes decode on older <code>imagecodecs</code> (<code>&gt;= 2026.6.6</code> without).</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.3/nd2wsi-viewer-2.6.3-macos-arm64.dmg" length="133862693" type="application/octet-stream" sparkle:edSignature="IdmIIXs5PKiAi35ddvmcPHGGI81MtpT4yJCvu1rGYryvdKr+8IdzbUOeS2tfdtfG4lyHefEsKyJKFnBWuy3AAw=="/>
+        </item>
+        <item>
             <title>2.6.2</title>
             <pubDate>Sun, 08 Nov 2026 22:55:00 +0900</pubDate>
             <sparkle:version>2.6.2</sparkle:version>
