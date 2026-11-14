@@ -720,6 +720,9 @@ def test_a4_hash_and_question_mark_paths_never_delete_parent_folders(tmp_path: P
     pytest.importorskip("limnd2")
     pytest.importorskip("nd2")
 
+    # NTFS rejects '?' as a filename character, so exercise '?' alongside '#' on POSIX and '#' on Windows.
+    q = "#" if os.name == "nt" else "?"
+
     backend = ZarrV2Storage()
     parent_hash = tmp_path / "Project" / "#12"
     child_dir = parent_hash / "child"
@@ -727,7 +730,7 @@ def test_a4_hash_and_question_mark_paths_never_delete_parent_folders(tmp_path: P
     parent_sentinel = parent_hash / "keep_parent.txt"
     parent_sentinel.write_text("do not delete parent", encoding="utf-8")
 
-    group_path = child_dir / "x?v=1.zarr"
+    group_path = child_dir / f"x{q}v=1.zarr"
     backend.create_group(group_path)
     assert (group_path / ".zgroup").is_file()
     assert parent_sentinel.read_text(encoding="utf-8") == "do not delete parent"
@@ -742,7 +745,7 @@ def test_a4_hash_and_question_mark_paths_never_delete_parent_folders(tmp_path: P
     assert keep_file.read_text(encoding="utf-8") == "keep"
 
     slide_parent = tmp_path / "scan#2"
-    slide_dir = slide_parent / "sub?q"
+    slide_dir = slide_parent / f"sub{q}q"
     slide_dir.mkdir(parents=True)
     scan_sentinel = slide_parent / "scan_sentinel.txt"
     sub_sentinel = slide_dir / "folder_sentinel.txt"
@@ -751,7 +754,7 @@ def test_a4_hash_and_question_mark_paths_never_delete_parent_folders(tmp_path: P
 
     arr = np.ones((64, 64, 1), dtype=np.uint16) * 500
     nd2_path = write_synthetic_nd2(
-        slide_dir / "slide#1?a.nd2",
+        slide_dir / f"slide#1{q}a.nd2",
         arr,
         [("DAPI", "blue")],
         pixel_um=0.5,
@@ -768,8 +771,8 @@ def test_a4_hash_and_question_mark_paths_never_delete_parent_folders(tmp_path: P
     finally:
         reg.close_all(immediate=True)
 
-    out_zarr = slide_dir / "out#1?v=2.ome.zarr"
-    out_svs = slide_dir / "out#1?v=2.nd2svs"
+    out_zarr = slide_dir / f"out#1{q}v=2.ome.zarr"
+    out_svs = slide_dir / f"out#1{q}v=2.nd2svs"
     convert(nd2_path, out_zarr, progress=False)
     convert(nd2_path, out_svs, progress=False)
     for out in (out_zarr, out_svs):
