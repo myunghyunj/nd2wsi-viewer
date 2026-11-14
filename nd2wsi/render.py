@@ -13,6 +13,7 @@ ROI export comes in two flavors:
 from __future__ import annotations
 
 import io
+import math
 import struct
 import threading
 from collections import OrderedDict
@@ -65,6 +66,10 @@ def parse_windows(
             lo, hi = float(parts[0]), float(parts[1])
             g = float(parts[2]) if len(parts) > 2 else 1.0
         except (IndexError, ValueError):
+            continue
+        if not (math.isfinite(lo) and math.isfinite(hi) and math.isfinite(g)):
+            continue
+        if abs(lo) >= _FLOAT32_SAFE_BOUND or abs(hi) >= _FLOAT32_SAFE_BOUND:
             continue
         if hi <= lo:
             hi = lo + 1.0

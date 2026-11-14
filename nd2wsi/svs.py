@@ -366,9 +366,16 @@ def open_svs(stack: ExitStack, path: str | Path, tile: int = 512) -> PlaneSource
     notes = [f"Aperio SVS baseline level ({w} x {h})"]
     if not calibrated:
         notes.append("no MPP in the Aperio metadata; measurements are in pixels")
+    raw_bps = getattr(page, "bitspersample", None)
+    s_dtype = np.dtype(series.dtype)
+    bit_depth = (
+        raw_bps
+        if s_dtype == np.dtype(np.uint16) and isinstance(raw_bps, int) and 0 < raw_bps < 16
+        else None
+    )
     return PlaneSource(
         data=data,
-        dtype=np.dtype(series.dtype),
+        dtype=s_dtype,
         shape=(3, h, w),
         rgb=True,
         channels=[
@@ -382,6 +389,7 @@ def open_svs(stack: ExitStack, path: str | Path, tile: int = 512) -> PlaneSource
         notes=notes,
         magnification=meta.get("magnification"),
         calibration_source="aperio-mpp" if calibrated else "unknown",
+        bit_depth=bit_depth,
     )
 
 
@@ -395,12 +403,30 @@ def collect_svs_info(path: str | Path) -> dict[str, Any]:
         series = tf.series[0]
         meta = _aperio_meta(tf.pages[0].description or "")
         page = tf.pages[0]
+        shape = tuple(int(v) for v in series.shape)
+        axes = str(getattr(series, "axes", "") or "")
+        if axes and len(axes) == len(shape):
+            sizes: dict[str, int] = {ax: dim for ax, dim in zip(axes, shape)}
+        elif len(shape) == 2:
+            sizes = {"Y": shape[0], "X": shape[1], "S": 1}
+        elif len(shape) == 3:
+            sizes = {"Y": shape[0], "X": shape[1], "S": shape[2]}
+        else:
+            sizes = {f"D{i}": dim for i, dim in enumerate(shape)}
+
+        def _level_hw(lv: Any) -> list[int]:
+            lv_shape = tuple(int(v) for v in lv.shape)
+            lv_axes = str(getattr(lv, "axes", "") or "")
+            if len(lv_axes) == len(lv_shape) and "Y" in lv_axes and "X" in lv_axes:
+                return [lv_shape[lv_axes.index("Y")], lv_shape[lv_axes.index("X")]]
+            return list(lv_shape[:2])
+
         out.update(
             {
                 "format": "Aperio SVS (pyramidal TIFF)",
-                "sizes": {"Y": series.shape[0], "X": series.shape[1], "S": series.shape[-1]},
+                "sizes": sizes,
                 "dtype": str(series.dtype),
-                "levels": [list(lv.shape[:2]) for lv in series.levels],
+                "levels": [_level_hw(lv) for lv in series.levels],
                 "tile": [page.tilelength, page.tilewidth] if page.is_tiled else None,
                 "compression": str(page.compression.name),
                 "mpp_um": meta.get("mpp"),

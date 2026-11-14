@@ -53,7 +53,7 @@ Versions 2.1.1–2.1.4 did not start automatic checks, so download the latest re
 manually once if you are upgrading from one of those versions. Automatic checks
 were restored in 2.1.5.
 
-The first open of a stitched ND2 may prepare a viewing cache. Preparation time and disk use depend on the acquisition, compression and storage. Later opens reuse the cache. Supported tiled SVS slides use their embedded pyramid directly.
+The first open of a stitched ND2 may prepare a viewing cache. Preparation time and disk use depend on the acquisition, compression and storage. Later opens reuse a matching cache; upgrades that change derived channel, tile or calibration semantics set the superseded cache aside as `*.corrupt-*` and rebuild once, so free disk space is needed for the rebuild (run `nd2wsi tidy` to clean up superseded copies). Supported tiled SVS slides use their embedded pyramid directly.
 
 JPEG images up to 512 megapixels and PNG images up to 64 megapixels open at their
 stored resolution, subject to a memory check before decoding. Large JPEGs can use
@@ -275,8 +275,11 @@ until the matching source is available. Pins, rulers and ROIs remain separate in
 Older directory caches remain readable. Opening a source scan with a matching
 managed scan-pyramid directory cache creates a verified single-file copy and
 keeps the old directory; deletion of the old copy is a separate explicit cleanup.
-Legacy multi-site plate directory caches are reused read-only without conversion.
-Portable `.ome.zarr` exports
+Matching caches are reused on later opens, while upgrades that change derived
+channel, tile or calibration semantics quarantine the superseded copy as
+`*.corrupt-*` and rebuild once (free disk space is needed; `nd2wsi tidy` removes
+superseded copies). Legacy multi-site plate directory caches are reused read-only
+without conversion. Portable `.ome.zarr` exports
 remain supported and are not converted or removed automatically. A tiled SVS
 normally needs no additional cache.
 

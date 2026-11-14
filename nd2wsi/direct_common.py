@@ -255,10 +255,18 @@ class _SvsLevel:
     walk off the native tile grid or touch zero-filled padding.
     """
 
-    def __init__(self, read, h: int, w: int, extra: int, life: _Lifecycle | None = None):
+    def __init__(
+        self,
+        read,
+        h: int,
+        w: int,
+        extra: int,
+        life: _Lifecycle | None = None,
+        dtype: np.dtype = np.dtype(np.uint8),
+    ):
         self._read = read
         self.shape = (3, h, w)
-        self.dtype = np.dtype(np.uint8)
+        self.dtype = np.dtype(dtype)
         self._extra = extra
         self._life = life
 

@@ -6,6 +6,7 @@ neither their locks nor their edits are placed beside the source slide.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -14,6 +15,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .session_lock import SessionFileLock
+
+_LOCK_TIMEOUT = 10.0
+_READONLY_ERRNOS = (errno.EACCES, errno.EPERM, errno.EROFS)
 
 
 def _read(path: Path) -> bytes | None:
@@ -31,7 +35,7 @@ def revision(raw: bytes | None) -> str:
 def annotation_lock(path: Path):
     """Lock a persistent inode, not the sidecar replaced by atomic saves."""
     lock = SessionFileLock(path.with_name("." + path.name + ".window-lock"))
-    lock.acquire(timeout=10.0)
+    lock.acquire(timeout=_LOCK_TIMEOUT)
     try:
         yield
     finally:
@@ -82,12 +86,20 @@ class AnnotationWorkspace:
         return target
 
     def read(self, path: Path) -> tuple[dict, str]:
-        with annotation_lock(path):
+        lock_path = path.with_name("." + path.name + ".window-lock")
+        if not path.exists() and not lock_path.exists():
+            return {}, revision(None)
+        try:
+            with annotation_lock(path):
+                raw = _read(path)
+        except OSError as exc:
+            if exc.errno not in _READONLY_ERRNOS:
+                raise
             raw = _read(path)
-            document = json.loads(raw) if raw is not None else {}
-            if not isinstance(document, dict):
-                raise ValueError("annotation document must be a JSON object")
-            return document, revision(raw)
+        document = json.loads(raw) if raw is not None else {}
+        if not isinstance(document, dict):
+            raise ValueError("annotation document must be a JSON object")
+        return document, revision(raw)
 
     def write(self, path: Path, payload: dict, expected: object, *, source_path: Path | None = None) -> str:
         with annotation_lock(path):
@@ -108,7 +120,7 @@ class AnnotationWorkspace:
                         "current_revision": current,
                         "payload": payload,
                         "auto_merge": False,
-                    }, indent=1).encode("utf-8"))
+                    }, indent=1, allow_nan=False).encode("utf-8"))
                 except (OSError, TypeError, ValueError) as exc:
                     draft = None
                     draft_error = str(exc)
@@ -118,6 +130,9 @@ class AnnotationWorkspace:
             document = json.loads(previous) if previous is not None else {}
             if not isinstance(document, dict):
                 raise ValueError("annotation document must be a JSON object")
+            # What this server writes must be finite; another tool's preserved
+            # values are written back exactly as that tool stored them.
+            json.dumps(payload, allow_nan=False)
             document.update(payload)
             raw = json.dumps(document, indent=1).encode("utf-8")
             _atomic_write(path, raw)

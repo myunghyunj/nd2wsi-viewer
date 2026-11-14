@@ -166,6 +166,9 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         series = tf.series[0]
         if series.ndim != 3 or series.shape[-1] not in (3, 4):
             raise NotImplementedError(f"unexpected SVS layout {series.shape}")
+        s_dtype = np.dtype(series.dtype)
+        if s_dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
+            raise NotImplementedError(f"unsupported direct SVS dtype {s_dtype}")
         fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
 
         H, W = int(series.shape[0]), int(series.shape[1])
@@ -183,7 +186,7 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         embedded: dict[int, Any] = {}
         for lv in series.levels:
             page = lv.pages[0]
-            if not getattr(page, "is_tiled", False):
+            if not getattr(page, "is_tiled", False) or np.dtype(page.dtype) != s_dtype:
                 continue
             d = max(1, round(H / lv.shape[0]))
             k = d.bit_length() - 1
@@ -219,7 +222,7 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
             # serve exactly what the source holds, so a read scaled by
             # ``e`` can never cross the source edge or its tile grid
             h, w = sh // e, sw // e
-            root[str(k)] = _SvsLevel(readers[src], h, w, e, life)
+            root[str(k)] = _SvsLevel(readers[src], h, w, e, life, dtype=s_dtype)
             served.append((h, w))
         shapes = served
 
@@ -231,9 +234,16 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         raise
     mpp = meta.get("mpp")
     calibrated = mpp is not None and mpp > 0
+    hi = float(np.iinfo(s_dtype).max)
+    raw_bps = getattr(embedded[0][0], "bitspersample", None)
+    end_val = (
+        float((1 << raw_bps) - 1)
+        if s_dtype == np.dtype(np.uint16) and isinstance(raw_bps, int) and 0 < raw_bps < 16
+        else hi
+    )
     src_info = PlaneSource(
         data=None,
-        dtype=np.dtype(np.uint8),
+        dtype=s_dtype,
         shape=(3, H, W),
         rgb=True,
         channels=[
@@ -248,7 +258,7 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         magnification=meta.get("magnification"),
         calibration_source="aperio-mpp" if calibrated else "unknown",
     )
-    windows = [{"start": 0.0, "end": 255.0, "min": 0.0, "max": 255.0}] * 3
+    windows = [{"start": 0.0, "end": end_val, "min": 0.0, "max": hi} for _ in range(3)]
     attrs = build_group_attrs(src_info, shapes, 512, windows)
     attrs["nd2wsi"]["direct"] = True
 

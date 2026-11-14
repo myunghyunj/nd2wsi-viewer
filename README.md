@@ -32,10 +32,10 @@
 
 ## Download
 
-| Platform | Download · 2.6.2 | Requirements |
+| Platform | Download · 2.6.3 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.2/nd2wsi-viewer-2.6.2-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.2/nd2wsi-viewer-2.6.2-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.3/nd2wsi-viewer-2.6.3-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.3/nd2wsi-viewer-2.6.3-windows-x64.zip) | x64 · Windows 11 ARM64 through x64 emulation · WebView2 |
 
 On macOS, drag the app into **Applications**. On Windows, extract the entire ZIP
 and keep `_internal` beside `nd2wsi-viewer.exe`. See the

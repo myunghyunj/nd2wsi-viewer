@@ -22,13 +22,13 @@ python -m pip install ".[nd2export]" \
 ```text
 nd2wsi info FILE
 nd2wsi view FILE [FILE ...]
-nd2wsi convert FILE [OUTPUT.ome.zarr]
+nd2wsi convert FILE [OUTPUT.ome.zarr | OUTPUT.nd2svs]
 nd2wsi crop INPUT.nd2 OUTPUT.nd2 --x X --y Y --w W --h H [--c 0,2]
 nd2wsi serve STORE [STORE ...]
 nd2wsi tidy FOLDER [FOLDER ...]
 ```
 
-`view` opens the browser UI on a local port. `convert` writes a portable OME-Zarr pyramid with every level. `crop` cuts a native ND2 region with no pyramid at all.
+`view` opens the browser UI on a local port. `info` reports metadata and layout for both raw slides and `.ome.zarr` / `.nd2svs` stores. `convert` writes a portable `.ome.zarr` directory or single-file `.nd2svs` pyramid with every level. `crop` cuts a native ND2 region with no pyramid at all.
 
 ## How it works
 

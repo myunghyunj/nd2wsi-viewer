@@ -480,7 +480,7 @@ def _plate_group(container: Path, mode: str):
         from .storage.single_file import open_zarr_group
         return open_zarr_group(container, prefix=THUMBS_NAME, mode=mode)
     import zarr
-    return zarr.open_group(filesystem_path(container / THUMBS_NAME), mode=mode, zarr_format=2)
+    return zarr.open_group(Path(filesystem_path(container / THUMBS_NAME)), mode=mode, zarr_format=2)
 
 
 def _close_plate_group(root: Any) -> None:
@@ -693,15 +693,25 @@ class PlateStore:
         if explicit and (manifest is None or not cls._matches(manifest, fingerprint, shape, source)):
             raise ValueError('explicit plate cache is missing or does not match its source')
         if container.is_dir():
-            if manifest is None or not cls._matches(manifest, fingerprint, shape, source):
+            if manifest is not None and cls._matches(manifest, fingerprint, shape, source):
+                root = None
+                try:
+                    root = _plate_group(container, 'r')
+                    cls._validate_root(
+                        root, shape, source.dtype, require_digest=_has_integrity(manifest)
+                    )
+                    return cls(source, container, root, manifest, None)
+                except Exception:
+                    _close_plate_group(root)
+                    if explicit:
+                        raise
+                except BaseException:
+                    _close_plate_group(root)
+                    raise
+            elif explicit:
                 raise ValueError('legacy plate cache does not match its source')
-            root = _plate_group(container, 'r')
-            try:
-                cls._validate_root(root, shape, source.dtype, require_digest=_has_integrity(manifest))
-                return cls(source, container, root, manifest, None)
-            except BaseException:
-                _close_plate_group(root)
-                raise
+            container = plate_container(source.path)
+            manifest = cls._read(container, recover=True)
         container.parent.mkdir(parents=True, exist_ok=True)
         writer = PlateWriterLock(container)
         try:
@@ -909,8 +919,10 @@ class PlateStore:
             )
         ]
         stored_ch_dtypes = thumbs.get("channel_dtypes")
-        requires_ch_dtypes = len(set(ch_dtypes)) > 1 or any(
-            "+" in dt or dt in ("Bgr96Float", "Bgra32") for dt in ch_dtypes
+        requires_ch_dtypes = (
+            len(set(ch_dtypes)) > 1
+            or any("+" in dt or ":" in dt or dt in ("Bgr96Float", "Bgra32") for dt in ch_dtypes)
+            or bool(getattr(source, "_requires_manifest_channel_dtypes", False))
         )
         if requires_ch_dtypes:
             ch_dtypes_ok = stored_ch_dtypes == ch_dtypes
@@ -1990,6 +2002,24 @@ class PlateSource:
             by_tzc.setdefault((sb.t, sb.z, sb.c), []).append(sb)
         self._czi_by_tz = by_tz
         self._czi_by_tzc = by_tzc
+        self._requires_manifest_channel_dtypes = False
+        if self.rgb and (self.Z > 1 or self.T > 1):
+            needs_zero_bg_tag = any(
+                len(z_sbs := by_tz.get((t_val, z_val), ())) == 0
+                or (
+                    len(z_sbs) == 1
+                    and (
+                        z_sbs[0].x_start != x0
+                        or z_sbs[0].y_start != y0
+                        or z_sbs[0].x_size != width
+                        or z_sbs[0].y_size != height
+                    )
+                )
+                for t_val in t_values
+                for z_val in z_values
+            )
+            if needs_zero_bg_tag:
+                self._requires_manifest_channel_dtypes = True
 
         pixel_size_um, cal_source, magnification, channels = _extract_czi_metadata(
             xml_root, n_c, self.rgb, c_values=c_values

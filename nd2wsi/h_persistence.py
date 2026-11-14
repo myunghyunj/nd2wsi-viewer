@@ -225,11 +225,15 @@ class PreparedReplacement:
         self._lock = CacheLock(self.final)
         if self.final.suffix.lower() != ".nd2svs" or self.source.suffix.lower() != ".nd2":
             raise ValueError("Persistent correction requires the original ND2 and its .nd2svs cache")
+        if not getattr(state, "managed_cache", True):
+            raise ValueError("Persistent correction requires a managed .nd2svs cache, not an exported file")
         self._lock.acquire(timeout=0)
         try:
             self._container_identity = _identity(self.final)
             self._source_identity = _identity(self.source, single_link=False)
             self.prior_manifest = read_manifest(self.final)
+            if (self.prior_manifest or {}).get("origin") == "export":
+                raise ValueError("Persistent correction requires a managed .nd2svs cache, not an exported file")
             if (not self.prior_manifest
                     or self.prior_manifest.get("format") not in (SINGLE_FILE_FORMAT, CORRECTED_SINGLE_FILE_FORMAT)
                     or self.prior_manifest.get("kind") not in ("full", "overview")

@@ -194,9 +194,12 @@ class ZarrV2ChunkArray:
         metadata = json.loads((self._path / ".zarray").read_text(encoding="utf-8"))
         if metadata.get("order", "C") != "C":
             raise ValueError("expected C-order chunks")
+        if metadata.get("filters"):
+            raise ValueError("direct storage does not apply filters")
         if metadata.get("fill_value", 0) not in (0, 0.0, None):
             raise ValueError("direct storage requires a zero fill value")
-        self._codec = numcodecs.get_codec(metadata["compressor"])
+        comp = metadata.get("compressor")
+        self._codec = None if comp is None else numcodecs.get_codec(comp)
         self._separator = metadata.get("dimension_separator", ".")
         self.chunk_shape = tuple(int(value) for value in metadata["chunks"])
 
@@ -218,7 +221,7 @@ class ZarrV2ChunkArray:
             payload = path.read_bytes()
         except FileNotFoundError:
             return None
-        decoded = self._codec.decode(payload)
+        decoded = bytes(payload) if self._codec is None else self._codec.decode(payload)
         return np.frombuffer(decoded, self.dtype).reshape(self.chunk_shape)
 
     def read(self, index: tuple[int, ...]) -> np.ndarray:
@@ -245,7 +248,9 @@ class ZarrV2ChunkArray:
         if not block.any():
             path.unlink(missing_ok=True)
             return False
-        path.write_bytes(self._codec.encode(np.ascontiguousarray(block)))
+        contig = np.ascontiguousarray(block)
+        encoded = contig.tobytes() if self._codec is None else self._codec.encode(contig)
+        path.write_bytes(encoded)
         return True
 
 
@@ -263,7 +268,9 @@ class ZarrV2Storage:
     def create_group(self, path: str | Path) -> Any:
         import zarr
 
-        return zarr.open_group(filesystem_path(path), mode="w", zarr_format=2)
+        # A str is parsed as a URL by zarr 3 ('#'/'?' truncate it); a Path is
+        # taken literally. "w-" never clears a pre-existing directory.
+        return zarr.open_group(Path(filesystem_path(path)), mode="w-", zarr_format=2)
 
     def create_array(
         self,

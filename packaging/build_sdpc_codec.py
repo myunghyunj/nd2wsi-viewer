@@ -151,16 +151,42 @@ def build_pyav(source: Path, prefix: Path, python: str, wheel_dir: Path,
          *wheel_options], cwd=source, env=env)
 
 
+def preflight_check(msys_bash: str | None = None) -> tuple[str, str]:
+    """Verify native build tools exist before downloading source tarballs."""
+    system, machine = platform.system(), platform.machine().lower()
+    if (system, machine) not in {("Darwin", "arm64"), ("Windows", "amd64"), ("Windows", "x86_64")}:
+        raise SystemExit(
+            "this host cannot build the SDPC codec; set ND2WSI_SDPC_CODEC_MANIFEST to a prebuilt "
+            "x64 codec manifest (supported release targets: native macOS arm64 and Windows x64)"
+        )
+    if system == "Windows":
+        bash = Path(msys_bash or r"C:\msys64\usr\bin\bash.exe")
+        if not bash.is_file():
+            raise SystemExit("MSYS2 bash is required; pass --msys-bash PATH")
+        if not (bash.parent / "make.exe").is_file():
+            raise SystemExit("Install make in the selected MSYS2 environment (pacman -S make)")
+        if not ((bash.parent / "cmp.exe").is_file() or (bash.parent / "diff.exe").is_file()):
+            raise SystemExit("Install diffutils in the selected MSYS2 environment (pacman -S diffutils)")
+        if not shutil.which("cl.exe"):
+            raise SystemExit("Run in an x64 MSVC developer environment (cl.exe missing)")
+    return system, machine
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True, help="new or empty output directory")
+    parser.add_argument("--output", type=Path, help="new or empty output directory")
+    parser.add_argument("--preflight", action="store_true", help="verify native build prerequisites and exit")
     parser.add_argument("--source-cache", type=Path, help="optional pinned source archive cache")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 2, 8))
     parser.add_argument("--msys-bash", help="Windows MSYS2 bash.exe (default C:\\msys64\\usr\\bin\\bash.exe)")
     args = parser.parse_args()
-    system, machine = platform.system(), platform.machine().lower()
-    if (system, machine) not in {("Darwin", "arm64"), ("Windows", "amd64"), ("Windows", "x86_64")}:
-        raise SystemExit("Supported release targets are native macOS arm64 and Windows x64")
+    if args.preflight:
+        preflight_check(args.msys_bash)
+        print("SDPC codec build preflight OK", flush=True)
+        return
+    if args.output is None:
+        parser.error("--output is required unless --preflight is set")
+    system, _machine = preflight_check(args.msys_bash)
     if args.jobs < 1:
         raise SystemExit("--jobs must be positive")
     output = args.output.resolve()
