@@ -2150,6 +2150,21 @@ async function exportAstromap(includePdf = false) {
   }
 }
 
+function reviewAstromapImport(pending) {
+  return window.Nd2AstromapImport.review(pending.text,
+    { width: Number($("astromap-import-width").value), height: Number($("astromap-import-height").value) },
+    { repairZeroArea: $("astromap-import-repair").checked === true });
+}
+
+function showAstromapImportReview(review) {
+  $("astromap-import-review").hidden = !review?.issues.length;
+  $("astromap-import-review-summary").textContent = review
+    ? `${review.skippedCount} skipped · ${review.repairedCount} repaired` : "";
+  // Use textContent: notes and malformed rows are user text, never HTML.
+  $("astromap-import-review-details").textContent = review
+    ? review.issues.map(issue => `${issue.repaired ? "Repaired" : "Skipped"}: ${issue.message}\nOriginal: ${issue.raw}`).join("\n\n") : "";
+}
+
 function refreshAstromapImport(ready = astromapReady()) {
   const pending = state.astromap.pendingImport;
   const busy = !!state.astromap.importReading;
@@ -2159,9 +2174,20 @@ function refreshAstromapImport(ready = astromapReady()) {
   const size = [Number($("astromap-import-width").value), Number($("astromap-import-height").value)];
   const validSize = size.every((n) => Number.isSafeInteger(n) && n > 0);
   const current = pending && pending.contextKey === activeFrameContext()?.key;
+  let review = null;
+  if (pending && current && validSize) {
+    try {
+      review = reviewAstromapImport(pending);
+      $("astromap-import-name").textContent = `${pending.name} · ${review.count} of ${review.total} regions ready`;
+      $("astromap-import-repair-row").hidden = !review.issues.some(issue => issue.repairable);
+      showAstromapImportReview(review);
+    } catch (error) { $("astromap-import-status").textContent = error.message; }
+  }
   if (pending && !current)
     $("astromap-import-status").textContent = "The displayed image changed. Choose the TXT again for the intended image.";
-  $("astromap-import-confirm").disabled = !ready || busy || !current || !validSize;
+  $("astromap-import-confirm").disabled = !ready || busy || !current || !review?.count;
+  $("astromap-import-confirm").textContent = review?.skippedCount ? `Import ${review.count} valid regions` : "Import regions";
+  $("astromap-import-repair").disabled = busy || !current;
   $("astromap-import-jpg").disabled = !ready || busy || !current;
   $("astromap-import-width").disabled = $("astromap-import-height").disabled = busy;
 }
@@ -2172,6 +2198,8 @@ async function readAstromapImportFile(file) {
   const seq = state.astromap.importSeq = (state.astromap.importSeq || 0) + 1;
   state.astromap.pendingImport = null;
   state.astromap.importReading = true;
+  $("astromap-import-repair").checked = false;
+  showAstromapImportReview(null);
   $("astromap-import-status").textContent = "Reading ROI coordinates…";
   refreshAstromapImport();
   try {
@@ -2182,19 +2210,13 @@ async function readAstromapImportFile(file) {
       throw new Error("The displayed image changed. Choose the TXT again for the intended image.");
     const size = state.info.raster ? { width: state.info.width, height: state.info.height }
       : window.Nd2Astromap.exportSize(state.info.width, state.info.height);
-    let parsed;
-    try { parsed = window.Nd2AstromapImport.parse(text); }
-    catch (error) {
-      // Include an independent reference-size mismatch in a malformed-file
-      // diagnostic. Valid files still reach the explicit dimension controls.
-      window.Nd2AstromapImport.parse(text, size);
-      throw error;
-    }
-    state.astromap.pendingImport = { rows: parsed.rows, contextKey, name: file.name };
+    // File-level failures remain fatal. Row-level problems are reviewed before
+    // append, using the original text again whenever dimensions/options change.
+    window.Nd2AstromapImport.review(text);
+    state.astromap.pendingImport = { text, contextKey, name: file.name };
     $("astromap-import-width").value = size.width;
     $("astromap-import-height").value = size.height;
-    $("astromap-import-name").textContent = `${file.name} · ${parsed.count} regions`;
-    $("astromap-import-status").textContent = "Check the JPG dimensions, then select Import regions.";
+    $("astromap-import-status").textContent = "Confirm the coordinate image size and review any skipped regions. The original TXT stays unchanged.";
     return true;
   } catch (error) {
     if (seq === state.astromap.importSeq) $("astromap-import-status").textContent = error.message;
@@ -2239,19 +2261,23 @@ function commitAstromapImport() {
   try {
     if (pending.contextKey !== activeFrameContext()?.key)
       throw new Error("The displayed image changed. Choose the TXT again for the intended image.");
-    const boxes = window.Nd2AstromapImport.mapToSource(pending.rows,
+    const review = reviewAstromapImport(pending);
+    showAstromapImportReview(review);
+    if (!review.count) throw new Error("No valid regions to import. Check the image dimensions or review the rows below.");
+    const boxes = window.Nd2AstromapImport.mapToSource(review.rows,
       { width: Number($("astromap-import-width").value), height: Number($("astromap-import-height").value) },
       { width: state.info.width, height: state.info.height });
     if (astromapItems().length + boxes.length > 2000) throw new Error("Astromap supports up to 2000 regions");
     closeEditor(true);
-    // Validate every row first, then append once, keeping imported overlaps
-    // and the current frame's existing annotations unchanged.
+    // Map every accepted row before appending once. Existing annotations and
+    // original TXT coordinates remain unchanged; omitted rows stay in the report.
     const imported = boxes.map((box) => ({ id: "a" + Date.now().toString(36) + annCounter++, ...box }));
     state.annotations.push(...imported);
     state.astromap.activeId = imported[0]?.id || state.astromap.activeId;
     state.astromap.pendingImport = null;
     annotationsChanged();
-    $("astromap-import-status").textContent = `Imported ${boxes.length} regions from ${pending.name}.`;
+    $("astromap-import-status").textContent = `Imported ${boxes.length} regions from ${pending.name}.` +
+      (review.issues.length ? ` ${review.skippedCount} skipped; ${review.repairedCount} repaired. See row details below.` : "");
     return true;
   } catch (error) {
     $("astromap-import-status").textContent = error.message;
@@ -2276,12 +2302,14 @@ function wireAstromapImport() {
   $("astromap-import-cancel").onclick = () => {
     state.astromap.importSeq = (state.astromap.importSeq || 0) + 1;
     state.astromap.pendingImport = null;
+    showAstromapImportReview(null);
     state.astromap.importReading = false;
     $("astromap-import-status").textContent = "";
     refreshAstromapImport();
   };
   for (const id of ["astromap-import-width", "astromap-import-height"])
     $(id).oninput = () => refreshAstromapImport();
+  $("astromap-import-repair").onchange = () => refreshAstromapImport();
 }
 
 function wireAstromap() {

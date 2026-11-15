@@ -230,12 +230,19 @@
             <button type="button" id="astromap-import-jpg" class="btn">Choose matching small.jpg</button>
             <input type="file" id="astromap-import-jpg-file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" hidden />
           </div>
+          <label id="astromap-import-repair-row" class="hint" hidden>
+            <input type="checkbox" id="astromap-import-repair" /> Restore zero-size dimensions to 1 pixel
+          </label>
           <div class="tool-row footer">
             <button type="button" id="astromap-import-cancel" class="btn">Cancel</button>
             <button type="button" id="astromap-import-confirm" class="btn primary grow2">Import regions</button>
           </div>
         </div>
         <p id="astromap-import-status" class="hint" role="status" aria-live="polite"></p>
+        <details id="astromap-import-review" hidden>
+          <summary id="astromap-import-review-summary"></summary>
+          <pre id="astromap-import-review-details"></pre>
+        </details>
         <div class="tool-row">
           <button type="button" id="astromap-draw" class="btn">Draw ROI</button>
           <button type="button" id="astromap-add-current" class="btn">Add current region</button>

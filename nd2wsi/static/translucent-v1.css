@@ -41,6 +41,12 @@ body { user-select: none; -webkit-user-select: none; }
 [data-locked="true"] #opacity-control { opacity: .3; }
 #overlay-status { position: absolute; left: 18px; right: 18px; top: 50%; transform: translateY(-50%); color: white; font-size: 13px; line-height: 1.45; text-align: center; text-shadow: 0 1px 4px #000, 0 0 8px #000; pointer-events: none; }
 #overlay-status[hidden] { display: none; }
+#roi-import-review { position: absolute; left: 14px; bottom: 48px; max-width: calc(100% - 28px); max-height: calc(100% - 108px); overflow: auto; z-index: 3; padding: 7px 10px; border-radius: 8px; background: rgba(25,25,25,.9); color: #fff; font-size: 12px; line-height: 1.4; }
+#roi-import-review[hidden], #roi-import-repair[hidden] { display: none; }
+#roi-import-summary { cursor: pointer; }
+#roi-import-issues { max-width: 520px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; font: 11px/1.5 ui-monospace, SFMono-Regular, monospace; }
+#roi-import-repair { max-width: 100%; padding: 5px 8px; border: 1px solid #777; border-radius: 5px; background: #333; color: #fff; font: inherit; cursor: pointer; }
+#roi-import-repair:disabled { opacity: .4; cursor: default; }
 .resize-handle { position: absolute; z-index: 2; touch-action: none; }
 [data-edge="n"], [data-edge="s"] { height: 7px; left: 18px; right: 18px; cursor: ns-resize; }
 [data-edge="n"] { top: 0; } [data-edge="s"] { bottom: 0; }

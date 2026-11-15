@@ -191,12 +191,15 @@ def test_invalid_200_roi_pair_reports_both_data_issues_and_preserves_loaded_list
       const accepted=m.setRois({ok:true,name:'200.txt',text,coordinateSize:{width:8000,height:5830}});
       return {accepted,name:m.state.roiName,label:h.element('roi-index').textContent,
         error:h.element('overlay-status').textContent,
+        issues:h.element('roi-import-issues').textContent,review:m.state.importReview,
         unchanged:JSON.stringify(before)===JSON.stringify({camera:api.camera(h.viewer),rois:m.state.rois})};
     """)
     assert result["accepted"] is False and result["unchanged"]
     assert result["name"] == "valid.txt" and result["label"] == "1/1"
-    assert "INDEX 199 has zero area (4877, 8248) → (4876, 8247)" in result["error"]
-    assert "125 regions are outside" in result["error"] and "first INDEX 58" in result["error"]
+    assert "INDEX 199 has zero area (4877, 8248) → (4876, 8247)" in result["issues"]
+    assert result["review"]["skippedCount"] == 126
+    assert "first INDEX 58" in result["issues"] and "first INDEX 182" in result["issues"]
+    assert "aspect ratios" in result["error"]
 
 
 def test_native_resize_anchor_follows_minimum_dimensions():
@@ -278,6 +281,102 @@ def test_canonical_pair_mapping_failure_keeps_imported_source_boxes_and_camera()
     assert result["label"] == "1/1"
     assert "aspect ratios" in result["error"]
     assert result["unchanged"] is True
+
+
+def test_partial_txt_import_keeps_problem_rows_visible_after_navigation_without_mutating_input():
+    result = run(r"""
+      const h=harness(),m=h.mounted;
+      const input={ok:true,name:'mixed.txt',coordinateSize:{width:1000,height:500},
+        text:'INDEX\tX1\tY1\tX2\tY2\tNOTE\n7\t10\t20\t10\t20\t정상\n41\t50\t43\t50\t42\t<img src=x>\n93\t90\t80\t91\t82\tlast'};
+      const before=JSON.stringify(input),accepted=m.setRois(input);
+      const summary=h.element('roi-import-summary').textContent,issues=h.element('roi-import-issues').textContent;
+      m.selectRoi(1);
+      return {accepted,rois:m.state.rois,summary,issues,
+        after:h.element('roi-import-summary').textContent,hidden:h.element('roi-import-review').hidden,
+        repairHidden:h.element('roi-import-repair').hidden,unchanged:before===JSON.stringify(input)};
+    """)
+    assert result["accepted"] is True and result["unchanged"] is True
+    assert [roi["index"] for roi in result["rois"]] == [7, 93]
+    assert result["rois"][0]["label"] == "정상"
+    assert result["summary"] == result["after"] == "Imported 2 ROIs · 1 skipped · 0 repaired"
+    assert "Line 3" in result["issues"] and "INDEX 41" in result["issues"]
+    assert "41\t50\t43\t50\t42\t<img src=x>" in result["issues"]
+    assert result["hidden"] is False and result["repairHidden"] is False
+
+
+def test_explicit_tracing_repair_preserves_original_txt_and_selected_roi_without_moving_camera():
+    result = run(r"""
+      const h=harness(),m=h.mounted;
+      const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n41\t50\t43\t50\t42\tpoint\n93\t90\t80\t91\t82\tlast';
+      m.setRois({ok:true,name:'mixed.txt',coordinateSize:{width:1000,height:500},text});
+      const before=api.camera(h.viewer),selected=m.state.rois[m.state.roiIndex].index;
+      const repaired=h.element('roi-import-repair').listeners.click();
+      return {repaired,rois:m.state.rois,selected,after:m.state.rois[m.state.roiIndex].index,
+        cameraUnchanged:JSON.stringify(before)===JSON.stringify(api.camera(h.viewer)),
+        unchanged:m.state.importResult.text===text,summary:h.element('roi-import-summary').textContent,
+        issues:h.element('roi-import-issues').textContent,hidden:h.element('roi-import-repair').hidden};
+    """)
+    assert result["repaired"] and result["cameraUnchanged"] and result["unchanged"]
+    assert result["selected"] == result["after"] == 93
+    assert result["rois"][0] == {"x": 50, "y": 43, "w": 1, "h": 1,
+                                  "index": 41, "label": "point"}
+    assert result["summary"] == "Imported 2 ROIs · 0 skipped · 1 repaired"
+    assert "Repaired:" in result["issues"] and "41\t50\t43\t50\t42\tpoint" in result["issues"]
+    assert result["hidden"] is True
+
+
+def test_new_header_invalid_txt_clears_old_repair_action_but_preserves_current_rois():
+    result = run(r"""
+      const h=harness(),m=h.mounted;
+      m.setRois({ok:true,name:'mixed.txt',coordinateSize:{width:1000,height:500},
+        text:'INDEX\tX1\tY1\tX2\tY2\tNOTE\n41\t50\t43\t50\t42\tpoint\n93\t90\t80\t91\t82\tlast'});
+      const before=JSON.stringify(m.state.rois),camera=JSON.stringify(api.camera(h.viewer));
+      const accepted=m.setRois({ok:true,name:'bad-header.txt',coordinateSize:{width:1000,height:500},text:'not an ROI header'});
+      return {accepted,unchanged:before===JSON.stringify(m.state.rois),
+        cameraUnchanged:camera===JSON.stringify(api.camera(h.viewer)),
+        result:m.state.importResult,review:m.state.importReview,
+        hidden:h.element('roi-import-review').hidden,repairHidden:h.element('roi-import-repair').hidden,
+        disabled:h.element('roi-import-repair').disabled,repair:m.repairRois(),
+        error:h.element('overlay-status').textContent};
+    """)
+    assert result["accepted"] is False and result["unchanged"] and result["cameraUnchanged"]
+    assert result["result"] is None and result["review"] is None
+    assert result["hidden"] and result["repairHidden"] and result["disabled"]
+    assert result["repair"] is False and "header" in result["error"]
+
+
+def test_all_invalid_tracing_import_preserves_current_rois_and_repair_is_blocked_while_locked():
+    result = run(r"""
+      const h=harness({initialContext:{rois:[{x:10,y:10,w:1,h:1,index:99}],roiIndex:0}}),m=h.mounted;
+      const before=api.camera(h.viewer),rois=JSON.stringify(m.state.rois);
+      const accepted=m.setRois({ok:true,name:'empty.txt',coordinateSize:{width:1000,height:500},
+        text:'INDEX\tX1\tY1\tX2\tY2\tNOTE\n41\t50\t43\t50\t42\tpoint'});
+      const retained=rois===JSON.stringify(m.state.rois),cameraUnchanged=JSON.stringify(before)===JSON.stringify(api.camera(h.viewer));
+      await m.toggleLock();
+      const disabled=h.element('roi-import-repair').disabled,blocked=m.repairRois();
+      await m.toggleLock();
+      const repaired=m.repairRois();
+      return {accepted,retained,cameraUnchanged,disabled,blocked,repaired,rois:m.state.rois,
+        summary:h.element('roi-import-summary').textContent};
+    """)
+    assert result["accepted"] is False and result["retained"] and result["cameraUnchanged"]
+    assert result["disabled"] is True and result["blocked"] is False and result["repaired"] is True
+    assert result["rois"] == [{"x": 50, "y": 43, "w": 1, "h": 1, "index": 41, "label": "point"}]
+    assert result["summary"] == "Imported 1 ROIs · 0 skipped · 1 repaired"
+
+
+def test_repaired_tracing_coordinates_still_require_matching_aspect_ratio():
+    result = run(r"""
+      const h=harness({initialContext:{rois:[{x:10,y:10,w:1,h:1,index:99}],roiIndex:0}}),m=h.mounted;
+      const before=JSON.stringify(m.state.rois),camera=JSON.stringify(api.camera(h.viewer));
+      m.setRois({ok:true,name:'wrong.txt',coordinateSize:{width:1000,height:1000},
+        text:'INDEX\tX1\tY1\tX2\tY2\tNOTE\n41\t50\t43\t50\t42\tpoint'});
+      const repaired=m.repairRois();
+      return {repaired,unchanged:before===JSON.stringify(m.state.rois),
+        cameraUnchanged:camera===JSON.stringify(api.camera(h.viewer)),error:h.element('overlay-status').textContent};
+    """)
+    assert result["repaired"] is False and result["unchanged"] and result["cameraUnchanged"]
+    assert "aspect ratios" in result["error"]
 
 
 @pytest.mark.parametrize("selected", [-1, 1])
