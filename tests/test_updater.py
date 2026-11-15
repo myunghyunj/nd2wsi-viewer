@@ -99,6 +99,38 @@ def test_inject_rejects_unpinned_framework(tmp_path):
         )
 
 
+def test_lab_bundle_keeps_pinned_sparkle_but_removes_the_public_feed_and_schedule(tmp_path):
+    app, plist, framework = _fake_app_and_framework(tmp_path)
+    info = plistlib.loads(plist.read_bytes())
+    info.update(ND2WSIEdition="SLACS-module", ND2WSIUpdatesOff=True,
+                CFBundleIdentifier="com.nd2wsi.viewer.slacs",
+                SUFeedURL="https://old.example.invalid/appcast.xml", SUScheduledCheckInterval=3600,
+                SUEnableAutomaticChecks=True)
+    plist.write_bytes(plistlib.dumps(info))
+    copied = inject_sparkle.inject(
+        app=app, framework=framework,
+        feed_url="https://updates.example.invalid/appcast.xml", public_ed_key=PUBLIC_KEY,
+    )
+    result = plistlib.loads(plist.read_bytes())
+    assert result["CFBundleIdentifier"] == "com.nd2wsi.viewer.slacs"
+    assert result["ND2WSIEdition"] == "SLACS-module"
+    assert result["SUEnableAutomaticChecks"] is False
+    assert result["SUAutomaticallyUpdate"] is False and result["SUAllowsAutomaticUpdates"] is False
+    assert "SUFeedURL" not in result and "SUScheduledCheckInterval" not in result
+    assert result["SUPublicEDKey"] == PUBLIC_KEY
+    assert (copied / "Versions/Current/Sparkle").read_bytes() == b"fake"
+
+
+def test_lab_bundle_still_rejects_an_unpinned_sparkle_framework(tmp_path):
+    app, plist, framework = _fake_app_and_framework(tmp_path, version="2.9.5")
+    info = plistlib.loads(plist.read_bytes())
+    info["ND2WSIUpdatesOff"] = True
+    plist.write_bytes(plistlib.dumps(info))
+    with pytest.raises(ValueError, match="expected Sparkle 2.9.6"):
+        inject_sparkle.inject(app=app, framework=framework,
+                              feed_url="https://updates.example.invalid/appcast.xml", public_ed_key=PUBLIC_KEY)
+
+
 def test_strict_relaunch_close_waits_and_closes_plate_without_timeout():
     registry = SlideRegistry()
     life = _Lifecycle()

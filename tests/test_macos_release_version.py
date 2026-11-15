@@ -11,7 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def write_release_plist(tmp_path, builder, version):
+def write_release_plist(tmp_path, builder, version, *, slacs_revision=None):
     text = (ROOT / "packaging" / builder).read_text()
     if builder == "build_mac_app.sh":
         script = text.split("<< 'PLISTEOF'\n", 1)[1].split("\nPLISTEOF", 1)[0]
@@ -26,7 +26,13 @@ def write_release_plist(tmp_path, builder, version):
     target.write_bytes(original)
     project = tmp_path / "pyproject.toml"
     project.write_text(f'[project]\nversion = "{version}"\n')
-    completed = subprocess.run([sys.executable, "-", str(target), str(project)],
+    if slacs_revision is not None:
+        edition = tmp_path / "nd2wsi/edition.py"
+        edition.parent.mkdir()
+        edition.write_text((ROOT / "nd2wsi/edition.py").read_text().replace(
+            "REVISION = 1", f"REVISION = {slacs_revision}"))
+    completed = subprocess.run([sys.executable, "-", str(target), str(project),
+                                str(ROOT / "packaging/macos_bundle_identity.py")],
                                input=script, text=True, capture_output=True, timeout=30)
     return completed, target, original
 
@@ -67,3 +73,37 @@ def test_project_and_locked_package_version_match():
     packages = tomllib.loads((ROOT / "uv.lock").read_text())["package"]
     locked = next(item for item in packages if item["name"] == project["name"])
     assert project["version"] == locked["version"]
+
+
+@pytest.mark.parametrize("revision,suffix", [(1, ""), (2, ".2")])
+def test_slacs_mac_bundle_has_a_distinct_install_identity_and_disabled_update_policy(tmp_path, revision, suffix):
+    completed, target, _ = write_release_plist(tmp_path, "build_mac_app.sh", "2.6.4", slacs_revision=revision)
+    assert completed.returncode == 0, completed.stderr
+    info = plistlib.loads(target.read_bytes())
+    assert info["CFBundleIdentifier"] == "com.nd2wsi.viewer.slacs"
+    assert info["CFBundleName"] == info["CFBundleDisplayName"] == "nd2wsi-viewer SLACS"
+    assert info["ND2WSIPackageVersion"] == info["CFBundleVersion"] == "2.6.4"
+    assert info["ND2WSIReleaseVersion"] == f"2.6.4_SLACS-module{suffix}"
+    assert info["ND2WSIEdition"] == "SLACS-module" and info["ND2WSIUpdatesOff"] is True
+    assert info["ND2WSIDevelopmentOnly"] is False
+    # The shell uses this exact name for the .app and executable, so the lab
+    # DMG installs beside the public app instead of replacing its bundle.
+    name = subprocess.check_output([sys.executable, str(ROOT / "packaging/macos_bundle_identity.py"),
+                                    "--root", str(tmp_path), "--field", "bundle_name"], text=True).strip()
+    assert name == info["CFBundleName"]
+
+
+def test_official_mac_bundle_retains_its_existing_identity_and_update_policy(tmp_path):
+    completed, target, _ = write_release_plist(tmp_path, "build_mac_app.sh", "2.6.4")
+    assert completed.returncode == 0, completed.stderr
+    info = plistlib.loads(target.read_bytes())
+    assert info["CFBundleIdentifier"] == "com.nd2wsi.viewer"
+    assert info["CFBundleName"] == info["CFBundleDisplayName"] == "nd2wsi-viewer"
+    assert info["ND2WSIReleaseVersion"] == "2.6.4"
+    assert info["ND2WSIEdition"] == "official" and info["ND2WSIUpdatesOff"] is False
+
+
+def test_invalid_slacs_revision_leaves_bundle_metadata_unchanged(tmp_path):
+    completed, target, original = write_release_plist(tmp_path, "build_mac_app.sh", "2.6.4", slacs_revision=0)
+    assert completed.returncode != 0 and "revision must be a positive integer" in completed.stderr
+    assert target.read_bytes() == original

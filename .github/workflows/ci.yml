@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, slacs-module]
     paths-ignore: ['updates/**', 'docs/release-notes-*.md']
   pull_request:
 

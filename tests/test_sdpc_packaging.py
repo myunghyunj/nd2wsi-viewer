@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import plistlib
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -81,13 +82,14 @@ def test_mac_sdpc_association_and_release_marker(tmp_path, builder):
         assert info["LSMinimumSystemVersion"] == "12.0"
 
 
-def test_codec_resources_bind_source_asset_checksum_and_release_url(monkeypatch, tmp_path):
+@pytest.mark.parametrize("platform", ["windows-x64", "macos-arm64"])
+def test_codec_resources_bind_source_asset_checksum_and_release_url(monkeypatch, tmp_path, platform):
     monkeypatch.syspath_prepend(str(ROOT / "packaging"))
     import bundle_sdpc_codec
 
     built = tmp_path / "codec"
     built.mkdir()
-    source = built / "sdpc-codec-sources-windows-x64.zip"
+    source = built / f"sdpc-codec-sources-{platform}.zip"
     source.write_bytes(b"verified source archive fixture")
     licenses = built / "licenses"
     licenses.mkdir()
@@ -100,17 +102,32 @@ def test_codec_resources_bind_source_asset_checksum_and_release_url(monkeypatch,
     verify = Mock(return_value=metadata)
     monkeypatch.setattr(bundle_sdpc_codec, "verified_manifest", verify)
     resources, output = tmp_path / "app-resources", tmp_path / "release-assets"
-    result = bundle_sdpc_codec.stage(manifest, resources, output, "2.3.0")
+    version = "2.3.0"
+    if platform == "macos-arm64":
+        # Execute the builder's real version assignment, then stage its resource
+        # manifest. A package-only version would point lab users at public sources.
+        script = (ROOT / "packaging/build_mac_app.sh").read_text()
+        assignment = next(line for line in script.splitlines() if line.startswith("VERSION="))
+        # Run the configured Python command directly so this release regression
+        # also runs on Windows without requiring a separate Bash installation.
+        command = shlex.split(assignment.removeprefix('VERSION="$(').removesuffix(')"'))
+        variables = {"$PY": sys.executable, "$HERE": str(ROOT / "packaging"), "$REPO": str(ROOT)}
+        for variable, value in variables.items():
+            command = [part.replace(variable, value) for part in command]
+        version = subprocess.check_output(command, text=True).strip()
+        package_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+        assert version == f"{package_version}_SLACS-module"
+    result = bundle_sdpc_codec.stage(manifest, resources, output, version)
     verify.assert_called_once_with(manifest)
     assert (output / source.name).read_bytes() == source.read_bytes()
     assert not (resources / source.name).exists()
     assert (resources / "sdpc-codec-manifest.json").read_bytes() == manifest.read_bytes()
     assert (resources / "sdpc-codec-licenses/LGPL.txt").read_text() == "license fixture"
-    assert result["source_url"].endswith("/v2.3.0/sdpc-codec-sources-windows-x64.zip")
+    assert result["source_url"].endswith(f"/v{version}/sdpc-codec-sources-{platform}.zip")
     assert json.loads((resources / "sdpc-codec-source.json").read_text()) == result
     source.write_bytes(b"changed source archive")
     with pytest.raises(ValueError, match="checksum changed"):
-        bundle_sdpc_codec.stage(manifest, resources, output, "2.3.0")
+        bundle_sdpc_codec.stage(manifest, resources, output, version)
 
 
 @pytest.mark.parametrize("sdpc_success", [False, True])

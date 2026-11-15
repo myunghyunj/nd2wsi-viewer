@@ -26,7 +26,6 @@ SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-RSPZ8oXqjqXqByfHTCoiskGziFs+zAHN
 RELEASE_STAGE="$(mktemp -d /private/tmp/nd2wsi-release.XXXXXX)"
 cleanup_release_stage() { rm -rf "$RELEASE_STAGE"; }
 trap cleanup_release_stage EXIT
-STAGED_APP="$RELEASE_STAGE/$APPNAME.app"
 
 # limnd2 pulls in optional GUI helpers that import tkinter, so the bundle
 # Python must carry _tkinter or ND2 export dies inside the app. Pick the
@@ -68,12 +67,15 @@ SDPC_WHEEL="$("$PY" "$HERE/bundle_sdpc_codec.py" wheel --manifest "$ND2WSI_SDPC_
 "$PY" -m pip -q install --no-deps --force-reinstall "$SDPC_WHEEL"
 "$PY" "$HERE/verify_sdpc_codec.py" --manifest "$ND2WSI_SDPC_CODEC_MANIFEST"
 "$PY" -c "import limnd2; print('   limnd2', limnd2.__version__, 'in build venv')"
+APPNAME="$("$PY" "$HERE/macos_bundle_identity.py" --root "$REPO" --field bundle_name)"
+BUNDLE_ID="$("$PY" "$HERE/macos_bundle_identity.py" --root "$REPO" --field bundle_id)"
+STAGED_APP="$RELEASE_STAGE/$APPNAME.app"
 
 echo "==> pyinstaller"
 "$BUILD/venv/bin/pyinstaller" \
   --noconfirm --windowed --name "$APPNAME" \
   --icon "$HERE/AppIcon.icns" \
-  --osx-bundle-identifier "com.nd2wsi.viewer" \
+  --osx-bundle-identifier "$BUNDLE_ID" \
   --collect-all nd2wsi \
   --collect-all nd2 \
   --collect-all scipy \
@@ -95,10 +97,12 @@ echo "==> pyinstaller"
   "$HERE/launch.py"
 
 echo "==> document types (Finder Open With)"
-"$PY" - "$OUT/$APPNAME.app/Contents/Info.plist" "$REPO/pyproject.toml" << 'PLISTEOF'
+"$PY" - "$OUT/$APPNAME.app/Contents/Info.plist" "$REPO/pyproject.toml" "$HERE/macos_bundle_identity.py" << 'PLISTEOF'
 import plistlib
 import re
+import runpy
 import sys
+from pathlib import Path
 
 path = sys.argv[1]
 with open(path, "rb") as fh:
@@ -120,6 +124,14 @@ info["CFBundleVersion"] = bundle
 info["ND2WSIPackageVersion"] = version
 info["ND2WSISdpcBundled"] = True
 info["ND2WSIDevelopmentOnly"] = False
+identity_helper = sys.argv[3] if len(sys.argv) > 3 else Path(sys.argv[2]).parent / "packaging/macos_bundle_identity.py"
+identity = runpy.run_path(str(identity_helper))["bundle_identity"](Path(sys.argv[2]).parent)
+info["CFBundleName"] = identity["bundle_name"]
+info["CFBundleDisplayName"] = identity["bundle_name"]
+info["CFBundleIdentifier"] = identity["bundle_id"]
+info["ND2WSIEdition"] = identity["edition"]
+info["ND2WSIReleaseVersion"] = identity["release_version"]
+info["ND2WSIUpdatesOff"] = identity["updates_off"]
 # The README promises macOS 14 or later; older systems refuse to launch it
 # with a clear message instead of failing inside the frozen runtime.
 info["LSMinimumSystemVersion"] = "14.0"
@@ -206,7 +218,7 @@ with open(path, "wb") as fh:
     plistlib.dump(info, fh)
 print("   document types declared")
 PLISTEOF
-VERSION="$("$PY" -c 'from importlib.metadata import version; print(version("nd2wsi-viewer"))')"
+VERSION="$("$PY" "$HERE/macos_bundle_identity.py" --root "$REPO" --field release_version)"
 "$PY" "$HERE/bundle_sdpc_codec.py" stage --manifest "$ND2WSI_SDPC_CODEC_MANIFEST" \
   --resources "$OUT/$APPNAME.app/Contents/Resources" --output "$OUT" --version "$VERSION"
 
@@ -255,7 +267,7 @@ ditto --norsrc --noextattr --noqtn "$STAGED_APP" "$DMGDIR/$APPNAME.app"
 ln -s /Applications "$DMGDIR/Applications"
 hdiutil create -volname "$APPNAME" -srcfolder "$DMGDIR" -ov -format UDZO \
   "$RELEASE_STAGE/$APPNAME.dmg" >/dev/null
-ditto --norsrc --noextattr --noqtn "$RELEASE_STAGE/$APPNAME.dmg" "$OUT/$APPNAME.dmg"
+ditto --norsrc --noextattr --noqtn "$RELEASE_STAGE/$APPNAME.dmg" "$OUT/nd2wsi-viewer.dmg"
 
 # Keep the loose app when the requested output directory permits a valid
 # bundle.  File-provider directories may immediately reattach FinderInfo; in
@@ -270,4 +282,4 @@ fi
 
 echo "done:"
 if [ -d "$OUT/$APPNAME.app" ]; then du -sh "$OUT/$APPNAME.app"; fi
-du -sh "$OUT/$APPNAME.dmg"
+du -sh "$OUT/nd2wsi-viewer.dmg"

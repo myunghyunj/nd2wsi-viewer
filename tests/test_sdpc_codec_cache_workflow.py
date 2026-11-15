@@ -37,6 +37,19 @@ def load_steps(workflow, job="build"):
     return document["jobs"][job]["steps"]
 
 
+@pytest.mark.parametrize("workflow", ["ci.yml", "windows.yml"])
+def test_lab_branch_push_runs_release_checks_before_tagging(workflow):
+    document = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8"))
+    # PyYAML's YAML1.1 loader treats the workflow's 'on' key as boolean True.
+    events = document.get("on", document.get(True))
+    assert events["push"]["branches"] == ["main", "slacs-module"]
+    assert events["push"]["paths-ignore"] == ["updates/**", "docs/release-notes-*.md"]
+    assert "pull_request" in events
+    if workflow == "windows.yml":
+        assert events["workflow_dispatch"]["inputs"]["ref"]["required"] is True
+        assert events["push"]["tags"] == ["v*"]
+
+
 def windows_build_steps():
     steps = load_steps("windows.yml")
     return steps, {step["id"]: step for step in steps if "id" in step}

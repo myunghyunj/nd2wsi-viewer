@@ -57,16 +57,24 @@ def inject(
 
     with plist_path.open("rb") as handle:
         info = plistlib.load(handle)
+    updates_off = info.get("ND2WSIUpdatesOff", False)
+    if type(updates_off) is not bool:
+        raise ValueError("ND2WSIUpdatesOff must be a boolean")
     info.update(
         {
             "SUFeedURL": feed_url,
             "SUPublicEDKey": public_ed_key.strip(),
-            "SUEnableAutomaticChecks": True,
+            "SUEnableAutomaticChecks": not updates_off,
             "SUAutomaticallyUpdate": False,
             "SUAllowsAutomaticUpdates": False,
             "SUScheduledCheckInterval": int(interval),
         }
     )
+    if updates_off:
+        # Lab builds retain the verified framework but must never advertise or
+        # schedule public-viewer updates, including through persisted defaults.
+        info.pop("SUFeedURL", None)
+        info.pop("SUScheduledCheckInterval", None)
     with plist_path.open("wb") as handle:
         plistlib.dump(info, handle, sort_keys=True)
     return destination

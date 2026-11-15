@@ -8,7 +8,7 @@ on:
         required: true
         type: string
   push:
-    branches: [main]
+    branches: [main, slacs-module]
     tags: ['v*']
     paths-ignore: ['updates/**', 'docs/release-notes-*.md']
   pull_request:

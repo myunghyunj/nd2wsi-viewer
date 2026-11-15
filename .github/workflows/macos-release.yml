@@ -91,8 +91,9 @@ jobs:
           bash packaging/build_mac_app.sh "$GITHUB_WORKSPACE/dist/macos" 2>&1 | tee dist/macos/build-evidence/mac-build.log
       - name: Verify the signed artifact and record build proof
         run: |
-          app="$GITHUB_WORKSPACE/dist/macos/nd2wsi-viewer.app"
-          [[ "$(lipo -archs "$app/Contents/MacOS/nd2wsi-viewer")" == arm64 ]]
+          app_name="$(.venv/bin/python packaging/macos_bundle_identity.py --field bundle_name)"
+          app="$GITHUB_WORKSPACE/dist/macos/$app_name.app"
+          [[ "$(lipo -archs "$app/Contents/MacOS/$app_name")" == arm64 ]]
           codesign --verify --deep --strict --verbose=2 "$app" 2>&1 | tee dist/macos/build-evidence/codesign-verification.log
           hdiutil verify dist/macos/nd2wsi-viewer.dmg 2>&1 | tee dist/macos/build-evidence/dmg-verification.log
           build/macapp/venv/bin/python -m pip freeze > dist/macos/build-evidence/packaged-environment.txt
@@ -127,6 +128,7 @@ jobs:
           import os
           import platform
           import plistlib
+          import runpy
           import subprocess
           import tomllib
           from pathlib import Path
@@ -138,16 +140,37 @@ jobs:
           root = Path.cwd()
           output = root / "dist/macos"
           evidence = output / "build-evidence"
-          app = output / "nd2wsi-viewer.app"
+          identity = runpy.run_path("packaging/macos_bundle_identity.py")["bundle_identity"](root)
+          app = output / (identity["bundle_name"] + ".app")
           with (app / "Contents/Info.plist").open("rb") as handle:
               info = plistlib.load(handle)
           with (root / "pyproject.toml").open("rb") as handle:
               version = tomllib.load(handle)["project"]["version"]
           assert info["ND2WSIPackageVersion"] == version
           assert info["ND2WSIDevelopmentOnly"] is False
-          assert info["CFBundleIdentifier"] == "com.nd2wsi.viewer"
-          assert info["SUEnableAutomaticChecks"] is True
+          assert info["CFBundleIdentifier"] == identity["bundle_id"]
+          assert info["CFBundleName"] == info["CFBundleDisplayName"] == identity["bundle_name"]
+          assert info["CFBundleExecutable"] == identity["executable"]
+          assert info["ND2WSIEdition"] == identity["edition"]
+          assert info["ND2WSIReleaseVersion"] == identity["release_version"]
+          assert info["ND2WSIUpdatesOff"] is identity["updates_off"]
+          assert info["SUEnableAutomaticChecks"] is (not identity["updates_off"])
           assert info["SUAutomaticallyUpdate"] is False
+          assert info["SUAllowsAutomaticUpdates"] is False
+          if identity["updates_off"]:
+              assert "SUFeedURL" not in info and "SUScheduledCheckInterval" not in info
+          else:
+              assert info["SUFeedURL"] == "https://raw.githubusercontent.com/myunghyunj/nd2wsi-viewer/main/updates/appcast.xml"
+          assert info["SUPublicEDKey"] == "RSPZ8oXqjqXqByfHTCoiskGziFs+zAHNJ/fGa3N/hvk="
+          runtime = json.loads(subprocess.check_output([
+              str(app / "Contents/MacOS" / identity["executable"]), "-c",
+              "import json, nd2wsi; from nd2wsi.app import Api; "
+              "print(json.dumps({'package_version': nd2wsi.__version__, "
+              "'updates_disabled': Api(None)._updates_disabled}))",
+          ], text=True, timeout=60, cwd="/private/tmp"))
+          assert runtime["package_version"] == version
+          assert runtime["updates_disabled"] is identity["updates_off"]
+          (evidence / "packaged-update-policy.json").write_text(json.dumps(runtime, indent=2) + "\n")
           with (app / "Contents/Frameworks/Sparkle.framework/Versions/Current/Resources/Info.plist").open("rb") as handle:
               sparkle_version = plistlib.load(handle)["CFBundleShortVersionString"]
           assert sparkle_version == "2.9.6"
@@ -171,7 +194,14 @@ jobs:
               path.with_name(path.name + ".sha256").write_text(f"{digest}  {path.name}\n", encoding="ascii")
           proof = {
               "source_sha": source_sha,
-              "version": version,
+              "version": identity["release_version"],
+              "package_version": version,
+              "edition": identity["edition"],
+              "bundle_name": identity["bundle_name"],
+              "bundle_id": identity["bundle_id"],
+              "executable": identity["executable"],
+              "updates_disabled": identity["updates_off"],
+              "packaged_update_policy": runtime,
               "platform": platform.platform(),
               "architecture": platform.machine(),
               "python": platform.python_version(),
@@ -181,7 +211,7 @@ jobs:
               "sparkle_archive_sha256": os.environ["SPARKLE_SHA256"],
               "sdpc_manifest_sha256": sha256(manifest_path),
               "smoke_fixture_sha256": fixture_sha,
-              "app_executable_sha256": sha256(app / "Contents/MacOS/nd2wsi-viewer"),
+              "app_executable_sha256": sha256(app / "Contents/MacOS" / identity["executable"]),
               "signing": "ad-hoc",
               "packaged_headless_smoke": "passed",
               "native_gui_validation": "required on the downloaded artifact before release",
