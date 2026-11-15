@@ -3,6 +3,21 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.4</title>
+            <pubDate>Sun, 15 Nov 2026 08:41:54 +0000</pubDate>
+            <sparkle:version>2.6.4</sparkle:version>
+            <sparkle:shortVersionString>2.6.4</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Astromap TXT import recovery</h2>
+<ul>
+<li><strong>Import valid regions from mixed-quality TXT files.</strong> Review skipped rows with their original line, INDEX, coordinates and note, while keeping the source TXT and existing annotations unchanged.</li>
+<li><strong>Optional one-pixel recovery.</strong> Explicitly restore zero-width or zero-height legacy rectangles to one pixel, with original and corrected coordinates shown. Duplicate INDEX values, larger reversals and out-of-image regions stay withheld.</li>
+<li><strong>Tracing-window import reports.</strong> Keep skipped and repaired-row details while navigating; files with no usable regions preserve the previous list.</li>
+</ul>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.4/nd2wsi-viewer-2.6.4-macos-arm64.dmg" length="133508234" type="application/octet-stream" sparkle:edSignature="ddCNJD4iwEZM4uAW3/foD4luA9kI169HR5GUZbR8CoJPL+HTFwpX6O+ej3KA8iHh5B+8ezCpG2D+//f0PJCWCw=="/>
+        </item>
+        <item>
             <title>2.6.3</title>
             <pubDate>Sun, 15 Nov 2026 02:34:08 +0900</pubDate>
             <sparkle:version>2.6.3</sparkle:version>
