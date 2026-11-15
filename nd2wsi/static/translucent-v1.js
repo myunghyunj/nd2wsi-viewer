@@ -235,6 +235,10 @@
     const nextRoi = doc.getElementById("roi-next");
     const roiIndex = doc.getElementById("roi-index");
     const roiLayer = doc.getElementById("roi-overlay");
+    const importReview = doc.getElementById("roi-import-review");
+    const importSummary = doc.getElementById("roi-import-summary");
+    const importIssues = doc.getElementById("roi-import-issues");
+    const importRepair = doc.getElementById("roi-import-repair");
     const opacityControl = doc.getElementById("opacity-control");
     const opacitySlider = doc.getElementById("overlay-opacity");
     const opacityValue = doc.getElementById("opacity-value");
@@ -272,6 +276,7 @@
     };
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
       rois: [], roiIndex: -1, roiName: "", loadingRois: false, stepUm: loadStep(), stepAuto: loadStepAuto(),
+      importResult: null, importReview: null, importApplied: false,
       opacity: initialOpacity, confirmedOpacity: initialOpacity,
       // Follow's flips as the app last confirmed them (remembered for this format).
       followFlips: { x: context.follow_flips?.flip_x === true, y: context.follow_flips?.flip_y === true },
@@ -468,6 +473,7 @@
       previousRoi.disabled = disabled || state.roiIndex <= 0;
       nextRoi.disabled = disabled || state.rois.length === 0 || state.roiIndex >= state.rois.length - 1;
       roiIndex.disabled = disabled;
+      importRepair.disabled = disabled || !state.importResult;
       roiIndex.textContent = state.rois.length === 0 ? "—" :
         (state.roiIndex < 0 ? "—" : state.roiIndex + 1) + "/" + state.rois.length;
       const label = state.rois[state.roiIndex]?.label;
@@ -475,6 +481,18 @@
       roiIndex.setAttribute("aria-label", state.roiIndex < 0 ? "Open AstroMapper JPG and TXT pair" :
         "ROI " + (state.roiIndex + 1) + " of " + state.rois.length + ". Open AstroMapper JPG and TXT pair");
       renderRoiBoxes();
+    };
+    const paintImportReview = () => {
+      const review = state.importReview;
+      importReview.hidden = !review?.issues.length;
+      importRepair.hidden = !review?.issues.some(issue => issue.repairable && !issue.repaired);
+      importSummary.textContent = review ?
+        `${state.importApplied ? "Imported" : "Ready"} ${review.count} ROIs · ${review.skippedCount} skipped · ${review.repairedCount} repaired` : "";
+      importIssues.textContent = review ? [
+        state.importResult?.name || "ROI TXT",
+        "Original TXT unchanged. Skipped rows are not shown on the image.",
+        ...review.issues.map(issue => `${issue.repaired ? "Repaired" : "Skipped"}: ${issue.message}\n${issue.raw}`),
+      ].join("\n\n") : "";
     };
     const paintLock = () => {
       overlay.dataset.locked = String(state.locked);
@@ -884,23 +902,66 @@
       showStatus("");
       return true;
     };
-    const setRois = (result, { pan = true, index = 0, initial = false } = {}) => {
+    const setRois = (result, { pan = true, index = 0, initial = false, repairZeroArea = false } = {}) => {
       if ((!initial && (state.locked || state.pending)) || !state.ready) return false;
       if (result?.cancelled) return false;
       try {
         requireSuccess(result, "Could not load the AstroMapper JPG and TXT pair");
-        // Parse, map and validate the entire pair before replacing a valid list.
-        const rois = importedRois(result, info, importer);
+        // Keep the source TXT and every rejected row available for review.
+        // Mapping still validates the whole-image relationship before replacing
+        // a working list; coordinate corrections require the explicit button.
+        let rois;
+        if (typeof result?.text === "string") {
+          // A new selection must never leave a repair action for the old TXT,
+          // even when the new file fails before any row can be reviewed.
+          state.importResult = null;
+          state.importReview = null;
+          state.importApplied = false;
+          paintImportReview();
+          paintRois();
+          if (!importer?.review || !importer?.mapToSource) throw new Error("AstroMapper import is unavailable");
+          const review = importer.review(result.text, result.coordinateSize, { repairZeroArea });
+          state.importResult = { ...result, coordinateSize: { ...result.coordinateSize } };
+          state.importReview = review;
+          state.importApplied = false;
+          paintImportReview();
+          paintRois();
+          if (!review.count) throw new Error("No valid ROIs to import. Review the skipped rows.");
+          rois = importedRois({ rois: importer.mapToSource(review.rows, result.coordinateSize,
+            { width: info.width, height: info.height }) }, info, importer);
+        } else {
+          rois = importedRois(result, info, importer);
+        }
         const selected = Number.isInteger(index) && index >= 0 && index < rois.length ? index : -1;
         if (pan && selected >= 0) focusRoi(viewer, rois[selected], info);
         state.rois = rois;
         state.roiName = typeof result.name === "string" ? result.name : "";
         state.roiIndex = selected;
+        if (typeof result?.text !== "string") {
+          state.importResult = null;
+          state.importReview = null;
+        }
+        state.importApplied = true;
+        paintImportReview();
         paintRois();
         showStatus("");
         return true;
       } catch (error) { showStatus(error.message); return false; }
     };
+    const repairRois = () => {
+      if (state.locked || state.pending || state.loadingRois || !state.importResult ||
+          !state.importReview?.issues.some(issue => issue.repairable && !issue.repaired)) return false;
+      const selected = state.importApplied ? state.rois[state.roiIndex]?.index : undefined;
+      const success = setRois(state.importResult, { pan: false, index: -1, repairZeroArea: true });
+      if (success && selected !== undefined) {
+        state.roiIndex = state.rois.findIndex(rect => rect.index === selected);
+        paintRois();
+      }
+      return success;
+    };
+    importRepair.addEventListener("click", repairRois);
+    for (const name of ["pointerdown", "pointermove", "pointerup", "pointercancel", "wheel"])
+      importReview.addEventListener(name, event => event.stopPropagation());
     const chooseRois = async () => {
       if (state.locked || state.pending || state.loadingRois || !state.ready) return;
       state.loadingRois = true; paintRois();
@@ -1009,7 +1070,7 @@
     };
     doc.getElementById("window-drag").addEventListener("pointerdown", event => startGesture(event));
     overlay.addEventListener("pointerdown", event => {
-      if (event.altKey && !event.target.closest("button, input, #opacity-control, #stage-follow-control, #stage-follow-settings, #laser-target, #laser-target-capture, .resize-handle")) startGesture(event);
+      if (event.altKey && !event.target.closest("button, input, #opacity-control, #roi-import-review, #stage-follow-control, #stage-follow-settings, #laser-target, #laser-target-capture, .resize-handle")) startGesture(event);
     }, true);
     for (const handle of doc.querySelectorAll(".resize-handle")) {
       handle.addEventListener("pointerdown", event => startGesture(event, handle.dataset.edge));
@@ -1038,7 +1099,7 @@
         event.preventDefault(); chooseRois(); return;
       }
       if (event.ctrlKey || event.metaKey) return;
-      if (event.target?.closest?.("#opacity-control") && /^(Arrow|Home$|End$|Page)/.test(event.key)) return;
+      if (event.target?.closest?.("#opacity-control, #roi-import-review") && /^(Arrow|Home$|End$|Page)/.test(event.key)) return;
       if (event.key === "Escape") { event.preventDefault(); close(); }
       else if (event.key.toLowerCase() === "l") { event.preventDefault(); toggleLock(); }
       else if (event.key === "ArrowLeft") { event.preventDefault(); selectRoi(state.roiIndex - 1); }
@@ -1080,7 +1141,7 @@
     }, { once: true });
     pollSlacsDiscovery();
     discoveryInterval = win.setInterval(() => { reportMovedWindow(); pollSlacsDiscovery(); }, 1000);
-    return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity,
+    return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity, repairRois,
       startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, revokeStageFollow,
       setStepUm, setStepAuto, setFollowFlips, reportView, forwardClientError, target };
   }

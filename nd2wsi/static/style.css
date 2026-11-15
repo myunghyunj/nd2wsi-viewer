@@ -138,6 +138,11 @@ button { font: inherit; color: inherit; }
 .astromap-import-size { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; font-size: 11px; }
 .astromap-import-size label { display: flex; align-items: center; gap: 4px; }
 #astromap-import-name, #astromap-import-status { overflow-wrap: anywhere; }
+#astromap-import-repair-row { display:block; margin:8px 0; }
+#astromap-import-repair-row[hidden], #astromap-import-review[hidden] { display:none; }
+#astromap-import-review { margin:8px 0; font-size:11px; color:var(--label-2); }
+#astromap-import-review summary { cursor:pointer; }
+#astromap-import-review-details { max-height:180px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; -webkit-user-select:text; }
 
 .win-titlebar {
   display: flex; align-items: center; flex: none;

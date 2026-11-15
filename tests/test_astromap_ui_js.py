@@ -363,6 +363,7 @@ function importFixture() {
   c.astromapItems=()=>c.state.annotations.filter(a=>a.type==='box'&&a.astromap);
   c.saved=0;c.annotationsChanged=()=>{c.saved++;c.refreshAstromapImport();};
   vm.runInContext('let annCounter=0;\n'+[
+    production('reviewAstromapImport'),production('showAstromapImportReview'),
     production('refreshAstromapImport'),production('readAstromapImportFile',true),
     production('readAstromapImportJpg',true),production('commitAstromapImport'),production('wireAstromapImport')
   ].join('\n'),c);
@@ -438,13 +439,96 @@ const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n'+Array.from({length:200},(_,i)=>{
   return `${index}\t100\t${y}\t110\t${y+10}\t${index}`;
 }).join('\n');
 const read=await f.c.readAstromapImportFile({name:'regions.txt',size:text.length,text:async()=>text});
-return {read,message:f.nodes.get('astromap-import-status').textContent,
+return {read,message:f.nodes.get('astromap-import-review-details').textContent,
+  summary:f.nodes.get('astromap-import-review-summary').textContent,
   unchanged:before===JSON.stringify(f.c.state.annotations),saved:f.c.saved,pending:f.c.state.astromap.pendingImport};
 """)
-    assert out["read"] is False and out["pending"] is None
+    assert out["read"] is True and out["pending"]["text"]
     assert out["unchanged"] and out["saved"] == 0
     assert "INDEX 199 has zero area (4877, 8248) → (4876, 8247)" in out["message"]
-    assert "125 regions are outside" in out["message"] and "first INDEX 58" in out["message"]
+    assert "126 skipped" in out["summary"] and "INDEX 58" in out["message"]
+
+
+@pytest.mark.parametrize("repair", [False, True])
+def test_mixed_import_keeps_valid_rows_and_requires_explicit_zero_area_repair(repair):
+    out = _run_import("const repair=" + json.dumps(repair) + ";" + r"""
+const f=importFixture(),before=JSON.stringify(f.c.state.annotations);
+Object.assign(f.c.state.info,{raster:true,width:8000,height:5677});
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n'+
+  '7\t1105\t1066\t1106\t1080\t정상 <b>note</b>\n'+
+  '41\t5675\t2543\t5675\t2542\t41\n'+
+  '90\tbad\t2\t3\t4\tmalformed';
+const read=await f.c.readAstromapImportFile({name:'regions.txt',size:text.length,text:async()=>text});
+const defaultRepair=f.nodes.get('astromap-import-repair').checked;
+const original=f.c.state.astromap.pendingImport.text;
+f.nodes.get('astromap-import-repair').checked=repair;
+f.c.refreshAstromapImport();
+const ready=f.nodes.get('astromap-import-name').textContent;
+const imported=f.c.commitAstromapImport();
+const added=f.c.state.annotations.slice(3);
+return {read,defaultRepair,original,unchanged:JSON.stringify(f.c.state.annotations.slice(0,3))===before,
+  ready,imported,added,report:f.nodes.get('astromap-import-review-details').textContent,
+  summary:f.nodes.get('astromap-import-review-summary').textContent,
+  reportVisible:!f.nodes.get('astromap-import-review').hidden,saves:f.c.saved};
+""")
+    assert out["read"] and out["imported"] and out["unchanged"]
+    assert not out["defaultRepair"] and out["saves"] == 1 and out["reportVisible"]
+    assert "41\t5675\t2543\t5675\t2542\t41" in out["original"]
+    assert out["added"][0]["astromapImportIndex"] == 7
+    assert out["added"][0]["text"] == "정상 <b>note</b>"
+    assert len(out["added"]) == (2 if repair else 1)
+    assert "90\tbad\t2\t3\t4\tmalformed" in out["report"]
+    if repair:
+        assert {k: out["added"][1][k] for k in ("x", "y", "w", "h", "astromapImportIndex")} == {
+            "x": 5675, "y": 2543, "w": 1, "h": 1, "astromapImportIndex": 41,
+        }
+        assert "1 skipped · 1 repaired" == out["summary"]
+        assert "Repaired to (5675, 2543) → (5675, 2543)" in out["report"]
+    else:
+        assert "2 skipped · 0 repaired" == out["summary"]
+
+
+def test_all_invalid_import_remains_reviewable_and_repair_choice_resets_for_next_file():
+    out = _run_import(r"""
+const f=importFixture(),before=JSON.stringify(f.c.state.annotations);
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n41\t5\t5\t5\t4\tpoint';
+const file={name:'zero.txt',size:text.length,text:async()=>text};
+await f.c.readAstromapImportFile(file);
+const initiallyDisabled=f.nodes.get('astromap-import-confirm').disabled;
+const rejected=f.c.commitAstromapImport();
+const unchanged=before===JSON.stringify(f.c.state.annotations);
+f.nodes.get('astromap-import-repair').checked=true;
+f.c.refreshAstromapImport();
+const repairedEnabled=!f.nodes.get('astromap-import-confirm').disabled;
+f.nodes.get('astromap-import-repair').checked=false;
+f.c.refreshAstromapImport();
+const undoDisabled=f.nodes.get('astromap-import-confirm').disabled;
+f.nodes.get('astromap-import-repair').checked=true;
+await f.c.readAstromapImportFile(file);
+return {initiallyDisabled,rejected,unchanged,repairedEnabled,undoDisabled,
+  reset:!f.nodes.get('astromap-import-repair').checked,saves:f.c.saved};
+""")
+    assert out == {"initiallyDisabled": True, "rejected": False, "unchanged": True,
+                   "repairedEnabled": True, "undoDisabled": True, "reset": True, "saves": 0}
+
+
+def test_partial_review_still_rejects_aspect_mismatch_and_capacity_overflow_atomically():
+    out = _run_import(r"""
+const results=[];
+for (const capacity of [false,true]) {
+  const f=importFixture();
+  if(capacity) f.c.state.annotations=Array.from({length:2000},(_,i)=>({id:'old'+i,type:'box',astromap:true}));
+  const before=JSON.stringify(f.c.state.annotations);
+  await f.c.readAstromapImportFile({name:'regions.txt',size:importText.length,text:async()=>importText});
+  if(!capacity) f.nodes.get('astromap-import-height').value='1000';
+  const imported=f.c.commitAstromapImport();
+  results.push({imported,unchanged:JSON.stringify(f.c.state.annotations)===before,saves:f.c.saved,
+    message:f.nodes.get('astromap-import-status').textContent});
+}
+return results;
+""")
+    assert all(not r["imported"] and r["unchanged"] and r["saves"] == 0 for r in out)
+    assert "aspect" in out[0]["message"] and "2000" in out[1]["message"]
 
 
 def test_valid_out_of_default_grid_can_still_confirm_explicit_coordinate_dimensions():

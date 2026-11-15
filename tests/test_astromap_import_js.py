@@ -130,6 +130,151 @@ process.stdout.write(JSON.stringify(messages));
     assert "2000" in out[2]
 
 
+def test_review_keeps_valid_rows_and_reports_exact_screenshot_failure_without_changing_text():
+    out = run(r"""
+const header='INDEX\tX1\tY1\tX2\tY2\tNOTE\n';
+const lines=Array.from({length:40},(_,i)=>`${i+1}\t10\t20\t11\t21\tROI ${i+1}`);
+const raw='41\t5675\t2543\t5675\t2542\t41';
+const text=header+lines.concat(raw,'42\t4\t5\t4\t5\t조직 <img src=x onerror=alert(1)>').join('\n');
+const before=text, grid={width:8000,height:5677};
+const reviewed=api.review(text,grid), repaired=api.review(text,grid,{repairZeroArea:true});
+const reverted=api.review(text,grid);
+process.stdout.write(JSON.stringify({reviewed,repaired,reverted,unchanged:text===before,
+  mapped:api.mapToSource(repaired.rows,grid,grid)}));
+""")
+    assert out["unchanged"] and out["reverted"] == out["reviewed"]
+    review, repair = out["reviewed"], out["repaired"]
+    assert (review["count"], review["total"], review["skippedCount"], review["repairedCount"]) == (41, 42, 1, 0)
+    assert [row["index"] for row in review["rows"]] == list(range(1, 41)) + [42]
+    issue = review["issues"][0]
+    assert (issue["line"], issue["index"], issue["repairable"], issue["repaired"]) == (42, 41, True, False)
+    assert issue["raw"] == "41\t5675\t2543\t5675\t2542\t41"
+    assert issue["original"] == {"index": 41, "x1": 5675, "y1": 2543, "x2": 5675, "y2": 2542, "note": "41"}
+    assert "has zero area (5675, 2543) → (5675, 2542)" in issue["message"]
+    assert (repair["count"], repair["total"], repair["skippedCount"], repair["repairedCount"]) == (42, 42, 0, 1)
+    assert repair["issues"][0]["repaired"] is True
+    assert repair["issues"][0]["original"] == issue["original"]
+    assert repair["rows"][40] == {**issue["original"], "y2": 2543}
+    assert {key: out["mapped"][40][key] for key in ("x", "y", "w", "h")} == {
+        "x": 5675, "y": 2543, "w": 1, "h": 1,
+    }
+    assert out["mapped"][-1]["astromapImportIndex"] == 42
+    assert out["mapped"][-1]["text"] == "조직 <img src=x onerror=alert(1)>"
+
+
+def test_review_repairs_only_collapsed_dimensions_with_explicit_boolean_opt_in():
+    out = run(r"""
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n'+[
+ '1\t4\t5\t3\t9\tzero width',
+ '2\t4\t5\t8\t4\tzero height',
+ '3\t4\t5\t3\t4\tzero both',
+ '4\t4\t5\t2\t4\treversed width',
+ '5\t4\t5\t3\t3\treversed height',
+ '6\t4\t5\t3\t4\t'+'x'.repeat(4097),
+ '7\t-1\t5\t0\t4\tnegative',
+ '8\t4.5\t5\t4\t4\tfraction',
+].join('\n');
+process.stdout.write(JSON.stringify({default:api.review(text),optIn:api.review(text,null,{repairZeroArea:true}),
+  stringOption:api.review(text,null,{repairZeroArea:'true'})}));
+""")
+    assert out["default"]["count"] == 0
+    assert out["default"]["skippedCount"] == 8
+    assert out["stringOption"] == out["default"]
+    assert [issue["repairable"] for issue in out["default"]["issues"]] == [True] * 3 + [False] * 5
+    assert out["optIn"]["repairedCount"] == 3
+    assert out["optIn"]["skippedCount"] == 5
+    assert [(r["x1"], r["y1"], r["x2"], r["y2"]) for r in out["optIn"]["rows"]] == [
+        (4, 5, 4, 9), (4, 5, 8, 5), (4, 5, 4, 5),
+    ]
+
+
+def test_review_withholds_all_duplicate_indices_even_when_one_occurrence_is_malformed():
+    out = run(r"""
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n'+[
+ '7\t4\t5\t6\t7\tvalid first',
+ '007\t4\t5\t3\t4\tcollapsed duplicate',
+ '8\tbad',
+ '8\t4\t5\t6\t7\tvalid second',
+ '9\tNaN\t5\t6\t7\tmalformed coordinate',
+ '9\t4\t5\t6\t7\tvalid third',
+ '10\t4\t5\t6\t7\tonly unique row',
+].join('\n');
+process.stdout.write(JSON.stringify(api.review(text,null,{repairZeroArea:true})));
+""")
+    assert out["count"] == 1 and out["rows"][0]["index"] == 10
+    assert (out["skippedCount"], out["repairedCount"]) == (6, 0)
+    assert [issue["index"] for issue in out["issues"]] == [7, 7, 8, 8, 9, 9]
+    assert all(not issue["repairable"] and not issue["repaired"] for issue in out["issues"])
+    assert all("all rows with this INDEX" in issue["message"] for issue in out["issues"])
+
+
+def test_review_bounds_are_rechecked_against_new_reference_size_without_clipping():
+    out = run(r"""
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n'+[
+ '1\t1\t1\t2\t2\tinside',
+ '2\t90\t10\t110\t20\tpartly outside',
+ '3\t100\t10\t99\t20\tcollapsed outside',
+ '4\t99\t99\t98\t98\tlast pixel',
+].join('\n');
+process.stdout.write(JSON.stringify({small:api.review(text,{width:100,height:100},{repairZeroArea:true}),
+  large:api.review(text,{width:200,height:200},{repairZeroArea:true})}));
+""")
+    small, large = out["small"], out["large"]
+    assert [row["index"] for row in small["rows"]] == [1, 4]
+    assert (small["repairedCount"], small["skippedCount"]) == (1, 2)
+    assert not small["issues"][0]["repairable"] and not small["issues"][1]["repairable"]
+    assert all("matching coordinate JPG" in issue["message"] for issue in small["issues"][:2])
+    assert "has zero area (100, 10) → (99, 20)" in small["issues"][1]["message"]
+    assert small["issues"][0]["original"]["x2"] == 110
+    assert large["count"] == 4 and large["repairedCount"] == 2
+    assert large["rows"][1]["x2"] == 110
+    assert large["rows"][2]["x1"] == large["rows"][2]["x2"] == 100
+
+
+def test_review_reports_zero_area_and_reference_mismatch_together():
+    out = run(r"""
+const text='INDEX\tX1\tY1\tX2\tY2\tNOTE\n199\t4877\t8248\t4876\t8247\t199';
+process.stdout.write(JSON.stringify(api.review(text,{width:8000,height:5830},{repairZeroArea:true})));
+""")
+    assert out["count"] == 0 and out["skippedCount"] == 1 and out["repairedCount"] == 0
+    issue = out["issues"][0]
+    assert not issue["repairable"] and not issue["repaired"]
+    assert "INDEX 199 has zero area (4877, 8248) → (4876, 8247)" in issue["message"]
+    assert "outside the coordinate JPG 8000 × 5830" in issue["message"]
+    assert "matching coordinate JPG" in issue["message"]
+
+
+def test_review_reports_all_malformed_rows_and_preserves_physical_line_numbers():
+    out = run(r"""
+const text='\ufeff\r\nINDEX\tX1\tY1\tX2\tY2\tNOTE\r\n\r\n'+[
+ 'broken', '0\t1\t2\t3\t4\tbad index', '2\t1\t2\t3\t4\tA\textra',
+ '3\t9007199254740993\t2\t3\t4\tunsafe integer',
+].join('\r\n');
+process.stdout.write(JSON.stringify(api.review(text)));
+""")
+    assert out["count"] == 0 and out["total"] == out["skippedCount"] == 4
+    assert [issue["line"] for issue in out["issues"]] == [4, 5, 6, 7]
+    assert [issue["index"] for issue in out["issues"]] == [None, None, 2, 3]
+    assert all(issue["original"] is None for issue in out["issues"])
+
+
+def test_review_file_errors_remain_fatal_and_invalid_rows_count_toward_limit():
+    out = run(r"""
+const header='INDEX\tX1\tY1\tX2\tY2\tNOTE\n', errors=[];
+const limit=header+Array.from({length:2000},(_,i)=>`${i+1}\t4\t5\t3\t4\tempty`).join('\n');
+for(const text of [null,'',header,'INDEX,X1,Y1,X2,Y2,NOTE\n1,1,1,1,1,note',
+ header+'x'.repeat(9_000_000),limit+'\n2001\tbad']) {
+ try {api.review(text);errors.push(null);}catch(e){errors.push(e.message);}
+}
+process.stdout.write(JSON.stringify({errors,total:api.review(limit).total,count:api.review(limit).count}));
+""")
+    assert all(isinstance(message, str) and message for message in out["errors"])
+    assert "header" in out["errors"][3]
+    assert "too large" in out["errors"][4]
+    assert "2000" in out["errors"][5]
+    assert out["total"] == 2000 and out["count"] == 0
+
+
 def test_odd_dimensions_inclusive_endpoints_and_last_pixels_roundtrip_exactly():
     out = run("""
 const exportApi=require(require('path').join(require('path').dirname(process.argv[1]),'astromap-v1.js'));
