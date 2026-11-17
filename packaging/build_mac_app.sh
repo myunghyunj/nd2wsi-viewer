@@ -155,6 +155,18 @@ info["UTImportedTypeDeclarations"] = [
         "UTTypeConformsTo": ["public.data"],
         "UTTypeTagSpecification": {"public.filename-extension": ["sdpc"]},
     },
+    {
+        "UTTypeIdentifier": "org.openmicroscopy.ome-tiff",
+        "UTTypeDescription": "OME-TIFF microscopy image",
+        "UTTypeConformsTo": ["public.tiff"],
+        "UTTypeTagSpecification": {"public.filename-extension": ["tif", "tiff"]},
+    },
+    {
+        "UTTypeIdentifier": "com.perkinelmer.qptiff",
+        "UTTypeDescription": "QPTIFF multiplex whole-slide image",
+        "UTTypeConformsTo": ["public.tiff"],
+        "UTTypeTagSpecification": {"public.filename-extension": ["qptiff"]},
+    },
 ]
 info["CFBundleDocumentTypes"] = [
     {
@@ -192,6 +204,18 @@ info["CFBundleDocumentTypes"] = [
         "LSItemContentTypes": ["com.sqray.sdpc"],
         "CFBundleTypeRole": "Viewer",
         "LSHandlerRank": "Default",
+    },
+    {
+        "CFBundleTypeName": "OME-TIFF and QPTIFF microscopy image",
+        "LSItemContentTypes": ["org.openmicroscopy.ome-tiff", "com.perkinelmer.qptiff"],
+        "CFBundleTypeRole": "Viewer",
+        "LSHandlerRank": "Default",
+    },
+    {
+        "CFBundleTypeName": "TIFF image",
+        "LSItemContentTypes": ["public.tiff"],
+        "CFBundleTypeRole": "Viewer",
+        "LSHandlerRank": "Alternate",
     },
 ]
 
