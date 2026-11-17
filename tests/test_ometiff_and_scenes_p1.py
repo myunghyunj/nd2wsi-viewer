@@ -1007,3 +1007,93 @@ def test_2d_lif_scene_selection_and_homogeneous_grid_exclusion_plus_track2_col_h
         assert st_code == 200
         assert seen_cols == ["00FFFF"]
 
+
+def test_cross_track_ometiff_roi_export_cli_info_view_and_custom_color_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    from nd2wsi import cli, render
+
+    # 1. 3-channel fluorescence OME-TIFF ROI export -> native ometiff.open_direct round-trip
+    rng = np.random.default_rng(2026)
+    raw3 = rng.integers(0, 50000, size=(3, 96, 128), dtype=np.uint16)
+    attrs3 = {
+        "nd2wsi": {
+            "source": "fluor3.nd2",
+            "selection": {"t": 0, "p": 0, "z": 0},
+            "levels": [{"path": "0", "width": 128, "height": 96, "downsample": 1}],
+            "tile": 64,
+            "dtype": "uint16",
+            "rgb": False,
+            "pixel_size_um": (0.325, 0.325),
+        },
+        "omero": {
+            "channels": [
+                {"label": "DAPI", "color": "00FFFF", "window": {"start": 0.0, "end": 40000.0}},
+                {"label": "FITC", "color": "00FF00", "window": {"start": 0.0, "end": 40000.0}},
+                {"label": "CY3", "color": "FF00FF", "window": {"start": 0.0, "end": 40000.0}},
+            ]
+        },
+    }
+    roi_tif = tmp_path / "exported_3ch_fluor.ome.tif"
+    render.export_roi_tiff({"0": raw3}, attrs3, roi_tif, 0, 0, 0, 128, 96, [0, 1, 2])
+
+    root_rt, attrs_rt = ometiff.open_direct(roi_tif)
+    try:
+        assert attrs_rt["nd2wsi"]["rgb"] is False
+        assert attrs_rt["nd2wsi"]["pixel_size_um"] == pytest.approx([0.325, 0.325])
+        assert [(c["label"], c["color"]) for c in attrs_rt["omero"]["channels"]] == [
+            ("DAPI", "00FFFF"),
+            ("FITC", "00FF00"),
+            ("CY3", "FF00FF"),
+        ]
+        np.testing.assert_array_equal(root_rt["0"][:, :, :], raw3)
+    finally:
+        root_rt.close()
+
+    # 2. CLI `nd2wsi info` (--json and human-readable) & `nd2wsi view` direct open routing
+    assert cli.main(["info", str(roi_tif), "--json"]) == 0
+    info_json = json.loads(capsys.readouterr().out)
+    assert info_json["format"] == "OME-TIFF"
+    assert info_json["channels"] == 3 and info_json["rgb"] is False
+
+    assert cli.main(["info", str(roi_tif)]) == 0
+    info_txt = capsys.readouterr().out
+    assert "OME-TIFF" in info_txt and "DAPI (#00FFFF)" in info_txt
+
+    served_stores: list[list[Path]] = []
+    monkeypatch.setattr(server, "serve", lambda stores, **kw: served_stores.append(list(stores)))
+    assert cli.main(["view", str(roi_tif)]) == 0
+    capsys.readouterr()
+    assert served_stores == [[roi_tif]]
+
+    # 3. End-to-end HTTP custom `col` compositing + LUT color persistence on exported OME-TIFF
+    with running_server([], port=0) as httpd:
+        base = server_url(httpd).rstrip("/")
+        code, opened = _http_json(f"{base}/api/open", method="POST", payload={"path": str(roi_tif)})
+        assert code == 200
+        sid = opened["sid"]
+
+        t_code, t_png, _ = _http_bytes(
+            f"{base}/s/{sid}/api/tile/0/0/0.png?c=0&win=0:1&col=FF0000,,"
+        )
+        assert t_code == 200
+        im = np.asarray(Image.open(io.BytesIO(t_png)))
+        assert im.shape[:2] == (96, 128)
+
+        lut_code, lut_saved = _http_json(
+            f"{base}/s/{sid}/api/lut-settings",
+            method="POST",
+            payload={
+                "format": "nd2wsi-lut-settings/1",
+                "luts": [
+                    {"lo": 0, "hi": 40000, "gamma": 1.0, "color": "FF3B30"},
+                    {"lo": 0, "hi": 40000, "gamma": 1.0},
+                    {"lo": 0, "hi": 40000, "gamma": 1.0},
+                ],
+            },
+        )
+        assert lut_code == 200 and lut_saved["ok"] is True
+        _, lut_loaded = _http_json(f"{base}/s/{sid}/api/lut-settings")
+        assert lut_loaded["settings"]["luts"][0]["color"] == "FF3B30"
+
+
