@@ -752,6 +752,10 @@ class ViewerState:
 
     @staticmethod
     def _close_root(root):
+        store = getattr(root, "store", None)
+        store_path = getattr(store, "path", None)
+        if store_path is not None:
+            render._RAW_CHUNK_CACHE.purge(store_path)
         close = getattr(root, "close", None)
         if close is not None:
             try:
@@ -2054,18 +2058,28 @@ class SlideRegistry:
         """Close every registered backend after the server stops.
 
         Without ``immediate``, source-backed roots keep _Root's short delay
-        before their native handles close. A stopped smoke-test server has no
-        requests left, so it may close them synchronously, and it also waits
-        up to 30 s for slides closed earlier whose last reads are finishing.
+        only when reads are still draining. Once ``busy`` has drained, stores,
+        plate prefetchers, and OME-TIFF handles close deterministically.
         """
         with self._lock:
             states = list(self.slides.values())
             self.slides.clear()
         for st in states:
             st.close_shading()
-            st.busy.close(timeout=30)
-            if immediate:
-                ViewerState._close_root(st.root)
+            drained = st.busy.close(timeout=30)
+            for p_attr in ("store_path", "source_path"):
+                p_val = getattr(st, p_attr, None)
+                if p_val is not None:
+                    render._RAW_CHUNK_CACHE.purge(p_val)
+            if immediate or drained:
+                plate_close = getattr(getattr(st, "plate", None), "close", None)
+                if callable(plate_close):
+                    try:
+                        plate_close(timeout=30)
+                    except TypeError:
+                        plate_close()
+                else:
+                    ViewerState._close_root(st.root)
                 continue
             close = getattr(st.root, "close", None)
             if close is not None:
@@ -2138,6 +2152,10 @@ class SlideRegistry:
         if not quiet:
             st.close_shading()  # waits for the replacement or refresh
         st.busy.close(timeout=None)
+        for p_attr in ("store_path", "source_path"):
+            p_val = getattr(st, p_attr, None)
+            if p_val is not None:
+                render._RAW_CHUNK_CACHE.purge(p_val)
         if st.plate is not None:
             st.plate.close(timeout=None)
         else:
@@ -2216,6 +2234,10 @@ class SlideRegistry:
         for st in states:
             st.close_shading()
             st.busy.close(timeout=None)
+            for p_attr in ("store_path", "source_path"):
+                p_val = getattr(st, p_attr, None)
+                if p_val is not None:
+                    render._RAW_CHUNK_CACHE.purge(p_val)
             if st.plate is not None:
                 st.plate.close(timeout=None)
                 continue
@@ -2544,6 +2566,30 @@ def _sidecar_items(document: Any, *, require_items: bool = False) -> list:
     return items
 
 
+_DISCONNECT_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in (
+        "EPIPE",
+        "ECONNRESET",
+        "ECONNABORTED",
+        "ENOTCONN",
+        "EBADF",
+        "ESHUTDOWN",
+    )
+    if hasattr(errno, name)
+)
+HTTP_MAX_WORKERS = 16
+
+
+def _resolve_http_max_workers() -> int:
+    raw = os.environ.get("ND2WSI_HTTP_MAX_WORKERS")
+    if raw is not None and raw.strip() != "":
+        val = int(raw)
+        if val >= 1:
+            return val
+    return HTTP_MAX_WORKERS
+
+
 def make_handler(
     registry: SlideRegistry, token: str = ""
 ) -> type[BaseHTTPRequestHandler]:
@@ -2552,6 +2598,36 @@ def make_handler(
         server_version = "nd2wsi"
         # Set once a download has sent its status line; reset per request.
         _response_started = False
+
+        def handle_one_request(self) -> None:
+            if getattr(self.server, "_shutting_down", False):
+                self.close_connection = True
+                return
+            try:
+                super().handle_one_request()
+            except (ConnectionError, TimeoutError):
+                self.close_connection = True
+            except OSError as exc:
+                if exc.errno in _DISCONNECT_ERRNOS or getattr(
+                    self.server, "_shutting_down", False
+                ):
+                    self.close_connection = True
+                    return
+                raise
+            if getattr(self.server, "_shutting_down", False):
+                self.close_connection = True
+
+        def finish(self) -> None:
+            try:
+                super().finish()
+            except (ConnectionError, TimeoutError):
+                pass
+            except OSError as exc:
+                if exc.errno in _DISCONNECT_ERRNOS or getattr(
+                    self.server, "_shutting_down", False
+                ):
+                    return
+                raise
 
         # ---- helpers -----------------------------------------------------
         def _discard_rejected_body(self) -> None:
@@ -2970,6 +3046,8 @@ def make_handler(
                     sid = registry.open_path(path, on_progress=on_progress)
                 if job:
                     _job_update(job, state="done", pct=100)
+            except ConnectionError:
+                raise
             except (
                 ValueError,
                 FileNotFoundError,
@@ -3094,6 +3172,8 @@ def make_handler(
                         "url": f"/s/{new_sid}/",
                     }
                 )
+            except ConnectionError:
+                raise
             except (
                 ValueError,
                 FileNotFoundError,
@@ -3792,12 +3872,14 @@ def create_server(
         # stdlib default backlog of 5 resets the overflow at the kernel.
         request_queue_size = 64
         daemon_threads = True
-        max_workers = 24
+        max_workers = _resolve_http_max_workers()
 
         def __init__(self, *args, **kwargs):
             self._pool_lock = threading.Lock()
+            self._shutting_down = False
             self._pool_closed = False
             self._pending_sockets: dict[Any, Any] = {}
+            self._active_sockets: set[Any] = set()
             self._executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.max_workers,
                 thread_name_prefix="nd2wsi-http",
@@ -3806,38 +3888,90 @@ def create_server(
 
         def process_request(self, request, client_address) -> None:
             with self._pool_lock:
-                if self._pool_closed:
-                    self.shutdown_request(request)
-                    return
-                key = object()
-                self._pending_sockets[key] = request
-                try:
-                    self._executor.submit(
-                        self._run_pooled_request, key, request, client_address
-                    )
-                except RuntimeError:
-                    self._pending_sockets.pop(key, None)
-                    self.shutdown_request(request)
+                if self._shutting_down or self._pool_closed:
+                    abort = True
+                else:
+                    abort = False
+                    key = object()
+                    self._pending_sockets[key] = request
+                    try:
+                        self._executor.submit(
+                            self._run_pooled_request, key, request, client_address
+                        )
+                    except RuntimeError:
+                        self._pending_sockets.pop(key, None)
+                        abort = True
+            if abort:
+                self.shutdown_request(request)
 
         def _run_pooled_request(self, key: Any, request, client_address) -> None:
             with self._pool_lock:
                 if self._pending_sockets.pop(key, None) is None:
                     return
-            self.process_request_thread(request, client_address)
+                if self._shutting_down or self._pool_closed:
+                    abort = True
+                else:
+                    abort = False
+                    self._active_sockets.add(request)
+            if abort:
+                try:
+                    self.shutdown_request(request)
+                except Exception:
+                    pass
+                return
+            try:
+                self.process_request_thread(request, client_address)
+            finally:
+                with self._pool_lock:
+                    self._active_sockets.discard(request)
 
-        def _shutdown_pool(self) -> None:
+        def handle_error(self, request, client_address) -> None:
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionError, TimeoutError)):
+                return
+            if isinstance(exc, OSError) and (
+                self._shutting_down or exc.errno in _DISCONNECT_ERRNOS
+            ):
+                return
+            super().handle_error(request, client_address)
+
+        def _drop_queued_requests(self) -> None:
             with self._pool_lock:
-                if self._pool_closed:
-                    return
-                self._pool_closed = True
+                self._shutting_down = True
                 queued = list(self._pending_sockets.values())
                 self._pending_sockets.clear()
-            self._executor.shutdown(wait=False, cancel_futures=True)
             for req in queued:
                 try:
                     self.shutdown_request(req)
                 except Exception:
                     pass
+
+        def _shutdown_pool(self) -> None:
+            import socket as _socket
+
+            with self._pool_lock:
+                self._shutting_down = True
+                already_closed = self._pool_closed
+                self._pool_closed = True
+                queued = list(self._pending_sockets.values())
+                self._pending_sockets.clear()
+                active = list(self._active_sockets)
+            if not already_closed:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            for req in queued:
+                try:
+                    self.shutdown_request(req)
+                except Exception:
+                    pass
+            for req in active:
+                try:
+                    req.shutdown(_socket.SHUT_RDWR)
+                except Exception:
+                    pass
+            cur = threading.current_thread()
+            for worker in list(getattr(self._executor, "_threads", ())):
+                if worker is not cur and worker.is_alive():
+                    worker.join(timeout=5.0)
 
         def _close_registry(self) -> None:
             if getattr(self, "_registry_closed", False):
@@ -3847,6 +3981,7 @@ def create_server(
             registry.close_all(immediate=True)
 
         def shutdown(self) -> None:
+            self._drop_queued_requests()
             super().shutdown()
             self._close_registry()
 
@@ -3857,6 +3992,7 @@ def create_server(
             sources after it. The release goes on, and calling this again
             waits for it again.
             """
+            self._drop_queued_requests()
             super().shutdown()
             if not getattr(self, "_registry_closed", False):
                 self._registry_closed = self._released_for_relaunch = True

@@ -14,12 +14,14 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from . import plate as _plate_mod
 from . import render
 from .contrast import auto_window
 from .direct_common import (
@@ -32,7 +34,7 @@ from .direct_common import (
     _TileCache,
     box_mean,
 )
-from .platform_io import BINARY, read_at
+from .platform_io import BINARY, read_at, total_physical_memory_bytes
 from .reader import ChannelInfo, PlaneSource, _finite_positive, level_shapes
 
 OMETIFF_SUFFIXES = {".tif", ".tiff", ".qptiff"}
@@ -41,11 +43,17 @@ STACK_MIN_DIM = 8
 STACK_MAX_DIM = 8192
 STACK_MAX_FRAME_PX = 40_000_000
 UNTILED_MAX_PIXELS = 256_000_000
+# Eager in-memory pyramid ceiling for untiled 2D TIFFs (64 MiB raw level-0 bytes).
+# Larger untiled 2D TIFFs stream strips/rows lazily on demand from disk.
+UNTILED_EAGER_MAX_BYTES = 64 * 1024 * 1024
+_LAZY_STREAM_BAND_ROWS = 256
+_MAX_CACHED_STRIP_BYTES = 16 * 1024 * 1024
 
 PLATE_K = (2, 4, 8, 16)
 THUMB_K = 8
 HISTOGRAM_LRU = 64
-PREFETCH_PENDING_MAX = 128
+PREFETCH_PENDING_MAX = 64
+Z_PREFETCH_PENDING_MAX = 2
 _MEMO_BAND_ROWS = 64
 
 _FLUOROPHORE_PALETTE: tuple[tuple[int, int, int], ...] = (
@@ -853,9 +861,15 @@ def is_ometiff_stack(path: str | Path, *, series: int = 0) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _page_kf(page: Any) -> Any:
+    """Return the underlying TiffPage keyframe for a TiffPage or lightweight TiffFrame."""
+    return getattr(page, "keyframe", None) or page
+
+
 def _decode_page_segment(page: Any, raw_bytes: bytes, seg: int, tables: dict[str, Any], out_dtype: np.dtype) -> np.ndarray:
+    kf = _page_kf(page)
     try:
-        decoded = np.asarray(page.decode(raw_bytes, seg, **tables)[0])
+        decoded = np.asarray(kf.decode(raw_bytes, seg, **tables)[0])
     except ValueError as exc:
         if "imagecodecs" in str(exc).lower():
             raise RuntimeError(
@@ -926,7 +940,7 @@ def _planar_tile_reader(
 ):
     """Cached per-channel window reader for multi-page ``CYX`` or single-page ``SEPARATE`` TIFFs."""
     single_separate = len(pages) == 1 and n_c > 1
-    page0 = pages[0]
+    page0 = _page_kf(pages[0])
     h, w = int(page0.imagelength), int(page0.imagewidth)
     th, tw = int(page0.tilelength), int(page0.tilewidth)
     ny = -(-h // th)
@@ -935,8 +949,8 @@ def _planar_tile_reader(
 
     page_tables = [
         {
-            "jpegtables": getattr(p, "jpegtables", None),
-            "jpegheader": getattr(p, "jpegheader", None),
+            "jpegtables": getattr(_page_kf(p), "jpegtables", None),
+            "jpegheader": getattr(_page_kf(p), "jpegheader", None),
         }
         for p in pages
     ]
@@ -1099,6 +1113,7 @@ class _MemoryPyramidLevel:
 
     def release(self) -> None:
         self._memo = None
+        self._base = None  # type: ignore[assignment]
 
     def __getitem__(self, idx: Any) -> np.ndarray:
         cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
@@ -1106,6 +1121,357 @@ class _MemoryPyramidLevel:
             if x0 == x1 or y0 == y1:
                 return np.empty((self.shape[0], y1 - y0, x1 - x0), dtype=self.dtype)[cs]
             if self._downsample >= 8:
+                return self._whole()[:, y0:y1, x0:x1][cs].copy()
+            return self._reduce_window(cs, y0, y1, x0, x1)
+
+
+def _resolve_untiled_eager_max_bytes(eager_max_bytes: int | None = None) -> int:
+    if eager_max_bytes is not None:
+        return max(0, int(eager_max_bytes))
+    raw_env = os.environ.get("ND2WSI_UNTILED_EAGER_MAX_BYTES")
+    if raw_env is not None and raw_env.strip() != "":
+        return max(0, int(raw_env))
+    return int(UNTILED_EAGER_MAX_BYTES)
+
+
+def _read_untiled_page_rows(
+    page: Any,
+    fd: int,
+    cache: _TileCache,
+    tag: Any,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    out_dtype: np.dtype,
+    keep_samples: int,
+    *,
+    strip_base: int = 0,
+) -> np.ndarray:
+    """Read ``(keep_samples, y1 - y0, x1 - x0)`` from an untiled TIFF page lazily."""
+    kf = _page_kf(page)
+    h, w = int(kf.imagelength), int(kf.imagewidth)
+    out_h = max(0, y1 - y0)
+    out_w = max(0, x1 - x0)
+    out = np.zeros((keep_samples, out_h, out_w), dtype=out_dtype)
+    if out_h == 0 or out_w == 0:
+        return out
+    cy0, cy1 = max(0, y0), min(h, y1)
+    cx0, cx1 = max(0, x0), min(w, x1)
+    if cy1 <= cy0 or cx1 <= cx0:
+        return out
+
+    rps = int(getattr(kf, "rowsperstrip", h) or h)
+    rps = max(1, min(rps, h))
+    offsets = page.dataoffsets
+    counts = page.databytecounts
+    planar = int(getattr(kf, "planarconfig", 1) or 1)
+    samples_in_strip = 1 if planar == 2 else int(getattr(kf, "samplesperpixel", 1) or 1)
+    raw_dt = np.dtype(kf.dtype)
+    bps = getattr(kf, "bitspersample", None)
+    bps_tuple = (bps,) if isinstance(bps, int) else tuple(bps or ())
+    direct_uncompressed = (
+        int(getattr(kf, "compression", 1) or 1) == 1
+        and int(getattr(kf, "predictor", 1) or 1) == 1
+        and int(getattr(kf, "fillorder", 1) or 1) == 1
+        and raw_dt != np.dtype(np.bool_)
+        and bool(bps_tuple)
+        and all(int(b) == raw_dt.itemsize * 8 for b in bps_tuple)
+    )
+    row_bytes = w * samples_in_strip * raw_dt.itemsize
+    tables = {
+        "jpegtables": getattr(kf, "jpegtables", None),
+        "jpegheader": getattr(kf, "jpegheader", None),
+    }
+
+    for s in range(cy0 // rps, (cy1 - 1) // rps + 1):
+        seg = strip_base + s
+        sy0 = max(cy0, s * rps)
+        sy1 = min(cy1, (s + 1) * rps, h)
+        if sy1 <= sy0 or seg >= len(counts) or counts[seg] == 0:
+            continue
+        sh = min(rps, h - s * rps)
+        if direct_uncompressed and int(counts[seg]) >= sh * row_bytes:
+            n_rows = sy1 - sy0
+            byte_off = int(offsets[seg]) + (sy0 - s * rps) * row_bytes
+            buf = read_at(fd, n_rows * row_bytes, byte_off)
+            if len(buf) == n_rows * row_bytes:
+                raw_rows = np.frombuffer(buf, dtype=raw_dt).reshape(n_rows, w, samples_in_strip)
+                sub = raw_rows[:, cx0:cx1, :keep_samples]
+                out[:, sy0 - y0 : sy1 - y0, cx0 - x0 : cx1 - x0] = np.asarray(
+                    np.moveaxis(sub, -1, 0), dtype=out_dtype
+                )
+                continue
+
+        key = (tag, "strip", seg)
+        strip_cyx = cache.get(key)
+        if strip_cyx is None:
+            raw = read_at(fd, int(counts[seg]), int(offsets[seg]))
+            dec = _decode_page_segment(page, raw, seg, tables, out_dtype).reshape(
+                -1, w, samples_in_strip
+            )[:sh]
+            strip_cyx = np.ascontiguousarray(np.moveaxis(dec[..., :keep_samples], -1, 0))
+            if strip_cyx.nbytes <= _MAX_CACHED_STRIP_BYTES:
+                cache.put(key, strip_cyx)
+        out[:, sy0 - y0 : sy1 - y0, cx0 - x0 : cx1 - x0] = strip_cyx[
+            :, sy0 - s * rps : sy1 - s * rps, cx0:cx1
+        ]
+    return out
+
+
+def _untiled_window_reader_for(
+    series: Any,
+    fd: int,
+    cache: _TileCache,
+    tag: Any,
+    layout: _ParsedSeriesLayout,
+    *,
+    z_idx: int = 0,
+    t_idx: int = 0,
+):
+    """Build a lazy ``read(cs, y0, y1, x0, x1)`` callable for an untiled 2D TIFF plane."""
+    axes = layout.axes
+    shape = layout.shape
+    page0 = series.pages[0]
+    page_ndim = len(page0.shape)
+    lead_axes = axes[: len(axes) - page_ndim]
+    lead_shape = shape[: len(shape) - page_ndim]
+    n_lead = math.prod(lead_shape) if lead_shape else 1
+    h, w = layout.height, layout.width
+
+    # 1. Multi-page where each lead coordinate maps to a TiffPage / TiffFrame
+    if len(series.pages) == n_lead and shape[len(lead_shape) :] == tuple(page0.shape):
+        if "C" in lead_axes:
+            c_pages = []
+            for ci in range(layout.n_c):
+                coords = [
+                    t_idx if ax == "T" else z_idx if ax == "Z" else ci if ax == "C" else 0
+                    for ax in lead_axes
+                ]
+                p_flat = int(np.ravel_multi_index(coords, lead_shape))
+                c_pages.append(series.pages[p_flat])
+            if all(
+                not getattr(_page_kf(p), "is_tiled", False)
+                and int(_page_kf(p).imagelength) == h
+                and int(_page_kf(p).imagewidth) == w
+                and int(getattr(_page_kf(p), "samplesperpixel", 1) or 1) == 1
+                for p in c_pages
+            ):
+                def _read_multipage(cs: Any, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                    selected = np.arange(layout.n_c)[cs]
+                    scalar = np.ndim(selected) == 0
+                    ch_list = [int(c) for c in np.atleast_1d(selected)]
+                    out = np.zeros((len(ch_list), max(0, y1 - y0), max(0, x1 - x0)), dtype=layout.dtype)
+                    for slot, ci in enumerate(ch_list):
+                        out[slot] = _read_untiled_page_rows(
+                            c_pages[ci],
+                            fd,
+                            cache,
+                            (*tag, "c", ci),
+                            y0,
+                            y1,
+                            x0,
+                            x1,
+                            layout.dtype,
+                            1,
+                        )[0]
+                    return out[0] if scalar else out
+
+                return _read_multipage
+
+        else:
+            coords = [
+                t_idx if ax == "T" else z_idx if ax == "Z" else 0 for ax in lead_axes
+            ]
+            p_flat = int(np.ravel_multi_index(coords, lead_shape)) if lead_shape else 0
+            target_page = series.pages[p_flat]
+            tkf = _page_kf(target_page)
+            if (
+                not getattr(tkf, "is_tiled", False)
+                and int(tkf.imagelength) == h
+                and int(tkf.imagewidth) == w
+            ):
+                planar = int(getattr(tkf, "planarconfig", 1) or 1)
+                samples = int(getattr(tkf, "samplesperpixel", 1) or 1)
+                if planar == 1 and samples >= layout.n_c:
+                    def _read_contig(cs: Any, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                        blk = _read_untiled_page_rows(
+                            target_page,
+                            fd,
+                            cache,
+                            (*tag, "p", p_flat),
+                            y0,
+                            y1,
+                            x0,
+                            x1,
+                            layout.dtype,
+                            layout.n_c,
+                        )
+                        return blk[cs]
+
+                    return _read_contig
+
+                if planar == 2 and samples >= layout.n_c:
+                    rps = max(1, min(h, int(getattr(tkf, "rowsperstrip", h) or h)))
+                    strips_per_plane = -(-h // rps)
+
+                    def _read_planar(cs: Any, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                        selected = np.arange(layout.n_c)[cs]
+                        scalar = np.ndim(selected) == 0
+                        ch_list = [int(c) for c in np.atleast_1d(selected)]
+                        out = np.zeros(
+                            (len(ch_list), max(0, y1 - y0), max(0, x1 - x0)),
+                            dtype=layout.dtype,
+                        )
+                        for slot, ci in enumerate(ch_list):
+                            out[slot] = _read_untiled_page_rows(
+                                target_page,
+                                fd,
+                                cache,
+                                (*tag, "ps", ci),
+                                y0,
+                                y1,
+                                x0,
+                                x1,
+                                layout.dtype,
+                                1,
+                                strip_base=ci * strips_per_plane,
+                            )[0]
+                        return out[0] if scalar else out
+
+                    return _read_planar
+
+    # 2. Single-IFD contiguous uncompressed hyperstack (e.g., ImageJ raw dataoffset)
+    dataoffset = getattr(series, "dataoffset", None)
+    if (
+        dataoffset is not None
+        and lead_axes
+        and int(getattr(page0, "compression", 1) or 1) == 1
+        and layout.raw_dtype != np.dtype(np.bool_)
+    ):
+        frame_axes = axes[len(lead_axes) :]
+        frame_shape = shape[len(lead_shape) :]
+        elem_bytes = int(math.prod(frame_shape)) * layout.raw_dtype.itemsize
+        if frame_axes == "YX" and "C" in lead_axes and frame_shape == (h, w):
+            row_bytes = w * layout.raw_dtype.itemsize
+
+            def _read_hyper_c(cs: Any, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+                selected = np.arange(layout.n_c)[cs]
+                scalar = np.ndim(selected) == 0
+                ch_list = [int(c) for c in np.atleast_1d(selected)]
+                out = np.zeros(
+                    (len(ch_list), max(0, y1 - y0), max(0, x1 - x0)), dtype=layout.dtype
+                )
+                cy0, cy1 = max(0, y0), min(h, y1)
+                cx0, cx1 = max(0, x0), min(w, x1)
+                if cy1 > cy0 and cx1 > cx0:
+                    n_rows = cy1 - cy0
+                    for slot, ci in enumerate(ch_list):
+                        coords = [
+                            t_idx if ax == "T" else z_idx if ax == "Z" else ci if ax == "C" else 0
+                            for ax in lead_axes
+                        ]
+                        idx_flat = int(np.ravel_multi_index(coords, lead_shape))
+                        off = int(dataoffset) + idx_flat * elem_bytes + cy0 * row_bytes
+                        buf = read_at(fd, n_rows * row_bytes, off)
+                        arr_p = np.frombuffer(buf, dtype=layout.raw_dtype).reshape(n_rows, w)
+                        out[slot, cy0 - y0 : cy1 - y0, cx0 - x0 : cx1 - x0] = np.asarray(
+                            arr_p[:, cx0:cx1], dtype=layout.dtype
+                        )
+                return out[0] if scalar else out
+
+            return _read_hyper_c
+
+    return None
+
+
+class _LazyUntiledLevel:
+    """Band-streamed, on-demand 2D pyramid level for untiled TIFFs exceeding the eager ceiling."""
+
+    def __init__(
+        self,
+        reader_fn: Any,
+        base_h: int,
+        base_w: int,
+        n_c: int,
+        h: int,
+        w: int,
+        downsample: int,
+        life: _Lifecycle,
+        dtype: np.dtype,
+    ):
+        self._read = reader_fn
+        self._base_h = int(base_h)
+        self._base_w = int(base_w)
+        self._downsample = int(downsample)
+        self._life = life
+        self.shape = (int(n_c), int(h), int(w))
+        self.dtype = np.dtype(dtype)
+        self._memo: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._memo_eligible = (
+            self._downsample >= 8
+            and int(n_c) * int(h) * int(w) * int(self.dtype.itemsize) <= 8 * 1024 * 1024
+        )
+
+    def _reduce_window(self, cs: Any, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        reader = self._read
+        if reader is None:
+            raise LeaseClosed(self._life)
+        d = self._downsample
+        if d == 1:
+            if (y1 - y0) <= _LAZY_STREAM_BAND_ROWS:
+                return reader(cs, y0, y1, x0, x1)
+            probe = np.empty((self.shape[0], 0, 0), dtype=self.dtype)[cs]
+            out = np.empty((*probe.shape[:-2], y1 - y0, x1 - x0), dtype=self.dtype)
+            for ry0 in range(y0, y1, _LAZY_STREAM_BAND_ROWS):
+                ry1 = min(y1, ry0 + _LAZY_STREAM_BAND_ROWS)
+                out[..., ry0 - y0 : ry1 - y0, :] = reader(cs, ry0, ry1, x0, x1)
+            return out
+
+        bh, bw = self._base_h, self._base_w
+        ky = min(d, bh)
+        kx = min(d, bw)
+        band_out = max(1, _LAZY_STREAM_BAND_ROWS // max(1, ky))
+        probe = np.empty((self.shape[0], 0, 0), dtype=self.dtype)[cs]
+        out = np.empty((*probe.shape[:-2], y1 - y0, x1 - x0), dtype=self.dtype)
+        for ry0 in range(y0, y1, band_out):
+            ry1 = min(y1, ry0 + band_out)
+            raw = reader(cs, ry0 * ky, min(bh, ry1 * ky), x0 * kx, min(bw, x1 * kx))
+            if ky == d and kx == d and raw.shape[-2] >= d and raw.shape[-1] >= d:
+                part = np.ascontiguousarray(box_mean(raw, d, self.dtype))
+            else:
+                mean = raw.astype(np.float32).mean(axis=(-2, -1), keepdims=True)
+                mean = np.broadcast_to(mean, (*raw.shape[:-2], ry1 - ry0, x1 - x0))
+                part = (
+                    np.rint(mean).astype(self.dtype)
+                    if np.issubdtype(self.dtype, np.integer)
+                    else mean.astype(self.dtype)
+                )
+            out[..., ry0 - y0 : ry1 - y0, :] = part
+        return out
+
+    def _whole(self) -> np.ndarray:
+        with self._lock:
+            if self._memo is None:
+                c, h, w = self.shape
+                memo = np.empty((c, h, w), dtype=self.dtype)
+                for r0 in range(0, h, _MEMO_BAND_ROWS):
+                    r1 = min(h, r0 + _MEMO_BAND_ROWS)
+                    memo[:, r0:r1, :] = self._reduce_window(slice(None), r0, r1, 0, w)
+                self._memo = memo
+            return self._memo
+
+    def release(self) -> None:
+        self._memo = None
+        self._read = None
+
+    def __getitem__(self, idx: Any) -> np.ndarray:
+        cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
+        with self._life:
+            if x0 == x1 or y0 == y1:
+                return np.empty((self.shape[0], y1 - y0, x1 - x0), dtype=self.dtype)[cs]
+            if self._memo_eligible:
                 return self._whole()[:, y0:y1, x0:x1][cs].copy()
             return self._reduce_window(cs, y0, y1, x0, x1)
 
@@ -1297,10 +1663,10 @@ def _tiled_level_reader_for(
         reader = _planar_tile_reader([p0], fd, cache, tag, layout.dtype, layout.n_c)
         return reader, lh, lw
     if len(pages) >= layout.n_c and all(
-        getattr(p, "is_tiled", False)
-        and int(p.imagelength) == lh
-        and int(p.imagewidth) == lw
-        and int(getattr(p, "samplesperpixel", 1)) == 1
+        getattr(_page_kf(p), "is_tiled", False)
+        and int(_page_kf(p).imagelength) == lh
+        and int(_page_kf(p).imagewidth) == lw
+        and int(getattr(_page_kf(p), "samplesperpixel", 1)) == 1
         for p in pages[: layout.n_c]
     ):
         reader = _planar_tile_reader(pages[: layout.n_c], fd, cache, tag, layout.dtype, layout.n_c)
@@ -1313,6 +1679,7 @@ def open_direct(
     *,
     series: int = 0,
     tile: int = 512,
+    eager_max_bytes: int | None = None,
 ) -> tuple[_Root, dict[str, Any]]:
     """Open a 2D TIFF / OME-TIFF / QPTIFF directly with zero on-disk cache."""
     import tifffile
@@ -1347,10 +1714,9 @@ def open_direct(
             and getattr(base_series.pages[0], "is_tiled", False)
         )
         embedded: dict[int, tuple[Any, int, int]] = {}
-        owner = f"ometiff:{path.resolve()}:s{series}"
+        owner = f"ometiff:{path.resolve()}:s{series}:{id(life)}"
         if can_tile_direct:
             fd = os.open(str(path), os.O_RDONLY | BINARY)
-            _TILE_CACHE.purge(owner)
             ident = path.stat().st_mtime_ns
             for lv_obj in level_objs:
                 p0 = lv_obj.pages[0]
@@ -1443,24 +1809,103 @@ def open_direct(
                 "save as a tiled TIFF or OME-TIFF pyramid"
             )
         plane_bytes = layout.n_c * H * W * layout.dtype.itemsize
+        eager_ceiling = _resolve_untiled_eager_max_bytes(eager_max_bytes)
+
+        raw_bps = getattr(base_series.pages[0], "bitspersample", None)
+        if isinstance(raw_bps, (tuple, list)):
+            raw_bps = raw_bps[0] if raw_bps else None
+
+        selection_meta = {}
+        if series > 0 or len(grouped) > 1:
+            selection_meta["p"] = series
+        if layout.n_z > 1:
+            selection_meta["z"] = z_sel
+        if layout.n_t > 1:
+            selection_meta["t"] = t_sel
+
+        # Large untiled 2D TIFFs (> eager_ceiling, default 64 MiB): stream strips/rows
+        # lazily on demand via pread rather than materializing hundreds of MB in RAM.
+        if plane_bytes > eager_ceiling:
+            if fd < 0:
+                fd = os.open(str(path), os.O_RDONLY | BINARY)
+            ident = path.stat().st_mtime_ns
+            lazy_reader = _untiled_window_reader_for(
+                base_series,
+                fd,
+                _TILE_CACHE,
+                (owner, ident, "untiled"),
+                layout,
+                z_idx=z_sel,
+                t_idx=t_sel,
+            )
+            if lazy_reader is not None:
+                lazy_levels: dict[str, _LazyUntiledLevel] = {
+                    str(k): _LazyUntiledLevel(
+                        lazy_reader, H, W, layout.n_c, sh, sw, 2**k, life, layout.dtype
+                    )
+                    for k, (sh, sw) in enumerate(shapes)
+                }
+                coarsest = np.asarray(lazy_levels[str(len(shapes) - 1)][:, :, :])
+                windows = _compute_default_windows(
+                    coarsest,
+                    layout.dtype,
+                    layout.rgb,
+                    raw_bps=raw_bps if isinstance(raw_bps, int) else None,
+                )
+                notes = [f"served lazily on demand from untiled TIFF ({W} x {H})"]
+                if layout.n_z > 1:
+                    notes.append(f"series has {layout.n_z} Z planes; showing plane z={z_sel}")
+                if not pixel_size_um:
+                    notes.append(
+                        "no physical pixel calibration in TIFF metadata; measurements are in pixels"
+                    )
+                src_info = PlaneSource(
+                    data=None,
+                    dtype=layout.dtype,
+                    shape=(layout.n_c, H, W),
+                    rgb=layout.rgb,
+                    channels=channels,
+                    pixel_size_um=pixel_size_um,
+                    source_name=str(path),
+                    selection=selection_meta,
+                    notes=notes,
+                    magnification=magnification,
+                    calibration_source=cal_source if pixel_size_um else "unknown",
+                )
+                attrs = build_group_attrs(src_info, shapes, tile, windows)
+                attrs["nd2wsi"]["direct"] = True
+
+                def _teardown_lazy() -> None:
+                    if not life.close():
+                        return
+                    for ll in lazy_levels.values():
+                        ll.release()
+                    tf.close()
+                    if fd >= 0:
+                        os.close(fd)
+                    _TILE_CACHE.purge(owner)
+
+                return _Root(lazy_levels, _teardown_lazy), attrs
+
         avail = available_memory_bytes()
-        budget = (avail if avail is not None else render._available_memory()) // 2
+        budget = (avail if avail is not None else total_physical_memory_bytes()) // 2
         if plane_bytes * 2 > budget:
             raise ValueError(
                 "Not enough memory to open this untiled TIFF at full resolution; close other slides and retry"
             )
 
         base_cyx = _series_2d_to_cyx(base_series, layout, z_idx=z_sel, t_idx=t_sel)
-        raw_bps = getattr(base_series.pages[0], "bitspersample", None)
-        if isinstance(raw_bps, (tuple, list)):
-            raw_bps = raw_bps[0] if raw_bps else None
         tf.close()
         tf_closed = True
+        if fd >= 0:
+            os.close(fd)
+            fd = -1
 
         mem_levels: dict[str, _MemoryPyramidLevel] = {
             str(k): _MemoryPyramidLevel(base_cyx, sh, sw, 2**k, life)
             for k, (sh, sw) in enumerate(shapes)
         }
+        del base_cyx  # _MemoryPyramidLevel owns the sole reference; release() frees it
         coarsest = np.asarray(mem_levels[str(len(shapes) - 1)][:, :, :])
         windows = _compute_default_windows(
             coarsest, layout.dtype, layout.rgb, raw_bps=raw_bps if isinstance(raw_bps, int) else None
@@ -1470,14 +1915,6 @@ def open_direct(
             notes.append(f"series has {layout.n_z} Z planes; showing plane z={z_sel}")
         if not pixel_size_um:
             notes.append("no physical pixel calibration in TIFF metadata; measurements are in pixels")
-
-        selection_meta = {}
-        if series > 0 or len(grouped) > 1:
-            selection_meta["p"] = series
-        if layout.n_z > 1:
-            selection_meta["z"] = z_sel
-        if layout.n_t > 1:
-            selection_meta["t"] = t_sel
 
         src_info = PlaneSource(
             data=None,
@@ -1555,8 +1992,10 @@ class _StackReducedLevel:
         return self._source.reduced(t, p, z, self._k)[cs, y0:y1, x0:x1].copy()
 
 
-_STACK_FRAME_CACHE = _TileCache(320 * 1024 * 1024)
-_STACK_REDUCED_CACHE = _TileCache(256 * 1024 * 1024)
+# Share the process-wide full-frame budget with PlateSource so opening OME-TIFF
+# and ND2/CZI/LIF Z-stacks concurrently never compounds two separate frame caches.
+_STACK_FRAME_CACHE = _plate_mod._FRAME_CACHE
+_STACK_REDUCED_CACHE = _TileCache(64 * 1024 * 1024)
 
 
 class _BaseInteractiveStackSource:
@@ -1574,16 +2013,28 @@ class _BaseInteractiveStackSource:
         self._life = _Lifecycle()
         self._io_lock = threading.Lock()
         self._closed = False
+        self._close_event = threading.Event()
         self._fg = 0
+        self._bg_tls = threading.local()
+        self._inflight_lock = threading.Lock()
+        self._inflight_frames: dict[tuple[int, int, int], threading.Event] = {}
         self._hist_lock = threading.Lock()
         self._hist: OrderedDict[tuple[int, int, int], list[dict[str, Any]]] = OrderedDict()
         self._focus_lock = threading.Lock()
         self._focus_cache: dict[int, list[float]] = {}
         self._pf_lock = threading.Lock()
         self._pf_cv = threading.Condition(self._pf_lock)
-        self._pf_queue: deque[tuple[int, int, int, int | None]] = deque()
-        self._pf_set: set[tuple[int, int, int, int | None]] = set()
+        self._pf_queue: deque[tuple[int, int, int, int]] = deque()
+        self._pf_set: set[tuple[int, int, int, int]] = set()
         self._pf_thread: threading.Thread | None = None
+        self._prefetch_epoch = 0
+        self._zpf_lock = threading.Lock()
+        self._zpf_executor: ThreadPoolExecutor | None = None
+        self._zpf_futures: list[Future[None]] = []
+        self._zpf_pending_targets: list[tuple[int, int, int]] = []
+        self._zpf_thread: threading.Thread | None = None
+        self._last_prefetch_tpz: tuple[int, int, int] | None = None
+        self._zpf_dir = 1
 
         st = os.stat(self.path)
         self._ident = (int(st.st_dev), int(st.st_ino), int(st.st_size), int(st.st_mtime_ns))
@@ -1680,21 +2131,45 @@ class _BaseInteractiveStackSource:
         t, p, z = int(t), int(p), int(z)
         if not (0 <= t < self.T and 0 <= p < self.P and 0 <= z < self.Z):
             raise ValueError(f"frame ({t}, {p}, {z}) out of range")
+        tpz = (t, p, z)
+        key = (self._owner, "frame", t, p, z)
         with self._life:
             self._check_source()
-            key = (self._owner, "frame", t, p, z)
             hit = _STACK_FRAME_CACHE.get(key)
             if hit is not None:
                 return hit
-            self._fg += 1
+            with self._inflight_lock:
+                hit = _STACK_FRAME_CACHE.get(key)
+                if hit is not None:
+                    return hit
+                waiter = self._inflight_frames.get(tpz)
+                if waiter is None:
+                    waiter = threading.Event()
+                    self._inflight_frames[tpz] = waiter
+                    leader = True
+                else:
+                    leader = False
+            if not leader:
+                waiter.wait()
+                if self._closed:
+                    raise ValueError("slide is closed")
+                hit = _STACK_FRAME_CACHE.get(key)
+                if hit is not None:
+                    return hit
+            fg_delta = 0 if getattr(self._bg_tls, "active", False) else 1
+            self._fg += fg_delta
             try:
                 cyx = self._read_plane_cyx(t, p, z)
+                cyx = np.ascontiguousarray(cyx)
+                if not self._closed:
+                    _STACK_FRAME_CACHE.put(key, cyx)
+                return cyx
             finally:
-                self._fg -= 1
-            cyx = np.ascontiguousarray(cyx)
-            if not self._closed:
-                _STACK_FRAME_CACHE.put(key, cyx)
-            return cyx
+                self._fg -= fg_delta
+                if leader:
+                    with self._inflight_lock:
+                        self._inflight_frames.pop(tpz, None)
+                    waiter.set()
 
     def frame_view(self, t: int, p: int, z: int) -> np.ndarray:
         return self.frame(t, p, z)
@@ -1834,31 +2309,17 @@ class _BaseInteractiveStackSource:
     def prefetch(self, t: int, z: int, k: int) -> None:
         if k not in PLATE_K or self._closed:
             return
-        wanted: list[tuple[int, int, int, int | None]] = []
+        wanted: list[tuple[int, int, int, int]] = []
         if t + 1 < self.T:
             wanted.append((t + 1, 0, z, int(k)))
         for z2 in (z + 1, z - 1):
             if 0 <= z2 < self.Z:
                 wanted.append((t, 0, z2, int(k)))
-        self._enqueue_prefetch(wanted)
-
-    def prefetch_neighbors(self, t: int, p: int, z: int) -> None:
-        if self.Z <= 1 or self._closed:
-            return
-        wanted: list[tuple[int, int, int, int | None]] = []
-        for z2 in (int(z) - 1, int(z) + 1):
-            if 0 <= z2 < self.Z:
-                if _STACK_FRAME_CACHE.get((self._owner, "frame", int(t), int(p), z2)) is None:
-                    wanted.append((int(t), int(p), z2, None))
-        if wanted:
-            self._enqueue_prefetch(wanted)
-
-    def _enqueue_prefetch(self, items: list[tuple[int, int, int, int | None]]) -> None:
         try:
             with self._pf_cv:
                 if self._closed:
                     return
-                for item in items:
+                for item in wanted:
                     if item in self._pf_set:
                         continue
                     while len(self._pf_queue) >= PREFETCH_PENDING_MAX:
@@ -1874,6 +2335,96 @@ class _BaseInteractiveStackSource:
                 self._pf_cv.notify()
         except Exception:
             pass
+
+    def prefetch_neighbors(self, t: int, p: int, z: int) -> None:
+        try:
+            if self.Z <= 1 or self._closed:
+                return
+            t_i, p_i, z_i = int(t), int(p), int(z)
+            if not (0 <= t_i < self.T and 0 <= p_i < self.P and 0 <= z_i < self.Z):
+                return
+            estimated_frame_bytes = int(math.prod(self.frame_shape)) * int(self.dtype.itemsize)
+            cache_budget = _plate_mod._effective_frame_cache_budget()
+            if cache_budget <= 0 or estimated_frame_bytes * 3 > cache_budget * 2:
+                max_neighbors = 0
+            elif estimated_frame_bytes * 2 > cache_budget or estimated_frame_bytes * 3 > cache_budget:
+                max_neighbors = 1
+            else:
+                max_neighbors = 2
+
+            with self._zpf_lock:
+                if self._closed:
+                    return
+                self._prefetch_epoch += 1
+                epoch = self._prefetch_epoch
+                if self._last_prefetch_tpz is not None:
+                    prev_t, prev_p, prev_z = self._last_prefetch_tpz
+                    if (prev_t, prev_p) == (t_i, p_i) and z_i != prev_z:
+                        self._zpf_dir = 1 if z_i > prev_z else -1
+                    elif (prev_t, prev_p) != (t_i, p_i):
+                        self._zpf_dir = 1
+                self._last_prefetch_tpz = (t_i, p_i, z_i)
+
+                for fut in self._zpf_futures:
+                    fut.cancel()
+                self._zpf_futures.clear()
+                self._zpf_pending_targets.clear()
+
+                if max_neighbors <= 0:
+                    return
+                step = self._zpf_dir
+                neighbor_zs = [
+                    z2 for z2 in (z_i + step, z_i - step) if 0 <= z2 < self.Z
+                ][:max_neighbors]
+                targets = [
+                    (t_i, p_i, z2)
+                    for z2 in neighbor_zs
+                    if _STACK_FRAME_CACHE.get((self._owner, "frame", t_i, p_i, z2)) is None
+                ]
+                if not targets:
+                    return
+                if self._zpf_executor is None:
+                    self._zpf_executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="stack-z-prefetch",
+                    )
+                self._zpf_pending_targets = list(targets)
+                for target in targets[:Z_PREFETCH_PENDING_MAX]:
+                    self._zpf_futures.append(
+                        self._zpf_executor.submit(self._run_z_prefetch, epoch, target)
+                    )
+                if self._zpf_thread is None:
+                    self._zpf_thread = next(
+                        iter(getattr(self._zpf_executor, "_threads", ())), None
+                    )
+        except Exception:
+            pass
+
+    def _run_z_prefetch(self, epoch: int, target: tuple[int, int, int]) -> None:
+        self._zpf_thread = threading.current_thread()
+        if epoch != self._prefetch_epoch or self._closed:
+            return
+        if self._close_event.wait(0.015):
+            return
+        if epoch != self._prefetch_epoch or self._closed:
+            return
+        while self._fg > 0:
+            if epoch != self._prefetch_epoch or self._closed or self._close_event.wait(0.005):
+                return
+        if epoch != self._prefetch_epoch or self._closed:
+            return
+        t_i, p_i, z_i = target
+        if _STACK_FRAME_CACHE.get((self._owner, "frame", t_i, p_i, z_i)) is not None:
+            return
+        if epoch != self._prefetch_epoch or self._closed:
+            return
+        self._bg_tls.active = True
+        try:
+            self.frame(t_i, p_i, z_i)
+        except (LeaseClosed, ValueError, OSError):
+            pass
+        finally:
+            self._bg_tls.active = False
 
     def _prefetch_worker(self) -> None:
         while True:
@@ -1891,12 +2442,8 @@ class _BaseInteractiveStackSource:
             if self._closed:
                 return
             try:
-                if k is None:
-                    if _STACK_FRAME_CACHE.get((self._owner, "frame", t, p, z)) is None:
-                        self.frame(t, p, z)
-                else:
-                    if _STACK_REDUCED_CACHE.get((self._owner, t, p, z, k)) is None:
-                        self.reduced(t, p, z, k)
+                if _STACK_REDUCED_CACHE.get((self._owner, t, p, z, k)) is None:
+                    self.reduced(t, p, z, k)
             except (LeaseClosed, ValueError, OSError):
                 if self._closed:
                     return
@@ -1905,11 +2452,32 @@ class _BaseInteractiveStackSource:
         if self._closed:
             return
         self._closed = True
+        self._close_event.set()
         with self._pf_cv:
             self._pf_queue.clear()
             self._pf_set.clear()
             self._pf_cv.notify_all()
-        if self._life.close(timeout=timeout):
+        with self._zpf_lock:
+            self._prefetch_epoch += 1
+            for fut in self._zpf_futures:
+                fut.cancel()
+            self._zpf_futures.clear()
+            self._zpf_pending_targets.clear()
+        drained = self._life.close(timeout=timeout)
+        with self._zpf_lock:
+            zpf_exec, self._zpf_executor = self._zpf_executor, None
+        pf_thread = self._pf_thread
+        zpf_thread = self._zpf_thread
+        if zpf_exec is not None:
+            zpf_exec.shutdown(
+                wait=(threading.current_thread() is not zpf_thread),
+                cancel_futures=True,
+            )
+        if zpf_thread is not None and zpf_thread.is_alive() and zpf_thread is not threading.current_thread():
+            zpf_thread.join(timeout=5.0)
+        if pf_thread is not None and pf_thread.is_alive() and pf_thread is not threading.current_thread():
+            pf_thread.join(timeout=5.0)
+        if drained:
             self._close_backend_handles()
             _STACK_FRAME_CACHE.purge(self._owner)
             _STACK_REDUCED_CACHE.purge(self._owner)
