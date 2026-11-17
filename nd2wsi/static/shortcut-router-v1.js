@@ -45,7 +45,8 @@
   function formatShortcutText(text, platform) {
     if (isMac(platform)) return text;
     return String(text).replaceAll("⌘", "Ctrl+").replaceAll("⌥", "Alt+")
-      .replaceAll("⇧", "Shift+").replaceAll("Option-drag", "Alt-drag");
+      .replaceAll("⇧", "Shift+").replaceAll("Option-drag", "Alt-drag")
+      .replaceAll("Option-click", "Alt-click");
   }
 
   function localizeLabels(document, platform) {
@@ -183,11 +184,40 @@
     return match ? Number(match[1]) - 1 : null;
   }
 
+  function rawHistoryAction(event, platform) {
+    if (isBlocked(event) || !commandPressed(event, platform) || event.altKey) return null;
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    if ([event.target, ...path].some(isFocusControl)) return null;
+    const code = letterCode(event);
+    if (code === "KeyZ") return event.shiftKey ? "redo" : "undo";
+    if (code === "KeyY" && !event.shiftKey) return "redo";
+    return null;
+  }
+
+  function isHistoryShortcut(event, platform) {
+    return Boolean(rawHistoryAction(event, platform));
+  }
+
+  function historyActionForEvent(event, platform) {
+    if (!event || event.repeat) return null;
+    return rawHistoryAction(event, platform);
+  }
+
+  function isShortcutHelpEvent(event) {
+    if (isBlocked(event) || event.repeat || event.metaKey || event.ctrlKey || event.altKey) {
+      return false;
+    }
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    if ([event.target, ...path].some(isFocusControl)) return false;
+    return event.key === "?" || (String(event.code || "") === "Slash" && Boolean(event.shiftKey));
+  }
+
   return {
     isTypingEvent, isFocusControl, hasTextSelection, letterCode, plainLetterForEvent,
     isPanelShortcut, panelForEvent, isAstromapShortcut, isOrientationShortcut,
     isNewWindowShortcut, newWindowRoleForEvent,
-    orientationForEvent, tabIndexForEvent, isMac, commandPressed,
-    formatShortcutText, localizeLabels,
+    orientationForEvent, tabIndexForEvent,
+    isHistoryShortcut, historyActionForEvent, isShortcutHelpEvent,
+    isMac, commandPressed, formatShortcutText, localizeLabels,
   };
 });

@@ -14,6 +14,11 @@
     <div class="tb-group">
       <span class="app-mark" id="source-badge">SLIDE</span>
       <span id="file-name">&nbsp;</span>
+      <div id="scene-picker" class="scene-picker" hidden>
+        <button type="button" id="scene-picker-btn" class="scene-picker-btn"
+                aria-haspopup="listbox" aria-expanded="false" aria-controls="scene-picker-menu"></button>
+        <div id="scene-picker-menu" class="scene-picker-menu" role="listbox" aria-label="Slide scenes" hidden></div>
+      </div>
       <span id="file-dims"></span>
     </div>
     <div class="tb-spacer"></div>
@@ -42,6 +47,9 @@
       <button class="tb-btn tb-theme" id="tb-theme" title="Appearance" aria-label="Appearance">
         <span class="tb-ico theme-glyph" aria-hidden="true"></span>
       </button>
+      <button type="button" class="tb-btn tb-help" id="tb-shortcuts"
+              title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts"
+              aria-keyshortcuts="Shift+Slash" aria-haspopup="dialog" aria-controls="shortcuts-modal">?</button>
     </div>
   </header>
 
@@ -194,11 +202,11 @@
         <div id="ann-list"></div>
         <div class="hint" id="ann-empty">Measurements and notes are stored outside the viewing cache.</div>
         <div class="tool-row footer">
-          <button id="ann-open" class="btn" title="Load annotations (.json or .geojson)">Open…</button>
-          <button id="ann-export" class="btn" title="Download the annotation file">Export</button>
+          <button id="ann-open" class="btn" title="Import annotations (.json or .geojson)">Import…</button>
+          <button id="ann-export" class="btn" title="Export native .annotations.json file">Export .json</button>
         </div>
         <div class="tool-row footer geojson-footer">
-          <button id="ann-geojson" class="btn full" title="Export QuPath-compatible GeoJSON (⌘⇧E)">Export GeoJSON</button>
+          <button id="ann-geojson" class="btn primary full" title="Export QuPath-compatible GeoJSON (⌘⇧E)">Export GeoJSON</button>
         </div>
         <div class="hint" id="ann-status"></div>
         <input type="file" id="ann-file" accept=".json,.geojson,application/json,application/geo+json" hidden />
@@ -349,6 +357,51 @@
   <div class="status-detail" id="plate-cache-cell" hidden title="The thumbnail store beside the file fills in the background"><span class="label">Cache</span><span class="value" id="plate-cache-val"></span></div>
   <div class="status-detail" id="export-cell" hidden><span class="label">Export</span><span id="export-bar"><span id="export-fill"></span></span><span class="value" id="export-pct">0 %</span></div>
   <div id="plane-note"></div>
+</div>
+<div id="shortcuts-modal" class="shortcuts-overlay" role="dialog" aria-modal="true" aria-labelledby="shortcuts-modal-title" hidden>
+  <div class="shortcuts-card">
+    <div class="shortcuts-head">
+      <h2 id="shortcuts-modal-title">Keyboard Shortcuts</h2>
+      <button type="button" id="shortcuts-close" class="shortcuts-close" aria-label="Close keyboard shortcuts" title="Close (Esc)">×</button>
+    </div>
+    <div class="shortcuts-grid">
+      <section class="shortcuts-section">
+        <h3>Navigation &amp; View</h3>
+        <dl class="shortcuts-list">
+          <div><dt><kbd data-shortcut>0</kbd></dt><dd>Fit slide to view</dd></div>
+          <div><dt><kbd data-shortcut>⌘T</kbd> / <kbd data-shortcut>⌘R</kbd></dt><dd>Rotate 90° clockwise</dd></div>
+          <div><dt><kbd data-shortcut>⌘F</kbd></dt><dd>Flip horizontally</dd></div>
+          <div><dt><kbd data-shortcut>I</kbd></dt><dd>Toggle Pixel Inspector</dd></div>
+          <div><dt><kbd data-shortcut>F</kbd></dt><dd>Autofocus (Z-stack / plate)</dd></div>
+          <div><dt><kbd data-shortcut>Space</kbd> / <kbd data-shortcut>↑ ↓ ← →</kbd></dt><dd>Play timeline / step Z &amp; Time</dd></div>
+        </dl>
+      </section>
+      <section class="shortcuts-section">
+        <h3>Panels, Compare &amp; Tabs</h3>
+        <dl class="shortcuts-list">
+          <div><dt><kbd data-shortcut>C</kbd> / <kbd data-shortcut>⌘C</kbd></dt><dd>Channels &amp; LUTs</dd></div>
+          <div><dt><kbd data-shortcut>Option-click</kbd></dt><dd>Solo / restore channel</dd></div>
+          <div><dt><kbd data-shortcut>E</kbd></dt><dd>Export region panel</dd></div>
+          <div><dt><kbd data-shortcut>A</kbd> / <kbd data-shortcut>⌘A</kbd></dt><dd>Annotations panel</dd></div>
+          <div><dt><kbd data-shortcut>⌘I</kbd></dt><dd>Slide Info</dd></div>
+          <div><dt><kbd data-shortcut>⌘⇧A</kbd></dt><dd>Astromap (<kbd>←</kbd> / <kbd>→</kbd> step ROIs)</dd></div>
+          <div><dt><kbd data-shortcut>⌘\</kbd> / <kbd data-shortcut>L</kbd></dt><dd>Compare slides / toggle link</dd></div>
+          <div><dt><kbd data-shortcut>⌘1</kbd> … <kbd data-shortcut>⌘9</kbd></dt><dd>Switch slide tab</dd></div>
+        </dl>
+      </section>
+      <section class="shortcuts-section shortcuts-section-wide">
+        <h3>Tools &amp; Editing</h3>
+        <dl class="shortcuts-list shortcuts-list-two-col">
+          <div><dt><kbd data-shortcut>M</kbd> / <kbd data-shortcut>P</kbd> / <kbd data-shortcut>B</kbd></dt><dd>Measure / Pin / Box tool</dd></div>
+          <div><dt><kbd data-shortcut>V</kbd></dt><dd>Move selected export region</dd></div>
+          <div><dt><kbd data-shortcut>⌘Z</kbd></dt><dd>Undo annotation or ROI edit</dd></div>
+          <div><dt><kbd data-shortcut data-redo-shortcut>⌘⇧Z</kbd></dt><dd>Redo annotation or ROI edit</dd></div>
+          <div><dt><kbd data-shortcut>⌘⇧E</kbd></dt><dd>Export QuPath GeoJSON</dd></div>
+          <div><dt><kbd data-shortcut>?</kbd> / <kbd data-shortcut>Esc</kbd></dt><dd>Keyboard shortcuts / close or cancel</dd></div>
+        </dl>
+      </section>
+    </div>
+  </div>
 </div>
 <dialog id="lut-dialog" aria-labelledby="lut-dialog-title" aria-describedby="lut-dialog-help">
   <form id="lut-form">

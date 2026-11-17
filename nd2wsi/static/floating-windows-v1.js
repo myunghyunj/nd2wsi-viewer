@@ -8,13 +8,47 @@
 
   const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
 
-  function createManager({ stage, document, storage }) {
+  function createManager({ stage, document, storage, fetch: fetchFn = null,
+    uiSettingsUrl = "/api/ui-settings", setTimeout: setTimer = typeof setTimeout === "function" ? setTimeout : null,
+    clearTimeout: clearTimer = typeof clearTimeout === "function" ? clearTimeout : null }) {
     let winZ = 30;
+    const windows = new Map();
+    let pendingPanels = {};
+    let syncTimer = null;
+
+    function flushBackendPanels() {
+      syncTimer = null;
+      if (typeof fetchFn !== "function") {
+        pendingPanels = {};
+        return;
+      }
+      const keys = Object.keys(pendingPanels);
+      if (!keys.length) return;
+      const patch = { panels: { ...pendingPanels } };
+      pendingPanels = {};
+      Promise.resolve().then(() => fetchFn(uiSettingsUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      })).catch(() => { /* ignore 404s or offline unit tests */ });
+    }
+
+    function scheduleBackendSave(key, snapshot) {
+      if (typeof fetchFn !== "function" || !key) return;
+      pendingPanels[key] = snapshot;
+      if (!setTimer) {
+        flushBackendPanels();
+        return;
+      }
+      if (syncTimer !== null && clearTimer) clearTimer(syncTimer);
+      syncTimer = setTimer(flushBackendPanels, 150);
+    }
 
     function createWindow(el, opts) {
       const body = el.querySelector(".win-body");
       const titlebar = el.querySelector(".win-titlebar");
       const store = "nd2wsi.win." + opts.key;
+      let userEdited = false;
 
       let st = {
         rect: opts.def(),
@@ -33,12 +67,12 @@
       } catch (_) { /* private mode etc. */ }
 
       function persist() {
+        userEdited = true;
+        const snapshot = { rect: { ...st.rect }, collapsed: st.collapsed };
         try {
-          storage.setItem(
-            store,
-            JSON.stringify({ rect: st.rect, collapsed: st.collapsed })
-          );
+          storage.setItem(store, JSON.stringify(snapshot));
         } catch (_) { /* ignore */ }
+        scheduleBackendSave(opts.key, snapshot);
       }
 
       function apply() {
@@ -204,10 +238,57 @@
       };
       apply();
       clampToStage();
+      if (opts.key) {
+        windows.set(opts.key, {
+          isDirty: () => userEdited,
+          applyRemote(saved) {
+            if (userEdited || !saved || !saved.rect || typeof saved.rect !== "object") return;
+            const r = saved.rect;
+            if (!Number.isFinite(Number(r.x)) || !Number.isFinite(Number(r.y)) ||
+                !Number.isFinite(Number(r.w))) return;
+            st.rect = {
+              x: Number(r.x),
+              y: Number(r.y),
+              w: Number(r.w),
+              h: r.h == null ? null : (Number.isFinite(Number(r.h)) ? Number(r.h) : null),
+            };
+            st.collapsed = !!saved.collapsed;
+            try {
+              storage.setItem(store, JSON.stringify({ rect: st.rect, collapsed: st.collapsed }));
+            } catch (_) { /* ignore */ }
+            clampToStage();
+            if (!st.hidden && opts.onResize) opts.onResize();
+          },
+        });
+      }
       return api;
     }
 
-    return { createWindow };
+    function hydrate() {
+      if (typeof fetchFn !== "function") return Promise.resolve(null);
+      return Promise.resolve()
+        .then(() => fetchFn(uiSettingsUrl, { cache: "no-store" }))
+        .then((res) => (res && res.ok && typeof res.json === "function" ? res.json() : null))
+        .then((data) => {
+          const root = data && data.settings && typeof data.settings === "object" ? data.settings : data;
+          const panels = root && root.panels && typeof root.panels === "object" ? root.panels : null;
+          if (!panels) return null;
+          for (const [key, saved] of Object.entries(panels)) {
+            const win = windows.get(key);
+            if (win) win.applyRemote(saved);
+            else if (saved && saved.rect) {
+              try {
+                storage.setItem("nd2wsi.win." + key,
+                  JSON.stringify({ rect: saved.rect, collapsed: !!saved.collapsed }));
+              } catch (_) { /* ignore */ }
+            }
+          }
+          return panels;
+        })
+        .catch(() => null);
+    }
+
+    return { createWindow, hydrate };
   }
 
   return { createManager };
