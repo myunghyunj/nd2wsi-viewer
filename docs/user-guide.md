@@ -24,9 +24,10 @@ exact source commit, archive checksums, and platform verification results.
 install WebView2 separately if it is missing.
 
 Use **Ctrl** in place of the Mac **⌘** shortcuts below, and **Alt** for
-**Option**. Open files using `+`, drag and drop, or pass a file to the executable.
-Windows uses its standard title bar and window buttons. Updates are installed
-manually from [Releases](https://github.com/myunghyunj/nd2wsi-viewer/releases);
+**Option**. Open `.nd2`, `.czi`, `.lif`, `.tif` / `.ome.tif`, `.svs`, `.sdpc`,
+`.nd2svs`, `.jpg`, or `.png` files using `+`, **Recent**, drag and drop, or pass
+a file to the executable. Windows uses its standard title bar and window buttons.
+Updates are installed manually from [Releases](https://github.com/myunghyunj/nd2wsi-viewer/releases);
 Windows does not use the macOS Sparkle updater.
 
 The Windows executable is not Authenticode-signed, so Windows may display an
@@ -37,7 +38,7 @@ for requirements, tested behavior, and build instructions.
 
 1. Download the `macos-arm64.dmg` from the [latest release](https://github.com/myunghyunj/nd2wsi-viewer/releases/latest) and drag the app into Applications. This release requires an Apple silicon Mac running macOS 14 or later.
 2. On the first launch macOS may refuse to open the app because it is not notarized with Apple. Open System Settings, go to Privacy & Security, and choose Open Anyway next to the message about nd2wsi-viewer. This happens once. On older systems, right-click the app and choose Open.
-3. Drop a `.jpg`, `.png`, `.nd2`, `.svs` or supported `.sdpc` file onto the window, or press `+` to browse.
+3. Drop a `.nd2`, `.czi`, `.lif`, `.tif` / `.ome.tif`, `.svs`, supported `.sdpc`, `.nd2svs`, `.jpg`, or `.png` file onto the window, press `+` to browse, or choose a slide from **Recent**.
 
 The macOS bundle is ad-hoc signed and uses signed Sparkle updates. This is not
 Developer ID signing or notarization.
@@ -53,7 +54,7 @@ Versions 2.1.1–2.1.4 did not start automatic checks, so download the latest re
 manually once if you are upgrading from one of those versions. Automatic checks
 were restored in 2.1.5.
 
-The first open of a stitched ND2 may prepare a viewing cache. Preparation time and disk use depend on the acquisition, compression and storage. Later opens reuse a matching cache; upgrades that change derived channel, tile or calibration semantics set the superseded cache aside as `*.corrupt-*` and rebuild once, so free disk space is needed for the rebuild (run `nd2wsi tidy` to clean up superseded copies). Supported tiled SVS slides use their embedded pyramid directly.
+The first open of a stitched ND2, CZI, or LIF scan may prepare a `.nd2svs` viewing cache. Preparation time and disk use depend on the acquisition, compression and storage. Later opens reuse a matching cache; upgrades that change derived channel, tile or calibration semantics set the superseded cache aside as `*.corrupt-*` and rebuild once, so free disk space is needed for the rebuild (run `nd2wsi tidy <folder> --remove-corrupt-caches` to clean up superseded directory caches). Supported tiled SVS and pyramidal OME-TIFF / TIFF slides use their embedded pyramid directly, and small untiled or exported `.tif` files also open directly without writing a cache.
 
 JPEG images up to 512 megapixels and PNG images up to 64 megapixels open at their
 stored resolution, subject to a memory check before decoding. Large JPEGs can use
@@ -83,15 +84,15 @@ Drop either one onto the app.
 
 ![Per-channel colors, brightness range, gamma, and histogram](channels-luts.png)
 
-Every fluorescence channel has its own row in the Channels panel. Pick a color, turn the channel on or off, and drag the two triangles under the histogram to set the darkest and brightest values shown. ND2 without saved LUTs opens with automatic contrast and **Auto-fit** enabled, fitting each channel's axis to its signal distribution. Uncheck it to show the full integer data range, such as 0 to 65,535 for uint16. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. For typical fluorescence histograms, its lower end follows the background peak, while rare bright pixels have less influence on its upper end. This display adjustment preserves native pixel values. Hold Shift while dragging to move every channel together.
+Every fluorescence channel has its own row in the Channels panel. Click a channel's colour swatch to choose a preset colour or **Reset to metadata**, turn the channel on or off (**Option / Alt-click** a channel toggle to solo that channel, and **Option / Alt-click** again to restore the previous multi-channel state), and drag the two triangles under the histogram to set the darkest and brightest values shown. Fluorescence ND2, CZI, LIF, and OME-TIFF / TIFF files without saved LUTs open with automatic contrast and **Auto-fit** enabled, fitting each channel's axis to its signal distribution. Uncheck it to show the full integer data range, such as 0 to 65,535 for uint16. This checkbox only changes the graph, preserving image contrast. Scroll over a histogram to zoom its X axis at the pointer, scroll sideways or drag empty graph space to pan, and double-click to restore the full range. Manual navigation turns off Auto-fit without changing image contrast. Zoom uses finer histogram counts from the same sampled pyramid level. Contrast updates while you drag its handles, with the final value applied on release. The round knob bends the curve between them, which is gamma. `Auto` adjusts contrast independently of the axis mode. For typical fluorescence histograms, its lower end follows the background peak, while rare bright pixels have less influence on its upper end. This display adjustment preserves native pixel values. Hold Shift while dragging to move every channel together.
 
-The standard viewer remembers each file's last-used minimum, maximum and gamma across app restarts. Saved LUTs take precedence over initial Auto; Reset restores the channel's metadata defaults and remembers that choice too. Preferences live in local application data, not in the image or its annotations. A moved, replaced or incompatible file uses normal defaults. The opt-in Metal viewer's independent controls are not persisted. LUT edits are saved on their own a moment after you make them; the green check at the bottom right of the pane confirms it.
+The desktop viewer remembers each file's last-used minimum, maximum, gamma and custom channel colours across app restarts. Saved LUTs take precedence over initial Auto; Reset restores the channel's metadata defaults and remembers that choice too. LUT preferences, explicit theme/panel settings, and recent-file history live in local application data, not in the image or its annotations. A moved, replaced or incompatible file uses normal defaults. The opt-in Metal viewer's independent controls are not persisted. LUT edits are saved on their own a moment after you make them; the green check at the bottom right of the pane confirms it.
 
 For exact settings, choose the **Type LUT** pencil icon and enter each channel's minimum, maximum and gamma. Apply updates the channels together; invalid entries leave every channel unchanged, and Cancel discards the edits. Use **Copy LUT** and **Paste LUT** to reuse those settings in another window. Paste matches unique channel names regardless of order and skips unmatched, duplicate, invalid or incompatible entries. It does not copy colors or visibility and does not change raw pixels or annotations. The pencil, copy and paste actions use matching borderless 16 px Fluent icons. Hover over each icon for about one second to see a short explanation, also available with keyboard focus. A successful copy immediately changes the copy icon to a brief green check with **Copied!**.
 
 ### Translucent viewer
 
-Click **‹** at the right of the top tab strip to expand its tools: **cloud**, **Astromapper**, **Shading Correction**, **Compare slides**, and **Slide Info**. **›** collapses them again. The cloud opens the current fluorescence image in a separate, always-on-top tracing window. It keeps the current channels, LUTs, plane, orientation and image scale. The image starts at 55% opacity; use its **Opacity** slider to adjust it from 10% to 100%. You can minimize the main viewer while using this window.
+On wider windows (`900 px` and above), the top tab strip's tools (**cloud**, **Astromapper**, **Shading Correction**, **Compare slides**, and **Slide Info**) start expanded; click **›** to collapse them or **‹** to expand them again. The cloud opens the current fluorescence or JPG/PNG image in a separate, always-on-top tracing window. It keeps the current channels, LUTs, plane, orientation and image scale. The image starts at 55% opacity; use its **Opacity** slider to adjust it from 10% to 100%. You can minimize the main viewer while using this window.
 
 Drag the image to pan and scroll or pinch to zoom; the viewer's keyboard rotate, flip, pan and zoom keys do nothing here, so the orientation stays the main viewer's. Drag the empty top edge, or Option/Alt-drag, to move the window. Drag an edge or corner to resize it: the image scale stays fixed and only the field of view changes. The white **lock** freezes image navigation, opacity and window placement; click it again to unlock. **×** closes the tracing window. The main viewer's source tab must remain open.
 
@@ -129,7 +130,9 @@ The mark at the left of the toolbar names the kind of file in two words. 2D or 3
 
 ![Six sites of a phage assay in plate mode](plate-mode.png)
 
-Some ND2 files are not scans. A time lapse of a plate stores one camera field per site, repeated over z planes and over time, with no stitched whole-slide plane. The viewer opens these files in plate mode and reads frames from the ND2. It prepares reduced frames beside the file in the background; the status bar shows progress. Available reduced frames are warmed into memory to improve navigation. Preparation time, cache size and responsiveness depend on the acquisition and storage.
+Some microscopy files are multi-plane stacks or multi-well plates rather than stitched 2D scans. Multi-position **ND2** plates and uniform 2D multi-series **LIF** files open in plate grid mode, while single-position (`P = 1`) **ND2**, **CZI**, **LIF** (including **LambdaScan** spectral series and **LIGHTNING** deconvolved Z-stacks), and multi-plane **OME-TIFF** stacks open directly in focused stack mode with Z and time controls active. For ND2 plates, the viewer prepares reduced frames beside the file in the background; the status bar shows progress, and available reduced frames and neighbouring confocal Z planes are warmed into memory to keep navigation responsive.
+
+When a heterogeneous multi-series **LIF** or multi-scene **CZI** container holds multiple independent acquisitions (`Series 1 / N`), use the toolbar **Series** picker beside the filename to switch scenes directly in the active tab, or run `nd2wsi convert sample.lif series-1.nd2svs --position 1` to build a standalone pyramid for a specific series.
 
 ![Scrubbing time and stepping through z planes](plate-time-z.gif)
 
@@ -139,7 +142,7 @@ Autofocus compares every Z plane for each site and time point. It uses the gradi
 
 Two gestures do most of the work. Over the grid, a vertical scroll moves through z and a horizontal swipe on the trackpad scrubs time. Click a site, or press its number, and it fills the stage as a deep zoom, where a vertical scroll zooms, a horizontal swipe still scrubs time, and Option with a vertical scroll moves through z. With keyboard focus on a grid cell, arrows move between sites and Enter opens one. On the image stage, arrows step z and time, Space plays, and Esc or the All sites capsule returns to the grid. Time and Z controls also support keyboard adjustment and announce their values to assistive technology.
 
-In the deep zoom the ruler, pins, boxes, pixel values, and region export all work on the frame you are looking at. Marks are kept per site in a small file beside the ND2 and are shared across time and z planes. Slide Info lists the sites and their arrangement, the z planes with their step and home, the length of the series and the interval between frames, and the exposure.
+In the deep zoom the ruler, pins, boxes, pixel values, and region export all work on the frame you are looking at. For ND2 plates, marks are kept per site in a sidecar beside the ND2 and shared across time and z planes; for confocal CZI and LIF stacks, marks are isolated per `(T, P, Z)` plane so annotations on one optical section do not bleed onto others. Slide Info lists the sites and their arrangement, the z planes with their step and home, the length of the series and the interval between frames (or reports timing as unavailable when acquisition timestamps are absent), and the exposure.
 
 The grid has no implicitly selected site. Choose a site to measure pixels, view its histogram or use Auto LUT, edit/import/export annotations, or export a region. Manual channel visibility, window and gamma controls still apply to every site in the grid. A plate's **Full Field** export is the selected site's current T/Z frame. Changing sites clears the region; changing T/Z within one site keeps its geometry and refreshes the preview. Pending pixel and histogram responses from an older frame cannot replace the current result.
 
@@ -151,7 +154,7 @@ Press `M` and drag for a ruler, `P` for a pin, and `B` for a box. Each mark can 
 
 The ruler is honest about its numbers. It counts full-resolution pixels between its two ends and multiplies by the micrometers per pixel that the file itself recorded, the voxel size in an ND2 or the MPP tag in an SVS. If a file carries no trustworthy calibration, the ruler reports pixels instead of inventing a number.
 
-Marks are saved automatically and come back the next time you open the slide. Press `⌘⇧E` to export them as `.geojson`, or choose **Open** in Annotations to import a QuPath GeoJSON file. Imported marks are added to the existing marks and saved with them. Opening a native `.annotations.json` file replaces the current set.
+Marks are saved automatically and come back the next time you open the slide, with 50-step undo and redo (`⌘Z` / `⌘⇧Z`, or `Ctrl+Z` / `Ctrl+Y` on Windows). Press `⌘⇧E` (**Export GeoJSON**) to export them as `.geojson`, or choose **Import…** (**Open**) in Annotations to import a QuPath GeoJSON file. Imported marks are added to the existing marks and saved with them. Exporting or importing a native `.annotations.json` file (**Export .json**) saves or replaces the full annotation set.
 
 A small green check at the bottom right of the pane, next to the scale bar, means the last change to your marks (including Astromapper regions) or LUTs was auto-saved. Hover over it, or focus it with the keyboard, to see how long ago that was. The check turns grey while a change is waiting to be written, orange when a save failed and will be retried every minute, and red for a conflict with another window, which still needs the recovery notice in Annotations.
 
@@ -163,8 +166,8 @@ QuPath ellipses, geometry collections, and annotations tied to a non-default cha
 
 ### Numbered regions with Astromapper
 
-Open **Astromapper** with the star or **⌘⇧A / Ctrl+Shift+A**.
-Expand the top tools first to reveal the star. Shift-drag to add a rectangle,
+Open **Astromapper** with the star in the top toolbar (click `‹` first on narrow windows) or **⌘⇧A / Ctrl+Shift+A**.
+Shift-drag to add a rectangle,
 or choose **Add current region**. In a **Link scale + frame** comparison,
 Shift-drag adjusts the pane's alignment; use **Add current region** to add an ROI.
 Click an ROI number to centre it **without changing the current zoom**;
@@ -180,15 +183,20 @@ whole-image JPG, or enter that coordinate image's width and height. The viewer
 scales the coordinates into the current image and includes the end pixels.
 Use the corresponding uncropped image in the same orientation: dimensions alone
 cannot account for a crop or register a different image.
-Up to 2000 regions can be imported. Invalid rows or coordinates outside the
-confirmed reference image reject the import and leave existing annotations intact;
-the error identifies the affected index and reference dimensions. Check the
-coordinate file and its matching image rather than assuming a region-count limit.
+Up to 2000 regions can be imported. When a TXT file mixes valid ROIs with malformed
+rows, the import review panel shows how many regions are ready and lists skipped
+rows with their line number, `INDEX`, coordinates, and reason—leaving existing
+annotations and the source TXT untouched until you confirm. Zero-area legacy
+rectangles can optionally be restored to `1 px` during review; duplicate `INDEX`
+values, reversed endpoints, and out-of-image coordinates remain withheld rather
+than guessed or clipped (the Translucent viewer's JPG + TXT loader provides the
+same partial-import review). Unrecognized headers, files exceeding resource limits,
+or incompatible image aspect ratios still prevent import.
 
 **Export JPG + TXT** creates a ZIP with a small whole-image JPEG and matching
 coordinates. **Export ZIP with PDF** adds a landscape report with numbered ROI
-views. **Clear all** removes the Astromapper regions while keeping ordinary
-annotations.
+views. **Clear all** asks for confirmation (and supports `⌘Z` undo) before removing
+Astromapper regions while keeping ordinary annotations.
 
 ## Cutting out a region
 
@@ -198,13 +206,13 @@ Press `E` to open the Export panel, choose **Select Region**, and drag a box, or
 
 | Format | What you get |
 |---|---|
-| ND2 | the original numbers of the selected channels, as a new ND2 file |
-| TIFF | the original numbers, as a tiled TIFF |
+| ND2 | the original numbers of the selected channels at native resolution (`uint8` / `uint16` non-raster slides), as a new ND2 file |
+| TIFF | the original numbers across all bit depths and export scales, as an OME-TIFF (`.tif`) with OME-XML channel and `µm/px` calibration metadata |
 | PNG or JPEG | a picture of the region exactly as it looks on screen |
 | Scale bar + SVG | a lossless PNG image embedded in an SVG, with an editable vector scale bar and label |
 | Scale bar + JPEG | a high-quality JPEG with the calibrated scale bar and label baked in |
 
-Native-resolution ND2 and TIFF exports preserve source channel values, or decoded RGB for colour slides. Reduced-resolution exports resample those values, and lossy source formats cannot recover pre-compression microscope samples. PNG and JPEG apply the current display colours and contrast; use source data for quantitative intensity analysis.
+Native-resolution ND2 and OME-TIFF exports preserve source channel values, or decoded RGB for colour slides (when ND2 export is unavailable, such as on `float32` or RGB raster images, **TIFF** becomes the primary data export button). Reduced-resolution TIFF exports resample those values, and lossy source formats cannot recover pre-compression microscope samples. PNG and JPEG apply the current display colours and contrast; use source data for quantitative intensity analysis.
 
 ### Editable scale bars in Adobe Illustrator
 
@@ -277,11 +285,12 @@ managed scan-pyramid directory cache creates a verified single-file copy and
 keeps the old directory; deletion of the old copy is a separate explicit cleanup.
 Matching caches are reused on later opens, while upgrades that change derived
 channel, tile or calibration semantics quarantine the superseded copy as
-`*.corrupt-*` and rebuild once (free disk space is needed; `nd2wsi tidy` removes
-superseded copies). Legacy multi-site plate directory caches are reused read-only
+`*.corrupt-*` and rebuild once (free disk space is needed;
+`nd2wsi tidy <folder> --remove-corrupt-caches` removes superseded directory
+caches after rescuing any embedded annotations). Legacy multi-site plate directory caches are reused read-only
 without conversion. Portable `.ome.zarr` exports
-remain supported and are not converted or removed automatically. A tiled SVS
-normally needs no additional cache.
+remain supported and are not converted or removed automatically. Tiled SVS and
+pyramidal OME-TIFF / TIFF slides normally need no additional cache.
 
 Viewing caches are retained for future opens. macOS 2.1.1 no longer exposes a
 cache-delete button in the viewer; source scans and annotations remain separate.
@@ -307,8 +316,10 @@ Shortcuts act on the image workspace. Image tools are ignored while typing in a 
 | `⌘⇧A` | show or hide Astromapper |
 | `⌘N` / `Ctrl+N` on Windows | open a separate viewer window |
 | `⌘1` … `⌘9` | switch to that tab |
+| `⌘Z` / `⌘⇧Z` | undo or redo annotation and Astromap edits (`Ctrl+Y` also redoes on Windows) |
 | `⌘⇧E` | export marks as GeoJSON |
-| `Esc` | cancel the active tool, or return to all sites |
+| `?` | show or hide keyboard shortcuts |
+| `Esc` | cancel the active tool, close shortcuts, or return to all sites |
 
 ### Orientation and comparison
 

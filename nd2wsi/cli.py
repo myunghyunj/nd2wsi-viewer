@@ -1,7 +1,8 @@
-"""Command-line tools for local whole-slide viewing and ROI export.
+"""Command-line tools for local whole-slide and confocal viewing, pyramid caching, and ROI export.
 
-``view`` builds or reuses a managed viewing cache. ``convert`` writes a
-self-contained OME-Zarr pyramid. ``crop`` reads native ND2 pixels directly.
+``view`` serves slides directly or builds/reuses a managed ``.nd2svs`` viewing
+cache. ``convert`` writes a self-contained ``.nd2svs`` or OME-Zarr pyramid.
+``crop`` reads native ND2 pixels directly.
 """
 
 from __future__ import annotations
@@ -27,7 +28,10 @@ def _add_selection_args(p: argparse.ArgumentParser) -> None:
         help="Z plane: index, 'mid' (default) or 'max' (max-intensity projection)",
     )
     p.add_argument(
-        "--position", type=int, default=0, help="position index for multipoint files"
+        "--position",
+        type=int,
+        default=0,
+        help="position, scene, or series index for multipoint/multi-series files",
     )
 
 
@@ -281,21 +285,27 @@ def main(argv: list[str] | None = None) -> int:
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="nd2wsi",
-        description="Local whole-slide viewing for Nikon ND2, Aperio SVS and SDPC, "
-        "with native-value ROI export.",
+        description="Local whole-slide and confocal viewing for Nikon ND2, Zeiss CZI, "
+        "Leica LIF, OME-TIFF/TIFF, Aperio SVS, and SDPC, with native-value ROI export.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_info = sub.add_parser("info", help="inspect an ND2/SVS/SDPC file's internal layout")
+    p_info = sub.add_parser(
+        "info",
+        help="inspect an ND2/CZI/LIF/SVS/SDPC/.nd2svs/.ome.zarr file's internal layout",
+    )
     p_info.add_argument("nd2")
     p_info.add_argument("--json", action="store_true", help="machine-readable output")
 
-    p_conv = sub.add_parser("convert", help="ND2/SVS -> OME-Zarr multiscale pyramid")
+    p_conv = sub.add_parser(
+        "convert",
+        help="ND2/CZI/LIF/SVS -> single-file .nd2svs or OME-Zarr multiscale pyramid",
+    )
     p_conv.add_argument("nd2")
     p_conv.add_argument(
         "out",
         nargs="?",
-        help="output store (default: pyramids/<source>.ome.zarr)",
+        help="output .nd2svs file or .ome.zarr directory (default: pyramids/<source>.ome.zarr)",
     )
     _add_convert_args(p_conv)
 
@@ -340,11 +350,16 @@ def _main(argv: list[str] | None = None) -> int:
         help="delete quarantined *.corrupt-* caches",
     )
 
-    p_serve = sub.add_parser("serve", help="serve the viewer for converted store(s)")
+    p_serve = sub.add_parser(
+        "serve", help="serve the viewer for converted .nd2svs or OME-Zarr store(s)"
+    )
     p_serve.add_argument("store", nargs="+", help="one tab per store")
     _add_serve_args(p_serve)
 
-    p_view = sub.add_parser("view", help="serve a slide directly or build a viewing cache if needed")
+    p_view = sub.add_parser(
+        "view",
+        help="serve a slide or stack directly, or build/reuse a .nd2svs viewing cache",
+    )
     p_view.add_argument("nd2", nargs="+", help="one tab per slide")
     p_view.add_argument(
         "--store", help="portable pyramid location for an explicit conversion"
