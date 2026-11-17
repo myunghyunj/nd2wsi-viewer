@@ -110,7 +110,7 @@ def test_sqlite_read_pool_concurrent_reads_pragmas_and_clean_close(tmp_path: Pat
             with obs_lock:
                 observed_conns.append(id(conn))
             barrier.wait(timeout=5.0)
-            assert conn.execute("PRAGMA cache_size").fetchone()[0] == -32768
+            assert conn.execute("PRAGMA cache_size").fetchone()[0] == -8192
             assert conn.execute("PRAGMA mmap_size").fetchone()[0] == 0
             assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
         for i in range(worker_idx, 48, 3):
@@ -126,9 +126,9 @@ def test_sqlite_read_pool_concurrent_reads_pragmas_and_clean_close(tmp_path: Pat
         for f in futs:
             f.result(timeout=10.0)
 
-    # Exactly 6 distinct read-only connections were opened under concurrency
+    # Exactly 4 distinct read-only connections were opened under concurrency
     pooled_conns = list(reader._read_connections)
-    assert len(set(observed_conns)) == _READ_POOL_SIZE == 6
+    assert len(set(observed_conns)) == _READ_POOL_SIZE == 4
     assert len(pooled_conns) == _READ_POOL_SIZE
 
     reader.close()
@@ -768,12 +768,17 @@ def test_export_roi_tiff_emits_compliant_ome_xml_and_preserves_pixels(tmp_path: 
 def test_dynamic_frame_cache_bytes_scaling():
     mib = 1024 * 1024
     gib = 1024 * mib
-    assert plate._default_frame_cache_bytes(2 * gib) == 320 * mib
-    assert plate._default_frame_cache_bytes(8 * gib) == int(8 * gib * 0.08)
-    assert plate._default_frame_cache_bytes(16 * gib) == int(16 * gib * 0.08)
-    assert plate._default_frame_cache_bytes(64 * gib) == 1536 * mib
-    assert 320 * mib <= plate.FRAME_CACHE_BYTES <= 1536 * mib
+    assert plate._default_frame_cache_bytes(2 * gib) == 256 * mib
+    assert plate._default_frame_cache_bytes(8 * gib) == int(8 * gib * 0.05)
+    assert plate._default_frame_cache_bytes(16 * gib) == 640 * mib
+    assert plate._default_frame_cache_bytes(64 * gib) == 640 * mib
+    assert 256 * mib <= plate.FRAME_CACHE_BYTES <= 640 * mib
     assert plate._FRAME_CACHE.budget == plate.FRAME_CACHE_BYTES
+
+    assert render._default_raw_chunk_cache_bytes(1 * gib) == 32 * mib
+    assert render._default_raw_chunk_cache_bytes(4 * gib) == int(4 * gib * 0.02)
+    assert render._default_raw_chunk_cache_bytes(16 * gib) == 96 * mib
+    assert 32 * mib <= render.RAW_CHUNK_CACHE_BYTES <= 96 * mib
 
 
 def test_plate_source_prefetch_neighbors_warms_adjacent_z_and_cleans_up(

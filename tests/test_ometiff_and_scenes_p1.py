@@ -893,7 +893,7 @@ def test_bounded_http_thread_pool_caps_worker_threads(tmp_path: Path):
     tifffile.imwrite(slide, np.zeros((512, 512), dtype=np.uint16), tile=(128, 128))
 
     httpd = create_server(slide, port=0)
-    assert httpd.max_workers == 24
+    assert httpd.max_workers == 16
     peak_http_threads = 0
     lock = threading.Lock()
 
@@ -916,7 +916,7 @@ def test_bounded_http_thread_pool_caps_worker_threads(tmp_path: Path):
         with concurrent.futures.ThreadPoolExecutor(max_workers=48) as client_pool:
             sizes = list(client_pool.map(_fetch_tile, range(72)))
         assert all(sz > 50 for sz in sizes)
-        assert 1 <= peak_http_threads <= 24
+        assert 1 <= peak_http_threads <= 16
 
     httpd.server_close()
     assert httpd._pool_closed is True

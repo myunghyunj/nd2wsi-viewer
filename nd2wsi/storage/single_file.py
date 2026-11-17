@@ -46,9 +46,34 @@ _WRITABLE_VERSIONS = frozenset({FORMAT_VERSION, CORRECTED_FORMAT_VERSION})
 _COMPANION_SUFFIXES = ("-journal", "-wal", "-shm")
 _PAGE_KEYS = 256
 _RECOVERY_TIMEOUT = 1.0
-_READ_POOL_SIZE = 6
+_READ_POOL_SIZE = 4
+_CACHE_SIZE_KIB = -8192
 _PATH_MUTATIONS_LOCK = threading.Lock()
 _PATH_MUTATIONS: dict[str, int] = {}
+
+
+def _resolve_max_readers(max_readers: int | None = None) -> int:
+    if max_readers is not None:
+        val = int(max_readers)
+    else:
+        raw = os.environ.get("ND2WSI_SQLITE_MAX_READERS")
+        val = int(raw) if raw is not None and raw.strip() != "" else _READ_POOL_SIZE
+    if val < 1:
+        raise ValueError("max_readers must be >= 1")
+    return val
+
+
+def _resolve_cache_size(cache_size: int | None = None) -> int:
+    if cache_size is not None:
+        return int(cache_size)
+    raw_exact = os.environ.get("ND2WSI_SQLITE_CACHE_SIZE")
+    if raw_exact is not None and raw_exact.strip() != "":
+        return int(raw_exact)
+    raw_kib = os.environ.get("ND2WSI_SQLITE_CACHE_KIB")
+    if raw_kib is not None and raw_kib.strip() != "":
+        kib = int(raw_kib)
+        return -abs(kib) if kib != 0 else 0
+    return _CACHE_SIZE_KIB
 
 
 def _bump_path_mutation(path: Path) -> None:
@@ -122,19 +147,22 @@ class SQLiteStore(Store):
     def __init__(
         self, path: str | os.PathLike, *, read_only: bool = False, prefix: str = "",
         recover: bool = False, _exclusive: bool = False, format_version: int = FORMAT_VERSION,
+        max_readers: int | None = None, cache_size: int | None = None,
     ):
         super().__init__(read_only=read_only)
         self.path = self.root = Path(os.path.abspath(os.fspath(path)))
         self.prefix = _normalize_key(prefix, prefix=True).rstrip("/")
+        self._max_readers = _resolve_max_readers(max_readers)
+        self._cache_size = _resolve_cache_size(cache_size)
         self._lock = threading.RLock()
         self._pool_lock = threading.Lock()
         self._pool_cv = threading.Condition(self._pool_lock)
+        self._read_sem = threading.BoundedSemaphore(self._max_readers)
         self._read_pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(
-            maxsize=_READ_POOL_SIZE
+            maxsize=self._max_readers
         )
         self._read_connections: list[sqlite3.Connection] = []
         self._active_reads = 0
-        self._opening_readers = 0
         self._mutation_seq = 0
         self._connection: sqlite3.Connection | None = None
         self._closed = False
@@ -165,12 +193,24 @@ class SQLiteStore(Store):
         return f"sqlite:{self.path}#{self.prefix}"
 
     def with_read_only(self, read_only: bool = False) -> SQLiteStore:
-        return type(self)(self.path, read_only=read_only, prefix=self.prefix)
+        return type(self)(
+            self.path,
+            read_only=read_only,
+            prefix=self.prefix,
+            max_readers=self._max_readers,
+            cache_size=self._cache_size,
+        )
 
     def child(self, prefix: str) -> SQLiteStore:
         relative = _normalize_key(prefix, prefix=True).rstrip("/")
         combined = "/".join(part for part in (self.prefix, relative) if part)
-        return type(self)(self.path, read_only=self.read_only, prefix=combined)
+        return type(self)(
+            self.path,
+            read_only=self.read_only,
+            prefix=combined,
+            max_readers=self._max_readers,
+            cache_size=self._cache_size,
+        )
 
     @staticmethod
     def _validate(connection: sqlite3.Connection, *, read_only: bool) -> None:
@@ -196,17 +236,30 @@ class SQLiteStore(Store):
             raise ValueError("unsupported single-file cache schema")
 
     @staticmethod
-    def _configure(connection: sqlite3.Connection, *, read_only: bool = False) -> None:
+    def _configure(
+        connection: sqlite3.Connection,
+        *,
+        read_only: bool = False,
+        cache_size: int = _CACHE_SIZE_KIB,
+    ) -> None:
         connection.execute("PRAGMA trusted_schema=OFF")
-        connection.execute(
-            "PRAGMA cache_size=-32768" if read_only else "PRAGMA cache_size=-8192"
-        )
+        connection.execute(f"PRAGMA cache_size={int(cache_size)}")
         connection.execute("PRAGMA mmap_size=0")
         connection.execute("PRAGMA temp_store=FILE")
         if read_only:
             connection.execute("PRAGMA query_only=ON")
         if hasattr(connection, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):
             connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+
+    @staticmethod
+    def _is_conn_usable(connection: sqlite3.Connection) -> bool:
+        try:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.execute("SELECT 1").fetchone()
+            return True
+        except (sqlite3.Error, ValueError):
+            return False
 
     def _recover_hot_journal(self) -> None:
         """Let SQLite roll back one interrupted owned write, never discard it.
@@ -329,7 +382,9 @@ class SQLiteStore(Store):
                 uri=True, timeout=30, isolation_level=None, check_same_thread=False,
             )
             try:
-                self._configure(connection, read_only=self.read_only)
+                self._configure(
+                    connection, read_only=self.read_only, cache_size=self._cache_size
+                )
                 if not created:
                     self._validate(connection, read_only=self.read_only)
                 if not self.read_only:
@@ -373,7 +428,7 @@ class SQLiteStore(Store):
             uri=True, timeout=30, isolation_level=None, check_same_thread=False,
         )
         try:
-            self._configure(connection, read_only=True)
+            self._configure(connection, read_only=True, cache_size=self._cache_size)
             self._validate(connection, read_only=True)
         except sqlite3.Error as exc:
             connection.close()
@@ -389,57 +444,72 @@ class SQLiteStore(Store):
             with self._lock:
                 yield self._ensure_open_sync()
             return
-        if self._connection is None and not self._closed:
+        if not getattr(self, "_is_open", False) and not self._closed:
             self._ensure_open_sync()
         conn: sqlite3.Connection | None = None
-        to_open = False
         with self._pool_cv:
-            while conn is None:
-                if self._closed:
-                    raise ValueError("SQLiteStore is closed")
-                try:
-                    conn = self._read_pool.get_nowait()
-                    self._active_reads += 1
-                    break
-                except queue.Empty:
-                    if (len(self._read_connections) + self._opening_readers) < _READ_POOL_SIZE:
-                        self._opening_readers += 1
-                        self._active_reads += 1
-                        to_open = True
-                        break
-                    self._pool_cv.wait()
-        if to_open:
+            while not self._closed and not self._read_sem.acquire(blocking=False):
+                self._pool_cv.wait()
+            if self._closed:
+                raise ValueError("SQLiteStore is closed")
+            self._active_reads += 1
             try:
-                opened = self._open_pool_reader()
-            except BaseException:
-                with self._pool_cv:
-                    self._opening_readers -= 1
-                    self._active_reads -= 1
-                    self._pool_cv.notify_all()
-                raise
-            with self._pool_cv:
-                self._opening_readers -= 1
-                if self._closed:
-                    self._active_reads -= 1
-                    self._pool_cv.notify_all()
-                    opened.close()
-                    raise ValueError("SQLiteStore is closed")
-                self._read_connections.append(opened)
-                conn = opened
-        assert conn is not None
+                conn = self._read_pool.get_nowait()
+            except queue.Empty:
+                conn = None
+        had_error = False
         try:
-            yield conn
+            if conn is None:
+                opened = self._open_pool_reader()
+                with self._pool_cv:
+                    if self._closed:
+                        opened.close()
+                        raise ValueError("SQLiteStore is closed")
+                    self._read_connections.append(opened)
+                    if self._connection is None:
+                        self._connection = opened
+                    conn = opened
+            try:
+                yield conn
+            except BaseException:
+                had_error = True
+                raise
         finally:
+            healthy = False
+            if conn is not None and not self._closed:
+                if not had_error:
+                    try:
+                        healthy = not conn.in_transaction
+                    except Exception:
+                        healthy = False
+                if not healthy:
+                    healthy = self._is_conn_usable(conn)
+            to_close: sqlite3.Connection | None = None
             with self._pool_cv:
                 self._active_reads -= 1
-                if self._closed:
-                    conn.close()
-                else:
-                    try:
-                        self._read_pool.put_nowait(conn)
-                    except queue.Full:  # pragma: no cover - defensive
-                        conn.close()
+                if conn is not None:
+                    if healthy and not self._closed:
+                        try:
+                            self._read_pool.put_nowait(conn)
+                        except queue.Full:  # pragma: no cover - defensive
+                            if conn in self._read_connections:
+                                self._read_connections.remove(conn)
+                            to_close = conn
+                    else:
+                        if conn in self._read_connections:
+                            self._read_connections.remove(conn)
+                        if self._connection is conn:
+                            self._connection = (
+                                self._read_connections[0] if self._read_connections else None
+                            )
+                        to_close = conn
+                self._read_sem.release()
                 self._pool_cv.notify_all()
+            if to_close is not None:
+                try:
+                    to_close.close()
+                except Exception:
+                    pass
 
     async def _open(self) -> None:
         await asyncio.to_thread(self._ensure_open_sync)
@@ -449,26 +519,38 @@ class SQLiteStore(Store):
             if self._in_batch:
                 raise RuntimeError("cannot close a SQLiteStore inside its batch")
             if self.read_only:
+                idle_conns: list[sqlite3.Connection] = []
                 with self._pool_cv:
                     self._closed = True
                     self._is_open = False
+                    while True:
+                        try:
+                            idle_conns.append(self._read_pool.get_nowait())
+                        except queue.Empty:
+                            break
                     self._pool_cv.notify_all()
                     self._pool_cv.wait_for(
-                        lambda: self._active_reads == 0 and self._opening_readers == 0,
+                        lambda: self._active_reads == 0,
                         timeout=30.0,
                     )
                     while True:
                         try:
-                            self._read_pool.get_nowait()
+                            idle_conns.append(self._read_pool.get_nowait())
                         except queue.Empty:
                             break
                     conns = list(self._read_connections)
                     self._read_connections.clear()
+                    for c in idle_conns:
+                        if c not in conns:
+                            conns.append(c)
                     if self._connection is not None and self._connection not in conns:
                         conns.append(self._connection)
                     self._connection = None
                 for c in conns:
-                    c.close()
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
                 return
             if self._connection is not None:
                 self._connection.close()

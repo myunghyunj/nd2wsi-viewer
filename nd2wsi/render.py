@@ -157,9 +157,23 @@ def _read_region(root: Any, level_path: str, x: int, y: int, w: int, h: int) -> 
     return np.asarray(arr[:, y0:y1, x0:x1])
 
 
-def _default_raw_chunk_cache_bytes() -> int:
-    ram = total_physical_memory_bytes()
-    return max(128 * 1024 * 1024, min(int(ram * 0.04), 256 * 1024 * 1024))
+# Coordinated process-wide raw-chunk cache budget:
+# Capped at min(96 MiB, 2% physical RAM) with a 32 MiB floor so decoded Zarr
+# tiles + Plate/Stack frame caches (256-640 MiB) + SQLite page caches (<=32 MiB
+# per open .nd2svs) never compound into multi-GB RSS spikes across 4-pane Compare.
+RAW_CHUNK_CACHE_MIN_BYTES = 32 * 1024 * 1024
+RAW_CHUNK_CACHE_MAX_BYTES = 96 * 1024 * 1024
+
+
+def _default_raw_chunk_cache_bytes(total_ram: int | None = None) -> int:
+    if total_ram is None:
+        raw_env = os.environ.get("ND2WSI_RAW_CHUNK_CACHE_BYTES")
+        if raw_env is not None and raw_env.strip() != "":
+            val = int(raw_env)
+            if val > 0:
+                return val
+    ram = int(total_physical_memory_bytes() if total_ram is None else total_ram)
+    return max(RAW_CHUNK_CACHE_MIN_BYTES, min(int(ram * 0.02), RAW_CHUNK_CACHE_MAX_BYTES))
 
 
 RAW_CHUNK_CACHE_BYTES = _default_raw_chunk_cache_bytes()
@@ -188,15 +202,29 @@ def _coalesced_file_sig(path: str | os.PathLike) -> tuple[int, int, int] | None:
 
 
 class _RawChunkCache:
-    """Thread-safe, byte-budgeted LRU cache for decoded multi-channel raw tiles."""
+    """Thread-safe, byte-budgeted LRU cache for decoded multi-channel raw tiles.
+
+    Enforces ``used <= budget`` strictly before every insertion and skips single
+    chunks larger than 25% of ``budget`` so oversized multi-channel regions
+    cannot flush the working viewport set.
+    """
 
     def __init__(self, budget: int = RAW_CHUNK_CACHE_BYTES):
         self.budget = int(budget)
         self.used = 0
         self.hits = 0
         self.misses = 0
+        self.evictions = 0
+        self.skipped = 0
         self._d: OrderedDict[Any, tuple[Any, np.ndarray]] = OrderedDict()
         self._lock = threading.Lock()
+
+    def _sweep_dead_locked(self) -> None:
+        dead_keys = [
+            k for k, (ref, _arr) in self._d.items() if ref is not None and ref() is None
+        ]
+        for k in dead_keys:
+            self.used -= int(self._d.pop(k)[1].nbytes)
 
     def get(self, key: Any, owner_obj: Any = None) -> np.ndarray | None:
         with self._lock:
@@ -208,7 +236,7 @@ class _RawChunkCache:
             if ref is not None:
                 alive = ref()
                 if alive is None or (owner_obj is not None and alive is not owner_obj):
-                    self.used -= arr.nbytes
+                    self.used -= int(arr.nbytes)
                     del self._d[key]
                     self.misses += 1
                     return None
@@ -217,12 +245,18 @@ class _RawChunkCache:
             return arr
 
     def put(self, key: Any, value: np.ndarray, owner_obj: Any = None) -> np.ndarray:
+        nbytes = int(value.nbytes)
+        if nbytes <= 0:
+            return value
+        with self._lock:
+            max_entry_bytes = self.budget // 4
+            if self.budget <= 0 or nbytes > max_entry_bytes:
+                self.skipped += 1
+                return value
         if not value.flags.owndata:
             value = value.copy()
         value.setflags(write=False)
         nbytes = int(value.nbytes)
-        if nbytes <= 0 or nbytes > self.budget:
-            return value
         ref = None
         if owner_obj is not None:
             try:
@@ -230,15 +264,39 @@ class _RawChunkCache:
             except TypeError:
                 ref = None
         with self._lock:
+            max_entry_bytes = self.budget // 4
+            if self.budget <= 0 or nbytes > max_entry_bytes:
+                self.skipped += 1
+                return value
             old = self._d.pop(key, None)
             if old is not None:
-                self.used -= old[1].nbytes
+                self.used -= int(old[1].nbytes)
+            if (self.used + nbytes) > self.budget:
+                self._sweep_dead_locked()
+            while (self.used + nbytes) > self.budget and self._d:
+                _, evicted = self._d.popitem(last=False)
+                self.used -= int(evicted[1].nbytes)
+                self.evictions += 1
+            if (self.used + nbytes) > self.budget:
+                self.skipped += 1
+                return value
             self._d[key] = (ref, value)
             self.used += nbytes
-            while self.used > self.budget and self._d:
-                _, evicted = self._d.popitem(last=False)
-                self.used -= evicted[1].nbytes
         return value
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            self._sweep_dead_locked()
+            return {
+                "budget": int(self.budget),
+                "max_entry_bytes": int(self.budget // 4),
+                "used": int(self.used),
+                "entries": len(self._d),
+                "hits": int(self.hits),
+                "misses": int(self.misses),
+                "evictions": int(self.evictions),
+                "skipped": int(self.skipped),
+            }
 
     def clear(self) -> None:
         with self._lock:
@@ -246,6 +304,8 @@ class _RawChunkCache:
             self.used = 0
             self.hits = 0
             self.misses = 0
+            self.evictions = 0
+            self.skipped = 0
 
     def purge(self, owner: Any) -> None:
         owner_id = id(owner) if not isinstance(owner, (int, str, Path)) else owner
@@ -260,17 +320,31 @@ class _RawChunkCache:
                     and (
                         k[0] == owner_id
                         or k[0] == owner_str
-                        or (isinstance(k[1], tuple) and k[1] and k[1][0] == owner_str)
+                        or (
+                            isinstance(k[1], tuple)
+                            and len(k[1]) >= 2
+                            and (k[1][0] == owner_str or k[1][1] == owner_str)
+                        )
                     )
                 )
             ]
             for k in to_drop:
-                self.used -= self._d.pop(k)[1].nbytes
+                self.used -= int(self._d.pop(k)[1].nbytes)
 
     invalidate = purge
 
 
 _RAW_CHUNK_CACHE = _RawChunkCache()
+
+
+def raw_chunk_cache_stats() -> dict[str, int]:
+    """Return deterministic byte-accounting and hit/eviction telemetry for `_RAW_CHUNK_CACHE`."""
+    return _RAW_CHUNK_CACHE.stats()
+
+
+def clear_raw_chunk_cache() -> None:
+    """Clear `_RAW_CHUNK_CACHE` and reset its counters."""
+    _RAW_CHUNK_CACHE.clear()
 
 
 def _store_generation_token(arr: Any, x: int, y: int) -> Any:
