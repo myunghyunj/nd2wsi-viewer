@@ -17,10 +17,17 @@ from typing import Any, BinaryIO
 import numpy as np
 
 from . import render
+from .annotation_sidecars import slide_stem
 from .direct_common import _parse_cyx_index
 from .metal import reduce2x_cpu
 
 JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _safe_export_stem(source: str | Path) -> str:
+    stem = slide_stem(source)
+    stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", stem).strip(". ")[:120]
+    return stem or "slide"
 
 
 class ExportRequestError(ValueError):
@@ -251,7 +258,10 @@ def prepare_export(
     job = (query.get("job") or [None])[0]
     if job and not JOB_RE.match(job):
         job = None
-    stem = Path(meta["source"]).stem
+    stem = _safe_export_stem(meta["source"])
+    base_sel = meta.get("selection") if isinstance(meta.get("selection"), dict) else {}
+    sel_p = base_sel.get("p")
+    has_nonzero_series = isinstance(sel_p, int) and not isinstance(sel_p, bool) and sel_p > 0
     try:
         frame = resolve_frame(state, query, require_p=True)
     except ValueError as exc:
@@ -259,7 +269,12 @@ def prepare_export(
     root = state.root
     if frame is not None:
         root = state.plate.root_for(*frame)
-        stem += "_t{}_p{}_z{}".format(*frame)
+        t_idx, p_idx, z_idx = frame
+        if p_idx == 0 and getattr(state.plate, "P", 1) <= 1 and has_nonzero_series:
+            p_idx = int(sel_p)
+        stem += f"_t{t_idx}_p{p_idx}_z{z_idx}"
+    elif has_nonzero_series:
+        stem += f"_p{sel_p}"
     applied = frame is None and (state.manifest.get("h_correction") or {}).get("applied") is True
     if applied:
         if fmt in ("nd2", "tif", "tiff"):

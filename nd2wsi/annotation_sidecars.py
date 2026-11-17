@@ -11,7 +11,23 @@ import re
 from pathlib import Path
 from typing import Any
 
-SLIDE_SUFFIXES = {".nd2", ".czi", ".lif", ".svs", ".sdpc"}
+SLIDE_SUFFIXES = {".nd2", ".czi", ".lif", ".tif", ".tiff", ".qptiff", ".svs", ".sdpc"}
+
+_OME_ZARR_SUFFIX_RE = re.compile(r"\.ome\.zarr$", re.IGNORECASE)
+_COMPOUND_SLIDE_SUFFIX_RE = re.compile(r"\.ome\.tiff?$", re.IGNORECASE)
+
+
+def slide_stem(source: str | Path) -> str:
+    """Return the logical stem of a slide/store name, stripping compound ``.ome.*`` suffixes."""
+    name = Path(str(source).replace("\\", "/")).name
+    zarr_stripped = _OME_ZARR_SUFFIX_RE.sub("", name)
+    if zarr_stripped:
+        name = zarr_stripped
+    ome_stripped = _COMPOUND_SLIDE_SUFFIX_RE.sub("", name)
+    if ome_stripped and ome_stripped != name:
+        return ome_stripped
+    stem = Path(name).stem
+    return stem or name
 
 def _slide_folder(container: Path) -> Path:
     """The slide's folder, for a cache or store in any layout the app writes."""
@@ -81,13 +97,13 @@ def _legacy_sidecar_matches(path: Path, source_name: str, home: Path) -> bool:
     # A downscaled JPG must never inherit those coordinates implicitly.
     if Path(source_name).suffix.lower() in RASTER_SUFFIXES:
         return False
-    stem = Path(source_name).stem
+    stems = {Path(source_name).stem, slide_stem(source_name)}
     try:
         siblings = [
             item
             for item in home.iterdir()
             if item.is_file()
-            and item.stem == stem
+            and (item.stem in stems or slide_stem(item.name) in stems)
             and item.suffix.lower() in SLIDE_SUFFIXES | RASTER_SUFFIXES
         ]
     except OSError:
@@ -118,7 +134,7 @@ def annotations_sidecar(
     store_path = Path(store_path).resolve()
     meta = attrs["nd2wsi"]
     source_name = Path(meta["source"]).name
-    stem = Path(source_name).stem
+    candidate_stems = tuple(dict.fromkeys((slide_stem(source_name), Path(source_name).stem)))
 
     container = manifest_container(store_path)
     # Always the slide's folder by the cache's own location: a recorded
@@ -156,12 +172,16 @@ def annotations_sidecar(
     if not new.exists():
         import shutil
 
-        old_paths = (
-            target_dir / f"annotations_{stem}.json",
-            home / f"annotations_{stem}.json",
-            home / CACHE_DIR_NAME / f"annotations_{stem}.json",
-            home / f"{stem}.annotations.json",
-            store_path.parent / f"annotations_{stem}.json",
+        old_paths = tuple(
+            candidate
+            for stem in candidate_stems
+            for candidate in (
+                target_dir / f"annotations_{stem}.json",
+                home / f"annotations_{stem}.json",
+                home / CACHE_DIR_NAME / f"annotations_{stem}.json",
+                home / f"{stem}.annotations.json",
+                store_path.parent / f"annotations_{stem}.json",
+            )
         )
         for old in old_paths:
             if old == new or old.is_symlink() or not old.exists():
@@ -218,7 +238,7 @@ def plate_annotations_sidecar(
     path = Path(path).resolve()
     source_name = Path(attrs["nd2wsi"]["source"]).name or path.name
     safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", source_name)
-    target_dir = path.parent / MANAGED_DIR / ANNOTATIONS_DIR
+    target_dir = _slide_folder(path) / MANAGED_DIR / ANNOTATIONS_DIR
     if create_directory:
         target_dir.mkdir(parents=True, exist_ok=True)
     return target_dir / f"annotations_{safe_source}--site{int(p)}.json"
@@ -227,20 +247,40 @@ def plate_annotations_sidecar(
 def confocal_annotations_sidecar(
     path: str | Path, attrs: dict[str, Any], frame: tuple[int, int, int],
 ) -> tuple[Path, Path | None]:
-    """Discover a CZI/LIF plane and a non-destructive legacy fallback.
+    """Discover a confocal/stack plane and a non-destructive legacy fallback.
 
     Reuse the pre-plate T/P/Z identity, so converted selections and interactive
-    planes see the same marks. A 2.6.1 site-wide document is a fallback only;
-    callers copy it (never move or merge it) into a missing plane document.
-    Discovery itself must remain read-only for Agent window snapshots.
+    planes see the same marks. When a single-scene stack source targets a
+    container series (``selection.p`` with ``plate.P <= 1``), preserve that
+    series index so distinct scenes never share ``p=0`` plane sidecars.
+    A 2.6.1 site-wide document is a fallback only; callers copy it (never move
+    or merge it) into a missing plane document. Discovery itself must remain
+    read-only for Agent window snapshots.
     """
     t, p, z = frame
-    selected = {**attrs, "nd2wsi": {**attrs["nd2wsi"], "selection": {"t": t, "p": p, "z": z}}}
+    meta = attrs["nd2wsi"]
+    base_sel = meta.get("selection")
+    plate_p = int((meta.get("plate") or {}).get("P", 1) or 1)
+    effective_p = (
+        int(base_sel["p"])
+        if (
+            p == 0
+            and plate_p <= 1
+            and isinstance(base_sel, dict)
+            and isinstance(base_sel.get("p"), int)
+            and not isinstance(base_sel.get("p"), bool)
+        )
+        else p
+    )
+    selected = {
+        **attrs,
+        "nd2wsi": {**meta, "selection": {"t": t, "p": effective_p, "z": z}},
+    }
     legacy: list[Path] = []
     canonical = annotations_sidecar(path, selected, migrate=False, legacy_paths=legacy)
     if canonical.exists():
         return canonical, None
-    shared = plate_annotations_sidecar(path, attrs, p, create_directory=False)
+    shared = plate_annotations_sidecar(path, attrs, effective_p, create_directory=False)
     if shared.is_file() and not shared.is_symlink():
         return canonical, shared
     return canonical, legacy[0] if legacy else None
