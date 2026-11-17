@@ -26,6 +26,9 @@ RECORD_FORMAT = "nd2wsi-lut-settings-record/1"
 MAX_BYTES = 128 * 1024
 MAX_CHANNELS = 512
 _INTEGER = re.compile(r"^(?:u?int\d+|bool|[<>=|]?[iu]\d+)$")
+_HEX_COLOR = re.compile(r"^[0-9A-Fa-f]{6}$")
+_REQUIRED_LUT_KEYS = frozenset({"lo", "hi", "gamma"})
+_ALLOWED_LUT_KEYS = frozenset({"lo", "hi", "gamma", "color"})
 
 
 class LutSettingsUnavailable(ValueError):
@@ -70,7 +73,9 @@ def validate_settings(payload, channels, dtype) -> dict:
     clean = []
     discrete = bool(_INTEGER.fullmatch(str(dtype).strip()))
     for lut, channel in zip(luts, channels):
-        if not isinstance(lut, dict) or set(lut) != {"lo", "hi", "gamma"}:
+        if (not isinstance(lut, dict)
+                or not _REQUIRED_LUT_KEYS <= set(lut)
+                or not set(lut) <= _ALLOWED_LUT_KEYS):
             raise ValueError("Each LUT must contain minimum, maximum and gamma")
         lo, hi, gamma = (lut[key] for key in ("lo", "hi", "gamma"))
         if (not all(_finite_number(value) for value in (lo, hi, gamma))
@@ -80,7 +85,16 @@ def validate_settings(payload, channels, dtype) -> dict:
         if discrete and hi - lo < 1 and not (
                 lo == default.get("start") and hi == default.get("end") and gamma == 1):
             raise ValueError("Integer LUT ranges must span at least one intensity unit")
-        clean.append({"lo": lo, "hi": hi, "gamma": gamma})
+        raw_color = lut.get("color")
+        clean_color: str | None = None
+        if raw_color is not None and raw_color != "":
+            if not isinstance(raw_color, str) or not _HEX_COLOR.fullmatch(raw_color):
+                raise ValueError("LUT channel color must be a 6-digit hex string without '#'")
+            clean_color = raw_color.upper()
+        entry = {"lo": lo, "hi": hi, "gamma": gamma}
+        if clean_color is not None:
+            entry["color"] = clean_color
+        clean.append(entry)
     result = {"format": FORMAT, "luts": clean}
     if len(_json_bytes(result)) > MAX_BYTES:
         raise ValueError("LUT settings are too large")

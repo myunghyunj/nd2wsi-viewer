@@ -14,16 +14,28 @@ from __future__ import annotations
 
 import io
 import math
+import os
+import re
 import struct
 import threading
+import time
+import uuid
+import weakref
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as _xml_escape
+from xml.sax.saxutils import quoteattr as _xml_quoteattr
 
 import numpy as np
 
 from .contrast import auto_window
+from .direct_common import LeaseClosed
 from .platform_io import total_physical_memory_bytes
+
+_HEX6_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 def parse_channels(param: str | None, n: int) -> list[int]:
@@ -78,6 +90,49 @@ def parse_windows(
     return windows, gammas
 
 
+def _rgb_tuple_from_default(item: tuple[int, int, int] | str) -> tuple[int, int, int]:
+    if isinstance(item, str):
+        cleaned = item.strip().lstrip("#")
+        if _HEX6_RE.fullmatch(cleaned):
+            return (int(cleaned[0:2], 16), int(cleaned[2:4], 16), int(cleaned[4:6], 16))
+        return (255, 255, 255)
+    return (int(item[0]), int(item[1]), int(item[2]))
+
+
+def parse_colors(
+    param: str | Sequence[str | None] | None,
+    defaults: Sequence[tuple[int, int, int] | str],
+) -> list[tuple[int, int, int]]:
+    """Per-channel RGB overrides from a ``col=00FFFF,FF00FF,,FFFFFF`` param.
+
+    Accepts a comma-separated string of 6-digit hex codes without ``#`` (or a
+    sequence of tokens). Empty or invalid tokens keep the metadata default
+    color for that channel.
+    """
+    colors = [_rgb_tuple_from_default(d) for d in defaults]
+    if not param:
+        return colors
+    tokens: Sequence[Any]
+    if isinstance(param, str):
+        tokens = param.split(",")
+    elif isinstance(param, Sequence) and not isinstance(param, (bytes, bytearray)):
+        tokens = param
+    else:
+        return colors
+    for i, tok in enumerate(tokens):
+        if i >= len(colors) or not isinstance(tok, str):
+            continue
+        cleaned = tok.strip()
+        if not _HEX6_RE.fullmatch(cleaned):
+            continue
+        colors[i] = (
+            int(cleaned[0:2], 16),
+            int(cleaned[2:4], 16),
+            int(cleaned[4:6], 16),
+        )
+    return colors
+
+
 def level_entry(levels: list, level: int) -> dict:
     """The level whose stored path names ``level``.
 
@@ -100,6 +155,202 @@ def _read_region(root: Any, level_path: str, x: int, y: int, w: int, h: int) -> 
     if x1 <= x0 or y1 <= y0:
         return np.zeros((arr.shape[0], 0, 0), dtype=arr.dtype)
     return np.asarray(arr[:, y0:y1, x0:x1])
+
+
+def _default_raw_chunk_cache_bytes() -> int:
+    ram = total_physical_memory_bytes()
+    return max(128 * 1024 * 1024, min(int(ram * 0.04), 256 * 1024 * 1024))
+
+
+RAW_CHUNK_CACHE_BYTES = _default_raw_chunk_cache_bytes()
+_STAT_SIG_TTL_S = 0.1
+_stat_sig_lock = threading.Lock()
+_stat_sig_cache: dict[str, tuple[float, tuple[int, int, int] | None]] = {}
+
+
+def _coalesced_file_sig(path: str | os.PathLike) -> tuple[int, int, int] | None:
+    p_str = str(path)
+    now = time.monotonic()
+    with _stat_sig_lock:
+        cached = _stat_sig_cache.get(p_str)
+        if cached is not None and (now - cached[0]) < _STAT_SIG_TTL_S:
+            return cached[1]
+    try:
+        st = os.stat(p_str)
+        sig: tuple[int, int, int] | None = (int(st.st_ino), int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        sig = None
+    with _stat_sig_lock:
+        if len(_stat_sig_cache) > 512:
+            _stat_sig_cache.clear()
+        _stat_sig_cache[p_str] = (now, sig)
+    return sig
+
+
+class _RawChunkCache:
+    """Thread-safe, byte-budgeted LRU cache for decoded multi-channel raw tiles."""
+
+    def __init__(self, budget: int = RAW_CHUNK_CACHE_BYTES):
+        self.budget = int(budget)
+        self.used = 0
+        self.hits = 0
+        self.misses = 0
+        self._d: OrderedDict[Any, tuple[Any, np.ndarray]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: Any, owner_obj: Any = None) -> np.ndarray | None:
+        with self._lock:
+            entry = self._d.get(key)
+            if entry is None:
+                self.misses += 1
+                return None
+            ref, arr = entry
+            if ref is not None:
+                alive = ref()
+                if alive is None or (owner_obj is not None and alive is not owner_obj):
+                    self.used -= arr.nbytes
+                    del self._d[key]
+                    self.misses += 1
+                    return None
+            self._d.move_to_end(key)
+            self.hits += 1
+            return arr
+
+    def put(self, key: Any, value: np.ndarray, owner_obj: Any = None) -> np.ndarray:
+        if not value.flags.owndata:
+            value = value.copy()
+        value.setflags(write=False)
+        nbytes = int(value.nbytes)
+        if nbytes <= 0 or nbytes > self.budget:
+            return value
+        ref = None
+        if owner_obj is not None:
+            try:
+                ref = weakref.ref(owner_obj)
+            except TypeError:
+                ref = None
+        with self._lock:
+            old = self._d.pop(key, None)
+            if old is not None:
+                self.used -= old[1].nbytes
+            self._d[key] = (ref, value)
+            self.used += nbytes
+            while self.used > self.budget and self._d:
+                _, evicted = self._d.popitem(last=False)
+                self.used -= evicted[1].nbytes
+        return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._d.clear()
+            self.used = 0
+            self.hits = 0
+            self.misses = 0
+
+    def purge(self, owner: Any) -> None:
+        owner_id = id(owner) if not isinstance(owner, (int, str, Path)) else owner
+        owner_str = str(owner)
+        with self._lock:
+            to_drop = [
+                k
+                for k in self._d
+                if (
+                    isinstance(k, tuple)
+                    and k
+                    and (
+                        k[0] == owner_id
+                        or k[0] == owner_str
+                        or (isinstance(k[1], tuple) and k[1] and k[1][0] == owner_str)
+                    )
+                )
+            ]
+            for k in to_drop:
+                self.used -= self._d.pop(k)[1].nbytes
+
+    invalidate = purge
+
+
+_RAW_CHUNK_CACHE = _RawChunkCache()
+
+
+def _store_generation_token(arr: Any, x: int, y: int) -> Any:
+    from .storage.single_file import SQLiteStore, path_mutation_seq
+
+    inner = getattr(arr, "_array", arr)
+    store = getattr(inner, "store", None)
+    if isinstance(store, SQLiteStore):
+        p_str = str(store.path)
+        return ("sqlite", p_str, path_mutation_seq(p_str), _coalesced_file_sig(p_str))
+    store_root = getattr(store, "root", None)
+    if store_root is not None:
+        arr_path = getattr(inner, "path", "") or ""
+        chunks = getattr(inner, "chunks", None)
+        chunk_sig = None
+        if isinstance(chunks, tuple) and len(chunks) == 3 and chunks[1] > 0 and chunks[2] > 0:
+            cy, cx = y // int(chunks[1]), x // int(chunks[2])
+            for sep in (".", "/"):
+                cpath = Path(store_root) / arr_path / f"0{sep}{cy}{sep}{cx}"
+                try:
+                    st = cpath.stat()
+                    chunk_sig = (int(st.st_size), int(st.st_mtime_ns))
+                    break
+                except OSError:
+                    continue
+        return ("dir", str(store_root), arr_path, chunk_sig)
+    mem_dict = getattr(store, "_store_dict", None)
+    if isinstance(mem_dict, dict):
+        arr_path = getattr(inner, "path", "") or ""
+        chunks = getattr(inner, "chunks", None)
+        if isinstance(chunks, tuple) and len(chunks) == 3 and chunks[1] > 0 and chunks[2] > 0:
+            cy, cx = y // int(chunks[1]), x // int(chunks[2])
+            buf = mem_dict.get(f"{arr_path}/0.{cy}.{cx}") or mem_dict.get(f"{arr_path}/0/{cy}/{cx}")
+            return ("mem", id(store), id(buf))
+    mutation_token = getattr(arr, "generation", None)
+    return ("obj", type(arr).__qualname__, mutation_token)
+
+
+def _read_cached_tile_region(
+    root: Any,
+    attrs: dict[str, Any],
+    level_path: str,
+    tx: int,
+    ty: int,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+) -> np.ndarray:
+    arr = root[level_path]
+    life = getattr(arr, "_life", None)
+    if life is not None and getattr(life, "closed", False):
+        raise LeaseClosed(life)
+    for candidate in (arr, getattr(arr, "raw", None)):
+        verify = getattr(candidate, "_verify_source", None)
+        if callable(verify):
+            verify()
+    # In-memory ndarrays and PlateSource _ArrayLevel wrappers are already raw RAM
+    # buffers: slicing them directly is zero-copy / microsecond-fast and reflects
+    # any in-place array edits immediately without duplicating memory.
+    if isinstance(arr, np.ndarray) or type(arr).__name__ == "_ArrayLevel":
+        return _read_region(root, level_path, x, y, w, h)
+
+    meta = attrs.get("nd2wsi") or {}
+    h_corr = meta.get("h_correction")
+    h_token = repr(h_corr) if h_corr is not None else None
+    attrs_token = (
+        meta.get("generation"),
+        h_token,
+        meta.get("display_dtype"),
+        meta.get("kind"),
+        meta.get("dtype"),
+    )
+    store_token = _store_generation_token(arr, x, y)
+    key = (id(arr), store_token, attrs_token, str(level_path), int(ty), int(tx), int(w), int(h))
+    hit = _RAW_CHUNK_CACHE.get(key, owner_obj=arr)
+    if hit is not None:
+        return hit
+    region = _read_region(root, level_path, x, y, w, h)
+    return _RAW_CHUNK_CACHE.put(key, region, owner_obj=arr)
 
 
 # Gamma lookup tables for 8/16-bit channels. A table holds, for every code the
@@ -188,6 +439,7 @@ def composite(
     colors: list[tuple[int, int, int]],
     rgb: bool,
     gammas: list[float] | None = None,
+    col: str | Sequence[str | None] | None = None,
 ) -> np.ndarray:
     """(C, h, w) raw values -> (h, w, 3) uint8 display image.
 
@@ -197,6 +449,8 @@ def composite(
     c, h, w = region.shape
     if h == 0 or w == 0:
         return np.zeros((h, w, 3), dtype=np.uint8)
+    if col is not None:
+        colors = parse_colors(col, colors)
     gammas = gammas or [1.0] * len(windows)
     floating = np.issubdtype(region.dtype, np.floating)
     # Preserve both sub-micro windows and small float64 differences at large
@@ -292,6 +546,16 @@ def composite(
 
 
 def encode_image(img: np.ndarray, fmt: str, quality: int = 87) -> bytes:
+    if fmt in ("jpg", "jpeg") and isinstance(img, np.ndarray) and img.dtype == np.uint8 and img.size > 0:
+        try:
+            import imagecodecs
+
+            jpeg8 = getattr(imagecodecs, "jpeg8_encode", None)
+            if jpeg8 is not None and getattr(getattr(imagecodecs, "JPEG8", None), "available", True):
+                return bytes(jpeg8(np.ascontiguousarray(img), level=int(quality)))
+        except Exception:
+            pass
+
     from PIL import Image
 
     buf = io.BytesIO()
@@ -314,6 +578,7 @@ def render_tile(
     channels: list[int],
     fmt: str = "jpg",
     win: str | None = None,
+    col: str | Sequence[str | None] | None = None,
 ) -> bytes:
     meta = attrs["nd2wsi"]
     tile = int(meta["tile"])
@@ -323,10 +588,29 @@ def render_tile(
     if x >= lw or y >= lh or tx < 0 or ty < 0:
         raise KeyError("tile out of range")
     w, h = min(tile, lw - x), min(tile, lh - y)
-    region = _read_region(root, lv["path"], x, y, w, h)
-    windows, colors = display_params(attrs)
+    region = _read_cached_tile_region(root, attrs, lv["path"], tx, ty, x, y, w, h)
+    windows, colors = display_params(attrs, col=col)
     windows, gammas = parse_windows(win, windows)
     img = composite(region, channels, windows, colors, meta["rgb"], gammas)
+    return encode_image(img, fmt)
+
+
+render_tile_bytes = render_tile
+
+
+def render_frame_bytes(
+    region: np.ndarray,
+    attrs: dict[str, Any],
+    channels: list[int],
+    fmt: str = "jpg",
+    win: str | None = None,
+    col: str | Sequence[str | None] | None = None,
+) -> bytes:
+    """Composite and encode a pre-loaded ``(C, H, W)`` frame array to JPEG/PNG."""
+    meta = attrs["nd2wsi"]
+    windows, colors = display_params(attrs, col=col)
+    windows, gammas = parse_windows(win, windows)
+    img = composite(region, channels, windows, colors, bool(meta.get("rgb")), gammas)
     return encode_image(img, fmt)
 
 
@@ -423,14 +707,20 @@ def compute_histograms(
 
 def display_params(
     attrs: dict[str, Any],
+    col: str | Sequence[str | None] | None = None,
 ) -> tuple[list[tuple[float, float]], list[tuple[int, int, int]]]:
     windows: list[tuple[float, float]] = []
     colors: list[tuple[int, int, int]] = []
     for ch in attrs["omero"]["channels"]:
         win = ch.get("window", {})
         windows.append((float(win.get("start", 0)), float(win.get("end", 255))))
-        hexcol = ch.get("color", "FFFFFF")
-        colors.append(tuple(int(hexcol[i : i + 2], 16) for i in (0, 2, 4)))
+        hexcol = str(ch.get("color", "FFFFFF")).strip().lstrip("#")
+        if _HEX6_RE.fullmatch(hexcol):
+            colors.append(tuple(int(hexcol[i : i + 2], 16) for i in (0, 2, 4)))
+        else:
+            colors.append((255, 255, 255))
+    if col is not None:
+        colors = parse_colors(col, colors)
     return windows, colors
 
 
@@ -501,6 +791,111 @@ def _roi_rgb_tile_iter(
             yield block
 
 
+_OME_DTYPE_NAMES = {
+    "int8": "int8",
+    "int16": "int16",
+    "int32": "int32",
+    "uint8": "uint8",
+    "uint16": "uint16",
+    "uint32": "uint32",
+    "float32": "float",
+    "float64": "double",
+    "bool": "bit",
+}
+_OME_SCHEMA = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
+
+
+def _clean_xml_text(value: Any) -> str:
+    return _XML_ILLEGAL_RE.sub("", str(value))
+
+
+def _rgb_to_ome_color_int(rgb_tuple: tuple[int, int, int]) -> int:
+    r, g, b = (max(0, min(255, int(v))) for v in rgb_tuple)
+    rgba = (r << 24) | (g << 16) | (b << 8) | 0xFF
+    return rgba - (1 << 32) if rgba >= (1 << 31) else rgba
+
+
+def _build_roi_ome_xml(
+    *,
+    source_name: str,
+    summary_description: str,
+    dtype: np.dtype,
+    w: int,
+    h: int,
+    channels: list[int],
+    attrs: dict[str, Any],
+    px_um: float | None,
+    py_um: float | None,
+    rgb: bool,
+    col: str | Sequence[str | None] | None = None,
+) -> str:
+    ome_type = _OME_DTYPE_NAMES.get(np.dtype(dtype).name)
+    if ome_type is None:
+        return summary_description.encode("ascii", "backslashreplace").decode("ascii")
+
+    clean_source = _clean_xml_text(Path(source_name).name or source_name)
+    clean_desc = _clean_xml_text(summary_description)
+    omero_channels = (attrs.get("omero") or {}).get("channels") or []
+    default_colors: list[tuple[int, int, int]] = []
+    labels: list[str] = []
+    for idx in range(max(len(omero_channels), max(channels, default=-1) + 1)):
+        if idx < len(omero_channels) and isinstance(omero_channels[idx], dict):
+            ch_obj = omero_channels[idx]
+            labels.append(_clean_xml_text(ch_obj.get("label") or f"C{idx}"))
+            default_colors.append(_rgb_tuple_from_default(str(ch_obj.get("color") or "FFFFFF")))
+        else:
+            labels.append(f"C{idx}")
+            default_colors.append((255, 255, 255))
+    resolved_colors = parse_colors(col, default_colors) if col is not None else default_colors
+
+    if rgb:
+        size_c = 3
+        interleaved = "true"
+        ch_meta_seed: list[tuple[str, int]] = [("RGB", -1)]
+        ch_xml = '<Channel ID="Channel:0:0" SamplesPerPixel="3" Name="RGB"/>'
+    else:
+        size_c = len(channels)
+        interleaved = "false"
+        ch_meta_seed = []
+        ch_parts = []
+        for out_idx, ci in enumerate(channels):
+            ch_label = labels[ci] if 0 <= ci < len(labels) else f"C{ci}"
+            ch_rgb = resolved_colors[ci] if 0 <= ci < len(resolved_colors) else (255, 255, 255)
+            color_int = _rgb_to_ome_color_int(ch_rgb)
+            ch_meta_seed.append((ch_label, color_int))
+            ch_parts.append(
+                f'<Channel ID="Channel:0:{out_idx}" SamplesPerPixel="1" '
+                f'Name={_xml_quoteattr(ch_label)} Color="{color_int}"/>'
+            )
+        ch_xml = "".join(ch_parts)
+
+    phys_xml = ""
+    if px_um is not None and py_um is not None and px_um > 0 and py_um > 0:
+        phys_xml = (
+            f' PhysicalSizeX="{px_um!r}" PhysicalSizeXUnit="µm"'
+            f' PhysicalSizeY="{py_um!r}" PhysicalSizeYUnit="µm"'
+        )
+
+    uid = uuid.uuid5(
+        uuid.NAMESPACE_OID,
+        f"nd2wsi-ome:{clean_source}:{clean_desc}:{w}x{h}:{ome_type}:{rgb}:{ch_meta_seed}:{px_um}:{py_um}",
+    )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<OME xmlns="{_OME_SCHEMA}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        f'xsi:schemaLocation="{_OME_SCHEMA} {_OME_SCHEMA}/ome.xsd" UUID="urn:uuid:{uid}">'
+        f'<Image ID="Image:0" Name={_xml_quoteattr(clean_source)}>'
+        f"<Description>{_xml_escape(clean_desc)}</Description>"
+        f'<Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="{ome_type}" '
+        f'SizeX="{int(w)}" SizeY="{int(h)}" SizeC="{size_c}" SizeZ="1" SizeT="1" '
+        f'Interleaved="{interleaved}"{phys_xml}>'
+        f"{ch_xml}"
+        '<TiffData IFD="0" PlaneCount="1"/>'
+        "</Pixels></Image></OME>"
+    )
+    return xml.encode("ascii", "xmlcharrefreplace").decode("ascii")
+
+
 def export_roi_tiff(
     root: Any,
     attrs: dict[str, Any],
@@ -512,14 +907,16 @@ def export_roi_tiff(
     h: int,
     channels: list[int],
     on_progress=None,
+    col: str | Sequence[str | None] | None = None,
 ) -> None:
-    """Stream a raw-dtype tiled TIFF of the ROI to a file object or path."""
+    """Stream a raw-dtype tiled OME-TIFF of the ROI to a file object or path."""
     import tifffile
 
     meta = attrs["nd2wsi"]
     # TIFF ImageDescription is ASCII, unlike the file path and HTTP download
     # name. Keep non-ASCII source names recoverable without rejecting exports.
-    source_description = str(meta["source"]).encode("ascii", "backslashreplace").decode("ascii")
+    raw_source = str(meta["source"])
+    source_description = raw_source.encode("ascii", "backslashreplace").decode("ascii")
     lv = level_entry(meta["levels"], level)
     level_path = lv["path"]
     tile = min(int(meta["tile"]), 512)
@@ -527,10 +924,14 @@ def export_roi_tiff(
     factor = lv["downsample"]
     # pixels per centimeter at this level; an uncalibrated store gets no
     # resolution tags at all rather than tags built from an invented value
+    px_um: float | None = None
+    py_um: float | None = None
     if meta.get("pixel_size_um"):
         py, px = meta["pixel_size_um"]
+        px_um = float(px) * factor
+        py_um = float(py) * factor
         res_kw = {
-            "resolution": (1e4 / (px * factor), 1e4 / (py * factor)),
+            "resolution": (1e4 / px_um, 1e4 / py_um),
             "resolutionunit": "CENTIMETER",
         }
     else:
@@ -544,7 +945,25 @@ def export_roi_tiff(
 
     ny = -(-h // tile)
     nx = -(-w // tile)
-    rgb = meta["rgb"] and channels == [0, 1, 2]
+    rgb = bool(meta["rgb"]) and channels == [0, 1, 2]
+    summary = (
+        f"nd2wsi ROI from {source_description} level {level} "
+        f"(downsample {factor}) x={x} y={y} w={w} h={h}"
+        + ("" if rgb else f" channels={channels}")
+    )
+    ome_description = _build_roi_ome_xml(
+        source_name=raw_source,
+        summary_description=summary,
+        dtype=dtype,
+        w=w,
+        h=h,
+        channels=channels,
+        attrs=attrs,
+        px_um=px_um,
+        py_um=py_um,
+        rgb=rgb,
+        col=col,
+    )
     with tifffile.TiffWriter(out_file, bigtiff=True) as tw:
         if rgb:
             tw.write(
@@ -555,10 +974,7 @@ def export_roi_tiff(
                 photometric="rgb",
                 **res_kw,
                 compression="zlib",
-                description=(
-                    f"nd2wsi ROI from {source_description} level {level} "
-                    f"(downsample {factor}) x={x} y={y} w={w} h={h}"
-                ),
+                description=ome_description,
             )
         else:
             multi = len(channels) > 1
@@ -568,11 +984,7 @@ def export_roi_tiff(
                 photometric="minisblack",
                 **res_kw,
                 compression="zlib",
-                description=(
-                    f"nd2wsi ROI from {source_description} level {level} "
-                    f"(downsample {factor}) x={x} y={y} w={w} h={h} "
-                    f"channels={channels}"
-                ),
+                description=ome_description,
             )
             if multi:
                 kwargs["shape"] = (len(channels), h, w)
@@ -602,6 +1014,7 @@ def export_roi_rendered(
     channels: list[int],
     fmt: str,
     win: str | None = None,
+    col: str | Sequence[str | None] | None = None,
     *,
     scale_bar: bool = False,
 ) -> bytes:
@@ -616,7 +1029,7 @@ def export_roi_rendered(
     """
     meta = attrs["nd2wsi"]
     lv = level_entry(meta["levels"], level)
-    windows, colors = display_params(attrs)
+    windows, colors = display_params(attrs, col=col)
     windows, gammas = parse_windows(win, windows)
 
     bar = None
