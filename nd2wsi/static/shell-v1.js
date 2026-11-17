@@ -133,10 +133,50 @@ function openActiveTranslucent() {
     sid, ...identity });
 }
 
-$("shell-tools-toggle").onclick = () => setShellToolsExpanded($("shell-tools").hidden);
+let shellToolsUserToggled = false;
+let shellToolsPreference = (() => {
+  try {
+    const saved = localStorage.getItem("nd2wsi.shellToolsExpanded");
+    if (saved === "true") return true;
+    if (saved === "false") return false;
+  } catch (_) { /* ignore */ }
+  return null;
+})();
+
+function hydrateShellUiSettings() {
+  if (typeof fetch !== "function") return;
+  fetch("api/ui-settings", { cache: "no-store" })
+    .then((res) => (res && res.ok && typeof res.json === "function" ? res.json() : null))
+    .then((data) => {
+      if (shellToolsUserToggled || !data) return;
+      const root = data.settings && typeof data.settings === "object" ? data.settings : data;
+      if (typeof root?.shellToolsExpanded === "boolean") {
+        shellToolsPreference = root.shellToolsExpanded;
+        try { localStorage.setItem("nd2wsi.shellToolsExpanded", String(root.shellToolsExpanded)); } catch (_) {}
+        setShellToolsExpanded(root.shellToolsExpanded);
+      }
+    })
+    .catch(() => {});
+}
+
+$("shell-tools-toggle").onclick = () => {
+  const next = $("shell-tools").hidden;
+  shellToolsUserToggled = true;
+  shellToolsPreference = next;
+  try { localStorage.setItem("nd2wsi.shellToolsExpanded", String(next)); } catch (_) {}
+  setShellToolsExpanded(next);
+  if (typeof fetch === "function") {
+    fetch("api/ui-settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ shellToolsExpanded: next }),
+    }).catch(() => {});
+  }
+};
 $("translucent-toggle").onclick = () => openActiveTranslucent();
 $("info-toggle").onclick = () => panelShortcut("info");
-setShellToolsExpanded(false);
+setShellToolsExpanded(shellToolsPreference !== null ? shellToolsPreference : Number(window.innerWidth) >= 900);
+hydrateShellUiSettings();
 window.addEventListener("pywebviewready", refreshShellToolButtons);
 
 function refreshAstromapButton() {
@@ -2646,7 +2686,7 @@ function receiveNewWindowShortcut(senderSid, data) {
 
 function panelShortcut(panel) {
   if (quitPreparation || pairPicker.open ||
-      !["channels", "region", "annot", "info"].includes(panel)) return false;
+      !["channels", "region", "annot", "info", "shortcuts"].includes(panel)) return false;
   const st = compare.states.get(active);
   if (!readyFrames.has(active) || !st?.paneInstanceId) return false;
   // Pane key events stay local to their iframe. Only keys owned by the shell
@@ -2655,6 +2695,56 @@ function panelShortcut(panel) {
     nd2wsi: "pane-panel-shortcut", version: VIEWPORT_PROTOCOL_VERSION,
     panel, ...localIdentity(st),
   });
+}
+
+function receiveSceneSelected(senderSid, data) {
+  if (!senderSid || quitPreparation || !data || typeof data.sid !== "string" || !data.sid) {
+    return false;
+  }
+  const newSid = data.sid;
+  const newName = typeof data.name === "string" && data.name ? data.name : null;
+  if (newSid === senderSid) {
+    const existing = slides.find((s) => s.sid === senderSid);
+    if (existing && newName) existing.name = newName;
+    frames.get(senderSid)?.contentWindow?.location?.reload?.();
+    render();
+    return true;
+  }
+  const oldIndex = slides.findIndex((s) => s.sid === senderSid);
+  if (typeof fetch === "function") {
+    fetch("api/slides", { cache: "no-store" })
+      .then((res) => (res && res.ok ? res.json() : null))
+      .then((listing) => {
+        const listed = Array.isArray(listing?.slides) ? listing.slides : [];
+        const hasOld = listed.some((s) => s.sid === senderSid);
+        const hasNew = listed.some((s) => s.sid === newSid);
+        const finishRetarget = () => refresh(newSid, () => {
+          if (oldIndex >= 0) {
+            const newIdx = slides.findIndex((s) => s.sid === newSid);
+            if (newIdx >= 0 && newIdx !== oldIndex) {
+              const [moved] = slides.splice(newIdx, 1);
+              if (newName) moved.name = newName;
+              slides.splice(Math.min(oldIndex, slides.length), 0, moved);
+            }
+          }
+        });
+        if (hasOld && hasNew) {
+          return fetch("api/close", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sid: senderSid }),
+          }).catch(() => {}).then(finishRetarget);
+        }
+        return finishRetarget();
+      })
+      .catch(() => refresh(newSid));
+  } else {
+    if (oldIndex >= 0) {
+      slides[oldIndex] = { ...slides[oldIndex], sid: newSid, name: newName || slides[oldIndex].name };
+    }
+    activate(newSid);
+  }
+  return true;
 }
 
 function orientationShortcut(action) {
@@ -2753,6 +2843,12 @@ $("compare-mirror-policy").onchange = (event) => {
 };
 
 window.addEventListener("keydown", (event) => {
+  if (ShortcutRouter?.isShortcutHelpEvent?.(event)) {
+    event.preventDefault();
+    event.stopPropagation();
+    panelShortcut("shortcuts");
+    return;
+  }
   if (ShortcutRouter?.isAstromapShortcut(event)) {
     event.preventDefault();
     event.stopPropagation();
@@ -2861,7 +2957,7 @@ $("newtab").onclick = () => {
     });
     return;
   }
-  const path = prompt("Path to an ND2, SVS, or OME-Zarr store:");
+  const path = prompt("Path to a slide (.nd2, .czi, .lif, .tif/.ome.tif, .svs, .sdpc, .nd2svs, .jpg, .png):");
   if (path?.trim()) openPath(path.trim());
 };
 
@@ -2959,6 +3055,9 @@ window.addEventListener("message", (event) => {
   } else if (kind === "tab-select") {
     if (!senderSid || !versioned) return;
     selectTabByIndex(Number(event.data.index));
+  } else if (kind === "scene-selected") {
+    if (!senderSid || !versioned) return;
+    receiveSceneSelected(senderSid, event.data);
   } else if (kind === "window-zoom") {
     // a double-click on a slide's own toolbar, relayed from its frame
     if (!senderSid || !versioned) return;

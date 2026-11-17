@@ -25,6 +25,26 @@
     font-family:ui-monospace,"SF Mono",Menlo,monospace}
   #drop.over::after{content:"";position:fixed;inset:14px;border-radius:16px;
     border:2px dashed rgba(10,132,255,.9);background:rgba(10,132,255,.06)}
+  .recent-wrap{margin:22px auto 0;width:min(440px,calc(100vw - 48px));
+    text-align:left;pointer-events:auto}
+  .recent-wrap[hidden]{display:none}
+  .recent-title{font-size:11px;font-weight:600;letter-spacing:.04em;
+    text-transform:uppercase;color:var(--label-3);padding:0 8px 6px}
+  .recent-list{display:flex;flex-direction:column;gap:2px;max-height:188px;
+    overflow-y:auto;padding:4px;border-radius:10px;
+    border:1px solid var(--hairline,rgba(255,255,255,.10));
+    background:var(--material-control,rgba(255,255,255,.04))}
+  .recent-item{display:flex;align-items:baseline;justify-content:space-between;
+    gap:12px;width:100%;padding:6px 9px;border:0;border-radius:7px;
+    background:transparent;color:var(--label);text-align:left;cursor:pointer;
+    font:12px -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
+  .recent-item:hover{background:rgba(10,132,255,.16)}
+  .recent-item:focus-visible{outline:2px solid #0a84ff;outline-offset:-1px}
+  .recent-name{font-weight:550;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;min-width:0;flex:0 1 auto}
+  .recent-dir{font-size:11px;color:var(--label-3);overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto;
+    text-align:right;font-family:ui-monospace,"SF Mono",Menlo,monospace}
   #update{position:fixed;right:12px;bottom:10px;height:28px;padding:0 11px;
     border:0;border-radius:7px;background:transparent;color:var(--label-2);
     font:12px -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
@@ -35,10 +55,14 @@
 <div id="drop"><div class="card">
   <div class="pyr"><div class="l1"></div><div class="l2"></div><div class="l3"></div></div>
   <h1>Drop a slide to open</h1>
-  <div class="sub"><b>.nd2</b>, <b>.czi</b>, <b>.lif</b>, <b>.svs</b>, <b>.sdpc</b>, <b>.nd2svs</b>, or <b>JPEG/PNG</b> &nbsp;·&nbsp; click anywhere to browse</div>
+  <div class="sub"><b>.nd2</b> · <b>.czi</b> · <b>.lif</b> · <b>.tif / .ome.tif</b> · <b>.svs</b> · <b>.sdpc</b> · <b>.nd2svs</b> · <b>.jpg</b> · <b>.png</b> &nbsp;·&nbsp; click anywhere to browse</div>
   <div id="status"></div>
   <div id="bar"><span id="fill"></span></div>
   <div id="pct"></div>
+  <div id="recent-files" class="recent-wrap" hidden>
+    <div class="recent-title">Recent</div>
+    <div id="recent-list" class="recent-list" role="list" aria-label="Recent files"></div>
+  </div>
 </div></div>
 <button id="update" type="button">Check for Updates…</button>
 <script>
@@ -106,8 +130,83 @@
     ev.preventDefault();
     drop.classList.remove('over');
   });
+  function bootApiUrl(sub){
+    const p = String(location.pathname || '');
+    if (p && p !== '/' && !p.endsWith('.html')) {
+      const base = p.includes('/static/') ? p.slice(0, p.indexOf('/static/')) : p.replace(/\/+$/, '');
+      if (base) return base + sub;
+    }
+    return sub;
+  }
+  function openRecentPath(path){
+    if (busy || !path) return;
+    if (typeof window.pywebview?.api?.open_paths === 'function') {
+      go(window.pywebview.api.open_paths([path]));
+      return;
+    }
+    if (typeof window.pywebview?.api?.open_path === 'function') {
+      go(window.pywebview.api.open_path(path));
+      return;
+    }
+    if (typeof fetch === 'function') {
+      busy = true;
+      setStatus('opening ' + (String(path).split(/[\\/]/).pop() || path) + ' …');
+      fetch(bootApiUrl('/api/open'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      }).then(r => r.json()).then(d => {
+        if (d?.url) location.replace(d.url);
+        else if (d?.sid) location.replace(bootApiUrl('/s/' + encodeURIComponent(d.sid) + '/'));
+        else end(d?.error || '');
+      }).catch(e => end('failed: ' + e));
+    }
+  }
+  function renderRecentFiles(payload){
+    const raw = Array.isArray(payload) ? payload
+      : (payload?.items || payload?.files || payload?.recent || []);
+    const items = raw.filter(it => it && typeof it.path === 'string' && it.path && it.available !== false);
+    const wrap = document.getElementById('recent-files');
+    const list = document.getElementById('recent-list');
+    if (!wrap || !list) return;
+    list.replaceChildren();
+    if (!items.length) { wrap.hidden = true; return; }
+    items.slice(0, 8).forEach(item => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'recent-item';
+      btn.title = item.path;
+      const name = document.createElement('span');
+      name.className = 'recent-name';
+      name.textContent = item.name || String(item.path).split(/[\\/]/).pop() || item.path;
+      const dir = document.createElement('span');
+      dir.className = 'recent-dir';
+      const parent = String(item.path).replace(/[\\/][^\\/]+$/, '');
+      dir.textContent = parent !== item.path ? parent : '';
+      btn.append(name, dir);
+      btn.addEventListener('click', ev => {
+        ev.stopPropagation();
+        openRecentPath(item.path);
+      });
+      list.append(btn);
+    });
+    wrap.hidden = false;
+  }
+  function loadRecentFiles(){
+    if (typeof fetch !== 'function') return;
+    fetch(bootApiUrl('/api/recent-files'), { cache: 'no-store' })
+      .then(r => (r && r.ok && typeof r.json === 'function' ? r.json() : null))
+      .then(data => { if (data) renderRecentFiles(data); })
+      .catch(() => {});
+  }
+  loadRecentFiles();
   window.addEventListener('pywebviewready', () => {
     pywebview.api.pending().then(p => { if (p) go(pywebview.api.open_slide()); });
+    if (typeof pywebview.api?.recent_files === 'function') {
+      Promise.resolve(pywebview.api.recent_files())
+        .then(data => { if (data && document.getElementById('recent-files')?.hidden) renderRecentFiles(data); })
+        .catch(() => {});
+    }
     const refreshUpdates = () => pywebview.api.update_status().then(s => {
         const button = document.getElementById('update');
         button.disabled = !s.available;

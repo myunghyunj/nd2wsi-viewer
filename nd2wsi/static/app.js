@@ -10,9 +10,13 @@ const state = {
   info: null,
   viewer: null,
   channels: [], // enabled channel indices
+  soloPrevChannels: null, // channel visibility snapshot before Option/Alt-solo
   luts: [], // per channel {lo, hi, gamma}; null while at store defaults
   lutPersistence: null, // durable, source-bound display preferences
   lutWidgets: [], // canvas LUT widgets, aligned with luts
+  undoStack: [], // bounded 50-step annotation & Astromap undo stack
+  redoStack: [], // bounded 50-step redo stack
+  historyApplying: false,
   shading: null, // committed, source-bound pyramid correction state
   shadingShellToken: null,
   shadingSeq: 0,
@@ -244,6 +248,7 @@ async function init() {
   document.title = info.name + " — nd2wsi-viewer";
   $("file-name").textContent = info.name;
   fillContextBadges(info);
+  wireScenePicker();
   $("plane-note").textContent = planeNote(info);
 
   const dpr = window.devicePixelRatio || 1;
@@ -255,6 +260,7 @@ async function init() {
   buildWindows();
   wireSlideInspector();
   wireTheme();
+  wireShortcutModal();
   wireDragForward();
   buildChannelPanel();
   buildLevelLamps();
@@ -312,10 +318,20 @@ async function refreshShadingPyramid(generation, captured) {
   }
   // Preserve effective LUT values even if a channel still uses its defaults.
   // Keep this metadata object: the source-bound persistence controller owns it.
+  const prevColors = info.channels.map((channel) => ({
+    color: channel.color,
+    metadataColor: channel.metadataColor,
+  }));
   info.channels.forEach((channel, index) => {
     if (!state.luts[index]) state.luts[index] = window.Nd2LutTransfer.currentLut(channel, null);
   });
   Object.assign(info, next);
+  info.channels.forEach((channel, index) => {
+    const prev = prevColors[index];
+    if (!prev) return;
+    if (prev.metadataColor) channel.metadataColor = prev.metadataColor;
+    if (prev.color) channel.color = prev.color;
+  });
   state.lutAutoPending.fill(false);
   frameRequests?.pixels.invalidate(true);
   frameRequests?.histograms.schedule(0);
@@ -381,18 +397,56 @@ function receiveShadingCommand(message) {
 }
 
 async function initializeDisplayLuts() {
+  if (Array.isArray(state.info?.channels)) {
+    state.info.channels.forEach((ch) => {
+      if (ch && typeof ch.color === "string" && !ch.metadataColor) {
+        ch.metadataColor = ch.color.replace(/^#/, "").toUpperCase();
+      }
+    });
+  }
   state.lutPersistence = window.Nd2LutPersistence.createController({
     info: state.info,
-    readLuts: () => state.luts,
+    readLuts: () => {
+      const channels = state.info?.channels;
+      if (!Array.isArray(channels) || state.info?.rgb) return state.luts;
+      const customColors = channels.map((ch) => {
+        const cur = typeof ch?.color === "string" ? ch.color.replace(/^#/, "").toUpperCase() : "";
+        const meta = typeof ch?.metadataColor === "string"
+          ? ch.metadataColor.replace(/^#/, "").toUpperCase() : cur;
+        return /^[0-9A-F]{6}$/.test(cur) && /^[0-9A-F]{6}$/.test(meta) && cur !== meta ? cur : "";
+      });
+      if (!customColors.some(Boolean)) return state.luts;
+      return channels.map((ch, i) => {
+        const base = state.luts[i];
+        if (!customColors[i]) return base;
+        const lut = window.Nd2LutTransfer.currentLut(ch, base);
+        return { ...lut, color: customColors[i] };
+      });
+    },
     fetch: (...args) => fetch(...args),
     reportError: (message) => showToast(String(message)),
     onSaveState: (event) => state.saveStatus?.report(event.channel, event),
   });
   const saved = await state.lutPersistence.load();
-  if (saved) state.luts = saved;
+  if (saved) {
+    if (Array.isArray(saved) && saved.some((entry) => entry && typeof entry.color === "string")) {
+      state.luts = saved.map((entry, i) => {
+        if (entry && typeof entry.color === "string" && entry.color) {
+          if (state.info?.channels?.[i]) {
+            state.info.channels[i].color = entry.color.replace(/^#/, "").toUpperCase();
+          }
+          const { color, ...rest } = entry;
+          return rest;
+        }
+        return entry;
+      });
+    } else {
+      state.luts = saved;
+    }
+  }
   // An explicit renderer handoff represents the view the user just left.
   // It overrides persisted values; both take precedence over initial Auto.
-  const handoffApi = window.parent !== window ? window.parent.pywebview?.api : null;
+  const handoffApi = window.parent && window.parent !== window ? window.parent.pywebview?.api : null;
   if (handoffApi?.initial_view_state) {
     const display = await handoffApi.initial_view_state(currentSlideSid());
     if (display) {
@@ -455,6 +509,160 @@ function createFrameRequests() {
       },
     }),
   };
+}
+
+function resolveSceneUrl(res) {
+  const rawUrl = typeof res?.url === "string" && res.url ? res.url : null;
+  const sid = typeof res?.sid === "string" && res.sid ? res.sid : null;
+  const path = typeof location !== "undefined" ? String(location.pathname || "") : "";
+  const idx = path.indexOf("/s/");
+  const prefix = idx > 0 ? path.slice(0, idx) : "";
+  if (rawUrl) {
+    if (prefix && rawUrl.startsWith("/s/")) return prefix + rawUrl;
+    return rawUrl;
+  }
+  return sid ? prefix + "/s/" + encodeURIComponent(sid) + "/" : "";
+}
+
+function setScenePickerOpen(open) {
+  const picker = $("scene-picker");
+  const btn = $("scene-picker-btn");
+  const menu = $("scene-picker-menu");
+  if (!picker || !btn || !menu) return;
+  const show = Boolean(open) && !picker.hidden && !btn.disabled;
+  menu.hidden = !show;
+  btn.setAttribute("aria-expanded", String(show));
+  if (show && typeof btn.getBoundingClientRect === "function") {
+    const r = btn.getBoundingClientRect();
+    const vw = typeof window !== "undefined" && window.innerWidth ? window.innerWidth : 1024;
+    const width = menu.offsetWidth || 280;
+    menu.style.left = Math.max(8, Math.min(vw - width - 8, r.left)) + "px";
+    menu.style.top = Math.max(8, r.bottom + 6) + "px";
+  }
+}
+
+async function selectScene(seriesIndex) {
+  const info = state.info;
+  if (!info || state.quitPreparing) return false;
+  const currentIndex = Number.isInteger(info.seriesIndex)
+    ? info.seriesIndex : Number(info.selection?.p || 0);
+  if (!Number.isInteger(seriesIndex) || seriesIndex < 0 || seriesIndex === currentIndex) {
+    setScenePickerOpen(false);
+    return false;
+  }
+  const btn = $("scene-picker-btn");
+  setScenePickerOpen(false);
+  if ($("ann-editor") && !$("ann-editor").hidden) closeEditor(true);
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = `Opening ${seriesIndex + 1} / ${info.seriesCount}…`;
+  }
+  try {
+    await Promise.allSettled([
+      typeof saveAnnotations === "function" && state.annDirty ? saveAnnotations() : Promise.resolve(),
+      state.lutPersistence?.isDirty?.() ? state.lutPersistence.flush() : Promise.resolve(),
+    ]);
+    const response = await fetch("api/select-scene", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ series: seriesIndex }),
+    });
+    const data = await response.json();
+    if (!response.ok || data?.ok === false || (!data?.sid && !data?.url)) {
+      throw new Error(data?.error || `HTTP ${response.status}`);
+    }
+    const targetUrl = resolveSceneUrl(data);
+    if (typeof window !== "undefined" && window.parent && window.parent !== window) {
+      window.parent.postMessage({
+        nd2wsi: "scene-selected",
+        version: VIEWPORT_PROTOCOL_VERSION,
+        oldSid: currentSlideSid(),
+        sid: data.sid,
+        name: data.name || info.name,
+        url: targetUrl,
+      }, location.origin);
+    } else if (targetUrl && typeof window !== "undefined" && window.location?.replace) {
+      window.location.replace(targetUrl);
+    }
+    return true;
+  } catch (error) {
+    showToast("Could not switch series: " + (error?.message || error));
+    renderScenePicker(info);
+    return false;
+  }
+}
+
+function renderScenePicker(info = state.info) {
+  const picker = $("scene-picker");
+  const btn = $("scene-picker-btn");
+  const menu = $("scene-picker-menu");
+  if (!picker || !btn || !menu) return;
+  const list = Array.isArray(info?.seriesList) ? info.seriesList : [];
+  const count = Number(info?.seriesCount) || list.length;
+  if (!(count > 1 && list.length > 1)) {
+    picker.hidden = true;
+    menu.hidden = true;
+    return;
+  }
+  const currentIndex = Number.isInteger(info.seriesIndex)
+    ? info.seriesIndex : Number(info.selection?.p || 0);
+  const currentEntry = list.find((s) => Number(s.index) === currentIndex) || list[0];
+  btn.disabled = false;
+  btn.textContent = `Series ${currentIndex + 1} / ${count} ▾`;
+  btn.title = currentEntry?.name
+    ? `Series ${currentIndex + 1} of ${count}: ${currentEntry.name}`
+    : `Series ${currentIndex + 1} of ${count}`;
+  btn.setAttribute("aria-expanded", "false");
+  menu.replaceChildren();
+  menu.hidden = true;
+  list.forEach((scene, fallbackIdx) => {
+    const idx = Number.isInteger(scene?.index) ? scene.index : fallbackIdx;
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "scene-picker-item";
+    item.dataset.series = String(idx);
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", String(idx === currentIndex));
+    const title = document.createElement("span");
+    title.className = "scene-picker-item-name";
+    title.textContent = `${idx + 1}. ${scene?.name || "Series " + (idx + 1)}`;
+    const meta = document.createElement("span");
+    meta.className = "scene-picker-item-meta";
+    const metaParts = [
+      `${fmtInt(Number(scene?.width) || 0)}×${fmtInt(Number(scene?.height) || 0)}`,
+      `${Number(scene?.channels) || 1} ch`,
+    ];
+    if (Number(scene?.zCount) > 1) metaParts.push(`Z ${scene.zCount}`);
+    if (Number(scene?.tCount) > 1) metaParts.push(`T ${scene.tCount}`);
+    meta.textContent = metaParts.join(" · ");
+    item.append(title, meta);
+    item.onclick = () => selectScene(idx);
+    menu.append(item);
+  });
+  picker.hidden = false;
+}
+
+function wireScenePicker() {
+  const picker = $("scene-picker");
+  const btn = $("scene-picker-btn");
+  const menu = $("scene-picker-menu");
+  if (!picker || !btn || !menu) return;
+  renderScenePicker(state.info);
+  btn.onclick = (ev) => {
+    ev?.stopPropagation?.();
+    setScenePickerOpen(menu.hidden);
+  };
+  document.addEventListener?.("pointerdown", (ev) => {
+    if (!menu.hidden && !picker.contains?.(ev.target)) setScenePickerOpen(false);
+  });
+  window.addEventListener?.("keydown", (ev) => {
+    if (ev.key === "Escape" && !menu.hidden) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setScenePickerOpen(false);
+      btn.focus?.({ preventScroll: true });
+    }
+  }, true);
 }
 
 function kindMark(info) {
@@ -551,12 +759,31 @@ function channelQuery(q) {
   return q;
 }
 
+function colorParam() {
+  const channels = state.info?.channels;
+  if (!Array.isArray(channels) || state.info?.rgb) return "";
+  let changed = false;
+  const tokens = channels.map((ch) => {
+    const cur = typeof ch?.color === "string" ? ch.color.replace(/^#/, "").toUpperCase() : "";
+    const meta = typeof ch?.metadataColor === "string"
+      ? ch.metadataColor.replace(/^#/, "").toUpperCase() : cur;
+    if (/^[0-9A-F]{6}$/.test(cur) && /^[0-9A-F]{6}$/.test(meta) && cur !== meta) {
+      changed = true;
+      return cur;
+    }
+    return "";
+  });
+  return changed ? tokens.join(",") : "";
+}
+
 function renderParams(q) {
-  // the channel set, the LUT windows and the cache generation, shared by
-  // tiles, plate frames, rendered exports and the export-scale previews
+  // the channel set, the LUT windows, custom channel colors and the cache
+  // generation, shared by tiles, plate frames, rendered exports and previews
   channelQuery(q);
   const win = lutParam();
   if (win) q.set("win", win);
+  const col = colorParam();
+  if (col) q.set("col", col);
   // the cache generation makes tile URLs immutable: the browser may keep
   // them, and a rebuilt cache changes the URLs instead of serving stale
   if (state.info.generation) q.set("g", state.info.generation);
@@ -812,14 +1039,163 @@ function macSwitch(on, onToggle) {
   const knob = document.createElement("span");
   knob.className = "knob";
   b.append(knob);
-  b.addEventListener("click", () => {
+  b.addEventListener("click", (ev) => {
     const next = !b.classList.contains("on");
-    if (onToggle(next) !== false) {
+    const outcome = onToggle(next, ev);
+    if (outcome !== false && outcome !== "synced") {
       b.classList.toggle("on", next);
       b.setAttribute("aria-checked", String(next));
     }
   });
   return b;
+}
+
+const CHANNEL_COLOR_PRESETS = [
+  { name: "Cyan", hex: "00FFFF" },
+  { name: "Magenta", hex: "FF00FF" },
+  { name: "Yellow", hex: "FFFF00" },
+  { name: "Green", hex: "00FF00" },
+  { name: "Red", hex: "FF3B30" },
+  { name: "Blue", hex: "3B82F6" },
+  { name: "White", hex: "FFFFFF" },
+];
+
+let activeSwatchPopover = null;
+
+function normalizeChannelHex(raw) {
+  const s = typeof raw === "string" ? raw.trim().replace(/^#/, "").toUpperCase() : "";
+  return /^[0-9A-F]{6}$/.test(s) ? s : "";
+}
+
+function closeChannelColorPopover(restoreFocus = false) {
+  if (!activeSwatchPopover) return;
+  const { el, anchor, onOutside, onKey } = activeSwatchPopover;
+  activeSwatchPopover = null;
+  el.hidden = true;
+  el.remove?.();
+  anchor?.setAttribute?.("aria-expanded", "false");
+  document.removeEventListener?.("pointerdown", onOutside, true);
+  window.removeEventListener?.("keydown", onKey, true);
+  if (restoreFocus) anchor?.focus?.({ preventScroll: true });
+}
+
+function setChannelColor(index, rawHex, swatchEl = null) {
+  const ch = state.info?.channels?.[index];
+  if (!ch || state.info?.rgb) return false;
+  const hex = normalizeChannelHex(rawHex);
+  if (!hex) return false;
+  if (!ch.metadataColor) ch.metadataColor = normalizeChannelHex(ch.color) || "FFFFFF";
+  const prev = normalizeChannelHex(ch.color);
+  ch.color = hex;
+  const btn = swatchEl || ch._swatchBtn;
+  if (btn?.style) btn.style.background = "#" + hex;
+  if (prev !== hex) {
+    if (!state.lutHandoffOutsideSavedRange) state.lutPersistence?.changed?.();
+    if (typeof relayoutLuts === "function") relayoutLuts();
+    refreshTiles();
+    if (state.roi && typeof scheduleScaleStrip === "function") scheduleScaleStrip();
+  }
+  if (activeSwatchPopover && activeSwatchPopover.index === index) {
+    activeSwatchPopover.sync();
+  }
+  return true;
+}
+
+function openChannelColorPopover(index, anchor) {
+  const ch = state.info?.channels?.[index];
+  if (!ch || state.info?.rgb) return;
+  if (activeSwatchPopover && activeSwatchPopover.anchor === anchor) {
+    closeChannelColorPopover(false);
+    return;
+  }
+  closeChannelColorPopover(false);
+  if (!ch.metadataColor) ch.metadataColor = normalizeChannelHex(ch.color) || "FFFFFF";
+
+  const pop = document.createElement("div");
+  pop.className = "swatch-popover";
+  pop.setAttribute("role", "dialog");
+  const label = ch.label || "Channel " + index;
+  pop.setAttribute("aria-label", label + " color");
+
+  const heading = document.createElement("div");
+  heading.className = "swatch-popover-title";
+  heading.textContent = label + " color";
+
+  const grid = document.createElement("div");
+  grid.className = "swatch-presets";
+  const presetBtns = CHANNEL_COLOR_PRESETS.map((preset) => {
+    const p = document.createElement("button");
+    p.type = "button";
+    p.className = "swatch-preset";
+    p.dataset.hex = preset.hex;
+    p.style.background = "#" + preset.hex;
+    p.title = `${preset.name} (#${preset.hex})`;
+    p.setAttribute("aria-label", `${preset.name} #${preset.hex}`);
+    p.addEventListener("click", () => setChannelColor(index, preset.hex, anchor));
+    grid.append(p);
+    return p;
+  });
+
+  const customRow = document.createElement("label");
+  customRow.className = "swatch-custom-row";
+  const customText = document.createElement("span");
+  customText.textContent = "Custom";
+  const colorInput = document.createElement("input");
+  colorInput.type = "color";
+  colorInput.className = "swatch-custom-input";
+  colorInput.setAttribute("aria-label", "Custom " + label + " color");
+  colorInput.value = "#" + (normalizeChannelHex(ch.color) || "FFFFFF").toLowerCase();
+  colorInput.addEventListener("input", () => setChannelColor(index, colorInput.value, anchor));
+  customRow.append(customText, colorInput);
+
+  const resetBtn = document.createElement("button");
+  resetBtn.type = "button";
+  resetBtn.className = "btn swatch-reset-btn";
+  resetBtn.textContent = "Reset to metadata";
+  resetBtn.addEventListener("click", () => setChannelColor(index, ch.metadataColor, anchor));
+
+  pop.append(heading, grid, customRow, resetBtn);
+  const host = document.body || $("win-channels") || $("channel-list");
+  host?.append?.(pop);
+  anchor?.setAttribute?.("aria-expanded", "true");
+
+  if (typeof anchor?.getBoundingClientRect === "function") {
+    const r = anchor.getBoundingClientRect();
+    const vw = typeof window !== "undefined" && window.innerWidth ? window.innerWidth : 1024;
+    const vh = typeof window !== "undefined" && window.innerHeight ? window.innerHeight : 768;
+    const pw = pop.offsetWidth || 218;
+    const ph = pop.offsetHeight || 142;
+    const left = Math.max(8, Math.min(vw - pw - 8, r.left));
+    const top = r.bottom + ph + 8 <= vh ? r.bottom + 6 : Math.max(8, r.top - ph - 6);
+    pop.style.left = left + "px";
+    pop.style.top = top + "px";
+  }
+
+  const sync = () => {
+    const cur = normalizeChannelHex(ch.color);
+    const meta = normalizeChannelHex(ch.metadataColor);
+    presetBtns.forEach((b) => b.classList.toggle("active", b.dataset.hex === cur));
+    colorInput.value = "#" + (cur || "FFFFFF").toLowerCase();
+    resetBtn.disabled = !meta || cur === meta;
+  };
+  sync();
+
+  const onOutside = (ev) => {
+    if (!pop.contains?.(ev.target) && ev.target !== anchor && !anchor?.contains?.(ev.target)) {
+      closeChannelColorPopover(false);
+    }
+  };
+  const onKey = (ev) => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeChannelColorPopover(true);
+    }
+  };
+  document.addEventListener?.("pointerdown", onOutside, true);
+  window.addEventListener?.("keydown", onKey, true);
+  activeSwatchPopover = { index, el: pop, anchor, onOutside, onKey, sync };
+  return pop;
 }
 
 function buildChannelPanel() {
@@ -834,15 +1210,40 @@ function buildChannelPanel() {
     state.lutWidgets.forEach((widget) => widget.setAutoRange(state.lutAutoRange));
   });
   wireLutToolbar();
+  const switches = [];
+  const syncChannelSwitches = () => {
+    switches.forEach((swBtn, idx) => {
+      const lit = state.channels.includes(idx);
+      swBtn.classList.toggle("on", lit);
+      swBtn.setAttribute("aria-checked", String(lit));
+    });
+  };
   info.channels.forEach((ch, i) => {
+    if (!ch.metadataColor) ch.metadataColor = normalizeChannelHex(ch.color) || "FFFFFF";
+    ch.color = normalizeChannelHex(ch.color) || ch.metadataColor;
     const row = document.createElement("div");
     row.className = "channel-row";
-    const sw = document.createElement("span");
+    const sw = document.createElement("button");
+    sw.type = "button";
     sw.className = "swatch";
     sw.style.background = "#" + ch.color;
+    const chLabel = ch.label || "Channel " + i;
+    sw.setAttribute("aria-label", chLabel + " color");
+    sw.setAttribute("aria-haspopup", "dialog");
+    sw.setAttribute("aria-expanded", "false");
+    sw.title = info.rgb ? chLabel + " (RGB component)" : "Change " + chLabel + " color";
+    if (info.rgb) sw.disabled = true;
+    else {
+      sw.addEventListener("click", (ev) => {
+        ev?.preventDefault?.();
+        ev?.stopPropagation?.();
+        openChannelColorPopover(i, sw);
+      });
+    }
+    ch._swatchBtn = sw;
     const name = document.createElement("span");
     name.className = "name";
-    name.textContent = ch.label || "Channel " + i;
+    name.textContent = chLabel;
     const win = document.createElement("span");
     win.className = "win";
     win.textContent = fmtInt(ch.window.start) + "–" + fmtInt(ch.window.end);
@@ -865,13 +1266,38 @@ function buildChannelPanel() {
       ev.preventDefault();
       state.lutWidgets[i].reset();
     });
-    const toggle = macSwitch(state.channels.includes(i), (next) => {
+    const toggle = macSwitch(state.channels.includes(i), (next, ev) => {
+      if (ev?.altKey && info.channels.length >= 2) {
+        if (state.channels.length === 1 && state.channels[0] === i) {
+          const prev = Array.isArray(state.soloPrevChannels) && state.soloPrevChannels.length > 1
+            ? state.soloPrevChannels.filter((c) => Number.isInteger(c) && c >= 0 && c < info.channels.length)
+            : info.channels.map((_, idx) => idx);
+          state.channels = prev.length ? [...new Set(prev)].sort((a, b) => a - b)
+            : info.channels.map((_, idx) => idx);
+          state.soloPrevChannels = null;
+        } else {
+          if (state.channels.length > 1) state.soloPrevChannels = [...state.channels];
+          state.channels = [i];
+        }
+        syncChannelSwitches();
+        refreshTiles();
+        if (state.roi && typeof scheduleScaleStrip === "function") scheduleScaleStrip();
+        return "synced";
+      }
+      state.soloPrevChannels = null;
       const on = new Set(state.channels);
       next ? on.add(i) : on.delete(i);
       if (!on.size) return false; // keep at least one channel lit
       state.channels = [...on].sort((a, b) => a - b);
+      syncChannelSwitches();
       refreshTiles();
+      if (state.roi && typeof scheduleScaleStrip === "function") scheduleScaleStrip();
+      return "synced";
     });
+    toggle.title = window.Nd2ShortcutRouter
+      ? window.Nd2ShortcutRouter.formatShortcutText("Toggle channel (Option-click to solo)")
+      : "Toggle channel (Option-click to solo)";
+    switches.push(toggle);
     if (info.channels.length < 2) toggle.style.display = "none";
     row.append(sw, name, win, auto, reset, toggle);
     list.append(row);
@@ -1584,14 +2010,18 @@ function syncFrameScopedControls() {
   }
   syncScaleBarExportControls();
   scopedButton("roi-move", !hasRoi, hasFrame ? "Mark a region first" : chooseSite);
-  const nd2Unavailable = state.info && state.info.nd2Export === false;
+  const nd2Unavailable = Boolean(state.info && state.info.nd2Export === false);
+  const nd2Reason = (state.info && typeof state.info.nd2ExportReason === "string" && state.info.nd2ExportReason.trim()) ||
+    "ND2 export needs the limnd2 package on the server";
   scopedButton(
     "roi-dl-nd2",
     !hasRoi || nd2Unavailable,
     nd2Unavailable
-      ? "ND2 export needs the limnd2 package on the server"
+      ? nd2Reason
       : hasFrame ? "Mark a region first" : chooseSite
   );
+  $("roi-dl-nd2")?.classList?.toggle?.("primary", !nd2Unavailable);
+  $("roi-dl-tiff")?.classList?.toggle?.("primary", nd2Unavailable);
 
   const annotationReady = annotationOwnerReady();
   const annotationReason = hasFrame
@@ -1905,9 +2335,11 @@ function wireTools() {
   if (state.info.nd2Export === false) {
     const b = $("roi-dl-nd2");
     b.disabled = true;
-    b.title =
-      "ND2 export needs the limnd2 package on the server — " +
-      "pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2";
+    b.title = (typeof state.info.nd2ExportReason === "string" && state.info.nd2ExportReason.trim()) ||
+      ("ND2 export needs the limnd2 package on the server — " +
+       "pip install --index-url https://pypi.laboratory-imaging.com/simple limnd2");
+    b.classList?.remove?.("primary");
+    $("roi-dl-tiff")?.classList?.add?.("primary");
   }
 
   wireRoiDims();
@@ -2026,6 +2458,7 @@ function clearAstromapRois() {
   if (!astromapReady() || state.astromap.importReading) return false;
   const ids = new Set(astromapItems().map((item) => item.id));
   if (!ids.size) return false;
+  if (typeof pushUndoSnapshot === "function") pushUndoSnapshot(undefined, "clear Astromap ROIs");
   if (ids.has(state.editingId)) closeEditor(false);
   if (state.tool === "astromap") state.cancelToolDrag?.();
   state.annotations = state.annotations.filter((item) => item.type !== "box" || item.astromap !== true);
@@ -2034,6 +2467,54 @@ function clearAstromapRois() {
   annotationsChanged();
   $("astromap-status").textContent = `Cleared ${ids.size} Astromap region${ids.size === 1 ? "" : "s"}.`;
   return true;
+}
+
+let astromapClearTimer = null;
+
+function disarmAstromapClearConfirm() {
+  if (astromapClearTimer !== null) {
+    clearTimeout(astromapClearTimer);
+    astromapClearTimer = null;
+  }
+  const btn = $("astromap-clear-all");
+  if (!btn) return;
+  if (btn.dataset?.confirmClear) {
+    delete btn.dataset.confirmClear;
+    btn.classList?.remove?.("confirming");
+    btn.textContent = "Clear all";
+  }
+}
+
+function requestClearAstromapRois() {
+  if (!astromapReady() || state.astromap.importReading) return false;
+  const count = astromapItems().length;
+  if (!count) {
+    disarmAstromapClearConfirm();
+    return false;
+  }
+  const btn = $("astromap-clear-all");
+  if (btn && btn.dataset?.confirmClear !== "true") {
+    btn.dataset.confirmClear = "true";
+    btn.classList?.add?.("confirming");
+    btn.textContent = `Confirm clear (${count})`;
+    const status = $("astromap-status");
+    if (status) {
+      status.textContent = `Click Confirm clear (${count}) again to remove all Astromap regions.`;
+    }
+    if (astromapClearTimer !== null) clearTimeout(astromapClearTimer);
+    astromapClearTimer = setTimeout(() => disarmAstromapClearConfirm(), 3800);
+    return false;
+  }
+  disarmAstromapClearConfirm();
+  const cleared = clearAstromapRois();
+  if (cleared && typeof showActionToast === "function") {
+    showActionToast(
+      `Cleared ${count} Astromap region${count === 1 ? "" : "s"}`,
+      "Undo",
+      () => { if (typeof undoAnnotationHistory === "function") undoAnnotationHistory(); }
+    );
+  }
+  return cleared;
 }
 
 function refreshAstromapPanel() {
@@ -2059,10 +2540,21 @@ function refreshAstromapPanel() {
       const find = () => state.annotations.find((item) => item.id === a.id && item.astromap === true);
       include.onchange = () => {
         const item = find(); if (!item || !astromapReady()) return;
+        if (typeof pushUndoSnapshot === "function") pushUndoSnapshot(undefined, "toggle Astromap ROI");
         item.astromapEnabled = include.checked; annotationsChanged();
+      };
+      let noteFocusSnapshot = null;
+      let noteFocusRecorded = false;
+      note.onfocus = () => {
+        noteFocusSnapshot = typeof captureAnnotationSnapshot === "function" ? captureAnnotationSnapshot() : null;
+        noteFocusRecorded = false;
       };
       note.oninput = () => {
         const item = find(); if (!item || !astromapReady()) return;
+        if (!noteFocusRecorded && item.text !== note.value && typeof pushUndoSnapshot === "function") {
+          pushUndoSnapshot(noteFocusSnapshot || undefined, "edit ROI note");
+          noteFocusRecorded = true;
+        }
         item.text = note.value;
         // the label editor open on this region would otherwise write its
         // older text back when it closes
@@ -2169,7 +2661,11 @@ function refreshAstromapImport(ready = astromapReady()) {
   const pending = state.astromap.pendingImport;
   const busy = !!state.astromap.importReading;
   $("astromap-import").disabled = !ready || busy;
-  $("astromap-clear-all").disabled = !ready || busy || !astromapItems().length;
+  const hasAstromapRois = astromapItems().length > 0;
+  $("astromap-clear-all").disabled = !ready || busy || !hasAstromapRois;
+  if ((!ready || busy || !hasAstromapRois) && typeof disarmAstromapClearConfirm === "function") {
+    disarmAstromapClearConfirm();
+  }
   $("astromap-import-options").hidden = !pending;
   const size = [Number($("astromap-import-width").value), Number($("astromap-import-height").value)];
   const validSize = size.every((n) => Number.isSafeInteger(n) && n > 0);
@@ -2272,6 +2768,7 @@ function commitAstromapImport() {
     // Map every accepted row before appending once. Existing annotations and
     // original TXT coordinates remain unchanged; omitted rows stay in the report.
     const imported = boxes.map((box) => ({ id: "a" + Date.now().toString(36) + annCounter++, ...box }));
+    if (typeof pushUndoSnapshot === "function") pushUndoSnapshot(undefined, "import Astromap ROIs");
     state.annotations.push(...imported);
     state.astromap.activeId = imported[0]?.id || state.astromap.activeId;
     state.astromap.pendingImport = null;
@@ -2318,7 +2815,9 @@ function wireAstromap() {
   $("astromap-add-current").onclick = () => {
     if (frameOwnsRoi()) addAstromapRoi({ ...state.roi });
   };
-  $("astromap-clear-all").onclick = clearAstromapRois;
+  $("astromap-clear-all").onclick = () => (
+    typeof requestClearAstromapRois === "function" ? requestClearAstromapRois() : clearAstromapRois()
+  );
   $("astromap-export").onclick = () => exportAstromap();
   $("astromap-export-pdf").onclick = () => exportAstromap(true);
   const observer = new MutationObserver(() => {
@@ -2333,8 +2832,166 @@ function wireAstromap() {
 /* ---- annotations: model, sidecar persistence, SVG rendering ---------------- */
 
 let annCounter = 0;
+const MAX_HISTORY_STEPS = 50;
+
+function captureAnnotationSnapshot() {
+  return {
+    annContext: state.annContext || 0,
+    annotations: JSON.parse(JSON.stringify(state.annotations || [])),
+    activeAstromapId: state.astromap?.activeId || null,
+  };
+}
+
+function pushUndoSnapshot(snapshot = captureAnnotationSnapshot(), label = "") {
+  if (state.historyApplying || state.quitPreparing) return false;
+  if (typeof annLocked === "function" && annLocked()) return false;
+  if (!Array.isArray(state.undoStack)) state.undoStack = [];
+  if (!Array.isArray(state.redoStack)) state.redoStack = [];
+  const ctx = state.annContext || 0;
+  state.undoStack = state.undoStack.filter((entry) => entry.annContext === ctx);
+  const top = state.undoStack[state.undoStack.length - 1];
+  const serialized = JSON.stringify(snapshot.annotations);
+  if (top && JSON.stringify(top.annotations) === serialized) return false;
+  state.undoStack.push({
+    annContext: ctx,
+    annotations: JSON.parse(serialized),
+    activeAstromapId: snapshot.activeAstromapId || null,
+    label: String(label || ""),
+  });
+  if (state.undoStack.length > MAX_HISTORY_STEPS) {
+    state.undoStack.splice(0, state.undoStack.length - MAX_HISTORY_STEPS);
+  }
+  state.redoStack = [];
+  return true;
+}
+
+function applyHistoryEntry(entry) {
+  state.historyApplying = true;
+  try {
+    if ($("ann-editor") && !$("ann-editor").hidden && typeof closeEditor === "function") {
+      closeEditor(false);
+    }
+    state.annotations = JSON.parse(JSON.stringify(entry.annotations));
+    if (state.astromap) {
+      state.astromap.activeId = entry.activeAstromapId || null;
+    }
+    annotationsChanged();
+  } finally {
+    state.historyApplying = false;
+  }
+}
+
+function undoAnnotationHistory() {
+  if (state.quitPreparing || (typeof annLocked === "function" && annLocked()) ||
+      (typeof annotationOwnerReady === "function" && !annotationOwnerReady())) {
+    return false;
+  }
+  if ($("ann-editor") && !$("ann-editor").hidden && typeof closeEditor === "function") {
+    closeEditor(true);
+  }
+  const ctx = state.annContext || 0;
+  if (!Array.isArray(state.undoStack)) state.undoStack = [];
+  if (!Array.isArray(state.redoStack)) state.redoStack = [];
+  state.undoStack = state.undoStack.filter((entry) => entry.annContext === ctx);
+  state.redoStack = state.redoStack.filter((entry) => entry.annContext === ctx);
+  if (!state.undoStack.length) {
+    if (typeof showToast === "function") showToast("Nothing to undo");
+    return false;
+  }
+  const current = captureAnnotationSnapshot();
+  const prev = state.undoStack.pop();
+  state.redoStack.push({ ...current, label: prev.label });
+  if (state.redoStack.length > MAX_HISTORY_STEPS) {
+    state.redoStack.splice(0, state.redoStack.length - MAX_HISTORY_STEPS);
+  }
+  applyHistoryEntry(prev);
+  if (typeof showToast === "function") {
+    showToast(prev.label ? `Undid ${prev.label}` : "Undid change");
+  }
+  return true;
+}
+
+function redoAnnotationHistory() {
+  if (state.quitPreparing || (typeof annLocked === "function" && annLocked()) ||
+      (typeof annotationOwnerReady === "function" && !annotationOwnerReady())) {
+    return false;
+  }
+  if ($("ann-editor") && !$("ann-editor").hidden && typeof closeEditor === "function") {
+    closeEditor(true);
+  }
+  const ctx = state.annContext || 0;
+  if (!Array.isArray(state.undoStack)) state.undoStack = [];
+  if (!Array.isArray(state.redoStack)) state.redoStack = [];
+  state.undoStack = state.undoStack.filter((entry) => entry.annContext === ctx);
+  state.redoStack = state.redoStack.filter((entry) => entry.annContext === ctx);
+  if (!state.redoStack.length) {
+    if (typeof showToast === "function") showToast("Nothing to redo");
+    return false;
+  }
+  const current = captureAnnotationSnapshot();
+  const next = state.redoStack.pop();
+  state.undoStack.push({ ...current, label: next.label });
+  if (state.undoStack.length > MAX_HISTORY_STEPS) {
+    state.undoStack.splice(0, state.undoStack.length - MAX_HISTORY_STEPS);
+  }
+  applyHistoryEntry(next);
+  if (typeof showToast === "function") {
+    showToast(next.label ? `Redid ${next.label}` : "Redid change");
+  }
+  return true;
+}
+
+function moveAnnotation(id, dx, dy) {
+  if (state.quitPreparing || (typeof annLocked === "function" && annLocked()) ||
+      (typeof annotationOwnerReady === "function" && !annotationOwnerReady())) {
+    return false;
+  }
+  const a = state.annotations.find((item) => item.id === id);
+  if (!a || (!Number.isFinite(dx) && !Number.isFinite(dy)) || (dx === 0 && dy === 0)) return false;
+  const maxW = Number(state.info?.width) || Infinity;
+  const maxH = Number(state.info?.height) || Infinity;
+  if (a.type === "pin") {
+    const nx = clamp(a.x + dx, 0, maxW);
+    const ny = clamp(a.y + dy, 0, maxH);
+    if (nx === a.x && ny === a.y) return false;
+    pushUndoSnapshot(undefined, "move annotation");
+    a.x = nx;
+    a.y = ny;
+  } else if (a.type === "box") {
+    const nx = clamp(a.x + dx, 0, Math.max(0, maxW - a.w));
+    const ny = clamp(a.y + dy, 0, Math.max(0, maxH - a.h));
+    if (nx === a.x && ny === a.y) return false;
+    if (a.astromap === true && window.Nd2Astromap &&
+        astromapItems().some((other) => other.id !== a.id &&
+          window.Nd2Astromap.overlaps({ x: nx, y: ny, w: a.w, h: a.h }, other))) {
+      if (typeof showToast === "function") showToast("This region overlaps another Astromap region");
+      return false;
+    }
+    pushUndoSnapshot(undefined, a.astromap ? "move Astromap ROI" : "move annotation");
+    a.x = nx;
+    a.y = ny;
+  } else if (a.type === "line") {
+    const minX = Math.min(a.x1, a.x2), maxX = Math.max(a.x1, a.x2);
+    const minY = Math.min(a.y1, a.y2), maxY = Math.max(a.y1, a.y2);
+    const shiftX = clamp(dx, -minX, maxW - maxX);
+    const shiftY = clamp(dy, -minY, maxH - maxY);
+    if (shiftX === 0 && shiftY === 0) return false;
+    pushUndoSnapshot(undefined, "move annotation");
+    a.x1 += shiftX;
+    a.x2 += shiftX;
+    a.y1 += shiftY;
+    a.y2 += shiftY;
+  } else {
+    return false;
+  }
+  annotationsChanged();
+  return true;
+}
 
 function addAnnotation(props) {
+  if (typeof pushUndoSnapshot === "function") {
+    pushUndoSnapshot(undefined, props?.astromap ? "add Astromap ROI" : "add annotation");
+  }
   const item = { id: "a" + Date.now().toString(36) + annCounter++, ...props };
   state.annotations.push(item);
   annotationsChanged();
@@ -2342,6 +2999,9 @@ function addAnnotation(props) {
 }
 
 function removeAnnotation(id) {
+  if (state.annotations.some((a) => a.id === id) && typeof pushUndoSnapshot === "function") {
+    pushUndoSnapshot(undefined, "delete");
+  }
   const previous = astromapItems().findIndex((a) => a.id === id);
   state.annotations = state.annotations.filter((a) => a.id !== id);
   if (state.astromap.activeId === id) {
@@ -2775,6 +3435,7 @@ function annColor(a) {
   return typeof a.color === "string" && /^#[0-9a-f]{6}$/i.test(a.color) ? a.color : ACCENT;
 }
 function cycleAnnColor(a) {
+  if (typeof pushUndoSnapshot === "function") pushUndoSnapshot(undefined, "change color");
   const i = ANN_COLORS.indexOf(annColor(a));
   a.color = ANN_COLORS[(i + 1) % ANN_COLORS.length];
   annotationsChanged();
@@ -2969,6 +3630,70 @@ function wireAnnotationPointer() {
     if (!a) return;
     if (a.type === "box" && a.astromap === true) selectAstromapRoi(a.id, false);
     openEditor(a.id);
+    if (!Number.isFinite(ev.clientX) || !Number.isFinite(ev.clientY) ||
+        typeof window === "undefined" || typeof window.addEventListener !== "function" ||
+        typeof viewerElementToImagePoint !== "function" ||
+        (typeof annLocked === "function" && annLocked()) || state.quitPreparing ||
+        !(a.type === "pin" || a.type === "box" || a.type === "line")) {
+      return;
+    }
+    const stage = typeof $ === "function" ? $("stage") : null;
+    if (!stage || typeof elementPoint !== "function") return;
+    const startClient = { x: ev.clientX, y: ev.clientY };
+    const startImg = viewerElementToImagePoint(elementPoint(ev, stage));
+    const origin = { x: a.x, y: a.y, x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2 };
+    const beforeDrag = typeof captureAnnotationSnapshot === "function" ? captureAnnotationSnapshot() : null;
+    let dragging = false;
+    const onMove = (moveEv) => {
+      if (Math.hypot(moveEv.clientX - startClient.x, moveEv.clientY - startClient.y) < 5 && !dragging) return;
+      if (!dragging) {
+        dragging = true;
+        const editorEl = typeof $ === "function" ? $("ann-editor") : null;
+        if (editorEl && !editorEl.hidden) closeEditor(false);
+      }
+      const curImg = viewerElementToImagePoint(elementPoint(moveEv, stage));
+      const dx = curImg.x - startImg.x;
+      const dy = curImg.y - startImg.y;
+      const maxW = Number(state.info?.width) || Infinity;
+      const maxH = Number(state.info?.height) || Infinity;
+      if (a.type === "pin") {
+        a.x = clamp(origin.x + dx, 0, maxW);
+        a.y = clamp(origin.y + dy, 0, maxH);
+      } else if (a.type === "box") {
+        const nx = clamp(origin.x + dx, 0, Math.max(0, maxW - a.w));
+        const ny = clamp(origin.y + dy, 0, Math.max(0, maxH - a.h));
+        if (!(a.astromap === true && window.Nd2Astromap &&
+            astromapItems().some((other) => other.id !== a.id &&
+              window.Nd2Astromap.overlaps({ x: nx, y: ny, w: a.w, h: a.h }, other)))) {
+          a.x = nx;
+          a.y = ny;
+        }
+      } else if (a.type === "line") {
+        const minX = Math.min(origin.x1, origin.x2), maxX = Math.max(origin.x1, origin.x2);
+        const minY = Math.min(origin.y1, origin.y2), maxY = Math.max(origin.y1, origin.y2);
+        const sx = clamp(dx, -minX, maxW - maxX);
+        const sy = clamp(dy, -minY, maxH - maxY);
+        a.x1 = origin.x1 + sx;
+        a.x2 = origin.x2 + sx;
+        a.y1 = origin.y1 + sy;
+        a.y2 = origin.y2 + sy;
+      }
+      annotationFrame = null;
+      renderAnnotations();
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onUp, true);
+      if (!dragging) return;
+      if (beforeDrag && typeof pushUndoSnapshot === "function") {
+        pushUndoSnapshot(beforeDrag, a.astromap ? "move Astromap ROI" : "move annotation");
+      }
+      annotationsChanged();
+    };
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onUp, true);
   });
 }
 
@@ -3237,6 +3962,7 @@ function closeEditor(save = true) {
     const a = state.annotations.find((x) => x.id === state.editingId);
     const text = $("ann-text").value.trim();
     if (a && (a.text || "") !== text) {
+      if (typeof pushUndoSnapshot === "function") pushUndoSnapshot(undefined, "edit note");
       a.text = text;
       annotationsChanged();
     }
@@ -3302,6 +4028,7 @@ async function openAnnotationFile(file) {
       throw new Error("the combined annotations exceed the 8 MB import limit");
     }
     if (!append) closeEditor(false);
+    if (typeof pushUndoSnapshot === "function") pushUndoSnapshot(undefined, "import annotations");
     state.annotations = combined;
     annotationsChanged();
     setAnnStatus((append ? "Imported " : "Opened ") + file.name + " (" + imported.length + ")" +
@@ -3405,7 +4132,7 @@ function geojsonFilename(info) {
   const name = basename(info && info.name);
   const stem = name
     .replace(/\.ome\.zarr$/i, "")
-    .replace(/\.(nd2|czi|lif|svs|sdpc|nd2svs|jpe?g|png)$/i, "");
+    .replace(/\.(?:ome\.tiff?|qptiff|tiff?|nd2|czi|lif|svs|sdpc|nd2svs|jpe?g|png)$/i, "");
   const selection = info === state.info ? currentSelection() : info && info.selection;
   return safeFilenamePart(stem, "slide") + "--" +
     selectionFilenameTag(selection) + ".geojson";
@@ -3435,7 +4162,10 @@ function exportAnnotationsJSON() {
   if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
   downloadJsonFile(
     annotationDocument(),
-    state.info.name.replace(/\.(nd2|czi|lif|svs)$/i, "") + ".annotations.json",
+    state.info.name
+      .replace(/\.ome\.zarr$/i, "")
+      .replace(/\.(?:ome\.tiff?|qptiff|tiff?|nd2|czi|lif|svs|sdpc|nd2svs|jpe?g|png)$/i, "") +
+      ".annotations.json",
     "application/json"
   );
   const note = keptItemsExportNote();
@@ -4997,24 +5727,66 @@ function announceTheme(mode, theme) {
   }
 }
 
+function uiSettingsEndpoint() {
+  const path = typeof location !== "undefined" ? String(location.pathname || "") : "";
+  const idx = path.indexOf("/s/");
+  return (idx >= 0 ? path.slice(0, idx) : "") + "/api/ui-settings";
+}
+
 function wireTheme() {
-  // each tab derives its look from its slide type; nothing persists
-  let mode = "auto";
+  let userSelected = false;
+  let mode = (() => {
+    try {
+      const cached = localStorage.getItem("nd2wsi.theme");
+      if (THEME_MODES.includes(cached)) return cached;
+    } catch (_) { /* private mode */ }
+    return "auto";
+  })();
   let theme = applyThemeMode(mode);
   announceTheme(mode, theme);
 
+  if (typeof fetch === "function") {
+    fetch(uiSettingsEndpoint(), { cache: "no-store" })
+      .then((res) => (res && res.ok && typeof res.json === "function" ? res.json() : null))
+      .then((data) => {
+        if (userSelected || !data) return;
+        const root = data.settings && typeof data.settings === "object" ? data.settings : data;
+        if (THEME_MODES.includes(root?.theme)) {
+          mode = root.theme;
+          try { localStorage.setItem("nd2wsi.theme", mode); } catch (_) { /* ignore */ }
+          theme = applyThemeMode(mode);
+          announceTheme(mode, theme);
+        }
+      })
+      .catch(() => {});
+  }
+
   $("tb-theme").onclick = () => {
+    userSelected = true;
     mode = THEME_MODES[(THEME_MODES.indexOf(mode) + 1) % THEME_MODES.length];
+    try { localStorage.setItem("nd2wsi.theme", mode); } catch (_) { /* ignore */ }
     theme = applyThemeMode(mode);
     announceTheme(mode, theme);
+    if (typeof fetch === "function") {
+      fetch(uiSettingsEndpoint(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ theme: mode }),
+      }).catch(() => {});
+    }
   };
+
+  window.addEventListener("focus", () => {
+    // Preserve explicit user-chosen "light" or "dark" mode across focus changes;
+    // never reset an explicit appearance choice back to "auto".
+    theme = applyThemeMode(mode);
+    announceTheme(mode, theme);
+  });
 
   window.addEventListener("message", (ev) => {
     if (ev.origin !== location.origin || !ev.data) return;
     if (ev.data.nd2wsi === "theme-request") {
-      // coming to the front re-asserts the slide-type default; a manual
-      // choice lasts only while the tab stays front
-      mode = "auto";
+      // Preserve explicit user-chosen "light" or "dark" mode when switching tabs.
       theme = applyThemeMode(mode);
       announceTheme(mode, theme);
     }
@@ -5042,6 +5814,8 @@ function buildWindows() {
       getItem: (key) => localStorage.getItem(key),
       setItem: (key, value) => localStorage.setItem(key, value),
     },
+    fetch: typeof fetch === "function" ? (...args) => fetch(...args) : null,
+    uiSettingsUrl: uiSettingsEndpoint(),
   });
   state.windows = {
     channels: makeMacWindow($("win-channels"), {
@@ -5110,6 +5884,7 @@ function buildWindows() {
   window.addEventListener("resize", () => {
     Object.values(state.windows).forEach((w) => w.clampToStage());
   });
+  floatingWindows.hydrate?.();
 }
 
 function makeMacWindow(el, opts) {
@@ -5774,7 +6549,7 @@ function setPlateFocus(p) {
   postSpatialReadiness();
 }
 
-const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #ann-editor, #ann-recovery, #z-slider, #plate-transpose, #zoom-cluster";
+const NATIVE_GESTURE_EXCLUSIONS = "#time-line, #plate-strip, #plate-back, .mac-window, #plate-view-menu, #scene-picker-menu, #shortcuts-modal, .swatch-popover, #ann-editor, #ann-recovery, #z-slider, #plate-transpose, #zoom-cluster";
 
 function wireNativeGestureScope() {
   let pending = false;
@@ -6014,8 +6789,55 @@ function applyOrientationShortcut(action) {
   return applyDesiredDisplayTransform();
 }
 
+function setShortcutModalOpen(open) {
+  const modal = $("shortcuts-modal");
+  const trigger = $("tb-shortcuts");
+  if (!modal) return false;
+  const shown = Boolean(open) && !state.quitPreparing;
+  modal.hidden = !shown;
+  trigger?.classList?.toggle?.("active", shown);
+  trigger?.setAttribute?.("aria-expanded", String(shown));
+  if (shown) {
+    $("shortcuts-close")?.focus?.({ preventScroll: true });
+  } else {
+    trigger?.focus?.({ preventScroll: true });
+  }
+  return shown;
+}
+
+function toggleShortcutModal() {
+  const modal = $("shortcuts-modal");
+  if (!modal) return false;
+  return setShortcutModalOpen(modal.hidden);
+}
+
+function wireShortcutModal() {
+  const modal = $("shortcuts-modal");
+  const trigger = $("tb-shortcuts");
+  if (!modal) return;
+  const router = window.Nd2ShortcutRouter;
+  if (router && typeof modal.querySelectorAll === "function") {
+    for (const kbd of modal.querySelectorAll("[data-shortcut]")) {
+      if (kbd.hasAttribute?.("data-redo-shortcut") && !router.isMac()) {
+        kbd.textContent = "Ctrl+Shift+Z / Ctrl+Y";
+      } else {
+        kbd.textContent = router.formatShortcutText(kbd.textContent);
+      }
+    }
+  }
+  if (trigger) trigger.onclick = () => toggleShortcutModal();
+  const closeBtn = $("shortcuts-close");
+  if (closeBtn) closeBtn.onclick = () => setShortcutModalOpen(false);
+  modal.addEventListener?.("click", (ev) => {
+    if (ev.target === modal) setShortcutModalOpen(false);
+  });
+}
+
 function togglePanelForShortcut(panel) {
   if (state.quitPreparing) return false;
+  if (panel === "shortcuts") {
+    return typeof toggleShortcutModal === "function" ? toggleShortcutModal() : false;
+  }
   if (panel === "info") {
     const inspector = state.windows?.info;
     if (!inspector) return false;
@@ -6034,6 +6856,14 @@ function wireKeys() {
   window.addEventListener("keydown", (ev) => {
     const shortcuts = window.Nd2ShortcutRouter;
     if (ev.defaultPrevented) return;
+    const shortcutModal = typeof $ === "function" ? $("shortcuts-modal") : null;
+    if (shortcutModal && !shortcutModal.hidden && ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (typeof setShortcutModalOpen === "function") setShortcutModalOpen(false);
+      else shortcutModal.hidden = true;
+      return;
+    }
     if (shortcuts && !shortcuts.isMac() && shortcuts.isNewWindowShortcut(ev) &&
         window.parent !== window && window.parent.pywebview?.api?.new_window) {
       const role = shortcuts.newWindowRoleForEvent(ev);
@@ -6046,6 +6876,20 @@ function wireKeys() {
     if (shortcuts && shortcuts.isTypingEvent(ev)) return;
     if (!shortcuts && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
     if (ev.target.closest?.("#tb-plate-view, #plate-view-menu")) return;
+    if (shortcuts?.isShortcutHelpEvent?.(ev)) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (typeof toggleShortcutModal === "function") toggleShortcutModal();
+      return;
+    }
+    if (shortcuts?.isHistoryShortcut?.(ev)) {
+      const action = shortcuts.historyActionForEvent(ev);
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (action === "undo" && typeof undoAnnotationHistory === "function") undoAnnotationHistory();
+      else if (action === "redo" && typeof redoAnnotationHistory === "function") redoAnnotationHistory();
+      return;
+    }
     const command = ev.metaKey || ev.ctrlKey;
     const letterCode = shortcuts ? shortcuts.letterCode(ev) : ev.code;
     if (shortcuts?.isAstromapShortcut(ev)) {
@@ -6171,6 +7015,29 @@ function showToast(msg) {
   t.classList.add("show");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove("show"), 3600);
+}
+function showActionToast(msg, actionLabel, onAction) {
+  const t = $("toast");
+  if (!t || typeof t.replaceChildren !== "function") {
+    showToast(msg);
+    return;
+  }
+  const text = document.createElement("span");
+  text.textContent = msg;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "toast-action";
+  btn.textContent = actionLabel;
+  btn.onclick = (ev) => {
+    ev?.stopPropagation?.();
+    t.classList.remove("show");
+    clearTimeout(toastTimer);
+    onAction?.();
+  };
+  t.replaceChildren(text, btn);
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 5200);
 }
 function debounceToast(msg) {
   let last = 0;
