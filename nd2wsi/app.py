@@ -24,8 +24,23 @@ from . import window_chrome as _window_chrome
 from . import window_lifecycle as _window_lifecycle
 
 APP_NAME = os.environ.get("ND2WSI_APP_NAME", "nd2wsi-viewer") if sys.platform == "darwin" else "nd2wsi-viewer"
-OPEN_SUFFIXES = (".nd2", ".czi", ".lif", ".svs", ".sdpc", ".nd2svs", ".jpg", ".jpeg", ".png")
-OPEN_FILE_TYPES = ("Slides and images (*.nd2;*.czi;*.lif;*.svs;*.sdpc;*.nd2svs;*.jpg;*.jpeg;*.png)",)
+OPEN_SUFFIXES = (
+    ".nd2",
+    ".czi",
+    ".lif",
+    ".tif",
+    ".tiff",
+    ".qptiff",
+    ".svs",
+    ".sdpc",
+    ".nd2svs",
+    ".jpg",
+    ".jpeg",
+    ".png",
+)
+OPEN_FILE_TYPES = (
+    "Slides and images (*.nd2;*.czi;*.lif;*.tif;*.tiff;*.qptiff;*.svs;*.sdpc;*.nd2svs;*.jpg;*.jpeg;*.png)",
+)
 _UPDATER_HANDLE = None
 _UPDATER_COORDINATOR = None
 
@@ -92,6 +107,7 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
     """
     from .cache import SINGLE_FILE_SUFFIX
     from .convert import ensure_cache, existing_cache_store
+    from .ometiff import is_ometiff
     from .plate import is_plate_file
     from .raster import is_raster
     from .sdpc import is_sdpc
@@ -105,6 +121,10 @@ def open_or_convert(nd2_path: Path, on_status=None, on_progress=None) -> Path:
         return nd2_path  # Direct sources need no cache creation or migration.
     if is_svs(nd2_path) and existing_cache_store(nd2_path) is None:
         return nd2_path  # the registry serves it straight from the file
+    if is_ometiff(nd2_path):
+        if on_status:
+            on_status(f"opening {nd2_path.name} …")
+        return nd2_path  # direct 2D pyramid or interactive Z/T stack
     if is_plate_file(nd2_path):
         if on_status:
             on_status(f"opening {nd2_path.name} … (plate)")
@@ -808,7 +828,10 @@ class Api:
         for raw in paths or []:
             p = Path(raw)
             if p.suffix.lower() not in OPEN_SUFFIXES:
-                self._status = f"{p.name}: not a supported slide, cache, or JPEG/PNG image"
+                self._status = (
+                    f"{p.name}: not a supported slide (.nd2, .czi, .lif, .tif/.ome.tif, .svs, .sdpc), "
+                    "cache, or JPEG/PNG image"
+                )
             elif not p.is_file():
                 self._status = f"could not find {p.name}"
             else:
@@ -912,6 +935,14 @@ class Api:
         NSOperationQueue.mainQueue().addOperationWithBlock_(act)
         return action
 
+    def recent_files(self) -> dict:
+        """Recent slide files for the entry screen."""
+        if self._window_session is not None and self._window_session.role == "agent":
+            return {"ok": True, "items": []}
+        from .server import _list_recent_files_safe
+
+        return {"ok": True, "items": _list_recent_files_safe()}
+
     def _open_registered(self, path: Path, note, frac) -> str:
         with self._translucent_lock:
             self._translucent_owner_closed = False
@@ -940,6 +971,12 @@ class Api:
             registry = getattr(self._httpd, "registry", None)
             if registry is not None:
                 registry.on_remove = self.close_translucent_viewer
+        try:
+            from .server import _record_recent_file_safe
+
+            _record_recent_file_safe(path, window_role="user")
+        except Exception:
+            pass
         self._prepare_handoff()
         return url
 
