@@ -25,6 +25,7 @@ import time
 import uuid
 import warnings
 from collections import OrderedDict, deque
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +58,7 @@ from .plate_integrity import (
     quarantine_chunk,
     zarr_v2_chunk_path,
 )
-from .platform_io import BINARY, filesystem_path, read_at
+from .platform_io import BINARY, filesystem_path, read_at, total_physical_memory_bytes
 from .reader import (
     FRAME_AXES,
     PlaneSource,
@@ -70,13 +71,20 @@ from .reader import (
 )
 from .session_lock import SessionFileLock
 
+
+def _default_frame_cache_bytes(total_ram: int | None = None) -> int:
+    ram = int(total_physical_memory_bytes() if total_ram is None else total_ram)
+    return max(320 * 1024 * 1024, min(int(ram * 0.08), 1536 * 1024 * 1024))
+
+
 PLATE_MAX_FRAME_PX = 4_500_000  # a camera field, not a stitched scan
 CZI_LIF_PLATE_MAX_DIM = 8192  # keeps level_shapes within PLATE_K=(2, 4, 8, 16) at tile=512
 CZI_LIF_PLATE_MAX_FRAME_PX = 40_000_000  # confocal / lightsheet Z-stacks and time series
 PLATE_CACHE_BYTES = 768 * 1024 * 1024  # reduced frames kept in memory
-FRAME_CACHE_BYTES = 320 * 1024 * 1024  # whole frames kept for the focused site
+FRAME_CACHE_BYTES = _default_frame_cache_bytes()  # whole frames kept for the focused site
 PLATE_K = (2, 4, 8, 16)  # box mean factors the grid may ask for
 PREFETCH_PENDING_MAX = 256  # frames queued for warming, oldest dropped first
+Z_PREFETCH_PENDING_MAX = 16  # neighboring full Z-planes queued for focused site
 HISTOGRAM_LRU = 64
 THUMB_K = 8  # the reduction the store keeps, the one the site grid shows
 WINDOWS_T = 0  # default display windows sample every site at this time point,
@@ -1768,6 +1776,14 @@ class PlateSource:
         self._pf_queue: deque[tuple[int, int, int, int]] = deque()
         self._pf_set: set[tuple[int, int, int, int]] = set()
         self._pf_thread: threading.Thread | None = None
+        self._inflight_lock = threading.Lock()
+        self._inflight_frames: dict[tuple[int, int, int], threading.Event] = {}
+        self._bg_tls = threading.local()
+        self._zpf_lock = threading.Lock()
+        self._zpf_cv = threading.Condition(self._zpf_lock)
+        self._zpf_queue: deque[tuple[int, int, int]] = deque()
+        self._zpf_set: set[tuple[int, int, int]] = set()
+        self._zpf_thread: threading.Thread | None = None
         self._fd = -1
         self._fg = 0  # foreground reads in flight; the prefetch worker yields to them
         self._f: Any = None
@@ -2330,36 +2346,63 @@ class PlateSource:
         """(C, H, W) frame that owns its memory, cached a few at a time."""
         if self._closed:
             raise ValueError("slide is closed")
+        t_i, p_i, z_i = int(t), int(p), int(z)
+        tpz = (t_i, p_i, z_i)
+        key = (self._owner, "frame", t_i, p_i, z_i)
         with self._life:
             self._check_source()
-            key = (self._owner, "frame", int(t), int(p), int(z))
             hit = _FRAME_CACHE.get(key)
             if hit is not None:
                 return hit
-            if self._backend == "czi":
-                self._fg += 1
-                try:
-                    cyx = self._read_czi_frame(int(t), int(p), int(z))
-                finally:
-                    self._fg -= 1
-            elif self._backend == "lif":
-                self._fg += 1
-                try:
-                    cyx = self._read_lif_frame(int(t), int(p), int(z))
-                finally:
-                    self._fg -= 1
-            else:
-                seq = self.seq(t, p, z)
-                self._fg += 1
-                try:
-                    raw = self._read_raw(seq)
-                finally:
-                    self._fg -= 1
-                cyx, _ = _frame_to_cyx(raw, self.sizes)
-            cyx = np.ascontiguousarray(cyx)
-            if not self._closed:
-                _FRAME_CACHE.put(key, cyx)
-            return cyx
+            with self._inflight_lock:
+                hit = _FRAME_CACHE.get(key)
+                if hit is not None:
+                    return hit
+                waiter = self._inflight_frames.get(tpz)
+                if waiter is None:
+                    waiter = threading.Event()
+                    self._inflight_frames[tpz] = waiter
+                    leader = True
+                else:
+                    leader = False
+            if not leader:
+                waiter.wait()
+                if self._closed:
+                    raise ValueError("slide is closed")
+                hit = _FRAME_CACHE.get(key)
+                if hit is not None:
+                    return hit
+            fg_delta = 0 if getattr(self._bg_tls, "active", False) else 1
+            try:
+                if self._backend == "czi":
+                    self._fg += fg_delta
+                    try:
+                        cyx = self._read_czi_frame(t_i, p_i, z_i)
+                    finally:
+                        self._fg -= fg_delta
+                elif self._backend == "lif":
+                    self._fg += fg_delta
+                    try:
+                        cyx = self._read_lif_frame(t_i, p_i, z_i)
+                    finally:
+                        self._fg -= fg_delta
+                else:
+                    seq = self.seq(t_i, p_i, z_i)
+                    self._fg += fg_delta
+                    try:
+                        raw = self._read_raw(seq)
+                    finally:
+                        self._fg -= fg_delta
+                    cyx, _ = _frame_to_cyx(raw, self.sizes)
+                cyx = np.ascontiguousarray(cyx)
+                if not self._closed:
+                    _FRAME_CACHE.put(key, cyx)
+                return cyx
+            finally:
+                if leader:
+                    with self._inflight_lock:
+                        self._inflight_frames.pop(tpz, None)
+                    waiter.set()
 
     def reduced(self, t: int, p: int, z: int, k: int, *, persist: bool = True) -> np.ndarray:
         """(C, H//k, W//k) box mean of one frame, rounded to the source dtype.
@@ -2488,18 +2531,89 @@ class PlateSource:
         channels: list[int],
         fmt: str = "jpg",
         win: str | None = None,
+        col: str | Sequence[str | None] | None = None,
     ) -> bytes:
         self._fg += 1
         try:
             region = self.reduced(t, p, z, k)
         finally:
             self._fg -= 1
-        windows, colors = render.display_params(self.attrs)
+        windows, colors = render.display_params(self.attrs, col=col)
         windows, gammas = render.parse_windows(win, windows)
         img = render.composite(region, channels, windows, colors, self.rgb, gammas)
         return render.encode_image(img, fmt)
 
     # ---- prefetch --------------------------------------------------------
+    def prefetch_neighbors(self, t: int, p: int, z: int) -> None:
+        """Asynchronously warm neighboring full Z-planes ``(z - 1, z + 1)`` into
+        ``_FRAME_CACHE`` without blocking foreground tile serving."""
+        try:
+            if self._closed or self.Z <= 1:
+                return
+            t_i, p_i, z_i = int(t), int(p), int(z)
+            if not (0 <= t_i < self.T and 0 <= p_i < self.P and 0 <= z_i < self.Z):
+                return
+            candidates = [
+                (t_i, p_i, z2)
+                for z2 in (z_i - 1, z_i + 1)
+                if 0 <= z2 < self.Z
+                and _FRAME_CACHE.get((self._owner, "frame", t_i, p_i, z2)) is None
+            ]
+            if not candidates:
+                return
+            with self._zpf_cv:
+                if self._closed:
+                    return
+                added = False
+                for item in candidates:
+                    if item in self._zpf_set:
+                        continue
+                    while len(self._zpf_queue) >= Z_PREFETCH_PENDING_MAX:
+                        old = self._zpf_queue.popleft()
+                        self._zpf_set.discard(old)
+                    self._zpf_queue.append(item)
+                    self._zpf_set.add(item)
+                    added = True
+                if added:
+                    if self._zpf_thread is None or not self._zpf_thread.is_alive():
+                        self._zpf_thread = threading.Thread(
+                            target=self._neighbor_prefetch_worker,
+                            name="plate-z-prefetch",
+                            daemon=True,
+                        )
+                        self._zpf_thread.start()
+                    self._zpf_cv.notify()
+        except Exception:
+            pass
+
+    def _neighbor_prefetch_worker(self) -> None:
+        while True:
+            with self._zpf_cv:
+                while not self._zpf_queue and not self._closed:
+                    self._zpf_cv.wait()
+                if self._closed:
+                    self._zpf_queue.clear()
+                    self._zpf_set.clear()
+                    return
+                item = self._zpf_queue.popleft()
+            try:
+                while self._fg > 0 and not self._closed:
+                    time.sleep(0.01)
+                if self._closed:
+                    return
+                t_i, p_i, z_i = item
+                if _FRAME_CACHE.get((self._owner, "frame", t_i, p_i, z_i)) is None:
+                    self._bg_tls.active = True
+                    try:
+                        self.frame(t_i, p_i, z_i)
+                    finally:
+                        self._bg_tls.active = False
+            except Exception:
+                if self._closed:
+                    return
+            finally:
+                with self._zpf_cv:
+                    self._zpf_set.discard(item)
     def prefetch(self, t: int, z: int, k: int) -> None:
         """Queue the neighbouring frames for warming. Never blocks, never raises."""
         try:
@@ -2582,6 +2696,8 @@ class PlateSource:
         self._closed = True
         with self._pf_cv:
             self._pf_cv.notify_all()
+        with self._zpf_cv:
+            self._zpf_cv.notify_all()
         if not self._life.close(timeout=timeout):
             # a reader still holds the map after the drain timeout. nd2's
             # frames are views onto the mmap and raise no BufferError on
@@ -2615,6 +2731,8 @@ class PlateSource:
                     self._life.reopen()
                     with self._pf_cv:
                         self._pf_cv.notify_all()
+                    with self._zpf_cv:
+                        self._zpf_cv.notify_all()
                     raise
                 if self._schedule_close_retry():
                     return False, None
@@ -2625,6 +2743,7 @@ class PlateSource:
                     timeout=None,
                 )
         prefetch = self._pf_thread
+        z_prefetch = self._zpf_thread
         try:
             # Once store.close() transfers the writer lease, no ordinary
             # handle-cleanup exception may hide that lease from the caller.
@@ -2633,6 +2752,11 @@ class PlateSource:
             try:
                 if prefetch is not None and prefetch.is_alive():
                     prefetch.join(timeout=3.0)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            try:
+                if z_prefetch is not None and z_prefetch.is_alive():
+                    z_prefetch.join(timeout=3.0)
             except Exception:  # pragma: no cover - defensive
                 pass
             try:

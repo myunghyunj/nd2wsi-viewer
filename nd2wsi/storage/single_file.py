@@ -12,6 +12,7 @@ import asyncio
 import errno
 import ntpath
 import os
+import queue
 import sqlite3
 import stat
 import sys
@@ -45,6 +46,19 @@ _WRITABLE_VERSIONS = frozenset({FORMAT_VERSION, CORRECTED_FORMAT_VERSION})
 _COMPANION_SUFFIXES = ("-journal", "-wal", "-shm")
 _PAGE_KEYS = 256
 _RECOVERY_TIMEOUT = 1.0
+_READ_POOL_SIZE = 6
+_PATH_MUTATIONS_LOCK = threading.Lock()
+_PATH_MUTATIONS: dict[str, int] = {}
+
+
+def _bump_path_mutation(path: Path) -> None:
+    key = str(path)
+    with _PATH_MUTATIONS_LOCK:
+        _PATH_MUTATIONS[key] = _PATH_MUTATIONS.get(key, 0) + 1
+
+
+def path_mutation_seq(path: str | os.PathLike) -> int:
+    return _PATH_MUTATIONS.get(os.path.abspath(os.fspath(path)), 0)
 
 
 def _normalize_key(key: str, *, prefix: bool = False) -> str:
@@ -113,6 +127,15 @@ class SQLiteStore(Store):
         self.path = self.root = Path(os.path.abspath(os.fspath(path)))
         self.prefix = _normalize_key(prefix, prefix=True).rstrip("/")
         self._lock = threading.RLock()
+        self._pool_lock = threading.Lock()
+        self._pool_cv = threading.Condition(self._pool_lock)
+        self._read_pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(
+            maxsize=_READ_POOL_SIZE
+        )
+        self._read_connections: list[sqlite3.Connection] = []
+        self._active_reads = 0
+        self._opening_readers = 0
+        self._mutation_seq = 0
         self._connection: sqlite3.Connection | None = None
         self._closed = False
         self._in_batch = False
@@ -173,11 +196,15 @@ class SQLiteStore(Store):
             raise ValueError("unsupported single-file cache schema")
 
     @staticmethod
-    def _configure(connection: sqlite3.Connection) -> None:
+    def _configure(connection: sqlite3.Connection, *, read_only: bool = False) -> None:
         connection.execute("PRAGMA trusted_schema=OFF")
-        connection.execute("PRAGMA cache_size=-8192")
+        connection.execute(
+            "PRAGMA cache_size=-32768" if read_only else "PRAGMA cache_size=-8192"
+        )
         connection.execute("PRAGMA mmap_size=0")
         connection.execute("PRAGMA temp_store=FILE")
+        if read_only:
+            connection.execute("PRAGMA query_only=ON")
         if hasattr(connection, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):
             connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
 
@@ -288,6 +315,10 @@ class SQLiteStore(Store):
                     raise ValueError("unsupported WAL companion beside single-file cache; preserve and recover it")
             connection = self._open_validated(created=created)
             self._connection = connection
+            if self.read_only:
+                with self._pool_lock:
+                    self._read_connections.append(connection)
+                    self._read_pool.put_nowait(connection)
             self._is_open = True
             return connection
 
@@ -298,7 +329,7 @@ class SQLiteStore(Store):
                 uri=True, timeout=30, isolation_level=None, check_same_thread=False,
             )
             try:
-                self._configure(connection)
+                self._configure(connection, read_only=self.read_only)
                 if not created:
                     self._validate(connection, read_only=self.read_only)
                 if not self.read_only:
@@ -336,6 +367,80 @@ class SQLiteStore(Store):
             return connection
         raise AssertionError("unreachable cache open retry")
 
+    def _open_pool_reader(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            _database_uri(self.path, "ro"),
+            uri=True, timeout=30, isolation_level=None, check_same_thread=False,
+        )
+        try:
+            self._configure(connection, read_only=True)
+            self._validate(connection, read_only=True)
+        except sqlite3.Error as exc:
+            connection.close()
+            raise ValueError(f"invalid or unreadable single-file cache: {self.path}") from exc
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    @contextmanager
+    def _read_conn(self) -> Iterator[sqlite3.Connection]:
+        if not self.read_only:
+            with self._lock:
+                yield self._ensure_open_sync()
+            return
+        if self._connection is None and not self._closed:
+            self._ensure_open_sync()
+        conn: sqlite3.Connection | None = None
+        to_open = False
+        with self._pool_cv:
+            while conn is None:
+                if self._closed:
+                    raise ValueError("SQLiteStore is closed")
+                try:
+                    conn = self._read_pool.get_nowait()
+                    self._active_reads += 1
+                    break
+                except queue.Empty:
+                    if (len(self._read_connections) + self._opening_readers) < _READ_POOL_SIZE:
+                        self._opening_readers += 1
+                        self._active_reads += 1
+                        to_open = True
+                        break
+                    self._pool_cv.wait()
+        if to_open:
+            try:
+                opened = self._open_pool_reader()
+            except BaseException:
+                with self._pool_cv:
+                    self._opening_readers -= 1
+                    self._active_reads -= 1
+                    self._pool_cv.notify_all()
+                raise
+            with self._pool_cv:
+                self._opening_readers -= 1
+                if self._closed:
+                    self._active_reads -= 1
+                    self._pool_cv.notify_all()
+                    opened.close()
+                    raise ValueError("SQLiteStore is closed")
+                self._read_connections.append(opened)
+                conn = opened
+        assert conn is not None
+        try:
+            yield conn
+        finally:
+            with self._pool_cv:
+                self._active_reads -= 1
+                if self._closed:
+                    conn.close()
+                else:
+                    try:
+                        self._read_pool.put_nowait(conn)
+                    except queue.Full:  # pragma: no cover - defensive
+                        conn.close()
+                self._pool_cv.notify_all()
+
     async def _open(self) -> None:
         await asyncio.to_thread(self._ensure_open_sync)
 
@@ -343,6 +448,28 @@ class SQLiteStore(Store):
         with self._lock:
             if self._in_batch:
                 raise RuntimeError("cannot close a SQLiteStore inside its batch")
+            if self.read_only:
+                with self._pool_cv:
+                    self._closed = True
+                    self._is_open = False
+                    self._pool_cv.notify_all()
+                    self._pool_cv.wait_for(
+                        lambda: self._active_reads == 0 and self._opening_readers == 0,
+                        timeout=30.0,
+                    )
+                    while True:
+                        try:
+                            self._read_pool.get_nowait()
+                        except queue.Empty:
+                            break
+                    conns = list(self._read_connections)
+                    self._read_connections.clear()
+                    if self._connection is not None and self._connection not in conns:
+                        conns.append(self._connection)
+                    self._connection = None
+                for c in conns:
+                    c.close()
+                return
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
@@ -350,6 +477,11 @@ class SQLiteStore(Store):
             self._is_open = False
 
     def __del__(self):
+        for c in tuple(getattr(self, "_read_connections", ())):
+            try:
+                c.close()
+            except Exception:
+                pass
         connection = getattr(self, "_connection", None)
         if connection is not None:
             connection.close()
@@ -390,6 +522,8 @@ class SQLiteStore(Store):
             else:
                 with self.batch():
                     connection.execute(sql, parameters)
+            self._mutation_seq += 1
+            _bump_path_mutation(self.path)
 
     def write_bytes(self, key: str, payload: bytes | bytearray | memoryview) -> None:
         key = self._key(key)
@@ -426,8 +560,8 @@ class SQLiteStore(Store):
                 )
         else:
             raise TypeError(f"unsupported byte range: {byte_range!r}")
-        with self._lock:
-            row = self._ensure_open_sync().execute(sql, parameters).fetchone()
+        with self._read_conn() as connection:
+            row = connection.execute(sql, parameters).fetchone()
         if row is None:
             raise FileNotFoundError(key)
         if not isinstance(row[0], bytes):
@@ -486,8 +620,8 @@ class SQLiteStore(Store):
 
     def _exists(self, key: str) -> bool:
         full_key = self._key(key)
-        with self._lock:
-            return self._ensure_open_sync().execute(
+        with self._read_conn() as connection:
+            return connection.execute(
                 "SELECT 1 FROM entries WHERE key=?", (full_key,),
             ).fetchone() is not None
 
@@ -496,8 +630,8 @@ class SQLiteStore(Store):
 
     def _list_page(self, prefix: str, after: str) -> list[str]:
         predicate, parameters = _prefix_predicate(prefix)
-        with self._lock:
-            rows = self._ensure_open_sync().execute(
+        with self._read_conn() as connection:
+            rows = connection.execute(
                 f"SELECT key FROM entries WHERE ({predicate}) AND key>? ORDER BY key LIMIT ?",
                 (*parameters, after, _PAGE_KEYS),
             ).fetchall()
@@ -544,8 +678,8 @@ class SQLiteStore(Store):
 
     def _getsize(self, key: str) -> int:
         full_key = self._key(key)
-        with self._lock:
-            row = self._ensure_open_sync().execute(
+        with self._read_conn() as connection:
+            row = connection.execute(
                 "SELECT length(value) FROM entries WHERE key=?", (full_key,),
             ).fetchone()
         if row is None:
@@ -559,14 +693,17 @@ class SQLiteStore(Store):
         relative = _normalize_key(prefix, prefix=True).rstrip("/")
         full_prefix = self._listing_prefix(relative + "/" if relative else "")
         predicate, parameters = _prefix_predicate(full_prefix)
-        with self._lock:
-            row = self._ensure_open_sync().execute(
+        with self._read_conn() as connection:
+            row = connection.execute(
                 f"SELECT coalesce(sum(length(value)),0) FROM entries WHERE {predicate}", parameters,
             ).fetchone()
         return row[0]
 
     async def getsize_prefix(self, prefix: str) -> int:
         return await asyncio.to_thread(self._getsize_prefix, prefix)
+
+
+SingleFileStore = SQLiteStore
 
 
 def read_entry(path: str | os.PathLike, key: str, *, recover: bool = False) -> bytes:
@@ -667,6 +804,7 @@ class _DirectReadArray:
     def __init__(self, array: Any):
         self._array = array
         self._reader: Any = _UNREAD
+        self._reader_lock = threading.Lock()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._array, name)
@@ -683,7 +821,10 @@ class _DirectReadArray:
     def __getitem__(self, selection: Any) -> Any:
         reader = self._reader
         if reader is _UNREAD:
-            reader = self._reader = self._make_reader()
+            with self._reader_lock:
+                reader = self._reader
+                if reader is _UNREAD:
+                    reader = self._reader = self._make_reader()
         if reader is not None:
             result = reader.read(selection)
             if result is not None:
