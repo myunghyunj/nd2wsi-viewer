@@ -19,7 +19,7 @@ Before distributing an external validation build to partner laboratories, the re
 | **Core Round-Trip Parity** | Native open → scene selection → native OME-TIFF ROI export → reopen `.ome.tif` → save and reload plane-scoped annotation sidecar across `.nd2`, `.czi`, `.lif`, and `.ome.tif`. | `uv run python scripts/benchmark_milestone.py --suite standard` |
 | **Multi-GB 4-Tab Memory Ceiling** | **4-concurrent-slide Compare Peak RSS `<= 1,228.8 MiB` (`1.2 GiB`)**, zero OOMs, zero HTTP socket errors, and `0` leaked Z-prefetch worker threads across `> 4.5 GiB` combined raw pixel volume. | `uv run python scripts/benchmark_milestone.py --suite scale --max-4tab-rss-mib 1228.8` |
 | **Untiled Large-TIFF Streaming** | Untiled 2D TIFFs exceeding `UNTILED_EAGER_MAX_BYTES` (`64 MiB`) stream bands lazily on demand (`_LazyUntiledLevel`) without materializing full uncompressed planes in RAM. | Verified at both `72.0 MiB` (`standard`) and `1,536.0 MiB` / `1.50 GiB` (`scale`) |
-| **OS Installer Trust** | Developer ID signature + Apple `notarytool` / `stapler` ticket (`spctl -a -vvv -t install`) on macOS; NSIS installer verification on Windows without manual terminal workarounds. | Clean-machine installation check in Step 1 of the [5-lab study](#2-5-external-lab-observational-study-protocol) |
+| **OS Installer Trust** | Developer ID signature + Apple `notarytool` / `stapler` ticket (`spctl -a -vvv -t exec` on `.app` and `spctl -a -vvv -t open --context context:primary-signature` on `.dmg`) on macOS; NSIS installer verification on Windows without manual terminal workarounds. | Clean-machine installation check in Step 1 of the [5-lab study](#2-5-external-lab-observational-study-protocol) |
 
 ### 1.2 Standard Multi-Vendor Suite (`--suite standard`, Commit `c9eb0c3`)
 

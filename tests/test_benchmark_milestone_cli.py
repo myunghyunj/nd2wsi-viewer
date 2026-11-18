@@ -338,6 +338,9 @@ def test_validation_protocol_doc_links_anchors_and_hygiene() -> None:
         "NIS-Elements",
         "ZEN",
         "LAS X",
+        "spctl -a -vvv -t exec",
+        "spctl -a -vvv -t open --context context:primary-signature",
     )
     for phrase in required_phrases:
         assert phrase in text, f"Missing required protocol specification {phrase!r} in {PROTOCOL_DOC.name}"
+    assert "spctl -a -vvv -t install" not in text
