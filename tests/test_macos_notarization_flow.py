@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import stat
 import subprocess
@@ -100,18 +101,25 @@ def _make_synthetic_app(base_dir: Path, *, include_sparkle: bool = True) -> Path
     return app
 
 
-def _install_mock_apple_tools(mock_bin: Path, log_file: Path) -> None:
+def _install_mock_apple_tools(
+    mock_bin: Path,
+    log_file: Path,
+    *,
+    python_exe: str | None = None,
+) -> None:
     """Create mock codesign, xcrun, and spctl executables recording every invocation."""
     mock_bin.mkdir(parents=True, exist_ok=True)
-    recorder = f"""#!{sys.executable}
-import json
+    py_exe = python_exe or sys.executable
+    recorder_py = mock_bin / "_apple_tool_recorder.py"
+    recorder_py.write_text(
+        f"""import json
 import os
 import sys
 import zipfile
 from pathlib import Path
 
-tool = Path(sys.argv[0]).name
-args = sys.argv[1:]
+tool = sys.argv[1]
+args = sys.argv[2:]
 log_path = Path({str(log_file)!r})
 entry = {{"tool": tool, "args": args}}
 
@@ -145,10 +153,16 @@ if tool == "xcrun" and len(args) >= 3 and args[0] == "notarytool" and args[1] ==
 with log_path.open("a", encoding="utf-8") as fh:
     fh.write(json.dumps(entry) + "\\n")
 raise SystemExit(0)
-"""
+""",
+        encoding="utf-8",
+    )
     for tool_name in ("codesign", "xcrun", "spctl"):
         script_path = mock_bin / tool_name
-        script_path.write_text(recorder, encoding="utf-8")
+        launcher = (
+            "#!/bin/sh\n"
+            f"exec {shlex.quote(py_exe)} {shlex.quote(str(recorder_py))} {shlex.quote(tool_name)} \"$@\"\n"
+        )
+        script_path.write_text(launcher, encoding="utf-8")
         script_path.chmod(0o755)
 
 
@@ -247,9 +261,14 @@ def test_sign_release_developer_id_keychain_profile_notarizes_staples_and_verifi
         encoding="utf-8",
     )
 
-    mock_bin = tmp_path / "mock_bin"
+    spaced_py_dir = tmp_path / "nd2 viewer project" / "venv_bin"
+    spaced_py_dir.mkdir(parents=True)
+    spaced_py = spaced_py_dir / "python"
+    spaced_py.symlink_to(sys.executable)
+
+    mock_bin = tmp_path / "mock bin with spaces"
     log_file = tmp_path / "calls.jsonl"
-    _install_mock_apple_tools(mock_bin, log_file)
+    _install_mock_apple_tools(mock_bin, log_file, python_exe=str(spaced_py))
     isolated_tmp = tmp_path / "isolated_tmp"
     isolated_tmp.mkdir()
 
@@ -377,9 +396,14 @@ def test_sign_release_developer_id_api_key_auto_enables_and_notarize_zero_skips(
     api_key = tmp_path / "AuthKey_ABC1234567.p8"
     api_key.write_text("-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEH\n-----END PRIVATE KEY-----\n", encoding="utf-8")
 
-    mock_bin = tmp_path / "mock_bin"
+    spaced_py_dir = tmp_path / "nd2 viewer project" / "venv_bin"
+    spaced_py_dir.mkdir(parents=True)
+    spaced_py = spaced_py_dir / "python"
+    spaced_py.symlink_to(sys.executable)
+
+    mock_bin = tmp_path / "mock bin with spaces"
     log_file = tmp_path / "calls.jsonl"
-    _install_mock_apple_tools(mock_bin, log_file)
+    _install_mock_apple_tools(mock_bin, log_file, python_exe=str(spaced_py))
     isolated_tmp = tmp_path / "isolated_tmp"
     isolated_tmp.mkdir()
 
@@ -483,9 +507,14 @@ def test_sign_release_fails_closed_on_invalid_notarization_inputs(
     expected_err: str,
 ) -> None:
     app = _make_synthetic_app(tmp_path, include_sparkle=False)
-    mock_bin = tmp_path / "mock_bin"
+    spaced_py_dir = tmp_path / "nd2 viewer project" / "venv_bin"
+    spaced_py_dir.mkdir(parents=True)
+    spaced_py = spaced_py_dir / "python"
+    spaced_py.symlink_to(sys.executable)
+
+    mock_bin = tmp_path / "mock bin with spaces"
     log_file = tmp_path / "calls.jsonl"
-    _install_mock_apple_tools(mock_bin, log_file)
+    _install_mock_apple_tools(mock_bin, log_file, python_exe=str(spaced_py))
 
     env = {
         k: v
@@ -542,9 +571,14 @@ def test_sign_release_fetches_notarytool_log_on_rejection_and_cleans_temp(
     failure_mode: str,
 ) -> None:
     app = _make_synthetic_app(tmp_path, include_sparkle=False)
-    mock_bin = tmp_path / "mock_bin"
+    spaced_py_dir = tmp_path / "nd2 viewer project" / "venv_bin"
+    spaced_py_dir.mkdir(parents=True)
+    spaced_py = spaced_py_dir / "python"
+    spaced_py.symlink_to(sys.executable)
+
+    mock_bin = tmp_path / "mock bin with spaces"
     log_file = tmp_path / "calls.jsonl"
-    _install_mock_apple_tools(mock_bin, log_file)
+    _install_mock_apple_tools(mock_bin, log_file, python_exe=str(spaced_py))
     isolated_tmp = tmp_path / "isolated_tmp"
     isolated_tmp.mkdir()
 
@@ -629,13 +663,17 @@ def test_macos_release_workflow_credential_step_modes_and_fail_closed(tmp_path: 
         if step.get("name") == "Configure macOS signing keychain and notarization credentials"
     )
 
-    mock_bin = tmp_path / "mock_security_bin"
+    spaced_py_dir = tmp_path / "nd2 viewer project" / "venv_bin"
+    spaced_py_dir.mkdir(parents=True)
+    spaced_py = spaced_py_dir / "python"
+    spaced_py.symlink_to(sys.executable)
+
+    mock_bin = tmp_path / "mock security bin"
     mock_bin.mkdir()
     identity = "Developer ID Application: Test Microscopy Lab (TEAM123456)"
-    security_mock = mock_bin / "security"
-    security_mock.write_text(
-        f"""#!{sys.executable}
-import sys
+    security_py = mock_bin / "_security_mock.py"
+    security_py.write_text(
+        f"""import sys
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -647,6 +685,11 @@ elif args[:1] == ["find-identity"]:
     print('  1) ABCDEF1234567890 "{identity}"')
 raise SystemExit(0)
 """,
+        encoding="utf-8",
+    )
+    security_mock = mock_bin / "security"
+    security_mock.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(str(spaced_py))} {shlex.quote(str(security_py))} \"$@\"\n",
         encoding="utf-8",
     )
     security_mock.chmod(0o755)
