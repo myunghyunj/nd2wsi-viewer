@@ -3,6 +3,23 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.5</title>
+            <pubDate>Wed, 18 Nov 2026 15:44:40 +0000</pubDate>
+            <sparkle:version>2.6.5</sparkle:version>
+            <sparkle:shortVersionString>2.6.5</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>OME-TIFF / TIFF, multi-series scene picker, UI polish, concurrency bounds, and Windows installer</h2>
+<ul>
+<li><strong>Native OME-TIFF / TIFF / QPTIFF viewing, OME-XML ROI export, and scanner fixes.</strong> Open pyramidal, tiled, and untiled <code>.ome.tif</code>, <code>.ome.tiff</code>, <code>.tif</code>, <code>.tiff</code>, and <code>.qptiff</code> slides and multi-plane stacks directly, export <code>2016-06</code> OME-XML <code>.tif</code> regions with physical calibration, and preserve full sidecars across Nikon NIS-Elements <code>&lt;InstrumentRef&gt;</code> / RGB channel colors, multipoint IFDs, and Zeiss ZEN <code>.czi</code> <code>StartC</code> / disabled-track channels.</li>
+<li><strong>Multi-series and multipoint scene picker (<code>#scene-picker</code>).</strong> Switch heterogeneous series, scenes, and positions directly from the toolbar <strong>Series</strong> selector across Leica <code>.lif</code>, Zeiss <code>.czi</code>, multi-series <code>.ome.tif</code>, and non-plate multipoint Nikon <code>.nd2</code> (<code>XYPosLoop</code>) files.</li>
+<li><strong>Channels, UI, and workflow polish.</strong> Click channel <code>.swatch</code> controls for color presets or metadata reset, <code>Option / Alt</code>-click channel toggles to solo, use 50-step <code>⌘Z</code> / <code>⌘⇧Z</code> annotation Undo/Redo and two-step Astromap <strong>Clear all</strong>, open <code>?</code> Keyboard Shortcuts, reopen <strong>Recent</strong> slides, persist theme/layout in <code>ui-settings.json</code>, and gate native <strong>ND2</strong> ROI export to <code>uint8</code> / <code>uint16</code> slides.</li>
+<li><strong>Coordinated concurrency and memory bounds.</strong> Bound multi-tab viewing and 5–20 GB scanner acquisitions with a 4-reader SQLite pool (<code>&lt;= 32 MiB</code>/store), decoded chunk LRU + <code>jpeg8_encode</code>, RAM-bounded shared stack frame cache with single-flight deduplication, epoch-cancelled 1-worker Z-neighbor prefetch, lazy strip-streaming (<code>&gt; 64 MiB</code> untiled TIFFs), and a 16-worker HTTP pool.</li>
+<li><strong>Windows per-user NSIS Setup installer and CI signing hooks.</strong> Ship a per-user Windows NSIS Setup executable (<code>-setup.exe</code>, <code>HKCU</code> associations, zero administrator UAC prompts) alongside the portable ZIP, plus optional macOS <code>notarytool</code> / <code>stapler</code> and Windows SHA-256 Authenticode CI release hooks.</li>
+</ul>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.5/nd2wsi-viewer-2.6.5-macos-arm64.dmg" length="133925972" type="application/octet-stream" sparkle:edSignature="+eQFptifBoxPkmimG1GIOxbo3mImdRMeV2AaKZOSb6iJ+fEbN7mbeh0GTycC8d5VgG0VnC7fFw6ssucDAfwUAQ=="/>
+        </item>
+        <item>
             <title>2.6.4</title>
             <pubDate>Sun, 15 Nov 2026 08:41:54 +0000</pubDate>
             <sparkle:version>2.6.4</sparkle:version>
