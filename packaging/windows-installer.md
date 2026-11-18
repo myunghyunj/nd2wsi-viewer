@@ -7,13 +7,14 @@ NSIS 3.x (`makensis`) using its default x86 Unicode stub (`NSIS_PTR_SIZE == 4`).
 The installed application remains the x64 PyInstaller bundle (`nd2wsi-viewer.exe`
 plus `_internal`).
 
-Setup accepts 64-bit Windows 10 version 1709 (build 16299) or later, Windows 11
-(including Education), and 64-bit Windows Server with Desktop Experience (such
-as `windows-2025` CI runners and lab remote-desktop servers). Windows 11 ARM64
-runs the x64 executable through Windows x64 emulation; Windows 10 ARM64,
-headless `Server Core` / `Nano Server`, and 32-bit Windows are refused.
-Acceptance by the OS gate is not a substitute for executing
-`verify_windows_installer.ps1` on the target Windows environment.
+Supported and CI-tested targets are Windows 11 x64, Windows 11 ARM64 (running
+the x64 executable through Windows x64 emulation), and Windows Server 2025 x64
+(Desktop Experience CI). While Setup's `.onInit` preflight gate permits 64-bit
+Windows build 16299+ (Windows 10 version 1709+) when `.NET Framework 4.6.2+` and
+WebView2 are present, Windows 10 is not tested in CI and is not a supported
+target; Windows 10 ARM64, headless `Server Core` / `Nano Server`, and 32-bit
+Windows are refused outright. Acceptance by the OS gate is not a substitute for
+executing `verify_windows_installer.ps1` on the target Windows environment.
 
 ## Compiler inputs
 

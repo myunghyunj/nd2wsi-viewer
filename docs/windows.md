@@ -121,11 +121,14 @@ Target execution modes (the verified CI environments are listed above):
 
 | Computer | Execution |
 | --- | --- |
-| Windows 10 (1709+) or Windows 11 on Intel/AMD x64 | Native x64 |
-| Windows Server 2019/2022/2025 x64 with Desktop Experience | Native x64 |
+| Windows 11 on Intel/AMD x64 | Native x64 |
 | Windows 11 on ARM64 | Same x64 EXE through Windows x64 emulation |
+| Windows Server 2025 x64 (Desktop Experience CI) | Native x64 |
 
-Windows 10 on ARM64, headless Server Core, and 32-bit Windows are not supported targets.
+Windows 10, headless Server Core, and 32-bit Windows are not supported targets.
+While the NSIS `.onInit` preflight gate permits 64-bit Windows build 16299+
+(Windows 10 version 1709+) when `.NET Framework 4.6.2+` and WebView2 are
+present, Windows 10 is not tested in CI.
 
 There is no GPU compute requirement. ARM64-native packaging is not claimed:
 the locked Python/.NET bridge and some scientific dependencies do not provide
@@ -154,8 +157,8 @@ to the original v1.2.8 tag continue to describe that original macOS revision.
 ## Local build and verification
 
 The installer wraps an existing checksum-verified portable ZIP without
-rebuilding its executable. The installed `READ-ME.txt` is updated for Setup and
-Windows 10 support, with both old and new hashes recorded explicitly.
+rebuilding its executable. The installed `READ-ME.txt` is updated for Setup,
+with both portable and installed hashes recorded explicitly.
 `packaging/build_windows_installer.py` uses the
 NSIS compiler, which can run on macOS, and records the exact portable payload,
 installer source, compiler, and Microsoft WebView2 bootstrapper hashes.
@@ -176,7 +179,7 @@ tested installation in the default user directory. Verification results describe
 only the Windows machines on which that script was actually run.
 
 The installer checks the .NET Framework 4.6.2 minimum and checks for WebView2.
-Windows 10 Education 22H2 already includes .NET Framework 4.8. It uses Microsoft's bundled, signed
+It uses Microsoft's bundled, signed
 bootstrapper if the runtime is missing. That prerequisite step needs Internet
 access; existing WebView2 installations are reused and are not uninstalled with
 the viewer. App removal preserves added images, annotations, caches, and other
