@@ -12,7 +12,8 @@ param(
     [Parameter(Mandatory = $true)][string]$ResultsDir,
     [Parameter(Mandatory = $true)][string]$WebView2Bootstrapper,
     [string]$BuildManifest,
-    [ValidatePattern('^[0-9a-f]{64}$')][string]$WebView2BootstrapperSha256 = '17debf797a6c737959bc588236e897936ffac1af5f7e515e674ab32f9edfe719',
+    [string]$WebView2BootstrapperSha256 = '',
+    [switch]$Quick,
     [switch]$KeepInstalled
 )
 
@@ -20,6 +21,11 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $productId = 'nd2wsi-viewer.windows.x64.current-user'
 $registrySubkey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer'
+$progId = 'nd2wsi-viewer.Slide'
+$capabilitiesSubkey = 'Software\nd2wsi-viewer\Capabilities'
+$registeredAppsSubkey = 'Software\RegisteredApplications'
+$appRegistrationSubkey = 'Software\Classes\Applications\nd2wsi-viewer.exe'
+$milestoneExtensions = @('.nd2', '.czi', '.lif', '.tif', '.tiff', '.qptiff', '.svs', '.sdpc', '.nd2svs')
 $expectedFixtureHash = '51d603317947b04c3b43c8e694f3ba97a16478ce30e795857ec6ae0321d41c33'
 $resultPath = [IO.Path]::GetFullPath($ResultsDir)
 $defaultInstall = Join-Path $env:LOCALAPPDATA 'Programs\nd2wsi-viewer'
@@ -51,6 +57,7 @@ $script:payloadFiles = $null
 # The exact build/payload manifests determine the version under test.
 # Never silently validate a new installer using an older release's identity.
 $script:version = $null
+$script:expectSigned = $false
 $previousLog = [Environment]::GetEnvironmentVariable('ND2WSI_LOG_FILE', 'Process')
 $transcriptStarted = $false
 $qaCreated = $false
@@ -404,8 +411,100 @@ function Assert-Shortcut {
     if (-not [string]::Equals($link.WorkingDirectory, $expectedWorkingDirectory, [StringComparison]::OrdinalIgnoreCase)) { throw "Shortcut working directory mismatch: $Path" }
 }
 
+function Assert-FileAssociations {
+    param([string]$Directory)
+    $expectedCommand = '"' + (Join-Path $Directory 'nd2wsi-viewer.exe') + '" "%1"'
+    $root = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $regApps = $root.OpenSubKey($registeredAppsSubkey)
+        try {
+            if ($null -eq $regApps -or [string]$regApps.GetValue('nd2wsi-viewer', '') -cne $capabilitiesSubkey) {
+                throw 'Per-user RegisteredApplications entry for nd2wsi-viewer is missing or incorrect.'
+            }
+        }
+        finally { if ($null -ne $regApps) { $regApps.Dispose() } }
+
+        $cmdKey = $root.OpenSubKey("Software\Classes\$progId\shell\open\command")
+        try {
+            if ($null -eq $cmdKey -or -not [string]::Equals([string]$cmdKey.GetValue('', ''), $expectedCommand, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Per-user ProgID open command is missing or does not match the installed executable.'
+            }
+        }
+        finally { if ($null -ne $cmdKey) { $cmdKey.Dispose() } }
+
+        $assocKey = $root.OpenSubKey("$capabilitiesSubkey\FileAssociations")
+        $supportedKey = $root.OpenSubKey("$appRegistrationSubkey\SupportedTypes")
+        try {
+            if ($null -eq $assocKey -or $null -eq $supportedKey) {
+                throw 'Per-user Capabilities\FileAssociations or SupportedTypes key is missing.'
+            }
+            $supportedNames = @($supportedKey.GetValueNames())
+            foreach ($ext in $milestoneExtensions) {
+                if ([string]$assocKey.GetValue($ext, '') -cne $progId) {
+                    throw "Per-user FileAssociations capability is missing Milestone 1 format: $ext"
+                }
+                if ($supportedNames -notcontains $ext) {
+                    throw "Per-user SupportedTypes is missing Milestone 1 format: $ext"
+                }
+                $openWithKey = $root.OpenSubKey("Software\Classes\$ext\OpenWithProgids")
+                try {
+                    if ($null -eq $openWithKey -or (@($openWithKey.GetValueNames()) -notcontains $progId)) {
+                        throw "Per-user OpenWithProgids registration is missing for format: $ext"
+                    }
+                }
+                finally { if ($null -ne $openWithKey) { $openWithKey.Dispose() } }
+            }
+        }
+        finally {
+            if ($null -ne $supportedKey) { $supportedKey.Dispose() }
+            if ($null -ne $assocKey) { $assocKey.Dispose() }
+        }
+    }
+    finally { $root.Dispose() }
+}
+
+function Assert-FileAssociationsRemoved {
+    $root = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $regApps = $root.OpenSubKey($registeredAppsSubkey)
+        try {
+            if ($null -ne $regApps -and (@($regApps.GetValueNames()) -contains 'nd2wsi-viewer')) {
+                throw 'Uninstall left the per-user RegisteredApplications entry.'
+            }
+        }
+        finally { if ($null -ne $regApps) { $regApps.Dispose() } }
+
+        foreach ($subkey in @($capabilitiesSubkey, "Software\Classes\$progId", $appRegistrationSubkey)) {
+            $leftover = $root.OpenSubKey($subkey)
+            try {
+                if ($null -ne $leftover) { throw "Uninstall left per-user registry key: HKCU\$subkey" }
+            }
+            finally { if ($null -ne $leftover) { $leftover.Dispose() } }
+        }
+
+        foreach ($ext in $milestoneExtensions) {
+            $openWithKey = $root.OpenSubKey("Software\Classes\$ext\OpenWithProgids")
+            try {
+                if ($null -ne $openWithKey -and (@($openWithKey.GetValueNames()) -contains $progId)) {
+                    throw "Uninstall left OpenWithProgids entry for $ext"
+                }
+            }
+            finally { if ($null -ne $openWithKey) { $openWithKey.Dispose() } }
+        }
+    }
+    finally { $root.Dispose() }
+}
+
 function Assert-Installation {
     param([string]$Directory)
+    $installedExe = Join-Path $Directory 'nd2wsi-viewer.exe'
+    $installedInternal = Join-Path $Directory '_internal'
+    if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) { throw 'Installed nd2wsi-viewer.exe is missing.' }
+    if (-not (Test-Path -LiteralPath $installedInternal -PathType Container)) { throw 'Installed _internal runtime directory is missing.' }
+    if ($script:expectSigned) {
+        $exeSig = Get-AuthenticodeSignature -LiteralPath $installedExe
+        if ($exeSig.Status -ne 'Valid') { throw "Installed nd2wsi-viewer.exe does not have a valid Authenticode signature: $($exeSig.Status)" }
+    }
     Assert-Payload $Directory
     $registration = Get-InstalledRegistration
     if ($null -eq $registration) { throw 'The current-user uninstall registration is missing.' }
@@ -418,9 +517,10 @@ function Assert-Installation {
     $markerText = Get-Content -LiteralPath $marker -Raw
     if ($markerText -notmatch ('(?m)^ProductId=' + [regex]::Escape($productId) + '\s*$') -or $markerText -notmatch ('(?m)^Version=' + [regex]::Escape($script:version) + '\s*$')) { throw 'The installer ownership marker is incorrect.' }
     if (-not (Test-LiteralEntry $uninstaller)) { throw 'The installed uninstaller is missing.' }
-    Assert-Shortcut $appShortcut (Join-Path $Directory 'nd2wsi-viewer.exe')
+    Assert-Shortcut $appShortcut $installedExe
     Assert-Shortcut $uninstallShortcut $uninstaller
-    Assert-Shortcut $desktopShortcut (Join-Path $Directory 'nd2wsi-viewer.exe')
+    Assert-Shortcut $desktopShortcut $installedExe
+    Assert-FileAssociations $Directory
     if (-not (Get-WebView2Version)) { throw 'The WebView2 Runtime prerequisite is missing after installation.' }
 }
 
@@ -439,8 +539,44 @@ function Assert-Sentinels {
     if ((Get-Sha256 $sourcePath) -cne $expectedFixtureHash -or (Get-Sha256 $fixturePath) -cne $expectedFixtureHash) { throw 'The original scientific source or QA fixture was changed.' }
 }
 
+function Invoke-CliAndOmetiffSmoke {
+    param([string]$Directory, [string]$Label)
+    $exe = Join-Path $Directory 'nd2wsi-viewer.exe'
+    $helpLog = Join-Path $resultPath ($Label + '-cli-help.log')
+    Remove-Item -LiteralPath $helpLog -Force -ErrorAction SilentlyContinue
+    $helpCmd = ConvertTo-NativeArgument '--help'
+    Invoke-CheckedProcess $exe $helpCmd ($Label + '-app-help') 60 (Join-Path $env:WINDIR 'System32') -EnvironmentOverrides @{
+        ND2WSI_LOG_FILE = $helpLog; TEMP = $runtimeTemp; TMP = $runtimeTemp
+    }
+    if (-not (Test-LiteralEntry $helpLog) -or (Get-Content -LiteralPath $helpLog -Raw -Encoding UTF8) -notmatch 'usage:\s+nd2wsi-viewer') {
+        throw 'Installed nd2wsi-viewer.exe --help did not write expected usage output.'
+    }
+
+    $moduleReport = Join-Path $resultPath ($Label + '-ometiff-cli.json')
+    $moduleLog = Join-Path $resultPath ($Label + '-ometiff-cli.log')
+    Remove-Item -LiteralPath $moduleReport, $moduleLog -Force -ErrorAction SilentlyContinue
+    $pySnippet = 'import contextlib, io, json, pathlib, sys, tifffile, imagecodecs, ome_types, nd2wsi.ometiff, nd2wsi.ui_settings, nd2wsi.cli; buf = io.StringIO(); ' +
+        'code = 0; ' +
+        'exec("try:\n with contextlib.redirect_stdout(buf):\n  nd2wsi.cli.main([\"--help\"])\nexcept SystemExit as e:\n code = e.code"); ' +
+        'assert code == 0, code; text = buf.getvalue(); ' +
+        'assert all(tok in text for tok in ("Zeiss CZI", "Leica LIF", "OME-TIFF", ".nd2svs")), text; ' +
+        'pathlib.Path(sys.argv[-1]).write_text(json.dumps({"ok": True, "ometiff": True, "cli_help": True}), encoding="utf-8")'
+    $pyArgs = ((@('-c', $pySnippet, $moduleReport) | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+    Invoke-CheckedProcess $exe $pyArgs ($Label + '-ometiff-cli') 60 (Join-Path $env:WINDIR 'System32') -EnvironmentOverrides @{
+        ND2WSI_LOG_FILE = $moduleLog; TEMP = $runtimeTemp; TMP = $runtimeTemp
+    }
+    if (-not (Test-LiteralEntry $moduleReport)) { throw 'Installed frozen nd2wsi.ometiff / CLI --help check did not write its report.' }
+    $moduleData = Get-Content -LiteralPath $moduleReport -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($moduleData.ok -ne $true -or $moduleData.ometiff -ne $true -or $moduleData.cli_help -ne $true) {
+        throw 'Installed frozen nd2wsi.ometiff / CLI --help verification failed.'
+    }
+}
+
 function Invoke-AppSmoke {
     param([string]$Directory, [string]$Label, [switch]$GuiOnly)
+    if (-not $GuiOnly) {
+        Invoke-CliAndOmetiffSmoke $Directory $Label
+    }
     $exe = Join-Path $Directory 'nd2wsi-viewer.exe'
     $modes = if ($GuiOnly) { @('gui-smoke') } else { @('smoke', 'gui-smoke') }
     foreach ($mode in $modes) {
@@ -459,7 +595,15 @@ function Invoke-AppSmoke {
         if ($mode -eq 'gui-smoke') {
             if (-not (Test-LiteralEntry $report) -or (Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json).ok -ne $true) { throw 'Installed GUI smoke did not record success.' }
         }
-        elseif (-not (Test-LiteralEntry $log) -or (Get-Content -LiteralPath $log -Raw -Encoding UTF8) -notmatch 'smoke ok') { throw 'Installed scientific smoke did not record success.' }
+        elseif (-not (Test-LiteralEntry $log)) {
+            throw 'Installed scientific smoke did not produce a log.'
+        }
+        else {
+            $smokeText = Get-Content -LiteralPath $log -Raw -Encoding UTF8
+            if ($smokeText -notmatch 'smoke ok: SDPC' -or $smokeText -notmatch 'smoke ok: Astromap JPEG, TXT and PDF') {
+                throw 'Installed scientific smoke did not record successful ND2/SVS/SDPC and Astromap checks.'
+            }
+        }
     }
 }
 
@@ -581,8 +725,53 @@ function Assert-Uninstalled {
         if (Test-LiteralEntry $path) { throw "Uninstall left an installer-owned file or shortcut: $path" }
     }
     if ($null -ne (Get-InstalledRegistration)) { throw 'Uninstall left the current-user uninstall registration.' }
+    Assert-FileAssociationsRemoved
     Assert-Sentinels
     if (-not (Get-WebView2Version)) { throw 'The shared WebView2 runtime was removed during uninstall.' }
+}
+
+function Invoke-DirectSilentUninstallAndVerifyCleanRemoval {
+    param([string]$Directory, [string]$Label)
+    $uninstaller = Join-Path $Directory 'Uninstall.exe'
+    if (-not (Test-LiteralEntry $uninstaller)) { throw "Direct silent uninstall requires installed Uninstall.exe: $uninstaller" }
+    $script:phase = 'uninstall-' + $Label
+    $script:stepNumber += 1
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $proc = Start-Process -FilePath $uninstaller -ArgumentList '/S' -WorkingDirectory $resultPath -Wait -PassThru
+    $exitCode = $proc.ExitCode
+    $proc.Dispose()
+    if ($exitCode -ne 0) {
+        throw "Uninstall.exe /S ($Label) returned unexpected exit code $exitCode."
+    }
+    # NSIS Uninstall.exe /S spawns a temporary helper in TEMP to remove Uninstall.exe
+    # and the empty installation directory; wait until directory, registration, and
+    # setup mutex are all released.
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
+    $cleaned = $false
+    while ($deadline.Elapsed.TotalSeconds -lt 120) {
+        $dirGone = -not (Test-LiteralEntry $Directory)
+        $regGone = $null -eq (Get-InstalledRegistration)
+        $mutex = $null
+        $mutexHeld = [Threading.Mutex]::TryOpenExisting('Local\nd2wsi-viewer-Setup-current-user', [ref]$mutex)
+        if ($null -ne $mutex) { $mutex.Dispose() }
+        if ($dirGone -and $regGone -and (-not $mutexHeld)) {
+            $cleaned = $true
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    $timer.Stop()
+    $script:steps.Add(@{
+        phase = ('uninstall-' + $Label); program = $uninstaller; arguments = '/S'
+        exit_code = $exitCode; expected_exit_codes = @(0); seconds = $timer.Elapsed.TotalSeconds
+    })
+    if (-not $cleaned) {
+        throw "Silent Uninstall.exe /S did not complete clean removal of $Directory within 120 seconds."
+    }
+    Assert-Uninstalled $Directory
+    if (Test-LiteralEntry $Directory) {
+        throw "Silent Uninstall.exe /S left an empty installation folder behind: $Directory"
+    }
 }
 
 function Install-FaultFixture {
@@ -766,7 +955,7 @@ try {
     $buildManifestPath = (Resolve-Path -LiteralPath $BuildManifest).Path
     $target = Get-TargetReadiness
     $target | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $resultPath 'target-readiness.json') -Encoding UTF8
-    if (-not $target.os_is_64_bit -or $target.build -lt 16299 -or $target.installation_type -ne 'Client') { throw 'This verification requires Windows 10 version 1709 or newer, or Windows 11, on a 64-bit desktop edition. Windows 10 Education is a desktop edition.' }
+    if (-not $target.os_is_64_bit -or $target.build -lt 16299 -or $target.installation_type -notin @('Client', 'Server')) { throw 'This verification requires 64-bit Windows 10 version 1709 or newer, Windows 11, or Windows Server with Desktop Experience (build 16299+).' }
     if (-not $target.net_framework_462_or_newer) { throw '.NET Framework 4.6.2 or newer is required. No system component was installed or changed by this preflight.' }
     $installerHash = Get-Sha256 $installerPath
     $manifestHash = Get-Sha256 $manifestPath
@@ -780,9 +969,17 @@ try {
     if ($installerHash -cne $buildManifestData.installer_sha256 -or $manifestHash -cne $buildManifestData.payload_manifest_sha256 -or $bootstrapperHash -cne $buildManifestData.webview2_bootstrapper_sha256) { throw 'Setup, payload manifest, or WebView2 bootstrapper does not match the exact installer build manifest.' }
     $script:version = [string]$buildManifestData.app_version
     if ($script:version -cnotmatch '^\d+\.\d+\.\d+$') { throw 'Build manifest app_version must contain three numeric components.' }
-    if ($bootstrapperHash -cne $WebView2BootstrapperSha256) { throw 'The official WebView2 bootstrapper checksum does not match the installer build input.' }
+    if ($WebView2BootstrapperSha256) {
+        if ($WebView2BootstrapperSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'WebView2BootstrapperSha256 must be a 64-character lowercase hex SHA-256.' }
+        if ($bootstrapperHash -cne $WebView2BootstrapperSha256) { throw 'The official WebView2 bootstrapper checksum does not match the installer build input.' }
+    }
     $bootstrapperSignature = Get-AuthenticodeSignature -LiteralPath $bootstrapperPath
     if ($bootstrapperSignature.Status -ne 'Valid' -or $null -eq $bootstrapperSignature.SignerCertificate -or $bootstrapperSignature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') { throw 'The embedded WebView2 bootstrapper does not have a valid Microsoft Corporation Authenticode signature.' }
+    $installerSignature = Get-AuthenticodeSignature -LiteralPath $installerPath
+    if ($null -ne $buildManifestData.PSObject.Properties['signing'] -and $buildManifestData.signing.signed -eq $true) {
+        $script:expectSigned = $true
+        if ($installerSignature.Status -ne 'Valid') { throw "Signed Setup.exe does not have a valid Authenticode signature: $($installerSignature.Status)" }
+    }
     if (-not (Test-LiteralEntry ($installerPath + '.sha256'))) { throw 'The required adjacent Setup.exe.sha256 checksum file is missing.' }
     $expectedInstaller = ((Get-Content -LiteralPath ($installerPath + '.sha256') -Raw).Trim() -split '\s+')[0]
     if ($expectedInstaller -cnotmatch '^[0-9a-f]{64}$' -or $installerHash -cne $expectedInstaller) { throw 'Setup.exe checksum does not match its adjacent checksum file.' }
@@ -818,43 +1015,61 @@ try {
     New-Item -ItemType Directory -Path $runtimeTemp | Out-Null
     Copy-Item -LiteralPath $sourcePath -Destination $fixturePath
 
-    # NSIS /D= is the final argument and intentionally unquoted. NSIS treats
-    # every remaining character as the destination, including spaces/Unicode.
-    Invoke-CheckedProcess $installerPath ('/S /D=' + $installPath) 'install-isolated' 900
-    Assert-Installation $installPath
-    Add-Sentinel (Join-Path $installPath 'scientific-data\keep.nd2')
-    Add-Sentinel (Join-Path $installPath 'scientific-data\nd2wsi\annotations\keep.json')
-    Add-Sentinel (Join-Path $installPath 'nd2wsi\caches\keep.txt')
-    Add-Sentinel (Join-Path $installPath 'nd2wsi\caches\keep.nd2svs')
-    Add-Sentinel $appDataSentinel
-    $installedNames = @(Get-InstalledFileNames $installPath)
-    Invoke-AppSmoke $installPath 'installed'
-    Assert-Payload $installPath
-    Assert-NoUnexpectedInstalledFiles $installPath $installedNames
-    Assert-Sentinels
-
-    Invoke-CheckedProcess $installerPath ('/S /D=' + $installPath) 'reinstall-same-version' 900
-    Assert-Installation $installPath
-    Assert-NoUnexpectedInstalledFiles $installPath $installedNames
-    Assert-Sentinels
-    Assert-JunctionRejection
-    Assert-NoUnexpectedInstalledFiles $installPath $installedNames
-
-    Assert-LockedUninstallRecovery $installPath 'payload'
-    foreach ($kind in @('desktop-shortcut', 'marker', 'uninstaller')) {
-        # A completed uninstall deliberately keeps scientific files. Use a
-        # fresh sibling QA path for the next case; never delete those files
-        # merely to make an old directory acceptable to Setup again.
-        $faultInstall = Join-Path $qaRoot ($koreanPath + ' ' + $script:uninstallFaultChecks.Count)
-        Install-FaultFixture $faultInstall $kind
-        Assert-LockedUninstallRecovery $faultInstall $kind
+    if ($Quick) {
+        Add-Sentinel $appDataSentinel
+        Invoke-CheckedProcess $installerPath ('/S /D=' + $installPath) 'install-isolated' 900
+        Assert-Installation $installPath
+        $installedNames = @(Get-InstalledFileNames $installPath)
+        Invoke-AppSmoke $installPath 'installed'
+        Assert-Payload $installPath
+        Assert-NoUnexpectedInstalledFiles $installPath $installedNames
+        Assert-Sentinels
+        Invoke-DirectSilentUninstallAndVerifyCleanRemoval $installPath 'quick-clean'
     }
-    $recoveryInstall = Join-Path $qaRoot ($koreanPath + ' 4')
-    Install-FaultFixture $recoveryInstall 'interrupted-cleanup'
-    Assert-InterruptedCleanupRecovery $recoveryInstall
+    else {
+        # NSIS /D= is the final argument and intentionally unquoted. NSIS treats
+        # every remaining character as the destination, including spaces/Unicode.
+        Invoke-CheckedProcess $installerPath ('/S /D=' + $installPath) 'install-isolated' 900
+        Assert-Installation $installPath
+        Add-Sentinel (Join-Path $installPath 'scientific-data\keep.nd2')
+        Add-Sentinel (Join-Path $installPath 'scientific-data\nd2wsi\annotations\keep.json')
+        Add-Sentinel (Join-Path $installPath 'nd2wsi\caches\keep.txt')
+        Add-Sentinel (Join-Path $installPath 'nd2wsi\caches\keep.nd2svs')
+        Add-Sentinel $appDataSentinel
+        $installedNames = @(Get-InstalledFileNames $installPath)
+        Invoke-AppSmoke $installPath 'installed'
+        Assert-Payload $installPath
+        Assert-NoUnexpectedInstalledFiles $installPath $installedNames
+        Assert-Sentinels
+
+        Invoke-CheckedProcess $installerPath ('/S /D=' + $installPath) 'reinstall-same-version' 900
+        Assert-Installation $installPath
+        Assert-NoUnexpectedInstalledFiles $installPath $installedNames
+        Assert-Sentinels
+        Assert-JunctionRejection
+        Assert-NoUnexpectedInstalledFiles $installPath $installedNames
+
+        Assert-LockedUninstallRecovery $installPath 'payload'
+        foreach ($kind in @('desktop-shortcut', 'marker', 'uninstaller')) {
+            # A completed uninstall deliberately keeps scientific files. Use a
+            # fresh sibling QA path for the next case; never delete those files
+            # merely to make an old directory acceptable to Setup again.
+            $faultInstall = Join-Path $qaRoot ($koreanPath + ' ' + $script:uninstallFaultChecks.Count)
+            Install-FaultFixture $faultInstall $kind
+            Assert-LockedUninstallRecovery $faultInstall $kind
+        }
+        $recoveryInstall = Join-Path $qaRoot ($koreanPath + ' 4')
+        Install-FaultFixture $recoveryInstall 'interrupted-cleanup'
+        Assert-InterruptedCleanupRecovery $recoveryInstall
+
+        $cleanInstall = Join-Path $qaRoot ($koreanPath + ' clean-uninstall')
+        Invoke-CheckedProcess $installerPath ('/S /D=' + $cleanInstall) 'install-clean-uninstall' 900
+        Assert-Installation $cleanInstall
+        Invoke-DirectSilentUninstallAndVerifyCleanRemoval $cleanInstall 'full-clean'
+    }
     $webviewAfter = Get-WebView2Version
     $uninstallVerified = $true
-    Write-State 'running' 'Installed smoke, GUI, reinstall, locked-file uninstall retries, and data preservation checks passed.'
+    Write-State 'running' 'Installed CLI/OME-TIFF, headless/GUI smoke, file associations, and silent uninstall checks passed.'
 
     $finalInstall = $null
     if ($KeepInstalled) {
@@ -871,23 +1086,28 @@ try {
     $script:phase = 'cleanup-owned-qa'
     Remove-OwnedQaRoot
     $report = @{
-        state = 'complete'; version = $script:version; run_id = $runId
+        state = 'complete'; version = $script:version; run_id = $runId; quick_mode = [bool]$Quick
         installer_sha256 = $installerHash; payload_manifest_sha256 = $manifestHash
         build_manifest_sha256 = $buildManifestHash; exact_build_inputs_verified = $true
+        installer_authenticode = [string]$installerSignature.Status
+        authenticode_expected = $script:expectSigned
         webview2_bootstrapper_sha256 = $bootstrapperHash
         webview2_bootstrapper_authenticode = [string]$bootstrapperSignature.Status
         webview2_bootstrapper_signer = $bootstrapperSignature.SignerCertificate.Subject
         source_sha256 = $expectedFixtureHash; payload_file_count = $names.Count
-        unicode_install_and_source_paths = $true; scientific_smoke = $true
-        gui_smoke = $true; same_version_reinstall = $true; uninstall_verified = $uninstallVerified
-        junction_reinstall_and_uninstall_rejected_without_data_loss = $true
+        unicode_install_and_source_paths = $true; cli_and_ometiff_smoke = $true
+        scientific_smoke = $true; gui_smoke = $true
+        milestone_file_associations_verified = $true
+        clean_silent_uninstall_verified = $true
+        same_version_reinstall = (-not $Quick); uninstall_verified = $uninstallVerified
+        junction_reinstall_and_uninstall_rejected_without_data_loss = (-not $Quick)
         uninstall_fault_checks = $script:uninstallFaultChecks.ToArray()
-        single_file_cache_sentinels_preserved = $true
+        single_file_cache_sentinels_preserved = (-not $Quick)
         scientific_and_appdata_sentinels_preserved = $true; qa_directory_removed = -not (Test-LiteralEntry $qaRoot)
         no_runtime_files_written_inside_installation = $true
         webview2_before = $webviewBefore; webview2_after_uninstall = $webviewAfter
         target_readiness = $target
-        scientific_smoke_scope = 'ND2 read/tile/pixel-exact calibrated ROI export; JPEG and lossless JPEG2000 SVS pyramid/tile/pixel-exact TIFF ROI export'
+        scientific_smoke_scope = 'Frozen nd2wsi.ometiff + CLI --help; ND2 read/tile/pixel-exact calibrated ROI export; JPEG and lossless JPEG2000 SVS pyramid/tile/pixel-exact TIFF ROI export; SDPC decode/ROI; Astromap JPEG/TXT/PDF export'
         optional_codec_dependencies = 'Some additional imagecodecs codecs require separately installed Visual C++ runtime or proprietary DLLs. Those optional formats are outside this verification; no Visual C++ runtime is installed by this check.'
         kept_installed = [bool]$KeepInstalled; final_install_location = $finalInstall
         windows = [Environment]::OSVersion.VersionString

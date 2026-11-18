@@ -21,13 +21,22 @@ executable through x64 emulation; this is not a native ARM64 build. Release
 records identify the exact executable and the x64/ARM64 execution targets
 checked. Windows 10 is not tested and is not a supported target.
 
-The executable is not Authenticode-signed, so Windows may show an
-unknown-publisher warning. Updates are installed manually from Releases.
-Windows uses the standard title bar and does not use the macOS Sparkle updater.
-Use **Ctrl** for Mac **⌘** shortcuts and **Alt** for **Option**.
+Unless built with Authenticode signing credentials, the executable and Setup
+installer are unsigned (`"signing": "unsigned"` in `build-info.json`), so
+Windows SmartScreen may show an unknown-publisher warning. Updates are
+installed manually from Releases. Windows uses the standard title bar and does
+not use the macOS Sparkle updater. Use **Ctrl** for Mac **⌘** shortcuts and
+**Alt** for **Option**.
 
-Stable 2.6.4 includes interactive Z-stack & time-series viewing for Zeiss CZI (`.czi`) and Leica LIF (`.lif`) confocal acquisitions, Astromap ROI import/export, and supported HEVC SDPC viewing.
-Shading Correction assesses supported FITC and CY3 channels; BF and DAPI remain
+Supported Milestone 1 formats include Nikon ND2 (`.nd2`), Zeiss CZI (`.czi`),
+Leica LIF (`.lif`), OME-TIFF and TIFF (`.ome.tif`, `.ome.tiff`, `.tif`,
+`.tiff`), QPTIFF (`.qptiff`), Aperio SVS (`.svs`), SQRAY SDPC (`.sdpc`), and
+single-file viewing caches (`.nd2svs`), with calibrated OME-TIFF / ND2 / PNG
+ROI export and Astromap ROI import/export. Stable 2.6.4 published the portable
+ZIP linked above; newer CI runs on `main` also build and verify the per-user
+NSIS Setup installer (`nd2wsi-viewer-<version>-windows-x64-setup.exe`) alongside
+the portable ZIP.
+Shading Correction assesses supported FITC and CY3 channels on stitched single-frame ND2 scans; BF and DAPI remain
 unchanged. See the [current method and limits](shading-correction-validation.md).
 
 It has the collapsible top tools and the translucent viewer, with ROI boxes,
@@ -79,13 +88,25 @@ emulation, not an ARM64-native binary.
 
 ## Installer build tooling
 
-The Windows app uses a native frame and Microsoft Edge WebView2. Installer
-tooling can produce a versioned Setup executable, but the current stable 2.6.4
-download is a portable ZIP; no Setup installer is published for that release. The tooling installs the app
-for the current Windows account in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`.
-It creates Start Menu shortcuts, an optional Desktop shortcut, and an entry in
-Windows Settings > Apps for removal. The executable and `_internal` directory
-are installed together; no separate Python installation is needed.
+The Windows app uses a native frame and Microsoft Edge WebView2.
+`packaging/build_windows_installer.py` and `packaging/windows-installer.nsi`
+wrap the checksum-verified portable ZIP into a per-user NSIS Setup executable
+(`nd2wsi-viewer-<version>-windows-x64-setup.exe`) while keeping the portable ZIP
+(`nd2wsi-viewer-<version>-windows-x64.zip`) intact alongside it. Note that the
+published Stable 2.6.4 release asset above is the portable ZIP; check each
+GitHub Release's attached assets, `.sha256` sidecars, and `build-info.json` for
+the exact artifacts published for that tag.
+
+Setup installs the app for the current Windows account (`RequestExecutionLevel user`,
+no administrator UAC prompt) in `%LOCALAPPDATA%\Programs\nd2wsi-viewer`. It
+creates Start Menu shortcuts, an optional Desktop shortcut, a Windows
+Settings > Apps entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer`,
+and per-user `Open with` / Default Apps capabilities under `HKCU\Software\Classes`
+(`nd2wsi-viewer.Slide`, `Capabilities\FileAssociations`, and `OpenWithProgids`)
+for `.nd2`, `.czi`, `.lif`, `.tif`, `.tiff`, `.qptiff`, `.svs`, `.sdpc`, and
+`.nd2svs` without overwriting existing default image handlers or modifying
+system `PATH`. The executable and `_internal` directory are installed together;
+no separate Python installation is needed.
 
 A portable ZIP can also be built locally. It includes x64 CPython, the viewer,
 ND2 reading and writing, TIFF/SVS codecs, and the application assets. Keep the
@@ -100,10 +121,11 @@ Target execution modes (the verified CI environments are listed above):
 
 | Computer | Execution |
 | --- | --- |
-| Windows 11 on Intel/AMD x64 | Native x64 |
+| Windows 10 (1709+) or Windows 11 on Intel/AMD x64 | Native x64 |
+| Windows Server 2019/2022/2025 x64 with Desktop Experience | Native x64 |
 | Windows 11 on ARM64 | Same x64 EXE through Windows x64 emulation |
 
-Windows 10 and 32-bit Windows are not supported targets.
+Windows 10 on ARM64, headless Server Core, and 32-bit Windows are not supported targets.
 
 There is no GPU compute requirement. ARM64-native packaging is not claimed:
 the locked Python/.NET bridge and some scientific dependencies do not provide
@@ -139,13 +161,19 @@ NSIS compiler, which can run on macOS, and records the exact portable payload,
 installer source, compiler, and Microsoft WebView2 bootstrapper hashes.
 See [the installer build contract](../packaging/windows-installer.md).
 
-`packaging/verify_windows_installer.ps1` verifies installation in a Korean path,
-all installed file hashes, shortcuts and uninstall registration, both app smoke
-modes, same-version reinstallation, and removal. Its scientific-data sentinels
-must survive removal; replaced directory junctions must cause installation and
-removal to stop before changing files. `-KeepInstalled` finishes with a tested
-installation in the default user directory. Verification results describe only
-the Windows machines on which that script was actually run.
+`packaging/verify_windows_installer.ps1` verifies silent installation in an
+isolated Unicode/space-containing path (`/S /D=...`), `nd2wsi-viewer.exe` and
+`_internal` presence, all installed file SHA-256 hashes, shortcuts, `HKCU`
+uninstall registration, per-user `HKCU` file-association capabilities across all
+Milestone 1 extensions (`.nd2`, `.czi`, `.lif`, `.tif`, `.tiff`, `.qptiff`,
+`.svs`, `.sdpc`, `.nd2svs`), frozen `nd2wsi.ometiff` + CLI `--help` checks, both
+packaged app smoke modes (`--smoke` and `--gui-smoke`), same-version
+reinstallation, directory-junction rejection, locked-file recovery, and clean
+silent uninstallation (`Uninstall.exe /S`). Scientific-data sentinels must
+survive removal when present, and an installation folder with no user files must
+be completely removed on `Uninstall.exe /S`. `-KeepInstalled` finishes with a
+tested installation in the default user directory. Verification results describe
+only the Windows machines on which that script was actually run.
 
 The installer checks the .NET Framework 4.6.2 minimum and checks for WebView2.
 Windows 10 Education 22H2 already includes .NET Framework 4.8. It uses Microsoft's bundled, signed
@@ -222,12 +250,22 @@ extracted EXE, including Korean and space-containing paths.
 ## CI workflow
 
 `.github/workflows/windows.yml` is configured for main-branch pushes, version
-tags, pull requests, and manual runs pinned to a full commit SHA. It builds on
-x64 Windows and tests the same final archive on x64 Windows and Windows 11 ARM
-runners, saving the archive and smoke evidence as workflow artifacts. A local
-build does not itself require publication. The workflow file alone does not
-establish a successful run for a particular release; report the exact tested commit and artifact
-hashes from completed jobs.
+tags, pull requests, and manual runs pinned to a full commit SHA. On `windows-2025`
+(x64), the `build` job runs the test suites, builds the source-verified LGPL SDPC
+decoder, packages and smoke-tests the portable archive
+(`nd2wsi-viewer-<version>-windows-x64.zip`), builds the per-user NSIS installer
+(`nd2wsi-viewer-<version>-windows-x64-setup.exe`) with
+`packaging/build_windows_installer.py`, runs a silent install/smoke/uninstall
+check (`packaging/verify_windows_installer.ps1 -Quick`), records artifact hashes
+and signing/installer provenance in `dist/windows/build-info.json`, and uploads
+`windows-x64-portable`, `windows-x64-installer`, and `windows-x64-release`
+workflow artifacts. The downstream `verify` job then validates the portable ZIP
+with `packaging/verify_windows.ps1` on clean `windows-2025` (x64) and
+`windows-11-arm` (ARM64 x64 emulation) runners, and runs the full
+`packaging/verify_windows_installer.ps1` suite on clean `windows-2025` (x64)
+without Python installed. A workflow file alone does not establish a successful
+run for a particular release; report the exact tested commit and artifact hashes
+from completed jobs.
 
 The Windows CI desktops explicitly enable a real LUT clipboard copy/paste round
 trip through the packaged toolbar. It checks the success feedback, matched-channel
@@ -278,6 +316,30 @@ extracting a newer supplied ZIP into a fresh folder. The Windows update button
 opens the GitHub Releases page for manual downloads. Sparkle remains specific
 to macOS. For a newer installed version, follow that release's upgrade instructions.
 
-The viewer executable and Setup are not Authenticode-signed. They include a project license and available
-dependency license files. A Windows code-signing certificate is optional for
-running the app but would reduce unknown-publisher warnings.
+## Optional Authenticode signing
+
+By default, when signing credentials are not configured, `nd2wsi-viewer.exe` and
+`nd2wsi-viewer-<version>-windows-x64-setup.exe` are unsigned (`"signing": "unsigned"`
+in `dist/windows/build-info.json` and `.build.json`), and Windows SmartScreen
+may display an unknown-publisher prompt. Both artifacts include project and
+third-party dependency licenses plus `.sha256` checksum sidecars.
+
+Optional SHA-256 Authenticode signing is supported in
+`packaging/build_windows_installer.py` (`sign_windows_binary`) and wired into
+`.github/workflows/windows.yml`:
+
+- **Local / CLI environment variables**: configure `WINDOWS_SIGN_PFX_PATH` (plus
+  optional `WINDOWS_SIGN_PFX_PASSWORD`) or `WINDOWS_SIGN_THUMBPRINT`, optional
+  `WINDOWS_SIGNTOOL` (otherwise discovered from `PATH` or Windows Kits SDK), and
+  optional `WINDOWS_TIMESTAMP_URL` (defaults to `http://timestamp.digicert.com`).
+  `build_windows_installer.py` signs the staged `nd2wsi-viewer.exe` before
+  invoking `makensis` and signs `*-windows-x64-setup.exe` after `makensis` using
+  `/fd sha256 /tr <url> /td sha256`. Setting `WINDOWS_REQUIRE_SIGNING=1` fails
+  closed if credentials or `signtool` are missing.
+- **GitHub Actions secrets / variables**: when `WINDOWS_CERT_PFX_BASE64` (with
+  optional `WINDOWS_CERT_PASSWORD`) or `WINDOWS_SIGN_THUMBPRINT` is configured,
+  `windows.yml` signs the NSIS installer payload executable and Setup binary,
+  records `"signing": "authenticode"` in `dist/windows/build-info.json`, and
+  deletes temporary PFX material in an `always()` cleanup step. When secrets are
+  absent, CI builds succeed cleanly in unsigned mode unless repository variable
+  `WINDOWS_REQUIRE_SIGNING=1` is set.
