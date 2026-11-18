@@ -900,11 +900,12 @@ def test_macos_release_workflow_build_info_signing_status_reporting(tmp_path: Pa
         )
         env.update(extra_env)
         return subprocess.run(
-            [sys.executable, "-"],
+            [sys.executable, "-X", "utf8", "-"],
             input=adapted_script,
             cwd=tmp_path,
             env=env,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             timeout=30,
         )

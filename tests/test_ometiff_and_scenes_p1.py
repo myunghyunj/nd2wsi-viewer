@@ -259,9 +259,10 @@ def test_app_and_mac_packaging_declare_tiff_extensions(tmp_path: Path):
     plist_path = tmp_path / "Info.plist"
     plist_path.write_bytes(plistlib.dumps({}))
     subprocess.run(
-        [sys.executable, "-", str(plist_path), str(ROOT / "pyproject.toml")],
+        [sys.executable, "-X", "utf8", "-", str(plist_path), str(ROOT / "pyproject.toml")],
         input=plist_src,
         text=True,
+        encoding="utf-8",
         check=True,
         timeout=30,
     )

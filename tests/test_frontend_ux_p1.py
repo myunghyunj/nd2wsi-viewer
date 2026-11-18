@@ -574,24 +574,25 @@ const editedText = state.annotations[0].text;
 ctx.removeAnnotation(pin.id);
 const afterDeleteCount = state.annotations.length;
 
-// Cmd+Z undoes delete -> edit -> move -> create
-press({ key: 'z', code: 'KeyZ', metaKey: true });
+// Cmd+Z (macOS) / Ctrl+Z (Windows) undoes delete -> edit -> move -> create
+const cmdMod = ShortcutRouter.isMac() ? { metaKey: true } : { ctrlKey: true };
+press({ key: 'z', code: 'KeyZ', ...cmdMod });
 const undoDelete = JSON.parse(JSON.stringify(state.annotations));
-press({ key: 'z', code: 'KeyZ', metaKey: true });
+press({ key: 'z', code: 'KeyZ', ...cmdMod });
 const undoEdit = state.annotations[0].text;
-press({ key: 'z', code: 'KeyZ', metaKey: true });
+press({ key: 'z', code: 'KeyZ', ...cmdMod });
 const undoMove = [state.annotations[0].x, state.annotations[0].y];
-press({ key: 'z', code: 'KeyZ', metaKey: true });
+press({ key: 'z', code: 'KeyZ', ...cmdMod });
 const undoCreateCount = state.annotations.length;
 
-// Cmd+Shift+Z redoes create -> move
-press({ key: 'Z', code: 'KeyZ', metaKey: true, shiftKey: true });
-press({ key: 'Z', code: 'KeyZ', metaKey: true, shiftKey: true });
+// Cmd+Shift+Z (macOS) / Ctrl+Shift+Z (Windows) redoes create -> move
+press({ key: 'Z', code: 'KeyZ', ...cmdMod, shiftKey: true });
+press({ key: 'Z', code: 'KeyZ', ...cmdMod, shiftKey: true });
 const redoMove = [state.annotations[0].x, state.annotations[0].y];
 
 // Typing inside an INPUT does NOT trigger viewer undo or ? modal
 const inputTarget = { tagName: 'INPUT', type: 'text', closest: () => ({}) };
-const preventedInInputZ = press({ key: 'z', code: 'KeyZ', metaKey: true, target: inputTarget });
+const preventedInInputZ = press({ key: 'z', code: 'KeyZ', ...cmdMod, target: inputTarget });
 const preventedInInputQ = press({ key: '?', code: 'Slash', shiftKey: true, target: inputTarget });
 const modalHiddenAfterInput = el('shortcuts-modal').hidden;
 

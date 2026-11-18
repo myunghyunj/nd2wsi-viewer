@@ -882,3 +882,16 @@ def test_slide_registry_close_all_closes_sqlite_plate_and_ometiff_deterministica
     assert tif_root._closed is True
     with pytest.raises(ValueError, match="closed"):
         _ = tif_root["0"][:, 0:8, 0:8]
+
+
+def test_http_server_bind_bypasses_getfqdn_dns_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _forbid_getfqdn(*_args: Any, **_kwargs: Any) -> str:
+        raise AssertionError("socket.getfqdn must not be called by local viewer server_bind()")
+
+    monkeypatch.setattr(socket, "getfqdn", _forbid_getfqdn)
+    httpd = create_server([], port=0)
+    try:
+        assert httpd.server_name == "127.0.0.1"
+        assert httpd.server_port > 0
+    finally:
+        httpd.server_close()

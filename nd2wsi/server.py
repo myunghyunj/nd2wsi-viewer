@@ -37,6 +37,7 @@ import math
 import os
 import re
 import shlex
+import socketserver
 import stat
 import sys
 import tempfile
@@ -3960,6 +3961,14 @@ def create_server(
             )
             super().__init__(*args, **kwargs)
 
+        def server_bind(self) -> None:
+            # Bypass HTTPServer.server_bind()'s socket.getfqdn(host) reverse DNS /
+            # mDNS lookup, which blocks 5s+ per server on offline Macs and macOS CI VMs.
+            socketserver.TCPServer.server_bind(self)
+            host, port = self.server_address[:2]
+            self.server_name = str(host) if host else "127.0.0.1"
+            self.server_port = int(port)
+
         def process_request(self, request, client_address) -> None:
             with self._pool_lock:
                 if self._shutting_down or self._pool_closed:
@@ -4042,6 +4051,14 @@ def create_server(
                     req.shutdown(_socket.SHUT_RDWR)
                 except Exception:
                     pass
+                if os.name == "nt":
+                    # On Windows Winsock, shutdown(SD_BOTH) does not wake a thread
+                    # blocked in recv() on an idle keep-alive socket, and socket.close()
+                    # defers _real_close() while BaseHTTPRequestHandler.rfile holds _io_refs > 0.
+                    try:
+                        req._real_close()
+                    except Exception:
+                        pass
             cur = threading.current_thread()
             for worker in list(getattr(self._executor, "_threads", ())):
                 if worker is not cur and worker.is_alive():
