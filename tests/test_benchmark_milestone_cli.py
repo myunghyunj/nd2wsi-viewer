@@ -358,3 +358,13 @@ def test_validation_protocol_doc_links_anchors_and_hygiene() -> None:
         assert private_prefix not in stripped, (
             f"Private host path prefix {private_prefix!r} leaked into {PROTOCOL_DOC.name}"
         )
+
+
+def test_windows_rss_fallback_when_posix_resource_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _load_bench_module()
+    monkeypatch.setattr(mod, "resource", None)
+    monkeypatch.setattr(mod.os, "name", "nt")
+    monkeypatch.setattr(mod, "_win32_process_rss_mib", lambda: (142.5, 198.25))
+    assert mod.current_ru_maxrss_mib() == pytest.approx(198.25)
+    assert mod._sample_ps_rss_mib(os.getpid()) == pytest.approx(142.5)
+    assert mod._sample_ps_rss_mib(os.getpid() + 99999) == 0.0

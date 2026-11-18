@@ -31,7 +31,6 @@ import http.client
 import json
 import os
 import platform
-import resource
 import shutil
 import statistics
 import struct
@@ -44,6 +43,11 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows lacks POSIX resource
+    resource = None  # type: ignore[assignment]
 
 import imagecodecs
 import numpy as np
@@ -91,15 +95,67 @@ def summarize_mib(samples_mib: list[float]) -> dict[str, Any]:
     }
 
 
+class _WinProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("PageFaultCount", ctypes.c_uint32),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def _win32_process_rss_mib() -> tuple[float, float]:
+    """Return ``(current_working_set_mib, peak_working_set_mib)`` on Windows."""
+    if os.name != "nt":
+        return 0.0, 0.0
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        get_proc = kernel32.GetCurrentProcess
+        get_proc.argtypes = []
+        get_proc.restype = ctypes.c_void_p
+        fn = getattr(kernel32, "K32GetProcessMemoryInfo", None)
+        if fn is None:
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
+            fn = psapi.GetProcessMemoryInfo
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WinProcessMemoryCounters),
+            ctypes.c_uint32,
+        ]
+        fn.restype = ctypes.c_int
+        pmc = _WinProcessMemoryCounters()
+        pmc.cb = ctypes.sizeof(_WinProcessMemoryCounters)
+        if fn(get_proc(), ctypes.byref(pmc), pmc.cb):
+            mib = 1024.0 * 1024.0
+            return float(pmc.WorkingSetSize) / mib, float(pmc.PeakWorkingSetSize) / mib
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
 def current_ru_maxrss_mib() -> float:
-    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        return float(ru) / (1024.0 * 1024.0)
-    return float(ru) / 1024.0
+    if resource is not None:
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return float(ru) / (1024.0 * 1024.0)
+        return float(ru) / 1024.0
+    if os.name == "nt":
+        _, peak_mib = _win32_process_rss_mib()
+        return peak_mib
+    return 0.0
 
 
 def _sample_ps_rss_mib(pid: int) -> float:
     if os.name == "nt":
+        if pid == os.getpid():
+            cur_mib, _ = _win32_process_rss_mib()
+            return cur_mib
         return 0.0
     try:
         out = subprocess.check_output(
