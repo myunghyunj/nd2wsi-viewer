@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use nd2wsi-viewer in your research, please cite this software."
+type: software
+title: "nd2wsi-viewer"
+abstract: "Local whole-slide and confocal microscopy viewer for Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF, Aperio SVS, and SDPC on macOS and Windows, with calibrated annotations and native-value ROI export."
+authors:
+  - family-names: "Jeong"
+    given-names: "Myunghyun"
+version: "2.6.4"
+license: MIT
+repository-code: "https://github.com/myunghyunj/nd2wsi-viewer"
+url: "https://github.com/myunghyunj/nd2wsi-viewer"
+keywords:
+  - microscopy
+  - whole-slide-imaging
+  - confocal-microscopy
+  - z-stack
+  - fluorescence-microscopy
+  - digital-pathology
+  - nd2
+  - czi
+  - lif
+  - ome-tiff
+  - ome-zarr
+  - svs
+  - sdpc

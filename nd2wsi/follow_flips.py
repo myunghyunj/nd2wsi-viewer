@@ -24,21 +24,41 @@ from .session_lock import SessionFileLock
 from .window_sessions import _atomic_json
 
 FORMAT_RECORD = "nd2wsi-follow-flips/1"
-FORMATS = ("nd2", "czi", "lif", "svs", "sdpc", "jpeg", "png", "other")
+FORMATS = ("nd2", "czi", "lif", "ometiff", "tiff", "qptiff", "svs", "sdpc", "jpeg", "png", "other")
 MAX_BYTES = 16 * 1024
-_SUFFIXES = {".nd2": "nd2", ".nd2svs": "nd2", ".czi": "czi", ".lif": "lif",
-             ".svs": "svs", ".sdpc": "sdpc", ".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png"}
+_SUFFIXES = {
+    ".nd2": "nd2",
+    ".nd2svs": "nd2",
+    ".czi": "czi",
+    ".lif": "lif",
+    ".tif": "tiff",
+    ".tiff": "tiff",
+    ".qptiff": "qptiff",
+    ".svs": "svs",
+    ".sdpc": "sdpc",
+    ".jpg": "jpeg",
+    ".jpeg": "jpeg",
+    ".png": "png",
+}
 # A flips file that exists but whose content is not a record: the only kind a save replaces.
 _INVALID = (ValueError, TypeError, UnicodeError, RecursionError)
+
+
+def _format_from_filename(filename: str) -> str | None:
+    lower = filename.lower()
+    if lower.endswith((".ome.tif", ".ome.tiff")):
+        return "ometiff"
+    suffix = Path(filename).suffix.lower()
+    return _SUFFIXES.get(suffix)
 
 
 def source_format(attrs, source_path=None) -> str:
     """The format whose remembered flips apply: the original file's, not its cache's.
 
     ``attrs["nd2wsi"]["source"]`` is the original file name for every reader,
-    so an ``.nd2svs`` cache or an OME-Zarr built from an ND2, CZI, LIF, or SVS
-    counts as its original format even when opened from the cache; ``source_path``
-    is only the fallback.
+    so an ``.nd2svs`` cache or an OME-Zarr built from an ND2, CZI, LIF,
+    OME-TIFF/TIFF/QPTIFF, or SVS counts as its original format even when opened
+    from the cache; ``source_path`` is only the fallback.
     """
     meta = attrs.get("nd2wsi", {}) if isinstance(attrs, Mapping) else {}
     if not isinstance(meta, Mapping):
@@ -53,11 +73,12 @@ def source_format(attrs, source_path=None) -> str:
             if suffix == ".nd2svs":
                 parts = path.stem.split("--")
                 for idx in range(len(parts) - 1, 0, -1):
-                    inner_suffix = Path("--".join(parts[:idx])).suffix.lower()
-                    if inner_suffix in _SUFFIXES:
-                        return _SUFFIXES[inner_suffix]
-            if suffix in _SUFFIXES:
-                return _SUFFIXES[suffix]
+                    inner_fmt = _format_from_filename("--".join(parts[:idx]))
+                    if inner_fmt is not None:
+                        return inner_fmt
+            matched = _format_from_filename(path.name)
+            if matched is not None:
+                return matched
     return "other"
 
 

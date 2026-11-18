@@ -64,6 +64,7 @@ button { color:inherit; font:inherit; }
 .tools-chevron { width:18px; height:18px; --shell-icon:url("vendor/icons8-win10/angle-left.svg"); }
 #shell-tools-toggle[aria-expanded="true"] .tools-chevron { --shell-icon:url("vendor/icons8-win10/angle-right.svg"); }
 .shell-info-icon { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+.compare-icon { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.65; stroke-linecap:round; stroke-linejoin:round; }
 .hotspot-icon { width:22px; height:15px; overflow:visible; fill:none; stroke:currentColor; stroke-width:2.15; stroke-linecap:round; stroke-linejoin:round; }
 .shading-icon { display:block; width:20px; height:20px; background:currentColor;
   -webkit-mask:url("icons/fluent-circle-highlight-20-regular.svg") center / contain no-repeat;

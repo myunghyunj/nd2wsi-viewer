@@ -1532,6 +1532,9 @@ def test_follow_flips_show_the_context_and_name_the_format():
         bridgeOverrides:bridge});
       const czi=followHarness({initialContext:{source_format:'czi'},bridgeOverrides:bridge});
       const lif=followHarness({initialContext:{source_format:'lif'},bridgeOverrides:bridge});
+      const ometiff=followHarness({initialContext:{source_format:'ometiff'},bridgeOverrides:bridge});
+      const tiff=followHarness({initialContext:{source_format:'tiff'},bridgeOverrides:bridge});
+      const qptiff=followHarness({initialContext:{source_format:'qptiff'},bridgeOverrides:bridge});
       const sdpc=followHarness({initialContext:{source_format:'sdpc'},bridgeOverrides:bridge});
       const plain=followHarness();  // an older context and a bridge without the method
       const show=h=>({ud:h.element('stage-follow-flip-ud').checked,lr:h.element('stage-follow-flip-lr').checked,
@@ -1539,10 +1542,16 @@ def test_follow_flips_show_the_context_and_name_the_format():
         hint:h.element('stage-follow-flip-hint').textContent});
       const check=value=>{const v=api.validateContext({...context,...value},context.slide_url);
         return [v.source_format,v.follow_flips];};
-      return {nd2:show(nd2),odd:show(odd),czi:show(czi).hint,lif:show(lif).hint,sdpc:show(sdpc).hint,plain:show(plain),
+      const colOk=api.validateContext({...context,query:'?c=0,1&col=FF00FF,,00FFFF&g=gen1'},context.slide_url).query;
+      let colBad=false;
+      try{api.validateContext({...context,query:'?c=0&col=ZZZZZZ&g=gen1'},context.slide_url);}catch(_){colBad=true;}
+      return {nd2:show(nd2),odd:show(odd),czi:show(czi).hint,lif:show(lif).hint,
+        ometiff:show(ometiff).hint,tiff:show(tiff).hint,qptiff:show(qptiff).hint,
+        sdpc:show(sdpc).hint,plain:show(plain),
         validated:check({source_format:'constructor',follow_flips:{flip_x:true,flip_y:'true'}}),
         older:check({}),
-        formats:['nd2','czi','lif','svs','sdpc','jpeg','png','other','PNG',7].map(f=>check({source_format:f})[0])};
+        colOk,colBad,
+        formats:['nd2','czi','lif','ometiff','tiff','qptiff','svs','sdpc','jpeg','png','other','PNG',7].map(f=>check({source_format:f})[0])};
     """)
     assert result["nd2"] == {"ud": True, "lr": False, "disabled": [False, False],
                              "hint": "Reverses Follow's movement only, never the image. "
@@ -1551,11 +1560,17 @@ def test_follow_flips_show_the_context_and_name_the_format():
     assert result["odd"]["hint"].endswith("Remembered for other image types on this PC.")
     assert result["czi"].endswith("Remembered for CZI files on this PC.")
     assert result["lif"].endswith("Remembered for LIF files on this PC.")
+    assert result["ometiff"].endswith("Remembered for OME-TIFF files on this PC.")
+    assert result["tiff"].endswith("Remembered for TIFF files on this PC.")
+    assert result["qptiff"].endswith("Remembered for QPTIFF files on this PC.")
     assert result["sdpc"].endswith("Remembered for SDPC files on this PC.")
     assert result["plain"]["disabled"] == [True, True] and result["plain"]["ud"] is False
     assert result["validated"] == ["other", {"flip_x": True, "flip_y": False}]
     assert result["older"] == ["other", {"flip_x": False, "flip_y": False}]
-    assert result["formats"] == ["nd2", "czi", "lif", "svs", "sdpc", "jpeg", "png", "other", "other", "other"]
+    assert "col=FF00FF%2C%2C00FFFF" in result["colOk"] and result["colBad"] is True
+    assert result["formats"] == [
+        "nd2", "czi", "lif", "ometiff", "tiff", "qptiff", "svs", "sdpc", "jpeg", "png", "other", "other", "other"
+    ]
 
 
 def test_a_flip_toggle_calls_the_bridge_stays_live_while_following_and_never_turns_the_image():

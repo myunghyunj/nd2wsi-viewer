@@ -58,20 +58,45 @@
       return info.channels;
     }
 
+    function normalizeHexColor(raw) {
+      if (raw === undefined || raw === null || raw === "") return "";
+      if (typeof raw !== "string" || !/^[0-9A-Fa-f]{6}$/.test(raw)) {
+        throw new Error("LUT channel color must be a 6-digit hex value.");
+      }
+      return raw.toUpperCase();
+    }
+
     function checkedLuts(values, allowDefaults) {
       const channels = metadata();
       if (!Array.isArray(values) || values.length !== channels.length)
         throw new Error("Saved LUT settings do not match this image's channels.");
       const result = [];
       for (let index = 0; index < channels.length; index++) {
+        const channel = channels[index];
         const value = values[index];
-        if (!(allowDefaults && value == null) && (!record(value) ||
-            Object.keys(value).length !== 3 ||
-            !["lo", "hi", "gamma"].every(key => Object.hasOwn(value, key))))
-          throw new Error("LUT settings must contain only minimum, maximum and gamma.");
-        const lut = transfer.currentLut(channels[index], value);
-        if (!transfer.fitsChannel(channels[index], lut, info.dtype))
+        const supportsColor = typeof channel.color === "string" ||
+          typeof channel.metadataColor === "string";
+        if (!(allowDefaults && value == null)) {
+          const validKeys = record(value) &&
+            ["lo", "hi", "gamma"].every(key => Object.hasOwn(value, key)) &&
+            (supportsColor
+              ? Object.keys(value).every(key =>
+                  key === "lo" || key === "hi" || key === "gamma" || key === "color")
+              : Object.keys(value).length === 3);
+          if (!validKeys)
+            throw new Error("LUT settings must contain only minimum, maximum and gamma.");
+        }
+        const lut = transfer.currentLut(channel, value);
+        if (!transfer.fitsChannel(channel, lut, info.dtype))
           throw new Error("LUT values are invalid for this image's pixel type.");
+        if (supportsColor && record(value) && Object.hasOwn(value, "color")) {
+          const hex = normalizeHexColor(value.color);
+          const metaRaw = typeof channel.metadataColor === "string"
+            ? channel.metadataColor : channel.color;
+          const metaHex = typeof metaRaw === "string" && /^[0-9A-Fa-f]{6}$/.test(metaRaw.replace(/^#/, ""))
+            ? metaRaw.replace(/^#/, "").toUpperCase() : "";
+          if (hex && hex !== metaHex) lut.color = hex;
+        }
         result.push(lut);
       }
       return result;

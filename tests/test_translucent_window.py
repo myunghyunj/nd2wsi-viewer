@@ -498,6 +498,8 @@ def test_parent_registry_owns_overlay_and_cleans_up_without_touching_source(stor
     ("slide.nd2", None, "nd2"), ("slide.nd2", "/cache/slide--t0-p0-zmid.nd2svs", "nd2"),
     ("brain.czi", None, "czi"), (None, "/cache/brain.czi--t0-p0-zmid.nd2svs", "czi"),
     ("sample.lif", None, "lif"), (None, "/cache/sample.lif--s0--t0-p0-zmid.nd2svs", "lif"),
+    ("mosaic.ome.tif", None, "ometiff"), (None, "/cache/mosaic.ome.tif--s0--t0-p0-zmid.nd2svs", "ometiff"),
+    ("stack.tif", None, "tiff"), ("multiplex.qptiff", None, "qptiff"),
     ("scan.sdpc", None, "sdpc"),
     (None, "/data/x.PNG", "png"), ("scan.svs", None, "svs"), (None, None, "other"),
 ])
@@ -509,6 +511,17 @@ def test_context_names_the_follow_format(store, payload, source, source_path, ex
     assert context["source_format"] == expected
     # The format only picks the remembered flips; the orientation is the handoff's.
     assert context["rotation"] == 90 and context["flip"] is True
+
+
+def test_context_accepts_custom_channel_colors_and_rejects_malformed_col(store, payload):
+    custom = {**payload, "query": f"?c=0,1&win=0:100,10:200&col=FF00FF,&g={store.generation}"}
+    context = overlay.validate_context(store, custom, slide_url="http://local/token/s/abc/")
+    assert "col=FF00FF%2C" in context["query"]
+    for bad_col in ("ZZZZZZ", "FF00", "FF00FF,00FFFF,112233,445566"):
+        with pytest.raises(ValueError, match="channel color"):
+            overlay.validate_context(
+                store, {**payload, "query": f"?c=0&col={bad_col}&g={store.generation}"}, slide_url="http://local/token/s/abc/"
+            )
 
 
 def test_parent_registry_passes_one_flip_store_to_each_overlay(store, payload, monkeypatch, tmp_path):

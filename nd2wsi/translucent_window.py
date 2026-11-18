@@ -199,9 +199,9 @@ def validate_context(store, payload, *, slide_url):
     if not isinstance(query, str) or len(query) > 16384:
         raise ValueError("Invalid display settings")
     pairs = urllib.parse.parse_qsl(query.removeprefix("?"), keep_blank_values=True,
-                                  strict_parsing=True, max_num_fields=6)
+                                  strict_parsing=True, max_num_fields=7)
     params = dict(pairs)
-    if len(params) != len(pairs) or set(params) - {"c", "win", "g", "t", "p", "z"}:
+    if len(params) != len(pairs) or set(params) - {"c", "win", "col", "g", "t", "p", "z"}:
         raise ValueError("Unsupported display setting")
     channels = store.attrs["omero"]["channels"]
     selected = params.get("c")
@@ -225,6 +225,13 @@ def validate_context(store, payload, *, slide_url):
                 raise ValueError("Invalid channel window")
             if len(values) == 3 and not 0.1 <= values[2] <= 10:
                 raise ValueError("Invalid channel gamma")
+    if "col" in params:
+        colors = params["col"].split(",")
+        if len(colors) > len(channels):
+            raise ValueError("Too many channel colors")
+        for color in colors:
+            if color and (len(color) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in color)):
+                raise ValueError("Invalid channel color")
     generation = getattr(store, "generation", "")
     if params.get("g", "") != generation:
         raise ValueError("The image changed; refresh the slide before opening the overlay")

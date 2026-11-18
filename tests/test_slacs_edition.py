@@ -112,12 +112,21 @@ def test_portable_zip_is_named_apart_from_the_public_zip():
     name = windows_builder().archive_name("2.5.4")
     suffix = "" if edition.REVISION == 1 else f".{edition.REVISION}"
     assert name == f"nd2wsi-viewer-2.5.4_SLACS-module{suffix}-windows-x64.zip"
+    spec = importlib.util.spec_from_file_location(
+        "edition_build_windows_installer", ROOT / "packaging/build_windows_installer.py"
+    )
+    installer_builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(installer_builder)
+    setup_name = installer_builder.installer_name("2.5.4")
+    assert setup_name == f"nd2wsi-viewer-2.5.4_SLACS-module{suffix}-windows-x64-setup.exe"
+    assert fnmatch.fnmatchcase(setup_name, "nd2wsi-viewer-*-windows-x64-setup.exe")
     # The windows workflow still uploads and verifies it ...
     workflow = (ROOT / ".github/workflows/windows.yml").read_text(encoding="utf-8")
     assert "dist/windows/nd2wsi-viewer-*-windows-x64.zip\n" in workflow.replace("\r\n", "\n")
     assert fnmatch.fnmatchcase(name, "nd2wsi-viewer-*-windows-x64.zip")
     # ... and a public installation's update check never matches it.
     assert release_selection._ASSET.fullmatch(name) is None
+    assert release_selection._ASSET.fullmatch(setup_name) is None
 
 
 def test_public_installs_never_select_a_slacs_module_release(monkeypatch):

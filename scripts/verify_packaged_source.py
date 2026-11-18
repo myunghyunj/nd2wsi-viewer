@@ -52,8 +52,11 @@ def verify(toc, extract, resources, info, *, expected_version, bundle_name="nd2w
         if parts[-1] == "__init__":
             parts.pop()
         module = ".".join(parts)
+        assert module in toc, f"missing packaged module: {module}"
         actual = normalized(extract(module))
-        expected = normalized(compile(source.read_text(encoding="utf-8"), "<source>", "exec"))
+        expected = normalized(
+            compile(source.read_text(encoding="utf-8"), "<source>", "exec", dont_inherit=True)
+        )
         # Compare code structurally: marshal bytes contain irrelevant object
         # reference/interner differences after archive decoding.
         assert actual == expected, f"stale packaged module: {module}"

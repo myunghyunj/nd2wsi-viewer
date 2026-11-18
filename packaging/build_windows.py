@@ -23,6 +23,7 @@ import sys
 import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
+from types import CodeType
 
 REPO = Path(__file__).resolve().parents[1]
 APP = "nd2wsi-viewer"
@@ -135,7 +136,8 @@ def verify_source_files(provenance: dict) -> None:
         if not actual.is_file() or sha256(actual) != expected:
             raise ValueError(f"Source snapshot checksum mismatch: {relative}")
     required = {
-        "pyproject.toml", "uv.lock", "LICENSE", "packaging/build_windows.py",
+        "pyproject.toml", "uv.lock", "LICENSE", "THIRD_PARTY_NOTICES.md",
+        "packaging/build_windows.py",
         "packaging/launch.py", "packaging/AppIcon.icns", "packaging/WINDOWS-README.txt",
         "packaging/windows-build-requirements.txt",
         "packaging/SDPC-CODEC-NOTICE.txt",
@@ -439,6 +441,45 @@ def copy_licenses(internal: Path, target: Path) -> None:
     shutil.copy2(python_license, destination)
 
 
+def _normalized_code(code: CodeType) -> CodeType:
+    return code.replace(co_filename="<source>", co_consts=tuple(
+        _normalized_code(item) if isinstance(item, CodeType) else item for item in code.co_consts))
+
+
+def open_windows_archive(exe: Path):
+    """Open the PYZ archive embedded inside the frozen Windows executable."""
+    from PyInstaller.archive.readers import CArchiveReader
+
+    return CArchiveReader(str(exe)).open_embedded_archive("PYZ.pyz")
+
+
+def verify_bundled_source(toc, extract, internal: Path, *, root: Path = REPO) -> dict[str, list[str]]:
+    """Verify every nd2wsi module and static asset inside the Windows bundle."""
+    checked: list[str] = []
+    for source in sorted((root / "nd2wsi").rglob("*.py")):
+        parts = list(source.relative_to(root).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        module = ".".join(parts)
+        assert module in toc, f"missing packaged module: {module}"
+        actual = _normalized_code(extract(module))
+        expected = _normalized_code(
+            compile(source.read_text(encoding="utf-8"), "<source>", "exec", dont_inherit=True)
+        )
+        assert actual == expected, f"stale packaged module: {module}"
+        checked.append(module)
+    for must_have in ("nd2wsi.ometiff", "nd2wsi.ui_settings"):
+        assert must_have in checked, f"missing required Milestone 1 module: {must_have}"
+    assets: list[str] = []
+    for source in sorted((root / "nd2wsi/static").rglob("*")):
+        if source.is_file():
+            relative = source.relative_to(root)
+            bundled = internal / relative
+            assert bundled.is_file() and bundled.read_bytes() == source.read_bytes(), str(relative)
+            assets.append(relative.as_posix())
+    return {"python_modules": checked, "static_assets": assets}
+
+
 def check_layout(bundle: Path) -> int:
     """The tidy folder users see; return the number of files it holds."""
     top = {path.name for path in bundle.iterdir()}
@@ -531,8 +572,11 @@ def main() -> int:
 
     # Fail before packaging if either scientific export or image codecs is absent,
     # or if the app's imports would need the Tk runtime the bundle excludes.
-    run(sys.executable, "-c", "import sys, limnd2, imagecodecs, clr, webview, reportlab, pypdf, nd2wsi.app; "
-        "assert imagecodecs.JPEG.available and imagecodecs.JPEG2K.available; "
+    run(sys.executable, "-c",
+        "import sys, limnd2, tifffile, imagecodecs, clr, webview, reportlab, pypdf, "
+        "nd2wsi.app, nd2wsi.ometiff, nd2wsi.ui_settings; "
+        "assert imagecodecs.JPEG.available and imagecodecs.JPEG2K.available "
+        "and imagecodecs.LZW.available and imagecodecs.ZLIB.available; "
         "assert 'tkinter' not in sys.modules and '_tkinter' not in sys.modules")
     from PIL import Image
 
@@ -563,6 +607,8 @@ def main() -> int:
     internal = bundle / "_internal"
     print(f"Pruned {prune_bundle(internal)} test and cache files")
     check_assembly_locations(internal)
+    pyz = open_windows_archive(exe)
+    verify_bundled_source(pyz.toc, pyz.extract, internal)
     about = internal / ABOUT
     webview2_info = None
     web_renderer = "Microsoft Edge WebView2 Evergreen Runtime (system prerequisite)"
@@ -603,6 +649,7 @@ def main() -> int:
     }
     (about / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     shutil.copy2(REPO / "LICENSE", about / "LICENSE.txt")
+    shutil.copy2(REPO / "THIRD_PARTY_NOTICES.md", about / "THIRD_PARTY_NOTICES.md")
     # Bytes, not text mode: keep the repository file's line endings.
     (bundle / "READ-ME.txt").write_bytes(readme_text(bundled=webview2_info is not None).encode("utf-8"))
     if webview2_info is not None:

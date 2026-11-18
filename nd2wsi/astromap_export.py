@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from . import render
+from .annotation_sidecars import slide_stem
 
 MAX_EDGE = 8000
 MAX_ROIS = 2000
@@ -111,7 +112,7 @@ def coordinates_text(boxes: tuple[ExportBox, ...]) -> str:
 
 def _filename(source: str) -> str:
     # Windows names and pasted paths must never become paths inside the archive.
-    stem = Path(source.replace("\\", "/")).stem
+    stem = slide_stem(source)
     stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", stem).strip(". ")[:120]
     return stem or "slide"
 
@@ -249,11 +250,14 @@ def prepare_astromap(state, payload: dict, *, resolve_frame, filename_prefix="")
     if window is not None and (not isinstance(window, str) or len(window) > 32768):
         raise AstromapError("Invalid display window")
     frame = payload.get("frame")
+    base_sel = meta.get("selection") if isinstance(meta.get("selection"), dict) else {}
+    sel_p = base_sel.get("p")
+    has_nonzero_series = isinstance(sel_p, int) and not isinstance(sel_p, bool) and sel_p > 0
     if state.plate is None:
         if frame is not None:
             raise AstromapError("This slide does not have plate frames")
         root = state.root
-        suffix = ""
+        suffix = f"_p{sel_p}" if has_nonzero_series else ""
     else:
         if (not isinstance(frame, dict) or set(frame) != {"t", "p", "z"}
                 or any(type(v) is not int for v in frame.values())):
@@ -274,7 +278,10 @@ def prepare_astromap(state, payload: dict, *, resolve_frame, filename_prefix="")
             )
         levels = [levels[0]]
         root = {str(levels[0]["path"]): state.plate.frame_view(*resolved)} if channels else {}
-        suffix = "_t{}_p{}_z{}".format(*resolved)
+        t_idx, p_idx, z_idx = resolved
+        if p_idx == 0 and getattr(state.plate, "P", 1) <= 1 and has_nonzero_series:
+            p_idx = int(sel_p)
+        suffix = f"_t{t_idx}_p{p_idx}_z{z_idx}"
     # The coordinate origin stays levels[0], even in a degraded overview whose
     # first stored path is 1. Use actual dimensions rather than 2**level.
     candidates = [lv for lv in levels if lv["width"] >= size[0] and lv["height"] >= size[1]]

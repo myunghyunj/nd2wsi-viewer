@@ -9,22 +9,47 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import struct
 import subprocess
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 APP = "nd2wsi-viewer"
 # Provenance and licences ship inside the runtime folder (see build_windows.py).
 ABOUT = "_internal/nd2wsi-viewer-about"
+DEFAULT_TIMESTAMP_URL = "http://timestamp.digicert.com"
+TRUTHY_ENV = {"1", "true", "yes", "on"}
 RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
 }
+
+
+def load_edition(root: Path = REPO):
+    """Load nd2wsi/edition.py when building a lab edition, or None for public builds."""
+    edition_path = Path(root) / "nd2wsi" / "edition.py"
+    if not edition_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("nd2wsi_edition", edition_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def installer_name(version: str, *, root: Path = REPO) -> str:
+    """NSIS Setup filename; edition label keeps SLACS installers distinct from public releases."""
+    edition = load_edition(root)
+    label = edition.release_version(version) if edition is not None else version
+    return f"{APP}-{label}-windows-x64-setup.exe"
 
 
 def sha256(path: Path) -> str:
@@ -144,7 +169,200 @@ def pe_machine(path: Path) -> int:
         return struct.unpack("<H", source.read(2))[0]
 
 
-def main() -> int:
+def _is_truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in TRUTHY_ENV
+
+
+def _redact_secret(text: str, secret: str | None) -> str:
+    if secret:
+        return text.replace(secret, "***")
+    return text
+
+
+def _sdk_version_key(path: Path) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", path.parent.parent.name)
+    return tuple(int(part) for part in parts)
+
+
+def find_signtool(env: Mapping[str, str] | None = None) -> Path:
+    environ = os.environ if env is None else env
+    configured = environ.get("WINDOWS_SIGNTOOL", "").strip()
+    search_path = environ.get("PATH")
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file():
+            return candidate.resolve()
+        located = shutil.which(configured, path=search_path)
+        if located:
+            return Path(located).resolve()
+        raise RuntimeError(f"Configured WINDOWS_SIGNTOOL does not exist: {configured}")
+    for name in ("signtool.exe", "signtool"):
+        located = shutil.which(name, path=search_path)
+        if located:
+            return Path(located).resolve()
+    kits_root = (
+        Path(environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        / "Windows Kits"
+        / "10"
+        / "bin"
+    )
+    if kits_root.is_dir():
+        candidates = sorted(
+            (p for p in kits_root.glob("*/x64/signtool.exe") if p.is_file()),
+            key=_sdk_version_key,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0].resolve()
+        direct = kits_root / "x64" / "signtool.exe"
+        if direct.is_file():
+            return direct.resolve()
+    raise RuntimeError(
+        "signtool.exe was not found; install Windows SDK Signing Tools or set WINDOWS_SIGNTOOL"
+    )
+
+
+def resolve_signing_config(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Validate optional Authenticode signing credentials, failing closed when required."""
+    environ = os.environ if env is None else env
+    pfx_raw = environ.get("WINDOWS_SIGN_PFX_PATH", "").strip()
+    pfx_password = environ.get("WINDOWS_SIGN_PFX_PASSWORD", "")
+    thumbprint = re.sub(r"\s+", "", environ.get("WINDOWS_SIGN_THUMBPRINT", "").strip())
+    signtool_raw = environ.get("WINDOWS_SIGNTOOL", "").strip()
+    require_signing = _is_truthy(environ.get("WINDOWS_REQUIRE_SIGNING"))
+    timestamp_url = environ.get("WINDOWS_TIMESTAMP_URL", "").strip() or DEFAULT_TIMESTAMP_URL
+
+    if pfx_raw and thumbprint:
+        raise ValueError("Specify only one of WINDOWS_SIGN_PFX_PATH or WINDOWS_SIGN_THUMBPRINT, not both")
+
+    if not pfx_raw and not thumbprint:
+        if require_signing:
+            raise RuntimeError(
+                "Authenticode signing is required (WINDOWS_REQUIRE_SIGNING=1), "
+                "but neither WINDOWS_SIGN_PFX_PATH nor WINDOWS_SIGN_THUMBPRINT is configured"
+            )
+        if signtool_raw:
+            raise RuntimeError(
+                "WINDOWS_SIGNTOOL is set without signing credentials "
+                "(set WINDOWS_SIGN_PFX_PATH or WINDOWS_SIGN_THUMBPRINT)"
+            )
+        return {
+            "enabled": False,
+            "status": "unsigned",
+            "method": None,
+            "timestamp_url": None,
+        }
+
+    if not timestamp_url.startswith(("http://", "https://")):
+        raise ValueError(f"WINDOWS_TIMESTAMP_URL must be an HTTP(S) URL: {timestamp_url!r}")
+
+    if pfx_raw:
+        pfx_path = Path(pfx_raw).expanduser()
+        if not pfx_path.is_file():
+            raise FileNotFoundError(f"WINDOWS_SIGN_PFX_PATH does not exist: {pfx_path}")
+        signtool = find_signtool(environ)
+        return {
+            "enabled": True,
+            "status": "authenticode",
+            "method": "pfx",
+            "pfx_path": pfx_path.resolve(),
+            "pfx_password": pfx_password,
+            "signtool": signtool,
+            "timestamp_url": timestamp_url,
+        }
+
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", thumbprint):
+        raise ValueError(
+            "WINDOWS_SIGN_THUMBPRINT must be a 40-character SHA-1 or 64-character SHA-256 hex thumbprint"
+        )
+    signtool = find_signtool(environ)
+    return {
+        "enabled": True,
+        "status": "authenticode",
+        "method": "thumbprint",
+        "thumbprint": thumbprint.upper(),
+        "signtool": signtool,
+        "timestamp_url": timestamp_url,
+    }
+
+
+def sign_windows_binary(
+    target: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+    description: str = APP,
+) -> dict[str, Any]:
+    """Sign a Windows PE executable with SHA-256 Authenticode + timestamping when configured."""
+    target = target.resolve(strict=True)
+    pe_machine(target)
+    config = resolve_signing_config(env)
+    if not config["enabled"]:
+        return {
+            "signed": False,
+            "status": "unsigned",
+            "method": None,
+            "digest_algorithm": None,
+            "timestamp_digest_algorithm": None,
+            "timestamp_url": None,
+            "signtool_sha256": None,
+            "target": target.name,
+            "sha256": sha256(target),
+        }
+
+    signtool_path = Path(config["signtool"])
+    command = [
+        str(signtool_path),
+        "sign",
+        "/fd",
+        "sha256",
+        "/tr",
+        str(config["timestamp_url"]),
+        "/td",
+        "sha256",
+        "/d",
+        description,
+    ]
+    secret = None
+    if config["method"] == "pfx":
+        command += ["/f", str(config["pfx_path"])]
+        if config.get("pfx_password"):
+            secret = str(config["pfx_password"])
+            command += ["/p", secret]
+    else:
+        command += ["/sha1", str(config["thumbprint"])]
+    command.append(str(target))
+
+    run_env = dict(os.environ if env is None else env)
+    result = subprocess.run(
+        command,
+        env=run_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+    )
+    redacted_output = _redact_secret(result.stdout or "", secret)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Authenticode signtool failed for {target.name} (exit {result.returncode}): "
+            f"{redacted_output.strip()}"
+        )
+    if redacted_output.strip():
+        print(redacted_output.strip())
+    return {
+        "signed": True,
+        "status": "authenticode",
+        "method": config["method"],
+        "digest_algorithm": "sha256",
+        "timestamp_digest_algorithm": "sha256",
+        "timestamp_url": config["timestamp_url"],
+        "signtool_sha256": sha256(signtool_path),
+        "target": target.name,
+        "sha256": sha256(target),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--expected-sha256", required=True)
@@ -157,12 +375,21 @@ def main() -> int:
                         default=REPO / "packaging/WINDOWS-INSTALLER-README.txt")
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     archive = args.archive.resolve(strict=True)
     bootstrapper = args.webview2_bootstrapper.resolve(strict=True)
     for path, expected in ((archive, args.expected_sha256), (bootstrapper, args.webview2_sha256)):
         if not re.fullmatch(r"[0-9a-f]{64}", expected) or sha256(path) != expected:
             parser.error(f"SHA-256 does not match: {path}")
+    env = os.environ.copy()
+    if args.nsisdir:
+        env["NSISDIR"] = str(args.nsisdir.resolve(strict=True))
+    # Fail closed before extracting or compiling if signing is required without credentials.
+    resolve_signing_config(env)
+    output = args.output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        raise ValueError(f"Refusing to overwrite an existing installer: {output}")
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=False)
     payload = work / APP
@@ -174,29 +401,64 @@ def main() -> int:
     readme_bytes = readme.read_bytes()
     (payload / "READ-ME.txt").write_bytes(readme_bytes)
     files["READ-ME.txt"] = hashlib.sha256(readme_bytes).hexdigest()
-    info = json.loads((payload / ABOUT / "build-info.json").read_text(encoding="utf-8"))
+    build_info_path = payload / ABOUT / "build-info.json"
+    original_build_info_hash = files[f"{ABOUT}/build-info.json"]
+    info = json.loads(build_info_path.read_text(encoding="utf-8"))
     version = info["version"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("Installer requires a three-part numeric app version")
-    if pe_machine(payload / f"{APP}.exe") != 0x8664:
+    release_version = str(info.get("release_version") or version)
+    edition_name = info.get("edition")
+    updates_off = info.get("updates_off")
+    app_exe_path = payload / f"{APP}.exe"
+    if pe_machine(app_exe_path) != 0x8664:
         raise ValueError("Portable executable must be AMD64/x64")
     if files[f"{APP}.exe"] != info["executable_sha256"]:
         raise ValueError("Executable does not match its build provenance")
+    unsigned_app_exe_hash = files[f"{APP}.exe"]
+    exe_signing = sign_windows_binary(app_exe_path, env=env, description=APP)
+    if exe_signing["signed"]:
+        files[f"{APP}.exe"] = exe_signing["sha256"]
+        info["unsigned_executable_sha256"] = unsigned_app_exe_hash
+        info["executable_sha256"] = files[f"{APP}.exe"]
+        info["authenticode_signing"] = {
+            "signed": True,
+            "status": exe_signing["status"],
+            "method": exe_signing["method"],
+            "digest_algorithm": exe_signing["digest_algorithm"],
+            "timestamp_digest_algorithm": exe_signing["timestamp_digest_algorithm"],
+            "timestamp_url": exe_signing["timestamp_url"],
+        }
+        updated_build_info = (json.dumps(info, indent=2) + "\n").encode("utf-8")
+        build_info_path.write_bytes(updated_build_info)
+        files[f"{ABOUT}/build-info.json"] = hashlib.sha256(updated_build_info).hexdigest()
     pe_machine(bootstrapper)
     install, uninstall, guard = emit_includes(payload, files, work)
-    output = args.output.resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists():
-        raise ValueError(f"Refusing to overwrite an existing installer: {output}")
-    manifest = {
+    manifest: dict[str, Any] = {
         "version": version,
+        "release_version": release_version,
+        **({"edition": edition_name} if edition_name is not None else {}),
+        **({"updates_off": updates_off} if updates_off is not None else {}),
         "portable_archive_sha256": args.expected_sha256,
         "files": files,
         "documentation_override": {
             "path": "READ-ME.txt", "portable_sha256": original_readme_hash,
             "installed_sha256": files["READ-ME.txt"],
         },
+        "signing": {
+            "signed": exe_signing["signed"],
+            "status": exe_signing["status"],
+            "method": exe_signing["method"],
+            "unsigned_app_executable_sha256": unsigned_app_exe_hash,
+            "app_executable_sha256": files[f"{APP}.exe"],
+        },
     }
+    if exe_signing["signed"]:
+        manifest["build_info_override"] = {
+            "path": f"{ABOUT}/build-info.json",
+            "portable_sha256": original_build_info_hash,
+            "installed_sha256": files[f"{ABOUT}/build-info.json"],
+        }
     manifest_path = output.with_suffix(".payload.json")
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     defines = {
@@ -211,9 +473,6 @@ def main() -> int:
     }
     if args.icon:
         defines["APP_ICON"] = str(args.icon.resolve(strict=True))
-    env = os.environ.copy()
-    if args.nsisdir:
-        env["NSISDIR"] = str(args.nsisdir.resolve(strict=True))
     compiler = str(args.makensis.resolve(strict=True))
     compiler_version = subprocess.check_output([compiler, "-VERSION"], env=env, text=True).strip()
     script = REPO / "packaging/windows-installer.nsi"
@@ -240,10 +499,16 @@ def main() -> int:
     for name, expected in files.items():
         if sha256(payload / name) != expected:
             raise RuntimeError(f"Payload changed during compilation: {name}")
+    unsigned_installer_hash = sha256(output)
+    installer_signing = sign_windows_binary(output, env=env, description=f"{APP} Setup")
+    final_installer_hash = installer_signing["sha256"]
     report = {
         "schema_version": 1,
         "app_version": version,
-        "installer_sha256": sha256(output),
+        "release_version": release_version,
+        **({"edition": edition_name} if edition_name is not None else {}),
+        **({"updates_off": updates_off} if updates_off is not None else {}),
+        "installer_sha256": final_installer_hash,
         "installer_bytes": output.stat().st_size,
         "installer_pe_machine": hex(pe_machine(output)),
         "portable_archive_sha256": args.expected_sha256,
@@ -256,6 +521,19 @@ def main() -> int:
         "webview2_bootstrapper_sha256": args.webview2_sha256,
         "installer_source_sha256": source_hashes,
         "generated_include_sha256": include_hashes,
+        "signing": {
+            "signed": installer_signing["signed"],
+            "status": installer_signing["status"],
+            "method": installer_signing["method"],
+            "digest_algorithm": installer_signing["digest_algorithm"],
+            "timestamp_digest_algorithm": installer_signing["timestamp_digest_algorithm"],
+            "timestamp_url": installer_signing["timestamp_url"],
+            "signtool_sha256": installer_signing["signtool_sha256"],
+            "unsigned_app_executable_sha256": unsigned_app_exe_hash,
+            "app_executable_sha256": files[f"{APP}.exe"],
+            "unsigned_installer_sha256": unsigned_installer_hash,
+            "installer_sha256": final_installer_hash,
+        },
         "windows_verification": "pending; run verify_windows_installer.ps1",
         "published": False,
     }

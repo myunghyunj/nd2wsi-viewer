@@ -28,24 +28,41 @@ from nd2wsi.follow_flips import FORMAT_RECORD, FollowFlipStore, source_format
     ({"source": "e.jpg"}, None, "jpeg"),
     ({"source": "e.JPEG"}, None, "jpeg"),
     ({"source": "f.png"}, None, "png"),
-    ({"source": "g.tif"}, None, "other"),
+    ({"source": "g.tif"}, None, "tiff"),
+    ({"source": "g.TIFF"}, None, "tiff"),
+    ({"source": "g.ome.tif"}, None, "ometiff"),
+    ({"source": "g.OME.TIFF"}, None, "ometiff"),
+    ({"source": "g.qptiff"}, None, "qptiff"),
+    ({"source": "g.QPTIFF"}, None, "qptiff"),
+    ({"source_format": "ometiff"}, None, "ometiff"),
+    ({"source_format": "tiff"}, None, "tiff"),
+    ({"source_format": "qptiff"}, None, "qptiff"),
+    ({"source": "h.bmp"}, None, "other"),
     ({}, None, "other"),
     ({}, "x.nd2", "nd2"),
     ({}, "x.czi", "czi"),
     ({}, "x.lif", "lif"),
+    ({}, "x.ome.tif", "ometiff"),
+    ({}, "x.tif", "tiff"),
+    ({}, "x.qptiff", "qptiff"),
     ({}, "x.svs", "svs"),
     ({}, "x.sdpc", "sdpc"),
     ({}, "/cache/brain.czi--t0-p0-zmid.nd2svs", "czi"),
     ({}, "/cache/sample.lif--s0--t0-p0-zmid.nd2svs", "lif"),
+    ({}, "/cache/mosaic.ome.tif--s0--t0-p0-zmid.nd2svs", "ometiff"),
+    ({}, "/cache/multiplex.qptiff--t0-p0-zmid.nd2svs", "qptiff"),
+    ({}, "/cache/stack.tif--t0-p0-zmid.nd2svs", "tiff"),
     ({}, "/cache/slide.svs--t0-p0-zmid.nd2svs", "svs"),
     ({}, "/cache/exp--01.czi--t0-p0-zmid.nd2svs", "czi"),
     ({}, "/cache/exp--01.lif--s0--t0-p0-zmid.nd2svs", "lif"),
+    ({}, "/cache/exp--01.ome.tiff--s0--t0-p0-zmid.nd2svs", "ometiff"),
     ({}, "/cache/patient--case--2.svs--t0-p0-zmid.nd2svs", "svs"),
     ({}, "/cache/slide--01--t0-p0-zmid.nd2svs", "nd2"),
     # The original file name wins over the cache the store was opened from.
     ({"source": "slide.nd2"}, "/data/nd2wsi/caches/slide--t0-p0-zmid.png", "nd2"),
     ({"source": "brain.czi"}, "/data/nd2wsi/caches/brain.czi--t0-p0-zmid.nd2svs", "czi"),
     ({"source": "sample.lif"}, "/data/nd2wsi/caches/sample.lif--s0--t0-p0-zmid.nd2svs", "lif"),
+    ({"source": "scan.ome.tif"}, "/data/nd2wsi/caches/scan.ome.tif--t0-p0-zmid.nd2svs", "ometiff"),
     ({"source": {"not": "a name"}}, None, "other"),
 ])
 def test_source_format_maps_suffixes_and_cache_names(meta, source_path, expected):
@@ -171,7 +188,7 @@ def test_save_never_replaces_a_link(tmp_path):
 
 
 @pytest.mark.parametrize("fmt, flip_x, flip_y", [
-    ("tiff", False, False), ("ND2", False, False), (None, False, False), (["nd2"], False, False),
+    ("bmp", False, False), ("ND2", False, False), (None, False, False), (["nd2"], False, False),
     ("nd2", 1, False), ("nd2", False, None), ("nd2", "true", False),
 ])
 def test_unknown_format_or_non_bool_is_refused(tmp_path, fmt, flip_x, flip_y):

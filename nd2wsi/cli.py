@@ -1,7 +1,8 @@
-"""Command-line tools for local whole-slide viewing and ROI export.
+"""Command-line tools for local whole-slide and confocal viewing, pyramid caching, and ROI export.
 
-``view`` builds or reuses a managed viewing cache. ``convert`` writes a
-self-contained OME-Zarr pyramid. ``crop`` reads native ND2 pixels directly.
+``view`` serves slides directly or builds/reuses a managed ``.nd2svs`` viewing
+cache. ``convert`` writes a self-contained ``.nd2svs`` or OME-Zarr pyramid.
+``crop`` reads native ND2 pixels directly.
 """
 
 from __future__ import annotations
@@ -27,7 +28,10 @@ def _add_selection_args(p: argparse.ArgumentParser) -> None:
         help="Z plane: index, 'mid' (default) or 'max' (max-intensity projection)",
     )
     p.add_argument(
-        "--position", type=int, default=0, help="position index for multipoint files"
+        "--position",
+        type=int,
+        default=0,
+        help="position, scene, or series index for multipoint/multi-series files",
     )
 
 
@@ -223,6 +227,34 @@ def _format_store_info(info: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_ometiff_info(info: dict[str, Any]) -> str:
+    from .reader import nice_bytes
+
+    lines = [
+        f"File          : {info['file']} ({nice_bytes(int(info.get('size_bytes') or 0))})",
+        f"Format        : {info['format']} (series={info.get('series_count', 1)}, "
+        f"tiled={info.get('tiled')}, levels={info.get('pyramid_levels', 1)})",
+        f"Dimensions    : {info['width']} x {info['height']} px, "
+        f"C={info['channels']}, Z={info['z_planes']}, T={info['timepoints']}",
+        f"Pixel type    : {info['dtype']} ({'RGB' if info.get('rgb') else 'fluorescence/scalar'})",
+    ]
+    if info.get("pixel_size_um"):
+        py, px = info["pixel_size_um"]
+        lines.append(
+            f"Pixel size    : {px:.4f} x {py:.4f} µm/px ({info.get('calibration_source')})"
+        )
+    else:
+        lines.append("Pixel size    : uncalibrated")
+    if info.get("z_step_um"):
+        lines.append(f"Z step        : {info['z_step_um']:.4f} µm")
+    if info.get("magnification"):
+        lines.append(f"Objective     : {info['magnification']:g}x")
+    lines.append("Channels      :")
+    for ch in info.get("channel_info") or []:
+        lines.append(f"  - {ch['name']} ({ch['color']})")
+    return "\n".join(lines)
+
+
 class _WindowsPipeStdout:
     """Normalize Windows CRT pipe errors only at stdout's write/flush boundary."""
 
@@ -281,21 +313,27 @@ def main(argv: list[str] | None = None) -> int:
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="nd2wsi",
-        description="Local whole-slide viewing for Nikon ND2, Aperio SVS and SDPC, "
-        "with native-value ROI export.",
+        description="Local whole-slide and confocal viewing for Nikon ND2, Zeiss CZI, "
+        "Leica LIF, OME-TIFF/TIFF, Aperio SVS, and SDPC, with native-value ROI export.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_info = sub.add_parser("info", help="inspect an ND2/SVS/SDPC file's internal layout")
+    p_info = sub.add_parser(
+        "info",
+        help="inspect an ND2/CZI/LIF/OME-TIFF/SVS/SDPC/.nd2svs/.ome.zarr file's internal layout",
+    )
     p_info.add_argument("nd2")
     p_info.add_argument("--json", action="store_true", help="machine-readable output")
 
-    p_conv = sub.add_parser("convert", help="ND2/SVS -> OME-Zarr multiscale pyramid")
+    p_conv = sub.add_parser(
+        "convert",
+        help="ND2/CZI/LIF/SVS -> single-file .nd2svs or OME-Zarr multiscale pyramid",
+    )
     p_conv.add_argument("nd2")
     p_conv.add_argument(
         "out",
         nargs="?",
-        help="output store (default: pyramids/<source>.ome.zarr)",
+        help="output .nd2svs file or .ome.zarr directory (default: pyramids/<source>.ome.zarr)",
     )
     _add_convert_args(p_conv)
 
@@ -340,11 +378,16 @@ def _main(argv: list[str] | None = None) -> int:
         help="delete quarantined *.corrupt-* caches",
     )
 
-    p_serve = sub.add_parser("serve", help="serve the viewer for converted store(s)")
+    p_serve = sub.add_parser(
+        "serve", help="serve the viewer for converted .nd2svs or OME-Zarr store(s)"
+    )
     p_serve.add_argument("store", nargs="+", help="one tab per store")
     _add_serve_args(p_serve)
 
-    p_view = sub.add_parser("view", help="serve a slide directly or build a viewing cache if needed")
+    p_view = sub.add_parser(
+        "view",
+        help="serve a slide or stack directly, or build/reuse a .nd2svs viewing cache",
+    )
     p_view.add_argument("nd2", nargs="+", help="one tab per slide")
     p_view.add_argument(
         "--store", help="portable pyramid location for an explicit conversion"
@@ -357,18 +400,34 @@ def _main(argv: list[str] | None = None) -> int:
 
     from .czi import collect_czi_info, format_czi_info, is_czi
     from .lif import collect_lif_info, format_lif_info, is_lif
+    from .ometiff import collect_ometiff_info, is_ometiff
     from .raster import is_raster
     from .sdpc import is_sdpc
+    from .svs import is_svs as _is_svs
 
-    if args.cmd == "convert" and is_sdpc(args.nd2):
-        parser.error("SDPC supports direct viewing and ROI export, not pyramid conversion; use 'view' to open it")
-    if args.cmd == "crop" and (is_sdpc(args.nd2) or is_czi(args.nd2) or is_lif(args.nd2)):
-        fmt = "SDPC" if is_sdpc(args.nd2) else ("CZI" if is_czi(args.nd2) else "LIF")
+    def _is_non_svs_ometiff(target: str | Path) -> bool:
+        return not _is_svs(target) and is_ometiff(target)
+
+    if args.cmd == "convert" and (is_sdpc(args.nd2) or _is_non_svs_ometiff(args.nd2)):
+        fmt = "SDPC" if is_sdpc(args.nd2) else "OME-TIFF/TIFF"
+        parser.error(f"{fmt} supports direct viewing and ROI export, not pyramid conversion; use 'view' to open it")
+    if args.cmd == "crop" and (
+        is_sdpc(args.nd2) or is_czi(args.nd2) or is_lif(args.nd2) or _is_non_svs_ometiff(args.nd2)
+    ):
+        fmt = (
+            "SDPC"
+            if is_sdpc(args.nd2)
+            else ("CZI" if is_czi(args.nd2) else ("LIF" if is_lif(args.nd2) else "OME-TIFF/TIFF"))
+        )
         parser.error(f"'crop' reads native ND2 files only; open the {fmt} with 'view' and use ROI export")
-    if args.cmd == "view" and any(is_sdpc(path) or is_raster(path) for path in args.nd2):
+    if args.cmd == "view" and any(is_sdpc(path) or is_raster(path) or _is_non_svs_ometiff(path) for path in args.nd2):
         conversion_flags = {"--store", "--overwrite", "--t", "--position", "--z", "--tile", "--workers", "--yes", "-y"}
         if any(argument.split("=", 1)[0] in conversion_flags for argument in command_args):
-            source_format = "SDPC" if any(is_sdpc(path) for path in args.nd2) else "JPEG/PNG"
+            source_format = (
+                "SDPC"
+                if any(is_sdpc(path) for path in args.nd2)
+                else ("OME-TIFF/TIFF" if any(_is_non_svs_ometiff(path) for path in args.nd2) else "JPEG/PNG")
+            )
             parser.error(f"{source_format} supports direct viewing only; conversion and T/Z/position options are unavailable")
 
     if args.cmd == "info":
@@ -407,6 +466,8 @@ def _main(argv: list[str] | None = None) -> int:
             collect_info, format_info = collect_czi_info, format_czi_info
         elif is_lif(args.nd2):
             collect_info, format_info = collect_lif_info, format_lif_info
+        elif is_ometiff(args.nd2):
+            collect_info, format_info = collect_ometiff_info, _format_ometiff_info
         else:
             from .inspect_nd2 import collect_info, format_info
 
@@ -577,7 +638,12 @@ def _main(argv: list[str] | None = None) -> int:
             if not explicit:
                 # the default view goes through the managed cache: identity
                 # checked, atomically built, straight from the file for SVS
-                if is_raster(slide) or is_sdpc(slide) or (is_svs(slide) and existing_cache_store(slide) is None):
+                if (
+                    is_raster(slide)
+                    or is_sdpc(slide)
+                    or (is_svs(slide) and existing_cache_store(slide) is None)
+                    or _is_non_svs_ometiff(slide)
+                ):
                     print(f"{Path(slide).name}: serving straight from the file")
                     stores.append(Path(slide))
                 elif is_plate_file(slide):

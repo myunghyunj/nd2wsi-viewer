@@ -23,7 +23,8 @@
   // (follow_flips.py), never in this page's storage: its origin changes with
   // every launch. "other" names every format not listed here.
   const FOLLOW_FORMAT_LABELS = {
-    nd2: "ND2", czi: "CZI", lif: "LIF", svs: "SVS", sdpc: "SDPC", jpeg: "JPEG", png: "PNG"
+    nd2: "ND2", czi: "CZI", lif: "LIF", ometiff: "OME-TIFF", tiff: "TIFF", qptiff: "QPTIFF",
+    svs: "SVS", sdpc: "SDPC", jpeg: "JPEG", png: "PNG"
   };
   // The current view is reported at most this often, for SLACS laser-shot records.
   const VIEW_REPORT_MS = 200;
@@ -44,8 +45,15 @@
     }
     const query = new URLSearchParams(String(value.query || "").replace(/^\?/, ""));
     for (const key of query.keys()) {
-      if (!["c", "win", "g", "t", "p", "z"].includes(key) || query.getAll(key).length !== 1) {
+      if (!["c", "win", "col", "g", "t", "p", "z"].includes(key) || query.getAll(key).length !== 1) {
         throw new Error("Invalid image display settings");
+      }
+    }
+    if (query.has("col")) {
+      for (const token of query.get("col").split(",")) {
+        if (token && !/^[0-9A-Fa-f]{6}$/.test(token)) {
+          throw new Error("Invalid image display settings");
+        }
       }
     }
     return { ...value, slide_url: slide.href, query: query.toString(),

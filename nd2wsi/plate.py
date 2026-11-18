@@ -25,6 +25,8 @@ import time
 import uuid
 import warnings
 from collections import OrderedDict, deque
+from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +59,7 @@ from .plate_integrity import (
     quarantine_chunk,
     zarr_v2_chunk_path,
 )
-from .platform_io import BINARY, filesystem_path, read_at
+from .platform_io import BINARY, filesystem_path, read_at, total_physical_memory_bytes
 from .reader import (
     FRAME_AXES,
     PlaneSource,
@@ -70,13 +72,30 @@ from .reader import (
 )
 from .session_lock import SessionFileLock
 
+FRAME_CACHE_MIN_BYTES = 256 * 1024 * 1024
+FRAME_CACHE_MAX_BYTES = 640 * 1024 * 1024
+
+
+def _default_frame_cache_bytes(total_ram: int | None = None) -> int:
+    if total_ram is None:
+        raw_env = os.environ.get("ND2WSI_FRAME_CACHE_BYTES")
+        if raw_env is not None and raw_env.strip() != "":
+            val = int(raw_env)
+            if val > 0:
+                return val
+    ram = int(total_physical_memory_bytes() if total_ram is None else total_ram)
+    return max(FRAME_CACHE_MIN_BYTES, min(int(ram * 0.05), FRAME_CACHE_MAX_BYTES))
+
+
 PLATE_MAX_FRAME_PX = 4_500_000  # a camera field, not a stitched scan
 CZI_LIF_PLATE_MAX_DIM = 8192  # keeps level_shapes within PLATE_K=(2, 4, 8, 16) at tile=512
 CZI_LIF_PLATE_MAX_FRAME_PX = 40_000_000  # confocal / lightsheet Z-stacks and time series
 PLATE_CACHE_BYTES = 768 * 1024 * 1024  # reduced frames kept in memory
-FRAME_CACHE_BYTES = 320 * 1024 * 1024  # whole frames kept for the focused site
+FRAME_CACHE_BYTES = _default_frame_cache_bytes()  # whole frames kept for the focused site
+_INIT_FRAME_CACHE_BYTES = FRAME_CACHE_BYTES
 PLATE_K = (2, 4, 8, 16)  # box mean factors the grid may ask for
 PREFETCH_PENDING_MAX = 256  # frames queued for warming, oldest dropped first
+Z_PREFETCH_PENDING_MAX = 2  # at most (z - 1, z + 1) pending for the latest epoch only
 HISTOGRAM_LRU = 64
 THUMB_K = 8  # the reduction the store keeps, the one the site grid shows
 WINDOWS_T = 0  # default display windows sample every site at this time point,
@@ -98,6 +117,12 @@ READER_REFRESH_S = 0.5
 _REDUCED_CACHE = _TileCache(PLATE_CACHE_BYTES)
 # whole frames read for the focused site or for a reduction, a few at a time
 _FRAME_CACHE = _TileCache(FRAME_CACHE_BYTES)
+
+
+def _effective_frame_cache_budget() -> int:
+    if _FRAME_CACHE.budget != _INIT_FRAME_CACHE_BYTES:
+        return int(_FRAME_CACHE.budget)
+    return int(FRAME_CACHE_BYTES)
 
 
 def _has_integrity(manifest: dict[str, Any]) -> bool:
@@ -1757,6 +1782,7 @@ class PlateSource:
         self._owner = (str(self.path.resolve()), self._open_generation)
         self._life = _Lifecycle()
         self._closed = False
+        self._close_event = threading.Event()
         self._teardown_complete = False
         self._close_lock = threading.Lock()
         self._close_retry_lock = threading.Lock()
@@ -1768,6 +1794,17 @@ class PlateSource:
         self._pf_queue: deque[tuple[int, int, int, int]] = deque()
         self._pf_set: set[tuple[int, int, int, int]] = set()
         self._pf_thread: threading.Thread | None = None
+        self._inflight_lock = threading.Lock()
+        self._inflight_frames: dict[tuple[int, int, int], threading.Event] = {}
+        self._bg_tls = threading.local()
+        self._prefetch_epoch = 0
+        self._zpf_lock = threading.Lock()
+        self._zpf_executor: ThreadPoolExecutor | None = None
+        self._zpf_futures: list[Future[None]] = []
+        self._zpf_pending_targets: list[tuple[int, int, int]] = []
+        self._zpf_thread: threading.Thread | None = None
+        self._last_prefetch_tpz: tuple[int, int, int] | None = None
+        self._zpf_dir = 1
         self._fd = -1
         self._fg = 0  # foreground reads in flight; the prefetch worker yields to them
         self._f: Any = None
@@ -2330,36 +2367,63 @@ class PlateSource:
         """(C, H, W) frame that owns its memory, cached a few at a time."""
         if self._closed:
             raise ValueError("slide is closed")
+        t_i, p_i, z_i = int(t), int(p), int(z)
+        tpz = (t_i, p_i, z_i)
+        key = (self._owner, "frame", t_i, p_i, z_i)
         with self._life:
             self._check_source()
-            key = (self._owner, "frame", int(t), int(p), int(z))
             hit = _FRAME_CACHE.get(key)
             if hit is not None:
                 return hit
-            if self._backend == "czi":
-                self._fg += 1
-                try:
-                    cyx = self._read_czi_frame(int(t), int(p), int(z))
-                finally:
-                    self._fg -= 1
-            elif self._backend == "lif":
-                self._fg += 1
-                try:
-                    cyx = self._read_lif_frame(int(t), int(p), int(z))
-                finally:
-                    self._fg -= 1
-            else:
-                seq = self.seq(t, p, z)
-                self._fg += 1
-                try:
-                    raw = self._read_raw(seq)
-                finally:
-                    self._fg -= 1
-                cyx, _ = _frame_to_cyx(raw, self.sizes)
-            cyx = np.ascontiguousarray(cyx)
-            if not self._closed:
-                _FRAME_CACHE.put(key, cyx)
-            return cyx
+            with self._inflight_lock:
+                hit = _FRAME_CACHE.get(key)
+                if hit is not None:
+                    return hit
+                waiter = self._inflight_frames.get(tpz)
+                if waiter is None:
+                    waiter = threading.Event()
+                    self._inflight_frames[tpz] = waiter
+                    leader = True
+                else:
+                    leader = False
+            if not leader:
+                waiter.wait()
+                if self._closed:
+                    raise ValueError("slide is closed")
+                hit = _FRAME_CACHE.get(key)
+                if hit is not None:
+                    return hit
+            fg_delta = 0 if getattr(self._bg_tls, "active", False) else 1
+            try:
+                if self._backend == "czi":
+                    self._fg += fg_delta
+                    try:
+                        cyx = self._read_czi_frame(t_i, p_i, z_i)
+                    finally:
+                        self._fg -= fg_delta
+                elif self._backend == "lif":
+                    self._fg += fg_delta
+                    try:
+                        cyx = self._read_lif_frame(t_i, p_i, z_i)
+                    finally:
+                        self._fg -= fg_delta
+                else:
+                    seq = self.seq(t_i, p_i, z_i)
+                    self._fg += fg_delta
+                    try:
+                        raw = self._read_raw(seq)
+                    finally:
+                        self._fg -= fg_delta
+                    cyx, _ = _frame_to_cyx(raw, self.sizes)
+                cyx = np.ascontiguousarray(cyx)
+                if not self._closed:
+                    _FRAME_CACHE.put(key, cyx)
+                return cyx
+            finally:
+                if leader:
+                    with self._inflight_lock:
+                        self._inflight_frames.pop(tpz, None)
+                    waiter.set()
 
     def reduced(self, t: int, p: int, z: int, k: int, *, persist: bool = True) -> np.ndarray:
         """(C, H//k, W//k) box mean of one frame, rounded to the source dtype.
@@ -2488,18 +2552,113 @@ class PlateSource:
         channels: list[int],
         fmt: str = "jpg",
         win: str | None = None,
+        col: str | Sequence[str | None] | None = None,
     ) -> bytes:
         self._fg += 1
         try:
             region = self.reduced(t, p, z, k)
         finally:
             self._fg -= 1
-        windows, colors = render.display_params(self.attrs)
+        windows, colors = render.display_params(self.attrs, col=col)
         windows, gammas = render.parse_windows(win, windows)
         img = render.composite(region, channels, windows, colors, self.rgb, gammas)
         return render.encode_image(img, fmt)
 
     # ---- prefetch --------------------------------------------------------
+    def prefetch_neighbors(self, t: int, p: int, z: int) -> None:
+        """Asynchronously warm neighboring full Z-planes ``(z - 1, z + 1)`` into
+        ``_FRAME_CACHE`` for the latest epoch only, cancelling stale intermediate
+        scrub epochs before they touch disk/decoders."""
+        try:
+            if self._closed or self.Z <= 1:
+                return
+            t_i, p_i, z_i = int(t), int(p), int(z)
+            if not (0 <= t_i < self.T and 0 <= p_i < self.P and 0 <= z_i < self.Z):
+                return
+            estimated_frame_bytes = int(math.prod(self.frame_shape)) * int(self.dtype.itemsize)
+            cache_budget = _effective_frame_cache_budget()
+            if cache_budget <= 0 or estimated_frame_bytes * 3 > cache_budget * 2:
+                max_neighbors = 0
+            elif estimated_frame_bytes * 2 > cache_budget or estimated_frame_bytes * 3 > cache_budget:
+                max_neighbors = 1
+            else:
+                max_neighbors = 2
+
+            with self._zpf_lock:
+                if self._closed:
+                    return
+                self._prefetch_epoch += 1
+                epoch = self._prefetch_epoch
+                if self._last_prefetch_tpz is not None:
+                    prev_t, prev_p, prev_z = self._last_prefetch_tpz
+                    if (prev_t, prev_p) == (t_i, p_i) and z_i != prev_z:
+                        self._zpf_dir = 1 if z_i > prev_z else -1
+                    elif (prev_t, prev_p) != (t_i, p_i):
+                        self._zpf_dir = 1
+                self._last_prefetch_tpz = (t_i, p_i, z_i)
+
+                for fut in self._zpf_futures:
+                    fut.cancel()
+                self._zpf_futures.clear()
+                self._zpf_pending_targets.clear()
+
+                if max_neighbors <= 0:
+                    return
+                step = self._zpf_dir
+                neighbor_zs = [
+                    z2 for z2 in (z_i + step, z_i - step) if 0 <= z2 < self.Z
+                ][:max_neighbors]
+                targets = [
+                    (t_i, p_i, z2)
+                    for z2 in neighbor_zs
+                    if _FRAME_CACHE.get((self._owner, "frame", t_i, p_i, z2)) is None
+                ]
+                if not targets:
+                    return
+                if self._zpf_executor is None:
+                    self._zpf_executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="plate-z-prefetch",
+                    )
+                self._zpf_pending_targets = list(targets)
+                for target in targets[:Z_PREFETCH_PENDING_MAX]:
+                    self._zpf_futures.append(
+                        self._zpf_executor.submit(self._run_z_prefetch, epoch, target)
+                    )
+                if self._zpf_thread is None:
+                    self._zpf_thread = next(
+                        iter(getattr(self._zpf_executor, "_threads", ())), None
+                    )
+        except Exception:
+            pass
+
+    def _run_z_prefetch(self, epoch: int, target: tuple[int, int, int]) -> None:
+        self._zpf_thread = threading.current_thread()
+        if epoch != self._prefetch_epoch or self._closed:
+            return
+        # Short 15 ms coalescing settle window (woken at once on close) so rapid
+        # Z-slider scrubbing cancels intermediate epochs with 0 wasted disk reads.
+        if self._close_event.wait(0.015):
+            return
+        if epoch != self._prefetch_epoch or self._closed:
+            return
+        while self._fg > 0:
+            if epoch != self._prefetch_epoch or self._closed or self._close_event.wait(0.005):
+                return
+        if epoch != self._prefetch_epoch or self._closed:
+            return
+        t_i, p_i, z_i = target
+        if _FRAME_CACHE.get((self._owner, "frame", t_i, p_i, z_i)) is not None:
+            return
+        if epoch != self._prefetch_epoch or self._closed:
+            return
+        self._bg_tls.active = True
+        try:
+            self.frame(t_i, p_i, z_i)
+        except Exception:
+            pass
+        finally:
+            self._bg_tls.active = False
     def prefetch(self, t: int, z: int, k: int) -> None:
         """Queue the neighbouring frames for warming. Never blocks, never raises."""
         try:
@@ -2580,8 +2739,17 @@ class PlateSource:
         if self._teardown_complete:
             return True, None
         self._closed = True
+        self._close_event.set()
         with self._pf_cv:
+            self._pf_queue.clear()
+            self._pf_set.clear()
             self._pf_cv.notify_all()
+        with self._zpf_lock:
+            self._prefetch_epoch += 1
+            for fut in self._zpf_futures:
+                fut.cancel()
+            self._zpf_futures.clear()
+            self._zpf_pending_targets.clear()
         if not self._life.close(timeout=timeout):
             # a reader still holds the map after the drain timeout. nd2's
             # frames are views onto the mmap and raise no BufferError on
@@ -2591,6 +2759,7 @@ class PlateSource:
             # lets a daemon finish teardown as soon as the readers drain.
             if reopen_on_timeout:
                 self._closed = False
+                self._close_event.clear()
                 self._life.reopen()
             else:
                 if self._schedule_close_retry():
@@ -2612,6 +2781,7 @@ class PlateSource:
             except RuntimeError:
                 if reopen_on_timeout:
                     self._closed = False
+                    self._close_event.clear()
                     self._life.reopen()
                     with self._pf_cv:
                         self._pf_cv.notify_all()
@@ -2625,14 +2795,31 @@ class PlateSource:
                     timeout=None,
                 )
         prefetch = self._pf_thread
+        with self._zpf_lock:
+            zpf_exec, self._zpf_executor = self._zpf_executor, None
+            for fut in self._zpf_futures:
+                fut.cancel()
+            self._zpf_futures.clear()
+            self._zpf_pending_targets.clear()
+        z_prefetch = self._zpf_thread
         try:
             # Once store.close() transfers the writer lease, no ordinary
             # handle-cleanup exception may hide that lease from the caller.
             # Drain every resource best-effort and return the escrowed writer so
             # trash_cache retains exclusion through its rename.
             try:
-                if prefetch is not None and prefetch.is_alive():
-                    prefetch.join(timeout=3.0)
+                if prefetch is not None and prefetch.is_alive() and prefetch is not threading.current_thread():
+                    prefetch.join(timeout=5.0)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            try:
+                if zpf_exec is not None:
+                    zpf_exec.shutdown(
+                        wait=(threading.current_thread() is not z_prefetch),
+                        cancel_futures=True,
+                    )
+                if z_prefetch is not None and z_prefetch.is_alive() and z_prefetch is not threading.current_thread():
+                    z_prefetch.join(timeout=5.0)
             except Exception:  # pragma: no cover - defensive
                 pass
             try:

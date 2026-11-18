@@ -28,21 +28,29 @@ GET/POST /s/<sid>/api/annotations   sidecar annotations
 
 from __future__ import annotations
 
+import concurrent.futures
 import errno
 import hashlib
+import inspect
 import json
 import math
 import os
 import re
 import shlex
+import socketserver
 import stat
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from . import render, session_log
 from .annotation_sidecars import (
@@ -70,7 +78,7 @@ from .region_export import JOB_RE, ExportRequestError, prepare_export
 
 STATIC_DIR = Path(__file__).parent / "static"
 TILE_RE = re.compile(r"^/api/tile/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
-PLATE_FRAME_RE = re.compile(r"^/api/plate/frame/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
+PLATE_FRAME_RE = re.compile(r"^/api/(?:plate/)?frame/(\d+)/(\d+)/(\d+)\.(jpg|jpeg|png)$")
 ASSOCIATED_RE = re.compile(
     r"^/api/associated/(thumbnail|label|macro|associated-(?:[1-9]|1[0-6]))\.jpg$"
 )
@@ -119,6 +127,558 @@ def _limnd2_available() -> bool:
         except Exception:
             _LIMND2_OK = False
     return _LIMND2_OK
+
+
+_HEX6_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+
+
+def _accepts_kwarg(fn: Any, kwarg: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == kwarg:
+            return True
+    return False
+
+
+def _attrs_with_colors(attrs: dict[str, Any], col: str | None) -> dict[str, Any]:
+    """Return a detached attrs dict with valid 6-hex custom colors applied."""
+    if not col or (attrs.get("nd2wsi") or {}).get("rgb"):
+        return attrs
+    omero = attrs.get("omero") or {}
+    orig_channels = list(omero.get("channels") or [])
+    if not orig_channels:
+        return attrs
+    tokens = col.split(",")
+    changed = False
+    new_channels = []
+    for idx, ch in enumerate(orig_channels):
+        tok = tokens[idx].strip().lstrip("#") if idx < len(tokens) else ""
+        if _HEX6_RE.fullmatch(tok):
+            upper = tok.upper()
+            if upper != ch.get("color"):
+                changed = True
+                new_channels.append({**ch, "color": upper})
+                continue
+        new_channels.append(ch)
+    if not changed:
+        return attrs
+    return {**attrs, "omero": {**omero, "channels": new_channels}}
+
+
+def _render_tile_compat(
+    root: Any,
+    attrs: dict[str, Any],
+    level: int,
+    tx: int,
+    ty: int,
+    channels: list[int],
+    fmt: str,
+    win: str | None,
+    col: str | None,
+) -> bytes:
+    if col:
+        if _accepts_kwarg(render.render_tile, "col"):
+            try:
+                return render.render_tile(
+                    root, attrs, level, tx, ty, channels, fmt, win, col=col
+                )
+            except TypeError:
+                pass
+        attrs = _attrs_with_colors(attrs, col)
+    return render.render_tile(root, attrs, level, tx, ty, channels, fmt, win)
+
+
+def _render_plate_frame_compat(
+    plate: Any,
+    t: int,
+    p: int,
+    z: int,
+    k: int,
+    channels: list[int],
+    fmt: str,
+    win: str | None,
+    col: str | None,
+) -> bytes:
+    if col:
+        if _accepts_kwarg(plate.render_frame, "col"):
+            try:
+                return plate.render_frame(t, p, z, k, channels, fmt, win, col=col)
+            except TypeError:
+                pass
+        if not getattr(plate, "rgb", False):
+            region = plate.reduced(t, p, z, k)
+            patched = _attrs_with_colors(plate.attrs, col)
+            windows, colors = render.display_params(patched)
+            windows, gammas = render.parse_windows(win, windows)
+            img = render.composite(region, channels, windows, colors, plate.rgb, gammas)
+            return render.encode_image(img, fmt)
+    return plate.render_frame(t, p, z, k, channels, fmt, win)
+
+
+# ---- UI settings & Recent files delegation + standalone fallback ---------
+
+_UI_FALLBACK_LOCK = threading.RLock()
+_PYTEST_FALLBACK_DIR: Path | None = None
+
+
+def _is_isolated_settings_env() -> bool:
+    if any(
+        os.environ.get(key)
+        for key in (
+            "ND2WSI_APP_SUPPORT_DIR",
+            "ND2WSI_UI_SETTINGS_ROOT",
+            "ND2WSI_UI_SETTINGS_PATH",
+            "ND2WSI_LUT_SETTINGS_ROOT",
+        )
+    ):
+        return True
+    try:
+        home = Path.home().resolve()
+        tmp_root = Path(tempfile.gettempdir()).resolve()
+        if home.is_relative_to(tmp_root) or "/pytest-" in str(home) or "\\pytest-" in str(home):
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _auto_record_allowed() -> bool:
+    """Skip implicit recent-file writes to real user Application Support during bare pytest runs."""
+    if "PYTEST_CURRENT_TEST" in os.environ and not _is_isolated_settings_env():
+        return False
+    return True
+
+
+def _fallback_ui_settings_file() -> Path:
+    global _PYTEST_FALLBACK_DIR
+    for env_key in ("ND2WSI_UI_SETTINGS_PATH",):
+        raw = os.environ.get(env_key)
+        if raw:
+            return Path(raw).expanduser().resolve()
+    for env_key in ("ND2WSI_UI_SETTINGS_ROOT", "ND2WSI_APP_SUPPORT_DIR"):
+        raw = os.environ.get(env_key)
+        if raw:
+            return Path(raw).expanduser().resolve() / "ui-settings.json"
+    lut_override = os.environ.get("ND2WSI_LUT_SETTINGS_ROOT")
+    if lut_override:
+        return Path(lut_override).expanduser().resolve().parent / "ui-settings.json"
+    if "PYTEST_CURRENT_TEST" in os.environ and not _is_isolated_settings_env():
+        if _PYTEST_FALLBACK_DIR is None:
+            _PYTEST_FALLBACK_DIR = Path(tempfile.mkdtemp(prefix="nd2wsi-ui-test-"))
+        return _PYTEST_FALLBACK_DIR / "ui-settings.json"
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return base / "nd2wsi-viewer" / "ui-settings.json"
+
+
+def _fallback_read_doc() -> dict[str, Any]:
+    path = _fallback_ui_settings_file()
+    try:
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _fallback_write_doc(doc: dict[str, Any]) -> None:
+    from .window_sessions import _atomic_json
+
+    path = _fallback_ui_settings_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_json(path, doc)
+
+
+def _normalize_ui_settings_dict(raw: dict[str, Any]) -> dict[str, Any]:
+    theme = raw.get("theme", "auto")
+    if theme not in ("auto", "light", "dark"):
+        theme = "auto"
+    panels_raw = raw.get("panels")
+    panels = dict(panels_raw) if isinstance(panels_raw, dict) else {}
+    expanded = raw.get("shellToolsExpanded")
+    if expanded is not None and not isinstance(expanded, bool):
+        expanded = None
+    return {
+        "theme": theme,
+        "panels": panels,
+        "shellToolsExpanded": expanded,
+    }
+
+
+def _load_ui_settings_safe() -> dict[str, Any]:
+    try:
+        from . import ui_settings as _ui_mod
+
+        if "PYTEST_CURRENT_TEST" not in os.environ or _is_isolated_settings_env():
+            return dict(_ui_mod.load_ui_settings())
+    except ImportError:
+        pass
+    with _UI_FALLBACK_LOCK:
+        return _normalize_ui_settings_dict(_fallback_read_doc())
+
+
+def _save_ui_settings_safe(patch: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(patch, dict):
+        raise ValueError("UI settings payload must be a JSON object")
+    clean_patch = {k: v for k, v in patch.items() if k != "ok"}
+    if "theme" in clean_patch and clean_patch["theme"] not in ("auto", "light", "dark"):
+        raise ValueError("theme must be 'auto', 'light', or 'dark'")
+    if "panels" in clean_patch and not isinstance(clean_patch["panels"], dict):
+        raise ValueError("panels must be an object")
+    if "shellToolsExpanded" in clean_patch and clean_patch["shellToolsExpanded"] is not None:
+        if not isinstance(clean_patch["shellToolsExpanded"], bool):
+            raise ValueError("shellToolsExpanded must be a boolean or null")
+    try:
+        from . import ui_settings as _ui_mod
+
+        if "PYTEST_CURRENT_TEST" not in os.environ or _is_isolated_settings_env():
+            return dict(_ui_mod.save_ui_settings(clean_patch))
+    except ImportError:
+        pass
+    with _UI_FALLBACK_LOCK:
+        doc = _fallback_read_doc()
+        current = _normalize_ui_settings_dict(doc)
+        if "theme" in clean_patch:
+            current["theme"] = clean_patch["theme"]
+        if "panels" in clean_patch:
+            merged_panels = dict(current["panels"])
+            merged_panels.update(clean_patch["panels"])
+            current["panels"] = merged_panels
+        if "shellToolsExpanded" in clean_patch:
+            current["shellToolsExpanded"] = clean_patch["shellToolsExpanded"]
+        doc.update(current)
+        _fallback_write_doc(doc)
+        return current
+
+
+def _is_unmounted_macos_volume(p: Path) -> bool:
+    parts = p.parts
+    if len(parts) >= 3 and parts[0] == "/" and parts[1] == "Volumes":
+        vol_root = Path("/") / "Volumes" / parts[2]
+        return not vol_root.exists()
+    return False
+
+
+def _list_recent_files_safe(limit: int = 12) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 50))
+    try:
+        from . import ui_settings as _ui_mod
+
+        if "PYTEST_CURRENT_TEST" not in os.environ or _is_isolated_settings_env():
+            return list(_ui_mod.list_recent_files(limit=limit))
+    except ImportError:
+        pass
+    with _UI_FALLBACK_LOCK:
+        doc = _fallback_read_doc()
+        raw_items = doc.get("recentFiles")
+        if not isinstance(raw_items, list):
+            return []
+        kept: list[dict[str, Any]] = []
+        pruned = False
+        for entry in raw_items:
+            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                pruned = True
+                continue
+            p = Path(entry["path"])
+            exists = p.exists()
+            if not exists and _is_unmounted_macos_volume(p):
+                kept.append(
+                    {
+                        "path": entry["path"],
+                        "name": str(entry.get("name") or p.name),
+                        "openedAt": float(entry.get("openedAt") or 0.0),
+                        "available": False,
+                    }
+                )
+            elif exists:
+                kept.append(
+                    {
+                        "path": entry["path"],
+                        "name": str(entry.get("name") or p.name),
+                        "openedAt": float(entry.get("openedAt") or 0.0),
+                        "available": True,
+                    }
+                )
+            else:
+                pruned = True
+        if pruned:
+            doc["recentFiles"] = kept[:20]
+            try:
+                _fallback_write_doc(doc)
+            except OSError:
+                pass
+        return kept[:limit]
+
+
+def _record_recent_file_safe(
+    path: str | Path, *, name: str | None = None, window_role: str = "user"
+) -> list[dict[str, Any]]:
+    if window_role == "agent":
+        return _list_recent_files_safe()
+    try:
+        from . import ui_settings as _ui_mod
+
+        if "PYTEST_CURRENT_TEST" not in os.environ or _is_isolated_settings_env():
+            return list(
+                _ui_mod.record_recent_file(path, name=name, window_role=window_role)
+            )
+    except ImportError:
+        pass
+    resolved = str(Path(path).expanduser().resolve())
+    disp_name = str(name).strip() if name else Path(resolved).name
+    now = time.time()
+    with _UI_FALLBACK_LOCK:
+        doc = _fallback_read_doc()
+        raw_items = doc.get("recentFiles")
+        existing = [
+            e
+            for e in (raw_items if isinstance(raw_items, list) else [])
+            if isinstance(e, dict) and e.get("path") != resolved
+        ]
+        new_entry = {
+            "path": resolved,
+            "name": disp_name,
+            "openedAt": now,
+            "available": Path(resolved).exists(),
+        }
+        updated = [new_entry, *existing][:20]
+        doc["recentFiles"] = updated
+        _fallback_write_doc(doc)
+    return _list_recent_files_safe()
+
+
+# ---- Multi-Series / Multi-Scene Container Metadata Inspection ------------
+
+_SERIES_META_CACHE: OrderedDict[tuple[str, int, int], tuple[int, list[dict[str, Any]]]] = OrderedDict()
+_SERIES_META_LOCK = threading.Lock()
+_SERIES_META_MAX = 64
+
+
+def _inspect_path_series(source_path: Path) -> tuple[int, list[dict[str, Any]]]:
+    """Return (seriesCount, seriesList) for .lif, .czi, multipoint .nd2, or multi-series .ome.tif.
+
+    ``seriesList`` is populated when ``seriesCount > 1`` on non-grid heterogeneous
+    ``.lif``, multi-scene ``.czi``, non-plate multipoint ``.nd2``, or multi-series
+    ``.ome.tif``, and ``[]`` otherwise.
+    """
+    from .ometiff import inspect_ometiff_series, is_ometiff
+    from .plate import PLATE_MAX_FRAME_PX
+    from .platform_io import BINARY
+
+    try:
+        resolved = source_path.resolve()
+        st_info = resolved.stat()
+    except OSError:
+        return 1, []
+
+    cache_key = (
+        str(resolved),
+        int(st_info.st_mtime_ns),
+        int(st_info.st_size),
+        int(PLATE_MAX_FRAME_PX),
+    )
+    with _SERIES_META_LOCK:
+        cached = _SERIES_META_CACHE.get(cache_key)
+        if cached is not None:
+            _SERIES_META_CACHE.move_to_end(cache_key)
+            return cached[0], [dict(item) for item in cached[1]]
+
+    suffix = resolved.suffix.lower()
+    result: tuple[int, list[dict[str, Any]]] = (1, [])
+    try:
+        if suffix == ".lif":
+            from .lif import _list_lif_series, _read_lif_header_and_blocks
+            from .plate import _lif_plate_series
+
+            fd = os.open(str(resolved), os.O_RDONLY | BINARY)
+            try:
+                root_xml, blocks = _read_lif_header_and_blocks(fd, st_info.st_size)
+            finally:
+                os.close(fd)
+            all_series = _list_lif_series(root_xml, blocks)
+            if len(all_series) > 1 and len(_lif_plate_series(all_series)) <= 1:
+                items: list[dict[str, Any]] = []
+                for idx, ser in enumerate(all_series):
+                    if ser.tile_positions_px and ser.n_m > 1:
+                        w = max(tx + ser.width for tx, _ty in ser.tile_positions_px)
+                        h = max(ty + ser.height for _tx, ty in ser.tile_positions_px)
+                    else:
+                        w, h = ser.width, ser.height
+                    items.append(
+                        {
+                            "index": idx,
+                            "name": str(ser.name or f"Series {idx + 1}"),
+                            "width": int(w),
+                            "height": int(h),
+                            "channels": int(len(ser.channels)),
+                            "zCount": int(ser.n_z),
+                            "tCount": int(ser.n_t),
+                        }
+                    )
+                result = (len(items), items)
+        elif suffix == ".czi":
+            from .czi import (
+                _level0_entries,
+                _read_czi_header_and_index,
+                _resolve_czi_entries_spec,
+            )
+
+            fd = os.open(str(resolved), os.O_RDONLY | BINARY)
+            try:
+                entries, xml_root = _read_czi_header_and_index(fd, st_info.st_size)
+            finally:
+                os.close(fd)
+            lvl0 = _level0_entries(entries)
+            s_values = sorted({e.s for e in lvl0})
+            if len(s_values) > 1:
+                scene_names: dict[int, str] = {}
+                if xml_root is not None:
+                    for sc_i, sc in enumerate(xml_root.findall(".//Scenes/Scene")):
+                        sc_name = (sc.get("Name") or sc.findtext("Name") or "").strip()
+                        if not sc_name:
+                            continue
+                        raw_idx = sc.get("Index")
+                        try:
+                            key_idx = int(raw_idx) if raw_idx is not None else sc_i
+                        except ValueError:
+                            key_idx = sc_i
+                        scene_names[key_idx] = sc_name
+                items = []
+                for idx, s_val in enumerate(s_values):
+                    s_entries = [e for e in lvl0 if e.s == s_val]
+                    t_vals = sorted({e.t for e in s_entries})
+                    ref = [e for e in s_entries if e.t == t_vals[0]] if t_vals else s_entries
+                    w = max(e.x_start + e.x_size for e in ref) - min(e.x_start for e in ref)
+                    h = max(e.y_start + e.y_size for e in ref) - min(e.y_start for e in ref)
+                    _dt, is_rgb, _ = _resolve_czi_entries_spec(ref)
+                    n_c = 3 if is_rgb else len({e.c for e in ref})
+                    n_z = max(1, len({e.z for e in ref}))
+                    n_t = max(1, len(t_vals))
+                    sname = scene_names.get(s_val) or scene_names.get(idx) or f"Scene {idx + 1}"
+                    items.append(
+                        {
+                            "index": idx,
+                            "name": sname,
+                            "width": int(w),
+                            "height": int(h),
+                            "channels": int(n_c),
+                            "zCount": int(n_z),
+                            "tCount": int(n_t),
+                        }
+                    )
+                result = (len(items), items)
+        elif suffix == ".nd2":
+            import warnings
+
+            import nd2
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with nd2.ND2File(str(resolved)) as f:
+                    sizes = dict(f.sizes)
+                    n_p = int(sizes.get("P", 1))
+                    w = int(sizes.get("X", 0))
+                    h = int(sizes.get("Y", 0))
+                    area = w * h
+                    is_plate = (
+                        not getattr(f, "is_legacy", False)
+                        and (getattr(f.attributes, "compressionType", None) or "none") == "none"
+                        and 0 < area <= PLATE_MAX_FRAME_PX
+                        and (int(sizes.get("T", 1)) * n_p * int(sizes.get("Z", 1))) > 1
+                    )
+                    if n_p > 1 and not is_plate and w > 0 and h > 0:
+                        pos_names: list[str] = []
+                        try:
+                            for loop in getattr(f, "experiment", None) or []:
+                                if getattr(loop, "type", "") == "XYPosLoop":
+                                    pts = (
+                                        getattr(getattr(loop, "parameters", None), "points", None)
+                                        or []
+                                    )
+                                    pos_names = [
+                                        str(getattr(pt, "name", "") or "").strip() for pt in pts
+                                    ]
+                                    break
+                        except Exception:
+                            pos_names = []
+                        n_s = int(sizes.get("S", 1))
+                        n_c_raw = int(sizes.get("C", 1))
+                        n_c = n_s if (n_s > 1 and n_c_raw == 1) else n_c_raw
+                        n_z = int(sizes.get("Z", 1))
+                        n_t = int(sizes.get("T", 1))
+                        items = [
+                            {
+                                "index": idx,
+                                "name": (
+                                    pos_names[idx]
+                                    if idx < len(pos_names) and pos_names[idx]
+                                    else f"Position {idx + 1}"
+                                ),
+                                "width": w,
+                                "height": h,
+                                "channels": n_c,
+                                "zCount": n_z,
+                                "tCount": n_t,
+                            }
+                            for idx in range(n_p)
+                        ]
+                        result = (len(items), items)
+        elif is_ometiff(resolved):
+            items = inspect_ometiff_series(resolved)
+            if len(items) > 1:
+                result = (len(items), items)
+    except Exception:
+        result = (1, [])
+
+    with _SERIES_META_LOCK:
+        _SERIES_META_CACHE[cache_key] = result
+        while len(_SERIES_META_CACHE) > _SERIES_META_MAX:
+            _SERIES_META_CACHE.popitem(last=False)
+    return result[0], [dict(item) for item in result[1]]
+
+
+def _inspect_slide_series(st: ViewerState) -> tuple[int, int, list[dict[str, Any]]]:
+    """Return (seriesCount, seriesIndex, seriesList) for an open ViewerState."""
+    meta = st.attrs.get("nd2wsi") or {}
+    sel = meta.get("selection") or {}
+    try:
+        cur_p = max(0, int(sel.get("p", 0) or 0))
+    except (TypeError, ValueError):
+        cur_p = 0
+    if st.plate is not None and getattr(st.plate, "P", 1) > 1:
+        return 1, 0, []
+    if st.source_path is None or not st.source_path.is_file():
+        return 1, 0, []
+    count, series_list = _inspect_path_series(st.source_path)
+    if count <= 1:
+        return 1, 0, []
+    clamped_p = cur_p if 0 <= cur_p < count else 0
+    return count, clamped_p, series_list
+
+
+def _series_item_is_stack(item: dict[str, Any]) -> bool:
+    from .ometiff import STACK_MAX_DIM, STACK_MAX_FRAME_PX, STACK_MIN_DIM
+
+    w = int(item.get("width", 0))
+    h = int(item.get("height", 0))
+    n_z = int(item.get("zCount", 1))
+    n_t = int(item.get("tCount", 1))
+    if n_z <= 1 and n_t <= 1:
+        return False
+    return (
+        STACK_MIN_DIM <= w <= STACK_MAX_DIM
+        and STACK_MIN_DIM <= h <= STACK_MAX_DIM
+        and w * h <= STACK_MAX_FRAME_PX
+    )
 
 
 MIME = {
@@ -256,6 +816,10 @@ class ViewerState:
 
     @staticmethod
     def _close_root(root):
+        store = getattr(root, "store", None)
+        store_path = getattr(store, "path", None)
+        if store_path is not None:
+            render._RAW_CHUNK_CACHE.purge(store_path)
         close = getattr(root, "close", None)
         if close is not None:
             try:
@@ -723,6 +1287,25 @@ class SlideRegistry:
                     return None
                 raise
             return canonical
+        from .ometiff import is_ometiff
+        from .svs import is_svs
+
+        if site is None and not is_svs(path) and is_ometiff(path):
+            legacy_ome: list[Path] = []
+            canonical = annotations_sidecar(path, attrs, migrate=False, legacy_paths=legacy_ome)
+            if self.agent_window:
+                return self.annotation_workspace.snapshot(
+                    canonical, source=legacy_ome[0] if legacy_ome else None
+                )
+            if canonical.exists() or not legacy_ome:
+                probe = canonical.parent
+                while not probe.exists() and probe != probe.parent:
+                    probe = probe.parent
+                return (
+                    canonical
+                    if (canonical.is_file() or (probe.is_dir() and os.access(probe, os.W_OK | os.X_OK)))
+                    else None
+                )
         if self.annotation_workspace is None:
             try:
                 with self._annotation_claim_lock:
@@ -757,8 +1340,11 @@ class SlideRegistry:
             raise
 
     @staticmethod
-    def sid_for(store_path: Path) -> str:
-        return hashlib.sha1(str(store_path.resolve()).encode()).hexdigest()[:8]
+    def sid_for(store_path: Path, *, series: int | None = None) -> str:
+        raw = str(store_path.resolve())
+        if series is not None and series > 0:
+            raw += f"#series={int(series)}"
+        return hashlib.sha1(raw.encode()).hexdigest()[:8]
 
     def lut_settings_for(self, st: ViewerState):
         from .lut_settings import LutSettingsStore
@@ -843,6 +1429,12 @@ class SlideRegistry:
                 store_path = Path(_ensure_cache(slide_path)).resolve()
                 trash_path = store_path
                 registered_source = registered_source or slide_path
+        from .ometiff import is_ometiff, is_ometiff_stack
+
+        if is_ometiff(store_path) and store_path.is_file():
+            if is_ometiff_stack(store_path, series=0):
+                return self.add_stack_scene(store_path, series=0)
+            return self.add_direct(store_path, series=0)
         manifest: dict[str, Any] = {}
         container_path = manifest_container(store_path)
         if container_path is not None:
@@ -1109,20 +1701,29 @@ class SlideRegistry:
         self._close_state(stale)
         return sid
 
-    def add_direct(self, slide_path: str | Path) -> str:
-        """Serve an RGB slide without a pixel cache; isolate Agent annotations."""
+    def add_direct(self, slide_path: str | Path, *, series: int = 0) -> str:
+        """Serve a slide directly without a pixel cache; isolate Agent annotations."""
         from .cache import fingerprints_match, quick_fingerprint
+        from .ometiff import is_ometiff
         from .raster import is_raster
         from .sdpc import is_sdpc
+        from .svs import is_svs
 
         slide_path = Path(slide_path).resolve()
+        series = int(series)
+        use_ometiff = not is_svs(slide_path) and is_ometiff(slide_path)
         if is_raster(slide_path):
-            from .raster import open_direct
+            from .raster import open_direct as _open_fn
         elif is_sdpc(slide_path):
-            from .sdpc import open_direct
+            from .sdpc import open_direct as _open_fn
+        elif use_ometiff:
+            from .ometiff import open_direct as _ome_open_direct
+
+            def _open_fn(p: Path):
+                return _ome_open_direct(p, series=series)
         else:
-            from .direct import open_direct
-        sid = self.sid_for(slide_path)
+            from .direct import open_direct as _open_fn
+        sid = self.sid_for(slide_path, series=series if series > 0 else None)
         stale = None
         with self._lock:
             fingerprint = quick_fingerprint(slide_path)
@@ -1130,6 +1731,8 @@ class SlideRegistry:
                 f"{int(fingerprint['mtime_ns']):x}-"
                 f"{str(fingerprint['quick_sha256'])[:16]}"
             )
+            if series > 0:
+                gen += f"-s{series}"
             st = self.slides.get(sid)
             if st is not None and st.generation == gen:
                 return sid
@@ -1139,7 +1742,7 @@ class SlideRegistry:
             # root still holds the previous inode.
             root = attrs = None
             for _ in range(2):
-                root, attrs = open_direct(slide_path)
+                root, attrs = _open_fn(slide_path)
                 # Never registered, so nothing reads it: close now rather than
                 # after _Root's delay, which kept a Windows sharing lock open
                 # while the retry opened the file again.
@@ -1161,6 +1764,8 @@ class SlideRegistry:
                 f"{int(fingerprint['mtime_ns']):x}-"
                 f"{str(fingerprint['quick_sha256'])[:16]}"
             )
+            if series > 0:
+                gen += f"-s{series}"
             stale = self.slides.get(sid)
             try:
                 annotations = self.annotation_path(slide_path, attrs)
@@ -1175,6 +1780,86 @@ class SlideRegistry:
                 )
             except BaseException:
                 ViewerState._close_root(root)
+                raise
+            self._apply_window_policy(st)
+            self.slides[sid] = st
+            self._retire(stale, closing=True)
+        self._close_state(stale)
+        return sid
+
+    def add_stack_scene(self, slide_path: str | Path, *, series: int = 0) -> str:
+        """Serve an interactive OME-TIFF/ImageJ stack or targeted LIF/CZI stack scene."""
+        from .cache import fingerprints_match, quick_fingerprint
+        from .direct_common import _Root
+        from .ometiff import ContainerSceneStackSource, OmeTiffStackSource, is_ometiff
+
+        slide_path = Path(slide_path).resolve()
+        series = int(series)
+        sid = self.sid_for(slide_path, series=series if series > 0 else None)
+        stale = None
+        with self._lock:
+            fingerprint = quick_fingerprint(slide_path)
+            gen = (
+                f"{int(fingerprint['mtime_ns']):x}-"
+                f"{str(fingerprint['quick_sha256'])[:16]}"
+            )
+            if series > 0:
+                gen += f"-s{series}"
+            st = self.slides.get(sid)
+            if st is not None and st.generation == gen and st.plate is not None:
+                return sid
+
+            source = None
+            for _ in range(2):
+                candidate = (
+                    OmeTiffStackSource(slide_path, series=series)
+                    if is_ometiff(slide_path)
+                    else ContainerSceneStackSource(slide_path, series=series)
+                )
+                try:
+                    current = quick_fingerprint(slide_path)
+                except BaseException:
+                    candidate.close()
+                    raise
+                if fingerprints_match(fingerprint, current):
+                    source = candidate
+                    fingerprint = current
+                    break
+                candidate.close()
+                fingerprint = current
+            if source is None:
+                raise RuntimeError(f"{slide_path.name} changed while it was opening")
+            gen = (
+                f"{int(fingerprint['mtime_ns']):x}-"
+                f"{str(fingerprint['quick_sha256'])[:16]}"
+            )
+            if series > 0:
+                gen += f"-s{series}"
+            try:
+                root = _Root(
+                    source.root_for(0, 0, source.z_home), closer=source.close
+                )
+                annotations = self.annotation_path(
+                    slide_path,
+                    source.attrs,
+                    site=0,
+                    frame=(0, 0, source.z_home)
+                    if source.attrs["nd2wsi"]["plate"].get("annotationScope") == "plane"
+                    else None,
+                )
+                stale = self.slides.get(sid)
+                st = ViewerState(
+                    root,
+                    source.attrs,
+                    max_render_mpx=self.max_render_mpx,
+                    annotations_path=annotations,
+                    generation=gen,
+                    source_path=slide_path,
+                    manifest={"source": fingerprint},
+                    plate=source,
+                )
+            except BaseException:
+                source.close()
                 raise
             self._apply_window_policy(st)
             self.slides[sid] = st
@@ -1278,46 +1963,149 @@ class SlideRegistry:
         self._close_state(stale)
         return sid
 
-    def open_path(self, path: str | Path, on_progress=None) -> str:
+    def open_path(
+        self,
+        path: str | Path,
+        on_progress=None,
+        *,
+        series: int | None = None,
+    ) -> str:
         """A slide file (converted on first open) or an existing store."""
         from .cache import SINGLE_FILE_SUFFIX
         from .convert import ensure_cache, existing_cache_store
+        from .ometiff import inspect_ometiff_series, is_ometiff, is_ometiff_stack
         from .raster import is_raster
+        from .reader import PlaneSelection
         from .sdpc import is_sdpc
         from .svs import is_svs
 
+        if series is not None:
+            if isinstance(series, bool) or not isinstance(series, int):
+                raise ValueError("series must be an integer")
+            if series < 0:
+                raise ValueError(f"series {series} must be >= 0")
+
         path = Path(path).expanduser()
         if path.suffix.lower() == SINGLE_FILE_SUFFIX:
-            return self.add_store(path)
+            sid = self.add_store(path)
+            self._record_opened_recent(sid, path)
+            return sid
         path = path.resolve()
         if is_sdpc(path) or is_raster(path):
-            return self.add_direct(path)
+            sid = self.add_direct(path)
+            self._record_opened_recent(sid, path)
+            return sid
+        if is_svs(path) and existing_cache_store(path, read_only=self.agent_window) is None:
+            try:
+                # the file already holds a pyramid, so serve it as it lies
+                sid = self.add_direct(path)
+                self._record_opened_recent(sid, path)
+                return sid
+            except NotImplementedError:
+                pass  # untiled or off-ladder file: build a store instead
+        if not is_svs(path) and is_ometiff(path):
+            if not path.is_file():
+                raise FileNotFoundError(f"could not find {path.name}")
+            target_s = 0 if series is None else int(series)
+            if series is not None:
+                ome_items = inspect_ometiff_series(path)
+                max_s = max(1, len(ome_items))
+                if not (0 <= target_s < max_s):
+                    raise ValueError(f"series {target_s} out of range (0..{max_s - 1})")
+            if is_ometiff_stack(path, series=target_s):
+                sid = self.add_stack_scene(path, series=target_s)
+            else:
+                sid = self.add_direct(path, series=target_s)
+            self._record_opened_recent(sid, path)
+            return sid
         if path.suffix.lower() in SLIDE_SUFFIXES:
-            if is_svs(path) and existing_cache_store(path, read_only=self.agent_window) is None:
-                try:
-                    # the file already holds a pyramid, so serve it as it lies
-                    return self.add_direct(path)
-                except NotImplementedError:
-                    pass  # untiled or off-ladder file: build a store instead
-            if path.suffix.lower() in (".nd2", ".czi", ".lif"):
+            suffix = path.suffix.lower()
+            if suffix in (".nd2", ".czi", ".lif"):
                 from .plate import is_plate_file
 
-                if is_plate_file(path):
+                if series is not None and suffix in (".czi", ".lif"):
+                    if not path.is_file():
+                        raise FileNotFoundError(f"could not find {path.name}")
+                    s_count, s_list = _inspect_path_series(path)
+                    if not (0 <= series < s_count):
+                        raise ValueError(f"series {series} out of range (0..{s_count - 1})")
+                    if series == 0 and is_plate_file(path):
+                        sid = self.add_plate(path)
+                        self._record_opened_recent(sid, path)
+                        return sid
+                    if series < len(s_list) and _series_item_is_stack(s_list[series]):
+                        sid = self.add_stack_scene(path, series=series)
+                        self._record_opened_recent(sid, path)
+                        return sid
+                    sel = PlaneSelection(t=0, p=series, z="mid")
+                    if self.agent_window:
+                        store = existing_cache_store(path, selection=sel, read_only=True)
+                        if store is None:
+                            raise PermissionError(
+                                "Agent windows cannot build or repair a shared cache; open an existing cache instead"
+                            )
+                    else:
+                        store = ensure_cache(path, selection=sel, on_progress=on_progress)
+                    sid = self.add_store(store, source_path=path)
+                    self._record_opened_recent(sid, path)
+                    return sid
+
+                if series is not None and suffix == ".nd2":
+                    if not path.is_file():
+                        raise FileNotFoundError(f"could not find {path.name}")
+                    s_count, _ = _inspect_path_series(path)
+                    if not (0 <= series < s_count):
+                        raise ValueError(f"series {series} out of range (0..{s_count - 1})")
+                    if series == 0 and is_plate_file(path):
+                        sid = self.add_plate(path)
+                        self._record_opened_recent(sid, path)
+                        return sid
+
+                if series is None and is_plate_file(path):
                     # camera fields over time: no pyramid to build, ever
-                    return self.add_plate(path)
+                    sid = self.add_plate(path)
+                    self._record_opened_recent(sid, path)
+                    return sid
+
+            sel_opt = PlaneSelection(t=0, p=series, z="mid") if series is not None else None
             if self.agent_window:
-                store = existing_cache_store(path, read_only=True)
+                store = existing_cache_store(path, selection=sel_opt, read_only=True)
                 if store is None:
                     raise PermissionError("Agent windows cannot build or repair a shared cache; open an existing cache instead")
             else:
-                store = ensure_cache(path, on_progress=on_progress)
+                store = (
+                    ensure_cache(path, selection=sel_opt, on_progress=on_progress)
+                    if sel_opt is not None
+                    else ensure_cache(path, on_progress=on_progress)
+                )
         elif path.is_dir():  # a user-supplied *.ome.zarr store
-            return self.add_store(path)
+            sid = self.add_store(path)
+            self._record_opened_recent(sid, path)
+            return sid
         else:
-            raise ValueError(f"not an ND2/SVS/SDPC slide, JPEG/PNG image, .nd2svs cache, or pyramid store: {path.name}")
+            raise ValueError(
+                "not a supported slide (.nd2, .czi, .lif, .tif/.ome.tif, .svs, .sdpc), "
+                f".nd2svs cache, .jpg/.png image, or pyramid store: {path.name}"
+            )
         # no explicit trash_path: add_store promotes a container store to its
         # container, so trashing removes manifest and pixels together
-        return self.add_store(store, source_path=path)
+        sid = self.add_store(store, source_path=path)
+        self._record_opened_recent(sid, path)
+        return sid
+
+    def _record_opened_recent(self, sid: str, fallback_path: Path) -> None:
+        if self.agent_window or not _auto_record_allowed():
+            return
+        st = self.slides.get(sid)
+        target = (
+            st.source_path
+            if (st is not None and st.source_path is not None and st.source_path.exists())
+            else fallback_path
+        )
+        try:
+            _record_recent_file_safe(target, window_role="user")
+        except Exception:
+            pass
 
     def remove(self, sid: str) -> bool:
         with self._lock:
@@ -1345,18 +2133,28 @@ class SlideRegistry:
         """Close every registered backend after the server stops.
 
         Without ``immediate``, source-backed roots keep _Root's short delay
-        before their native handles close. A stopped smoke-test server has no
-        requests left, so it may close them synchronously, and it also waits
-        up to 30 s for slides closed earlier whose last reads are finishing.
+        only when reads are still draining. Once ``busy`` has drained, stores,
+        plate prefetchers, and OME-TIFF handles close deterministically.
         """
         with self._lock:
             states = list(self.slides.values())
             self.slides.clear()
         for st in states:
             st.close_shading()
-            st.busy.close(timeout=30)
-            if immediate:
-                ViewerState._close_root(st.root)
+            drained = st.busy.close(timeout=30)
+            for p_attr in ("store_path", "source_path"):
+                p_val = getattr(st, p_attr, None)
+                if p_val is not None:
+                    render._RAW_CHUNK_CACHE.purge(p_val)
+            if immediate or drained:
+                plate_close = getattr(getattr(st, "plate", None), "close", None)
+                if callable(plate_close):
+                    try:
+                        plate_close(timeout=30)
+                    except TypeError:
+                        plate_close()
+                else:
+                    ViewerState._close_root(st.root)
                 continue
             close = getattr(st.root, "close", None)
             if close is not None:
@@ -1429,6 +2227,10 @@ class SlideRegistry:
         if not quiet:
             st.close_shading()  # waits for the replacement or refresh
         st.busy.close(timeout=None)
+        for p_attr in ("store_path", "source_path"):
+            p_val = getattr(st, p_attr, None)
+            if p_val is not None:
+                render._RAW_CHUNK_CACHE.purge(p_val)
         if st.plate is not None:
             st.plate.close(timeout=None)
         else:
@@ -1507,6 +2309,10 @@ class SlideRegistry:
         for st in states:
             st.close_shading()
             st.busy.close(timeout=None)
+            for p_attr in ("store_path", "source_path"):
+                p_val = getattr(st, p_attr, None)
+                if p_val is not None:
+                    render._RAW_CHUNK_CACHE.purge(p_val)
             if st.plate is not None:
                 st.plate.close(timeout=None)
                 continue
@@ -1835,6 +2641,30 @@ def _sidecar_items(document: Any, *, require_items: bool = False) -> list:
     return items
 
 
+_DISCONNECT_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in (
+        "EPIPE",
+        "ECONNRESET",
+        "ECONNABORTED",
+        "ENOTCONN",
+        "EBADF",
+        "ESHUTDOWN",
+    )
+    if hasattr(errno, name)
+)
+HTTP_MAX_WORKERS = 16
+
+
+def _resolve_http_max_workers() -> int:
+    raw = os.environ.get("ND2WSI_HTTP_MAX_WORKERS")
+    if raw is not None and raw.strip() != "":
+        val = int(raw)
+        if val >= 1:
+            return val
+    return HTTP_MAX_WORKERS
+
+
 def make_handler(
     registry: SlideRegistry, token: str = ""
 ) -> type[BaseHTTPRequestHandler]:
@@ -1843,6 +2673,36 @@ def make_handler(
         server_version = "nd2wsi"
         # Set once a download has sent its status line; reset per request.
         _response_started = False
+
+        def handle_one_request(self) -> None:
+            if getattr(self.server, "_shutting_down", False):
+                self.close_connection = True
+                return
+            try:
+                super().handle_one_request()
+            except (ConnectionError, TimeoutError):
+                self.close_connection = True
+            except OSError as exc:
+                if exc.errno in _DISCONNECT_ERRNOS or getattr(
+                    self.server, "_shutting_down", False
+                ):
+                    self.close_connection = True
+                    return
+                raise
+            if getattr(self.server, "_shutting_down", False):
+                self.close_connection = True
+
+        def finish(self) -> None:
+            try:
+                super().finish()
+            except (ConnectionError, TimeoutError):
+                pass
+            except OSError as exc:
+                if exc.errno in _DISCONNECT_ERRNOS or getattr(
+                    self.server, "_shutting_down", False
+                ):
+                    return
+                raise
 
         # ---- helpers -----------------------------------------------------
         def _discard_rejected_body(self) -> None:
@@ -2062,6 +2922,10 @@ def make_handler(
                     return self._static(path[len("/static/") :])
                 if path == "/api/slides":
                     return self._json({"slides": registry.listing()})
+                if path == "/api/ui-settings" or path.endswith("/api/ui-settings"):
+                    return self._ui_settings_get()
+                if path == "/api/recent-files" or path.endswith("/api/recent-files"):
+                    return self._recent_files_get(q)
                 if path == "/api/roi/progress" or path.endswith("/api/roi/progress"):
                     job = (q.get("job") or [""])[0]
                     if not JOB_RE.match(job):
@@ -2118,7 +2982,7 @@ def make_handler(
                     if st.plate is None:
                         return self._error(404, "not a plate slide")
                     return self._json(st.plate.focus_map())
-                if sub == "/api/roi":
+                if sub in ("/api/roi", "/api/region"):
                     return self._roi(st, q)
                 if sub == "/api/astromap/download":
                     return self._astromap_download(st, q)
@@ -2150,7 +3014,13 @@ def make_handler(
                     return self._close()
                 if path == "/api/trash":
                     return self._trash()
+                if path == "/api/ui-settings" or path.endswith("/api/ui-settings"):
+                    return self._ui_settings_post()
+                if path == "/api/recent-files" or path.endswith("/api/recent-files"):
+                    return self._recent_files_post()
                 st, sub = self._resolve(path)
+                if st is not None and sub == "/api/select-scene":
+                    return self._select_scene(st)
                 if st is not None and sub in ("/api/shading/start", "/api/shading/revoke", "/api/shading/cancel"):
                     try:
                         data = self._body_json(limit=1000)
@@ -2228,6 +3098,13 @@ def make_handler(
                 path = data.get("path") if isinstance(data, dict) else None
                 if not path:
                     return self._error(400, 'expected {"path": "..."}')
+                has_series = isinstance(data, dict) and data.get("series") is not None
+                series_arg: int | None = None
+                if has_series:
+                    raw_s = data["series"]
+                    if isinstance(raw_s, bool) or not isinstance(raw_s, int):
+                        return self._error(400, "series must be an integer")
+                    series_arg = int(raw_s)
                 job = data.get("job") if isinstance(data, dict) else None
                 if job and not JOB_RE.match(str(job)):
                     job = None
@@ -2240,9 +3117,14 @@ def make_handler(
                             job, state="converting", pct=int(min(1.0, frac) * 100)
                         )
 
-                sid = registry.open_path(path, on_progress=on_progress)
+                if has_series:
+                    sid = registry.open_path(path, on_progress=on_progress, series=series_arg)
+                else:
+                    sid = registry.open_path(path, on_progress=on_progress)
                 if job:
                     _job_update(job, state="done", pct=100)
+            except ConnectionError:
+                raise
             except (
                 ValueError,
                 FileNotFoundError,
@@ -2265,6 +3147,129 @@ def make_handler(
             session_log.event("file_open", via="shell", path=str(path),
                               format=Path(str(path)).suffix.lower().lstrip("."),
                               seconds=round(time.monotonic() - began, 2), **fields)
+
+        def _ui_settings_get(self):
+            if registry.agent_window:
+                agent_ui = getattr(registry, "_agent_ui_settings", None)
+                if agent_ui is None:
+                    agent_ui = _load_ui_settings_safe()
+                    registry._agent_ui_settings = dict(agent_ui)
+                return self._json({"ok": True, **agent_ui})
+            settings = _load_ui_settings_safe()
+            return self._json({"ok": True, **settings})
+
+        def _ui_settings_post(self):
+            try:
+                data = self._body_json(limit=65_536)
+                if not isinstance(data, dict):
+                    raise ValueError("expected a JSON object")
+                if registry.agent_window:
+                    current = getattr(registry, "_agent_ui_settings", None)
+                    if current is None:
+                        current = dict(_load_ui_settings_safe())
+                    clean = {k: v for k, v in data.items() if k != "ok"}
+                    if "theme" in clean:
+                        if clean["theme"] not in ("auto", "light", "dark"):
+                            raise ValueError("theme must be 'auto', 'light', or 'dark'")
+                        current["theme"] = clean["theme"]
+                    if "panels" in clean:
+                        if not isinstance(clean["panels"], dict):
+                            raise ValueError("panels must be an object")
+                        current["panels"] = {**current.get("panels", {}), **clean["panels"]}
+                    if "shellToolsExpanded" in clean:
+                        if clean["shellToolsExpanded"] is not None and not isinstance(
+                            clean["shellToolsExpanded"], bool
+                        ):
+                            raise ValueError("shellToolsExpanded must be a boolean or null")
+                        current["shellToolsExpanded"] = clean["shellToolsExpanded"]
+                    registry._agent_ui_settings = current
+                    return self._json({"ok": True, **current})
+                updated = _save_ui_settings_safe(data)
+                return self._json({"ok": True, **updated})
+            except (ValueError, TypeError, json.JSONDecodeError) as e:
+                return self._error(400, str(e))
+            except OSError as e:
+                return self._error(500, f"Could not save UI settings: {e}")
+
+        def _recent_files_get(self, q: dict):
+            raw_limit = (q.get("limit") or ["12"])[0]
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                limit = 12
+            items = _list_recent_files_safe(limit=limit)
+            return self._json({"ok": True, "items": items})
+
+        def _recent_files_post(self):
+            try:
+                data = self._body_json(limit=16_384)
+                if not isinstance(data, dict):
+                    raise ValueError("expected a JSON object")
+                raw_path = data.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    raise ValueError('expected {"path": "..."}')
+                raw_name = data.get("name")
+                name = str(raw_name) if isinstance(raw_name, str) and raw_name.strip() else None
+                role = "agent" if registry.agent_window else "user"
+                items = _record_recent_file_safe(raw_path, name=name, window_role=role)
+                return self._json({"ok": True, "items": items})
+            except (ValueError, TypeError, json.JSONDecodeError) as e:
+                return self._error(400, str(e))
+            except OSError as e:
+                return self._error(500, f"Could not record recent file: {e}")
+
+        def _select_scene(self, st: ViewerState):
+            try:
+                data = self._body_json(limit=10_000)
+                if not isinstance(data, dict) or "series" not in data:
+                    raise ValueError('expected {"series": <int>}')
+                raw_series = data["series"]
+                if isinstance(raw_series, bool) or not isinstance(raw_series, int):
+                    raise ValueError("series must be an integer")
+                target_series = int(raw_series)
+                if st.source_path is None or not st.source_path.is_file():
+                    raise ValueError("original slide source is unavailable for scene selection")
+                series_count, _cur_idx, series_list = _inspect_slide_series(st)
+                if not (0 <= target_series < series_count):
+                    raise ValueError(
+                        f"series {target_series} out of range (0..{series_count - 1})"
+                    )
+                new_sid = registry.open_path(st.source_path, series=target_series)
+                new_st = registry.get(new_sid)
+                base_name = (
+                    new_st.attrs["nd2wsi"]["source"]
+                    if new_st is not None
+                    else st.source_path.name
+                )
+                scene_name = (
+                    series_list[target_series]["name"]
+                    if target_series < len(series_list)
+                    else ""
+                )
+                display_name = (
+                    f"{base_name} · {scene_name}"
+                    if (series_count > 1 and scene_name)
+                    else base_name
+                )
+                return self._json(
+                    {
+                        "ok": True,
+                        "sid": new_sid,
+                        "name": display_name,
+                        "url": f"/s/{new_sid}/",
+                    }
+                )
+            except ConnectionError:
+                raise
+            except (
+                ValueError,
+                FileNotFoundError,
+                OSError,
+                NotImplementedError,
+                RuntimeError,
+                json.JSONDecodeError,
+            ) as e:
+                return self._error(400, str(e))
 
         def _trash(self):
             if registry.window_session is not None:
@@ -2326,6 +3331,31 @@ def make_handler(
         def _info_payload(self, st: ViewerState) -> dict[str, Any]:
             meta = st.attrs["nd2wsi"]
             lv0 = meta["levels"][0]
+            is_raster = bool(meta.get("raster", False))
+            try:
+                dtype_name = np.dtype(meta["dtype"]).name
+            except Exception:
+                dtype_name = str(meta.get("dtype") or "")
+            limnd2_ok = _limnd2_available()
+            nd2_export = bool(
+                limnd2_ok and not is_raster and dtype_name in ("uint8", "uint16")
+            )
+            if nd2_export:
+                nd2_export_reason = ""
+            elif is_raster:
+                nd2_export_reason = (
+                    "ND2 export is unavailable for JPEG and PNG images; use TIFF export instead."
+                )
+            elif dtype_name not in ("uint8", "uint16"):
+                nd2_export_reason = (
+                    f"ND2 export supports 8-bit and 16-bit integer images (this slide is {dtype_name}); "
+                    "use TIFF export to preserve native values."
+                )
+            else:
+                nd2_export_reason = (
+                    "ND2 export requires the optional limnd2 package; use TIFF export instead."
+                )
+            series_count, series_index, series_list = _inspect_slide_series(st)
             return {
                 "name": meta["source"],
                 **({"window": registry.window_session.as_dict()} if registry.window_session is not None else {}),
@@ -2348,14 +3378,18 @@ def make_handler(
                     for ch in st.attrs["omero"]["channels"]
                 ],
                 "maxRenderMpx": st.max_render_mpx,
-                "nd2Export": _limnd2_available() and not meta.get("raster", False),
-                "raster": bool(meta.get("raster")),
+                "nd2Export": nd2_export,
+                "nd2ExportReason": nd2_export_reason,
+                "raster": is_raster,
                 "direct": bool(meta.get("direct")),
                 "trashable": st.trash_path is not None and registry.window_session is None,
                 "generation": st.generation,
                 "storage": _storage_mode(meta),
                 "kind": "plate" if meta.get("plate") else "slide",
                 "plate": self._plate_block(st),
+                "seriesCount": series_count,
+                "seriesIndex": series_index,
+                "seriesList": series_list,
             }
 
         def _plate_block(self, st: ViewerState) -> dict[str, Any] | None:
@@ -2705,14 +3739,15 @@ def make_handler(
             n = len(st.attrs["omero"]["channels"])
             channels = render.parse_channels((q.get("c") or [None])[0], n)
             win = (q.get("win") or [None])[0]
+            col = (q.get("col") or [None])[0]
             try:
                 frame = _frame_args(st, q)
             except ValueError as e:
                 return self._error(400, str(e))
             root = st.plate.root_for(*frame) if frame is not None else st.root
             try:
-                body = render.render_tile(
-                    root, st.attrs, level, tx, ty, channels, fmt, win
+                body = _render_tile_compat(
+                    root, st.attrs, level, tx, ty, channels, fmt, win, col
                 )
             except KeyError as e:
                 return self._error(404, str(e))
@@ -2720,6 +3755,11 @@ def make_handler(
                 return self._error(409, str(e))
             ctype = "image/jpeg" if fmt in ("jpg", "jpeg") else "image/png"
             self._send(200, body, ctype, cache=self._immutable_when_current(st, q))
+            if frame is not None and st.plate is not None and hasattr(st.plate, "prefetch_neighbors"):
+                try:
+                    st.plate.prefetch_neighbors(*frame)
+                except Exception:  # pragma: no cover - prefetch never reaches a client
+                    pass
 
         def _plate_frame(self, st: ViewerState, m: re.Match, q: dict):
             """A reduced frame of one site for the grid."""
@@ -2740,8 +3780,9 @@ def make_handler(
             n = len(st.attrs["omero"]["channels"])
             channels = render.parse_channels((q.get("c") or [None])[0], n)
             win = (q.get("win") or [None])[0]
+            col = (q.get("col") or [None])[0]
             try:
-                body = plate.render_frame(t, p, z, k, channels, fmt, win)
+                body = _render_plate_frame_compat(plate, t, p, z, k, channels, fmt, win, col)
             except ValueError as e:
                 if "closed" in str(e):
                     return self._error(409, "slide was closed")
@@ -2812,11 +3853,13 @@ def make_handler(
 
         def _roi_impl(self, st: ViewerState, q: dict):
             from contextlib import nullcontext
+            from dataclasses import replace as _dc_replace
 
             prefix = (
                 f"agent-{registry.window_session.id[:12]}_"
                 if registry.agent_window else ""
             )
+            col = (q.get("col") or [None])[0]
             try:
                 export = prepare_export(st, q, resolve_frame=_frame_args, filename_prefix=prefix)
                 # Scale-strip previews and size samples are api/roi reads too.
@@ -2833,6 +3876,49 @@ def make_handler(
                                 filename=artifact.filename,
                             )
                         return
+                    if col:
+                        if _accepts_kwarg(render.export_roi_rendered, "col"):
+                            if export.fmt not in ("png", "jpg", "jpeg", "svg"):
+                                raise ExportRequestError(f"unknown format {export.fmt}")
+                            if export.w * export.h / 1e6 > export.max_render_mpx:
+                                export.rendered()
+                            try:
+                                body = render.export_roi_rendered(
+                                    export.root,
+                                    export.attrs,
+                                    export.level,
+                                    export.x,
+                                    export.y,
+                                    export.w,
+                                    export.h,
+                                    export.channels,
+                                    export.fmt,
+                                    export.window,
+                                    scale_bar=export.scale_bar,
+                                    col=col,
+                                )
+                            except ValueError as exc:
+                                raise ExportRequestError(str(exc)) from exc
+                            ext = "jpg" if export.fmt == "jpeg" else export.fmt
+                            ctype = {
+                                "png": "image/png",
+                                "jpg": "image/jpeg",
+                                "svg": "image/svg+xml",
+                            }[ext]
+                            suffix = "_scalebar" if export.scale_bar else ""
+                            return self._send(
+                                200,
+                                body,
+                                ctype,
+                                {
+                                    "Content-Disposition": content_disposition(
+                                        f"{export.filename}{suffix}.{ext}"
+                                    )
+                                },
+                            )
+                        export = _dc_replace(
+                            export, attrs=_attrs_with_colors(export.attrs, col)
+                        )
                     artifact = export.rendered()
                     return self._send(
                         200, artifact.body, artifact.content_type,
@@ -2883,6 +3969,122 @@ def create_server(
         # stdlib default backlog of 5 resets the overflow at the kernel.
         request_queue_size = 64
         daemon_threads = True
+        max_workers = _resolve_http_max_workers()
+
+        def __init__(self, *args, **kwargs):
+            self._pool_lock = threading.Lock()
+            self._shutting_down = False
+            self._pool_closed = False
+            self._pending_sockets: dict[Any, Any] = {}
+            self._active_sockets: set[Any] = set()
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers,
+                thread_name_prefix="nd2wsi-http",
+            )
+            super().__init__(*args, **kwargs)
+
+        def server_bind(self) -> None:
+            # Bypass HTTPServer.server_bind()'s socket.getfqdn(host) reverse DNS /
+            # mDNS lookup, which blocks 5s+ per server on offline Macs and macOS CI VMs.
+            socketserver.TCPServer.server_bind(self)
+            host, port = self.server_address[:2]
+            self.server_name = str(host) if host else "127.0.0.1"
+            self.server_port = int(port)
+
+        def process_request(self, request, client_address) -> None:
+            with self._pool_lock:
+                if self._shutting_down or self._pool_closed:
+                    abort = True
+                else:
+                    abort = False
+                    key = object()
+                    self._pending_sockets[key] = request
+                    try:
+                        self._executor.submit(
+                            self._run_pooled_request, key, request, client_address
+                        )
+                    except RuntimeError:
+                        self._pending_sockets.pop(key, None)
+                        abort = True
+            if abort:
+                self.shutdown_request(request)
+
+        def _run_pooled_request(self, key: Any, request, client_address) -> None:
+            with self._pool_lock:
+                if self._pending_sockets.pop(key, None) is None:
+                    return
+                if self._shutting_down or self._pool_closed:
+                    abort = True
+                else:
+                    abort = False
+                    self._active_sockets.add(request)
+            if abort:
+                try:
+                    self.shutdown_request(request)
+                except Exception:
+                    pass
+                return
+            try:
+                self.process_request_thread(request, client_address)
+            finally:
+                with self._pool_lock:
+                    self._active_sockets.discard(request)
+
+        def handle_error(self, request, client_address) -> None:
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionError, TimeoutError)):
+                return
+            if isinstance(exc, OSError) and (
+                self._shutting_down or exc.errno in _DISCONNECT_ERRNOS
+            ):
+                return
+            super().handle_error(request, client_address)
+
+        def _drop_queued_requests(self) -> None:
+            with self._pool_lock:
+                self._shutting_down = True
+                queued = list(self._pending_sockets.values())
+                self._pending_sockets.clear()
+            for req in queued:
+                try:
+                    self.shutdown_request(req)
+                except Exception:
+                    pass
+
+        def _shutdown_pool(self) -> None:
+            import socket as _socket
+
+            with self._pool_lock:
+                self._shutting_down = True
+                already_closed = self._pool_closed
+                self._pool_closed = True
+                queued = list(self._pending_sockets.values())
+                self._pending_sockets.clear()
+                active = list(self._active_sockets)
+            if not already_closed:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            for req in queued:
+                try:
+                    self.shutdown_request(req)
+                except Exception:
+                    pass
+            for req in active:
+                try:
+                    req.shutdown(_socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                if os.name == "nt":
+                    # On Windows Winsock, shutdown(SD_BOTH) does not wake a thread
+                    # blocked in recv() on an idle keep-alive socket, and socket.close()
+                    # defers _real_close() while BaseHTTPRequestHandler.rfile holds _io_refs > 0.
+                    try:
+                        req._real_close()
+                    except Exception:
+                        pass
+            cur = threading.current_thread()
+            for worker in list(getattr(self._executor, "_threads", ())):
+                if worker is not cur and worker.is_alive():
+                    worker.join(timeout=5.0)
 
         def _close_registry(self) -> None:
             if getattr(self, "_registry_closed", False):
@@ -2892,6 +4094,7 @@ def create_server(
             registry.close_all(immediate=True)
 
         def shutdown(self) -> None:
+            self._drop_queued_requests()
             super().shutdown()
             self._close_registry()
 
@@ -2902,6 +4105,7 @@ def create_server(
             sources after it. The release goes on, and calling this again
             waits for it again.
             """
+            self._drop_queued_requests()
             super().shutdown()
             if not getattr(self, "_registry_closed", False):
                 self._registry_closed = self._released_for_relaunch = True
@@ -2910,6 +4114,7 @@ def create_server(
                 registry.close_all_for_relaunch(timeout=timeout)
 
         def server_close(self) -> None:
+            self._shutdown_pool()
             self._close_registry()
             super().server_close()
 

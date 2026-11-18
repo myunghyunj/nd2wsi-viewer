@@ -7,15 +7,17 @@ Keep the matching checksum supplied beside this ZIP.
 1. Right-click the ZIP, choose Extract All, and extract it to a folder on
    this computer (not a network drive).
 2. Open nd2wsi-viewer.exe in the extracted nd2wsi-viewer folder.
-3. Use Open to select an ND2 or SVS image. You can also open a file with
-   nd2wsi-viewer.exe from Windows' Open with menu.
+3. Drop a slide onto the window or use + / Open to select an ND2, CZI, LIF,
+   OME-TIFF / TIFF, SVS, SDPC, ND2SVS, JPG, or PNG file. You can also open
+   a file with nd2wsi-viewer.exe from Windows' Open with menu.
 
 Keep the _internal folder beside the EXE. Do not run the EXE inside the ZIP.
 
 If the viewer reports "Failed to resolve Python.Runtime.Loader.Initialize",
 Windows blocked the extracted files: right-click the ZIP, choose Properties,
 tick Unblock, then extract the whole ZIP again to a folder on this computer.
-Python, Nikon NIS-Elements, CUDA, and a dedicated graphics card are not needed.
+Python, vendor microscope software (NIS-Elements, ZEN, LAS X), CUDA, and a
+dedicated graphics card are not needed.
 Image reading and export run on the CPU.
 
 Supported target: current Windows 11, Intel/AMD x64 or ARM64.

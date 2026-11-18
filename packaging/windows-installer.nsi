@@ -41,6 +41,10 @@ ManifestDPIAware true
 !define PRODUCT_ID "nd2wsi-viewer.windows.x64.current-user"
 !define MARKER ".nd2wsi-install.ini"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer"
+!define PROG_ID "nd2wsi-viewer.Slide"
+!define CAPABILITIES_KEY "Software\nd2wsi-viewer\Capabilities"
+!define REGISTERED_APPS_KEY "Software\RegisteredApplications"
+!define APP_REG_KEY "Software\Classes\Applications\${APP_EXE}"
 !define WEBVIEW2_KEY "Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
 Name "${APP_NAME} ${APP_VERSION}"
@@ -67,7 +71,7 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "nd2wsi-viewer contributors"
 !endif
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "Install nd2wsi-viewer ${APP_VERSION}"
-!define MUI_WELCOMEPAGE_TEXT "View microscopy images with nd2wsi-viewer.$\r$\n$\r$\nSetup installs the app for your Windows account. Close nd2wsi-viewer before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64. Windows 10 Education is supported. ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. If WebView2 Runtime is missing, Setup can download it from Microsoft using an Internet connection."
+!define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with nd2wsi-viewer.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close nd2wsi-viewer before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. If WebView2 Runtime is missing, Setup can download it from Microsoft using an Internet connection."
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
 !define MUI_PAGE_CUSTOMFUNCTION_LEAVE VerifyDirectoryPage
@@ -139,6 +143,20 @@ Var ProcessCheckedCount
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "EstimatedSize" ${PAYLOAD_SIZE_KIB}
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
+!macroend
+
+!macro ND2WSI_REGISTER_EXTENSION EXT
+  WriteRegStr HKCU "${CAPABILITIES_KEY}\FileAssociations" "${EXT}" "${PROG_ID}"
+  WriteRegStr HKCU "${APP_REG_KEY}\SupportedTypes" "${EXT}" ""
+  WriteRegStr HKCU "Software\Classes\${EXT}\OpenWithProgids" "${PROG_ID}" ""
+!macroend
+
+!macro ND2WSI_UNREGISTER_EXTENSION EXT
+  DeleteRegValue HKCU "Software\Classes\${EXT}\OpenWithProgids" "${PROG_ID}"
+  Push "Software\Classes\${EXT}\OpenWithProgids"
+  Call un.DeleteKeyIfTrulyEmpty
+  Push "Software\Classes\${EXT}"
+  Call un.DeleteKeyIfTrulyEmpty
 !macroend
 
 ; Shared checks exist in both executable contexts. No process is terminated.
@@ -515,9 +533,12 @@ Function .onInit
     !insertmacro ND2WSI_TRACE "" "Abort phase=.onInit guard=$GuardError"
     Abort
   ${EndIf}
-  ${If} ${IsServerOS}
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=This installer supports Windows 10 and 11 desktop editions, including Education. Windows Server editions are not supported."
-    MessageBox MB_OK|MB_ICONSTOP "This installer supports Windows 10 and 11 desktop editions, including Education. Windows Server editions are not supported." /SD IDOK
+  ReadRegStr $0 HKLM "Software\Microsoft\Windows NT\CurrentVersion" "InstallationType"
+  !insertmacro ND2WSI_TRACE "" ".onInit.installation_type value=$0"
+  ${If} $0 == "Server Core"
+  ${OrIf} $0 == "Nano Server"
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=nd2wsi-viewer requires a Windows desktop shell (Windows 10/11 or Windows Server with Desktop Experience). Headless Server Core editions are not supported."
+    MessageBox MB_OK|MB_ICONSTOP "nd2wsi-viewer requires a Windows desktop shell (Windows 10/11 or Windows Server with Desktop Experience). Headless Server Core editions are not supported." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "" "Abort phase=.onInit guard=$GuardError"
     Abort
@@ -923,6 +944,35 @@ Function FailInitialRecords
   Abort
 FunctionEnd
 
+Function WriteFileAssociations
+  !insertmacro ND2WSI_TRACE "" "WriteFileAssociations.begin instdir=$INSTDIR"
+  SetRegView 64
+  ClearErrors
+  WriteRegStr HKCU "Software\Classes\${PROG_ID}" "" "Microscopy Slide or Image (nd2wsi-viewer)"
+  WriteRegStr HKCU "Software\Classes\${PROG_ID}\DefaultIcon" "" "$INSTDIR\${APP_EXE},0"
+  WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell" "" "open"
+  WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell\open" "" "Open with nd2wsi-viewer"
+  WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+  WriteRegStr HKCU "${APP_REG_KEY}" "FriendlyAppName" "${APP_NAME}"
+  WriteRegStr HKCU "${APP_REG_KEY}\DefaultIcon" "" "$INSTDIR\${APP_EXE},0"
+  WriteRegStr HKCU "${APP_REG_KEY}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+  WriteRegStr HKCU "${CAPABILITIES_KEY}" "ApplicationName" "${APP_NAME}"
+  WriteRegStr HKCU "${CAPABILITIES_KEY}" "ApplicationDescription" "Local whole-slide and confocal microscopy viewer for ND2, CZI, LIF, OME-TIFF, TIFF, QPTIFF, SVS, SDPC, and ND2SVS"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".nd2"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".czi"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".lif"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".tif"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".tiff"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".qptiff"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".svs"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".sdpc"
+  !insertmacro ND2WSI_REGISTER_EXTENSION ".nd2svs"
+  WriteRegStr HKCU "${REGISTERED_APPS_KEY}" "${APP_NAME}" "${CAPABILITIES_KEY}"
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
+  ClearErrors
+  !insertmacro ND2WSI_TRACE "" "WriteFileAssociations.complete"
+FunctionEnd
+
 Section "nd2wsi-viewer (required)" SecApplication
   SectionIn RO
   !insertmacro ND2WSI_TRACE "" "SecApplication.begin instdir=$INSTDIR"
@@ -1008,11 +1058,13 @@ Section "nd2wsi-viewer (required)" SecApplication
   CreateDirectory "$SMPROGRAMS\nd2wsi-viewer"
   CreateShortcut "$SMPROGRAMS\nd2wsi-viewer\nd2wsi-viewer.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
   CreateShortcut "$SMPROGRAMS\nd2wsi-viewer\Uninstall nd2wsi-viewer.lnk" "$INSTDIR\Uninstall.exe"
+  Call WriteFileAssociations
   !insertmacro ND2WSI_TRACE "" "SecApplication.complete"
 SectionEnd
 
 Section "Desktop shortcut" SecDesktop
   SetOutPath "$INSTDIR"
+  CreateDirectory "$DESKTOP"
   CreateShortcut "$DESKTOP\nd2wsi-viewer.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
 SectionEnd
 
@@ -1187,6 +1239,55 @@ Function un.RestoreRetryRecords
   ${EndIf}
 FunctionEnd
 
+Function un.DeleteKeyIfTrulyEmpty
+  ; Delete HKCU subkey ONLY when it has zero child subkeys AND zero values,
+  ; preserving any preexisting handlers or OpenWithProgids registered by other apps.
+  Exch $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  System::Call 'advapi32::RegOpenKeyExW(p 0x80000001, w "$R0", i 0, i 0x20119, *p.R1)i.R2'
+  ${If} $R2 == 0
+    System::Call 'advapi32::RegQueryInfoKeyW(p R1, p 0, p 0, p 0, *i.R3, p 0, p 0, *i.R4, p 0, p 0, p 0, p 0)i.R2'
+    System::Call 'advapi32::RegCloseKey(p R1)'
+    ${If} $R2 == 0
+    ${AndIf} $R3 == 0
+    ${AndIf} $R4 == 0
+      DeleteRegKey /ifempty HKCU "$R0"
+    ${EndIf}
+  ${EndIf}
+  ClearErrors
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+FunctionEnd
+
+Function un.RemoveFileAssociations
+  !insertmacro ND2WSI_TRACE "un." "RemoveFileAssociations.begin"
+  SetRegView 64
+  DeleteRegValue HKCU "${REGISTERED_APPS_KEY}" "${APP_NAME}"
+  DeleteRegKey HKCU "${CAPABILITIES_KEY}"
+  Push "Software\nd2wsi-viewer"
+  Call un.DeleteKeyIfTrulyEmpty
+  DeleteRegKey HKCU "Software\Classes\${PROG_ID}"
+  DeleteRegKey HKCU "${APP_REG_KEY}"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".nd2"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".czi"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".lif"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".tif"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".tiff"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".qptiff"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".svs"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".sdpc"
+  !insertmacro ND2WSI_UNREGISTER_EXTENSION ".nd2svs"
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
+  ClearErrors
+  !insertmacro ND2WSI_TRACE "un." "RemoveFileAssociations.complete"
+FunctionEnd
+
 Function un.onInit
   Call un.InitInstallerLog
   !insertmacro ND2WSI_TRACE "un." "un.onInit.begin instdir=$INSTDIR exepath=$EXEPATH"
@@ -1254,6 +1355,7 @@ Section "Uninstall"
   ${If} $UninstallHadErrors != 0
     Goto removal_failed
   ${EndIf}
+  Call un.RemoveFileAssociations
   ; Do not remove either retry record until all payload/shortcut removals
   ; have succeeded. A path-bound marker can authorize a retry after the
   ; registration is removed but before the following cleanup completes.

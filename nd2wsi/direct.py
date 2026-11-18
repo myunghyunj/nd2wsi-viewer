@@ -15,7 +15,10 @@ nothing to do.
 
 from __future__ import annotations
 
+import math
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -97,30 +100,71 @@ class _Nd2Level0:
     touched in almost every case.
     """
 
-    def __init__(self, view: np.ndarray, life: _Lifecycle, path: str | Path):
+    _STAT_TTL_S = 0.1
+
+    def __init__(
+        self,
+        view: np.ndarray,
+        life: _Lifecycle,
+        path: str | Path,
+        *,
+        fd: int | None = None,
+    ):
         self._view = view
         self._life = life
         self._path = str(path)
+        self._fd = fd if isinstance(fd, int) and fd >= 0 else None
         st = os.stat(path)
         self._ident = (st.st_size, st.st_mtime_ns)
+        self._stat_lock = threading.Lock()
+        self._last_stat_at = -math.inf
         self.shape = tuple(view.shape)
         self.dtype = view.dtype
+
+    def _verify_source(self) -> None:
+        now = time.monotonic()
+        with self._stat_lock:
+            recent = (now - self._last_stat_at) < self._STAT_TTL_S
+        if recent:
+            if self._fd is not None:
+                try:
+                    fst = os.fstat(self._fd)
+                except OSError:
+                    pass
+                else:
+                    if os.name != "nt" and getattr(fst, "st_nlink", 1) == 0:
+                        raise ValueError(
+                            "the source file is unreachable (deleted); "
+                            "close and reopen the slide"
+                        )
+                    if (fst.st_size, fst.st_mtime_ns) != self._ident:
+                        raise ValueError(
+                            "the source file changed while it was open; "
+                            "close and reopen the slide"
+                        )
+                    return
+            else:
+                return
+        try:
+            st = os.stat(self._path)
+        except OSError as e:
+            raise ValueError(
+                f"the source file is unreachable ({e.strerror}); "
+                "close and reopen the slide"
+            ) from e
+        if (st.st_size, st.st_mtime_ns) != self._ident:
+            raise ValueError(
+                "the source file changed while it was open; "
+                "close and reopen the slide"
+            )
+        with self._stat_lock:
+            if now > self._last_stat_at:
+                self._last_stat_at = now
 
     def __getitem__(self, idx: Any) -> np.ndarray:
         cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
         with self._life:
-            try:
-                st = os.stat(self._path)
-            except OSError as e:
-                raise ValueError(
-                    f"the source file is unreachable ({e.strerror}); "
-                    "close and reopen the slide"
-                ) from e
-            if (st.st_size, st.st_mtime_ns) != self._ident:
-                raise ValueError(
-                    "the source file changed while it was open; "
-                    "close and reopen the slide"
-                )
+            self._verify_source()
             return self._view[cs, y0:y1, x0:x1].copy()
 
 
@@ -325,7 +369,14 @@ def open_nd2_backed(
             )
 
         life = _Lifecycle()
-        raw_level0 = _Nd2Level0(view, life, slide)
+        raw_fd: int | None = None
+        try:
+            fh = getattr(getattr(f, "_rdr", None), "_fh", None)
+            if fh is not None and hasattr(fh, "fileno"):
+                raw_fd = int(fh.fileno())
+        except Exception:
+            raw_fd = None
+        raw_level0 = _Nd2Level0(view, life, slide, fd=raw_fd)
         levels: dict[str, Any] = {"0": raw_level0}
         if (manifest.get("format") == "nd2wsi-cache/5"
                 or manifest.get("h_correction") is not None or meta.get("h_correction") is not None):

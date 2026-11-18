@@ -268,6 +268,190 @@ jobs:
         run: |
           .venv/Scripts/python.exe packaging/build_windows.py --smoke-file docs/example_cell.nd2 --webview2-fixed-runtime "$env:ND2WSI_WEBVIEW2_FIXED_RUNTIME"
           if ($LASTEXITCODE -ne 0) { throw 'Windows build or packaged smoke failed' }
+      - name: Prepare NSIS compiler and Microsoft WebView2 bootstrapper
+        id: installer-prereqs
+        shell: pwsh
+        run: |
+          $makensis = @(
+            (Get-Command makensis.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+            'C:\Program Files (x86)\NSIS\makensis.exe',
+            'C:\Program Files\NSIS\makensis.exe'
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $makensis) {
+            choco install nsis --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'NSIS installation via Chocolatey failed' }
+            $makensis = @(
+              'C:\Program Files (x86)\NSIS\makensis.exe',
+              'C:\Program Files\NSIS\makensis.exe',
+              (Get-Command makensis.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+            ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          }
+          if (-not $makensis) { throw 'makensis.exe was not found after installation' }
+          $inputsDir = Join-Path $env:RUNNER_TEMP 'installer-inputs'
+          New-Item -ItemType Directory -Force -Path $inputsDir | Out-Null
+          $bootstrapper = Join-Path $inputsDir 'MicrosoftEdgeWebview2Setup.exe'
+          Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $bootstrapper
+          $signature = Get-AuthenticodeSignature -LiteralPath $bootstrapper
+          if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
+            throw 'Downloaded WebView2 bootstrapper does not have a valid Microsoft Corporation Authenticode signature'
+          }
+          $webview2Sha = (Get-FileHash -LiteralPath $bootstrapper -Algorithm SHA256).Hash.ToLowerInvariant()
+          "makensis=$makensis" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "bootstrapper=$bootstrapper" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "webview2_sha256=$webview2Sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Configure optional Authenticode signing
+        id: authenticode
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          WINDOWS_SIGN_THUMBPRINT: ${{ secrets.WINDOWS_SIGN_THUMBPRINT }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+          WINDOWS_REQUIRE_SIGNING: ${{ vars.WINDOWS_REQUIRE_SIGNING }}
+        run: |
+          if ($env:WINDOWS_CERT_PFX_BASE64) {
+            $pfxDir = Join-Path $env:RUNNER_TEMP 'authenticode'
+            New-Item -ItemType Directory -Force -Path $pfxDir | Out-Null
+            $pfxPath = Join-Path $pfxDir 'windows-signing.pfx'
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64.Trim()))
+            "WINDOWS_SIGN_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            if ($env:WINDOWS_CERT_PASSWORD) {
+              "WINDOWS_SIGN_PFX_PASSWORD=$($env:WINDOWS_CERT_PASSWORD)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+            if ($env:WINDOWS_TIMESTAMP_URL) {
+              "WINDOWS_TIMESTAMP_URL=$($env:WINDOWS_TIMESTAMP_URL)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+            "signing=authenticode" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+          elseif ($env:WINDOWS_SIGN_THUMBPRINT) {
+            "WINDOWS_SIGN_THUMBPRINT=$($env:WINDOWS_SIGN_THUMBPRINT.Trim())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            if ($env:WINDOWS_TIMESTAMP_URL) {
+              "WINDOWS_TIMESTAMP_URL=$($env:WINDOWS_TIMESTAMP_URL)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+            "signing=authenticode" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+          else {
+            if (($env:WINDOWS_REQUIRE_SIGNING -as [string]).Trim().ToLowerInvariant() -in @('1', 'true', 'yes', 'on')) {
+              throw 'WINDOWS_REQUIRE_SIGNING is enabled, but neither WINDOWS_CERT_PFX_BASE64 nor WINDOWS_SIGN_THUMBPRINT is configured'
+            }
+            "signing=unsigned" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+      - name: Build the per-user NSIS Windows installer
+        id: build-installer
+        shell: pwsh
+        env:
+          MAKENSIS_EXE: ${{ steps.installer-prereqs.outputs.makensis }}
+          WEBVIEW2_BOOTSTRAPPER: ${{ steps.installer-prereqs.outputs.bootstrapper }}
+          WEBVIEW2_SHA256: ${{ steps.installer-prereqs.outputs.webview2_sha256 }}
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath dist/windows -Filter 'nd2wsi-viewer-*-windows-x64.zip')
+          if ($archives.Count -ne 1) { throw 'Expected exactly one portable ZIP before building NSIS installer' }
+          $portableZip = $archives[0].FullName
+          $expectedPortableSha = ((Get-Content -LiteralPath "$portableZip.sha256" -Raw).Trim() -split '\s+')[0]
+          $actualPortableSha = (Get-FileHash -LiteralPath $portableZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualPortableSha -cne $expectedPortableSha) { throw 'Portable ZIP checksum mismatch before NSIS build' }
+          $installerName = (.venv/Scripts/python.exe -c "import sys, tomllib; sys.path.insert(0, 'packaging'); import build_windows_installer as b; v = tomllib.loads(open('pyproject.toml', encoding='utf-8').read())['project']['version']; print(b.installer_name(v))").Trim()
+          $setupExe = Join-Path (Resolve-Path -LiteralPath dist/windows).Path $installerName
+          $nsisWork = Join-Path $env:RUNNER_TEMP 'nsis-work'
+          .venv/Scripts/python.exe packaging/build_windows_installer.py `
+            --archive $portableZip `
+            --expected-sha256 $expectedPortableSha `
+            --makensis $env:MAKENSIS_EXE `
+            --webview2-bootstrapper $env:WEBVIEW2_BOOTSTRAPPER `
+            --webview2-sha256 $env:WEBVIEW2_SHA256 `
+            --icon build/windows/AppIcon.ico `
+            --work $nsisWork `
+            --output $setupExe
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS Windows installer build failed' }
+          if ((Get-FileHash -LiteralPath $portableZip -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedPortableSha) {
+            throw 'NSIS build altered the verified portable ZIP'
+          }
+          "setup_exe=$setupExe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Smoke-verify the NSIS installer silent install and clean uninstall
+        shell: pwsh
+        env:
+          SETUP_EXE: ${{ steps.build-installer.outputs.setup_exe }}
+          WEBVIEW2_BOOTSTRAPPER: ${{ steps.installer-prereqs.outputs.bootstrapper }}
+          WEBVIEW2_SHA256: ${{ steps.installer-prereqs.outputs.webview2_sha256 }}
+        run: |
+          $payloadManifest = [IO.Path]::ChangeExtension($env:SETUP_EXE, '.payload.json')
+          $buildManifest = [IO.Path]::ChangeExtension($env:SETUP_EXE, '.build.json')
+          ./packaging/verify_windows_installer.ps1 `
+            -Installer $env:SETUP_EXE `
+            -PayloadManifest $payloadManifest `
+            -BuildManifest $buildManifest `
+            -SmokeFile docs/example_cell.nd2 `
+            -ResultsDir dist/windows/installer-smoke `
+            -WebView2Bootstrapper $env:WEBVIEW2_BOOTSTRAPPER `
+            -WebView2BootstrapperSha256 $env:WEBVIEW2_SHA256 `
+            -Quick
+      - name: Record Windows release build and signing metadata
+        shell: python
+        env:
+          SETUP_EXE: ${{ steps.build-installer.outputs.setup_exe }}
+        run: |
+          import hashlib, json, os, platform, runpy, subprocess, tomllib
+          from pathlib import Path
+
+          def sha256(path: Path) -> str:
+              with path.open("rb") as handle:
+                  return hashlib.file_digest(handle, "sha256").hexdigest()
+
+          root = Path.cwd()
+          output = root / "dist" / "windows"
+          version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          edition_path = root / "nd2wsi" / "edition.py"
+          edition = runpy.run_path(str(edition_path)) if edition_path.is_file() else None
+          release_version = edition["release_version"](version) if edition else version
+          portable_zip = output / f"nd2wsi-viewer-{release_version}-windows-x64.zip"
+          setup_exe = Path(os.environ["SETUP_EXE"])
+          sdpc_sources = output / "sdpc-codec-sources-windows-x64.zip"
+          build_report = json.loads(setup_exe.with_suffix(".build.json").read_text(encoding="utf-8"))
+          smoke_report_path = output / "installer-smoke" / "installer-verification.json"
+          smoke_report = json.loads(smoke_report_path.read_text(encoding="utf-8"))
+          assert smoke_report.get("state") == "complete", smoke_report
+          source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          sdpc_manifest = Path(os.environ["ND2WSI_SDPC_CODEC_MANIFEST"])
+          fixture_sha = sha256(root / "docs" / "example_cell.nd2")
+          signing_info = build_report["signing"]
+          signing_status = "authenticode" if signing_info["signed"] else "unsigned"
+          artifacts = {}
+          for artifact in (portable_zip, setup_exe, sdpc_sources):
+              digest = sha256(artifact)
+              sidecar = Path(str(artifact) + ".sha256")
+              expected = sidecar.read_text(encoding="ascii").strip().split()[0]
+              assert digest == expected, f"Checksum mismatch for {artifact.name}"
+              artifacts[artifact.name] = {"sha256": digest, "bytes": artifact.stat().st_size}
+          proof = {
+              "source_sha": source_sha,
+              "version": release_version,
+              **({"package_version": version, "edition": edition["NAME"], "updates_off": edition["UPDATES_OFF"]} if edition else {}),
+              "platform": platform.platform(),
+              "architecture": "x64",
+              "python": platform.python_version(),
+              "run_url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "signing": signing_status,
+              "installer_signing": signing_status,
+              "portable_signing": "unsigned",
+              "signing_details": signing_info,
+              "installer": {
+                  "filename": setup_exe.name,
+                  "sha256": build_report["installer_sha256"],
+                  "bytes": build_report["installer_bytes"],
+                  "compiler_version": build_report["compiler_version"],
+                  "payload_file_count": build_report["payload_file_count"],
+                  "per_user_install": True,
+                  "uac_elevation": False,
+                  "verification": "passed",
+                  "smoke_report_sha256": sha256(smoke_report_path),
+              },
+              "sdpc_manifest_sha256": sha256(sdpc_manifest),
+              "smoke_fixture_sha256": fixture_sha,
+              "packaged_headless_and_gui_smoke": "passed",
+              "artifacts": artifacts,
+          }
+          (output / "build-info.json").write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-portable
@@ -278,6 +462,31 @@ jobs:
           retention-days: 30
           # The ZIP is already deflated.
           compression-level: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-installer
+          path: |
+            dist/windows/nd2wsi-viewer-*-windows-x64-setup.exe
+            dist/windows/nd2wsi-viewer-*-windows-x64-setup.exe.sha256
+            dist/windows/nd2wsi-viewer-*-windows-x64-setup.build.json
+            dist/windows/nd2wsi-viewer-*-windows-x64-setup.payload.json
+            dist/windows/build-info.json
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-release
+          path: |
+            dist/windows/nd2wsi-viewer-*-windows-x64-setup.exe
+            dist/windows/nd2wsi-viewer-*-windows-x64-setup.exe.sha256
+            dist/windows/nd2wsi-viewer-*-windows-x64.zip
+            dist/windows/nd2wsi-viewer-*-windows-x64.zip.sha256
+            dist/windows/sdpc-codec-sources-windows-x64.zip
+            dist/windows/sdpc-codec-sources-windows-x64.zip.sha256
+            dist/windows/build-info.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
       - uses: actions/upload-artifact@v4
         with:
           name: sdpc-codec-sources-windows-x64
@@ -293,10 +502,24 @@ jobs:
           if-no-files-found: error
           retention-days: 3
       - uses: actions/upload-artifact@v4
+        with:
+          name: windows-webview2-bootstrapper
+          path: ${{ steps.installer-prereqs.outputs.bootstrapper }}
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: windows-build-evidence
           path: dist/windows/build-smoke/
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-installer-evidence
+          path: |
+            dist/windows/installer-smoke/
+            dist/windows/*.compile.log
           retention-days: 30
       # A pull request or main push that found no entry caches its source-built
       # decoder, and only after the packaged SDPC smoke passed. Caching is best
@@ -332,6 +555,14 @@ jobs:
         with:
           path: ${{ runner.temp }}/sdpc-codec
           key: ${{ steps.sdpc-codec-cache.outputs.cache-primary-key }}
+      - name: Remove temporary Authenticode key material
+        if: always()
+        shell: pwsh
+        run: |
+          $pfxDir = Join-Path $env:RUNNER_TEMP 'authenticode'
+          if (Test-Path -LiteralPath $pfxDir) {
+            Remove-Item -LiteralPath $pfxDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
   verify:
     needs: build
@@ -346,7 +577,7 @@ jobs:
           - runner: windows-11-arm
             platform: arm64-emulation
     runs-on: ${{ matrix.runner }}
-    # Three packaged runs: headless, bundled GUI and the system-runtime negative control.
+    # Three packaged runs (headless, bundled GUI, system-runtime negative control) plus NSIS verification on x64.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -373,6 +604,36 @@ jobs:
           $archive = @(Get-ChildItem -LiteralPath dist/windows -Filter '*.zip')
           if ($archive.Count -ne 1) { throw 'Expected exactly one portable ZIP' }
           ./packaging/verify_windows.ps1 -Archive $archive[0].FullName -SmokeFile testdata/example_cell.nd2 -RequireBundledWebView2
+      - uses: actions/download-artifact@v4
+        if: matrix.platform == 'x64'
+        with:
+          name: windows-x64-installer
+          path: dist/windows-installer
+      - uses: actions/download-artifact@v4
+        if: matrix.platform == 'x64'
+        with:
+          name: windows-webview2-bootstrapper
+          path: dist/windows-bootstrapper
+      - name: Verify the shipped NSIS installer on clean Windows x64
+        if: matrix.platform == 'x64'
+        shell: pwsh
+        run: |
+          $setup = @(Get-ChildItem -LiteralPath dist/windows-installer -Filter 'nd2wsi-viewer-*-windows-x64-setup.exe')
+          if ($setup.Count -ne 1) { throw 'Expected exactly one NSIS Setup installer' }
+          $bootstrapper = @(Get-ChildItem -LiteralPath dist/windows-bootstrapper -Filter '*.exe')
+          if ($bootstrapper.Count -ne 1) { throw 'Expected exactly one WebView2 bootstrapper' }
+          $setupPath = $setup[0].FullName
+          $payloadManifest = [IO.Path]::ChangeExtension($setupPath, '.payload.json')
+          $buildManifest = [IO.Path]::ChangeExtension($setupPath, '.build.json')
+          $bootstrapperSha = (Get-FileHash -LiteralPath $bootstrapper[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          ./packaging/verify_windows_installer.ps1 `
+            -Installer $setupPath `
+            -PayloadManifest $payloadManifest `
+            -BuildManifest $buildManifest `
+            -SmokeFile testdata/example_cell.nd2 `
+            -ResultsDir dist/windows/verification/installer `
+            -WebView2Bootstrapper $bootstrapper[0].FullName `
+            -WebView2BootstrapperSha256 $bootstrapperSha
       - uses: actions/upload-artifact@v4
         if: always()
         with:
