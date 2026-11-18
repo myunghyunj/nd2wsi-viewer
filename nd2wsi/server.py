@@ -463,12 +463,14 @@ _SERIES_META_MAX = 64
 
 
 def _inspect_path_series(source_path: Path) -> tuple[int, list[dict[str, Any]]]:
-    """Return (seriesCount, seriesList) for .lif, .czi, or multi-series .ome.tif.
+    """Return (seriesCount, seriesList) for .lif, .czi, multipoint .nd2, or multi-series .ome.tif.
 
     ``seriesList`` is populated when ``seriesCount > 1`` on non-grid heterogeneous
-    ``.lif``, multi-scene ``.czi``, or multi-series ``.ome.tif``, and ``[]`` otherwise.
+    ``.lif``, multi-scene ``.czi``, non-plate multipoint ``.nd2``, or multi-series
+    ``.ome.tif``, and ``[]`` otherwise.
     """
     from .ometiff import inspect_ometiff_series, is_ometiff
+    from .plate import PLATE_MAX_FRAME_PX
     from .platform_io import BINARY
 
     try:
@@ -477,7 +479,12 @@ def _inspect_path_series(source_path: Path) -> tuple[int, list[dict[str, Any]]]:
     except OSError:
         return 1, []
 
-    cache_key = (str(resolved), int(st_info.st_mtime_ns), int(st_info.st_size))
+    cache_key = (
+        str(resolved),
+        int(st_info.st_mtime_ns),
+        int(st_info.st_size),
+        int(PLATE_MAX_FRAME_PX),
+    )
     with _SERIES_META_LOCK:
         cached = _SERIES_META_CACHE.get(cache_key)
         if cached is not None:
@@ -568,6 +575,62 @@ def _inspect_path_series(source_path: Path) -> tuple[int, list[dict[str, Any]]]:
                         }
                     )
                 result = (len(items), items)
+        elif suffix == ".nd2":
+            import warnings
+
+            import nd2
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with nd2.ND2File(str(resolved)) as f:
+                    sizes = dict(f.sizes)
+                    n_p = int(sizes.get("P", 1))
+                    w = int(sizes.get("X", 0))
+                    h = int(sizes.get("Y", 0))
+                    area = w * h
+                    is_plate = (
+                        not getattr(f, "is_legacy", False)
+                        and (getattr(f.attributes, "compressionType", None) or "none") == "none"
+                        and 0 < area <= PLATE_MAX_FRAME_PX
+                        and (int(sizes.get("T", 1)) * n_p * int(sizes.get("Z", 1))) > 1
+                    )
+                    if n_p > 1 and not is_plate and w > 0 and h > 0:
+                        pos_names: list[str] = []
+                        try:
+                            for loop in getattr(f, "experiment", None) or []:
+                                if getattr(loop, "type", "") == "XYPosLoop":
+                                    pts = (
+                                        getattr(getattr(loop, "parameters", None), "points", None)
+                                        or []
+                                    )
+                                    pos_names = [
+                                        str(getattr(pt, "name", "") or "").strip() for pt in pts
+                                    ]
+                                    break
+                        except Exception:
+                            pos_names = []
+                        n_s = int(sizes.get("S", 1))
+                        n_c_raw = int(sizes.get("C", 1))
+                        n_c = n_s if (n_s > 1 and n_c_raw == 1) else n_c_raw
+                        n_z = int(sizes.get("Z", 1))
+                        n_t = int(sizes.get("T", 1))
+                        items = [
+                            {
+                                "index": idx,
+                                "name": (
+                                    pos_names[idx]
+                                    if idx < len(pos_names) and pos_names[idx]
+                                    else f"Position {idx + 1}"
+                                ),
+                                "width": w,
+                                "height": h,
+                                "channels": n_c,
+                                "zCount": n_z,
+                                "tCount": n_t,
+                            }
+                            for idx in range(n_p)
+                        ]
+                        result = (len(items), items)
         elif is_ometiff(resolved):
             items = inspect_ometiff_series(resolved)
             if len(items) > 1:
@@ -1985,6 +2048,17 @@ class SlideRegistry:
                     sid = self.add_store(store, source_path=path)
                     self._record_opened_recent(sid, path)
                     return sid
+
+                if series is not None and suffix == ".nd2":
+                    if not path.is_file():
+                        raise FileNotFoundError(f"could not find {path.name}")
+                    s_count, _ = _inspect_path_series(path)
+                    if not (0 <= series < s_count):
+                        raise ValueError(f"series {series} out of range (0..{s_count - 1})")
+                    if series == 0 and is_plate_file(path):
+                        sid = self.add_plate(path)
+                        self._record_opened_recent(sid, path)
+                        return sid
 
                 if series is None and is_plate_file(path):
                     # camera fields over time: no pyramid to build, ever

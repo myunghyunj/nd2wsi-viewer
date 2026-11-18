@@ -110,6 +110,31 @@ Measured on Apple M4 Pro (`24 GiB` RAM, macOS arm64, Python `3.14.6`) across **8
   - *NIS-Elements OME-TIFF metadata & multipoint IFDs (`nd2wsi/ometiff.py`):* Resolved per-`<Image>` `<ObjectiveSettings>` / `<InstrumentRef>` before global `<Objective>` fallback (avoiding Nikon's backward-compatibility `Instrument:0` `1×` placeholder), supported unsigned 24-bit `0x00RRGGBB` `<Channel Color="...">` integers alongside standard signed 32-bit RGBA OME-XML colors, and recovered trailing homogeneous multipoint IFDs when an exporter writes a single `<Image>` header for `N × C` planes.
   - *Zeiss ZEN CZI `StartC` & disabled-track channel mapping (`nd2wsi/czi.py`):* Prioritized ZISRAW `StartC` attributes when XML `<Channel Id="...">` values repeat, and mapped strictly ascending equal-count XML channel definitions `1:1` when an intermediate acquisition track was disabled (`Channel:0, Channel:1, Channel:3` → SubBlocks `[0, 1, 2]`).
 
+### 1.6 Measured `5–20 GB` Single-File Real-Scanner Acquisitions (`--files`)
+
+Measured on Apple M4 Pro (`24 GiB` RAM, macOS arm64, Python `3.14.6`) across **6 anonymized single-file `5–20 GB` real scanner acquisitions** (`56.33 GiB` / `60.48 GB` combined on disk spanning multipoint NIS-Elements `.ome.tif` and `.nd2`, 32-tile 3D Lightsheet `.czi`, and ultra-large `1.31–2.28 GPx` stitched whole-slide `.nd2` scans up to `16.99 GiB` / `18.24 GB`), staged inside bounded `< 30 GiB` isolated local NVMe sandboxes with verified `before == after` non-mutation of the read-only external drive:
+
+| Anonymized Acquisition | Modality, Dimensions & Storage | Disk Size (`.nd2svs` Cache) | Cold Open (`med`) | Warm Open (`med` / `p95`) | 16-Tile Initial (`med` / `p95`) | 16-Tile LUT Drag (`med` / `p95`) | Round-Trip (`med`) | Clean Single-Slide Peak RSS |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `Scanner OME-TIFF #1` | `7578 × 7578`, `18`-pos 3-ch `uint16` NIS-Elements untiled multipoint (`10×`, `_LazyUntiledLevel`) | `5.78 GiB` / `6.21 GB` *(direct, `0 B`)* | `476.72 ms` | `256.86` / `261.91 ms` | `276.92` / `281.97 ms` | **`13.28` / `19.34 ms`** | `827.52 ms` | **`290.9 MiB`** |
+| `Scanner ND2 #3` | `7578 × 7578`, `18`-pos 3-ch `uint16` NIS-Elements multipoint WSI (`10×`, compact `.nd2svs`) | `5.78 GiB` / `6.20 GB` (`58.1 MiB` / pos) | `1,499.74 ms` *(builds `.nd2svs`)* | **`22.20` / `25.88 ms`** | `13.65` / `21.47 ms` | **`11.39` / `22.42 ms`** | `127.29 ms` | **`281.9 MiB`** *(warm; cold build: `888.4 MiB`)* |
+| `Scanner CZI #3` | `4969 × 6254`, `M=32` (`4×8`) × `Z=56` 1-ch `uint16` Lightsheet Z.1 (`5×`, `PlateSource`) | `4.21 GiB` / `4.52 GB` (`2.4 MiB`) | `243.18 ms` | `52.52` / `59.47 ms` | **`9.11` / `16.12 ms`** | **`12.02` / `19.62 ms`** | `149.72 ms` | **`398.9 MiB`** |
+| `Scanner ND2 #4` | `46705 × 27954` (`1.31 GPx`), 2-ch `uint16` stitched WSI (`10×`, compact `.nd2svs`) | `9.32 GiB` / `10.00 GB` (`758.7 MiB`) | `6,238.45 ms` *(builds `.nd2svs`)* | **`20.16` / `23.37 ms`** | **`9.01` / `16.86 ms`** | **`10.58` / `19.13 ms`** | `127.84 ms` | **`250.4 MiB`** *(warm; cold build: `6,861.0 MiB`)* |
+| `Scanner ND2 #5` | `68938 × 27744` (`1.91 GPx`), 4-ch `uint16` stitched WSI (`10×`, compact `.nd2svs`) | `14.25 GiB` / `15.30 GB` (`2,694.8 MiB`) | `83,889.26 ms` *(builds `.nd2svs`)* | `29.86` / `32.31 ms` | `16.99` / `20.03 ms` | `24.52` / `27.58 ms` | `213.48 ms` | **`318.9 MiB`** *(warm; cold build: `11,201.7 MiB`)* |
+| `Scanner ND2 #6` | `73684 × 30951` (`2.28 GPx`), 4-ch `uint16` stitched WSI (`10×`, compact `.nd2svs`) | `16.99 GiB` / `18.24 GB` (`3,520.3 MiB`) | `97,539.37 ms` *(builds `.nd2svs`)* | **`23.31` / `27.23 ms`** | `19.32` / `24.37 ms` | **`14.05` / `22.42 ms`** | `204.93 ms` | **`315.2 MiB`** *(warm; cold build: `11,491.2 MiB`)* |
+
+**`5–20 GB` Multipoint Scene Switching, 3D Lightsheet Z-Scrub, Ground-Truth Parity & 4-Tab RSS Gate Summary:**
+
+- **Multipoint `18`-Position Scene Switching & Ground-Truth Parity (`POST /s/<sid>/api/select-scene`):**
+  - `Scanner OME-TIFF #1` (`5.78 GiB` / `6.21 GB`, `18 × 3 × 7578²` `uint16` IFDs): **`59.57 ms` median / `65.72 ms` p95** warm (`425.99 ms` cold); verified **100% bit-exact per-channel pixel agreement** across `Position 1` (`series=0`), `Position 2` (`series=1`), and `Position 18` (`series=17`) against the paired native `Scanner ND2 #3` source frames (`c25565d`).
+  - `Scanner ND2 #3` (`5.78 GiB` / `6.20 GB`, `P=18` stitched `7578²` WSI positions): **`14.34 ms` median / `19.19 ms` p95** warm (`754.46 ms` initial cold build of Position 2). Non-plate multipoint `.nd2` acquisitions (`X × Y > PLATE_MAX_FRAME_PX`) now expose all `XYPosLoop` positions (`Position 1..N`) in `#scene-picker` (`nd2wsi/server.py`).
+- **3D Multi-Tile Lightsheet Z-Stack (`Scanner CZI #3`, `4.21 GiB` / `4.52 GB`, `M=32` × `Z=56`, `62.15 MiB`/plane):**
+  - Cold Z jump `56.89` / `66.57 ms`, prefetched `z+1` step **`5.69 ms` median** (`41.15 ms` p95), and `54`-step rapid Z-scrub (`3 ms`/step) decoded only **`8.0` planes median (`8` max)** out of `54` with `0` leaked worker threads.
+- **4-Concurrent-`5–20 GB`-Slide Compare Gates (`<= 1,228.8 MiB` / `1.2 GiB` ceiling):**
+  - **4-Distinct-Slide `5–10 GB` Compare (`Scanner OME-TIFF #1` + `Scanner ND2 #3` + `Scanner CZI #3` + `Scanner ND2 #4` = `25.09 GiB` / `26.94 GB` across 4 tabs):** **`963.0 MiB` median / `963.8 MiB` p95 / `963.9 MiB` max** (`n = 3`) → **PASS (`+264.9 MiB` / `21.6%` headroom)**.
+  - **4-Tab Ultra-Large `16.99 GiB + 5.78 GiB` Compare (`2 × Scanner ND2 #6` + `2 × Scanner OME-TIFF #1` = `45.54 GiB` / `48.90 GB` across 4 tabs):** **`592.6 MiB` Peak RSS** → **PASS (`+636.2 MiB` / `51.8%` headroom)**.
+  - **4-Tab `14.25 GiB` WSI Compare (`4 × Scanner ND2 #5` = `57.00 GiB` / `61.21 GB` across 4 tabs):** **`460.4 MiB` Peak RSS** → **PASS (`+768.4 MiB` / `62.5%` headroom)** *(note: one-time uncached Dask `.nd2svs` overview conversion on `14.25–16.99 GiB` 4-ch `uint16` scans runs for `83.9–97.5 s` and faults up to `11.2–11.5 GiB` kernel mmap RSS before dropping to `315–319 MiB` on every warm open)*.
+
 ---
 
 ## 2. 5-External-Lab Observational Study Protocol

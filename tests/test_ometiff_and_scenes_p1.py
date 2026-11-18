@@ -1269,3 +1269,126 @@ def test_czi_startc_and_disabled_track_channel_mapping() -> None:
     ]
 
 
+def test_non_plate_multipoint_nd2_exposes_positions_and_switches_scenes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mmap
+    from types import SimpleNamespace
+
+    import nd2
+
+    from nd2wsi import plate as plate_mod
+
+    n_p, n_c, h, w = 3, 3, 48, 64
+    nd2_path = tmp_path / "multipoint_wsi.nd2"
+    raw_arr = np.empty((n_p, n_c, h, w), dtype=np.uint16)
+    for p_idx in range(n_p):
+        for c_idx in range(n_c):
+            raw_arr[p_idx, c_idx] = (p_idx + 1) * 1000 + c_idx * 100
+    nd2_path.write_bytes(raw_arr.tobytes())
+
+    class _FakeMultipointND2:
+        def __init__(self, path_str: str) -> None:
+            self.path = path_str
+            self.is_legacy = False
+            self.dtype = np.dtype(np.uint16)
+            self.sizes = {"P": n_p, "C": n_c, "Y": h, "X": w}
+            self.attributes = SimpleNamespace(compressionType="none")
+            self.metadata = SimpleNamespace(
+                channels=[
+                    SimpleNamespace(
+                        channel=SimpleNamespace(
+                            name=nm,
+                            color=SimpleNamespace(r=col[0], g=col[1], b=col[2]),
+                        ),
+                        volume=SimpleNamespace(axesCalibrated=(True, True, False)),
+                        microscope=SimpleNamespace(objectiveMagnification=10.0),
+                    )
+                    for nm, col in (
+                        ("FITC", (36, 255, 0)),
+                        ("TxRed", (255, 0, 0)),
+                        ("DAPI", (2, 106, 255)),
+                    )
+                ]
+            )
+            self.experiment = [
+                SimpleNamespace(
+                    type="XYPosLoop",
+                    parameters=SimpleNamespace(
+                        points=[
+                            SimpleNamespace(name=None),
+                            SimpleNamespace(name="Well B2"),
+                            SimpleNamespace(name=""),
+                        ]
+                    ),
+                )
+            ]
+            self._fh = open(path_str, "rb")
+            self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+            self._rdr = SimpleNamespace(_fh=self._fh)
+
+        def voxel_size(self):
+            return SimpleNamespace(x=0.65, y=0.65, z=1.0)
+
+        def read_frame(self, seq: int) -> np.ndarray:
+            frame_bytes = n_c * h * w * 2
+            return np.ndarray(
+                shape=(n_c, h, w),
+                dtype=np.uint16,
+                buffer=self._mm,
+                offset=int(seq) * frame_bytes,
+            )
+
+        def close(self) -> None:
+            try:
+                self._mm.close()
+            finally:
+                self._fh.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+
+    monkeypatch.setattr(nd2, "ND2File", _FakeMultipointND2)
+    # Force frame area (64 * 48 = 3072) above PLATE_MAX_FRAME_PX so it routes as non-plate WSI
+    monkeypatch.setattr(plate_mod, "PLATE_MAX_FRAME_PX", 512)
+
+    with running_server([], port=0) as httpd:
+        base = server_url(httpd).rstrip("/")
+        code, opened = _http_json(
+            f"{base}/api/open", method="POST", payload={"path": str(nd2_path)}
+        )
+        assert code == 200
+        sid0 = opened["sid"]
+        _, info0 = _http_json(f"{base}/s/{sid0}/api/info")
+        assert info0["kind"] == "slide"
+        assert info0["seriesCount"] == 3
+        assert info0["seriesIndex"] == 0
+        assert [s["name"] for s in info0["seriesList"]] == [
+            "Position 1",
+            "Well B2",
+            "Position 3",
+        ]
+        _, pix0 = _http_json(f"{base}/s/{sid0}/api/pixel?x=8&y=8")
+        assert [v["value"] for v in pix0["values"]] == [1000, 1100, 1200]
+
+        sc_code, sc_res = _http_json(
+            f"{base}/s/{sid0}/api/select-scene", method="POST", payload={"series": 2}
+        )
+        assert sc_code == 200
+        sid2 = sc_res["sid"]
+        assert sid2 != sid0
+        _, info2 = _http_json(f"{base}/s/{sid2}/api/info")
+        assert info2["seriesIndex"] == 2
+        _, pix2 = _http_json(f"{base}/s/{sid2}/api/pixel?x=8&y=8")
+        assert [v["value"] for v in pix2["values"]] == [3000, 3100, 3200]
+
+        bad_code, _ = _http_json(
+            f"{base}/s/{sid0}/api/select-scene", method="POST", payload={"series": 5}
+        )
+        assert bad_code == 400
+
+
+

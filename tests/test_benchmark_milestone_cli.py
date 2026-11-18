@@ -343,6 +343,12 @@ def test_validation_protocol_doc_links_anchors_and_hygiene() -> None:
         "### 1.5 Measured Real-Scanner Acquisitions (`--files`)",
         "Scanner ND2 #1",
         "714.4 MiB",
+        "### 1.6 Measured `5–20 GB` Single-File Real-Scanner Acquisitions (`--files`)",
+        "Scanner OME-TIFF #1",
+        "Scanner ND2 #3",
+        "Scanner CZI #3",
+        "Scanner ND2 #6",
+        "963.9 MiB",
     )
     for phrase in required_phrases:
         assert phrase in text, f"Missing required protocol specification {phrase!r} in {PROTOCOL_DOC.name}"
