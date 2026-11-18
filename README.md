@@ -20,7 +20,7 @@
 
 ## Recent updates
 
-- **OME-TIFF / TIFF, multi-series scenes & workflow upgrades:** open pyramidal `.ome.tif` / `.tif` slides directly and multi-plane stacks interactively, switch heterogeneous `.lif` / `.czi` series from the toolbar, customize channel colours or `Option/Alt`-click to solo a channel, undo/redo annotation edits (`⌘Z` / `⌘⇧Z`), reopen recent slides from the start screen, and export OME-XML `.tif` regions.
+- **OME-TIFF / TIFF, multi-series scenes, workflow polish, concurrency bounds & Windows installer (`2.6.5`):** open pyramidal `.ome.tif` / `.tif` / `.qptiff` slides directly and multi-plane stacks interactively, switch `.lif`, `.czi`, `.ome.tif`, and multipoint `.nd2` series from the toolbar, customize channel colours or `Option/Alt`-click to solo a channel, undo/redo annotation edits (`⌘Z` / `⌘⇧Z`), reopen recent slides from the start screen, export `2016-06` OME-XML `.tif` regions, bound multi-tab memory and reader pools on multi-GB scans, and install per-user on Windows with `-setup.exe`. [2.6.5 release notes](docs/release-notes-2.6.5.md).
 - **Astromap TXT import recovery (`2.6.4`):** review skipped rows, import valid regions, and optionally restore zero-area legacy rectangles to one pixel without changing the source TXT. [2.6.4 release notes](docs/release-notes-2.6.4.md).
 - **Path safety, nested LIF mosaics & 16-bit SVS (`2.6.3`):** fix `#` / `?` path truncation during cache creation and conversion, stitch hierarchical Leica `.lif` tile scans, preserve `uint16` precision across 16-bit RGB `.svs` viewing and TIFF export, scope CZI `--t` to the selected scene, and write single-file `.nd2svs` pyramids from `nd2wsi convert`. [2.6.3 release notes](docs/release-notes-2.6.3.md).
 - **Interactive CZI & LIF Z-stacks (`2.6.1–2.6.2`):** scrub physical `µm` Z planes, run sharpness autofocus (`F`), play time series, browse LambdaScan and uniform multi-series `.lif` site grids, decode mixed-depth channels accurately, and isolate annotations per `(T, P, Z)` plane. [2.6.1](docs/release-notes-2.6.1.md) · [2.6.2](docs/release-notes-2.6.2.md).
@@ -32,12 +32,12 @@
 
 ## Download
 
-| Platform | Download · 2.6.4 | Requirements |
+| Platform | Download · 2.6.5 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.4/nd2wsi-viewer-2.6.4-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.4/nd2wsi-viewer-2.6.4-windows-x64.zip) | Windows 11 (x64, or ARM64 via x64 emulation) · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.5/nd2wsi-viewer-2.6.5-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.5/nd2wsi-viewer-2.6.5-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.5/nd2wsi-viewer-2.6.5-windows-x64.zip) | Windows 11 (x64, or ARM64 via x64 emulation) · WebView2 |
 
-On macOS, drag the app into **Applications**; on first launch, choose **System Settings → Privacy & Security → Open Anyway** once (ad-hoc signed; signed Sparkle updates run from **nd2wsi-viewer → Check for Updates…** thereafter). On Windows, extract the entire ZIP, keep `_internal` beside `nd2wsi-viewer.exe`, and allow the SmartScreen unsigned-publisher prompt if shown (verify against the accompanying `.sha256` checksum). See the [installation guide](docs/user-guide.md#get-started).
+On macOS, drag the app into **Applications**; on first launch, choose **System Settings → Privacy & Security → Open Anyway** once (ad-hoc signed; signed Sparkle updates run from **nd2wsi-viewer → Check for Updates…** thereafter). On Windows, run the per-user **Installer** (no administrator prompt) or extract the entire **Portable ZIP** keeping `_internal` beside `nd2wsi-viewer.exe`, and allow the SmartScreen unsigned-publisher prompt if shown (verify against the accompanying `.sha256` checksum). See the [installation guide](docs/user-guide.md#get-started).
 
 Click the start screen, drop a slide into the window, use **+**, or pick from **Recent**. Tiled **SVS**, **SDPC**, pyramidal **OME-TIFF / TIFF**, **ND2SVS**, **JPG**, and **PNG** files open directly; stitched **ND2**, **CZI**, and **LIF** scans prepare a reusable `.nd2svs` viewing cache on first open.
 
