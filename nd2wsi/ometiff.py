@@ -744,22 +744,37 @@ def _expand_multipoint_ome_pages(
     total_pages = len(tf.pages)
     if total_pages <= k_pages or total_pages % k_pages != 0:
         return None
-    all_pages = [_page_kf(tf.pages[i]) for i in range(total_pages)]
-    p0 = _page_kf(s0.pages[0])
+    all_pages = [
+        pg.aspage() if hasattr(pg, "aspage") else pg
+        for pg in tf.pages
+    ]
+    if len(all_pages) != total_pages:
+        return None
+    p0 = all_pages[0]
     ref_shape = tuple(p0.shape)
     ref_dtype = np.dtype(p0.dtype)
     ref_tiled = bool(getattr(p0, "is_tiled", False))
     ref_spp = int(getattr(p0, "samplesperpixel", 1) or 1)
     ref_planar = int(getattr(p0, "planarconfig", 1) or 1)
+    size_c = ome0.get("size_c")
+    size_z = ome0.get("size_z")
+    size_t = ome0.get("size_t")
+    if size_c is not None and size_z is not None and size_t is not None:
+        expected_ifds = (
+            max(1, int(size_c) // max(1, ref_spp))
+            * max(1, int(size_z))
+            * max(1, int(size_t))
+        )
+        if expected_ifds != k_pages:
+            return None
     for pg in all_pages:
-        kf = _page_kf(pg)
         if (
-            int(getattr(kf, "subfiletype", 0) or 0) != 0
-            or tuple(kf.shape) != ref_shape
-            or np.dtype(kf.dtype) != ref_dtype
-            or bool(getattr(kf, "is_tiled", False)) != ref_tiled
-            or int(getattr(kf, "samplesperpixel", 1) or 1) != ref_spp
-            or int(getattr(kf, "planarconfig", 1) or 1) != ref_planar
+            int(getattr(pg, "subfiletype", 0) or 0) != 0
+            or tuple(pg.shape) != ref_shape
+            or np.dtype(pg.dtype) != ref_dtype
+            or bool(getattr(pg, "is_tiled", False)) != ref_tiled
+            or int(getattr(pg, "samplesperpixel", 1) or 1) != ref_spp
+            or int(getattr(pg, "planarconfig", 1) or 1) != ref_planar
         ):
             return None
 

@@ -1199,6 +1199,8 @@ def test_multipoint_ometiff_single_image_xml_expands_trailing_ifds(tmp_path: Pat
             ("TxRed", "FF0000"),
             ("DAPI", "026AFF"),
         ]
+        _, pix0 = _http_json(f"{base}/s/{sid0}/api/pixel?x=8&y=8")
+        assert [v["value"] for v in pix0["values"]] == [1000, 1100, 1200]
 
         sc_code, sc_res = _http_json(
             f"{base}/s/{sid0}/api/select-scene", method="POST", payload={"series": 2}
@@ -1207,6 +1209,18 @@ def test_multipoint_ometiff_single_image_xml_expands_trailing_ifds(tmp_path: Pat
         sid2 = sc_res["sid"]
         _, pix = _http_json(f"{base}/s/{sid2}/api/pixel?x=8&y=8")
         assert [v["value"] for v in pix["values"]] == [3000, 3100, 3200]
+
+    root_lazy0, _ = ometiff.open_direct(mp_tif, series=0, eager_max_bytes=1)
+    try:
+        assert root_lazy0["0"][:, 8:9, 8:9].ravel().tolist() == [1000, 1100, 1200]
+    finally:
+        root_lazy0.close()
+
+    root_lazy2, _ = ometiff.open_direct(mp_tif, series=2, eager_max_bytes=1)
+    try:
+        assert root_lazy2["0"][:, 8:9, 8:9].ravel().tolist() == [3000, 3100, 3200]
+    finally:
+        root_lazy2.close()
 
 
 def test_czi_startc_and_disabled_track_channel_mapping() -> None:
