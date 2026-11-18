@@ -89,13 +89,14 @@ def _extract_links(md_path: Path) -> list[str]:
         "THIRD_PARTY_NOTICES.md",
         "docs/user-guide.md",
         "docs/release-notes-2.6.4.md",
+        "docs/release-notes-2.6.5.md",
     ],
 )
 def test_relative_links_and_anchors_resolve(doc_rel: str) -> None:
     doc_path = ROOT / doc_rel
     assert doc_path.is_file(), f"missing documentation file: {doc_rel}"
     targets = _extract_links(doc_path)
-    assert targets or doc_rel == "docs/release-notes-2.6.4.md"
+    assert targets or doc_rel in ("docs/release-notes-2.6.4.md", "docs/release-notes-2.6.5.md")
 
     for raw in targets:
         if raw.startswith(("http://", "https://", "mailto:", "data:")):
@@ -120,6 +121,7 @@ def test_relative_links_and_anchors_resolve(doc_rel: str) -> None:
         "README.md",
         "docs/user-guide.md",
         "docs/release-notes-2.6.4.md",
+        "docs/release-notes-2.6.5.md",
         "packaging/WINDOWS-README.txt",
         "THIRD_PARTY_NOTICES.md",
     ],
@@ -138,7 +140,7 @@ def test_readme_positioning_and_sections_are_synced() -> None:
     assert ">Astromap<" in readme
     assert "## Latest update" not in readme
     assert "## Recent updates" in readme
-    for ver in ("2.6.4", "2.6.3", "2.6.2", "2.6.1", "2.6.0"):
+    for ver in ("2.6.5", "2.6.4", "2.6.3", "2.6.2", "2.6.1", "2.6.0"):
         assert f"docs/release-notes-{ver}.md" in readme
     assert (
         'src="docs/overview-sdpc.png" '
