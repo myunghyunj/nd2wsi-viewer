@@ -75,9 +75,9 @@ def test_a_silent_client_still_times_out_after_the_request_timeout():
     receiver = StageFollowReceiver(request_timeout=0.4)
     descriptor = receiver.start()
     try:
+        started = time.monotonic()
         connection = _stalled_client(receiver, descriptor, _incomplete_body)
         connection.settimeout(3)
-        started = time.monotonic()
         reply = connection.recv(4096)
         assert b"408" in reply.split(b"\r\n", 1)[0]
         assert 0.3 < time.monotonic() - started < 2
