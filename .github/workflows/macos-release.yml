@@ -86,9 +86,130 @@ jobs:
           assert version == "2.9.6", version
           PY
           echo "SPARKLE_FRAMEWORK=$sparkle_dir/Sparkle.framework" >> "$GITHUB_ENV"
+      - name: Configure macOS signing keychain and notarization credentials
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          CODESIGN_IDENTITY_SECRET: ${{ secrets.CODESIGN_IDENTITY }}
+          APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID_SECRET: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID_SECRET: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_PROFILE_SECRET: ${{ secrets.APPLE_NOTARY_PROFILE }}
+        run: |
+          any_cert=0
+          all_cert=0
+          if [ -n "$MACOS_CERT_P12_BASE64" ] || [ -n "$MACOS_CERT_PASSWORD" ] || [ -n "$CODESIGN_IDENTITY_SECRET" ]; then
+            any_cert=1
+          fi
+          if [ -n "$MACOS_CERT_P12_BASE64" ] && [ -n "$MACOS_CERT_PASSWORD" ] && [ -n "$CODESIGN_IDENTITY_SECRET" ] && [ "$CODESIGN_IDENTITY_SECRET" != "-" ]; then
+            all_cert=1
+          fi
+
+          any_api_key=0
+          all_api_key=0
+          if [ -n "$APPLE_NOTARY_KEY_BASE64" ] || [ -n "$APPLE_NOTARY_KEY_ID_SECRET" ] || [ -n "$APPLE_NOTARY_ISSUER_ID_SECRET" ]; then
+            any_api_key=1
+          fi
+          if [ -n "$APPLE_NOTARY_KEY_BASE64" ] && [ -n "$APPLE_NOTARY_KEY_ID_SECRET" ] && [ -n "$APPLE_NOTARY_ISSUER_ID_SECRET" ]; then
+            all_api_key=1
+          fi
+
+          has_profile=0
+          [ -n "$APPLE_NOTARY_PROFILE_SECRET" ] && has_profile=1
+
+          if [ "$any_cert" -eq 1 ] && [ "$all_cert" -eq 0 ]; then
+            echo "ERROR: incomplete macOS Developer ID signing secrets; configure MACOS_CERT_P12_BASE64, MACOS_CERT_PASSWORD, and CODESIGN_IDENTITY (or leave all empty for ad-hoc signing)" >&2
+            exit 1
+          fi
+          if { [ "$any_api_key" -eq 1 ] || [ "$has_profile" -eq 1 ]; } && [ "$all_cert" -eq 0 ]; then
+            echo "ERROR: Apple notarization secrets are configured without Developer ID signing secrets" >&2
+            exit 1
+          fi
+          if [ "$any_api_key" -eq 1 ] && [ "$all_api_key" -eq 0 ] && [ "$has_profile" -eq 0 ]; then
+            echo "ERROR: incomplete App Store Connect API notarization secrets; configure APPLE_NOTARY_KEY_BASE64, APPLE_NOTARY_KEY_ID, and APPLE_NOTARY_ISSUER_ID" >&2
+            exit 1
+          fi
+
+          if [ "$all_cert" -eq 0 ]; then
+            echo "MACOS_SIGNING_MODE=ad-hoc" >> "$GITHUB_ENV"
+            echo "No Developer ID signing secrets configured; building with ad-hoc code signature."
+            exit 0
+          fi
+
+          keychain_path="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          cert_path="$RUNNER_TEMP/signing-cert.p12"
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$cert_path"
+          chmod 600 "$cert_path"
+          [ -s "$cert_path" ] || { echo "ERROR: decoded MACOS_CERT_P12_BASE64 is empty" >&2; exit 1; }
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$cert_path" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          rm -f "$cert_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path" >/dev/null
+
+          existing_keychains=()
+          while IFS= read -r line; do
+            cleaned="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+            [ -n "$cleaned" ] && existing_keychains+=("$cleaned")
+          done < <(security list-keychains -d user)
+          if [ "${#existing_keychains[@]}" -gt 0 ]; then
+            security list-keychains -d user -s "$keychain_path" "${existing_keychains[@]}"
+          else
+            security list-keychains -d user -s "$keychain_path"
+          fi
+
+          security find-identity -v -p codesigning "$keychain_path" | grep -Fq "$CODESIGN_IDENTITY_SECRET" || {
+            echo "ERROR: CODESIGN_IDENTITY '$CODESIGN_IDENTITY_SECRET' not found in imported certificate keychain" >&2
+            exit 1
+          }
+
+          echo "CODESIGN_IDENTITY=$CODESIGN_IDENTITY_SECRET" >> "$GITHUB_ENV"
+          echo "MACOS_SIGNING_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+
+          if [ "$all_api_key" -eq 1 ]; then
+            notary_dir="$RUNNER_TEMP/notary"
+            mkdir -p "$notary_dir"
+            chmod 700 "$notary_dir"
+            key_path="$notary_dir/AuthKey_${APPLE_NOTARY_KEY_ID_SECRET}.p8"
+            if [[ "$APPLE_NOTARY_KEY_BASE64" == *"-----BEGIN PRIVATE KEY-----"* ]]; then
+              printf '%s\n' "$APPLE_NOTARY_KEY_BASE64" > "$key_path"
+            else
+              printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$key_path"
+            fi
+            chmod 600 "$key_path"
+            [ -s "$key_path" ] || { echo "ERROR: decoded APPLE_NOTARY_KEY_BASE64 is empty" >&2; exit 1; }
+            echo "APPLE_NOTARY_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+            echo "APPLE_NOTARY_KEY_ID=$APPLE_NOTARY_KEY_ID_SECRET" >> "$GITHUB_ENV"
+            echo "APPLE_NOTARY_ISSUER_ID=$APPLE_NOTARY_ISSUER_ID_SECRET" >> "$GITHUB_ENV"
+            echo "NOTARIZE_RELEASE=1" >> "$GITHUB_ENV"
+            echo "MACOS_SIGNING_MODE=notarized" >> "$GITHUB_ENV"
+          elif [ "$has_profile" -eq 1 ]; then
+            echo "APPLE_NOTARY_PROFILE=$APPLE_NOTARY_PROFILE_SECRET" >> "$GITHUB_ENV"
+            echo "NOTARIZE_RELEASE=1" >> "$GITHUB_ENV"
+            echo "MACOS_SIGNING_MODE=notarized" >> "$GITHUB_ENV"
+          else
+            echo "NOTARIZE_RELEASE=0" >> "$GITHUB_ENV"
+            echo "MACOS_SIGNING_MODE=developer-id" >> "$GITHUB_ENV"
+          fi
       - name: Build the production app and require packaged smoke
         run: |
           bash packaging/build_mac_app.sh "$GITHUB_WORKSPACE/dist/macos" 2>&1 | tee dist/macos/build-evidence/mac-build.log
+      - name: Sign, notarize, and staple the release DMG
+        if: env.MACOS_SIGNING_MODE != 'ad-hoc'
+        run: |
+          bash packaging/sign_release.sh "$GITHUB_WORKSPACE/dist/macos/nd2wsi-viewer.dmg" 2>&1 | tee dist/macos/build-evidence/dmg-signing.log
+      - name: Verify Gatekeeper acceptance and stapled notarization tickets
+        if: env.MACOS_SIGNING_MODE == 'notarized'
+        run: |
+          app="$GITHUB_WORKSPACE/dist/macos/nd2wsi-viewer.app"
+          dmg="$GITHUB_WORKSPACE/dist/macos/nd2wsi-viewer.dmg"
+          xcrun stapler validate -v "$app" 2>&1 | tee dist/macos/build-evidence/stapler-app.log
+          xcrun stapler validate -v "$dmg" 2>&1 | tee dist/macos/build-evidence/stapler-dmg.log
+          spctl -a -vvv -t exec "$app" 2>&1 | tee dist/macos/build-evidence/spctl-app.log
+          spctl -a -vvv -t open --context context:primary-signature "$dmg" 2>&1 | tee dist/macos/build-evidence/spctl-dmg.log
       - name: Verify the signed artifact and record build proof
         run: |
           app="$GITHUB_WORKSPACE/dist/macos/nd2wsi-viewer.app"
@@ -164,6 +285,18 @@ jobs:
               assert marker in smoke_log, f"Missing required packaged check: {marker}"
           source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           assert source_sha == os.environ["REQUESTED_REF"]
+          signing_mode = os.environ.get("MACOS_SIGNING_MODE", "ad-hoc").strip() or "ad-hoc"
+          assert signing_mode in {"ad-hoc", "developer-id", "notarized"}, f"Unexpected MACOS_SIGNING_MODE: {signing_mode}"
+          identity = os.environ.get("CODESIGN_IDENTITY", "-").strip() or "-"
+          if signing_mode == "ad-hoc":
+              assert identity == "-", f"Expected ad-hoc identity '-', got {identity!r}"
+          elif signing_mode == "developer-id":
+              assert identity != "-", "developer-id mode requires a non-ad-hoc CODESIGN_IDENTITY"
+              assert (evidence / "dmg-signing.log").is_file(), "Missing dmg-signing.log for developer-id build"
+          elif signing_mode == "notarized":
+              assert identity != "-", "notarized mode requires a non-ad-hoc CODESIGN_IDENTITY"
+              for required_log in ("dmg-signing.log", "stapler-app.log", "stapler-dmg.log", "spctl-app.log", "spctl-dmg.log"):
+                  assert (evidence / required_log).is_file(), f"Missing notarization verification log: {required_log}"
           artifacts = {}
           for path in (output / "nd2wsi-viewer.dmg", source_archive):
               digest = sha256(path)
@@ -182,7 +315,7 @@ jobs:
               "sdpc_manifest_sha256": sha256(manifest_path),
               "smoke_fixture_sha256": fixture_sha,
               "app_executable_sha256": sha256(app / "Contents/MacOS/nd2wsi-viewer"),
-              "signing": "ad-hoc",
+              "signing": signing_mode,
               "packaged_headless_smoke": "passed",
               "native_gui_validation": "required on the downloaded artifact before release",
               "artifacts": artifacts,
@@ -207,3 +340,10 @@ jobs:
           name: macos-build-evidence
           path: dist/macos/build-evidence/
           retention-days: 30
+      - name: Clean up ephemeral signing keychain and notary credentials
+        if: always()
+        run: |
+          if [ -n "${MACOS_SIGNING_KEYCHAIN:-}" ] && [ -f "$MACOS_SIGNING_KEYCHAIN" ]; then
+            security delete-keychain "$MACOS_SIGNING_KEYCHAIN" || rm -f "$MACOS_SIGNING_KEYCHAIN"
+          fi
+          rm -rf "$RUNNER_TEMP/notary" "$RUNNER_TEMP/signing-cert.p12"

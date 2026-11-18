@@ -757,10 +757,13 @@ def test_readme_and_signing_script_stay_strictly_factual() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     sign_script = (ROOT / "packaging" / "sign_release.sh").read_text(encoding="utf-8")
 
-    # packaging/sign_release.sh implements codesign only (no notarytool or stapler)
+    # packaging/sign_release.sh defaults to ad-hoc codesign and supports optional
+    # Developer ID hardened-runtime signing + notarytool/stapler/spctl verification
+    assert 'IDENTITY="${CODESIGN_IDENTITY:--}"' in sign_script
     assert "codesign" in sign_script
-    assert "notarytool" not in sign_script
-    assert "stapler" not in sign_script
+    assert "notarytool" in sign_script
+    assert "stapler" in sign_script
+    assert "spctl" in sign_script
 
     # README accurately describes ad-hoc signing and makes zero notarization or speed-multiplier claims
     assert "ad-hoc signed" in readme
