@@ -870,12 +870,7 @@ def test_macos_release_workflow_build_info_signing_status_reporting(tmp_path: Pa
         )
     with (sparkle_res / "Info.plist").open("wb") as handle:
         plistlib.dump({"CFBundleShortVersionString": "2.9.6"}, handle)
-    exe_stub = app / "Contents" / "MacOS" / "nd2wsi-viewer"
-    exe_stub.write_text(
-        f'#!/bin/sh\nprintf \'%s\\n\' \'{{"package_version": "{version}", "updates_disabled": false}}\'\n',
-        encoding="utf-8",
-    )
-    exe_stub.chmod(0o755)
+    (app / "Contents" / "MacOS" / "nd2wsi-viewer").write_bytes(b"arm64-binary")
     (output / "nd2wsi-viewer.dmg").write_bytes(b"dmg-payload")
 
     source_archive = output / "sdpc-codec-sources-macos-arm64.zip"
@@ -889,11 +884,22 @@ def test_macos_release_workflow_build_info_signing_status_reporting(tmp_path: Pa
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     shutil.copyfile(manifest_path, app / "Contents" / "Resources" / "sdpc-codec-manifest.json")
 
-    # Replace the hardcoded example_cell.nd2 fixture SHA check in this isolated unit test
+    # Replace the hardcoded example_cell.nd2 fixture SHA check and mock the Mach-O
+    # app binary '-c' runtime probe so this workflow proof test runs cross-platform
+    # (including on Windows CI where /private/tmp and Mach-O execution do not exist).
     fixture_bytes = b"synthetic-smoke-nd2"
     (tmp_path / "docs" / "example_cell.nd2").write_bytes(fixture_bytes)
     fixture_sha = hashlib.sha256(fixture_bytes).hexdigest()
-    adapted_script = proof_script.replace(
+    prelude = (
+        "import json as _json, subprocess as _sp\n"
+        "_orig_check_output = _sp.check_output\n"
+        "def _mock_check_output(cmd, *a, **kw):\n"
+        "    if isinstance(cmd, list) and len(cmd) >= 2 and cmd[1] == '-c':\n"
+        f"        return _json.dumps({{'package_version': {version!r}, 'updates_disabled': False}})\n"
+        "    return _orig_check_output(cmd, *a, **kw)\n"
+        "_sp.check_output = _mock_check_output\n"
+    )
+    adapted_script = prelude + proof_script.replace(
         "51d603317947b04c3b43c8e694f3ba97a16478ce30e795857ec6ae0321d41c33",
         fixture_sha,
     )
