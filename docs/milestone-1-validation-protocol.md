@@ -74,6 +74,42 @@ ND2WSI_BENCH_TMP=/tmp/nd2wsi-ext-bench \
 
 `--files` stages independent copies/clones inside `ND2WSI_BENCH_TMP`, verifies via pre/post directory snapshots that **zero `nd2wsi/` cache or annotation files are created, modified, or deleted beside the user's real slides**, cleans up all temporary artifacts in `finally`, and exits non-zero (`exit 2`) if 4-tab Compare Peak RSS exceeds `--max-4tab-rss-mib`.
 
+### 1.5 Measured Real-Scanner Acquisitions (`--files`)
+
+Measured on Apple M4 Pro (`24 GiB` RAM, macOS arm64, Python `3.14.6`) across **8 anonymized real scanner acquisitions** (`10.39 GiB` on disk spanning Nikon `.nd2`, Zeiss `.czi`, Leica `.lif`, uncompressed 16-bit `.tif`, Aperio `.svs`, and HEVC `.sdpc`) staged in isolated local NVMe sandboxes with verified pre/post non-mutation of the read-only external acquisition drive (`74.98 s` total wall time):
+
+| Anonymized Acquisition | Modality, Dimensions & Storage | Disk Size (`.nd2svs` Cache) | Cold Open (`med`) | Warm Open (`med` / `p95`) | 16-Tile Initial (`med` / `p95`) | 16-Tile LUT Drag (`med` / `p95`) | Round-Trip (`med`) | Clean Single-Slide Peak RSS |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `Scanner ND2 #1` | `23975 × 22336`, 4-ch `uint16` stitched WSI (`10×`, compact `.nd2svs`) | `3.99 GiB` (`815.5 MiB`) | `7,397.55 ms` *(builds `.nd2svs`)* | `27.53` / `29.52 ms` | `19.84` / `28.12 ms` | `12.92` / `24.55 ms` | `152.19 ms` | **`300.9 MiB`** *(warm; cold build: `5,185.1 MiB`)* |
+| `Scanner CZI #1` | `11323 × 11338`, 2-scene `27`-tile `JPEG-XR` RGB mosaic (`10×`, full `.nd2svs`) | `65.6 MiB` (`319.1 MiB`) | `7,056.94 ms` *(builds `.nd2svs`)* | `24.11` / `34.81 ms` | `14.95` / `21.63 ms` | `9.42` / `16.38 ms` | `79.06 ms` | **`153.5 MiB`** *(warm; cold build: `733.6 MiB`)* |
+| `Scanner TIFF #1` | `14555 × 16076`, 3-ch `uint16` uncompressed untiled (`_LazyUntiledLevel`) | `1.31 GiB` *(direct, `0 B`)* | `812.46 ms` | `784.59` / `793.02 ms` | `116.78` / `119.53 ms` | **`10.12` / `13.34 ms`** | `870.07 ms` | **`205.6 MiB`** |
+| `Scanner CZI #2` | `2048 × 2048`, 4-ch `uint16` `Z=31` confocal stack (`63×`, `PlateSource`) | `992.6 MiB` (`2.2 MiB`) | `141.38 ms` | `26.32` / `30.69 ms` | `19.92` / `26.85 ms` | `16.58` / `24.19 ms` | `113.52 ms` | **`389.7 MiB`** |
+| `Scanner LIF #1` | `16`-series mixed `1024 × 1024` 2-ch `Z=9` & `644 × 644` 3-ch 2D confocal (`40×`) | `68.5 MiB` (`0.2 MiB`) | `121.95 ms` | `18.54` / `21.88 ms` | `11.25` / `16.40 ms` | `9.96` / `15.84 ms` | `59.41 ms` | **`199.7 MiB`** |
+| `Scanner ND2 #2` | `2048 × 2048`, 5-ch `uint16` `Z=23` confocal stack (`20×`, `PlateSource`) | `920.7 MiB` (`1.4 MiB`) | `165.91 ms` | `46.09` / `48.98 ms` | `23.13` / `25.46 ms` | `21.50` / `25.49 ms` | `143.72 ms` | **`439.9 MiB`** |
+| `Scanner SVS #1` | `89999 × 77410` (`6.97 GPx`), 3-ch `uint8` 4-level tiled WSI (`40×`, direct) | `1.43 GiB` *(direct, `0 B`)* | `88.68 ms` | `8.34` / `9.70 ms` | `10.59` / `14.97 ms` | `8.84` / `15.34 ms` | `54.73 ms` | **`179.9 MiB`** |
+| `Scanner SDPC #1` | `249600 × 173696` (`43.35 GPx`), 8-level HEVC tiled WSI (`40×`, direct) | `1.66 GiB` *(direct, `0 B`)* | `155.93 ms` | `6.41` / `7.93 ms` | `10.34` / `17.01 ms` | `8.74` / `15.27 ms` | `36.06 ms` | **`195.6 MiB`** |
+
+**Real-Scanner Multi-Series, 3D Z-Stack, 4-Tab RSS Gate & `v2.6.4` (`6f3a2cc`) Baseline Summary:**
+
+- **Multi-Series Scene Switching (`POST /s/<sid>/api/select-scene`):**
+  - `Scanner CZI #1` (`2` stitched mosaic scenes): **`10.35 ms` median / `17.46 ms` p95** warm (`7,183.85 ms` initial cold `.nd2svs` build of Scene 1).
+  - `Scanner LIF #1` (`16` confocal series, switching across 3D `plate` and 2D `slide` scenes): **`4.99 ms` median / `9.16 ms` p95** warm (`212.20 ms` initial cold build of Series 1).
+- **Real 3D Confocal Z-Stack Navigation (`z + 1` Prefetched Step & Rapid `3 ms`/step Z-Scrub):**
+  - `Scanner CZI #2` (`Z=31`, `992.6 MiB` 4-ch `uint16`): `z+1` step **`8.37` / `10.85 ms`** (`med` / `p95`); 29-step rapid scrub decoded **`3.0` planes median (`4` max)**, `0` leaked threads (`455.6 MiB` Peak RSS).
+  - `Scanner ND2 #2` (`Z=23`, `920.7 MiB` 5-ch `uint16`): `z+1` step **`8.91` / `11.75 ms`**; 21-step rapid scrub decoded **`3.0` planes median (`3` max)**, `0` leaked threads (`521.7 MiB` Peak RSS).
+  - `Scanner LIF #1` (`Z=9`, `68.5 MiB` 2-ch `uint8`): `z+1` step **`9.27` / `12.03 ms`**; 7-step rapid scrub decoded **`3.0` planes median (`3` max)**, `0` leaked threads (`149.9 MiB` Peak RSS).
+- **4-Concurrent-Real-Slide Compare Gate (`Scanner ND2 #1` + `Scanner CZI #1` + `Scanner TIFF #1` + `Scanner CZI #2` = `6.63 GiB` combined raw pixels across 4 tabs + 32-tile bursts + LUT drag + `Z=31` scrub):**
+  - **Observed Peak RSS:** **`709.3 MiB` median / `713.9 MiB` p95 / `714.4 MiB` max** (`n = 3` clean subprocesses).
+  - **Acceptance Gate (`<= 1,228.8 MiB` / `1.2 GiB`):** **PASS** with **`+514.4 MiB` (`41.9%`) headroom** *(one-time uncached Dask `.nd2svs` overview build on the `3.99 GiB` 4-ch `uint16` `Scanner ND2 #1` peaks at `5,185.1 MiB` during its `7.40 s` conversion before dropping to `300.9 MiB` steady-state)*.
+- **Measured `v2.6.4` (`6f3a2cc`) vs Milestone 1 Baseline Comparison on Real Scanner Files:**
+  - **Native `.tif` / `.ome.tif` Open & ROI Round-Trip Reopen:** `HTTP 400` unsupported across all slides in `6f3a2cc` → **`100%` (`8 / 8`) `200 OK`** native open, `.ome.tif` ROI reopen, and sidecar persistence in Milestone 1.
+  - **Multi-Scene Access:** `seriesCount = 1` only in `6f3a2cc` → **`2` scenes** (`Scanner CZI #1`), **`16` series** (`Scanner LIF #1`), and **`18` multipoint positions** recovered on single-`<Image>` multipoint OME-TIFF exports (`5.78 GiB`, `18 × 3 × 7578²` `uint16`).
+  - **16-Tile Live LUT Drag (`win=` median):** `21.63 → 12.92 ms` (`-40.3%`) on `Scanner ND2 #1`; `19.82 → 9.42 ms` (`-52.5%`) on `Scanner CZI #1`; `20.10 → 9.96 ms` (`-50.4%`) on `Scanner LIF #1`; `22.35 → 16.58 ms` (`-25.8%`) on `Scanner CZI #2`.
+  - **3D Confocal `Scanner CZI #2` (`Z=31`) Step & Scrub:** `z+1` step **`22.09 → 8.37 ms` (`2.64×` faster)**, rapid-scrub final frame `29.14 → 16.66 ms` (`-42.8%`), and Z-stack Peak RSS `581.6 → 455.6 MiB` (`-126.0 MiB`).
+- **Real-Scanner Container Quirks Resolved During Hardware Validation:**
+  - *NIS-Elements OME-TIFF metadata & multipoint IFDs (`nd2wsi/ometiff.py`):* Resolved per-`<Image>` `<ObjectiveSettings>` / `<InstrumentRef>` before global `<Objective>` fallback (avoiding Nikon's backward-compatibility `Instrument:0` `1×` placeholder), supported unsigned 24-bit `0x00RRGGBB` `<Channel Color="...">` integers alongside standard signed 32-bit RGBA OME-XML colors, and recovered trailing homogeneous multipoint IFDs when an exporter writes a single `<Image>` header for `N × C` planes.
+  - *Zeiss ZEN CZI `StartC` & disabled-track channel mapping (`nd2wsi/czi.py`):* Prioritized ZISRAW `StartC` attributes when XML `<Channel Id="...">` values repeat, and mapped strictly ascending equal-count XML channel definitions `1:1` when an intermediate acquisition track was disabled (`Channel:0, Channel:1, Channel:3` → SubBlocks `[0, 1, 2]`).
+
 ---
 
 ## 2. 5-External-Lab Observational Study Protocol

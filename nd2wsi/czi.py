@@ -220,6 +220,9 @@ _CHANNEL_ID_RE = re.compile(r"(?:^|:)(\d+)$")
 
 
 def _czi_channel_index(ch: ET.Element) -> int | None:
+    start_c = (ch.get("StartC") or "").strip()
+    if start_c.isdigit():
+        return int(start_c)
     raw = (ch.get("Id") or "").strip()
     m = _CHANNEL_ID_RE.search(raw)
     return int(m.group(1)) if m else None
@@ -244,6 +247,19 @@ def _map_czi_channels(
             if ch is not None:
                 used.add(c_idx)
             mapped.append(ch)
+        if (
+            any(m is None for m in mapped)
+            and len(ch_list) == n_channels
+            and len(set(actual_c_values)) == n_channels
+            and actual_c_values == sorted(actual_c_values)
+        ):
+            xml_ids = [idx for idx, _ in indexed]
+            if (
+                all(idx is not None for idx in xml_ids)
+                and len(set(xml_ids)) == n_channels
+                and xml_ids == sorted(xml_ids)  # type: ignore[type-var]
+            ):
+                return list(ch_list)
         return mapped
     if (
         len(set(actual_c_values)) == n_channels

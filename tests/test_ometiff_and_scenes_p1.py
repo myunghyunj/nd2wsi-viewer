@@ -1097,3 +1097,161 @@ def test_cross_track_ometiff_roi_export_cli_info_view_and_custom_color_roundtrip
         assert lut_loaded["settings"]["luts"][0]["color"] == "FF3B30"
 
 
+def test_nis_elements_ometiff_instrument_ref_and_rgb24_colors(tmp_path: Path) -> None:
+    nis_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2015-01">
+  <Instrument ID="Instrument:0">
+    <!-- backward compatibility with NIS elements 4.30 -->
+    <Objective ID="Objective:0" NominalMagnification="1" CalibratedMagnification="1.0"/>
+  </Instrument>
+  <Instrument ID="Instrument:1">
+    <Objective ID="Objective:1" NominalMagnification="10" Model="Plan Fluor 10x"/>
+  </Instrument>
+  <Image ID="Image:0" Name="widefield_scan.tif">
+    <InstrumentRef ID="Instrument:1"/>
+    <Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint16"
+            SizeX="64" SizeY="48" SizeC="3" SizeZ="1" SizeT="1"
+            PhysicalSizeX="0.660367" PhysicalSizeY="0.660367">
+      <Channel ID="Channel:0" Name="FITC" Color="2424576"/>
+      <Channel ID="Channel:1" Name="TxRed" Color="16711680"/>
+      <Channel ID="Channel:2" Name="DAPI" Color="158463"/>
+      <TiffData/>
+    </Pixels>
+  </Image>
+</OME>"""
+    records = ometiff._parse_ome_xml(nis_xml)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["magnification"] == pytest.approx(10.0)
+    assert rec["pixel_size_um"] == pytest.approx((0.660367, 0.660367))
+    assert [(ch["name"], ch["color"]) for ch in rec["channels"]] == [
+        ("FITC", (36, 255, 0)),
+        ("TxRed", (255, 0, 0)),
+        ("DAPI", (2, 106, 255)),
+    ]
+
+    # Standard signed 32-bit RGBA OME-XML colors and ObjectiveSettings override remain intact
+    std_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Instrument ID="Instrument:0">
+    <Objective ID="Objective:0" NominalMagnification="20"/>
+    <Objective ID="Objective:1" NominalMagnification="63"/>
+  </Instrument>
+  <Image ID="Image:0" Name="confocal">
+    <InstrumentRef ID="Instrument:0"/>
+    <ObjectiveSettings ID="Objective:1"/>
+    <Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint16"
+            SizeX="32" SizeY="32" SizeC="3" SizeZ="1" SizeT="1">
+      <Channel ID="Channel:0" Name="Red" Color="-16776961"/>
+      <Channel ID="Channel:1" Name="Green" Color="16711935"/>
+      <Channel ID="Channel:2" Name="Blue" Color="65535"/>
+    </Pixels>
+  </Image>
+</OME>"""
+    std_rec = ometiff._parse_ome_xml(std_xml)[0]
+    assert std_rec["magnification"] == pytest.approx(63.0)
+    assert [ch["color"] for ch in std_rec["channels"]] == [
+        (255, 0, 0),
+        (0, 255, 0),
+        (0, 0, 255),
+    ]
+
+
+def test_multipoint_ometiff_single_image_xml_expands_trailing_ifds(tmp_path: Path) -> None:
+    mp_tif = tmp_path / "multipoint_nis_export.tif"
+    ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2015-01">
+  <Instrument ID="Instrument:0"><Objective ID="Objective:0" NominalMagnification="1"/></Instrument>
+  <Instrument ID="Instrument:1"><Objective ID="Objective:1" NominalMagnification="10"/></Instrument>
+  <Image ID="Image:0" Name="multipoint.tif">
+    <InstrumentRef ID="Instrument:1"/>
+    <Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint16"
+            SizeX="64" SizeY="48" SizeC="3" SizeZ="1" SizeT="1"
+            PhysicalSizeX="0.65" PhysicalSizeY="0.65">
+      <Channel ID="Channel:0" Name="FITC" Color="2424576"/>
+      <Channel ID="Channel:1" Name="TxRed" Color="16711680"/>
+      <Channel ID="Channel:2" Name="DAPI" Color="158463"/>
+      <TiffData/>
+    </Pixels>
+  </Image>
+</OME>"""
+    with tifffile.TiffWriter(str(mp_tif), ome=False) as tw:
+        for pos_idx in range(3):
+            for ch_idx in range(3):
+                plane = np.full((48, 64), (pos_idx + 1) * 1000 + ch_idx * 100, dtype=np.uint16)
+                desc = ome_xml if (pos_idx == 0 and ch_idx == 0) else None
+                tw.write(plane, photometric="minisblack", description=desc, metadata=None)
+
+    scenes = ometiff.inspect_ometiff_series(mp_tif)
+    assert len(scenes) == 3
+    assert [s["name"] for s in scenes] == ["Position 1", "Position 2", "Position 3"]
+
+    with running_server([], port=0) as httpd:
+        base = server_url(httpd).rstrip("/")
+        code, opened = _http_json(f"{base}/api/open", method="POST", payload={"path": str(mp_tif)})
+        assert code == 200
+        sid0 = opened["sid"]
+        _, info0 = _http_json(f"{base}/s/{sid0}/api/inspect")
+        assert info0["seriesCount"] == 3
+        assert info0["objective_magnification"] == pytest.approx(10.0)
+        assert [(c["label"], c["color"]) for c in info0["channels"]] == [
+            ("FITC", "24FF00"),
+            ("TxRed", "FF0000"),
+            ("DAPI", "026AFF"),
+        ]
+
+        sc_code, sc_res = _http_json(
+            f"{base}/s/{sid0}/api/select-scene", method="POST", payload={"series": 2}
+        )
+        assert sc_code == 200
+        sid2 = sc_res["sid"]
+        _, pix = _http_json(f"{base}/s/{sid2}/api/pixel?x=8&y=8")
+        assert [v["value"] for v in pix["values"]] == [3000, 3100, 3200]
+
+
+def test_czi_startc_and_disabled_track_channel_mapping() -> None:
+    import xml.etree.ElementTree as ET
+
+    from nd2wsi.czi import _extract_czi_metadata
+
+    # 1. Duplicate Id="Channel:1" disambiguated via StartC="0" / StartC="1"
+    xml_startc = ET.fromstring(
+        """<?xml version="1.0" encoding="utf-8"?>
+        <ImageDocument><Metadata>
+          <DisplaySetting><Channels>
+            <Channel Id="Channel:1" Name="Brightfield" StartC="0">
+              <ShortName>RhodB</ShortName>
+            </Channel>
+            <Channel Id="Channel:1" Name="C2" StartC="1">
+              <DyeName>Dye2</DyeName>
+            </Channel>
+          </Channels></DisplaySetting>
+        </Metadata></ImageDocument>"""
+    )
+    _, _, _, chs_sc = _extract_czi_metadata(xml_startc, 2, False, c_values=[0, 1])
+    assert [c.name for c in chs_sc] == ["RhodB", "C2"]
+
+    # 2. Disabled middle ZEN track: 3 XML channels (Channel:0, Channel:1, Channel:3) for SubBlocks [0, 1, 2]
+    xml_axioscan = ET.fromstring(
+        """<?xml version="1.0" encoding="utf-8"?>
+        <ImageDocument><Metadata>
+          <Information><Image><Dimensions><Channels>
+            <Channel Id="Channel:0" Name="DNA"><Color>#FF0000FF</Color></Channel>
+            <Channel Id="Channel:1" Name="AF488"><Color>#FFFFFFFF</Color></Channel>
+            <Channel Id="Channel:3" Name="WGA"><Color>#FFFF00FF</Color></Channel>
+          </Channels></Dimensions></Image></Information>
+          <DisplaySetting><Channels>
+            <Channel Id="Channel:0" Name="DNA"><ShortName>H3258</ShortName></Channel>
+            <Channel Id="Channel:1" Name="AF488"><ShortName>EGFP</ShortName></Channel>
+            <Channel Id="Channel:3" Name="WGA"><ShortName>AF647</ShortName></Channel>
+          </Channels></DisplaySetting>
+        </Metadata></ImageDocument>"""
+    )
+    _, _, _, chs_ax = _extract_czi_metadata(xml_axioscan, 3, False, c_values=[0, 1, 2])
+    assert [(c.name, c.color) for c in chs_ax] == [
+        ("H3258", (0, 0, 255)),
+        ("EGFP", (255, 255, 255)),
+        ("AF647", (255, 0, 255)),
+    ]
+
+

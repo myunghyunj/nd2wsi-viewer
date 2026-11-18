@@ -340,7 +340,15 @@ def test_validation_protocol_doc_links_anchors_and_hygiene() -> None:
         "LAS X",
         "spctl -a -vvv -t exec",
         "spctl -a -vvv -t open --context context:primary-signature",
+        "### 1.5 Measured Real-Scanner Acquisitions (`--files`)",
+        "Scanner ND2 #1",
+        "714.4 MiB",
     )
     for phrase in required_phrases:
         assert phrase in text, f"Missing required protocol specification {phrase!r} in {PROTOCOL_DOC.name}"
     assert "spctl -a -vvv -t install" not in text
+    stripped = re.sub(r"```.*?```", "", text, flags=re.S)
+    for private_prefix in ("/Volumes/", "/Users/"):
+        assert private_prefix not in stripped, (
+            f"Private host path prefix {private_prefix!r} leaked into {PROTOCOL_DOC.name}"
+        )

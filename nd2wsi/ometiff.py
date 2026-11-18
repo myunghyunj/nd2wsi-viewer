@@ -128,8 +128,8 @@ def _unit_to_um(value: Any, unit_raw: str | None) -> float | None:
     return um if _finite_positive(um) else None
 
 
-def _parse_ome_color(raw: Any) -> tuple[int, int, int] | None:
-    """Decode OME-XML signed 32-bit RGBA integer or hex string into (R, G, B)."""
+def _parse_ome_color(raw: Any, *, rgb24: bool = False) -> tuple[int, int, int] | None:
+    """Decode OME-XML signed 32-bit RGBA integer (or 24-bit 0x00RRGGBB) or hex string into (R, G, B)."""
     if raw is None:
         return None
     text = str(raw).strip()
@@ -153,13 +153,49 @@ def _parse_ome_color(raw: Any) -> tuple[int, int, int] | None:
         c_int = int(text)
     except ValueError:
         return None
-    rgb_24 = (c_int >> 8) & 0xFFFFFF
+    if rgb24 and 0 <= c_int <= 0xFFFFFF:
+        rgb_24 = c_int & 0xFFFFFF
+    else:
+        rgb_24 = (c_int >> 8) & 0xFFFFFF
     r = (rgb_24 >> 16) & 0xFF
     g = (rgb_24 >> 8) & 0xFF
     b = rgb_24 & 0xFF
     if (r, g, b) == (0, 0, 0):
         return None
     return (r, g, b)
+
+
+def _pixels_uses_rgb24_colors(raw_colors: list[str | None]) -> bool:
+    """Detect unsigned 24-bit 0x00RRGGBB channel colors (e.g. Nikon NIS-Elements OME-XML).
+
+    Standard OME-XML packs 32-bit RGBA ``(R << 24) | (G << 16) | (B << 8) | A`` with
+    ``A == 0xFF`` (negative signed int32 whenever ``R >= 128``, ``> 0xFFFFFF`` whenever
+    ``1 <= R <= 127``, and low byte ``0xFF`` whenever ``R == 0``). NIS-Elements writes
+    unsigned 24-bit ``0x00RRGGBB`` integers in ``0..0xFFFFFF`` where non-blue channels
+    have low byte ``!= 0xFF`` (e.g. ``FITC = 0x24FF00``, ``TxRed = 0xFF0000``).
+    """
+    ints: list[int] = []
+    for raw in raw_colors:
+        if raw is None:
+            continue
+        t = str(raw).strip()
+        if not t or t.startswith("#"):
+            continue
+        try:
+            ints.append(int(t))
+        except ValueError:
+            return False
+    if not ints:
+        return False
+    if any(c < 0 or c > 0xFFFFFF for c in ints):
+        return False
+    nonzero = [c for c in ints if c > 0]
+    return bool(nonzero) and any((c & 0xFF) != 0xFF for c in nonzero)
+
+
+def _objective_mag(elem: ET.Element) -> float | None:
+    mag_raw = elem.attrib.get("NominalMagnification") or elem.attrib.get("CalibratedMagnification")
+    return float(mag_raw) if _finite_positive(mag_raw) else None
 
 
 def _parse_ome_xml(ome_xml: str | None) -> list[dict[str, Any]]:
@@ -174,25 +210,58 @@ def _parse_ome_xml(ome_xml: str | None) -> list[dict[str, Any]]:
     except ET.ParseError:
         return []
 
-    magnification: float | None = None
+    objectives_by_id: dict[str, float] = {}
+    instruments_by_id: dict[str, float] = {}
+    default_magnification: float | None = None
     for elem in root.iter():
-        if _local_tag(elem.tag) == "Objective":
-            mag_raw = elem.attrib.get("NominalMagnification") or elem.attrib.get("CalibratedMagnification")
-            if _finite_positive(mag_raw):
-                magnification = float(mag_raw)
-                break
+        tag = _local_tag(elem.tag)
+        if tag == "Instrument":
+            inst_id = (elem.attrib.get("ID") or "").strip()
+            for sub in elem.iter():
+                if _local_tag(sub.tag) == "Objective":
+                    mag = _objective_mag(sub)
+                    if mag is not None:
+                        obj_id = (sub.attrib.get("ID") or "").strip()
+                        if obj_id and obj_id not in objectives_by_id:
+                            objectives_by_id[obj_id] = mag
+                        if inst_id and inst_id not in instruments_by_id:
+                            instruments_by_id[inst_id] = mag
+                        if default_magnification is None:
+                            default_magnification = mag
+        elif tag == "Objective":
+            mag = _objective_mag(elem)
+            if mag is not None:
+                obj_id = (elem.attrib.get("ID") or "").strip()
+                if obj_id and obj_id not in objectives_by_id:
+                    objectives_by_id[obj_id] = mag
+                if default_magnification is None:
+                    default_magnification = mag
 
     images: list[dict[str, Any]] = []
     for img_idx, elem in enumerate(root.iter()):
         if _local_tag(elem.tag) != "Image":
             continue
         pixels = None
+        img_obj_id: str | None = None
+        img_inst_id: str | None = None
         for child in elem:
-            if _local_tag(child.tag) == "Pixels":
+            ctag = _local_tag(child.tag)
+            if ctag == "Pixels" and pixels is None:
                 pixels = child
-                break
+            elif ctag == "ObjectiveSettings" and img_obj_id is None:
+                img_obj_id = (child.attrib.get("ID") or "").strip() or None
+            elif ctag == "InstrumentRef" and img_inst_id is None:
+                img_inst_id = (child.attrib.get("ID") or "").strip() or None
         if pixels is None:
             continue
+
+        magnification: float | None = None
+        if img_obj_id and img_obj_id in objectives_by_id:
+            magnification = objectives_by_id[img_obj_id]
+        elif img_inst_id and img_inst_id in instruments_by_id:
+            magnification = instruments_by_id[img_inst_id]
+        else:
+            magnification = default_magnification
 
         px_unit = pixels.attrib.get("PhysicalSizeXUnit", "µm")
         py_unit = pixels.attrib.get("PhysicalSizeYUnit", px_unit)
@@ -214,20 +283,21 @@ def _parse_ome_xml(ome_xml: str | None) -> list[dict[str, Any]]:
             else None
         )
 
+        ch_elems = [pchild for pchild in pixels if _local_tag(pchild.tag) == "Channel"]
+        rgb24_colors = _pixels_uses_rgb24_colors([c.attrib.get("Color") for c in ch_elems])
         ch_records: list[dict[str, Any]] = []
-        for pchild in pixels:
-            if _local_tag(pchild.tag) == "Channel":
-                cname = (
-                    (pchild.attrib.get("Name") or "").strip()
-                    or (pchild.attrib.get("Fluor") or "").strip()
-                )
-                ccolor = _parse_ome_color(pchild.attrib.get("Color"))
-                spp_raw = pchild.attrib.get("SamplesPerPixel")
-                try:
-                    spp = int(spp_raw) if spp_raw is not None else 1
-                except ValueError:
-                    spp = 1
-                ch_records.append({"name": cname, "color": ccolor, "samples": spp})
+        for pchild in ch_elems:
+            cname = (
+                (pchild.attrib.get("Name") or "").strip()
+                or (pchild.attrib.get("Fluor") or "").strip()
+            )
+            ccolor = _parse_ome_color(pchild.attrib.get("Color"), rgb24=rgb24_colors)
+            spp_raw = pchild.attrib.get("SamplesPerPixel")
+            try:
+                spp = int(spp_raw) if spp_raw is not None else 1
+            except ValueError:
+                spp = 1
+            ch_records.append({"name": cname, "color": ccolor, "samples": spp})
 
         def _int_attr(attr_name: str) -> int | None:
             raw = pixels.attrib.get(attr_name)
@@ -640,6 +710,75 @@ def _is_associated_series(series: Any) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class _SyntheticPageSeries:
+    """Lightweight view over a slice of homogeneous TIFF IFDs (e.g. NIS-Elements multipoint OME-TIFF)."""
+
+    pages: tuple[Any, ...]
+    shape: tuple[int, ...]
+    axes: str
+    dtype: np.dtype
+    name: str
+    parent: Any
+
+    @property
+    def levels(self) -> list[_SyntheticPageSeries]:
+        return [self]
+
+    def asarray(self) -> np.ndarray:
+        arrs = [np.asarray(p.asarray()) for p in self.pages]
+        if len(arrs) == 1 and tuple(arrs[0].shape) == self.shape:
+            return arrs[0]
+        return np.stack(arrs, axis=0).reshape(self.shape)
+
+
+def _expand_multipoint_ome_pages(
+    tf: Any, s0: Any, ome0: dict[str, Any] | None
+) -> list[tuple[Any, list[Any], dict[str, Any] | None]] | None:
+    """Recover trailing multipoint scenes when an exporter wrote 1 OME <Image> for N*K homogeneous IFDs."""
+    if ome0 is None or len(s0.levels) != 1:
+        return None
+    k_pages = len(s0.pages)
+    if k_pages < 1:
+        return None
+    total_pages = len(tf.pages)
+    if total_pages <= k_pages or total_pages % k_pages != 0:
+        return None
+    all_pages = [_page_kf(tf.pages[i]) for i in range(total_pages)]
+    p0 = _page_kf(s0.pages[0])
+    ref_shape = tuple(p0.shape)
+    ref_dtype = np.dtype(p0.dtype)
+    ref_tiled = bool(getattr(p0, "is_tiled", False))
+    ref_spp = int(getattr(p0, "samplesperpixel", 1) or 1)
+    ref_planar = int(getattr(p0, "planarconfig", 1) or 1)
+    for pg in all_pages:
+        kf = _page_kf(pg)
+        if (
+            int(getattr(kf, "subfiletype", 0) or 0) != 0
+            or tuple(kf.shape) != ref_shape
+            or np.dtype(kf.dtype) != ref_dtype
+            or bool(getattr(kf, "is_tiled", False)) != ref_tiled
+            or int(getattr(kf, "samplesperpixel", 1) or 1) != ref_spp
+            or int(getattr(kf, "planarconfig", 1) or 1) != ref_planar
+        ):
+            return None
+
+    n_scenes = total_pages // k_pages
+    out: list[tuple[Any, list[Any], dict[str, Any] | None]] = []
+    for idx in range(n_scenes):
+        slc = tuple(all_pages[idx * k_pages : (idx + 1) * k_pages])
+        syn = _SyntheticPageSeries(
+            pages=slc,
+            shape=tuple(s0.shape),
+            axes=str(s0.axes),
+            dtype=np.dtype(s0.dtype),
+            name=f"Position {idx + 1}",
+            parent=tf,
+        )
+        out.append((syn, [syn], {**ome0, "name": f"Position {idx + 1}"}))
+    return out
+
+
 def _group_logical_series(
     tf: Any, ome_images: list[dict[str, Any]], *, is_qptiff: bool = False
 ) -> list[tuple[Any, list[Any], dict[str, Any] | None]]:
@@ -665,6 +804,11 @@ def _group_logical_series(
 
     s0 = raw_series[0]
     ome0 = ome_images[0] if ome_images else None
+    if len(raw_series) == 1 and len(ome_images) == 1 and len(s0.levels) == 1:
+        expanded = _expand_multipoint_ome_pages(tf, s0, ome0)
+        if expanded is not None:
+            return expanded
+
     if len(s0.levels) > 1 or len(raw_series) == 1 or len(ome_images) > 1:
         if len(ome_images) <= 1 and len(s0.levels) > 1:
             return [(s0, list(s0.levels), ome0)]
@@ -863,7 +1007,12 @@ def is_ometiff_stack(path: str | Path, *, series: int = 0) -> bool:
 
 def _page_kf(page: Any) -> Any:
     """Return the underlying TiffPage keyframe for a TiffPage or lightweight TiffFrame."""
-    return getattr(page, "keyframe", None) or page
+    kf = getattr(page, "keyframe", None)
+    if kf is not None:
+        return kf
+    if hasattr(page, "aspage"):
+        return page.aspage()
+    return page
 
 
 def _decode_page_segment(page: Any, raw_bytes: bytes, seg: int, tables: dict[str, Any], out_dtype: np.dtype) -> np.ndarray:
@@ -1711,7 +1860,7 @@ def open_direct(
         can_tile_direct = (
             layout.n_z == 1
             and layout.n_t == 1
-            and getattr(base_series.pages[0], "is_tiled", False)
+            and getattr(_page_kf(base_series.pages[0]), "is_tiled", False)
         )
         embedded: dict[int, tuple[Any, int, int]] = {}
         owner = f"ometiff:{path.resolve()}:s{series}:{id(life)}"
@@ -1719,7 +1868,7 @@ def open_direct(
             fd = os.open(str(path), os.O_RDONLY | BINARY)
             ident = path.stat().st_mtime_ns
             for lv_obj in level_objs:
-                p0 = lv_obj.pages[0]
+                p0 = _page_kf(lv_obj.pages[0])
                 lh, lw = int(p0.imagelength), int(p0.imagewidth)
                 d = max(1, round(H / max(1, lh)))
                 k = d.bit_length() - 1
@@ -1760,7 +1909,7 @@ def open_direct(
                     memo_levels.append(coarse)
                     served.append((h_k, w_k))
             shapes = served
-            raw_bps = getattr(base_series.pages[0], "bitspersample", None)
+            raw_bps = getattr(_page_kf(base_series.pages[0]), "bitspersample", None)
             if isinstance(raw_bps, (tuple, list)):
                 raw_bps = raw_bps[0] if raw_bps else None
             coarsest = np.asarray(levels[str(len(shapes) - 1)][:, :, :])
@@ -1811,7 +1960,7 @@ def open_direct(
         plane_bytes = layout.n_c * H * W * layout.dtype.itemsize
         eager_ceiling = _resolve_untiled_eager_max_bytes(eager_max_bytes)
 
-        raw_bps = getattr(base_series.pages[0], "bitspersample", None)
+        raw_bps = getattr(_page_kf(base_series.pages[0]), "bitspersample", None)
         if isinstance(raw_bps, (tuple, list)):
             raw_bps = raw_bps[0] if raw_bps else None
 

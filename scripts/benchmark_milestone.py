@@ -170,6 +170,14 @@ def _apfs_clonefile(src: Path, dst: Path) -> bool:
         return False
 
 
+def _clone_or_copy_file(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> str:
+    """Zero-copy APFS clonefile on same-volume macOS sandboxes, falling back to shutil.copy2."""
+    src_p, dst_p = Path(src), Path(dst)
+    if not _apfs_clonefile(src_p, dst_p):
+        shutil.copy2(src_p, dst_p)
+    return str(dst_p)
+
+
 def stage_isolated_slide(src: Path, sandbox_dir: Path, *, dst_name: str | None = None) -> Path:
     """Stage ``src`` as an independent regular file inside ``sandbox_dir``.
 
@@ -186,23 +194,24 @@ def stage_isolated_slide(src: Path, sandbox_dir: Path, *, dst_name: str | None =
     dst = sandbox_resolved / (dst_name or src_resolved.name)
     if dst.exists() or dst.is_symlink():
         dst.unlink()
-    if not _apfs_clonefile(src_resolved, dst):
-        shutil.copy2(src_resolved, dst)
+    _clone_or_copy_file(src_resolved, dst)
     if dst.is_symlink() or dst.resolve().parent != sandbox_resolved:
         raise RuntimeError(f"Sandbox isolation check failed for staged file {dst}")
     return dst
 
 
-def _dir_snapshot(folder: Path) -> dict[str, tuple[int, int]]:
-    """Snapshot ``{entry_name: (is_dir, size_or_zero)}`` of a source directory for non-mutation checks."""
-    snap: dict[str, tuple[int, int]] = {}
+def _dir_snapshot(folder: Path) -> dict[str, tuple[int, int, int]]:
+    """Snapshot ``{entry_name: (is_dir, size_or_zero, mtime_ns)}`` of a source directory for non-mutation checks."""
+    snap: dict[str, tuple[int, int, int]] = {}
     for item in sorted(folder.iterdir(), key=lambda p: p.name):
         try:
+            st = item.lstat()
             is_d = int(item.is_dir())
-            sz = 0 if is_d else int(item.stat().st_size)
+            sz = 0 if is_d else int(st.st_size)
+            mt = int(st.st_mtime_ns)
         except OSError:
-            is_d, sz = 0, -1
-        snap[item.name] = (is_d, sz)
+            is_d, sz, mt = 0, -1, -1
+        snap[item.name] = (is_d, sz, mt)
     return snap
 
 
@@ -1145,6 +1154,7 @@ def child_open_and_tiles(spec: dict[str, Any]) -> dict[str, Any]:
                 finally:
                     _stop_server(srv, th)
 
+            inspect_payload: dict[str, Any] = {}
             if n_burst > 0:
                 srv, th, base = _start_server()
                 try:
@@ -1154,6 +1164,9 @@ def child_open_and_tiles(spec: dict[str, Any]) -> dict[str, Any]:
                     sid = json.loads(raw)["sid"]
                     _, info_raw, _ = _http_request(base, "GET", f"/s/{sid}/api/info")
                     info_payload = json.loads(info_raw)
+                    ci_code, insp_raw, _ = _http_request(base, "GET", f"/s/{sid}/api/inspect")
+                    if ci_code == 200:
+                        inspect_payload = json.loads(insp_raw)
                     gen = info_payload["generation"]
                     channels = info_payload["channels"]
                     levels = info_payload["levels"]
@@ -1212,10 +1225,40 @@ def child_open_and_tiles(spec: dict[str, Any]) -> dict[str, Any]:
                         if hasattr(render, "raw_chunk_cache_stats")
                         else None
                     )
+
+                    scene_switch_cold_ms: float | None = None
+                    scene_switch_warm_ms: list[float] = []
+                    if int(info_payload.get("seriesCount") or 1) > 1:
+                        n_sc_switches = int(spec.get("n_scene_switches", 6))
+                        cur_sid = sid
+                        t_sc0 = time.perf_counter()
+                        sc_c, sc_r, _ = _http_request(
+                            base, "POST", f"/s/{cur_sid}/api/select-scene", {"series": 1}
+                        )
+                        if sc_c == 200:
+                            cur_sid = json.loads(sc_r)["sid"]
+                            _http_request(base, "GET", f"/s/{cur_sid}/api/info")
+                            scene_switch_cold_ms = round((time.perf_counter() - t_sc0) * 1000.0, 2)
+                            for sw_i in range(n_sc_switches):
+                                target_s = 0 if (sw_i % 2 == 0) else 1
+                                t_sw = time.perf_counter()
+                                sw_c, sw_r, _ = _http_request(
+                                    base,
+                                    "POST",
+                                    f"/s/{cur_sid}/api/select-scene",
+                                    {"series": target_s},
+                                )
+                                if sw_c != 200:
+                                    break
+                                cur_sid = json.loads(sw_r)["sid"]
+                                _http_request(base, "GET", f"/s/{cur_sid}/api/info")
+                                scene_switch_warm_ms.append((time.perf_counter() - t_sw) * 1000.0)
                 finally:
                     _stop_server(srv, th)
             else:
                 cache_stats = None
+                scene_switch_cold_ms = None
+                scene_switch_warm_ms = []
 
             if export_warm_dir is not None and kept_dir is not None:
                 if export_warm_dir.exists():
@@ -1227,18 +1270,28 @@ def child_open_and_tiles(spec: dict[str, Any]) -> dict[str, Any]:
                 shutil.rmtree(kept_dir, ignore_errors=True)
             shutil.rmtree(work_dir, ignore_errors=True)
 
+    plate_info = info_payload.get("plate") or {}
+    cache_bytes = inspect_payload.get("cache_bytes")
     return {
         "supported": True,
         "storage": info_payload.get("storage"),
         "kind": info_payload.get("kind"),
         "width": info_payload.get("width"),
         "height": info_payload.get("height"),
+        "dtype": info_payload.get("dtype"),
+        "channels_count": len(info_payload.get("channels") or []),
+        "z_planes": int(plate_info.get("Z") or plate_info.get("zCount") or 1) if plate_info else 1,
+        "pixel_size_um": info_payload.get("pixelSizeUm"),
+        "objective_magnification": inspect_payload.get("objective_magnification"),
+        "cache_mib": round(float(cache_bytes) / (1024.0 * 1024.0), 2) if cache_bytes else None,
         "series_count": info_payload.get("seriesCount", 1),
         "notes": info_payload.get("notes", []),
         "cold_open": summarize_ms(cold_ms),
         "warm_open": summarize_ms(warm_ms),
         "tile_burst_initial_16": summarize_ms(burst_init_ms),
         "tile_burst_lut_update_16": summarize_ms(burst_lut_ms),
+        "scene_switch_cold_ms": scene_switch_cold_ms,
+        "scene_switch_warm": summarize_ms(scene_switch_warm_ms),
         "raw_chunk_cache_stats": cache_stats,
         "rss": rss.report(),
     }
@@ -1433,7 +1486,7 @@ def child_milestone_roundtrip(spec: dict[str, Any]) -> dict[str, Any]:
             for i in range(n_iters):
                 iter_dir = work_dir / f"rt_{i}"
                 if prewarmed_dir is not None and prewarmed_dir.is_dir():
-                    shutil.copytree(prewarmed_dir, iter_dir)
+                    shutil.copytree(prewarmed_dir, iter_dir, copy_function=_clone_or_copy_file)
                     slide_copy = iter_dir / fixture_path.name
                 else:
                     slide_copy = stage_isolated_slide(fixture_path, iter_dir)
@@ -1579,7 +1632,7 @@ def child_memory_stress(spec: dict[str, Any]) -> dict[str, Any]:
                 sub = work_dir / f"s_{idx}"
                 if isinstance(entry, dict) and entry.get("prewarmed_dir"):
                     pw = Path(entry["prewarmed_dir"])
-                    shutil.copytree(pw, sub)
+                    shutil.copytree(pw, sub, copy_function=_clone_or_copy_file)
                     copies.append(sub / Path(entry["path"]).name)
                 else:
                     fp = Path(entry["path"] if isinstance(entry, dict) else entry)
@@ -2216,7 +2269,8 @@ def run_external_files_suite(
         "memory": {},
     }
 
-    prewarmed_entries: list[dict[str, str] | str] = []
+    prewarmed_entries: list[dict[str, str]] = []
+    single_rss_by_slide: dict[str, dict[str, Any]] = {}
     for idx, p in enumerate(resolved_inputs):
         key = f"{idx}_{p.name}"
         warm_dir = bench_tmp / f"warm_ext_{idx}"
@@ -2230,26 +2284,27 @@ def run_external_files_suite(
                 "work_dir": str(bench_tmp / f"work_ext_open_{idx}"),
                 "tile_level": 0,
                 "n_cold": 1,
-                "n_warm": 3,
-                "n_burst": 8,
+                "n_warm": 5,
+                "n_burst": 10,
                 "export_warm_dir": str(warm_dir),
             },
             timeout=1800,
         )
         results["open_and_tiles"][key] = open_res
         if open_res.get("supported"):
-            prewarmed_entries.append({"path": str(p), "prewarmed_dir": str(warm_dir)})
+            warm_slide = warm_dir / p.name
+            local_src = warm_slide if warm_slide.is_file() else p
             if open_res.get("kind") == "plate":
                 z_res = run_child_scenario(
                     repo_root,
                     bench_tmp,
                     "zstack",
                     {
-                        "fixture_path": str(p),
+                        "fixture_path": str(local_src),
                         "work_dir": str(bench_tmp / f"work_ext_z_{idx}"),
-                        "n_jumps": 5,
-                        "n_steps": 5,
-                        "n_scrubs": 3,
+                        "n_jumps": 8,
+                        "n_steps": 8,
+                        "n_scrubs": 4,
                     },
                     timeout=900,
                 )
@@ -2264,29 +2319,52 @@ def run_external_files_suite(
                     "fixture_path": str(p),
                     "work_dir": str(bench_tmp / f"work_ext_rt_{idx}"),
                     "prewarmed_dir": str(warm_dir),
-                    "n_iters": 2,
+                    "n_iters": 3,
                 },
                 timeout=900,
             )
             results["roundtrip"][key] = rt_res
+
+            r1 = run_child_scenario(
+                repo_root,
+                bench_tmp,
+                "memory",
+                {
+                    "mode": "single",
+                    "fixture_entries": [{"path": str(p), "prewarmed_dir": str(warm_dir)}],
+                    "work_dir": str(bench_tmp / f"work_ext_mem1_{idx}"),
+                },
+                timeout=900,
+            )
+            single_rss_by_slide[key] = r1["rss"]
+
+            if len(prewarmed_entries) < 4:
+                prewarmed_entries.append({"path": str(p), "prewarmed_dir": str(warm_dir)})
+            else:
+                # Reclaim staged disk immediately beyond the 4-tab Compare set
+                shutil.rmtree(warm_dir, ignore_errors=True)
 
     if not prewarmed_entries:
         raise RuntimeError("None of the supplied --files could be opened by nd2wsi")
 
     # Populate 4 distinct tabs (cycling across supplied slides when < 4 files are passed)
     four_entries = [prewarmed_entries[i % len(prewarmed_entries)] for i in range(4)]
-    r4 = run_child_scenario(
-        repo_root,
-        bench_tmp,
-        "memory",
-        {
-            "mode": "four_concurrent",
-            "fixture_entries": four_entries,
-            "work_dir": str(bench_tmp / "work_ext_mem4"),
-        },
-        timeout=900,
-    )
-    four_peaks = [float(r4["rss"]["peak_rss_mib"])]
+    n_mem_reps = 3 if len(prewarmed_entries) >= 4 else 1
+    four_peaks: list[float] = []
+    for rep in range(n_mem_reps):
+        r4 = run_child_scenario(
+            repo_root,
+            bench_tmp,
+            "memory",
+            {
+                "mode": "four_concurrent",
+                "fixture_entries": four_entries,
+                "work_dir": str(bench_tmp / f"work_ext_mem4_{rep}"),
+            },
+            timeout=900,
+        )
+        four_peaks.append(float(r4["rss"]["peak_rss_mib"]))
+    results["memory"]["single_slide_clean_rss"] = single_rss_by_slide
     results["memory"]["four_concurrent_slides_mib"] = summarize_mib(four_peaks)
     results["gate"] = _evaluate_gate(four_peaks, max_4tab_rss_mib)
 
