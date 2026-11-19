@@ -104,7 +104,10 @@ def test_server_gate_and_security_headers():
         assert status == 200
         hdrs_lower = {k.lower(): v for k, v in hdrs.items()}
         assert hdrs_lower.get("x-frame-options") == "SAMEORIGIN"
-        assert "default-src" in hdrs_lower.get("content-security-policy", "")
+        csp = hdrs_lower.get("content-security-policy", "")
+        assert "default-src 'self'" in csp
+        assert "script-src 'self' 'unsafe-eval'" in csp
+        assert "object-src 'none'" in csp
 
         # Wrong Host port -> 404 + Connection: close
         other_port = port + 1 if port < 65535 else port - 1

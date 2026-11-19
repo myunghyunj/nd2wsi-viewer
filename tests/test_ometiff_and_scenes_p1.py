@@ -588,17 +588,21 @@ def test_3d_zstack_ometiff_interactive_z_planes_autofocus_and_prefetch(tmp_path:
         assert focus["best"][0][0] == 3
 
         # Verify tile serving triggers prefetch_neighbors(t, p, z)
+        # (called immediately after _send completes on the server worker thread).
         plate_src = httpd.registry.get(sid).plate
         prefetch_calls: list[tuple[int, int, int]] = []
+        prefetch_done = threading.Event()
         orig_prefetch = plate_src.prefetch_neighbors
 
         def _spy_prefetch(t: int, p: int, z: int) -> None:
             prefetch_calls.append((t, p, z))
+            prefetch_done.set()
             orig_prefetch(t, p, z)
 
         monkeypatch.setattr(plate_src, "prefetch_neighbors", _spy_prefetch)
         st_tile, _, _ = _http_bytes(f"{base}/s/{sid}/api/tile/0/0/0.jpg?t=0&p=0&z=2")
         assert st_tile == 200
+        assert prefetch_done.wait(timeout=2.0)
         assert (0, 0, 2) in prefetch_calls
 
         # Verify reduced frame endpoint + ?col= override

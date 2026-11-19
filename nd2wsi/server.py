@@ -2691,16 +2691,20 @@ def _resolve_http_max_workers() -> int:
     return HTTP_MAX_WORKERS
 
 
+# pywebview 6's Window.evaluate_js() runs `eval(...)` inside macOS WKWebView's
+# main world, so `script-src` must permit `'unsafe-eval'` while still forbidding
+# `'unsafe-inline'`, remote/data/blob scripts, plugins, and cross-origin framing.
 _CSP_HEADER = (
     "default-src 'self'; "
-    "script-src 'self'; "
+    "script-src 'self' 'unsafe-eval'; "
     "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data: blob:; "
     "font-src 'self'; "
     "connect-src 'self'; "
     "object-src 'none'; "
     "base-uri 'self'; "
-    "frame-ancestors 'self'"
+    "frame-ancestors 'self'; "
+    "form-action 'self'"
 )
 
 
