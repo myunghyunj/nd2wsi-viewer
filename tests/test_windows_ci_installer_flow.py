@@ -568,11 +568,12 @@ def test_verify_windows_installer_ps1_structure_ascii_and_smoke_snippet(tmp_path
         timeout=30,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert json.loads(report_path.read_text(encoding="utf-8")) == {
-        "ok": True,
-        "ometiff": True,
-        "cli_help": True,
-    }
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["ok"] is True
+    assert report["ometiff"] is True
+    assert report["cli_help"] is True
+    assert isinstance(report["package_version"], str) and report["package_version"]
+    assert isinstance(report["updates_disabled"], bool)
 
 
 # ---------------------------------------------------------------------------

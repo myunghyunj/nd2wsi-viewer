@@ -102,6 +102,9 @@ const state = {
     pointRevision: 0,
   },
 };
+// Expose the viewer state handle for same-origin native shell/smoke checks
+// without relying on CSP-disallowed `contentWindow.eval(...)`.
+window.nd2ViewerState = state;
 
 const {
   setPlateZ, stepPlateZ, setPlateAuto, setPlateT,
