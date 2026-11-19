@@ -59,7 +59,7 @@ def pane_eval(parent, expression):
         stmt = f"return ({body});"
     return parent.evaluate_js(
         "(() => {"
-        " const __frame = document.querySelector('#frames iframe.active');"
+        " const __frame = window.document.querySelector('#frames iframe.active');"
         " const __win = __frame && __frame.contentWindow;"
         " if (!__win) return null;"
         " const state = __win.nd2ViewerState;"
