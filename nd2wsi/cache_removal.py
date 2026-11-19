@@ -170,8 +170,8 @@ def _iter_safe_annotation_files(folder: Path) -> list[tuple[Path, bytes]]:
                 entry_path = Path(entry.path)
                 st_entry = entry.stat(follow_symlinks=False)
                 if _is_windows_reparse_point(st_entry) or stat.S_ISLNK(st_entry.st_mode):
-                    if fnmatch.fnmatch(entry.name, "annotations_*.json") or stat.S_ISDIR(st_entry.st_mode):
-                        raise ValueError(f"refusing to traverse symlink/reparse point: {entry_path}")
+                    if fnmatch.fnmatch(entry.name, "annotations_*.json"):
+                        raise ValueError(f"refusing to read symlinked annotation: {entry_path}")
                     continue
                 if stat.S_ISDIR(st_entry.st_mode):
                     _walk_win(entry_path)
