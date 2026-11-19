@@ -3,6 +3,22 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.6</title>
+            <pubDate>Thu, 19 Nov 2026 09:30:15 +0000</pubDate>
+            <sparkle:version>2.6.6</sparkle:version>
+            <sparkle:shortVersionString>2.6.6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Windows Setup installer fixes, active-ROI Astromapper bubbles, large JPEG RAM budget, and security/stability hardening</h2>
+<ul>
+<li><strong>Windows Setup installer fixes (<code>-setup.exe</code>).</strong> Keep the <strong>Install</strong> button active on the destination folder page (<code>MUI_DIRECTORYPAGE_VERIFYONLEAVE</code>) and validate path syntax and 64-bit free disk space with explicit dialogs, remove the fresh-install path-check stall, support offline bundled WebView2 Fixed Version runtimes, and enable clean in-place upgrades over prior Setup installs.</li>
+<li><strong>Cleaner Astromapper ROI number bubbles.</strong> Show numbered label bubbles only for the currently active (yellow-highlighted) Astromapper ROI when clicking an ROI box or stepping with Left/Right arrow keys, keeping dense fields unobstructed.</li>
+<li><strong>Large RGB JPEG memory budget on Windows.</strong> Estimate decode RAM from actual Pillow footprint (5 B/px for direct RGB JPEGs against 75% of live available RAM on Windows/Linux) with clean <code>MemoryError</code> handling, so 200+ MPx stitched JPEGs open reliably on 8–16 GB Windows PCs.</li>
+<li><strong>Security, format-bounds, concurrency, and UI hardening.</strong> Remove arbitrary <code>-c</code> execution from packaged launchers, allowlist safe Zarr v2 codecs with a 64 MiB chunk cap, harden loopback HTTP headers/timeouts, add XML DTD rejection and parser bounds across CZI/LIF/OME-TIFF/SVS and shading models, guard native Metal viewport callbacks, fix scene-picker clipping and floating-window z-order/clamping, propagate custom channel colors to translucent overlays and Astromap exports, and scope the <code>limnd2</code> index in <code>pyproject.toml</code>/<code>uv.lock</code>.</li>
+</ul>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.6/nd2wsi-viewer-2.6.6-macos-arm64.dmg" length="134222011" type="application/octet-stream" sparkle:edSignature="QS5x8mhuqmiiwmG+EVJ3Mb0oBWFU480/ri5qqBYCqWOHd81bUQkaBoqnhBJZkX3l/LpCX943aQOj4xgue5kfDw=="/>
+        </item>
+        <item>
             <title>2.6.5</title>
             <pubDate>Wed, 18 Nov 2026 15:44:40 +0000</pubDate>
             <sparkle:version>2.6.5</sparkle:version>
