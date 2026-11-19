@@ -508,11 +508,12 @@ def test_raw_chunk_cache_enforces_exact_budget_skips_oversized_and_evicts_lru():
     def writer_worker(tid: int) -> None:
         nonlocal peak_observed_used
         for step in range(10):
-            # Keep ("hot", 0) hot on even steps
-            if step % 2 == 0:
-                _ = cache.get(("hot", 0))
+            # Keep ("hot", 0) hot on every iteration (including the final step)
+            # so 16 concurrent threads finishing odd steps cannot all evict it.
+            _ = cache.get(("hot", 0))
             arr = np.full((1, 128, 512), tid * 100 + step, dtype=np.uint16)  # 128 KiB
             cache.put(("worker", tid, step), arr)
+            _ = cache.get(("hot", 0))
             cur_used = cache.used
             assert 0 <= cur_used <= budget
             with obs_lock:
