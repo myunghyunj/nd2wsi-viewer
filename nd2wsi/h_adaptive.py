@@ -24,6 +24,7 @@ fixed validation box for 2D `H_auto_refit/1` (such as `1-2.nd2`), this module:
 from __future__ import annotations
 
 import copy
+import io
 import json
 from collections import Counter
 from pathlib import Path
@@ -156,13 +157,17 @@ def supported_x_geometry(raw32, box, mapping, reference, pitch, saturation, chec
     ci = [bfi] + [mapping[n] for n in ("FITC", "CY3") if n in mapping]
     vals = raw32[ci, y0:y1, x0:x1]
     valid = np.isfinite(vals).all(axis=0) & (im > 0.6 * reference) & (vals < saturation).all(axis=0)
+    if not np.any(valid):
+        raise base.Unsupported("insufficient_BF_support")
 
     def smooth(sigma):
         den = ndi.gaussian_filter(valid.astype(float), sigma)
         return ndi.gaussian_filter(np.where(valid, im, 0), sigma) / np.maximum(den, 1e-12)
 
     bg = smooth(30)
-    z = np.where(valid, (smooth(1) - bg) / bg, 0)
+    s1 = smooth(1)
+    z = np.zeros_like(bg)
+    np.divide(s1 - bg, bg, out=z, where=valid & (bg > 0))
     hh, ww = z.shape
     yy, xx = np.indices(z.shape)
     target = z * np.hanning(hh)[:, None] * np.hanning(ww)[None, :]
@@ -312,7 +317,11 @@ def project_amplitude(
     alpha = float(np.dot(prof, template) / denom) if denom > 1e-15 else 0.0
     shape_r2 = base.r2(prof, alpha * template)
     pos_r2 = base.r2(prof, max(0.0, alpha) * template) if alpha > 0.0 else 0.0
-    corr = float(np.corrcoef(prof, template)[0, 1]) if np.std(prof) > 1e-12 else 0.0
+    corr = (
+        float(np.corrcoef(prof, template)[0, 1])
+        if np.std(prof) > 1e-12 and np.std(template) > 1e-12
+        else 0.0
+    )
     energy = float(np.dot(prof, prof))
     return {
         "amplitude": alpha,
@@ -350,12 +359,14 @@ def enumerate_all_lattice_cells(
     del coarse_coords
 
     yy_ov, xx_ov = np.nonzero(raw32[bfi] > 0.6 * bf_reference)
+    if yy_ov.size == 0:
+        raise base.Unsupported("insufficient_BF_support")
     ph_y = basis[0, 0] * (yy_ov - 0.5) + basis[0, 1] * (xx_ov - 0.5)
     ph_x = basis[1, 0] * (yy_ov - 0.5) + basis[1, 1] * (xx_ov - 0.5)
     r_min = max(0, int(np.floor(ph_y.min())))
-    r_max = int(np.floor(ph_y.max()))
+    r_max = max(r_min, int(np.floor(ph_y.max())))
     c_min = max(0, int(np.floor(ph_x.min())))
-    c_max = int(np.floor(ph_x.max()))
+    c_max = max(c_min, int(np.floor(ph_x.max())))
     # Full-overview support coordinates belong only to discovery, not to the
     # retained-cell peak reserved by adaptive_workspace_plan.
     del yy_ov, xx_ov, ph_y, ph_x
@@ -1341,9 +1352,9 @@ def fit_adaptive_from_config(
     )
 
     check()
-    output.parent.mkdir(parents=True, exist_ok=True)
+    prov_buf = io.BytesIO()
     np.savez_compressed(
-        output,
+        prov_buf,
         model_schema=np.asarray(ADAPTIVE_SCHEMA),
         basis=np.asarray(basis, dtype=np.float64),
         oldbasis=np.asarray(oldbasis, dtype=np.float64),
@@ -1357,7 +1368,8 @@ def fit_adaptive_from_config(
         amplitude_nodes=target_nodes,
         envelope_cell_origin=np.asarray(origin_rc, dtype=np.int64),
     )
-    prov_model = base.Model(output)
+    prov_buf.seek(0)
+    prov_model = base.Model(prov_buf)
     try:
         # Validate each candidate independently before its Strip C evaluation.
         # The archive loader remains strict for every enabled channel.
@@ -1398,8 +1410,8 @@ def fit_adaptive_from_config(
         for n in target_names
     ]
     check()
-    np.savez_compressed(
-        output,
+    base._savez_atomic(
+        Path(output),
         model_schema=np.asarray(ADAPTIVE_SCHEMA),
         basis=np.asarray(basis, dtype=np.float64),
         oldbasis=np.asarray(oldbasis, dtype=np.float64),

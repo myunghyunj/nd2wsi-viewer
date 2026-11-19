@@ -21,7 +21,9 @@
       })};
   }
   function applyDisplay(state, display) {
-    if (!display || display.version !== 1 || display.source_dimensions[0] !== state.info.width ||
+    if (!display || display.version !== 1 || !Array.isArray(display.source_dimensions) ||
+        !Array.isArray(display.channels) ||
+        display.source_dimensions[0] !== state.info.width ||
         display.source_dimensions[1] !== state.info.height || display.channels.length !== state.info.channels.length)
       throw new Error("Display handoff does not match the opened slide");
     state.channels = [];
@@ -32,6 +34,11 @@
     });
   }
   function applyCamera(viewer, display) {
+    if (!display || !Number.isFinite(display.zoom) || display.zoom <= 0 ||
+        !Array.isArray(display.center) || display.center.length < 2 ||
+        !Number.isFinite(display.center[0]) || !Number.isFinite(display.center[1])) {
+      throw new Error("Invalid camera handoff");
+    }
     const size = viewer.viewport.getContainerSize();
     const width = size.x / display.zoom, height = size.y / display.zoom;
     const bounds = viewer.viewport.imageToViewportRectangle(

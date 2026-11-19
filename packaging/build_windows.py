@@ -149,7 +149,7 @@ def verify_source_files(provenance: dict) -> None:
     required.update(str(path.relative_to(REPO).as_posix())
                     for path in (REPO / "nd2wsi").rglob("*")
                     if path.is_file() and "__pycache__" not in path.parts
-                    and path.suffix != ".pyc")
+                    and path.suffix != ".pyc" and path.name != ".DS_Store")
     missing = required - set(files)
     if missing:
         raise ValueError(f"Source manifest omits build inputs: {sorted(missing)}")

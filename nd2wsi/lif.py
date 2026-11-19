@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import struct
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack
@@ -102,6 +103,12 @@ class _LifSeriesSpec:
     z_step_um: float | None = None
 
 
+_MAX_XML_BYTES = 32 * 1024 * 1024
+_MAX_ID_BYTES = 1 * 1024 * 1024
+_MAX_MOSAIC_SIDE = 1_000_000
+_DTD_TEXT_RE = re.compile(r"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+
+
 def _read_lif_header_and_blocks(
     fd: int, file_size: int
 ) -> tuple[ET.Element, dict[str, tuple[int, int]]]:
@@ -112,11 +119,13 @@ def _read_lif_header_and_blocks(
     if magic != 0x70 or marker != 0x2A:
         raise ValueError("not a valid Leica LIF file (missing 0x70/0x2A container magic)")
     xml_bytes_len = int(xml_nc) * 2
-    if xml_bytes_len <= 0 or 13 + xml_bytes_len > file_size:
-        raise ValueError("LIF XML header size exceeds file bounds")
+    if xml_bytes_len <= 0 or xml_bytes_len > _MAX_XML_BYTES or 13 + xml_bytes_len > file_size:
+        raise ValueError("LIF XML header size exceeds bounds")
 
     xml_raw = read_at(fd, xml_bytes_len, 13)
     xml_text = xml_raw.decode("utf-16-le", errors="replace").rstrip("\x00 \t\r\n")
+    if _DTD_TEXT_RE.search(xml_text):
+        raise ValueError("LIF XML header contains forbidden DTD/entity declarations")
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
@@ -147,7 +156,7 @@ def _read_lif_header_and_blocks(
             break
         id_bytes_len = int(id_nc) * 2
         id_pos = pos + prefix_len
-        if id_pos + id_bytes_len > file_size:
+        if id_bytes_len > _MAX_ID_BYTES or id_pos + id_bytes_len > file_size:
             break
         mem_id = (
             read_at(fd, id_bytes_len, id_pos)
@@ -649,6 +658,8 @@ def open_lif(
         tile_coords = [(0, 0)]
         width = series.width
         height = series.height
+    if not (0 < width <= _MAX_MOSAIC_SIDE and 0 < height <= _MAX_MOSAIC_SIDE):
+        raise ValueError(f"LIF canvas {width}x{height} exceeds safety limit")
 
     notes: list[str] = [f"Leica LIF series {selection.p} '{series.name}' ({width} x {height})"]
     if n_p > 1:

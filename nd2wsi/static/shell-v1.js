@@ -1,6 +1,16 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+if (typeof crypto !== "undefined" && typeof crypto.randomUUID !== "function" &&
+    typeof crypto.getRandomValues === "function") {
+  crypto.randomUUID = () => {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+}
 const frames = new Map();
 const readyFrames = new Set();
 const shadingStates = new Map();
@@ -698,6 +708,22 @@ function slideName(sid) {
   return slides.find((slide) => slide.sid === sid)?.name || "Slide";
 }
 
+function updateBusyTabNode(entry) {
+  if (!entry?._tabEl) return false;
+  entry._tabEl.title = entry.name;
+  if (entry._nameEl) entry._nameEl.textContent = entry.name;
+  if (entry._fillEl) {
+    if (entry.pct > 0) {
+      entry._fillEl.classList.remove("indet");
+      entry._fillEl.style.width = `${entry.pct}%`;
+    } else {
+      entry._fillEl.style.width = "";
+      entry._fillEl.classList.add("indet");
+    }
+  }
+  return true;
+}
+
 function render() {
   refreshShellToolButtons();
   refreshShadingButton();
@@ -732,18 +758,32 @@ function render() {
       else fill.className = "indet";
       progress.append(fill);
       tab.append(progress);
+      slide._tabEl = tab;
+      slide._nameEl = name;
+      slide._fillEl = fill;
     } else {
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", String(slide.sid === active));
+      tab.tabIndex = slide.sid === active ? 0 : -1;
       const close = document.createElement("button");
       close.className = "x";
       close.type = "button";
       close.textContent = "×";
       close.title = "Close tab";
+      close.setAttribute("aria-label", `Close ${slide.name}`);
       close.onclick = (event) => {
         event.stopPropagation();
         closeTab(slide.sid);
       };
       tab.append(close);
       tab.onclick = () => activate(slide.sid);
+      tab.addEventListener("keydown", (event) => {
+        if (event.target !== tab) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          activate(slide.sid);
+        }
+      });
     }
     bar.insertBefore(tab, plus);
   }
@@ -942,6 +982,8 @@ function activate(sid) {
   const selected = frames.get(active);
   if (selected?.contentWindow) {
     selected.contentWindow.postMessage({ nd2wsi: "theme-request" }, location.origin);
+  } else if (!active) {
+    applyShellTheme("dark");
   }
   render();
   focusActivePane();
@@ -988,7 +1030,7 @@ function refresh(selectSid, beforeActivate) {
         if (slides.length < 2) closePairPicker(false);
         else renderPairPicker();
       }
-      if (selectSid) activate(selectSid);
+      if (selectSid && openSids.has(selectSid)) activate(selectSid);
       else if (!slides.some((slide) => slide.sid === active)) {
         activate(slides.length ? slides[slides.length - 1].sid : null);
       } else {
@@ -1045,7 +1087,7 @@ function openPath(path) {
         entry.name = entry.pct > 0
           ? `Converting ${name} ${entry.pct} %`
           : `Preparing ${name}…`;
-        render();
+        if (!updateBusyTabNode(entry)) render();
       })
       .catch(() => {});
   }, 400);
@@ -2437,16 +2479,18 @@ function renderChips() {
   chips.replaceChildren();
   const group = groupSids();
   group.forEach((sid, index) => {
-    const chip = document.createElement("button");
-    chip.type = "button";
+    const chip = document.createElement("div");
     chip.className = "compare-chip" + (index === 0 ? " anchor" : "");
     chip.dataset.sid = sid;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "compare-chip-btn";
     const pair = index === 0 ? null : compare.pairs.get(sid);
     const note = pair ? orientationNote(pair) : "";
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = slideName(sid);
-    chip.append(name);
+    btn.append(name);
     if (note) {
       const meta = document.createElement("span");
       meta.className = "meta";
@@ -2455,19 +2499,22 @@ function renderChips() {
       meta.textContent = pair?.fit
         ? Math.round(pair.fit.angleDeg) + "°" + (pair.fit.reflected ? " · mirror" : "")
         : note;
-      chip.append(meta);
+      btn.append(meta);
     }
-    chip.title = index === 0
+    btn.title = index === 0
       ? `${slideName(sid)} is the anchor. Every other slide follows it.`
       : `${slideName(sid)}${note ? " · " + note : ""}. Click to link a different slide in its place.`;
-    chip.disabled = index === 0 || Boolean(compare.pendingRequest) || compare.landmark.active;
-    chip.onclick = () => openPicker("replace", sid);
+    btn.disabled = index === 0 || Boolean(compare.pendingRequest) || compare.landmark.active;
+    btn.onclick = () => openPicker("replace", sid);
+    chip.append(btn);
     if (index > 0) {
-      const remove = document.createElement("span");
+      const remove = document.createElement("button");
+      remove.type = "button";
       remove.className = "remove";
       remove.textContent = "×";
       remove.title = `Unlink ${slideName(sid)}`;
-      remove.setAttribute("role", "button");
+      remove.setAttribute("aria-label", `Unlink ${slideName(sid)}`);
+      remove.disabled = Boolean(compare.landmark.active);
       remove.onclick = (event) => {
         event.stopPropagation();
         if (!compare.landmark.active) removeMember(sid, true);
@@ -2885,7 +2932,8 @@ function panelShortcut(panel) {
 }
 
 function receiveSceneSelected(senderSid, data) {
-  if (!senderSid || quitPreparation || !data || typeof data.sid !== "string" || !data.sid) {
+  if (!senderSid || quitPreparation || !data || typeof data.sid !== "string" ||
+      !/^[A-Za-z0-9_-]{1,64}$/.test(data.sid)) {
     return false;
   }
   const newSid = data.sid;
@@ -2901,6 +2949,7 @@ function receiveSceneSelected(senderSid, data) {
     const existing = slides.find((s) => s.sid === senderSid);
     if (existing && newName) existing.name = newName;
     closeSenderTranslucent();
+    readyFrames.delete(senderSid);
     frames.get(senderSid)?.contentWindow?.location?.reload?.();
     render();
     return true;
@@ -3069,7 +3118,10 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   if (event.repeat) return;
-  if (event.key === "Escape" && pairPickerIsOpen()) {
+  if (event.key === "Escape" && !$("compare-link-menu").hidden) {
+    event.preventDefault();
+    setLinkMenuVisible(false);
+  } else if (event.key === "Escape" && pairPickerIsOpen()) {
     event.preventDefault();
     closePairPicker();
   } else if (event.key === "Escape" && compare.landmark.active) {
@@ -3118,6 +3170,11 @@ $("compare-picker").addEventListener("keydown", (event) => {
 });
 
 document.addEventListener("pointerdown", (event) => {
+  const linkMenu = $("compare-link-menu");
+  if (linkMenu && !linkMenu.hidden && !linkMenu.contains(event.target) &&
+      !$("compare-link").contains(event.target)) {
+    setLinkMenuVisible(false, false);
+  }
   if (!pairPickerIsOpen()) return;
   if ($("compare-picker").contains(event.target) || $("compare-toggle").contains(event.target) ||
       $("compare-add").contains(event.target) || $("compare-chips").contains(event.target)) return;
@@ -3127,7 +3184,7 @@ document.addEventListener("pointerdown", (event) => {
 const compareDivider = $("compare-divider");
 let dividerPointer = null;
 compareDivider.addEventListener("pointerdown", (event) => {
-  if (!compare.enabled || event.target.closest("button")) return;
+  if ((event.button != null && event.button !== 0) || !compare.enabled || event.target.closest("button")) return;
   event.preventDefault();
   dividerPointer = event.pointerId;
   compareDivider.setPointerCapture(event.pointerId);
@@ -3148,6 +3205,7 @@ function finishDividerDrag(event) {
 }
 compareDivider.addEventListener("pointerup", finishDividerDrag);
 compareDivider.addEventListener("pointercancel", finishDividerDrag);
+compareDivider.addEventListener("lostpointercapture", finishDividerDrag);
 
 $("newtab").onclick = () => {
   if (window.pywebview?.api?.pick_paths) {

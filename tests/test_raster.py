@@ -442,6 +442,38 @@ def test_large_jpeg_uses_current_available_memory_before_decode(tmp_path, monkey
             raster.open_direct(path)
 
 
+@pytest.mark.parametrize("available,allowed", [(3 << 30, True), (2 << 30, True), (512 << 20, False)])
+def test_large_rgb_jpeg_budget_matches_actual_pillow_footprint_on_windows(
+    tmp_path, monkeypatch, available, allowed
+):
+    from PIL import JpegImagePlugin
+
+    # Matches A-1_large.jpg (19178 x 11219 = 215.16 MPx RGB JPEG; ~820 MiB decoded).
+    # Previously demanded >6.41 GiB free RAM (16 B/px vs half of available RAM).
+    path = jpeg_with_large_header(tmp_path, 19178, 11219)
+    monkeypatch.setattr("nd2wsi.convert.available_memory_bytes", lambda: available)
+
+    class DecoderReached(Exception):
+        pass
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "load", lambda _: (_ for _ in ()).throw(DecoderReached()))
+    if allowed:
+        with pytest.raises(DecoderReached):
+            raster.open_direct(path)
+    else:
+        with pytest.raises(ValueError, match="Not enough memory"):
+            raster.open_direct(path)
+
+
+def test_raster_translates_pillow_memory_error(tmp_path, monkeypatch):
+    from PIL import JpegImagePlugin
+
+    path = save_image(tmp_path, name="oom.jpg")
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "load", lambda _: (_ for _ in ()).throw(MemoryError()))
+    with pytest.raises(ValueError, match="Not enough memory"):
+        raster.open_direct(path)
+
+
 def test_agent_raster_opens_without_shared_cache_or_sidecar_writes(tmp_path, monkeypatch):
     source = tmp_path / "input"
     source.mkdir()

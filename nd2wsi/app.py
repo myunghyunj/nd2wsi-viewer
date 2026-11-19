@@ -64,8 +64,18 @@ def _write_app_log(msg: str) -> None:
         log = log_path()
         log.parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
-        with open(log, "a", encoding="utf-8") as fh:
-            fh.write(f"{stamp} {msg}\n")
+        line = f"{stamp} {msg}\n"
+        if os.name == "nt":
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        else:
+            fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fh.write(line)
     except OSError:
         pass
 
@@ -614,6 +624,8 @@ class Api:
             window_session is not None and window_session.role == "agent"
         )
         self._server_lock = threading.Lock()
+        self._open_lock = threading.Lock()
+        self._active_opens = 0
         self._translucent_lock = threading.RLock()
         self._translucent_windows = {}
         self._active_translucent_sid = None
@@ -746,46 +758,58 @@ class Api:
                 if self._translucent_owner_closed:
                     raise ValueError("The source viewer is closing")
                 previous = self._translucent_windows.get(sid)
-                if previous is not None:
-                    previous.refresh_context(context)
-                    return {"ok": True, "id": previous._window.uid}
-                claim = tracing_claim(self._window_session)
-                try:
-                    if self._translucent_windows:
-                        raise TimeoutError("another tracing window is open")
-                    claim.acquire()
-                except TimeoutError:
-                    session_log.event("translucent_refused", reason="another_open", sid=sid)
-                    return {"ok": False, "reason": "another_open",
-                            "message": "A tracing window is already open. Close it before opening another."}
-                self._translucent_claim = claim
+                if previous is None:
+                    if self._translucent_windows or self._translucent_claim is not None:
+                        session_log.event("translucent_refused", reason="another_open", sid=sid)
+                        return {"ok": False, "reason": "another_open",
+                                "message": "A tracing window is already open. Close it before opening another."}
+                    claim = tracing_claim(self._window_session)
+                    try:
+                        claim.acquire()
+                    except TimeoutError:
+                        session_log.event("translucent_refused", reason="another_open", sid=sid)
+                        return {"ok": False, "reason": "another_open",
+                                "message": "A tracing window is already open. Close it before opening another."}
+                    self._translucent_claim = claim
 
-                def remove(closed):
-                    with self._translucent_lock:
-                        if self._translucent_windows.get(sid) is closed:
-                            self._translucent_windows.pop(sid, None)
-                        if self._translucent_claim is claim:
-                            self._translucent_claim = None
-                        claim.release()
-                    session_log.event("translucent_closed", sid=sid)
+            if previous is not None:
+                previous.refresh_context(context)
+                return {"ok": True, "id": previous._window.uid}
 
-                def active(locked):
-                    if locked:
-                        self._active_translucent_sid = sid
+            def remove(closed):
+                with self._translucent_lock:
+                    if self._translucent_windows.get(sid) is closed:
+                        self._translucent_windows.pop(sid, None)
+                    if self._translucent_claim is claim:
+                        self._translucent_claim = None
+                    claim.release()
+                session_log.event("translucent_closed", sid=sid)
 
-                def deliver(message):
-                    # Called only by the overlay's bounded delivery worker, without either lock.
-                    owner = self._lut_clipboard_owner()
-                    return owner.evaluate_js("window.nd2wsiSlacsLaserBox?.(" +
-                                             json.dumps({**message, "sid": sid}, allow_nan=False) + ") === true")
+            def active(locked):
+                if locked:
+                    self._active_translucent_sid = sid
 
-                overlay = create_translucent_window(
-                    context, url=base_url + "static/translucent.html",
-                    title=APP_NAME + " — Translucent", logger=_dlog, on_closed=remove,
-                    flip_store=self._follow_flip_store(), target_store=LaserTargetStore(self._window_session),
-                    on_laser_box=deliver, is_active=lambda: self._active_translucent_sid == sid, on_lock=active,
-                )
-                self._translucent_windows[sid] = overlay
+            def deliver(message):
+                # Called only by the overlay's bounded delivery worker, without either lock.
+                owner = self._lut_clipboard_owner()
+                return owner.evaluate_js("window.nd2wsiSlacsLaserBox?.(" +
+                                         json.dumps({**message, "sid": sid}, allow_nan=False) + ") === true")
+
+            overlay = create_translucent_window(
+                context, url=base_url + "static/translucent.html",
+                title=APP_NAME + " — Translucent", logger=_dlog, on_closed=remove,
+                flip_store=self._follow_flip_store(), target_store=LaserTargetStore(self._window_session),
+                on_laser_box=deliver, is_active=lambda: self._active_translucent_sid == sid, on_lock=active,
+            )
+            owner_closed = False
+            with self._translucent_lock:
+                if self._translucent_owner_closed:
+                    owner_closed = True
+                else:
+                    self._translucent_windows[sid] = overlay
+            if owner_closed:
+                overlay.close_translucent()
+                raise ValueError("The source viewer is closing")
             session_log.event("translucent_opened", sid=sid, id=overlay._window.uid)
             return {"ok": True, "id": overlay._window.uid}
         except Exception as exc:
@@ -862,7 +886,9 @@ class Api:
             if type(retry) is not bool:
                 raise ValueError("Retry must be an explicit boolean choice")
 
-            st = self._httpd.registry.get(sid) if self._httpd is not None and isinstance(sid, str) else None
+            with self._server_lock:
+                server = self._httpd
+            st = server.registry.get(sid) if server is not None and isinstance(sid, str) else None
             if st is None or st.source_path is None:
                 raise ValueError("Open a source slide before choosing Metal")
             meta = st.attrs["nd2wsi"]
@@ -890,14 +916,16 @@ class Api:
         return metrics_snapshot()
 
     def _prepare_handoff(self) -> None:
-        if self._handoff_state is None or self._httpd is None:
+        with self._server_lock:
+            server = self._httpd
+        if self._handoff_state is None or server is None:
             return
         from copy import deepcopy
 
         from .view_state import validate_view_state
 
-        for item in self._httpd.registry.listing():
-            st = self._httpd.registry.get(item["sid"])
+        for item in server.registry.listing():
+            st = server.registry.get(item["sid"])
             if st.source_path != self._handoff_source:
                 continue
             meta = st.attrs["nd2wsi"]
@@ -1086,7 +1114,9 @@ class Api:
         self._updater = handle
 
     def update_block_reason(self) -> str | None:
-        if self._frac >= 0:
+        with self._open_lock:
+            opening = self._active_opens > 0 or self._frac >= 0
+        if opening:
             return "Waiting for the slide which is opening…"
         with self._server_lock:
             server = self._httpd
@@ -1108,9 +1138,12 @@ class Api:
         """
         self._close_translucent_windows(owner_closing=False)
         with self._server_lock:
-            server, self._httpd = self._httpd, None
-            if server is None:
-                server, self._releasing_httpd = self._releasing_httpd, None
+            if self._httpd is not None:
+                server = self._httpd
+                self._httpd = None
+                self._releasing_httpd = server
+            else:
+                server = self._releasing_httpd
         if server is None:
             return
         shutdown = getattr(server, "shutdown_for_relaunch", None)
@@ -1122,10 +1155,11 @@ class Api:
             else:
                 shutdown(timeout=timeout)
         except TimeoutError:
-            with self._server_lock:
-                self._releasing_httpd = server
             server.server_close()
             raise
+        with self._server_lock:
+            if self._releasing_httpd is server:
+                self._releasing_httpd = None
         server.server_close()
 
     def _dialog_window(self):
@@ -1290,23 +1324,31 @@ class Api:
 
     def _open_registered(self, path: Path, note, frac) -> str:
         with self._translucent_lock:
-            self._translucent_owner_closed = False
+            if self._translucent_owner_closed:
+                raise RuntimeError("The viewer window is closing")
         if self._window_session is not None and self._window_session.role == "agent":
             # Do not call open_or_convert/ensure_cache before the registry can
             # apply Agent policy. Existing ND2 caches, native SVS/SDPC and plates
             # are opened read-only; missing/shared-cache repair is refused.
             note("opening in isolated Agent window")
             with self._server_lock:
+                with self._translucent_lock:
+                    if self._translucent_owner_closed:
+                        raise RuntimeError("The viewer window is closing")
                 if self._httpd is None:
                     self._httpd, _ = start_server([], window_session=self._window_session)
-                registry = getattr(self._httpd, "registry", None)
+                server = self._httpd
+                registry = getattr(server, "registry", None)
                 if registry is not None:
                     registry.on_remove = self.close_translucent_viewer
-                self._httpd.registry.open_path(path, on_progress=frac)
-                self._prepare_handoff()
-                return _server_url(self._httpd)
+            server.registry.open_path(path, on_progress=frac)
+            self._prepare_handoff()
+            return _server_url(server)
         store = open_or_convert(path, on_status=note, on_progress=frac)
         with self._server_lock:
+            with self._translucent_lock:
+                if self._translucent_owner_closed:
+                    raise RuntimeError("The viewer window is closing")
             if self._httpd is None:
                 kwargs = {"window_session": self._window_session} if self._window_session is not None else {}
                 self._httpd, url = start_server(store, **kwargs)
@@ -1339,23 +1381,31 @@ class Api:
 
             _dlog(f"open {p}")
             began = time.monotonic()
-            try:
+            with self._open_lock:
+                self._active_opens += 1
                 self._frac = 0.0  # bar up while the file opens, before ticks
+            try:
                 # a plate file skips conversion; the bar stays up while the
                 # registry opens it, which reads a few frames for its window
                 url = self._open_registered(p, note, frac)
-                self._frac = -1.0
                 _record_open(p, began, ok=True)
             except Exception as e:
-                self._frac = -1.0
                 self._status = f"could not open {p.name}: {e}"
                 _dlog(f"open FAILED {p.name}: {e}")
                 _record_open(p, began, ok=False, error=str(e))
+            finally:
+                with self._open_lock:
+                    self._active_opens = max(0, self._active_opens - 1)
+                    if self._active_opens == 0:
+                        self._frac = -1.0
         self._status = "starting viewer …" if url else self._status
         return url
 
     def _launch(self, path: Path):
         began = time.monotonic()
+        with self._open_lock:
+            self._active_opens += 1
+            self._frac = 0.0  # bar up while the file opens, before ticks
         try:
             def note(msg):
                 self._status = msg
@@ -1363,17 +1413,19 @@ class Api:
             def frac(f):
                 self._frac = f
 
-            self._frac = 0.0  # bar up while the file opens, before ticks
             url = self._open_registered(path, note, frac)
             self._status = "starting viewer …"
-            self._frac = -1.0
             _record_open(path, began, ok=True)
             return url  # the tab shell at / lists every open slide
         except Exception as e:  # surfaced in the bootstrap page
-            self._frac = -1.0
             self._status = f"could not open {path.name}: {e}"
             _record_open(path, began, ok=False, error=str(e))
             return None
+        finally:
+            with self._open_lock:
+                self._active_opens = max(0, self._active_opens - 1)
+                if self._active_opens == 0:
+                    self._frac = -1.0
 
 
 def smoke(nd2_path: Path) -> int:
@@ -1459,7 +1511,12 @@ def _daemonize_pywebview_bridge_threads(webview) -> None:
         util.Thread = _PywebviewDaemonThread
 
 
-_DIAGNOSTIC_RUN_FLAGS = ("--gui-smoke", "--handoff-check-report", "--browser-replay-report")
+_DIAGNOSTIC_RUN_FLAGS = (
+    "--gui-smoke",
+    "--handoff-check-report",
+    "--browser-replay-report",
+    "--cli-self-check",
+)
 
 # How long an interactive exit waits for slide reads, exports and plate writers
 # to let go of their sources once the window has closed.
@@ -1553,6 +1610,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog=APP_NAME, description=__doc__)
     ap.add_argument("nd2", nargs="?", help="ND2, SVS, SDPC, JPEG or PNG file to open at launch")
     ap.add_argument("--smoke", action="store_true", help="headless self-test")
+    ap.add_argument("--cli-self-check", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--gui-smoke", action="store_true", help="open, verify and close the native window")
     ap.add_argument("--smoke-report", type=Path, help="write the native GUI self-test result as JSON")
     ap.add_argument("--handoff-state", type=Path, help=argparse.SUPPRESS)
@@ -1603,6 +1661,34 @@ def _main(args) -> int:
                 or not initial.resolve().is_relative_to(args.benchmark_test_root.resolve())):
             print("Browser replay requires a macOS Agent window and source inside an explicit test root", file=sys.stderr)
             return 2
+    if args.cli_self_check:
+        import contextlib
+        import io
+
+        import imagecodecs  # noqa: F401
+        import tifffile  # noqa: F401
+
+        from . import cli as _cli
+        from . import ometiff as _ometiff  # noqa: F401
+        from . import ui_settings as _ui_settings  # noqa: F401
+
+        buf = io.StringIO()
+        code = 0
+        try:
+            with contextlib.redirect_stdout(buf):
+                _cli.main(["--help"])
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+        text = buf.getvalue()
+        ok = code == 0 and all(
+            tok in text for tok in ("Zeiss CZI", "Leica LIF", "OME-TIFF", ".nd2svs")
+        )
+        args.cli_self_check.parent.mkdir(parents=True, exist_ok=True)
+        args.cli_self_check.write_text(
+            json.dumps({"ok": ok, "ometiff": True, "cli_help": ok}),
+            encoding="utf-8",
+        )
+        return 0 if ok else 4
     if args.smoke:
         if not initial:
             print("--smoke needs an ND2 path", file=sys.stderr)

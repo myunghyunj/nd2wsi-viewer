@@ -13,6 +13,27 @@ import time
 from collections.abc import Callable
 
 
+def _redact_url_for_log(url: object) -> str:
+    """Redact the capability token path segment before writing a URL to app logs."""
+    import urllib.parse
+
+    if not url:
+        return ""
+    text = str(url)
+    try:
+        parsed = urllib.parse.urlparse(text)
+    except ValueError:
+        return "<invalid-url>"
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return text
+    parts = parsed.path.split("/")
+    if len(parts) >= 2 and parts[1]:
+        parts[1] = "<redacted>"
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, "/".join(parts), "", "", "")
+    )
+
+
 def native_window(window):
     """The NSWindow behind a pywebview window, or None (main thread only)."""
     import AppKit
@@ -21,9 +42,15 @@ def native_window(window):
     candidate = getattr(native, "window", None) or native
     if isinstance(candidate, AppKit.NSWindow):
         return candidate
-    for win in AppKit.NSApplication.sharedApplication().windows():
-        if win.isVisible():
-            return win
+    try:
+        from webview.platforms.cocoa import BrowserView
+
+        uid = getattr(window, "uid", None)
+        browser = BrowserView.instances.get(uid) if uid is not None else None
+        if browser is not None and isinstance(getattr(browser, "window", None), AppKit.NSWindow):
+            return browser.window
+    except Exception:
+        pass
     return None
 
 
@@ -66,15 +93,22 @@ class NativeTitlebarDrag:
         self._monitor = None
         self._press = None
         self._pressed_at = 0.0
+        self._closed = False
         window.events.shown += lambda: self._schedule(self._install)
         window.events.closed += lambda: self._schedule(self._remove)
         window.events.before_load += lambda: self._schedule(self._clear)
 
     def _schedule(self, operation):
+        def guarded():
+            try:
+                operation()
+            except Exception as exc:
+                self.logger(f"native title-bar drag callback failed: {exc!r}")
+
         try:
             from Foundation import NSOperationQueue
 
-            NSOperationQueue.mainQueue().addOperationWithBlock_(operation)
+            NSOperationQueue.mainQueue().addOperationWithBlock_(guarded)
         except Exception as exc:
             self.logger(f"native title-bar drag unavailable: {exc!r}")
 
@@ -82,7 +116,7 @@ class NativeTitlebarDrag:
         self._press = None
 
     def _install(self):
-        if self._token is not None:
+        if self._closed or self._token is not None:
             return
         try:
             import AppKit
@@ -112,6 +146,7 @@ class NativeTitlebarDrag:
             self.logger(f"native title-bar drag install failed: {exc!r}")
 
     def _remove(self):
+        self._closed = True
         self._clear()
         if self._token is not None:
             import AppKit
@@ -292,7 +327,7 @@ def wire_file_drop(window, *, logger: Callable[[str], None]):
 
     def attach(*_args):
         try:
-            logger(f"loaded {window.get_current_url()}")
+            logger(f"loaded {_redact_url_for_log(window.get_current_url())}")
         except Exception:
             pass
         try:
@@ -303,6 +338,48 @@ def wire_file_drop(window, *, logger: Callable[[str], None]):
             pass  # not a document we control; the next load re-attaches
 
     window.events.loaded += attach
+
+
+_WINDOW_MENU_TARGET_CLASSES: dict[type, type] = {}
+
+
+def _window_menu_target_class(appkit):
+    base = appkit.NSObject
+    cached = _WINDOW_MENU_TARGET_CLASSES.get(base)
+    if cached is not None:
+        return cached
+
+    class ND2WSIWindowMenuTarget(base):
+        def newUserWindow_(self, _sender):
+            result = self._api.new_window("user")
+            if not result.get("ok"):
+                self._api._status = result.get("message", "Could not open a window.")
+
+        def newAgentWindow_(self, _sender):
+            result = self._api.new_window("agent")
+            if not result.get("ok"):
+                self._api._status = result.get("message", "Could not open an Agent window.")
+
+        def openInMetal_(self, _sender):
+            # evaluate_js must not synchronously wait on AppKit's
+            # main thread. The page resolves the active tab itself.
+            def request():
+                try:
+                    self._window.evaluate_js("window.nd2OpenActiveInMetal?.(); true")
+                except Exception as exc:
+                    self._api._status = f"Could not open in Metal: {exc}"
+            threading.Thread(target=request, daemon=True).start()
+
+        def retryInMetal_(self, _sender):
+            def request():
+                try:
+                    self._window.evaluate_js("window.nd2OpenActiveInMetal?.(true); true")
+                except Exception as exc:
+                    self._api._status = f"Could not retry Metal: {exc}"
+            threading.Thread(target=request, daemon=True).start()
+
+    _WINDOW_MENU_TARGET_CLASSES[base] = ND2WSIWindowMenuTarget
+    return ND2WSIWindowMenuTarget
 
 
 def install_window_menu(api, window, *, logger: Callable[[str], None]) -> None:
@@ -318,36 +395,10 @@ def install_window_menu(api, window, *, logger: Callable[[str], None]) -> None:
                 if getattr(api, "_window_menu_target", None) is not None:
                     return
                 # NSMenuItem does not retain its target; keep it on this Api.
-                class ND2WSIWindowMenuTarget(AppKit.NSObject):
-                    def newUserWindow_(self, _sender):
-                        result = api.new_window("user")
-                        if not result.get("ok"):
-                            api._status = result.get("message", "Could not open a window.")
-
-                    def newAgentWindow_(self, _sender):
-                        result = api.new_window("agent")
-                        if not result.get("ok"):
-                            api._status = result.get("message", "Could not open an Agent window.")
-
-                    def openInMetal_(self, _sender):
-                        # evaluate_js must not synchronously wait on AppKit's
-                        # main thread. The page resolves the active tab itself.
-                        def request():
-                            try:
-                                window.evaluate_js("window.nd2OpenActiveInMetal?.(); true")
-                            except Exception as exc:
-                                api._status = f"Could not open in Metal: {exc}"
-                        threading.Thread(target=request, daemon=True).start()
-
-                    def retryInMetal_(self, _sender):
-                        def request():
-                            try:
-                                window.evaluate_js("window.nd2OpenActiveInMetal?.(true); true")
-                            except Exception as exc:
-                                api._status = f"Could not retry Metal: {exc}"
-                        threading.Thread(target=request, daemon=True).start()
-
-                target = ND2WSIWindowMenuTarget.alloc().init()
+                target_cls = _window_menu_target_class(AppKit)
+                target = target_cls.alloc().init()
+                target._api = api
+                target._window = window
                 main_menu = AppKit.NSApplication.sharedApplication().mainMenu()
                 if main_menu is None:
                     raise RuntimeError("native menu is not ready")

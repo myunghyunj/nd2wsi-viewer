@@ -327,15 +327,15 @@ def _evaluate_recent_files(
     return kept_stored, evaluated, pruned
 
 
-def list_recent_files(limit: int = 12) -> list[dict[str, Any]]:
-    """Return recent files, pruning missing local paths while keeping unmounted
-    ``/Volumes/<vol>/...`` entries with ``"available": False``."""
+def list_recent_files(limit: int = 12, *, prune: bool = True) -> list[dict[str, Any]]:
+    """Return recent files, optionally pruning missing local paths while keeping
+    unmounted ``/Volumes/<vol>/...`` entries with ``"available": False``."""
     cap = max(0, int(limit))
     path = ui_settings_path()
     with _LOCK:
         doc = _read_document_unlocked(path)
         kept_stored, evaluated, pruned = _evaluate_recent_files(doc["recentFiles"])
-        if pruned and path.exists():
+        if prune and pruned and path.exists():
             try:
                 file_lock = SessionFileLock(path.with_suffix(".lock"))
                 file_lock.acquire(timeout=5)
@@ -363,11 +363,12 @@ def record_recent_file(
 ) -> list[dict[str, Any]]:
     """Record an opened file at the front of the recent-files list (capped at 20).
 
-    Strictly a no-op when ``window_role == "agent"`` (or ``role == "agent"``).
+    Strictly a no-op when ``window_role == "agent"`` (or ``role == "agent"``);
+    never reads or mutates the shared user ``ui-settings.json``.
     """
     effective_role = role if role is not None else window_role
     if effective_role == "agent":
-        return list_recent_files(limit=MAX_RECENT_STORED)
+        return []
 
     raw_p = Path(path).expanduser()
     resolved_str = str(raw_p.resolve())

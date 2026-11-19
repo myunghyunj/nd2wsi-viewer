@@ -18,17 +18,23 @@ function Get-WebView2Version {
 
 $version = Get-WebView2Version
 if (-not $version) {
-    $installer = Join-Path $env:TEMP 'nd2wsi-MicrosoftEdgeWebview2Setup.exe'
-    Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $installer
-    $signature = Get-AuthenticodeSignature -LiteralPath $installer
-    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
-        throw 'The WebView2 bootstrapper does not have a valid Microsoft signature.'
+    $tempDir = Join-Path $env:TEMP ("nd2wsi-wv2-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    $installer = Join-Path $tempDir 'MicrosoftEdgeWebview2Setup.exe'
+    try {
+        Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $installer
+        $signature = Get-AuthenticodeSignature -LiteralPath $installer
+        if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
+            throw 'The WebView2 bootstrapper does not have a valid Microsoft signature.'
+        }
+        $process = Start-Process -FilePath $installer -ArgumentList '/silent', '/install' -Wait -PassThru
+        if ($process.ExitCode -notin @(0, 3010)) {
+            throw "WebView2 setup failed with exit code $($process.ExitCode)."
+        }
+        $version = Get-WebView2Version
+        if (-not $version) { throw 'WebView2 setup completed but the runtime could not be detected.' }
+    } finally {
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-    $process = Start-Process -FilePath $installer -ArgumentList '/silent', '/install' -Wait -PassThru
-    if ($process.ExitCode -notin @(0, 3010)) {
-        throw "WebView2 setup failed with exit code $($process.ExitCode)."
-    }
-    $version = Get-WebView2Version
-    if (-not $version) { throw 'WebView2 setup completed but the runtime could not be detected.' }
 }
 Write-Host "Microsoft Edge WebView2 Runtime: $version"

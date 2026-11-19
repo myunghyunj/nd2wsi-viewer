@@ -40,7 +40,8 @@
         !Number.isFinite(value.zoom) || value.zoom <= 0 ||
         !Number.isFinite(value.rotation ?? 0)) throw new Error("Invalid image handoff");
     const slide = new URL(value.slide_url, pageUrl);
-    if (slide.origin !== new URL(pageUrl).origin || !/\/s\/[a-zA-Z0-9_-]+\/$/.test(slide.pathname)) {
+    if (slide.origin !== new URL(pageUrl).origin || slide.search || slide.hash ||
+        !/^(\/[A-Za-z0-9._~%-]+)?\/s\/[a-zA-Z0-9_-]+\/$/.test(slide.pathname)) {
       throw new Error("The source must belong to this viewer");
     }
     const query = new URLSearchParams(String(value.query || "").replace(/^\?/, ""));
@@ -49,11 +50,11 @@
         throw new Error("Invalid image display settings");
       }
     }
-    if (query.has("col")) {
-      for (const token of query.get("col").split(",")) {
-        if (token && !/^[0-9A-Fa-f]{6}$/.test(token)) {
-          throw new Error("Invalid image display settings");
-        }
+    const col = query.get("col");
+    if (col !== null) {
+      const tokens = col.split(",");
+      if (!tokens.length || tokens.length > 32 || !tokens.every(tok => tok === "" || /^[0-9a-fA-F]{6}$/.test(tok))) {
+        throw new Error("Invalid image display settings");
       }
     }
     return { ...value, slide_url: slide.href, query: query.toString(),
@@ -1145,7 +1146,10 @@
       if (discoveryInterval !== null) win.clearInterval(discoveryInterval);
       if (viewReportTimer !== null) win.clearTimeout(viewReportTimer);
       viewReportTimer = null;
-      cancelGesture(); observer?.disconnect(); viewer.destroy();
+      cancelGesture();
+      win.removeEventListener?.("resize", resize);
+      observer?.disconnect();
+      viewer.destroy();
     }, { once: true });
     pollSlacsDiscovery();
     discoveryInterval = win.setInterval(() => { reportMovedWindow(); pollSlacsDiscovery(); }, 1000);
@@ -1171,7 +1175,11 @@
         status.textContent = error.message || "Could not open the translucent viewer";
         status.hidden = false;
         // Exit stays available even when the source closes before the image opens.
-        doc.getElementById("overlay-close").onclick = () => win.pywebview?.api.close_translucent();
+        const closeOnFail = () => win.pywebview?.api?.close_translucent?.();
+        doc.getElementById("overlay-close").onclick = closeOnFail;
+        doc.addEventListener("keydown", event => {
+          if (event.key === "Escape") { event.preventDefault(); closeOnFail(); }
+        }, true);
       }
     };
     if (win.pywebview?.api?.translucent_context) start();

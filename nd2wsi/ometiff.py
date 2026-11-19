@@ -198,12 +198,26 @@ def _objective_mag(elem: ET.Element) -> float | None:
     return float(mag_raw) if _finite_positive(mag_raw) else None
 
 
+_MAX_XML_BYTES = 32 * 1024 * 1024
+_MAX_SEGMENT_BYTES = 256 * 1024 * 1024
+_MAX_STACK_FRAME_BYTES = 512 * 1024 * 1024
+_DTD_TEXT_RE = re.compile(r"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+
+
+def _checked_read_segment(fd: int, file_size: int, offset: int, count: int, seg: int) -> bytes:
+    off = int(offset)
+    cnt = int(count)
+    if off < 0 or cnt < 0 or cnt > _MAX_SEGMENT_BYTES or off + cnt > file_size:
+        raise ValueError(f"TIFF segment {seg} ({cnt} B @ {off}) exceeds file bounds")
+    return read_at(fd, cnt, off)
+
+
 def _parse_ome_xml(ome_xml: str | None) -> list[dict[str, Any]]:
     """Parse OME-XML into per-Image metadata records."""
-    if not ome_xml:
+    if not ome_xml or len(ome_xml) > _MAX_XML_BYTES:
         return []
     cleaned = ome_xml.strip().rstrip("\x00")
-    if "<" not in cleaned:
+    if "<" not in cleaned or _DTD_TEXT_RE.search(cleaned):
         return []
     try:
         root = ET.fromstring(cleaned)
@@ -308,7 +322,7 @@ def _parse_ome_xml(ome_xml: str | None) -> list[dict[str, Any]]:
 
         images.append(
             {
-                "name": (elem.attrib.get("Name") or "").strip() or f"Series {img_idx + 1}",
+                "name": (elem.attrib.get("Name") or "").strip() or f"Series {len(images) + 1}",
                 "pixel_size_um": pixel_size_um,
                 "z_step_um": z_step_um,
                 "magnification": magnification,
@@ -325,7 +339,9 @@ def _parse_ome_xml(ome_xml: str | None) -> list[dict[str, Any]]:
 
 def _parse_qpi_page_meta(desc: str | None) -> dict[str, Any] | None:
     """Extract PerkinElmer/Akoya QPTIFF channel metadata from page XML."""
-    if not desc or "PerkinElmer-QPI" not in desc:
+    if not desc or len(desc) > _MAX_XML_BYTES or "PerkinElmer-QPI" not in desc:
+        return None
+    if _DTD_TEXT_RE.search(desc):
         return None
     try:
         root = ET.fromstring(desc.strip().rstrip("\x00"))
@@ -446,7 +462,12 @@ def _extract_imagej_calibration(
     z_step_um: float | None = None
     spacing = ij_meta.get("spacing")
     if spacing is not None and isinstance(unit_str, str):
-        z_step_um = _unit_to_um(abs(float(spacing)) if _finite_positive(abs(float(spacing))) else None, unit_str)
+        try:
+            spacing_val = abs(float(spacing))
+        except (TypeError, ValueError):
+            spacing_val = None
+        if spacing_val is not None and _finite_positive(spacing_val):
+            z_step_um = _unit_to_um(spacing_val, unit_str)
 
     return pixel_size_um, z_step_um, cal_source
 
@@ -1053,6 +1074,7 @@ def _contig_tile_reader(page: Any, fd: int, cache: _TileCache, tag: Any, out_dty
     across = -(-w // tw)
     offsets = page.dataoffsets
     counts = page.databytecounts
+    file_size = os.fstat(fd).st_size
     tables = {
         "jpegtables": getattr(page, "jpegtables", None),
         "jpegheader": getattr(page, "jpegheader", None),
@@ -1067,7 +1089,7 @@ def _contig_tile_reader(page: Any, fd: int, cache: _TileCache, tag: Any, out_dty
         if seg >= len(counts) or counts[seg] == 0:
             block = np.zeros((keep_samples, th, tw), dtype=out_dtype)
         else:
-            raw = read_at(fd, counts[seg], offsets[seg])
+            raw = _checked_read_segment(fd, file_size, offsets[seg], counts[seg], seg)
             dec = _decode_page_segment(page, raw, seg, tables, out_dtype).reshape(-1, tw, samples)[:th]
             block = np.ascontiguousarray(np.moveaxis(dec[..., :keep_samples], -1, 0))
         cache.put(key, block)
@@ -1110,6 +1132,7 @@ def _planar_tile_reader(
     ny = -(-h // th)
     nx = -(-w // tw)
     tiles_per_plane = ny * nx
+    file_size = os.fstat(fd).st_size
 
     page_tables = [
         {
@@ -1137,7 +1160,7 @@ def _planar_tile_reader(
         if seg >= len(counts) or counts[seg] == 0:
             block = np.zeros((th, tw), dtype=out_dtype)
         else:
-            raw = read_at(fd, counts[seg], offsets[seg])
+            raw = _checked_read_segment(fd, file_size, offsets[seg], counts[seg], seg)
             dec = _decode_page_segment(page, raw, seg, tables, out_dtype).reshape(-1, tw)[:th]
             block = np.ascontiguousarray(dec)
         cache.put(key, block)
@@ -1343,6 +1366,7 @@ def _read_untiled_page_rows(
         and all(int(b) == raw_dt.itemsize * 8 for b in bps_tuple)
     )
     row_bytes = w * samples_in_strip * raw_dt.itemsize
+    file_size = os.fstat(fd).st_size
     tables = {
         "jpegtables": getattr(kf, "jpegtables", None),
         "jpegheader": getattr(kf, "jpegheader", None),
@@ -1358,7 +1382,7 @@ def _read_untiled_page_rows(
         if direct_uncompressed and int(counts[seg]) >= sh * row_bytes:
             n_rows = sy1 - sy0
             byte_off = int(offsets[seg]) + (sy0 - s * rps) * row_bytes
-            buf = read_at(fd, n_rows * row_bytes, byte_off)
+            buf = _checked_read_segment(fd, file_size, byte_off, n_rows * row_bytes, seg)
             if len(buf) == n_rows * row_bytes:
                 raw_rows = np.frombuffer(buf, dtype=raw_dt).reshape(n_rows, w, samples_in_strip)
                 sub = raw_rows[:, cx0:cx1, :keep_samples]
@@ -1370,7 +1394,7 @@ def _read_untiled_page_rows(
         key = (tag, "strip", seg)
         strip_cyx = cache.get(key)
         if strip_cyx is None:
-            raw = read_at(fd, int(counts[seg]), int(offsets[seg]))
+            raw = _checked_read_segment(fd, file_size, int(offsets[seg]), int(counts[seg]), seg)
             dec = _decode_page_segment(page, raw, seg, tables, out_dtype).reshape(
                 -1, w, samples_in_strip
             )[:sh]
@@ -2193,6 +2217,7 @@ class _BaseInteractiveStackSource:
         self._pf_thread: threading.Thread | None = None
         self._prefetch_epoch = 0
         self._zpf_lock = threading.Lock()
+        self._close_lock = threading.Lock()
         self._zpf_executor: ThreadPoolExecutor | None = None
         self._zpf_futures: list[Future[None]] = []
         self._zpf_pending_targets: list[tuple[int, int, int]] = []
@@ -2613,10 +2638,11 @@ class _BaseInteractiveStackSource:
                     return
 
     def close(self, timeout: float | None = 300.0, **_kw: Any) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._close_event.set()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._close_event.set()
         with self._pf_cv:
             self._pf_queue.clear()
             self._pf_set.clear()
@@ -2754,6 +2780,8 @@ class ContainerSceneStackSource(_BaseInteractiveStackSource):
         else:
             width, height = ser.width, ser.height
         n_c = len(ser.channels)
+        if width <= 0 or height <= 0 or width * height * max(1, n_c) * np.dtype(ser.dtype).itemsize > _MAX_STACK_FRAME_BYTES:
+            raise ValueError(f"LIF interactive stack frame ({n_c}x{height}x{width}) exceeds memory budget")
         self.T = max(1, int(ser.n_t))
         self.P = 1
         self.Z = max(1, int(ser.n_z))
@@ -2804,6 +2832,8 @@ class ContainerSceneStackSource(_BaseInteractiveStackSource):
         z_values = sorted({e.z for e in s_entries})
         t_values = sorted({e.t for e in s_entries})
         n_c = 3 if rgb else len(c_values)
+        if width <= 0 or height <= 0 or width * height * max(1, n_c) * np.dtype(dtype).itemsize > _MAX_STACK_FRAME_BYTES:
+            raise ValueError(f"CZI interactive stack frame ({n_c}x{height}x{width}) exceeds memory budget")
 
         self.T = max(1, len(t_values))
         self.P = 1
@@ -2892,9 +2922,10 @@ class ContainerSceneStackSource(_BaseInteractiveStackSource):
         return out
 
     def _close_backend_handles(self) -> None:
-        if self._fd >= 0:
-            os.close(self._fd)
-            self._fd = -1
+        with self._close_lock:
+            fd, self._fd = self._fd, -1
+        if fd >= 0:
+            os.close(fd)
 
 
 def _apply_col_override(

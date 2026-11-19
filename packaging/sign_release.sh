@@ -184,14 +184,41 @@ notarize_and_verify() {
   set -e
   cat "$submit_out"
 
-  submission_id="$(
-    sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p; s/^[[:space:]]*id:[[:space:]]*([0-9A-Za-z-]+).*$/\1/p' "$submit_out" | head -n 1
-  )"
-  submission_status="$(
-    sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p; s/^[[:space:]]*status:[[:space:]]*([A-Za-z]+).*$/\1/p' "$submit_out" | tail -n 1
-  )"
+  submission_id=""
+  submission_status=""
+  while IFS='=' read -r k v; do
+    case "$k" in
+      id) submission_id="$v" ;;
+      status) submission_status="$v" ;;
+    esac
+  done < <(python3 - "$submit_out" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+data = None
+decoder = json.JSONDecoder()
+for match in re.finditer(r"\{", raw):
+    try:
+        obj, _ = decoder.raw_decode(raw, match.start())
+    except json.JSONDecodeError:
+        continue
+    if isinstance(obj, dict) and ("id" in obj or "status" in obj):
+        data = obj
+if isinstance(data, dict):
+    sub_id = data.get("id")
+    sub_status = data.get("status")
+else:
+    m_id = re.search(r'"id"\s*:\s*"([^"]+)"|^\s*id:\s*([0-9A-Za-z-]+)', raw, re.M)
+    sub_id = (m_id.group(1) or m_id.group(2)) if m_id else ""
+    statuses = re.findall(r'"status"\s*:\s*"([^"]+)"|^\s*status:\s*([A-Za-z]+)', raw, re.M)
+    sub_status = (statuses[-1][0] or statuses[-1][1]) if statuses else ""
+if isinstance(sub_id, str) and sub_id:
+    print(f"id={sub_id}")
+if isinstance(sub_status, str) and sub_status:
+    print(f"status={sub_status}")
+PY
+)
 
-  if [ "$submit_rc" -ne 0 ] || { [ -n "$submission_status" ] && [ "$submission_status" != "Accepted" ]; }; then
+  if [ "$submit_rc" -ne 0 ] || [ "$submission_status" != "Accepted" ]; then
     echo "ERROR: notarization failed for $target (exit=$submit_rc, status=${submission_status:-unknown})" >&2
     if [ -n "$submission_id" ]; then
       echo "==> Retrieving Apple notarytool log for submission $submission_id" >&2

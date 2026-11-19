@@ -41,6 +41,16 @@ window.Nd2ShortcutRouter?.localizeLabels(document);
 const $ = (id) => document.getElementById(id);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const fmtInt = (v) => Math.round(v).toLocaleString("en-US");
+if (typeof crypto !== "undefined" && typeof crypto.randomUUID !== "function" &&
+    typeof crypto.getRandomValues === "function") {
+  crypto.randomUUID = () => {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+}
 
 const state = {
   info: null,
@@ -400,26 +410,31 @@ async function refreshShadingPyramid(generation, captured) {
       next.channels.some((channel, index) => channel.label !== info.channels[index].label)) {
     throw new Error("The rebuilt pyramid does not match this slide's geometry or channels");
   }
-  // Preserve effective LUT values even if a channel still uses its defaults.
-  // Keep this metadata object: the source-bound persistence controller owns it.
-  const prevColors = info.channels.map((channel) => ({
-    color: channel.color,
-    metadataColor: channel.metadataColor,
-  }));
-  info.channels.forEach((channel, index) => {
+  // Preserve effective LUT values and existing channel object references
+  // (held by LUT widgets and swatch buttons) even if a channel uses defaults.
+  const prevChannels = info.channels;
+  prevChannels.forEach((channel, index) => {
     if (!state.luts[index]) state.luts[index] = window.Nd2LutTransfer.currentLut(channel, null);
   });
+  const nextChannels = next.channels;
   Object.assign(info, next);
-  info.channels.forEach((channel, index) => {
-    const prev = prevColors[index];
-    if (!prev) return;
-    if (prev.metadataColor) channel.metadataColor = prev.metadataColor;
-    if (prev.color) channel.color = prev.color;
+  info.channels = prevChannels;
+  prevChannels.forEach((channel, index) => {
+    const updated = nextChannels[index];
+    if (!updated) return;
+    const prevColor = channel.color;
+    const prevMeta = channel.metadataColor;
+    const prevSwatch = channel._swatchBtn;
+    Object.assign(channel, updated);
+    if (prevMeta) channel.metadataColor = prevMeta;
+    if (prevColor) channel.color = prevColor;
+    if (prevSwatch) channel._swatchBtn = prevSwatch;
   });
   state.lutAutoPending.fill(false);
   frameRequests?.pixels.invalidate(true);
   frameRequests?.histograms.schedule(0);
   state.inspect = null;
+  if (state.windows?.info && !state.windows.info.isHidden()) loadSlideInspector(true);
   $("level-lamps").replaceChildren();
   buildLevelLamps();
   updateScaleStrip();
@@ -597,11 +612,12 @@ function createFrameRequests() {
 
 function resolveSceneUrl(res) {
   const rawUrl = typeof res?.url === "string" && res.url ? res.url : null;
-  const sid = typeof res?.sid === "string" && res.sid ? res.sid : null;
+  const sid = typeof res?.sid === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(res.sid) ? res.sid : null;
   const path = typeof location !== "undefined" ? String(location.pathname || "") : "";
   const idx = path.indexOf("/s/");
-  const prefix = idx > 0 ? path.slice(0, idx) : "";
-  if (rawUrl) {
+  const rawPrefix = idx > 0 ? path.slice(0, idx) : "";
+  const prefix = /^\/[A-Za-z0-9._~%-]+$/.test(rawPrefix) ? rawPrefix : "";
+  if (rawUrl && /^(\/[A-Za-z0-9._~%-]+)?\/s\/[A-Za-z0-9_-]+\/$/.test(rawUrl)) {
     if (prefix && rawUrl.startsWith("/s/")) return prefix + rawUrl;
     return rawUrl;
   }
@@ -622,6 +638,8 @@ function setScenePickerOpen(open) {
     const width = menu.offsetWidth || 280;
     menu.style.left = Math.max(8, Math.min(vw - width - 8, r.left)) + "px";
     menu.style.top = Math.max(8, r.bottom + 6) + "px";
+    const selected = menu.querySelector?.('[aria-selected="true"]') || menu.querySelector?.(".scene-picker-item");
+    selected?.focus?.({ preventScroll: true });
   }
 }
 
@@ -637,15 +655,21 @@ async function selectScene(seriesIndex) {
   const btn = $("scene-picker-btn");
   setScenePickerOpen(false);
   if ($("ann-editor") && !$("ann-editor").hidden) closeEditor(true);
+  state.cancelToolDrag?.();
+  state.cancelAnnotationDrag?.();
   if (btn) {
     btn.disabled = true;
     btn.textContent = `Opening ${seriesIndex + 1} / ${info.seriesCount}…`;
   }
   try {
-    await Promise.allSettled([
-      typeof saveAnnotations === "function" && state.annDirty ? saveAnnotations() : Promise.resolve(),
-      state.lutPersistence?.isDirty?.() ? state.lutPersistence.flush() : Promise.resolve(),
-    ]);
+    if (typeof annotationStore !== "undefined" && annotationStore?.flushForUpdate) {
+      await annotationStore.flushForUpdate();
+    } else if (typeof saveAnnotations === "function" && state.annDirty) {
+      await saveAnnotations();
+    }
+    if (state.lutPersistence?.isDirty?.()) {
+      await state.lutPersistence.flush();
+    }
     const response = await fetch("api/select-scene", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -656,6 +680,9 @@ async function selectScene(seriesIndex) {
       throw new Error(data?.error || `HTTP ${response.status}`);
     }
     const targetUrl = resolveSceneUrl(data);
+    if (!targetUrl) {
+      throw new Error("Invalid scene target URL");
+    }
     if (typeof window !== "undefined" && window.parent && window.parent !== window) {
       window.parent.postMessage({
         nd2wsi: "scene-selected",
@@ -665,7 +692,7 @@ async function selectScene(seriesIndex) {
         name: data.name || info.name,
         url: targetUrl,
       }, location.origin);
-    } else if (targetUrl && typeof window !== "undefined" && window.location?.replace) {
+    } else if (typeof window !== "undefined" && window.location?.replace) {
       window.location.replace(targetUrl);
     }
     return true;
@@ -736,17 +763,38 @@ function wireScenePicker() {
     ev?.stopPropagation?.();
     setScenePickerOpen(menu.hidden);
   };
+  menu.addEventListener?.("keydown", (ev) => {
+    const items = [...(menu.querySelectorAll?.(".scene-picker-item") || [])];
+    if (!items.length) return;
+    const idx = items.indexOf(document.activeElement);
+    let next = null;
+    if (ev.key === "ArrowDown") next = items[(idx + 1 + items.length) % items.length];
+    else if (ev.key === "ArrowUp") next = items[(idx - 1 + items.length) % items.length];
+    else if (ev.key === "Home") next = items[0];
+    else if (ev.key === "End") next = items[items.length - 1];
+    else if (ev.key === "Tab") { setScenePickerOpen(false); return; }
+    if (next) {
+      ev.preventDefault();
+      next.focus?.({ preventScroll: true });
+    }
+  });
   document.addEventListener?.("pointerdown", (ev) => {
-    if (!menu.hidden && !picker.contains?.(ev.target)) setScenePickerOpen(false);
+    if (!menu.hidden && !picker.contains?.(ev.target) && !menu.contains?.(ev.target)) {
+      setScenePickerOpen(false);
+    }
   });
   window.addEventListener?.("keydown", (ev) => {
+    if (ev.defaultPrevented) return;
     if (ev.key === "Escape" && !menu.hidden) {
       ev.preventDefault();
-      ev.stopPropagation();
+      ev.stopImmediatePropagation?.();
+      ev.stopPropagation?.();
       setScenePickerOpen(false);
       btn.focus?.({ preventScroll: true });
     }
   }, true);
+  window.addEventListener?.("resize", () => { if (!menu.hidden) setScenePickerOpen(true); });
+  window.addEventListener?.("blur", () => { if (!menu.hidden) setScenePickerOpen(false); });
 }
 
 function kindMark(info) {
@@ -1270,9 +1318,11 @@ function openChannelColorPopover(index, anchor) {
     }
   };
   const onKey = (ev) => {
+    if (ev.defaultPrevented) return;
     if (ev.key === "Escape") {
       ev.preventDefault();
-      ev.stopPropagation();
+      ev.stopImmediatePropagation?.();
+      ev.stopPropagation?.();
       closeChannelColorPopover(true);
     }
   };
@@ -2693,6 +2743,8 @@ async function exportAstromap(includePdf = false) {
   if (!rois.length) { showToast("Select at least one Astromap region"); return false; }
   const payload = { generation: state.info.generation || "", rois,
     channels: [...state.channels], window: lutParam() || null, frame: captured.frame };
+  const customCol = typeof colorParam === "function" ? colorParam() : null;
+  if (customCol) payload.col = customCol;
   const withPdf = includePdf === true;
   if (withPdf) payload.include_pdf = true;
   state.astromap.exporting = true;
@@ -3172,6 +3224,7 @@ async function flushAnnotationsForUpdate() {
   if (!$('ann-editor').hidden) closeEditor(true);
   // A mark still being dragged would land after editing froze, unsaved.
   state.cancelToolDrag?.();
+  state.cancelAnnotationDrag?.();
   state.quitPreparing = true;
   await annotationStore.flushForUpdate();
 }
@@ -3520,7 +3573,7 @@ function annColor(a) {
 }
 function cycleAnnColor(a) {
   if (typeof pushUndoSnapshot === "function") pushUndoSnapshot(undefined, "change color");
-  const i = ANN_COLORS.indexOf(annColor(a));
+  const i = ANN_COLORS.indexOf(annColor(a).toLowerCase());
   a.color = ANN_COLORS[(i + 1) % ANN_COLORS.length];
   annotationsChanged();
 }
@@ -3705,7 +3758,9 @@ function refreshAnnotationsForViewport() {
 // and the live ruler fall through to OpenSeadragon.
 function wireAnnotationPointer() {
   const layer = $("ann-layer");
+  let activeDragCancel = null;
   layer.addEventListener("pointerdown", (ev) => {
+    if ((ev.button != null && ev.button !== 0) || state.tool) return;
     const hit = ev.target?.closest?.("[data-ann-id]");
     if (!hit || !layer.contains(hit)) return;
     ev.stopPropagation();
@@ -3723,15 +3778,71 @@ function wireAnnotationPointer() {
     }
     const stage = typeof $ === "function" ? $("stage") : null;
     if (!stage || typeof elementPoint !== "function") return;
+    activeDragCancel?.();
+    const pointerId = ev.pointerId;
+    const startContext = state.annContext;
     const startClient = { x: ev.clientX, y: ev.clientY };
     const startImg = viewerElementToImagePoint(elementPoint(ev, stage));
     const origin = { x: a.x, y: a.y, x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2 };
     const beforeDrag = typeof captureAnnotationSnapshot === "function" ? captureAnnotationSnapshot() : null;
     let dragging = false;
+    let finished = false;
+    let rafId = null;
+    const restoreOrigin = () => {
+      if (a.type === "pin" || a.type === "box") { a.x = origin.x; a.y = origin.y; }
+      else if (a.type === "line") { a.x1 = origin.x1; a.y1 = origin.y1; a.x2 = origin.x2; a.y2 = origin.y2; }
+    };
+    const scheduleDraw = () => {
+      if (typeof requestAnimationFrame === "function") {
+        if (rafId !== null) return;
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          annotationFrame = null;
+          renderAnnotations();
+        });
+      } else {
+        annotationFrame = null;
+        renderAnnotations();
+      }
+    };
+    const teardown = () => {
+      if (rafId !== null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onCancel, true);
+      hit.removeEventListener?.("lostpointercapture", onCancel);
+      if (pointerId != null) {
+        try { hit.releasePointerCapture?.(pointerId); } catch (_) { /* optional */ }
+      }
+      if (activeDragCancel === abortDrag) activeDragCancel = null;
+    };
+    const abortDrag = () => {
+      if (finished) return;
+      finished = true;
+      teardown();
+      if (dragging && startContext === state.annContext) {
+        restoreOrigin();
+        annotationFrame = null;
+        renderAnnotations();
+      }
+    };
     const onMove = (moveEv) => {
+      if (finished) return;
+      if (pointerId != null && moveEv.pointerId != null && moveEv.pointerId !== pointerId) return;
+      if (startContext !== state.annContext || state.quitPreparing ||
+          (typeof annLocked === "function" && annLocked())) {
+        abortDrag();
+        return;
+      }
       if (Math.hypot(moveEv.clientX - startClient.x, moveEv.clientY - startClient.y) < 5 && !dragging) return;
       if (!dragging) {
         dragging = true;
+        if (pointerId != null) {
+          try { hit.setPointerCapture?.(pointerId); } catch (_) { /* optional */ }
+        }
         const editorEl = typeof $ === "function" ? $("ann-editor") : null;
         if (editorEl && !editorEl.hidden) closeEditor(false);
       }
@@ -3762,23 +3873,41 @@ function wireAnnotationPointer() {
         a.y1 = origin.y1 + sy;
         a.y2 = origin.y2 + sy;
       }
+      scheduleDraw();
+    };
+    const onCancel = (cancelEv) => {
+      if (pointerId != null && cancelEv?.pointerId != null && cancelEv.pointerId !== pointerId) return;
+      abortDrag();
+    };
+    const onUp = (upEv) => {
+      if (finished) return;
+      if (pointerId != null && upEv?.pointerId != null && upEv.pointerId !== pointerId) return;
+      finished = true;
+      teardown();
+      if (!dragging) return;
+      if (startContext !== state.annContext || state.quitPreparing ||
+          (typeof annLocked === "function" && annLocked())) {
+        if (startContext === state.annContext) {
+          restoreOrigin();
+          annotationFrame = null;
+          renderAnnotations();
+        }
+        return;
+      }
       annotationFrame = null;
       renderAnnotations();
-    };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove, true);
-      window.removeEventListener("pointerup", onUp, true);
-      window.removeEventListener("pointercancel", onUp, true);
-      if (!dragging) return;
       if (beforeDrag && typeof pushUndoSnapshot === "function") {
         pushUndoSnapshot(beforeDrag, a.astromap ? "move Astromap ROI" : "move annotation");
       }
       annotationsChanged();
     };
+    activeDragCancel = abortDrag;
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
-    window.addEventListener("pointercancel", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
+    hit.addEventListener?.("lostpointercapture", onCancel);
   });
+  state.cancelAnnotationDrag = () => activeDragCancel?.();
 }
 
 function renderAnnotations() {
@@ -3819,10 +3948,12 @@ function renderAnnotations() {
         stroke: a.slacs?.kind === "laser_shot" ? "#a0a6ae" : a.astromap === true ? active ? "#ffd966" : "#a0a6ae" : annColor(a), "stroke-width": 1.5,
         "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke",
       }, g);
-      const note = a.astromap === true ? astromapDisplayNote(a) : a.text;
-      const label = chip(root, 0, 0, a.astromap === true
-        ? `${astromapNumber}${note ? " · " + note : ""}` : a.text || "Box", a.id);
-      marks.push({ node: label, box: { x: a.x, y: a.y, w: a.w, h: a.h }, dx: 0, dy: -22 });
+      if (a.astromap !== true || active) {
+        const note = a.astromap === true ? astromapDisplayNote(a) : a.text;
+        const label = chip(root, 0, 0, a.astromap === true
+          ? `${astromapNumber}${note ? " · " + note : ""}` : a.text || "Box", a.id);
+        marks.push({ node: label, box: { x: a.x, y: a.y, w: a.w, h: a.h }, dx: 0, dy: -22 });
+      }
     } else if (a.type === "geojson") {
       renderImportedGeoJSON(a, image, null, root, marks);
     } else if (a.type === "pin") {
@@ -4067,6 +4198,12 @@ function wireAnnotationPanel() {
     if (ev.key === "Escape") closeEditor(false);
     ev.stopPropagation();
   });
+  document.addEventListener?.("pointerdown", (ev) => {
+    const ed = $("ann-editor");
+    if (!ed || ed.hidden) return;
+    if (ed.contains?.(ev.target) || ev.target?.closest?.("[data-ann-id]")) return;
+    closeEditor(true);
+  }, true);
 
   $("ann-export").onclick = exportAnnotationsJSON;
   $("ann-geojson").onclick = exportAnnotationsGeoJSON;
@@ -4248,12 +4385,15 @@ function exportAnnotationsJSON() {
     return;
   }
   if (!$("ann-editor").hidden) closeEditor(true); // include the label being typed
+  const stem = String(state.info.name || "").split(/[\\/]/).pop()
+    .replace(/\.ome\.zarr$/i, "")
+    .replace(/\.(?:ome\.tiff?|qptiff|tiff?|nd2|czi|lif|svs|sdpc|nd2svs|jpe?g|png)$/i, "");
+  const safeStem = typeof safeFilenamePart === "function"
+    ? safeFilenamePart(stem, "slide")
+    : (stem.replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_").replace(/[. ]+$/g, "").trim() || "slide");
   downloadJsonFile(
     annotationDocument(),
-    state.info.name
-      .replace(/\.ome\.zarr$/i, "")
-      .replace(/\.(?:ome\.tiff?|qptiff|tiff?|nd2|czi|lif|svs|sdpc|nd2svs|jpe?g|png)$/i, "") +
-      ".annotations.json",
+    safeStem + ".annotations.json",
     "application/json"
   );
   const note = keptItemsExportNote();
@@ -4428,11 +4568,14 @@ function rebuildAnnList() {
   for (const a of state.annotations) {
     const row = document.createElement("div");
     row.className = "ann-item";
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
     const g = document.createElement("button");
     g.className = "glyph";
     g.type = "button";
     g.textContent = "●";
     g.title = "Change color";
+    g.setAttribute("aria-label", "Change annotation color");
     g.style.color = annColor(a);
     g.onclick = (ev) => { ev.stopPropagation(); cycleAnnColor(a); };
     const txt = document.createElement("span");
@@ -4446,11 +4589,17 @@ function rebuildAnnList() {
     meta.textContent = a.type === "line" ? lineLengthLabel(a) : "";
     const del = document.createElement("button");
     del.className = "del";
+    del.type = "button";
     del.title = "Delete";
+    del.setAttribute("aria-label", "Delete annotation");
     del.textContent = "×";
     del.onclick = (ev) => { ev.stopPropagation(); removeAnnotation(a.id); };
     row.append(g, txt, meta, del);
     row.onclick = () => flyToAnnotation(a);
+    row.addEventListener?.("keydown", (ev) => {
+      if (ev.target !== row) return;
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); flyToAnnotation(a); }
+    });
     list.append(row);
   }
 }
@@ -4649,6 +4798,15 @@ let scaleSeq = 0;
 let scaleRequests = null; // aborts the strip's preview and size requests
 let scaleUrls = []; // object URLs of the previews on screen
 const scaleStripRest = debounce(() => updateScaleStrip(), 300);
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  window.addEventListener("pagehide", () => {
+    scaleStripRest.cancel();
+    scaleRequests?.abort();
+    scaleRequests = null;
+    for (const url of scaleUrls) URL.revokeObjectURL(url);
+    scaleUrls = [];
+  }, { once: true });
+}
 
 // A frame step (playback, wheel z-scrubbing): what the strip still loads for
 // the old frame stops now and can no longer land, and the strip refreshes
@@ -4933,63 +5091,82 @@ function releaseExportGauge() {
   if (exportGaugeOwner() === null) $("export-cell").hidden = true;
 }
 
+let exportPageHidden = false;
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  window.addEventListener("pagehide", () => {
+    exportPageHidden = true;
+    clearTimeout(exportGaugeDone);
+    exportGaugeDone = null;
+    for (const entry of exportJobs.values()) {
+      if (entry.timer) clearTimeout(entry.timer);
+    }
+    exportJobs.clear();
+  }, { once: true });
+}
+
 function trackExport(job, label) {
+  if (exportPageHidden) return;
   const cell = $("export-cell");
   const fill = $("export-fill");
   const pct = $("export-pct");
-  const entry = { label, shown: false };
+  const entry = { label, shown: false, timer: null };
   const t0 = Date.now();
   exportJobs.set(job, entry);
-  const poll = () => fetch("api/roi/progress?job=" + job, { cache: "no-store" })
-    .then((r) => (r.ok ? r.json() : {}))
-    .catch(() => ({})) // a missed poll is retried by the next one
-    .then((d) => {
-      const elapsed = Date.now() - t0;
-      if (d.state === "writing" || d.state === "streaming") {
-        entry.shown = true;
-        if (exportGaugeOwner() === job && exportGaugeDone === null) {
-          const p = d.pct || 0;
-          cell.hidden = false;
-          cell.classList.remove("done");
-          fill.style.width = p + "%";
-          pct.textContent =
-            d.state === "writing" ? label + " " + p + " %" : label + " saving…";
+  const poll = () => {
+    entry.timer = null;
+    if (exportPageHidden || !exportJobs.has(job)) return;
+    fetch("api/roi/progress?job=" + job, { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : {}))
+      .catch(() => ({})) // a missed poll is retried by the next one
+      .then((d) => {
+        if (exportPageHidden || !exportJobs.has(job)) return;
+        const elapsed = Date.now() - t0;
+        if (d.state === "writing" || d.state === "streaming") {
+          entry.shown = true;
+          if (exportGaugeOwner() === job && exportGaugeDone === null) {
+            const p = d.pct || 0;
+            cell.hidden = false;
+            cell.classList.remove("done");
+            fill.style.width = p + "%";
+            pct.textContent =
+              d.state === "writing" ? label + " " + p + " %" : label + " saving…";
+          }
+        } else if (d.state === "done") {
+          // an export that finished before its first poll still says it is done
+          entry.shown = true;
+          const owned = exportGaugeOwner() === job;
+          exportJobs.delete(job);
+          if (owned) {
+            cell.hidden = false;
+            fill.style.width = "100%";
+            cell.classList.add("done");
+            pct.textContent = label + " done";
+            clearTimeout(exportGaugeDone);
+            exportGaugeDone = setTimeout(() => {
+              exportGaugeDone = null;
+              releaseExportGauge();
+            }, 2000);
+          }
+          return;
+        } else if (d.state === "error") {
+          exportJobs.delete(job);
+          releaseExportGauge();
+          showToast("export failed: " + (d.error || "unknown error"));
+          return;
+        } else if (!entry.shown && elapsed > 30000) {
+          // the request never started writing (refused, or the slide closed)
+          exportJobs.delete(job);
+          return;
         }
-      } else if (d.state === "done") {
-        // an export that finished before its first poll still says it is done
-        entry.shown = true;
-        const owned = exportGaugeOwner() === job;
-        exportJobs.delete(job);
-        if (owned) {
-          cell.hidden = false;
-          fill.style.width = "100%";
-          cell.classList.add("done");
-          pct.textContent = label + " done";
-          clearTimeout(exportGaugeDone);
-          exportGaugeDone = setTimeout(() => {
-            exportGaugeDone = null;
-            releaseExportGauge();
-          }, 2000);
+        if (elapsed > 15 * 60 * 1000) {
+          exportJobs.delete(job);
+          releaseExportGauge();
+          return;
         }
-        return;
-      } else if (d.state === "error") {
-        exportJobs.delete(job);
-        releaseExportGauge();
-        showToast("export failed: " + (d.error || "unknown error"));
-        return;
-      } else if (!entry.shown && elapsed > 30000) {
-        // the request never started writing (refused, or the slide closed)
-        exportJobs.delete(job);
-        return;
-      }
-      if (elapsed > 15 * 60 * 1000) {
-        exportJobs.delete(job);
-        releaseExportGauge();
-        return;
-      }
-      setTimeout(poll, 350);
-    });
-  setTimeout(poll, 350);
+        entry.timer = setTimeout(poll, 350);
+      });
+  };
+  entry.timer = setTimeout(poll, 350);
 }
 
 /* ---- slide inspector ------------------------------------------------------- */
@@ -5018,6 +5195,7 @@ function wireSlideInspector() {
 
 async function loadSlideInspector(force = false) {
   if (state.inspectLoading || (state.inspect && !force)) return;
+  const expectedGen = state.info?.generation;
   state.inspectLoading = true;
   $("info-loading").hidden = false;
   $("info-loading").textContent = state.inspect ? "Refreshing slide metadata…" : "Loading slide metadata…";
@@ -5028,6 +5206,7 @@ async function loadSlideInspector(force = false) {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     if (!data || typeof data !== "object") throw new Error("invalid response");
+    if (expectedGen && state.info?.generation && state.info.generation !== expectedGen) return;
     state.inspect = { ...state.info, ...data };
     renderSlideInspector(state.inspect);
     $("info-status").textContent = "";
@@ -5161,6 +5340,9 @@ function renderSlideInspector(data, partial = false) {
     const detail = document.createElement("dd");
     term.textContent = label;
     detail.textContent = value;
+    if (label === "Plane") {
+      detail.dataset.infoField = "plane";
+    }
     if (label === "Source" || label === "Cache") {
       detail.classList.add("info-path");
       detail.title = value;
@@ -5175,6 +5357,16 @@ function renderSlideInspector(data, partial = false) {
   );
   renderAssociatedImages(partial ? [] : data.associated);
   if (state.windows && state.windows.info) state.windows.info.fitContent();
+}
+
+function updateSlideInspectorPlane() {
+  const grid = $("info-grid");
+  const cell = grid?.querySelector?.('[data-info-field="plane"]');
+  if (!cell) return false;
+  const data = state.inspect || state.info;
+  const plate = data?.kind === "plate" && data.plate && typeof data.plate === "object" ? data.plate : null;
+  cell.textContent = plate ? platePlaneLabel() : selectionLabel(data?.selection);
+  return true;
 }
 
 function renderAssociatedImages(names) {
@@ -5929,7 +6121,7 @@ function wireTheme() {
   });
 
   window.addEventListener("message", (ev) => {
-    if (ev.origin !== location.origin || !ev.data) return;
+    if (ev.origin !== location.origin || ev.source !== window.parent || !ev.data) return;
     if (ev.data.nd2wsi === "theme-request") {
       // Preserve explicit user-chosen "light" or "dark" mode when switching tabs.
       theme = applyThemeMode(mode);
@@ -5972,6 +6164,8 @@ function buildWindows() {
       zoomW: 480,
       toolbarBtn: $("tb-channels"),
       onResize: debounce(() => relayoutLuts(), 50),
+      onClose: () => closeChannelColorPopover(false),
+      onMove: () => closeChannelColorPopover(false),
     }),
     region: makeMacWindow($("win-region"), {
       key: "region",
@@ -6028,6 +6222,9 @@ function buildWindows() {
   };
   window.addEventListener("resize", () => {
     Object.values(state.windows).forEach((w) => w.clampToStage());
+  });
+  $("win-channels")?.querySelector?.(".win-body")?.addEventListener?.("scroll", () => {
+    closeChannelColorPopover(false);
   });
   floatingWindows.hydrate?.();
 }
@@ -6455,9 +6652,12 @@ function buildPlate() {
   // #plate is inset in the stage, so its observer sees every window resize
   // too; the window listener is only the fallback, not a second layout pass.
   if (typeof ResizeObserver === "function") {
-    new ResizeObserver(() => layoutPlate()).observe($("plate"));
+    const plateObserver = new ResizeObserver(() => layoutPlate());
+    plateObserver.observe($("plate"));
+    window.addEventListener("pagehide", () => plateObserver.disconnect(), { once: true });
   } else {
     window.addEventListener("resize", layoutPlate);
+    window.addEventListener("pagehide", () => window.removeEventListener("resize", layoutPlate), { once: true });
   }
   layoutPlate();
   paintPlate();
@@ -6632,6 +6832,7 @@ function plateFrameChanged() {
     } else {
       state.cancelToolDrag?.();
     }
+    state.cancelAnnotationDrag?.();
     // Save the departing owner's captured T/P/Z, then clear the marks
     // synchronously while the new plane loads (including autofocus).
     annotationStore.switchOwner();
@@ -6647,7 +6848,9 @@ function plateFrameChanged() {
   refreshHistograms();
   syncFrameScopedControls();
   $("plane-note").textContent = platePlaneNote();
-  if (state.inspect && !state.windows.info.isHidden()) renderSlideInspector(state.inspect);
+  if (state.inspect && !state.windows.info.isHidden()) {
+    if (!updateSlideInspectorPlane()) renderSlideInspector(state.inspect);
+  }
 }
 
 function setPlateFocus(p) {
@@ -7002,12 +7205,26 @@ function wireKeys() {
     const shortcuts = window.Nd2ShortcutRouter;
     if (ev.defaultPrevented) return;
     const shortcutModal = typeof $ === "function" ? $("shortcuts-modal") : null;
-    if (shortcutModal && !shortcutModal.hidden && ev.key === "Escape") {
-      ev.preventDefault();
-      ev.stopPropagation();
-      if (typeof setShortcutModalOpen === "function") setShortcutModalOpen(false);
-      else shortcutModal.hidden = true;
-      return;
+    if (shortcutModal && !shortcutModal.hidden) {
+      if (ev.key === "Escape" || shortcuts?.isShortcutHelpEvent?.(ev)) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation?.();
+        ev.stopPropagation?.();
+        if (typeof setShortcutModalOpen === "function") setShortcutModalOpen(false);
+        else shortcutModal.hidden = true;
+        return;
+      }
+      if (ev.key === "Tab") {
+        ev.preventDefault();
+        ev.stopPropagation?.();
+        $("shortcuts-close")?.focus?.({ preventScroll: true });
+        return;
+      }
+      if (!shortcuts?.isNewWindowShortcut?.(ev)) {
+        ev.preventDefault();
+        ev.stopPropagation?.();
+        return;
+      }
     }
     if (shortcuts && !shortcuts.isMac() && shortcuts.isNewWindowShortcut(ev) &&
         window.parent !== window && window.parent.pywebview?.api?.new_window) {

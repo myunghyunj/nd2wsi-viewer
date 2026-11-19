@@ -44,14 +44,18 @@ def parse_channels(param: str | None, n: int) -> list[int]:
         return []
     if not param:
         return list(range(n))
-    out = []
+    out: list[int] = []
+    seen: set[int] = set()
     for tok in param.split(","):
         tok = tok.strip()
         if tok == "":
             continue
         i = int(tok)
-        if 0 <= i < n:
+        if 0 <= i < n and i not in seen:
+            seen.add(i)
             out.append(i)
+            if len(out) >= n:
+                break
     return out or list(range(n))
 
 
@@ -707,7 +711,26 @@ def compute_histograms(
         if lv["width"] * lv["height"] >= min_pixels:
             pick = lv
             break
-    data = np.asarray(root[pick["path"]][:])  # (C, h, w)
+    arr = root[pick["path"]]
+    arr_h, arr_w = int(pick["height"]), int(pick["width"])
+    max_hist_pixels = 16_000_000
+    if arr_h * arr_w <= max_hist_pixels:
+        data = np.asarray(arr[:])  # (C, h, w)
+    else:
+        # Sample an even grid of contiguous 512x512 patches (compatible with
+        # non-strided direct readers) capped to ~4 MPx total.
+        patch = 512
+        grid_n = max(1, min(4, int(math.sqrt(4_000_000 / (patch * patch)))))
+        ys = [int(i * max(0, arr_h - patch) / max(1, grid_n - 1)) for i in range(grid_n)]
+        xs = [int(j * max(0, arr_w - patch) / max(1, grid_n - 1)) for j in range(grid_n)]
+        patches = []
+        for y0 in sorted(set(ys)):
+            y1 = min(arr_h, y0 + patch)
+            for x0 in sorted(set(xs)):
+                x1 = min(arr_w, x0 + patch)
+                block = np.asarray(arr[:, y0:y1, x0:x1])
+                patches.append(block.reshape(block.shape[0], -1))
+        data = np.concatenate(patches, axis=1)  # (C, N)
 
     def histogram(values, count, low, high):
         if np.issubdtype(values.dtype, np.floating):
@@ -944,7 +967,14 @@ def _build_roi_ome_xml(
         ch_xml = "".join(ch_parts)
 
     phys_xml = ""
-    if px_um is not None and py_um is not None and px_um > 0 and py_um > 0:
+    if (
+        px_um is not None
+        and py_um is not None
+        and math.isfinite(px_um)
+        and math.isfinite(py_um)
+        and px_um > 0
+        and py_um > 0
+    ):
         phys_xml = (
             f' PhysicalSizeX="{px_um!r}" PhysicalSizeXUnit="µm"'
             f' PhysicalSizeY="{py_um!r}" PhysicalSizeYUnit="µm"'

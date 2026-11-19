@@ -22,7 +22,6 @@ from .cache import (
     STORE_NAME,
     fingerprints_match,
     quick_fingerprint,
-    source_base,
 )
 
 
@@ -99,10 +98,14 @@ def pack_directory(
     if (old_format == "nd2wsi-plate/1") != (manifest.get("kind") == "plate"):
         raise ValueError("cache format and kind disagree")
     if source is None:
-        rel = manifest.get("source", {}).get("relative_path")
-        if not isinstance(rel, str) or not rel:
-            raise ValueError("cache manifest lacks a relative source path")
-        source = (source_base(container) / rel).resolve()
+        from .annotation_sidecars import _manifest_source_path
+
+        resolved_source = _manifest_source_path(container, manifest)
+        if resolved_source is None:
+            raise ValueError(
+                "cache manifest lacks a valid relative source path inside the slide folder"
+            )
+        source = resolved_source
     source = Path(source).resolve()
     if source_info.get("name") != source.name:
         raise ValueError("cache source name does not match its relative path")

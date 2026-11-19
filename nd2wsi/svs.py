@@ -244,6 +244,8 @@ def _window_reader(page: Any, fd: int):
     across = -(-w // tw)
     offsets = page.dataoffsets
     counts = page.databytecounts
+    file_size = os.fstat(fd).st_size
+    max_segment_bytes = 256 * 1024 * 1024
     # Aperio's JPEG flavour keeps one shared quantization/Huffman table in
     # TIFF tag 347 and writes abbreviated streams per tile, so the decoder
     # needs the tables handed to it. Every tifffile decoder takes these two
@@ -258,9 +260,13 @@ def _window_reader(page: Any, fd: int):
         for ty in range(y0 // th, -(-y1 // th)):
             for tx in range(x0 // tw, -(-x1 // tw)):
                 seg = ty * across + tx
-                if counts[seg] == 0:  # sparse tile, leave it at zero
+                if seg >= len(counts) or counts[seg] == 0:  # sparse tile, leave it at zero
                     continue
-                data = read_at(fd, counts[seg], offsets[seg])
+                cnt = int(counts[seg])
+                off = int(offsets[seg])
+                if cnt < 0 or off < 0 or cnt > max_segment_bytes or off + cnt > file_size:
+                    raise ValueError(f"TIFF tile segment {seg} ({cnt} B @ {off}) exceeds file bounds")
+                data = read_at(fd, cnt, off)
                 decoded = np.asarray(page.decode(data, seg, **tables)[0]).reshape(
                     -1, tw, samples
                 )[:th]

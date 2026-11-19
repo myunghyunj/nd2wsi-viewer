@@ -554,14 +554,13 @@ def test_verify_windows_installer_ps1_structure_ascii_and_smoke_snippet(tmp_path
     assert "-ArgumentList '/S'" in ps1
     assert "Local\\nd2wsi-viewer-Setup-current-user" in ps1
 
-    # Extract and execute the frozen -c Python snippet against this repository
-    match = re.search(r"\$pySnippet\s*=\s*((?:'[^']*'\s*\+?\s*)+)", ps1)
-    assert match is not None, "Could not locate $pySnippet in verify_windows_installer.ps1"
-    snippet = "".join(re.findall(r"'([^']*)'", match.group(1)))
+    # Verify the installer smoke uses --cli-self-check (never arbitrary -c exec)
+    assert "--cli-self-check" in ps1
+    assert "'-c'" not in ps1 and '"-c"' not in ps1
     report_path = tmp_path / "ometiff-cli-report.json"
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
     proc = subprocess.run(
-        [sys.executable, "-c", snippet, str(report_path)],
+        [sys.executable, "-m", "nd2wsi.app", "--cli-self-check", str(report_path)],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -775,6 +774,7 @@ def test_slacs_edition_installer_bundles_webview2_runtime_and_records_release_ve
     events = json.loads(event_log.read_text(encoding="utf-8"))
     assert events[0]["defines"]["APP_VERSION"] == "2.6.4"
     assert events[0]["defines"]["APP_VERSION_QUAD"] == "2.6.4.0"
+    assert events[0]["defines"]["BUNDLED_WEBVIEW2"] == "1"
 
     report = json.loads(output.with_suffix(".build.json").read_text(encoding="utf-8"))
     payload_manifest = json.loads(output.with_suffix(".payload.json").read_text(encoding="utf-8"))
@@ -782,6 +782,7 @@ def test_slacs_edition_installer_bundles_webview2_runtime_and_records_release_ve
     assert report["release_version"] == "2.6.4_SLACS-module"
     assert report["edition"] == "SLACS-module"
     assert report["updates_off"] is True
+    assert report["bundled_webview2_runtime"] is True
     assert payload_manifest["release_version"] == "2.6.4_SLACS-module"
     assert "_internal/webview2-runtime/msedgewebview2.exe" in payload_manifest["files"]
     assert "_internal/nd2wsi-viewer-about/WEBVIEW2-RUNTIME-NOTICE.txt" in payload_manifest["files"]

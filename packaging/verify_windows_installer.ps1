@@ -556,14 +556,8 @@ function Invoke-CliAndOmetiffSmoke {
     $moduleReport = Join-Path $resultPath ($Label + '-ometiff-cli.json')
     $moduleLog = Join-Path $resultPath ($Label + '-ometiff-cli.log')
     Remove-Item -LiteralPath $moduleReport, $moduleLog -Force -ErrorAction SilentlyContinue
-    $pySnippet = 'import contextlib, io, json, pathlib, sys, tifffile, imagecodecs, ome_types, nd2wsi.ometiff, nd2wsi.ui_settings, nd2wsi.cli; buf = io.StringIO(); ' +
-        'code = 0; ' +
-        'exec("try:\n with contextlib.redirect_stdout(buf):\n  nd2wsi.cli.main([\"--help\"])\nexcept SystemExit as e:\n code = e.code"); ' +
-        'assert code == 0, code; text = buf.getvalue(); ' +
-        'assert all(tok in text for tok in ("Zeiss CZI", "Leica LIF", "OME-TIFF", ".nd2svs")), text; ' +
-        'pathlib.Path(sys.argv[-1]).write_text(json.dumps({"ok": True, "ometiff": True, "cli_help": True}), encoding="utf-8")'
-    $pyArgs = ((@('-c', $pySnippet, $moduleReport) | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
-    Invoke-CheckedProcess $exe $pyArgs ($Label + '-ometiff-cli') 60 (Join-Path $env:WINDIR 'System32') -EnvironmentOverrides @{
+    $selfCheckArgs = ((@('--cli-self-check', $moduleReport) | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+    Invoke-CheckedProcess $exe $selfCheckArgs ($Label + '-ometiff-cli') 60 (Join-Path $env:WINDIR 'System32') -EnvironmentOverrides @{
         ND2WSI_LOG_FILE = $moduleLog; ND2WSI_SESSION_LOG_DIR = $sessionLogsDir; TEMP = $runtimeTemp; TMP = $runtimeTemp
     }
     if (-not (Test-LiteralEntry $moduleReport)) { throw 'Installed frozen nd2wsi.ometiff / CLI --help check did not write its report.' }

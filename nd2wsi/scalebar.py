@@ -40,8 +40,11 @@ def layout(width: int, height: int, pixel_size_um, downsample: float) -> ScaleBa
     target = width * pixel_x * 0.2
     if not math.isfinite(target) or target <= 0:
         raise ValueError("Scale bar export requires valid pixel calibration")
-    power = 10 ** math.floor(math.log10(target))
-    length = max(n * power for n in (1, 2, 5) if n * power <= target)
+    power = 10.0 ** math.floor(math.log10(target))
+    while power > target:
+        power /= 10.0
+    candidates = [n * power for n in (1, 2, 5) if n * power <= target]
+    length = max(candidates) if candidates else power
     unit = min(width / 796, height / 775)
     margin = max(4, 28 * unit)
     thickness = max(1, 6 * unit)

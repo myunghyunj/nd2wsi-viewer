@@ -219,9 +219,10 @@
       ctx.strokeStyle = inkColor(0.85);
       ctx.beginPath();
       const steps = 40;
+      const winSpan = cur.hi - cur.lo;
       for (let s = 0; s <= steps; s++) {
         const value = vmin + (vmax - vmin) * s / steps;
-        const t = (value - cur.lo) / (cur.hi - cur.lo);
+        const t = winSpan > 0 ? (value - cur.lo) / winSpan : (value >= cur.hi ? 1 : 0);
         const x = PLOT.x0 + w * s / steps;
         if (s === 0) ctx.moveTo(x, curveY(t));
         else ctx.lineTo(x, curveY(t));

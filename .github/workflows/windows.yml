@@ -30,6 +30,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
       - name: Verify the requested source commit
         if: github.event_name == 'workflow_dispatch'
         shell: pwsh
@@ -325,7 +326,6 @@ jobs:
         shell: pwsh
         env:
           WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
-          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
           WINDOWS_SIGN_THUMBPRINT: ${{ secrets.WINDOWS_SIGN_THUMBPRINT }}
           WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
           WINDOWS_REQUIRE_SIGNING: ${{ vars.WINDOWS_REQUIRE_SIGNING }}
@@ -336,9 +336,6 @@ jobs:
             $pfxPath = Join-Path $pfxDir 'windows-signing.pfx'
             [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64.Trim()))
             "WINDOWS_SIGN_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            if ($env:WINDOWS_CERT_PASSWORD) {
-              "WINDOWS_SIGN_PFX_PASSWORD=$($env:WINDOWS_CERT_PASSWORD)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            }
             if ($env:WINDOWS_TIMESTAMP_URL) {
               "WINDOWS_TIMESTAMP_URL=$($env:WINDOWS_TIMESTAMP_URL)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             }
@@ -364,6 +361,7 @@ jobs:
           MAKENSIS_EXE: ${{ steps.installer-prereqs.outputs.makensis }}
           WEBVIEW2_BOOTSTRAPPER: ${{ steps.installer-prereqs.outputs.bootstrapper }}
           WEBVIEW2_SHA256: ${{ steps.installer-prereqs.outputs.webview2_sha256 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
           $archives = @(Get-ChildItem -LiteralPath dist/windows -Filter 'nd2wsi-viewer-*-windows-x64.zip')
           if ($archives.Count -ne 1) { throw 'Expected exactly one portable ZIP before building NSIS installer' }
@@ -388,6 +386,15 @@ jobs:
             throw 'NSIS build altered the verified portable ZIP'
           }
           "setup_exe=$setupExe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Remove temporary Authenticode key material
+        if: always()
+        shell: pwsh
+        run: |
+          $pfxDir = Join-Path $env:RUNNER_TEMP 'authenticode'
+          if (Test-Path -LiteralPath $pfxDir) {
+            Remove-Item -LiteralPath $pfxDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          "WINDOWS_SIGN_PFX_PATH=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Smoke-verify the NSIS installer silent install and clean uninstall
         shell: pwsh
         env:
@@ -576,14 +583,6 @@ jobs:
         with:
           path: ${{ runner.temp }}/sdpc-codec
           key: ${{ steps.sdpc-codec-cache.outputs.cache-primary-key }}
-      - name: Remove temporary Authenticode key material
-        if: always()
-        shell: pwsh
-        run: |
-          $pfxDir = Join-Path $env:RUNNER_TEMP 'authenticode'
-          if (Test-Path -LiteralPath $pfxDir) {
-            Remove-Item -LiteralPath $pfxDir -Recurse -Force -ErrorAction SilentlyContinue
-          }
 
   verify:
     needs: build
@@ -604,6 +603,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: windows-x64-portable

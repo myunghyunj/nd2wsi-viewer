@@ -1,5 +1,6 @@
 :root {
   --accent: #0a84ff;
+  --tabbar-height: 42px;
   --compare-split: 50%;
   --compare-line: rgba(255,255,255,.28);
   --font-text: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", sans-serif;
@@ -10,7 +11,7 @@
 * { box-sizing: border-box; }
 html, body { height:100%; margin:0; overflow:hidden; background:var(--canvas); color:var(--label); font:13px var(--font-text); -webkit-font-smoothing:antialiased; user-select:none; }
 button { color:inherit; font:inherit; }
-#tabbar { position:relative; z-index:150; display:flex; align-items:center; gap:6px; height:42px; padding:5px 8px; background: var(--material-bar); box-shadow:inset 0 -0.5px 0 var(--hairline);
+#tabbar { position:relative; z-index:150; display:flex; align-items:center; gap:6px; height:var(--tabbar-height); padding:5px 8px; background: var(--material-bar); box-shadow:inset 0 -0.5px 0 var(--hairline);
   -webkit-backdrop-filter: var(--material-bar-filter);
   backdrop-filter: var(--material-bar-filter);
 }
@@ -164,7 +165,7 @@ button { color:inherit; font:inherit; }
 #compare-divider[hidden] { display:none; }
 #compare-divider::before { content:""; position:absolute; top:0; bottom:0; left:7.5px; width:1px; background:var(--compare-line); box-shadow:0 0 0 .5px rgba(0,0,0,.20); }
 #compare-divider.dragging::before { width:2px; left:7px; background:var(--accent); }
-#compare-controls { position:fixed; z-index:90; top:52px; left:50%; display:flex; flex-direction:column; gap:4px; width:940px; max-width:calc(100% - 24px); padding:3px; border:1px solid var(--hairline); border-radius:12px; transform:translateX(-50%); cursor:default; color:var(--label); background: var(--material-bar); box-shadow:var(--shadow);
+#compare-controls { position:fixed; z-index:90; top:52px; left:50%; display:flex; flex-direction:column; gap:4px; width:940px; max-width:calc(100% - 24px); max-height:calc(100vh - 64px); overflow-y:auto; padding:3px; border:1px solid var(--hairline); border-radius:12px; transform:translateX(-50%); cursor:default; color:var(--label); background: var(--material-bar); box-shadow:var(--shadow);
   -webkit-backdrop-filter: var(--material-bar-filter);
   backdrop-filter: var(--material-bar-filter);
 }
@@ -182,16 +183,19 @@ button { color:inherit; font:inherit; }
 .compare-control:focus-visible, #compare-orientation-target:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 #compare-status { flex:0 1 auto; max-width:360px; padding:0 7px; color:var(--label-2); font-size:11px; white-space:normal; }
 #compare-chips { display:flex; flex:1; align-items:center; gap:3px; min-width:0; }
-.compare-chip { display:flex; align-items:center; gap:5px; min-width:0; max-width:200px; height:26px; padding:0 6px 0 8px; border:0; border-radius:7px; color:var(--label); background: var(--material-control); font-size:11px; font-weight:600; }
-.compare-chip.anchor { color:#fff; background:var(--accent); }
-.compare-chip:not(:disabled):hover { background: var(--material-control-hover); }
+.compare-chip { display:flex; align-items:center; gap:3px; min-width:0; max-width:200px; height:26px; padding:0 5px 0 0; border:0; border-radius:7px; color:var(--label); background: var(--material-control); font-size:11px; font-weight:600; }
+.compare-chip.anchor { color:#fff; background:var(--accent); padding-right:8px; }
+.compare-chip:not(.anchor):hover { background: var(--material-control-hover); }
 .compare-chip.anchor:hover { background:var(--accent); }
-.compare-chip:disabled { opacity:1; cursor:default; }
+.compare-chip-btn { display:flex; align-items:center; gap:5px; min-width:0; flex:1; height:100%; padding:0 4px 0 8px; border:0; border-radius:7px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+.compare-chip-btn:disabled { opacity:1; cursor:default; }
+.compare-chip-btn:focus-visible, .compare-chip .remove:focus-visible { outline:2px solid var(--accent); outline-offset:-1px; }
 .compare-chip .name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .compare-chip .meta { flex:none; color:var(--label-3); font-weight:500; }
 .compare-chip.anchor .meta { color:rgba(255,255,255,.75); }
-.compare-chip .remove { flex:none; width:16px; height:16px; border-radius:5px; color:var(--label-2); font-size:13px; line-height:16px; text-align:center; }
-.compare-chip .remove:hover { color:#fff; background:#ff453a; }
+.compare-chip .remove { flex:none; width:16px; height:16px; padding:0; border:0; border-radius:5px; background:transparent; color:var(--label-2); font-size:13px; line-height:16px; text-align:center; cursor:pointer; }
+.compare-chip .remove:hover:not(:disabled) { color:#fff; background:#ff453a; }
+.compare-chip .remove:disabled { opacity:.45; cursor:default; }
 .compare-control { display:flex; align-items:center; justify-content:center; min-width:28px; height:26px; padding:0 6px; border:0; border-radius:7px; color:var(--label-2); background:transparent; }
 .compare-control:hover:not(:disabled) { color:var(--label); background: var(--material-control-hover); }
 .compare-control:disabled { opacity:.45; cursor:default; }
@@ -222,11 +226,13 @@ button { color:inherit; font:inherit; }
 .landmark-row .name { flex:0 1 280px; min-width:0; overflow-wrap:anywhere; color:var(--label-2); }
 .landmark-row .state { flex:1 1 260px; overflow-wrap:anywhere; font:600 11px "SF Mono", ui-monospace, Menlo, monospace; color:var(--label); }
 .landmark-row.done .state { color:#30d158; }
+:root.light .landmark-row.done .state { color:#1a7f37; }
 .landmark-hint { flex:1 1 220px; min-width:180px; max-width:340px; color:var(--label-2); font-size:11px; white-space:normal; line-height:1.35; }
 .landmark-actions { display:flex; flex-wrap:wrap; align-items:center; gap:3px; margin-left:auto; max-width:100%; }
 .compare-picker-option.current .dot { box-shadow:0 0 0 2px rgba(10,132,255,.28); }
 .compare-picker-option.current .meta { color:var(--accent); }
 #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; }
+#empty[hidden] { display:none; }
 #empty .pyr { width:64px; margin:0 auto 24px; opacity:.92; }
 #empty .pyr div { height:10px; margin:4px auto; border-radius:999px; box-shadow:inset 0 1px 0 rgba(255,255,255,.28); }
 #empty .l1 { width:26px; background:#78beff; }
@@ -260,7 +266,10 @@ button { color:inherit; font:inherit; }
 #tabbar-space { flex: 1 1 auto; height: 100%; min-width: 24px; }
 /* the spacer toolbar makes the native bar 38px with the lights centered
    at 19px, so the strip matches it and the two share one center line */
-.native-chrome #tabbar { height: 38px; padding-top: 4px; padding-bottom: 4px; }
+.native-chrome { --tabbar-height: 38px; }
+.native-chrome #tabbar { padding-top: 4px; padding-bottom: 4px; }
+.native-chrome #frames { inset: calc(38px + var(--compare-toolbar-height, 0px)) 0 0; }
+.native-chrome #compare-controls { top: 48px; max-height: calc(100vh - 58px); }
 
 #translucent-warning { position: fixed; right: 16px; bottom: 16px; z-index: 170; width: min(340px, calc(100vw - 32px)); padding: 16px; border: 1px solid var(--hairline); border-radius: var(--panel-radius); background: var(--material-popover); box-shadow: var(--material-popover-shadow); color: var(--label); font-size: 12px;
   -webkit-backdrop-filter: var(--material-popover-filter);

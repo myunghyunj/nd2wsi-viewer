@@ -162,6 +162,7 @@
       };
       let drag = false;
       knob.addEventListener("pointerdown", (ev) => {
+        if (ev.button != null && ev.button !== 0) return;
         drag = true;
         try { knob.setPointerCapture(ev.pointerId); } catch (_) { /* optional */ }
         ev.preventDefault();
@@ -169,7 +170,9 @@
       knob.addEventListener("pointermove", (ev) => { if (drag) zFromY(ev.clientY); });
       knob.addEventListener("pointerup", () => { drag = false; });
       knob.addEventListener("pointercancel", () => { drag = false; });
+      knob.addEventListener("lostpointercapture", () => { drag = false; });
       slider.addEventListener("pointerdown", (ev) => {
+        if (ev.button != null && ev.button !== 0) return;
         if (ev.target !== knob && ev.target.id !== "z-label") zFromY(ev.clientY);
       });
       knob.addEventListener("keydown", (ev) => {
@@ -306,6 +309,7 @@
       };
       let drag = false;
       track.addEventListener("pointerdown", (ev) => {
+        if (ev.button != null && ev.button !== 0) return;
         drag = true;
         try { track.setPointerCapture(ev.pointerId); } catch (_) { /* optional */ }
         tFromX(ev.clientX);
@@ -314,6 +318,7 @@
       track.addEventListener("pointermove", (ev) => { if (drag) tFromX(ev.clientX); });
       track.addEventListener("pointerup", () => { drag = false; });
       track.addEventListener("pointercancel", () => { drag = false; });
+      track.addEventListener("lostpointercapture", () => { drag = false; });
 
       $("t-first").onclick = () => setPlateT(0);
       $("t-last").onclick = () => setPlateT(info.T - 1);

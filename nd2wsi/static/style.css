@@ -335,6 +335,7 @@ button { font: inherit; color: inherit; }
   font: 12px var(--font-mono); }
 .lut-input-values input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 #lut-error { min-height: 16px; margin: 8px 0; font-size: 12px; color: #ff6961; }
+:root.light #lut-error { color: #c41e16; }
 .lut-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .channel-row {
   display: flex; align-items: center; gap: 8px; padding: 4px 0;
@@ -449,6 +450,7 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 .ed-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
 .ed-spacer { flex: 1; }
 .btn.danger { color: #ff6961; }
+:root.light .btn.danger { color: #c41e16; }
 #astromap-clear-all.confirming {
   color: #fff; background: #d72c30; border-color: rgba(0, 0, 0, 0.22); font-weight: 600;
 }
@@ -483,6 +485,8 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
   border: 0; background: none; color: var(--label-3); padding: 0 3px; font-size: 12px;
 }
 .ann-item .del:hover { color: #ff6961; }
+:root.light .ann-item .del:hover { color: #c41e16; }
+.ann-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 /* ---- slide info ------------------------------------------------------------ */
 .info-state {
@@ -494,6 +498,9 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
   min-height: 0; margin-bottom: 10px; padding: 8px 9px;
   justify-content: space-between; text-align: left;
   border-radius: 8px; color: #ffd60a; background: rgba(255, 214, 10, 0.09);
+}
+:root.light .info-state.info-error {
+  color: #7a5200; background: rgba(176, 114, 0, 0.12);
 }
 .info-state.info-error .btn { flex: none; min-height: 22px; padding: 2px 10px; font-size: 11px; }
 .info-grid {
@@ -731,8 +738,9 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
   #statusbar { gap: 10px; }
 }
 
-/* minimap viewport indicator: white (thickness untouched) */
+/* minimap viewport indicator: high contrast in both themes */
 .displayregion { border-color: #fff !important; }
+:root.light .displayregion { border-color: #0a84ff !important; }
 
 /* ---- region-export progress (status popover) ------------------------------ */
 #export-bar {
@@ -996,9 +1004,9 @@ input.dim:focus { box-shadow: inset 0 0.5px 1px rgba(0,0,0,.4), 0 0 0 2.5px rgba
 /* the autofocus toggle rides in the transport capsule, because following
    the sharpest plane is something the user turns on to scrub time */
 #t-auto {
-  display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px 0 8px; border: 0; border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 5px; height: var(--control-height, 26px); padding: 0 9px; border: 0; border-radius: var(--control-radius, 6px);
   background: var(--material-control); color: var(--label-2);
-  font: 600 11px var(--font-text); white-space: nowrap; cursor: default;
+  font: 600 12px var(--font-text); white-space: nowrap; cursor: default;
 }
 #t-auto svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
 #t-auto:hover:not(:disabled) { background: var(--material-control-hover); }

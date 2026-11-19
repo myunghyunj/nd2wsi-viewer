@@ -43,7 +43,9 @@
     if (!item || typeof item !== "object" || Array.isArray(item)) return "not an annotation object";
     if (item.type === "geojson") {
       const geometry = item.geojson && item.geojson.geometry;
-      const depth = geometry ? GEOMETRY_DEPTH[geometry.type] : undefined;
+      const depth = geometry && Object.hasOwn(GEOMETRY_DEPTH, geometry.type)
+        ? GEOMETRY_DEPTH[geometry.type]
+        : undefined;
       return depth !== undefined && finitePoints(geometry.coordinates, depth) ? null : "invalid geometry";
     }
     const keys = Object.prototype.hasOwnProperty.call(COORDINATES, item.type) ? COORDINATES[item.type] : null;

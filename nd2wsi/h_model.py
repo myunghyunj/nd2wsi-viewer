@@ -13,11 +13,42 @@ extended with:
 """
 
 import json
+import os
+import tempfile
+import zipfile
 from pathlib import Path
 
 import numpy as np
 from scipy import ndimage as ndi
 from scipy.optimize import minimize, minimize_scalar
+
+MAX_MODEL_BYTES = 32 * 1024 * 1024
+
+
+def _savez_atomic(output: Path, **arrays) -> None:
+    """Write a compressed .npz archive atomically via temp file + fsync + replace."""
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+            np.savez_compressed(fh, **arrays)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, output)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 class Unsupported(RuntimeError):
@@ -57,6 +88,8 @@ def template(a, sigma):
         raise Unsupported("insufficient_finite_phase_template")
     num = ndi.gaussian_filter(np.where(ok, t, 0), sigma, mode="wrap")
     den = ndi.gaussian_filter(ok.astype(float), sigma, mode="wrap")
+    if float(np.min(den)) <= 1e-6:
+        raise Unsupported("insufficient_finite_phase_template")
     t = num / den
     return t - t.mean()
 
@@ -290,10 +323,32 @@ class Model:
         "amplitude_nodes", "envelope_cell_origin", "model_schema",
     ))
 
+    @classmethod
+    def _check_archive_budget(cls, path):
+        position = path.tell() if hasattr(path, "read") else None
+        expected = (
+            {name + ".npy" for name in cls.BASE_FIELDS},
+            {name + ".npy" for name in cls.ADAPTIVE_FIELDS},
+        )
+        try:
+            with zipfile.ZipFile(path) as archive:
+                entries = archive.infolist()
+                names = [entry.filename for entry in entries]
+                if len(names) != len(set(names)) or set(names) not in expected:
+                    raise ValueError("Unsupported correction model fields")
+                if sum(entry.file_size for entry in entries) > MAX_MODEL_BYTES:
+                    raise ValueError("Oversized correction model archive")
+        except zipfile.BadZipFile as exc:
+            raise ValueError("Invalid correction model archive") from exc
+        finally:
+            if position is not None:
+                path.seek(position)
+
     def __init__(self, path):
         # Persisted models are small, verified NPZ entries inside .nd2svs.
         # A BytesIO keeps reopen read-only and avoids temporary sidecar files.
         self.path = None if hasattr(path, "read") else Path(path)
+        self._check_archive_budget(path)
         self.data = np.load(path, allow_pickle=False)
         try:
             files = set(self.data.files)
@@ -421,7 +476,10 @@ class Model:
         return self._gain(c, shape, origin)
 
     def _gain(self, c, shape, origin):
-        ci = self.indices.index(int(c))
+        c_int = int(c)
+        if c_int not in self.indices:
+            return np.ones(shape, np.float32)
+        ci = self.indices.index(c_int)
         h, w = shape
         y, x = origin
         if not self.enabled[ci]:
@@ -864,8 +922,8 @@ def _fit_impl(
         enabled.append(ok)
         oldout.append(oldtemplates[c])
     check()
-    np.savez_compressed(
-        output,
+    _savez_atomic(
+        Path(output),
         basis=basis,
         templates=np.asarray(templates),
         delta=delta,

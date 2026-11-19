@@ -210,6 +210,16 @@ def validate_context(store, payload, *, slide_url):
         if (any(not index.isascii() or not index.isdecimal() or not 0 <= int(index) < len(channels)
                 for index in indices) or len(set(indices)) != len(indices)):
             raise ValueError("Invalid channel selection")
+    if "col" in params and params["col"] != "":
+        col_tokens = params["col"].split(",")
+        if len(col_tokens) > len(channels):
+            raise ValueError("Too many channel colors")
+        for token in col_tokens:
+            if not token:
+                continue
+            cleaned = token[1:] if token.startswith("#") else token
+            if len(cleaned) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in cleaned):
+                raise ValueError("Invalid channel color")
     if "win" in params:
         windows = params["win"].split(",")
         if len(windows) > len(channels):
@@ -322,15 +332,18 @@ class _OverlayDrag(NativeTitlebarDrag):
         super().__init__(window, logger=logger)
 
     def _begin(self):
-        import AppKit
+        try:
+            import AppKit
 
-        event, native = self._press, self.native
-        self._clear()
-        if (self.api._locked or self.api._closed or event is None or native is None
-                or event.window() != native or time.monotonic() - self._pressed_at > 1
-                or not (AppKit.NSEvent.pressedMouseButtons() & 1) or not native.isVisible()):
-            return
-        native.performWindowDragWithEvent_(event)
+            event, native = self._press, self.native
+            self._clear()
+            if (self.api._locked or self.api._closed or event is None or native is None
+                    or event.window() != native or time.monotonic() - self._pressed_at > 1
+                    or not (AppKit.NSEvent.pressedMouseButtons() & 1) or not native.isVisible()):
+                return
+            native.performWindowDragWithEvent_(event)
+        except Exception as exc:
+            self.logger(f"translucent window drag failed: {exc!r}")
 
 
 class TranslucentApi:
@@ -1393,7 +1406,10 @@ class TranslucentApi:
             if not self._closed and sys.platform == "darwin":
                 self._window.native.setMovable_(not self._locked)
 
-        self._dispatch(apply)
+        try:
+            self._dispatch(apply)
+        except Exception as exc:
+            self._logger(f"translucent lock update failed: {exc!r}")
         if self._on_lock is not None:
             self._on_lock(locked)
         return {"ok": True, "locked": locked}

@@ -49,7 +49,6 @@ echo "==> build venv ($BASEPY)"
 rm -rf "$BUILD/venv"
 "$BASEPY" -m venv "$BUILD/venv"
 PY="$BUILD/venv/bin/python"
-"$PY" -m pip -q install --upgrade pip
 # The bundle gets exactly the packages the test suite ran against: runtime
 # packages from uv.lock (limnd2 included, through the nd2export extra) and
 # PyInstaller from its own hash-pinned lock, as the Windows build does.
@@ -59,12 +58,12 @@ RUNTIME_LOCK="$BUILD/runtime-requirements.txt"
 uv export --project "$REPO" --frozen --no-dev --no-emit-project --emit-index-url \
   --extra app --extra svs --extra nd2export --format requirements-txt \
   --output-file "$RUNTIME_LOCK" >/dev/null
-"$PY" -m pip -q install --require-hashes -r "$RUNTIME_LOCK" -r "$HERE/macos-build-requirements.txt"
+PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" "$PY" -m pip -q install --require-hashes -r "$RUNTIME_LOCK" -r "$HERE/macos-build-requirements.txt"
 # Build the project with the pinned setuptools above, not one fetched for an
 # isolated build environment.
-"$PY" -m pip -q install --no-build-isolation --no-deps "$REPO"
+PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" "$PY" -m pip -q install --no-build-isolation --no-deps "$REPO"
 SDPC_WHEEL="$("$PY" "$HERE/bundle_sdpc_codec.py" wheel --manifest "$ND2WSI_SDPC_CODEC_MANIFEST")"
-"$PY" -m pip -q install --no-deps --force-reinstall "$SDPC_WHEEL"
+PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" "$PY" -m pip -q install --no-deps --force-reinstall "$SDPC_WHEEL"
 "$PY" "$HERE/verify_sdpc_codec.py" --manifest "$ND2WSI_SDPC_CODEC_MANIFEST"
 "$PY" -c "import limnd2; print('   limnd2', limnd2.__version__, 'in build venv')"
 APPNAME="$("$PY" "$HERE/macos_bundle_identity.py" --root "$REPO" --field bundle_name)"
@@ -102,6 +101,7 @@ import plistlib
 import re
 import runpy
 import sys
+import tomllib
 from pathlib import Path
 
 path = sys.argv[1]
@@ -109,8 +109,8 @@ with open(path, "rb") as fh:
     info = plistlib.load(fh)
 
 # Finder's Get Info reads these; PyInstaller leaves them at 0.0.0
-pyproject = open(sys.argv[2]).read()
-version = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+with open(sys.argv[2], "rb") as fh:
+    version = tomllib.load(fh)["project"]["version"]
 match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:(b|rc)(\d+))?", version)
 if not match:
     raise ValueError(f"unsupported package version for Info.plist: {version}")

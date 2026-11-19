@@ -99,6 +99,21 @@ class _RasterLevel:
             return np.ascontiguousarray(np.moveaxis(window, -1, 0)[channels])
 
 
+def _estimated_decode_bytes(image) -> int:
+    """Estimate peak Pillow memory (bytes) for load + mode normalization."""
+    pixels = image.width * image.height
+    mode = image.mode
+    if mode in ("RGB", "I"):
+        # Decoded straight into Pillow's 4 B/px buffer with no full-image copy;
+        # add 1 B/px headroom for overview memos and concurrent tile crops.
+        return pixels * 5
+    if "A" in image.getbands() or "transparency" in image.info:
+        # Source + RGBA conversion (if needed) + RGB composite + alpha mask.
+        return pixels * (12 if mode == "RGBA" else 16)
+    # Mode conversion (e.g. L/CMYK -> RGB or I;16 -> I) briefly holds source + target.
+    return pixels * 9
+
+
 def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
     """Open a bounded raster once, with no source writes.
 
@@ -126,13 +141,13 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         max_pixels = MAX_JPEG_PIXELS if image.format == "JPEG" else MAX_PIXELS
         if width * height > max_pixels:
             raise ValueError(f"{image.format} input exceeds {max_pixels / 1_000_000:g} megapixels")
-        # Budget the source decode, RGB/RGBA conversion, and alpha mask before
-        # asking Pillow's decoder to allocate pixels (RGB uses four bytes/px).
-        # Windows/Linux report current available physical memory. On macOS,
-        # keep the established conservative quarter-of-physical-memory budget.
+        # Budget peak Pillow decode/conversion memory before allocating pixels.
+        # Windows/Linux report live available physical memory (allowing up to 75%
+        # of currently free RAM so ~200+ MPx RGB JPEGs open on 8–16 GB PCs);
+        # macOS falls back to a quarter of installed physical memory.
         available = available_memory_bytes()
-        budget = (available if available is not None else _available_memory()) // 2
-        if width * height * 16 > budget:
+        budget = (available * 3) // 4 if available is not None else _available_memory() // 2
+        if _estimated_decode_bytes(image) > budget:
             raise ValueError("Not enough memory to open this image at full resolution; close other slides and retry")
         # Pillow narrows 16-bit colour and gray+alpha PNGs to 8 bits as it
         # decodes them, keeping each sample's high byte; say so. The decoder
@@ -144,32 +159,37 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         notes = ["Stored pixel orientation; physical calibration is unavailable"]
         if orientation != 1:
             notes.append(f"EXIF orientation {orientation} is ignored to preserve TXT pixel coordinates")
-        image.load()
-        gray16 = image.mode in GRAY16_MODES
-        if gray16:
-            if image.mode != "I":
+        try:
+            image.load()
+            gray16 = image.mode in GRAY16_MODES
+            if gray16:
+                if image.mode != "I":
+                    original = image
+                    image = image.convert("I")
+                    original.close()
+                notes.append("16-bit grayscale values are kept as stored")
+            elif image.mode != "RGB":
                 original = image
-                image = image.convert("I")
-                original.close()
-            notes.append("16-bit grayscale values are kept as stored")
-        elif image.mode != "RGB":
-            original = image
-            if "A" in image.getbands() or "transparency" in image.info:
-                rgba = image if image.mode == "RGBA" else image.convert("RGBA")
-                try:
-                    image = Image.new("RGB", rgba.size, (0, 0, 0))
-                    alpha = rgba.getchannel("A")
+                if "A" in image.getbands() or "transparency" in image.info:
+                    rgba = image if image.mode == "RGBA" else image.convert("RGBA")
                     try:
-                        image.paste(rgba, mask=alpha)
+                        image = Image.new("RGB", rgba.size, (0, 0, 0))
+                        alpha = rgba.getchannel("A")
+                        try:
+                            image.paste(rgba, mask=alpha)
+                        finally:
+                            alpha.close()
                     finally:
-                        alpha.close()
-                finally:
-                    if rgba is not original:
-                        rgba.close()
-                notes.append("Transparency is composited on black")
-            else:
-                image = image.convert("RGB")
-            original.close()
+                        if rgba is not original:
+                            rgba.close()
+                    notes.append("Transparency is composited on black")
+                else:
+                    image = image.convert("RGB")
+                original.close()
+        except MemoryError as exc:
+            raise ValueError(
+                "Not enough memory to open this image at full resolution; close other slides and retry"
+            ) from exc
         if narrowed:
             notes.append("16-bit colour PNG is shown at 8 bits per channel; pixel values and "
                          "TIFF data exports hold the high byte of each stored value")

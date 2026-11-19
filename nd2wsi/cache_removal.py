@@ -113,6 +113,103 @@ def _delete_verified_cache_file(path: Path, expected: os.stat_result, root_fd: i
         os.close(root_fd)
 
 
+_MAX_RESCUE_ANNOTATION_BYTES = 64 * 1024 * 1024
+
+
+def _is_windows_reparse_point(st_res: os.stat_result) -> bool:
+    return bool(getattr(st_res, "st_file_attributes", 0) & 0x400)
+
+
+def _iter_safe_annotation_files(folder: Path) -> list[tuple[Path, bytes]]:
+    """Collect regular, non-symlink ``annotations_*.json`` files safely inside ``folder``."""
+    import fnmatch
+
+    from .platform_io import BINARY
+
+    found: list[tuple[Path, bytes]] = []
+    file_flags = os.O_RDONLY | BINARY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+
+    def _read_regular_bounded(
+        path: Path, parent_fd: int | None = None, expected_stat: os.stat_result | None = None
+    ) -> bytes:
+        try:
+            if parent_fd is not None:
+                try:
+                    fd = os.open(path.name, file_flags, dir_fd=parent_fd)
+                except TypeError:
+                    fd = os.open(path, file_flags)
+            else:
+                st_path = path.stat(follow_symlinks=False)
+                if not stat.S_ISREG(st_path.st_mode) or _is_windows_reparse_point(st_path):
+                    raise ValueError(f"refusing to read non-regular annotation entry: {path}")
+                expected_stat = st_path
+                fd = os.open(path, file_flags)
+            with os.fdopen(fd, "rb") as handle:
+                st_fd = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(st_fd.st_mode)
+                    or st_fd.st_nlink != 1
+                    or _is_windows_reparse_point(st_fd)
+                    or (expected_stat is not None and not _same_file_identity(st_fd, expected_stat))
+                ):
+                    raise ValueError(f"refusing to read non-regular annotation entry: {path}")
+                if st_fd.st_size > _MAX_RESCUE_ANNOTATION_BYTES:
+                    raise ValueError(f"annotation file exceeds size limit: {path}")
+                data = handle.read(_MAX_RESCUE_ANNOTATION_BYTES + 1)
+            if len(data) > _MAX_RESCUE_ANNOTATION_BYTES:
+                raise ValueError(f"annotation file exceeds size limit: {path}")
+            return data
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise OSError(f"could not read annotation before cache deletion: {path}") from exc
+
+    if os.name == "nt":
+        def _walk_win(directory: Path) -> None:
+            for entry in sorted(os.scandir(directory), key=lambda e: e.name):
+                entry_path = Path(entry.path)
+                st_entry = entry.stat(follow_symlinks=False)
+                if _is_windows_reparse_point(st_entry) or stat.S_ISLNK(st_entry.st_mode):
+                    if fnmatch.fnmatch(entry.name, "annotations_*.json") or stat.S_ISDIR(st_entry.st_mode):
+                        raise ValueError(f"refusing to traverse symlink/reparse point: {entry_path}")
+                    continue
+                if stat.S_ISDIR(st_entry.st_mode):
+                    _walk_win(entry_path)
+                elif fnmatch.fnmatch(entry.name, "annotations_*.json"):
+                    found.append((entry_path, _read_regular_bounded(entry_path)))
+
+        _walk_win(folder)
+        return found
+
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+    def _walk_posix(dir_fd: int, current_path: Path) -> None:
+        for name in sorted(os.listdir(dir_fd)):
+            child_path = current_path / name
+            st_entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if stat.S_ISLNK(st_entry.st_mode):
+                if fnmatch.fnmatch(name, "annotations_*.json"):
+                    raise ValueError(f"refusing to read symlinked annotation: {child_path}")
+                continue
+            if stat.S_ISDIR(st_entry.st_mode):
+                child_fd = _open_child_directory(dir_fd, name, st_entry)
+                try:
+                    _walk_posix(child_fd, child_path)
+                finally:
+                    os.close(child_fd)
+            elif fnmatch.fnmatch(name, "annotations_*.json"):
+                found.append(
+                    (child_path, _read_regular_bounded(child_path, parent_fd=dir_fd, expected_stat=st_entry))
+                )
+
+    root_fd = os.open(folder, dir_flags)
+    try:
+        _walk_posix(root_fd, folder)
+    finally:
+        os.close(root_fd)
+    return found
+
+
 def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
     """Copy annotation sidecars out of ``folder`` before it is deleted.
 
@@ -126,7 +223,7 @@ def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
         folder_stat = folder.stat(follow_symlinks=False)
     except OSError as exc:
         raise OSError(f"could not inspect annotation source: {folder}") from exc
-    if not stat.S_ISDIR(folder_stat.st_mode):
+    if not stat.S_ISDIR(folder_stat.st_mode) or _is_windows_reparse_point(folder_stat):
         raise ValueError(f"annotation source is not a real directory: {folder}")
     home.mkdir(parents=True, exist_ok=True)
     folder_resolved = folder.resolve()
@@ -134,11 +231,7 @@ def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
     if home_resolved == folder_resolved or folder_resolved in home_resolved.parents:
         raise ValueError("annotation rescue destination is inside the doomed cache")
     saved = []
-    for path in folder.rglob("annotations_*.json"):
-        try:
-            source = path.read_bytes()
-        except OSError as exc:
-            raise OSError(f"could not read annotation before cache deletion: {path}") from exc
+    for path, source in _iter_safe_annotation_files(folder):
         target = home / path.name
         while True:
             fd = None

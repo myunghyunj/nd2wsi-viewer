@@ -69,7 +69,7 @@
         ? ["install", "cancel", ...offered.filter(action => !["install", "cancel"].includes(action))].filter(action => offered.includes(action))
         : offered;
       for (const action of ordered) {
-        if (!labels[action]) continue;
+        if (!Object.hasOwn(labels, action)) continue;
         const button = doc.createElement("button"); button.type = "button";
         button.textContent = labels[action]; button.disabled = busy; button.dataset.action = action;
         if (["download", "install", "retry"].includes(action)) button.className = "update-primary";

@@ -13,6 +13,9 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   realdata:
     runs-on: macos-15
@@ -20,6 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
       - name: Verify the manual gate targets the exact commit
         if: github.event_name == 'workflow_dispatch'
         env:

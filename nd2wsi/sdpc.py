@@ -357,6 +357,7 @@ def associated_image_jpeg(path: str | Path, name: str, *, max_side: int = 512) -
 
 def _decode_tile(data: bytes, width: int, height: int) -> np.ndarray:
     av = _require_av()
+    decoder = None
     try:
         # A fresh single-threaded decoder per tile, so a damaged tile cannot carry
         # decoder state into the next one. The HEVC parser splits the tile into
@@ -388,6 +389,12 @@ def _decode_tile(data: bytes, width: int, height: int) -> np.ndarray:
         return np.ascontiguousarray(rgb)
     except Exception as exc:
         raise ValueError(f"cannot decode SDPC HEVC tile: {exc}") from exc
+    finally:
+        if decoder is not None:
+            try:
+                decoder.close()
+            except Exception:
+                pass
 
 
 def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
