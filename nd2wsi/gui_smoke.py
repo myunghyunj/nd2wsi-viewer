@@ -77,7 +77,7 @@ _GUI_SMOKE_KEYBOARD_SETUP = """(() => {
   const panelNames = [...Object.keys(ids), 'info'];
   if (!page || !toolbar || Object.values(ids).some(id => !page.getElementById(id)))
     throw new Error('Native keyboard smoke controls are unavailable');
-  const panels = view.eval('state.windows');
+  const panels = view.nd2ViewerState.windows;
   const original = Object.fromEntries(panelNames.map(id => [id, panels[id].isHidden()]));
   const focused = document.activeElement;
   const input = document.createElement('input');
@@ -353,16 +353,16 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         throw new Error('Packaged Shading Correction contains obsolete method controls');
                       await step('shading-status', async () => {
                         const deadline = Date.now() + 10000;
-                        while (!view.eval('state.shading && !state.shading.snapshot().refreshing && !state.shading.snapshot().view_stale && state.shading.snapshot().state !== "checking"') ||
+                        while (!(view.nd2ViewerState?.shading && !view.nd2ViewerState.shading.snapshot().refreshing && !view.nd2ViewerState.shading.snapshot().view_stale && view.nd2ViewerState.shading.snapshot().state !== "checking") ||
                             !shadingStates.has(frame.dataset.sid)) {
                           if (Date.now() >= deadline) throw new Error('Shading Correction status did not arrive');
                           await new Promise(resolve => setTimeout(resolve, 50));
                         }
                       });
-                      const shadingStatus = view.eval('state.shading.snapshot()');
+                      const shadingStatus = view.nd2ViewerState.shading.snapshot();
                       if (typeof shadingStatus.applied !== 'boolean' || typeof shadingStatus.can_cancel !== 'boolean' ||
                           !(shadingStatus.operation === null || ['apply', 'revoke'].includes(shadingStatus.operation)) ||
-                          shadingStatus.generation !== view.eval('state.info.generation') || shadingStatus.state === 'failed' ||
+                          shadingStatus.generation !== view.nd2ViewerState.info.generation || shadingStatus.state === 'failed' ||
                           !shadingButton.title.includes('Shading Correction'))
                         throw new Error('Shading Correction did not initialize its committed pyramid state');
                       const shading = window.Nd2ShadingCorrection;
@@ -399,7 +399,7 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                       // Auto-LUT loading must settle before a same-values round trip.
                       if (__CLIPBOARD_CHECK__) await step('autolut', async () => {
                         const deadline = Date.now() + 15000;
-                        while (view.eval('state.lutAutoPending.some(Boolean)')) {
+                        while (view.nd2ViewerState.lutAutoPending.some(Boolean)) {
                           if (Date.now() >= deadline) throw new Error('LUT smoke autolut timed out after 15000 ms');
                           await new Promise(resolve => setTimeout(resolve, 50));
                         }
@@ -414,11 +414,11 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                             !svg.querySelector('path')) throw new Error('Invalid packaged LUT icon: ' + name);
                       })));
                       const infoImages = await step('info-images', async () => {
-                        const inspector = view.eval('state.windows.info');
+                        const inspector = view.nd2ViewerState.windows.info;
                         const wasHidden = inspector.isHidden();
                         await view.loadSlideInspector();
                         inspector.open();
-                        const names = view.eval('state.inspect && state.inspect.associated');
+                        const names = view.nd2ViewerState.inspect && view.nd2ViewerState.inspect.associated;
                         if (!Array.isArray(names)) throw new Error('Slide Info metadata did not load');
                         const images = [...page.querySelectorAll('#info-associated img')];
                         if (images.length !== names.length) throw new Error('Slide Info omitted embedded images');
@@ -457,9 +457,9 @@ def gui_smoke(api: Api, window, *, expect_slide: bool = False, timeout: float = 
                         clipboard_api: {write: typeof view.navigator.clipboard?.writeText === 'function',
                           read: typeof view.navigator.clipboard?.readText === 'function'}};
                       if (__CLIPBOARD_CHECK__) {
-                        const current = () => view.eval('window.Nd2LutTransfer.encode(state.info.channels, state.luts, state.info.dtype)');
+                        const current = () => view.Nd2LutTransfer.encode(view.nd2ViewerState.info.channels, view.nd2ViewerState.luts, view.nd2ViewerState.info.dtype);
                         const before = current();
-                        const expected = view.eval('window.Nd2LutTransfer.planPaste(window.Nd2LutTransfer.encode(state.info.channels, state.luts, state.info.dtype), state.info.channels, state.info.dtype).updates.length');
+                        const expected = view.Nd2LutTransfer.planPaste(before, view.nd2ViewerState.info.channels, view.nd2ViewerState.info.dtype).updates.length;
                         if (!expected) throw new Error('LUT clipboard fixture has no uniquely named compatible channels');
                         const [, copy, paste] = buttons;
                         const toast = () => page.getElementById('toast')?.textContent || 'No result reported';

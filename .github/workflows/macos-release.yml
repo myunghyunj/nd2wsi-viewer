@@ -285,11 +285,9 @@ jobs:
               assert info["SUFeedURL"] == "https://raw.githubusercontent.com/myunghyunj/nd2wsi-viewer/main/updates/appcast.xml"
           assert info["SUPublicEDKey"] == "RSPZ8oXqjqXqByfHTCoiskGziFs+zAHNJ/fGa3N/hvk="
           runtime = json.loads(subprocess.check_output([
-              str(app / "Contents/MacOS" / identity["executable"]), "-c",
-              "import json, nd2wsi; from nd2wsi.app import Api; "
-              "print(json.dumps({'package_version': nd2wsi.__version__, "
-              "'updates_disabled': Api(None)._updates_disabled}))",
+              str(app / "Contents/MacOS" / identity["executable"]), "--cli-self-check", "-",
           ], text=True, timeout=60, cwd="/private/tmp"))
+          assert runtime["ok"] is True
           assert runtime["package_version"] == version
           assert runtime["updates_disabled"] is identity["updates_off"]
           (evidence / "packaged-update-policy.json").write_text(json.dumps(runtime, indent=2) + "\n")

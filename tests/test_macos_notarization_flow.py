@@ -885,8 +885,8 @@ def test_macos_release_workflow_build_info_signing_status_reporting(tmp_path: Pa
     shutil.copyfile(manifest_path, app / "Contents" / "Resources" / "sdpc-codec-manifest.json")
 
     # Replace the hardcoded example_cell.nd2 fixture SHA check and mock the Mach-O
-    # app binary '-c' runtime probe so this workflow proof test runs cross-platform
-    # (including on Windows CI where /private/tmp and Mach-O execution do not exist).
+    # app binary '--cli-self-check' runtime probe so this workflow proof test runs
+    # cross-platform (including on Windows CI where /private/tmp and Mach-O execution do not exist).
     fixture_bytes = b"synthetic-smoke-nd2"
     (tmp_path / "docs" / "example_cell.nd2").write_bytes(fixture_bytes)
     fixture_sha = hashlib.sha256(fixture_bytes).hexdigest()
@@ -894,8 +894,8 @@ def test_macos_release_workflow_build_info_signing_status_reporting(tmp_path: Pa
         "import json as _json, subprocess as _sp\n"
         "_orig_check_output = _sp.check_output\n"
         "def _mock_check_output(cmd, *a, **kw):\n"
-        "    if isinstance(cmd, list) and len(cmd) >= 2 and cmd[1] == '-c':\n"
-        f"        return _json.dumps({{'package_version': {version!r}, 'updates_disabled': False}})\n"
+        "    if isinstance(cmd, list) and len(cmd) >= 2 and cmd[1] == '--cli-self-check':\n"
+        f"        return _json.dumps({{'ok': True, 'ometiff': True, 'cli_help': True, 'package_version': {version!r}, 'updates_disabled': False}})\n"
         "    return _orig_check_output(cmd, *a, **kw)\n"
         "_sp.check_output = _mock_check_output\n"
     )

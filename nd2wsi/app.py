@@ -1668,6 +1668,7 @@ def _main(args) -> int:
         import imagecodecs  # noqa: F401
         import tifffile  # noqa: F401
 
+        from . import __version__ as _package_version
         from . import cli as _cli
         from . import ometiff as _ometiff  # noqa: F401
         from . import ui_settings as _ui_settings  # noqa: F401
@@ -1683,11 +1684,20 @@ def _main(args) -> int:
         ok = code == 0 and all(
             tok in text for tok in ("Zeiss CZI", "Leica LIF", "OME-TIFF", ".nd2svs")
         )
-        args.cli_self_check.parent.mkdir(parents=True, exist_ok=True)
-        args.cli_self_check.write_text(
-            json.dumps({"ok": ok, "ometiff": True, "cli_help": ok}),
-            encoding="utf-8",
+        payload = json.dumps(
+            {
+                "ok": ok,
+                "ometiff": True,
+                "cli_help": ok,
+                "package_version": _package_version,
+                "updates_disabled": Api(None)._updates_disabled,
+            }
         )
+        if str(args.cli_self_check) == "-":
+            print(payload)
+        else:
+            args.cli_self_check.parent.mkdir(parents=True, exist_ok=True)
+            args.cli_self_check.write_text(payload, encoding="utf-8")
         return 0 if ok else 4
     if args.smoke:
         if not initial:

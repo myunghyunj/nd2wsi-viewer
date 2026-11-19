@@ -56,7 +56,7 @@ def run():
         url = api.open_path(str(source))
         check(url, f'open failed: {api._status}')
         window.load_url(url)
-        wait_js("(() => {const f=document.querySelector('#frames iframe.active'); return !!(f && f.contentWindow.eval('state.info && state.annReady && !!state.windows.astromap'));})()")
+        wait_js("(() => {const f=document.querySelector('#frames iframe.active'); const s=f?.contentWindow?.nd2ViewerState; return !!(s && s.info && s.annReady && !!s.windows.astromap);})()")
         report['url'] = url
         check(window.evaluate_js("!document.getElementById('astromap-toggle').hidden"), 'star hidden initially')
         window.evaluate_js("document.getElementById('astromap-toggle').click(); true")
@@ -84,46 +84,45 @@ def run():
         # First ROI through Select Region -> Add Current; second via the committed drag callback.
         setup = """(() => {
           const f=document.querySelector('#frames iframe.active'), v=f.contentWindow;
-          return v.eval(`(() => {
-            state.roi={x:200,y:300,w:500,h:400}; state.roiSite=null;
-            refreshAstromapPanel(); document.getElementById('astromap-add-current').click();
-            const stage=document.getElementById('stage'), bounds=stage.getBoundingClientRect();
-            const a0=imageToViewerElementPoint({x:1000,y:1100});
-            const b0=imageToViewerElementPoint({x:1300,y:1300});
-            const pointer=(type,p,button=0,shift=true)=>stage.dispatchEvent(new PointerEvent(type,{
-              pointerId:9, pointerType:'mouse', isPrimary:true, button,
-              buttons:type==='pointerup'?0:1, shiftKey:shift, bubbles:true,cancelable:true,
-              clientX:bounds.left+p.x,clientY:bounds.top+p.y}));
-            pointer('pointerdown',a0,2); pointer('pointerup',b0,2);
-            if(state.annotations.filter(x=>x.astromap===true).length!==1) throw new Error('right-click created ROI');
-            pointer('pointerdown',a0); pointer('pointermove',b0); pointer('pointerup',b0);
-            if(state.tool!==null || !state.viewer.isMouseNavEnabled()) throw new Error('navigation not restored');
-            const a=state.annotations.filter(x=>x.astromap===true);
-            if(a.length!==2) throw new Error('ROI count '+a.length);
-            a[0].text='검증 ROI'; a[1].text='second';
-            annotationsChanged(); refreshAstromapPanel();
-            return {rois:Nd2Astromap.selectedRois(state.annotations),
-              generation:state.info.generation,channels:state.channels,window:lutParam(),frame:null,
-              info:state.info};
-          })()`);
+          const state=v.nd2ViewerState, doc=v.document;
+          state.roi={x:200,y:300,w:500,h:400}; state.roiSite=null;
+          v.refreshAstromapPanel(); doc.getElementById('astromap-add-current').click();
+          const stage=doc.getElementById('stage'), bounds=stage.getBoundingClientRect();
+          const a0=v.imageToViewerElementPoint({x:1000,y:1100});
+          const b0=v.imageToViewerElementPoint({x:1300,y:1300});
+          const pointer=(type,p,button=0,shift=true)=>stage.dispatchEvent(new v.PointerEvent(type,{
+            pointerId:9, pointerType:'mouse', isPrimary:true, button,
+            buttons:type==='pointerup'?0:1, shiftKey:shift, bubbles:true,cancelable:true,
+            clientX:bounds.left+p.x,clientY:bounds.top+p.y}));
+          pointer('pointerdown',a0,2); pointer('pointerup',b0,2);
+          if(state.annotations.filter(x=>x.astromap===true).length!==1) throw new Error('right-click created ROI');
+          pointer('pointerdown',a0); pointer('pointermove',b0); pointer('pointerup',b0);
+          if(state.tool!==null || !state.viewer.isMouseNavEnabled()) throw new Error('navigation not restored');
+          const a=state.annotations.filter(x=>x.astromap===true);
+          if(a.length!==2) throw new Error('ROI count '+a.length);
+          a[0].text='검증 ROI'; a[1].text='second';
+          v.annotationsChanged(); v.refreshAstromapPanel();
+          return {rois:v.Nd2Astromap.selectedRois(state.annotations),
+            generation:state.info.generation,channels:state.channels,window:v.lutParam(),frame:null,
+            info:state.info};
         })()"""
         data = window.evaluate_js(setup)
         report['rois'] = data['rois']
         # Capture the exact browser export request and let the UI prepare its native download.
         script = """(() => {
           const v=document.querySelector('#frames iframe.active').contentWindow;
-          v.eval(`window.__qaFetch=window.fetch;
-            window.fetch=async function(input,init){
-              const result=await window.__qaFetch.call(this,input,init);
-              if(String(input).includes('api/astromap') && init?.method==='POST') {
-                window.__qaExportStatus=result.status;
-                window.__qaExport=await result.clone().json();
-              }
-              return result;
-            };
-            window.__qaAnchorClick=HTMLAnchorElement.prototype.click;
-            HTMLAnchorElement.prototype.click=function(){window.__qaDownload=this.href;};
-            document.getElementById('astromap-export').click();`);
+          v.__qaFetch=v.fetch;
+          v.fetch=async function(input,init){
+            const result=await v.__qaFetch.call(this,input,init);
+            if(String(input).includes('api/astromap') && init?.method==='POST') {
+              v.__qaExportStatus=result.status;
+              v.__qaExport=await result.clone().json();
+            }
+            return result;
+          };
+          v.__qaAnchorClick=v.HTMLAnchorElement.prototype.click;
+          v.HTMLAnchorElement.prototype.click=function(){v.__qaDownload=this.href;};
+          v.document.getElementById('astromap-export').click();
           return true;
         })()"""
         window.evaluate_js(script)
@@ -148,7 +147,7 @@ def run():
             check('検' not in report['txt'] and '검증 ROI' in report['txt'], 'UTF-8 note lost')
         report['export'] = result
         # State must remain original-sized after saving.
-        after = window.evaluate_js("document.querySelector('#frames iframe.active').contentWindow.eval('Nd2Astromap.selectedRois(state.annotations)')")
+        after = window.evaluate_js("(() => { const v=document.querySelector('#frames iframe.active').contentWindow; return v.Nd2Astromap.selectedRois(v.nd2ViewerState.annotations); })()")
         check(after == data['rois'], 'export mutated original coordinates')
         # Saving twice must keep dimensions/coordinates and rendered image identical.
         request = urllib.request.Request(download.split('api/astromap/download')[0]+'api/astromap',

@@ -327,7 +327,7 @@ const buttons={
   'lut-dialog':{},'lut-copy-tooltip':{},'toast':{get textContent(){return toast}},
 };
 if(mode==='missing-handler')delete buttons['lut-paste'].onclick;
-const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){},fitsChannel(){}},
+const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){return encoded;},planPaste(){return {updates:[{},{}]};},fitsChannel(){}},
   Nd2ShadingCorrection:mode==='missing-shading-module'?null:Shading,
   async loadSlideInspector(){infoCalls.load++;inspectNames=mode==='info-metadata-missing'?null:associatedNames;},
   parent:{pywebview:{platform:mode==='wrong-platform'?'cocoa':'edgechromium',api:{
@@ -337,16 +337,18 @@ const view={Nd2LutTransfer:mode==='missing-module'?null:{encode(){},planPaste(){
   fetch:async url=>{fetches.push(String(url));if(mode==='icons-timeout')return new Promise(()=>{});
     return {ok:mode!=='missing-icon',status:404,text:async()=>mode==='invalid-icon'?'bad':'svg'}},
   DOMParser:class{parseFromString(text){return {documentElement:{tagName:text==='svg'?'svg':'parsererror',getAttribute:()=> '0 0 20 20'},querySelector:()=>({})}}},
-  eval(expression){
-    if(expression.startsWith('state.shading && '))return true;
-    if(expression==='state.shading.snapshot()')return mode==='legacy-shading-status'?{state:'idle',enabled:false}:
-      {state:mode==='applied'?'ready':'idle',applied:mode==='applied',operation:null,can_cancel:false,generation:'pyramid-test'};
-    if(expression==='state.info.generation')return 'pyramid-test';
-    if(expression==='state.windows.info')return inspector;
-    if(expression==='state.inspect && state.inspect.associated')return inspectNames;
-    if(expression==='state.lutAutoPending.some(Boolean)')return mode==='autolut-timeout';
-    if(expression.includes('planPaste'))return 2;
-    return encoded;
+  nd2ViewerState:{
+    shading:{
+      snapshot(){
+        return mode==='legacy-shading-status'?{state:'idle',enabled:false,refreshing:false,view_stale:false}:
+          {state:mode==='applied'?'ready':'idle',applied:mode==='applied',operation:null,can_cancel:false,generation:'pyramid-test',refreshing:false,view_stale:false};
+      },
+    },
+    info:{generation:'pyramid-test',channels:[],dtype:'uint16'},
+    luts:[],
+    windows:{info:inspector},
+    get inspect(){return inspectNames===null?null:{associated:inspectNames};},
+    get lutAutoPending(){return [mode==='autolut-timeout'];},
   },
 };
 const page={baseURI:'http://viewer.test/private-token/s/test/',
@@ -629,7 +631,7 @@ const toolbar={id:'newtab',focus(){document.activeElement=this;}};
 const document={activeElement:focused,
   getElementById:()=>toolbar,
   querySelector:()=>({contentDocument:{getElementById:id=>buttons[id]},
-    contentWindow:{eval:()=>panels,getSelection:()=>({removeAllRanges(){}})}}),
+    contentWindow:{nd2ViewerState:{windows:panels},getSelection:()=>({removeAllRanges(){}})}}),
   body:{appendChild:input=>inputs.push(input)},
   createElement:()=>({style:{},value:'',focus(){document.activeElement=this;},
     setSelectionRange(a,b){this.selectionStart=a;this.selectionEnd=b;},remove(){inputs.pop();}}),

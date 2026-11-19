@@ -3,10 +3,18 @@ from pathlib import Path
 
 base = Path(__file__).with_name('check_native_astromap.py')
 source = base.read_text()
-extra = '''        def pane(code):
-            return window.evaluate_js("document.querySelector('#frames iframe.active').contentWindow.eval("+json.dumps(code)+")")
+extra = '''        from nd2wsi.translucent_smoke import pane_eval as _pane_eval
+        def pane(code):
+            return _pane_eval(window, code)
         def wait_pane(code):
-            return wait_js("document.querySelector('#frames iframe.active').contentWindow.eval("+json.dumps(code)+")")
+            deadline = time.monotonic() + 30
+            last = None
+            while time.monotonic() < deadline:
+                last = _pane_eval(window, code)
+                if last:
+                    return last
+                time.sleep(0.05)
+            raise TimeoutError(f'timed out waiting for {code}: {last}')
         pane("state.viewportRelay.displayRotation=0; state.viewportRelay.displayFlipped=false; applyDesiredDisplayTransform(); state.viewer.viewport.goHome(true); addAnnotation({type:'pin',x:1100,y:1200,text:'Pin follows image'}); addAnnotation({type:'line',x1:1000,y1:1200,x2:1500,y2:1450,text:'Line follows image'}); true")
         pane("document.activeElement?.blur(); renderAnnotations(); true")
         before=pane('JSON.stringify(state.annotations)')

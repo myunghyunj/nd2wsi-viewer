@@ -62,9 +62,34 @@ def bridge_result(window, expression, *, timeout=30):
 
 
 def pane_eval(parent, expression):
+    """Run a diagnostic expression against the active slide pane without eval()."""
+    body = expression.strip()
+    if ";" in body and not body.startswith(("(()", "(function")):
+        head, tail = body.rsplit(";", 1)
+        tail = tail.strip()
+        stmt = f"{head}; return ({tail});" if tail else f"{head}; return true;"
+    else:
+        stmt = f"return ({body});"
     return parent.evaluate_js(
-        "document.querySelector('#frames iframe.active').contentWindow.eval(" +
-        json.dumps(expression) + ")"
+        "(() => {"
+        " const __frame = document.querySelector('#frames iframe.active');"
+        " const __win = __frame && __frame.contentWindow;"
+        " if (!__win) return null;"
+        " const state = __win.nd2ViewerState;"
+        " const document = __win.document;"
+        " const captureTranslucentView = __win.captureTranslucentView;"
+        " const applyDesiredDisplayTransform = __win.applyDesiredDisplayTransform;"
+        " const Nd2Astromap = __win.Nd2Astromap;"
+        " const Nd2LutTransfer = __win.Nd2LutTransfer;"
+        " const loadSlideInspector = __win.loadSlideInspector;"
+        " const addAnnotation = __win.addAnnotation;"
+        " const renderAnnotations = __win.renderAnnotations;"
+        " const refreshAstromapPanel = __win.refreshAstromapPanel;"
+        " const annotationsChanged = __win.annotationsChanged;"
+        " const imageToViewerElementPoint = __win.imageToViewerElementPoint;"
+        " const lutParam = __win.lutParam;"
+        " " + stmt +
+        "})()"
     )
 
 
