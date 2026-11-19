@@ -423,9 +423,15 @@ def write_manifest(
         manifest["storage"].update({"container": "nd2svs-sqlite/2"})
         write_entry(container, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
         return
-    tmp = container / f".{MANIFEST_NAME}.tmp"
-    tmp.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
-    tmp.replace(container / MANIFEST_NAME)
+    tmp = container / f".{MANIFEST_NAME}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(json.dumps(manifest, indent=1).encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, container / MANIFEST_NAME)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def read_manifest(container: str | Path, *, recover: bool = False) -> dict[str, Any] | None:
@@ -884,28 +890,45 @@ def sweep_stale_builds(caches_dir: Path) -> int:
             continue
         family = match.group(1)
         lock = CacheLock(caches_dir / family)
-        info = lock._read()
-        live = False
-        if info:
-            if _taken_elsewhere(info):
-                live = False  # a builder on another machine or boot is not running here
-            else:
-                try:
-                    live = process_is_alive(int(info.get("pid", -1)))
-                except (ProcessLookupError, ValueError, TypeError, OverflowError):
-                    pass
-                except PermissionError:
-                    live = True
-        if not live:
+        held_arbiter = False
+        if lock._arbiter.path.exists():
             try:
-                _refuse_database_companions(item)
-                if item.is_file():
-                    from .storage.single_file import is_single_file
+                lock._arbiter.acquire(timeout=0)
+                held_arbiter = True
+            except (TimeoutError, OSError):
+                continue  # another local process is actively coordinating this family
+        try:
+            info = lock._read()
+            live = False
+            if info:
+                if _taken_elsewhere(info):
+                    live = False  # a builder on another machine or boot is not running here
+                else:
+                    try:
+                        live = process_is_alive(int(info.get("pid", -1)))
+                    except (ProcessLookupError, ValueError, TypeError, OverflowError):
+                        pass
+                    except PermissionError:
+                        live = True
+            if not live:
+                try:
+                    _refuse_database_companions(item)
+                    if item.is_file():
+                        from .storage.single_file import is_single_file
 
-                    if not is_single_file(item):
-                        continue  # an arbitrary file with a staging-like name is not cache
-                _remove_artifact(item)
-                n += 1
-            except (OSError, RuntimeError):
-                pass  # leave inaccessible artifacts in place; do not report them removed
+                        if not is_single_file(item):
+                            continue  # an arbitrary file with a staging-like name is not cache
+                    elif item.is_dir() and not item.is_symlink() and ".replaced-" in name:
+                        from .cache_removal import rescue_annotations
+
+                        rescue_annotations(item, caches_dir.parent / ANNOTATIONS_DIR)
+                    if not held_arbiter and lock._arbiter.path.exists():
+                        continue  # a local builder started while we inspected this family
+                    _remove_artifact(item)
+                    n += 1
+                except (OSError, RuntimeError):
+                    pass  # leave inaccessible artifacts in place; do not report them removed
+        finally:
+            if held_arbiter:
+                lock._arbiter.release()
     return n

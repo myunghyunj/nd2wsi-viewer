@@ -17,7 +17,6 @@
       <div id="scene-picker" class="scene-picker" hidden>
         <button type="button" id="scene-picker-btn" class="scene-picker-btn"
                 aria-haspopup="listbox" aria-expanded="false" aria-controls="scene-picker-menu"></button>
-        <div id="scene-picker-menu" class="scene-picker-menu" role="listbox" aria-label="Slide scenes" hidden></div>
       </div>
       <span id="file-dims"></span>
     </div>
@@ -52,6 +51,8 @@
               aria-keyshortcuts="Shift+Slash" aria-haspopup="dialog" aria-controls="shortcuts-modal">?</button>
     </div>
   </header>
+
+  <div id="scene-picker-menu" class="scene-picker-menu" role="listbox" aria-label="Slide scenes" hidden></div>
 
   <div id="plate-view-menu" role="menu" aria-label="Plate view options" hidden>
     <button type="button" role="menuitemcheckbox" aria-checked="false" tabindex="0" data-plate-view="siteLabels">
@@ -118,9 +119,9 @@
     <section class="mac-window" id="win-channels">
       <div class="win-titlebar">
         <div class="traffic">
-          <button class="tl tl-close" title="Close"></button>
-          <button class="tl tl-min" title="Collapse"></button>
-          <button class="tl tl-zoom" title="Zoom"></button>
+          <button type="button" class="tl tl-close" title="Close" aria-label="Close Channels"></button>
+          <button type="button" class="tl tl-min" title="Collapse" aria-label="Collapse Channels"></button>
+          <button type="button" class="tl tl-zoom" title="Zoom" aria-label="Resize Channels"></button>
         </div>
         <span class="win-title">Channels &amp; LUTs</span>
       </div>
@@ -140,9 +141,9 @@
     <section class="mac-window" id="win-region">
       <div class="win-titlebar">
         <div class="traffic">
-          <button class="tl tl-close" title="Close"></button>
-          <button class="tl tl-min" title="Collapse"></button>
-          <button class="tl tl-zoom" title="Zoom"></button>
+          <button type="button" class="tl tl-close" title="Close" aria-label="Close Export"></button>
+          <button type="button" class="tl tl-min" title="Collapse" aria-label="Collapse Export"></button>
+          <button type="button" class="tl tl-zoom" title="Zoom" aria-label="Resize Export"></button>
         </div>
       <span class="win-title">Export</span>
       </div>
@@ -187,9 +188,9 @@
     <section class="mac-window" id="win-annot">
       <div class="win-titlebar">
         <div class="traffic">
-          <button class="tl tl-close" title="Close"></button>
-          <button class="tl tl-min" title="Collapse"></button>
-          <button class="tl tl-zoom" title="Zoom"></button>
+          <button type="button" class="tl tl-close" title="Close" aria-label="Close Annotations"></button>
+          <button type="button" class="tl tl-min" title="Collapse" aria-label="Collapse Annotations"></button>
+          <button type="button" class="tl tl-zoom" title="Zoom" aria-label="Resize Annotations"></button>
         </div>
         <span class="win-title">Annotations</span>
       </div>
@@ -275,9 +276,9 @@
     <section class="mac-window" id="win-info">
       <div class="win-titlebar">
         <div class="traffic">
-          <button class="tl tl-close" title="Close"></button>
-          <button class="tl tl-min" title="Collapse"></button>
-          <button class="tl tl-zoom" title="Zoom"></button>
+          <button type="button" class="tl tl-close" title="Close" aria-label="Close Slide Info"></button>
+          <button type="button" class="tl tl-min" title="Collapse" aria-label="Collapse Slide Info"></button>
+          <button type="button" class="tl tl-zoom" title="Zoom" aria-label="Resize Slide Info"></button>
         </div>
         <span class="win-title">Slide Info</span>
       </div>

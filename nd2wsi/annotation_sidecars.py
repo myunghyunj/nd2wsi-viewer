@@ -170,8 +170,6 @@ def annotations_sidecar(
         target_dir.mkdir(parents=True, exist_ok=True)
 
     if not new.exists():
-        import shutil
-
         old_paths = tuple(
             candidate
             for stem in candidate_stems
@@ -218,7 +216,18 @@ def annotations_sidecar(
                             break
                         old.rename(new)
                 else:
-                    shutil.copy2(old, new)
+                    import uuid
+
+                    raw_bytes = old.read_bytes()
+                    tmp = new.with_name(f".{new.name}.{uuid.uuid4().hex}.tmp")
+                    try:
+                        with tmp.open("xb") as fh:
+                            fh.write(raw_bytes)
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                        os.replace(tmp, new)
+                    finally:
+                        tmp.unlink(missing_ok=True)
                 break
             except OSError:
                 continue

@@ -18,6 +18,33 @@ import numpy as np
 
 from ..platform_io import filesystem_path
 
+_ALLOWED_COMPRESSOR_IDS = frozenset({"blosc", "zstd", "zlib", "gzip", "lz4", "bz2", "lzma"})
+# Upper bound on a single decoded chunk (64 MiB). Normal pyramid tiles are
+# 512x512..1024x1024 uint16 (~0.5..2 MiB); bounding rejects crafted zip/chunk bombs.
+MAX_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _safe_compressor(config: Any) -> Any:
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        raise ValueError("compressor configuration must be a JSON object")
+    codec_id = config.get("id")
+    if not isinstance(codec_id, str) or codec_id not in _ALLOWED_COMPRESSOR_IDS:
+        raise ValueError(f"unsupported or unsafe Zarr compressor {codec_id!r}")
+    import numcodecs
+
+    return numcodecs.get_codec(config)
+
+
+def _checked_chunk_bytes(chunk_shape: tuple[int, ...], dtype: np.dtype) -> int:
+    total = int(math.prod(chunk_shape)) * int(dtype.itemsize)
+    if total <= 0 or total > MAX_CHUNK_BYTES:
+        raise ValueError(
+            f"chunk size {total} bytes exceeds safety limit ({MAX_CHUNK_BYTES} bytes)"
+        )
+    return total
+
 
 def _index(value: Any, length: int, *, wrap: bool) -> int | None:
     """``value`` as an in-range axis position, or None when it is not one."""
@@ -68,8 +95,6 @@ class ZarrV2RegionReader:
         fetch: Callable[[str], bytes | None],
         spread: Callable[[list[Callable[[], None]]], None] | None = None,
     ):
-        import numcodecs
-
         if metadata.get("zarr_format") != 2 or metadata.get("order", "C") != "C":
             raise ValueError("direct reads need a C-order Zarr v2 array")
         if metadata.get("filters"):
@@ -86,11 +111,11 @@ class ZarrV2RegionReader:
         self.chunk_shape = tuple(int(value) for value in metadata["chunks"])
         if not self.shape or len(self.chunk_shape) != len(self.shape) or min(self.chunk_shape) < 1:
             raise ValueError("direct reads need matching shape and chunks")
+        self._chunk_bytes = _checked_chunk_bytes(self.chunk_shape, self.dtype)
         separator = metadata.get("dimension_separator", ".")
         if separator not in (".", "/"):
             raise ValueError(f"unknown dimension separator {separator!r}")
-        compressor = metadata.get("compressor")
-        self._codec = None if compressor is None else numcodecs.get_codec(compressor)
+        self._codec = _safe_compressor(metadata.get("compressor"))
         self._separator = separator
         self._prefix = f"{path}/" if path else ""
         self._fetch = fetch
@@ -177,6 +202,10 @@ class ZarrV2RegionReader:
                 out[slot] = 0
             return
         decoded = payload if self._codec is None else self._codec.decode(payload)
+        if len(decoded) != self._chunk_bytes:
+            raise ValueError(
+                f"decoded chunk size {len(decoded)} does not match expected {self._chunk_bytes}"
+            )
         chunk = np.frombuffer(decoded, self.dtype).reshape(self.chunk_shape)
         for slot, offset in rows:
             out[slot] = chunk[(offset, *inner)]
@@ -186,8 +215,6 @@ class ZarrV2ChunkArray:
     """Direct chunk access for one local, C-order Zarr v2 array."""
 
     def __init__(self, array: Any):
-        import numcodecs
-
         self.shape = tuple(int(value) for value in array.shape)
         self.dtype = np.dtype(array.dtype)
         self._path = Path(filesystem_path(array.store.root)) / array.path
@@ -198,10 +225,10 @@ class ZarrV2ChunkArray:
             raise ValueError("direct storage does not apply filters")
         if metadata.get("fill_value", 0) not in (0, 0.0, None):
             raise ValueError("direct storage requires a zero fill value")
-        comp = metadata.get("compressor")
-        self._codec = None if comp is None else numcodecs.get_codec(comp)
+        self._codec = _safe_compressor(metadata.get("compressor"))
         self._separator = metadata.get("dimension_separator", ".")
         self.chunk_shape = tuple(int(value) for value in metadata["chunks"])
+        self._chunk_bytes = _checked_chunk_bytes(self.chunk_shape, self.dtype)
 
     def _file(self, index: tuple[int, ...]) -> Path:
         if len(index) != len(self.chunk_shape):
@@ -222,6 +249,10 @@ class ZarrV2ChunkArray:
         except FileNotFoundError:
             return None
         decoded = bytes(payload) if self._codec is None else self._codec.decode(payload)
+        if len(decoded) != self._chunk_bytes:
+            raise ValueError(
+                f"decoded chunk size {len(decoded)} does not match expected {self._chunk_bytes}"
+            )
         return np.frombuffer(decoded, self.dtype).reshape(self.chunk_shape)
 
     def read(self, index: tuple[int, ...]) -> np.ndarray:

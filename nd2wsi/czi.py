@@ -77,6 +77,14 @@ def _finite_positive(v: Any) -> bool:
         return False
 
 
+_MAX_DIR_BYTES = 128 * 1024 * 1024
+_MAX_DIR_ENTRIES = 5_000_000
+_MAX_XML_BYTES = 32 * 1024 * 1024
+_MAX_SUBBLOCK_BYTES = 256 * 1024 * 1024
+_MAX_MOSAIC_SIDE = 1_000_000
+_DTD_BYTES_RE = re.compile(rb"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+
+
 @dataclass(frozen=True)
 class _SubBlockEntry:
     pixel_type: int
@@ -133,11 +141,14 @@ def _read_czi_header_and_index(
         raise ValueError("CZI SubBlock directory segment is missing ZISRAWDIRECTORY header")
     _, used_size = struct.unpack("<QQ", dir_hdr[16:32])
     entry_count = struct.unpack("<i", dir_hdr[32:36])[0]
-    if entry_count < 0:
+    if entry_count < 0 or entry_count > _MAX_DIR_ENTRIES:
         raise ValueError(f"invalid CZI SubBlock count {entry_count}")
 
     # Read the directory payload in one positional read for fast parsing
-    max_dir_bytes = min(file_size - (dir_pos + 160), max(used_size, entry_count * 256))
+    avail_dir = file_size - (dir_pos + 160)
+    if used_size > _MAX_DIR_BYTES:
+        raise ValueError(f"CZI SubBlock directory size {used_size} exceeds safety limit")
+    max_dir_bytes = min(avail_dir, _MAX_DIR_BYTES, max(used_size, entry_count * 256))
     dir_buf = read_at(fd, max_dir_bytes, dir_pos + 160)
     pos = 0
     entries: list[_SubBlockEntry] = []
@@ -193,12 +204,13 @@ def _read_czi_header_and_index(
         meta_hdr = read_at(fd, 288, meta_pos)
         if meta_hdr[:14].startswith(b"ZISRAWMETADATA"):
             xml_size = struct.unpack("<I", meta_hdr[32:36])[0]
-            if 0 < xml_size and meta_pos + 288 + xml_size <= file_size:
+            if 0 < xml_size <= _MAX_XML_BYTES and meta_pos + 288 + xml_size <= file_size:
                 xml_bytes = read_at(fd, xml_size, meta_pos + 288).rstrip(b"\x00 \t\r\n")
-                try:
-                    xml_root = ET.fromstring(xml_bytes.decode("utf-8", errors="replace"))
-                except ET.ParseError:
-                    xml_root = None
+                if not _DTD_BYTES_RE.search(xml_bytes):
+                    try:
+                        xml_root = ET.fromstring(xml_bytes.decode("utf-8", errors="replace"))
+                    except ET.ParseError:
+                        xml_root = None
 
     return entries, xml_root
 
@@ -422,10 +434,17 @@ def _zstd1_payload_bytes(raw: bytes, itemsize: int, expected_bytes: int) -> byte
             raise ValueError(f"unsupported CZI Zstd1 chunk layout (header_size={hdr})")
         zbytes = raw[hdr:]
 
+    if expected_bytes <= 0 or expected_bytes > _MAX_SUBBLOCK_BYTES:
+        raise ValueError(f"CZI Zstd1 expected SubBlock size {expected_bytes} exceeds safety limit")
     zstd_err = getattr(imagecodecs, "ZstdError", ValueError)
     try:
-        data = imagecodecs.zstd_decode(zbytes)
+        out_buf = bytearray(expected_bytes)
+        data = bytes(imagecodecs.zstd_decode(zbytes, out=out_buf))
     except (zstd_err, RuntimeError, MemoryError, ValueError) as exc:
+        if "too small" in str(exc).lower():
+            raise ValueError(
+                f"CZI Zstd1 SubBlock decoded payload is larger than expected ({expected_bytes} B)"
+            ) from exc
         raise ValueError(f"invalid CZI Zstd1 SubBlock payload: {exc}") from exc
 
     if len(data) < expected_bytes:
@@ -463,12 +482,19 @@ def _decode_subblock_bytes(
     import imagecodecs
 
     if comp == 5:  # Zstd0
+        expected_bytes = h * w * samples * dtype.itemsize
+        if expected_bytes <= 0 or expected_bytes > _MAX_SUBBLOCK_BYTES:
+            raise ValueError(f"CZI Zstd0 SubBlock size {expected_bytes} exceeds safety limit")
         zstd_err = getattr(imagecodecs, "ZstdError", ValueError)
         try:
-            decomp = imagecodecs.zstd_decode(raw)
+            out_buf = bytearray(expected_bytes)
+            decomp = bytes(imagecodecs.zstd_decode(raw, out=out_buf))
         except (zstd_err, RuntimeError, MemoryError, ValueError) as exc:
+            if "too small" in str(exc).lower():
+                raise ValueError(
+                    f"CZI Zstd0 SubBlock decoded payload is larger than expected ({expected_bytes} B)"
+                ) from exc
             raise ValueError(f"invalid CZI Zstd0 SubBlock payload: {exc}") from exc
-        expected_bytes = h * w * samples * dtype.itemsize
         if len(decomp) != expected_bytes:
             raise ValueError(
                 f"CZI Zstd0 SubBlock decoded payload ({len(decomp)} B) "
@@ -502,7 +528,16 @@ def _decode_subblock_bytes(
         return np.ascontiguousarray(arr[:h, :w, :3])
 
     if comp == 2:  # LZW
-        decomp = imagecodecs.lzw_decode(raw)
+        expected_bytes = h * w * samples * dtype.itemsize
+        if expected_bytes <= 0 or expected_bytes > _MAX_SUBBLOCK_BYTES:
+            raise ValueError(f"CZI LZW SubBlock size {expected_bytes} exceeds safety limit")
+        out_buf = bytearray(expected_bytes)
+        decomp = bytes(imagecodecs.lzw_decode(raw, out=out_buf))
+        if len(decomp) != expected_bytes:
+            raise ValueError(
+                f"CZI LZW SubBlock decoded payload ({len(decomp)} B) "
+                f"does not match expected ({expected_bytes} B)"
+            )
         arr = np.frombuffer(decomp, dtype=dtype).reshape(h, w, samples)
         if samples == 1:
             return arr[:, :, 0]
@@ -615,6 +650,9 @@ def _read_subblock_window(
             raise ValueError(f"invalid CZI SubBlock dimension count {hdr_ndims}")
     header_len = max(256, 16 + 32 + 20 * hdr_ndims)
     data_offset = sb.file_pos + 32 + header_len + meta_size
+    file_size = os.fstat(fd).st_size
+    if data_offset < 0 or data_offset > file_size:
+        raise ValueError(f"CZI SubBlock data offset {data_offset} exceeds file bounds")
 
     # Fast path for uncompressed SubBlocks: read only the intersecting row span
     if sb.compression == 0 and sb.x_stored == sb.x_size and sb.y_stored == sb.y_size:
@@ -626,12 +664,16 @@ def _read_subblock_window(
             )
         span_offset = data_offset + ry0 * row_bytes
         span_bytes = (ry1 - ry0) * row_bytes
+        if span_bytes > _MAX_SUBBLOCK_BYTES or span_offset + span_bytes > file_size:
+            raise ValueError(f"CZI SubBlock span ({span_bytes} B) exceeds bounds")
         raw = read_at(fd, span_bytes, span_offset)
         rows = np.frombuffer(raw, dtype=sb_dtype).reshape(ry1 - ry0, sb.x_stored, sb_samples)
         if sb_samples == 1:
             return np.ascontiguousarray(rows[:, rx0:rx1, 0], dtype=dtype)
         return np.ascontiguousarray(rows[:, rx0:rx1, :3][:, :, ::-1], dtype=dtype)
 
+    if int(data_size) > _MAX_SUBBLOCK_BYTES or data_offset + int(data_size) > file_size:
+        raise ValueError(f"CZI SubBlock payload size ({data_size} B) exceeds safety bounds")
     raw = read_at(fd, int(data_size), data_offset)
     decoded = _decode_subblock_bytes(raw, sb, sb_dtype, sb_samples)
     if decoded.ndim == 2:
@@ -705,6 +747,8 @@ def open_czi(
     y0_origin = min(e.y_start for e in st_entries)
     width = max(e.x_start + e.x_size for e in st_entries) - x0_origin
     height = max(e.y_start + e.y_size for e in st_entries) - y0_origin
+    if not (0 < width <= _MAX_MOSAIC_SIDE and 0 < height <= _MAX_MOSAIC_SIDE):
+        raise ValueError(f"CZI mosaic canvas {width}x{height} exceeds safety limit")
 
     notes: list[str] = [f"Zeiss CZI ({width} x {height})"]
     if n_p > 1:

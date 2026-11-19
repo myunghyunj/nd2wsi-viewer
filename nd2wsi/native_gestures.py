@@ -769,8 +769,10 @@ def wire_native_trackpad_bridge(
     key = str(window.uid)
     scopes = scope_cache or NativeGestureScopeCache()
 
+    closed = threading.Event()
+
     def install() -> None:
-        if key in _MONITORS:
+        if closed.is_set() or key in _MONITORS:
             return
         try:
             import AppKit
@@ -803,6 +805,11 @@ def wire_native_trackpad_bridge(
                 AppKit.NSEventMaskScrollWheel | AppKit.NSEventMaskSwipe,
                 monitor,
             )
+            if closed.is_set():
+                if token is not None:
+                    AppKit.NSEvent.removeMonitor_(token)
+                _SESSIONS.pop(key, None)
+                return
             _MONITORS[key] = (token, monitor)
             logger("native trackpad bridge installed")
         except Exception as exc:
@@ -811,6 +818,8 @@ def wire_native_trackpad_bridge(
             )
 
     def schedule_install(*_args) -> None:
+        if closed.is_set():
+            return
         try:
             from Foundation import NSOperationQueue
 
@@ -818,7 +827,7 @@ def wire_native_trackpad_bridge(
         except Exception:
             install()
 
-    def remove(*_args) -> None:
+    def remove_native() -> None:
         pair = _MONITORS.pop(key, None)
         _SESSIONS.pop(key, None)
         if pair is None:
@@ -829,6 +838,18 @@ def wire_native_trackpad_bridge(
             AppKit.NSEvent.removeMonitor_(pair[0])
         except Exception as exc:
             logger(f"native trackpad bridge removal failed: {exc!r}")
+
+    def remove(*_args) -> None:
+        closed.set()
+        try:
+            from Foundation import NSOperationQueue, NSThread
+
+            if NSThread.isMainThread():
+                remove_native()
+            else:
+                NSOperationQueue.mainQueue().addOperationWithBlock_(remove_native)
+        except Exception:
+            remove_native()
 
     window.events.shown += schedule_install
     window.events.closed += remove

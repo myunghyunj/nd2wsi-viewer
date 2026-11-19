@@ -191,11 +191,13 @@ class _Root(dict):
         super().__init__(levels)
         self._closer = closer
         self._closed = False
+        self._lock = threading.Lock()
 
     def close(self, delay: float = 5.0) -> None:
-        if self._closed or self._closer is None:
-            return
-        self._closed = True
+        with self._lock:
+            if self._closed or self._closer is None:
+                return
+            self._closed = True
         if delay <= 0:
             self._closer()
             return

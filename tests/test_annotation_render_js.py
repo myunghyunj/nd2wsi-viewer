@@ -293,10 +293,10 @@ def test_full_renders_add_no_per_mark_listeners_and_the_layer_keeps_one():
     assert out["mixedListeners"] == 0
     assert out["layerListeners"] == [["pointerdown", 1]]
     assert out["markListeners"] == 0
-    # outlines first (the image group), then the screen-sized marks in annotation order
+    # outlines first (the image group), then screen-sized marks (only the active Astromap ROI gets a label chip)
     assert out["hitIds"] == [
         "box", "astro", "astro-2", "shape",
-        "box", "astro", "astro-2", "pin", "pin", "7", "line", "shape", "dots", "dots",
+        "box", "astro", "pin", "pin", "7", "line", "shape", "dots", "dots",
     ]
 
 
@@ -308,7 +308,7 @@ def test_delegated_pointerdown_reproduces_each_mark_kind():
       const nodes = descendants(root());
       const groupOf = id => nodes.filter(node => node.getAttribute('data-ann-id') === id);
       const results = {};
-      for (const [id, groups] of [['box', groupOf('box')], ['astro', groupOf('astro')], ['pin', groupOf('pin')],
+      for (const [id, groups] of [['box', groupOf('box')], ['astro', groupOf('astro')], ['astro-2', groupOf('astro-2')], ['pin', groupOf('pin')],
           ['7', groupOf('7')], ['line', groupOf('line')], ['shape', groupOf('shape')], ['dots', groupOf('dots')]]) {
         results[id] = groups.map(group => group.children.map(child => ({tag: child.tag, ...press(child)})));
       }
@@ -336,11 +336,16 @@ def test_delegated_pointerdown_reproduces_each_mark_kind():
 
     selected = {"calls": [["select", "astro", False], ["editor", "astro"]],
                 "stopped": True, "reachedWrap": False}
+    selected2 = {"calls": [["select", "astro-2", False], ["editor", "astro-2"]],
+                 "stopped": True, "reachedWrap": False}
     results = out["results"]
     assert tags(results["box"]) == [["polygon"], ["rect", "text"]]
     assert strip(results["box"]) == [[editor("box")], [editor("box")] * 2]
-    # an Astromap box and its numbered label both select the region, then open it
-    assert strip(results["astro"]) == [[selected], [selected] * 2]
+    # inactive Astromap ROI renders only its clickable box; active Astromap ROI renders both box and label bubble
+    assert tags(results["astro"]) == [["polygon"]]
+    assert strip(results["astro"]) == [[selected]]
+    assert tags(results["astro-2"]) == [["polygon"], ["rect", "text"]]
+    assert strip(results["astro-2"]) == [[selected2], [selected2] * 2]
     assert tags(results["pin"]) == [["circle", "circle"], ["rect", "text"]]
     assert strip(results["pin"]) == [[editor("pin")] * 2, [editor("pin")] * 2]
     # a numeric id round-trips through data-ann-id and reaches the editor as itself
@@ -460,7 +465,7 @@ def test_pure_pan_translates_the_root_by_the_display_delta(rotation, flip):
     assert out["firstError"] < 1e-9 and out["secondError"] < 1e-9
     assert out["moved"] > 100
     # the translated picture is the one a full render draws, mark for mark
-    assert out["marks"] == 40
+    assert out["marks"] == 38
     assert out["pictureError"] < 1e-9
 
 
@@ -630,12 +635,13 @@ def test_frame_work_for_two_thousand_astromap_regions():
       }
       return {full, pans, zooms};
     """)
-    assert out["full"] == {"elements": 2 + 5 * 2000, "replaceChildren": 1, "listeners": 0,
+    # root + image groups, 2 nodes per Astromap box (hit group + polygon), plus 3 nodes for the single active label chip
+    assert out["full"] == {"elements": 2 + 2 * 2000 + 3, "replaceChildren": 1, "listeners": 0,
                            "setAttribute": out["full"]["setAttribute"], "removeAttribute": 0}
     pan = {"elements": 0, "replaceChildren": 0, "listeners": 0, "setAttribute": 1, "removeAttribute": 0}
     assert out["pans"] == [pan] * 30
-    # a zoom frame writes the image matrix and one position per label; the first also drops the pan
-    zoom = {"elements": 0, "replaceChildren": 0, "listeners": 0, "setAttribute": 1 + 2000, "removeAttribute": 0}
+    # a zoom frame writes the image matrix and one position for the single active label; the first also drops the pan
+    zoom = {"elements": 0, "replaceChildren": 0, "listeners": 0, "setAttribute": 1 + 1, "removeAttribute": 0}
     assert out["zooms"] == [{**zoom, "removeAttribute": 1}] + [zoom] * 9
 
 

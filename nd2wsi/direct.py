@@ -271,46 +271,50 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
         shapes = served
 
         meta = _aperio_meta(tf.pages[0].description or "")
-    except Exception:
+        mpp = meta.get("mpp")
+        calibrated = mpp is not None and mpp > 0
+        hi = float(np.iinfo(s_dtype).max)
+        raw_bps = getattr(embedded[0][0], "bitspersample", None)
+        end_val = (
+            float((1 << raw_bps) - 1)
+            if s_dtype == np.dtype(np.uint16) and isinstance(raw_bps, int) and 0 < raw_bps < 16
+            else hi
+        )
+        src_info = PlaneSource(
+            data=None,
+            dtype=s_dtype,
+            shape=(3, H, W),
+            rgb=True,
+            channels=[
+                ChannelInfo("Red", (255, 0, 0)),
+                ChannelInfo("Green", (0, 255, 0)),
+                ChannelInfo("Blue", (0, 0, 255)),
+            ],
+            pixel_size_um=(float(mpp), float(mpp)) if calibrated else None,
+            source_name=str(path),
+            selection={},
+            notes=[f"served straight from the SVS ({len(embedded)} embedded levels)"],
+            magnification=meta.get("magnification"),
+            calibration_source="aperio-mpp" if calibrated else "unknown",
+        )
+        windows = [{"start": 0.0, "end": end_val, "min": 0.0, "max": hi} for _ in range(3)]
+        attrs = build_group_attrs(src_info, shapes, 512, windows)
+        attrs["nd2wsi"]["direct"] = True
+    except BaseException:
         tf.close()
         if fd >= 0:
             os.close(fd)
+            fd = -1
         raise
-    mpp = meta.get("mpp")
-    calibrated = mpp is not None and mpp > 0
-    hi = float(np.iinfo(s_dtype).max)
-    raw_bps = getattr(embedded[0][0], "bitspersample", None)
-    end_val = (
-        float((1 << raw_bps) - 1)
-        if s_dtype == np.dtype(np.uint16) and isinstance(raw_bps, int) and 0 < raw_bps < 16
-        else hi
-    )
-    src_info = PlaneSource(
-        data=None,
-        dtype=s_dtype,
-        shape=(3, H, W),
-        rgb=True,
-        channels=[
-            ChannelInfo("Red", (255, 0, 0)),
-            ChannelInfo("Green", (0, 255, 0)),
-            ChannelInfo("Blue", (0, 0, 255)),
-        ],
-        pixel_size_um=(float(mpp), float(mpp)) if calibrated else None,
-        source_name=str(path),
-        selection={},
-        notes=[f"served straight from the SVS ({len(embedded)} embedded levels)"],
-        magnification=meta.get("magnification"),
-        calibration_source="aperio-mpp" if calibrated else "unknown",
-    )
-    windows = [{"start": 0.0, "end": end_val, "min": 0.0, "max": hi} for _ in range(3)]
-    attrs = build_group_attrs(src_info, shapes, 512, windows)
-    attrs["nd2wsi"]["direct"] = True
 
     def _teardown() -> None:
+        nonlocal fd
         if not life.close():
             return  # a read still holds the fd; leaking beats EBADF under it
         tf.close()
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
+            fd = -1
         _TILE_CACHE.purge(owner)
 
     return _Root(root, _teardown), attrs

@@ -54,9 +54,18 @@
     for (const element of document.querySelectorAll("[title]")) {
       element.title = formatShortcutText(element.title, platform);
     }
-    if (!isMac(platform)) for (const element of document.querySelectorAll("[aria-keyshortcuts]")) {
-      element.setAttribute("aria-keyshortcuts",
-        element.getAttribute("aria-keyshortcuts").replaceAll("Meta+", "Control+"));
+    if (!isMac(platform)) {
+      for (const element of document.querySelectorAll("[aria-keyshortcuts]")) {
+        element.setAttribute("aria-keyshortcuts",
+          element.getAttribute("aria-keyshortcuts").replaceAll("Meta+", "Control+"));
+      }
+      for (const element of document.querySelectorAll("kbd[data-shortcut]")) {
+        if (element.hasAttribute?.("data-redo-shortcut")) {
+          element.textContent = "Ctrl+Shift+Z / Ctrl+Y";
+        } else {
+          element.textContent = formatShortcutText(element.textContent, platform);
+        }
+      }
     }
   }
 
@@ -130,9 +139,12 @@
     if (commandPressed(event, platform)) {
       if (!Object.hasOwn(COMMAND_PANEL_BY_CODE, code)) return false;
       if (code === "KeyI") return true;
-      // Copy/select-all keep their native meaning in controls and whenever
-      // the document has meaningful selected text, including read-only Info.
+      // Copy/select-all keep their native meaning in controls, selectable
+      // read-only panels (e.g. Slide Info), and whenever text is selected.
       const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+      if (code === "KeyA" && [event.target, ...path].some((t) => Boolean(targetElement(t)?.closest?.("#win-info")))) {
+        return false;
+      }
       return ![event.target, ...path].some(isFocusControl) && !hasTextSelection(event);
     }
     return !event.metaKey && !event.ctrlKey && Object.hasOwn(PLAIN_PANEL_BY_CODE, code);

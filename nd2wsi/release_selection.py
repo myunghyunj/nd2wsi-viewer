@@ -26,7 +26,7 @@ _DARWIN_CAFILE = "/etc/ssl/cert.pem"
 _VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?(?:(a|b|rc)(\d+))?", re.I)
 _ASSET = re.compile(
     r"nd2wsi-viewer-(\d+\.\d+\.\d+(?:(?:b|rc)\d+)?)-(macos|windows)-"
-    r"(arm64|x64|x86_64|universal2|universal)(\.dmg|\.zip|\.exe)"
+    r"(arm64|x64|x86_64|universal2|universal)(-setup)?(\.dmg|\.zip|\.exe)"
 )
 _LEGACY_MAC_VERSIONS = {(1, 2, patch, 3, 0) for patch in range(2, 9)} | {(2, 0, 0, 3, 0)}
 
@@ -76,8 +76,10 @@ def _candidate_asset(name: str, release_version, platform_name: str, machine: st
         return None
     if not isinstance(name, str) or not (match := _ASSET.fullmatch(name)):
         return None
-    asset_version, asset_platform, asset_arch, extension = match.groups()
+    asset_version, asset_platform, asset_arch, setup_suffix, extension = match.groups()
     if _version_key(asset_version) != release_version:
+        return None
+    if setup_suffix and (asset_platform != "windows" or extension != ".exe"):
         return None
     if platform_name == "darwin":
         if asset_platform != "macos" or extension != ".dmg":
@@ -165,6 +167,14 @@ def select_release_asset(releases, *, platform_name: str, machine: str,
     return {**selected[3], "release_notes": release_note_items(selected[4])}
 
 
+_DEFAULT_URLOPEN = urllib.request.urlopen
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("unexpected update metadata redirect")
+
+
 def fetch_releases() -> list:
     """One bounded, unauthenticated HTTPS metadata request; no asset download."""
     request = urllib.request.Request(RELEASES_API, headers={
@@ -175,7 +185,15 @@ def fetch_releases() -> list:
     ctx = ssl.create_default_context()
     if sys.platform == "darwin" and os.path.isfile(_DARWIN_CAFILE):
         ctx.load_verify_locations(cafile=_DARWIN_CAFILE)
-    with urllib.request.urlopen(request, timeout=8, context=ctx) as response:
+    if urllib.request.urlopen is _DEFAULT_URLOPEN:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            _NoRedirectHandler(),
+        )
+        cm = opener.open(request, timeout=8)
+    else:
+        cm = urllib.request.urlopen(request, timeout=8, context=ctx)
+    with cm as response:
         if response.geturl() != RELEASES_API:
             raise ValueError("unexpected update metadata redirect")
         data = response.read(MAX_METADATA_BYTES + 1)

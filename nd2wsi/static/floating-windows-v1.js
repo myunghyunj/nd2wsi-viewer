@@ -11,10 +11,17 @@
   function createManager({ stage, document, storage, fetch: fetchFn = null,
     uiSettingsUrl = "/api/ui-settings", setTimeout: setTimer = typeof setTimeout === "function" ? setTimeout : null,
     clearTimeout: clearTimer = typeof clearTimeout === "function" ? clearTimeout : null }) {
-    let winZ = 30;
+    const BASE_Z = 30;
+    const zOrder = [];
     const windows = new Map();
     let pendingPanels = {};
     let syncTimer = null;
+
+    function syncZIndices() {
+      zOrder.forEach((panelEl, idx) => {
+        panelEl.style.zIndex = BASE_Z + idx;
+      });
+    }
 
     function flushBackendPanels() {
       syncTimer = null;
@@ -60,9 +67,17 @@
         // geometry and collapse persist; "closed" is session-only, so panels
         // come back in their opening state on the next launch
         const saved = JSON.parse(storage.getItem(store) || "null");
-        if (saved && saved.rect) {
-          st.rect = saved.rect;
-          st.collapsed = !!saved.collapsed;
+        if (saved && saved.rect && typeof saved.rect === "object") {
+          const r = saved.rect;
+          if (Number.isFinite(Number(r.x)) && Number.isFinite(Number(r.y)) && Number.isFinite(Number(r.w))) {
+            st.rect = {
+              x: Number(r.x),
+              y: Number(r.y),
+              w: Number(r.w),
+              h: r.h == null ? null : (Number.isFinite(Number(r.h)) ? Number(r.h) : null),
+            };
+            st.collapsed = !!saved.collapsed;
+          }
         }
       } catch (_) { /* private mode etc. */ }
 
@@ -94,16 +109,27 @@
       function clampToStage() {
         const sw = stage.clientWidth;
         const sh = stage.clientHeight;
-        st.rect.w = Math.min(Math.max(st.rect.w, opts.minW), opts.maxW, sw - 20);
+        if (!(sw > 0 && sh > 0)) return;
+        const maxAvailW = Math.max(opts.minW, Math.min(opts.maxW, sw - 20));
+        st.rect.w = clamp(st.rect.w, opts.minW, maxAvailW);
         st.rect.x = clamp(st.rect.x, 6 - st.rect.w + 60, sw - 60);
         st.rect.y = clamp(st.rect.y, 6, Math.max(6, sh - 34));
         apply();
       }
 
+      zOrder.push(el);
+      syncZIndices();
+
       function focus() {
+        const alreadyTop = zOrder[zOrder.length - 1] === el;
         document.querySelectorAll(".mac-window").forEach((w) => w.classList.remove("focused"));
         el.classList.add("focused");
-        el.style.zIndex = ++winZ;
+        if (!alreadyTop) {
+          const idx = zOrder.indexOf(el);
+          if (idx !== -1) zOrder.splice(idx, 1);
+          zOrder.push(el);
+        }
+        syncZIndices();
       }
 
       el.addEventListener("pointerdown", focus);
@@ -111,9 +137,10 @@
       // -- dragging by the title bar
       let dragFrom = null;
       titlebar.addEventListener("pointerdown", (ev) => {
-        if (ev.target.closest(".tl")) return;
+        if ((ev.button != null && ev.button !== 0) || ev.target.closest(".tl")) return;
         dragFrom = { px: ev.clientX, py: ev.clientY, x: st.rect.x, y: st.rect.y };
         el.classList.add("dragging");
+        if (opts.onMove) opts.onMove();
         titlebar.setPointerCapture(ev.pointerId);
         ev.preventDefault();
       });
@@ -123,11 +150,15 @@
         st.rect.y = dragFrom.y + (ev.clientY - dragFrom.py);
         clampToStage();
       });
-      titlebar.addEventListener("pointerup", () => {
+      const finishDrag = () => {
+        if (!dragFrom) return;
         dragFrom = null;
         el.classList.remove("dragging");
         persist();
-      });
+      };
+      titlebar.addEventListener("pointerup", finishDrag);
+      titlebar.addEventListener("pointercancel", finishDrag);
+      titlebar.addEventListener("lostpointercapture", finishDrag);
       titlebar.addEventListener("dblclick", (ev) => {
         if (ev.target.closest(".tl")) return;
         setCollapsed(!st.collapsed);
@@ -140,6 +171,7 @@
         el.append(h);
         let from = null;
         h.addEventListener("pointerdown", (ev) => {
+          if (ev.button != null && ev.button !== 0) return;
           from = {
             px: ev.clientX,
             py: ev.clientY,
@@ -149,6 +181,7 @@
             h: st.rect.h != null ? st.rect.h : el.offsetHeight,
           };
           el.classList.add("resizing");
+          if (opts.onMove) opts.onMove();
           focus();
           h.setPointerCapture(ev.pointerId);
           ev.preventDefault();
@@ -166,6 +199,10 @@
           if (r.w < opts.minW) { if (dir.includes("w")) r.x -= opts.minW - r.w; r.w = opts.minW; }
           if (r.w > opts.maxW) { if (dir.includes("w")) r.x += r.w - opts.maxW; r.w = opts.maxW; }
           if (r.h < opts.minH) { if (dir.includes("n")) r.y -= opts.minH - r.h; r.h = opts.minH; }
+          if (dir.includes("n") && r.y < 6) {
+            r.h = Math.max(opts.minH, r.h - (6 - r.y));
+            r.y = 6;
+          }
           st.rect = r;
           apply();
           if (opts.onResize) opts.onResize();
@@ -186,10 +223,12 @@
         st.collapsed = on;
         apply();
         persist();
+        if (on && opts.onClose) opts.onClose();
       }
       function close(silent) {
         st.hidden = true;
         apply();
+        if (opts.onClose) opts.onClose();
         if (!silent) persist();
       }
       function open() {

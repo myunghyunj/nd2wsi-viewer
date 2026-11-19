@@ -10,6 +10,7 @@ import errno
 import hashlib
 import json
 import os
+import stat
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,13 +19,43 @@ from .session_lock import SessionFileLock
 
 _LOCK_TIMEOUT = 10.0
 _READONLY_ERRNOS = (errno.EACCES, errno.EPERM, errno.EROFS)
+_MAX_ANNOTATION_BYTES = 64 * 1024 * 1024
 
 
 def _read(path: Path) -> bytes | None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
-        return path.read_bytes()
+        fd = os.open(str(path), flags)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise OSError(errno.ELOOP, "Refusing to read symlinked annotation sidecar") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "Annotation sidecar is not a regular file")
+        if st.st_size > _MAX_ANNOTATION_BYTES:
+            raise OSError(errno.EFBIG, "Annotation sidecar exceeds size limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_ANNOTATION_BYTES:
+                raise OSError(errno.EFBIG, "Annotation sidecar exceeds size limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def revision(raw: bytes | None) -> str:

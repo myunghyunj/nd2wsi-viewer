@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import errno
+import functools
 import hashlib
+import hmac
 import inspect
 import json
 import math
@@ -132,6 +134,7 @@ def _limnd2_available() -> bool:
 _HEX6_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
 
 
+@functools.lru_cache(maxsize=64)
 def _accepts_kwarg(fn: Any, kwarg: str) -> bool:
     try:
         sig = inspect.signature(fn)
@@ -423,7 +426,7 @@ def _record_recent_file_safe(
     path: str | Path, *, name: str | None = None, window_role: str = "user"
 ) -> list[dict[str, Any]]:
     if window_role == "agent":
-        return _list_recent_files_safe()
+        return []
     try:
         from . import ui_settings as _ui_mod
 
@@ -835,14 +838,15 @@ class ViewerState:
         return open_store(path)
 
     def _adopt_pyramid(self, root, attrs, manifest):
-        self.root, self.attrs, self.manifest = root, attrs, dict(manifest)
-        self.generation = str(manifest["generation"])
-        self.histograms = None
-        self._cache_usage_ready = False
-        self._cache_usage = None
-        self._cache_identity = self._pyramid_identity()
-        if hasattr(self._lut_settings_store, "refresh_attrs"):
-            self._lut_settings_store.refresh_attrs(attrs)
+        with self.lock, self._inspect_lock:
+            self.root, self.attrs, self.manifest = root, attrs, dict(manifest)
+            self.generation = str(manifest["generation"])
+            self.histograms = None
+            self._cache_usage_ready = False
+            self._cache_usage = None
+            self._cache_identity = self._pyramid_identity()
+            if hasattr(self._lut_settings_store, "refresh_attrs"):
+                self._lut_settings_store.refresh_attrs(attrs)
 
     def replace_pyramid(self, replacement):
         """Validate, drain readers, atomically publish, then reopen the new pixels."""
@@ -1170,11 +1174,13 @@ def reveal_in_file_manager(path: Path, *, platform: str | None = None, runner=No
     run = runner or subprocess.run
     if platform == "win32":
         # Explorer may return a nonzero status when handing off to an existing
-        # window. Its comma switch and full path are separate arguments so
-        # spaces, Unicode and shell metacharacters remain ordinary path text.
-        run(["explorer.exe", "/select,", str(path.resolve())], check=False, timeout=10)
+        # window. Use the full SystemRoot path to prevent CWD binary hijacking.
+        import ntpath
+
+        explorer = ntpath.join(os.environ.get("SystemRoot") or r"C:\Windows", "explorer.exe")
+        run([explorer, "/select,", str(path.resolve())], check=False, timeout=10)
     else:
-        run(["/usr/bin/open", "-R", str(path)], check=True, timeout=10)
+        run(["/usr/bin/open", "-R", "--", str(path.resolve())], check=True, timeout=10)
 
 
 def store_generation(store_path: str | Path) -> str:
@@ -1225,6 +1231,7 @@ class SlideRegistry:
             from .annotation_workspace import AnnotationWorkspace
             self.annotation_workspace = AnnotationWorkspace(window_session)
         self._annotation_claim_lock = threading.Lock()
+        self._agent_ui_lock = threading.Lock()
         self.on_remove = None
 
     def _apply_window_policy(self, st: ViewerState) -> None:
@@ -2146,7 +2153,7 @@ class SlideRegistry:
                 p_val = getattr(st, p_attr, None)
                 if p_val is not None:
                     render._RAW_CHUNK_CACHE.purge(p_val)
-            if immediate or drained:
+            if drained:
                 plate_close = getattr(getattr(st, "plate", None), "close", None)
                 if callable(plate_close):
                     try:
@@ -2155,6 +2162,14 @@ class SlideRegistry:
                         plate_close()
                 else:
                     ViewerState._close_root(st.root)
+                continue
+            # Readers are still active after the drain budget; never close an
+            # mmap-backed handle underneath an active reader (SIGSEGV). Hand off
+            # to a background closer or delayed close instead.
+            if immediate:
+                with self._lock:
+                    self._closing.append(st)
+                self._close_state(st)
                 continue
             close = getattr(st.root, "close", None)
             if close is not None:
@@ -2482,16 +2497,16 @@ class SlideRegistry:
                             "an export from this slide did not finish in time — "
                             "try again when it finishes"
                         )
-                    st._mark_closed()
+                    if plate_source is None:
+                        st._mark_closed()
 
                 try:
-                    st.close_shading()
-                    # A plate's builder writes chunks straight into the container.
-                    # Drain all source readers and stop it synchronously without
-                    # dropping a local writer lease; trash owns that lease through
-                    # the rename.
                     if plate_source is not None:
+                        # Drain plate readers before marking closed so a timeout
+                        # rollback leaves the slide completely healthy.
                         detached_writer = plate_source.close_for_trash()
+                        st._mark_closed()
+                        st.close_shading()
                         if local_plate_writer:
                             writer = detached_writer
                             if writer is None or not writer.acquired:
@@ -2504,6 +2519,7 @@ class SlideRegistry:
                                 "read-only plate unexpectedly held a writer"
                             )
                     else:
+                        st.close_shading()
                         ViewerState._close_root(st.root)
                 except BaseException:
                     # PlateSource restores itself when a pre-teardown drain times
@@ -2613,12 +2629,19 @@ def content_disposition(filename: str) -> str:
     HTTP headers travel as latin-1; a Korean or accented slide name used
     to raise UnicodeEncodeError after the export was already written. The
     ASCII fallback keeps old clients working and the RFC 5987 filename*
-    carries the real name.
+    carries the real name. Control characters (including CR/LF) are stripped
+    to prevent response header injection.
     """
     import urllib.parse as _up
 
-    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace('"', "_")
-    utf8_name = _up.quote(filename, safe="")
+    clean = re.sub(r"[\x00-\x1f\x7f]+", "_", str(filename))
+    ascii_name = (
+        clean.encode("ascii", "replace")
+        .decode("ascii")
+        .replace('"', "_")
+        .replace("\\", "_")
+    )
+    utf8_name = _up.quote(clean, safe="")
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
 
 
@@ -2659,10 +2682,26 @@ HTTP_MAX_WORKERS = 16
 def _resolve_http_max_workers() -> int:
     raw = os.environ.get("ND2WSI_HTTP_MAX_WORKERS")
     if raw is not None and raw.strip() != "":
-        val = int(raw)
+        try:
+            val = int(raw)
+        except ValueError:
+            return HTTP_MAX_WORKERS
         if val >= 1:
             return val
     return HTTP_MAX_WORKERS
+
+
+_CSP_HEADER = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'self'"
+)
 
 
 def make_handler(
@@ -2671,6 +2710,9 @@ def make_handler(
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nd2wsi"
+        # Bound idle keep-alive sockets and stalled unauthenticated connections
+        # so they cannot permanently occupy all ThreadPoolExecutor workers.
+        timeout = 15.0
         # Set once a download has sent its status line; reset per request.
         _response_started = False
 
@@ -2740,8 +2782,20 @@ def make_handler(
             cache: str = "no-store",
         ):
             rejecting_post = self.command == "POST" and code >= 300
-            if rejecting_post:
+            if rejecting_post or code >= 400:
                 self.close_connection = True
+            else:
+                server = getattr(self, "server", None)
+                active = getattr(server, "_active_sockets", None)
+                max_workers = getattr(server, "max_workers", None)
+                if (
+                    active is not None
+                    and isinstance(max_workers, int)
+                    and max_workers > 2
+                    and len(active) >= max_workers - 2
+                ):
+                    # Shed idle keep-alive sockets before the pool saturates.
+                    self.close_connection = True
             # As in _stream_file: once the status line may be out, a failed
             # write cannot become an error reply inside this one's declared
             # length. _error drops the connection instead.
@@ -2773,7 +2827,9 @@ def make_handler(
         def _policy_headers(self, cache: str) -> None:
             self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", _CSP_HEADER)
 
         def _stream_file(
             self,
@@ -2855,47 +2911,87 @@ def make_handler(
             Every route lives under /<token>/. A request without the right
             token gets a bare 404 — tiles, downloads and API alike — so a
             local process or a web page cannot even probe the server. The
-            Host header must name loopback, and any Origin present must be
-            this server itself.
+            Host header must name loopback (and this server's port if given),
+            and any Origin present must match this server's exact origin.
             """
             if getattr(self, "request_version", "") == "HTTP/0.9":
+                self.close_connection = True
                 self._error(404, "not found")
                 return None
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.scheme or parsed.netloc:
+                self.close_connection = True
+                self._error(404, "not found")
+                return None
             path = parsed.path
+            server_port = getattr(getattr(self, "server", None), "server_port", None)
+            if not isinstance(server_port, int) or server_port <= 0:
+                server_port = None
             get_all = getattr(self.headers, "get_all", None)
             host_headers = get_all("Host", []) if get_all is not None else []
             raw_host = (host_headers[0] if len(host_headers) == 1 else "").strip()
             host: str | None = None
+            host_port: int | None = None
             if raw_host.startswith("["):  # bracketed IPv6, maybe with a port
                 if "]" in raw_host:
                     bracket, rest = raw_host.split("]", 1)
-                    if rest == "" or (rest.startswith(":") and rest[1:].isascii() and rest[1:].isdigit()):
+                    if rest == "":
                         host = (bracket + "]").lower()
+                    elif rest.startswith(":") and rest[1:].isascii() and rest[1:].isdigit():
+                        host = (bracket + "]").lower()
+                        host_port = int(rest[1:])
             elif ":" in raw_host:
                 h, port = raw_host.rsplit(":", 1)
                 if h != "" and port.isascii() and port.isdigit():
                     host = h.lower()
+                    host_port = int(port)
             elif raw_host:
                 host = raw_host.lower()
-            if host not in ("127.0.0.1", "localhost", "[::1]"):
-                self._error(404, "not found")
-                return None
-            origin = self.headers.get("Origin")
-            if origin and urllib.parse.urlparse(origin).hostname not in (
-                "127.0.0.1",
-                "localhost",
-                "::1",
+            if host not in ("127.0.0.1", "localhost", "[::1]") or (
+                host_port is not None and server_port is not None and host_port != server_port
             ):
+                self.close_connection = True
                 self._error(404, "not found")
                 return None
+            origin_headers = get_all("Origin", []) if get_all is not None else (
+                [self.headers.get("Origin")] if self.headers.get("Origin") else []
+            )
+            if len(origin_headers) > 1:
+                self.close_connection = True
+                self._error(404, "not found")
+                return None
+            if origin_headers:
+                try:
+                    parsed_origin = urllib.parse.urlparse(origin_headers[0])
+                    origin_port = parsed_origin.port
+                except ValueError:
+                    self.close_connection = True
+                    self._error(404, "not found")
+                    return None
+                effective_origin_port = 80 if origin_port is None else origin_port
+                if (
+                    parsed_origin.scheme != "http"
+                    or parsed_origin.hostname not in ("127.0.0.1", "localhost", "::1")
+                    or (server_port is not None and effective_origin_port != server_port)
+                ):
+                    self.close_connection = True
+                    self._error(404, "not found")
+                    return None
             if not token:
                 return path
-            prefix = f"/{token}"
-            if path == prefix:
+            if not path.startswith("/"):
+                self.close_connection = True
+                self._error(404, "not found")
+                return None
+            seg, sep, tail = path[1:].partition("/")
+            if not hmac.compare_digest(seg, token):
+                self.close_connection = True
+                self._error(404, "not found")
+                return None
+            if not sep:
                 # redirect rather than rewrite: relative asset and API URLs
                 # only resolve when the document URL ends with the slash
-                target = prefix + "/"
+                target = f"/{token}/"
                 if parsed.query:
                     target += "?" + parsed.query
                 self._send(
@@ -2903,10 +2999,7 @@ def make_handler(
                     {"Location": target},
                 )
                 return None
-            if not path.startswith(prefix + "/"):
-                self._error(404, "not found")
-                return None
-            return path[len(prefix) :]
+            return "/" + tail
 
         def do_GET(self):  # noqa: N802 (http.server API)
             self._response_started = False
@@ -3138,11 +3231,13 @@ def make_handler(
 
         def _ui_settings_get(self):
             if registry.agent_window:
-                agent_ui = getattr(registry, "_agent_ui_settings", None)
-                if agent_ui is None:
-                    agent_ui = _load_ui_settings_safe()
-                    registry._agent_ui_settings = dict(agent_ui)
-                return self._json({"ok": True, **agent_ui})
+                with registry._agent_ui_lock:
+                    agent_ui = getattr(registry, "_agent_ui_settings", None)
+                    if agent_ui is None:
+                        agent_ui = dict(_load_ui_settings_safe())
+                        registry._agent_ui_settings = agent_ui
+                    snapshot = dict(agent_ui)
+                return self._json({"ok": True, **snapshot})
             settings = _load_ui_settings_safe()
             return self._json({"ok": True, **settings})
 
@@ -3152,26 +3247,22 @@ def make_handler(
                 if not isinstance(data, dict):
                     raise ValueError("expected a JSON object")
                 if registry.agent_window:
-                    current = getattr(registry, "_agent_ui_settings", None)
-                    if current is None:
-                        current = dict(_load_ui_settings_safe())
+                    from . import ui_settings as _ui_mod
+
                     clean = {k: v for k, v in data.items() if k != "ok"}
-                    if "theme" in clean:
-                        if clean["theme"] not in ("auto", "light", "dark"):
-                            raise ValueError("theme must be 'auto', 'light', or 'dark'")
-                        current["theme"] = clean["theme"]
-                    if "panels" in clean:
-                        if not isinstance(clean["panels"], dict):
-                            raise ValueError("panels must be an object")
-                        current["panels"] = {**current.get("panels", {}), **clean["panels"]}
-                    if "shellToolsExpanded" in clean:
-                        if clean["shellToolsExpanded"] is not None and not isinstance(
-                            clean["shellToolsExpanded"], bool
-                        ):
-                            raise ValueError("shellToolsExpanded must be a boolean or null")
-                        current["shellToolsExpanded"] = clean["shellToolsExpanded"]
-                    registry._agent_ui_settings = current
-                    return self._json({"ok": True, **current})
+                    with registry._agent_ui_lock:
+                        current = getattr(registry, "_agent_ui_settings", None)
+                        if current is None:
+                            current = dict(_load_ui_settings_safe())
+                        doc = {
+                            "theme": current.get("theme", "auto"),
+                            "panels": dict(current.get("panels") or {}),
+                            "shellToolsExpanded": current.get("shellToolsExpanded"),
+                            "recentFiles": [],
+                        }
+                        updated = _ui_mod._public_ui_settings(_ui_mod._apply_ui_patch(doc, clean))
+                        registry._agent_ui_settings = dict(updated)
+                    return self._json({"ok": True, **updated})
                 updated = _save_ui_settings_safe(data)
                 return self._json({"ok": True, **updated})
             except (ValueError, TypeError, json.JSONDecodeError) as e:
@@ -3180,6 +3271,8 @@ def make_handler(
                 return self._error(500, f"Could not save UI settings: {e}")
 
         def _recent_files_get(self, q: dict):
+            if registry.agent_window:
+                return self._json({"ok": True, "items": []})
             raw_limit = (q.get("limit") or ["12"])[0]
             try:
                 limit = int(raw_limit)
@@ -3196,10 +3289,25 @@ def make_handler(
                 raw_path = data.get("path")
                 if not isinstance(raw_path, str) or not raw_path.strip():
                     raise ValueError('expected {"path": "..."}')
+                if registry.agent_window:
+                    return self._json({"ok": True, "items": []})
+                candidate = Path(raw_path).expanduser().resolve()
+                registered = {
+                    p.resolve()
+                    for st in list(registry.slides.values())
+                    for p in (st.source_path, st.store_path, st.container_path)
+                    if p is not None
+                }
+                allowed_suffixes = {
+                    *SLIDE_SUFFIXES,
+                    ".tif", ".tiff", ".qptiff", ".svs", ".sdpc", ".nd2svs",
+                    ".jpg", ".jpeg", ".png", ".zarr",
+                }
+                if candidate not in registered and candidate.suffix.lower() not in allowed_suffixes:
+                    raise ValueError("path is not a supported slide or registered store")
                 raw_name = data.get("name")
                 name = str(raw_name) if isinstance(raw_name, str) and raw_name.strip() else None
-                role = "agent" if registry.agent_window else "user"
-                items = _record_recent_file_safe(raw_path, name=name, window_role=role)
+                items = _record_recent_file_safe(candidate, name=name, window_role="user")
                 return self._json({"ok": True, "items": items})
             except (ValueError, TypeError, json.JSONDecodeError) as e:
                 return self._error(400, str(e))
@@ -3561,9 +3669,25 @@ def make_handler(
                                        "revision": rev, "window": registry.window_session.as_dict()})
                 except (ValueError, UnicodeError, OSError, TimeoutError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
-            if p.exists():
+            if p.exists() or p.is_symlink():
                 try:
-                    document = json.loads(p.read_text(encoding="utf-8"))
+                    from .platform_io import BINARY
+
+                    max_ann_bytes = 64 * 1024 * 1024
+                    flags = (
+                        os.O_RDONLY
+                        | BINARY
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_NONBLOCK", 0)
+                    )
+                    with os.fdopen(os.open(p, flags), "rb") as handle:
+                        st_fd = os.fstat(handle.fileno())
+                        if not stat.S_ISREG(st_fd.st_mode) or st_fd.st_size > max_ann_bytes:
+                            raise ValueError("annotation sidecar is not a bounded regular file")
+                        raw_bytes = handle.read(max_ann_bytes + 1)
+                    if len(raw_bytes) > max_ann_bytes:
+                        raise ValueError("annotation sidecar exceeds size limit")
+                    document = json.loads(raw_bytes.decode("utf-8"))
                     items = _sidecar_items(document, require_items=True)
                     _same_geometry(document)
                 except (ValueError, UnicodeError, OSError) as e:
@@ -3715,7 +3839,10 @@ def make_handler(
             level, tx, ty = int(m.group(1)), int(m.group(2)), int(m.group(3))
             fmt = m.group(4)
             n = len(st.attrs["omero"]["channels"])
-            channels = render.parse_channels((q.get("c") or [None])[0], n)
+            try:
+                channels = render.parse_channels((q.get("c") or [None])[0], n)
+            except ValueError as e:
+                return self._error(400, str(e))
             win = (q.get("win") or [None])[0]
             col = (q.get("col") or [None])[0]
             try:
@@ -3756,7 +3883,10 @@ def make_handler(
             if k not in (2, 4, 8, 16):
                 return self._error(400, "k must be 2, 4, 8 or 16")
             n = len(st.attrs["omero"]["channels"])
-            channels = render.parse_channels((q.get("c") or [None])[0], n)
+            try:
+                channels = render.parse_channels((q.get("c") or [None])[0], n)
+            except ValueError as e:
+                return self._error(400, str(e))
             win = (q.get("win") or [None])[0]
             col = (q.get("col") or [None])[0]
             try:
@@ -4059,10 +4189,15 @@ def create_server(
                         req._real_close()
                     except Exception:
                         pass
-            cur = threading.current_thread()
-            for worker in list(getattr(self._executor, "_threads", ())):
-                if worker is not cur and worker.is_alive():
-                    worker.join(timeout=5.0)
+            if not already_closed:
+                cur = threading.current_thread()
+                join_deadline = time.monotonic() + 5.0
+                for worker in list(getattr(self._executor, "_threads", ())):
+                    if worker is not cur and worker.is_alive():
+                        remaining = join_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        worker.join(timeout=remaining)
 
         def _close_registry(self) -> None:
             if getattr(self, "_registry_closed", False):

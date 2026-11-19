@@ -352,19 +352,23 @@ def test_finder_reveal_uses_an_argument_vector_and_is_platform_guarded(tmp_path)
 
     reveal_in_file_manager(path, platform="darwin", runner=runner)
     assert calls == [
-        (["/usr/bin/open", "-R", str(path)], {"check": True, "timeout": 10})
+        (["/usr/bin/open", "-R", "--", str(path.resolve())], {"check": True, "timeout": 10})
     ]
     with pytest.raises(RuntimeError, match="macOS"):
         reveal_in_file_manager(path, platform="linux", runner=runner)
 
 
 def test_explorer_reveal_preserves_unicode_spaces_and_metacharacters(tmp_path):
+    import ntpath
+    import os
+
     path = tmp_path / "한글 scan & sample.svs"
     path.write_bytes(b"slide")
     calls = []
     reveal_in_file_manager(path, platform="win32", runner=lambda command, **kwargs: calls.append((command, kwargs)))
+    expected_explorer = ntpath.join(os.environ.get("SystemRoot") or r"C:\Windows", "explorer.exe")
     assert calls == [
-        (["explorer.exe", "/select,", str(path.resolve())], {"check": False, "timeout": 10})
+        ([expected_explorer, "/select,", str(path.resolve())], {"check": False, "timeout": 10})
     ]
     path.unlink()
     with pytest.raises(FileNotFoundError):

@@ -71,9 +71,16 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "nd2wsi-viewer contributors"
 !endif
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "Install nd2wsi-viewer ${APP_VERSION}"
-!define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with nd2wsi-viewer.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close nd2wsi-viewer before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. If WebView2 Runtime is missing, Setup can download it from Microsoft using an Internet connection."
+!ifdef BUNDLED_WEBVIEW2
+  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with nd2wsi-viewer.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close nd2wsi-viewer before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. Microsoft Edge WebView2 Fixed Version Runtime is bundled for offline installation."
+!else
+  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with nd2wsi-viewer.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close nd2wsi-viewer before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. If WebView2 Runtime is missing, Setup can download it from Microsoft using an Internet connection."
+!endif
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
+; Never silently grey out the Install button on the directory page; validate
+; path syntax, 64-bit free disk space, and ownership with explicit dialogs on leave.
+!define MUI_DIRECTORYPAGE_VERIFYONLEAVE
 !define MUI_PAGE_CUSTOMFUNCTION_LEAVE VerifyDirectoryPage
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -105,6 +112,7 @@ Var SetupMutex
 Var InstallerLogPath
 Var ProcessInspectError
 Var ProcessCheckedCount
+Var ExistingUpgrade
 
 !macro ND2WSI_TRACE PREFIX MESSAGE
   Push "${MESSAGE}"
@@ -228,7 +236,7 @@ Function ${PREFIX}CheckPathChain
   ; NSIS GetFullPathName can clear its output for a nonexistent leaf.
   ; Use lexical Win32 normalization so every existing ancestor is still
   ; inspected even when the destination or a shipped child does not exist.
-  System::Call 'kernel32::GetFullPathNameW(w "$R0", i ${NSIS_MAX_STRLEN}, w .R1, p 0)i.R2 ?e'
+  System::Call 'kernel32::GetFullPathNameW(w R0, i ${NSIS_MAX_STRLEN}, w .R1, p 0)i.R2 ?e'
   Pop $R3
   ${If} $R2 == 0
   ${OrIf} $R2 >= ${NSIS_MAX_STRLEN}
@@ -238,7 +246,7 @@ Function ${PREFIX}CheckPathChain
   ${EndIf}
   StrCpy $R0 $R1
   ${Do}
-    System::Call 'kernel32::GetFileAttributesW(w "$R0")i.R1 ?e'
+    System::Call 'kernel32::GetFileAttributesW(w R0)i.R1 ?e'
     Pop $R3
     ${If} $R1 == -1
       ${If} $R3 != 2
@@ -269,6 +277,34 @@ Function ${PREFIX}CheckPathChain
   Pop $R0
 FunctionEnd
 
+Function ${PREFIX}CheckLeafPath
+  ; Inspect a single path under an already-verified $INSTDIR without
+  ; redundantly re-walking every ancestor up to the drive root.
+  Exch $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  System::Call 'kernel32::GetFileAttributesW(w R0)i.R1 ?e'
+  Pop $R3
+  ${If} $R1 == -1
+    ${If} $R3 != 2
+    ${AndIf} $R3 != 3
+      StrCpy $GuardError "Setup could not safely inspect this path:$\r$\n$R0$\r$\n$\r$\nCheck folder access and try again."
+      !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckLeafPath.reject path=$R0 attributes=$R1 win32_error=$R3 reason=$GuardError"
+    ${EndIf}
+  ${Else}
+    IntOp $R2 $R1 & 0x400
+    ${If} $R2 != 0
+      StrCpy $GuardError "Setup found a linked file or folder:$\r$\n$R0$\r$\n$\r$\nRestore the original app folder before reinstalling or uninstalling. No app files have been changed."
+      !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckLeafPath.reject path=$R0 attributes=$R1 reason=$GuardError"
+    ${EndIf}
+  ${EndIf}
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+FunctionEnd
+
 Function ${PREFIX}CheckPayloadPaths
   !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckPayloadPaths.begin instdir=$INSTDIR"
   StrCpy $GuardError ""
@@ -277,7 +313,28 @@ Function ${PREFIX}CheckPayloadPaths
   ${If} $GuardError != ""
     Return
   ${EndIf}
-  !define ND2WSI_GUARD_FUNCTION "${PREFIX}CheckPathChain"
+  ; If $INSTDIR does not exist yet, none of the payload children can exist or be
+  ; junctions; skip thousands of redundant Win32 metadata queries on the UI thread.
+  Push $R0
+  Push $R1
+  Push $R2
+  StrCpy $R0 "$INSTDIR"
+  System::Call 'kernel32::GetFileAttributesW(w R0)i.R1 ?e'
+  Pop $R2
+  ${If} $R1 == -1
+    ${If} $R2 == 2
+    ${OrIf} $R2 == 3
+      Pop $R2
+      Pop $R1
+      Pop $R0
+      !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckPayloadPaths.complete instdir=$INSTDIR missing_root=1 guard="
+      Return
+    ${EndIf}
+  ${EndIf}
+  Pop $R2
+  Pop $R1
+  Pop $R0
+  !define ND2WSI_GUARD_FUNCTION "${PREFIX}CheckLeafPath"
   !insertmacro ND2WSI_GUARD_PATH "${MARKER}"
   !insertmacro ND2WSI_GUARD_PATH "Uninstall.exe"
   !include "${PAYLOAD_GUARD_INCLUDE}"
@@ -412,7 +469,8 @@ Function ${PREFIX}WriteOwnershipMarker
   ${If} $MarkerWriteFailed != 0
     Goto marker_cleanup
   ${EndIf}
-  System::Call 'kernel32::MoveFileExW(w "$R1", w "$INSTDIR\${MARKER}", i 9)i.R3 ?e'
+  StrCpy $R2 "$INSTDIR\${MARKER}"
+  System::Call 'kernel32::MoveFileExW(w R1, w R2, i 9)i.R3 ?e'
   Pop $R4
   !insertmacro ND2WSI_TRACE "${PREFIX}" "WriteOwnershipMarker.MoveFileEx result=$R3 win32_error=$R4 source=$R1 destination=$INSTDIR\${MARKER}"
   ${If} $R3 == 0
@@ -443,7 +501,7 @@ Function ${PREFIX}WriteOwnershipMarker
   ${EndIf}
   Goto marker_done
   marker_cleanup:
-  System::Call 'kernel32::DeleteFileW(w "$R1")i.R3 ?e'
+  System::Call 'kernel32::DeleteFileW(w R1)i.R3 ?e'
   Pop $R4
   ${If} $R3 == 0
   ${AndIf} $R4 != 2
@@ -469,7 +527,8 @@ Function ${PREFIX}CheckOwnedDirectory
   StrCpy $GuardError ""
   ; A fresh installation is allowed to target a nonexistent folder. Keep
   ; the chosen path intact unless Win32 normalization succeeds completely.
-  System::Call 'kernel32::GetFullPathNameW(w "$INSTDIR", i ${NSIS_MAX_STRLEN}, w .r0, p 0)i.r1 ?e'
+  StrCpy $2 "$INSTDIR"
+  System::Call 'kernel32::GetFullPathNameW(w r2, i ${NSIS_MAX_STRLEN}, w .r0, p 0)i.r1 ?e'
   Pop $2
   ${If} $1 == 0
   ${OrIf} $1 >= ${NSIS_MAX_STRLEN}
@@ -496,11 +555,32 @@ Function ${PREFIX}CheckOwnedDirectory
   ${If} $2 != ""
     GetFullPathName $2 "$2"
   ${EndIf}
-  ${If} $0 != "${PRODUCT_ID}"
-  ${OrIf} $1 != "${APP_VERSION}"
-  ${OrIf} $2 != $INSTDIR
-    StrCpy $GuardError "This folder is not a registered nd2wsi-viewer ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
-  ${EndIf}
+  !if "x${PREFIX}" == "x"
+    StrCpy $ExistingUpgrade 0
+    ReadINIStr $3 "$INSTDIR\${MARKER}" "Installation" "UninstallState"
+    ReadRegStr $4 HKCU "${UNINSTALL_KEY}" "ProductId"
+    ${If} $0 == "${PRODUCT_ID}"
+    ${AndIf} $2 == $INSTDIR
+      ${If} $1 == "${APP_VERSION}"
+        ; Same-version reinstall in the registered folder.
+      ${ElseIf} $1 != ""
+      ${AndIf} $3 == ""
+      ${AndIf} $4 == "${PRODUCT_ID}"
+      ${AndIf} ${FileExists} "$INSTDIR\Uninstall.exe"
+        StrCpy $ExistingUpgrade 1
+      ${Else}
+        StrCpy $GuardError "This folder is not a registered nd2wsi-viewer ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
+      ${EndIf}
+    ${Else}
+      StrCpy $GuardError "This folder is not a registered nd2wsi-viewer ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
+    ${EndIf}
+  !else
+    ${If} $0 != "${PRODUCT_ID}"
+    ${OrIf} $1 != "${APP_VERSION}"
+    ${OrIf} $2 != $INSTDIR
+      StrCpy $GuardError "This folder is not a registered nd2wsi-viewer ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
+    ${EndIf}
+  !endif
   !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckOwnedDirectory.complete marker_product=$0 marker_version=$1 registered_path=$2 instdir=$INSTDIR guard=$GuardError"
 FunctionEnd
 !macroend
@@ -518,6 +598,9 @@ Function .onInit
   !insertmacro ND2WSI_TRACE "" ".onInit.begin version=${APP_VERSION} instdir=$INSTDIR exepath=$EXEPATH"
   SetShellVarContext current
   SetRegView 64
+  ${If} $INSTDIR == ""
+    StrCpy $INSTDIR "$LOCALAPPDATA\Programs\nd2wsi-viewer"
+  ${EndIf}
   ${IfNot} ${AtLeastWin10}
     !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=nd2wsi-viewer requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11."
     MessageBox MB_OK|MB_ICONSTOP "nd2wsi-viewer requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11." /SD IDOK
@@ -601,20 +684,21 @@ FunctionEnd
 Function CheckInstallDirectory
   !insertmacro ND2WSI_TRACE "" "CheckInstallDirectory.begin instdir=$INSTDIR"
   StrCpy $InitialInstallFresh 0
+  StrCpy $ExistingUpgrade 0
   Call CheckPayloadPaths
   ${If} $GuardError != ""
     Return
   ${EndIf}
   Call CheckOwnedDirectory
   ${If} $GuardError == ""
-    !insertmacro ND2WSI_TRACE "" "CheckInstallDirectory.existing_owned instdir=$INSTDIR"
+    !insertmacro ND2WSI_TRACE "" "CheckInstallDirectory.existing_owned instdir=$INSTDIR upgrade=$ExistingUpgrade"
     Return
   ${EndIf}
   ; A registered installation cannot silently be moved or overwritten by a
   ; second one. Uninstall it first; the user's data is retained.
   ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallLocation"
   ${If} $0 != ""
-    StrCpy $GuardError "nd2wsi-viewer is already registered in:$\r$\n$0$\r$\n$\r$\nChoose that folder to reinstall the same version, or uninstall the existing app first."
+    StrCpy $GuardError "nd2wsi-viewer is already registered in:$\r$\n$0$\r$\n$\r$\nChoose that folder to reinstall or upgrade, or uninstall the existing app first."
     Return
   ${EndIf}
   ${GetRoot} "$INSTDIR" $0
@@ -623,7 +707,8 @@ Function CheckInstallDirectory
     Return
   ${EndIf}
   ; Reject a file or directory junction at the chosen destination.
-  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR")i.r0'
+  StrCpy $1 "$INSTDIR"
+  System::Call 'kernel32::GetFileAttributesW(w r1)i.r0'
   !insertmacro ND2WSI_TRACE "" "CheckInstallDirectory.attributes value=$0"
   ${If} $0 != -1
     IntOp $1 $0 & 0x400
@@ -658,6 +743,62 @@ Function CheckInstallDirectory
 FunctionEnd
 
 Function VerifyDirectoryPage
+  GetInstDirError $0
+  !insertmacro ND2WSI_TRACE "" "VerifyDirectoryPage.instdir_error code=$0 instdir=$INSTDIR"
+  ${If} $0 == 1
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=VerifyDirectoryPage message=Choose a valid local installation folder (for example, $LOCALAPPDATA\Programs\nd2wsi-viewer). A drive root or malformed path cannot be used."
+    MessageBox MB_OK|MB_ICONEXCLAMATION "Choose a valid local installation folder (for example, $LOCALAPPDATA\Programs\nd2wsi-viewer). A drive root or malformed path cannot be used." /SD IDOK
+    Abort
+  ${EndIf}
+  ${If} $0 == 2
+    ; Re-verify free space with 64-bit Win32 GetDiskFreeSpaceExW on the nearest
+    ; existing ancestor so nonexistent subfolders, redirected profiles, or large
+    ; (>4 TB) drives never falsely block installation.
+    Push $R0
+    Push $R1
+    Push $R2
+    Push $R3
+    Push $R4
+    StrCpy $R0 "$INSTDIR"
+    StrCpy $R2 0
+    ${Do}
+      System::Call 'kernel32::GetDiskFreeSpaceExW(w R0, *l.R1, p 0, p 0)i.R2'
+      ${If} $R2 != 0
+        ${ExitDo}
+      ${EndIf}
+      ${GetParent} "$R0" $R3
+      ${If} $R3 == ""
+      ${OrIf} $R3 == $R0
+        ${ExitDo}
+      ${EndIf}
+      StrCpy $R0 $R3
+    ${Loop}
+    ${If} $R2 != 0
+      System::Int64Op $R1 / 1024
+      Pop $R3
+      System::Int64Op $R3 < ${PAYLOAD_SIZE_KIB}
+      Pop $R4
+      ${If} $R4 != 0
+        System::Int64Op $R3 / 1024
+        Pop $R1
+        IntOp $R4 ${PAYLOAD_SIZE_KIB} + 1023
+        IntOp $R4 $R4 / 1024
+        !insertmacro ND2WSI_TRACE "" "VerifyDirectoryPage.low_disk_space free_kib=$R3 required_kib=${PAYLOAD_SIZE_KIB} root=$R0"
+        MessageBox MB_OK|MB_ICONEXCLAMATION "There is not enough free disk space on $R0 to install nd2wsi-viewer.$\r$\n$\r$\nRequired: $R4 MB$\r$\nAvailable: $R1 MB$\r$\n$\r$\nFree up space or choose another folder." /SD IDOK
+        Pop $R4
+        Pop $R3
+        Pop $R2
+        Pop $R1
+        Pop $R0
+        Abort
+      ${EndIf}
+    ${EndIf}
+    Pop $R4
+    Pop $R3
+    Pop $R2
+    Pop $R1
+    Pop $R0
+  ${EndIf}
   Call CheckInstallDirectory
   ${If} $GuardError != ""
     !insertmacro ND2WSI_TRACE "" "MessageBox phase=VerifyDirectoryPage message=$GuardError"
@@ -702,39 +843,45 @@ Function EnsureWebView2
     DetailPrint "Microsoft Edge WebView2 Runtime: $WebView2Version"
     Return
   ${EndIf}
-  IfSilent install_runtime
-  !insertmacro ND2WSI_TRACE "" "MessageBox phase=EnsureWebView2 message=nd2wsi-viewer needs Microsoft Edge WebView2 Runtime. Choose OK to download and install it from Microsoft. An Internet connection is required."
-  MessageBox MB_OKCANCEL|MB_ICONINFORMATION "nd2wsi-viewer needs Microsoft Edge WebView2 Runtime. Choose OK to download and install it from Microsoft. An Internet connection is required." IDCANCEL cancelled
-  install_runtime:
-  InitPluginsDir
-  SetOutPath "$PLUGINSDIR"
-  File /oname=MicrosoftEdgeWebView2Setup.exe "${WEBVIEW2_BOOTSTRAPPER}"
-  DetailPrint "Installing Microsoft Edge WebView2 Runtime..."
-  !insertmacro ND2WSI_TRACE "" "EnsureWebView2.ExecWait.before bootstrapper=$PLUGINSDIR\MicrosoftEdgeWebView2Setup.exe"
-  ClearErrors
-  ExecWait '"$PLUGINSDIR\MicrosoftEdgeWebView2Setup.exe" /silent /install' $0
-  ${If} ${Errors}
-    !insertmacro ND2WSI_TRACE "" "EnsureWebView2.ExecWait.failed exit=$0 nsis_errors=1"
-    Goto failed
-  ${EndIf}
-  !insertmacro ND2WSI_TRACE "" "EnsureWebView2.ExecWait.after exit=$0 nsis_errors=0"
-  ${If} $0 != 0
-  ${AndIf} $0 != 3010
-    Goto failed
-  ${EndIf}
-  Call FindWebView2
-  !insertmacro ND2WSI_TRACE "" "EnsureWebView2.after_install version=$WebView2Version"
-  ${If} $WebView2Version == ""
-    Goto failed
-  ${EndIf}
-  Return
-  failed:
-  !insertmacro ND2WSI_TRACE "" "MessageBox phase=EnsureWebView2 message=Microsoft Edge WebView2 Runtime could not be installed. Check your Internet connection, install the Microsoft WebView2 Evergreen Runtime, and run Setup again."
-  MessageBox MB_OK|MB_ICONSTOP "Microsoft Edge WebView2 Runtime could not be installed. Check your Internet connection, install the Microsoft WebView2 Evergreen Runtime, and run Setup again." /SD IDOK
-  cancelled:
-  SetErrorLevel 2
-  !insertmacro ND2WSI_TRACE "" "Abort phase=EnsureWebView2 guard=$GuardError"
-  Abort
+  !ifdef BUNDLED_WEBVIEW2
+    DetailPrint "Using bundled Microsoft Edge WebView2 Fixed Version Runtime."
+    !insertmacro ND2WSI_TRACE "" "EnsureWebView2.bundled_fixed_runtime"
+    Return
+  !else
+    IfSilent install_runtime
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=EnsureWebView2 message=nd2wsi-viewer needs Microsoft Edge WebView2 Runtime. Choose OK to download and install it from Microsoft. An Internet connection is required."
+    MessageBox MB_OKCANCEL|MB_ICONINFORMATION "nd2wsi-viewer needs Microsoft Edge WebView2 Runtime. Choose OK to download and install it from Microsoft. An Internet connection is required." IDCANCEL cancelled
+    install_runtime:
+    InitPluginsDir
+    SetOutPath "$PLUGINSDIR"
+    File /oname=MicrosoftEdgeWebView2Setup.exe "${WEBVIEW2_BOOTSTRAPPER}"
+    DetailPrint "Installing Microsoft Edge WebView2 Runtime..."
+    !insertmacro ND2WSI_TRACE "" "EnsureWebView2.ExecWait.before bootstrapper=$PLUGINSDIR\MicrosoftEdgeWebView2Setup.exe"
+    ClearErrors
+    ExecWait '"$PLUGINSDIR\MicrosoftEdgeWebView2Setup.exe" /silent /install' $0
+    ${If} ${Errors}
+      !insertmacro ND2WSI_TRACE "" "EnsureWebView2.ExecWait.failed exit=$0 nsis_errors=1"
+      Goto failed
+    ${EndIf}
+    !insertmacro ND2WSI_TRACE "" "EnsureWebView2.ExecWait.after exit=$0 nsis_errors=0"
+    ${If} $0 != 0
+    ${AndIf} $0 != 3010
+      Goto failed
+    ${EndIf}
+    Call FindWebView2
+    !insertmacro ND2WSI_TRACE "" "EnsureWebView2.after_install version=$WebView2Version"
+    ${If} $WebView2Version == ""
+      Goto failed
+    ${EndIf}
+    Return
+    failed:
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=EnsureWebView2 message=Microsoft Edge WebView2 Runtime could not be installed. Check your Internet connection, install the Microsoft WebView2 Evergreen Runtime, and run Setup again."
+    MessageBox MB_OK|MB_ICONSTOP "Microsoft Edge WebView2 Runtime could not be installed. Check your Internet connection, install the Microsoft WebView2 Evergreen Runtime, and run Setup again." /SD IDOK
+    cancelled:
+    SetErrorLevel 2
+    !insertmacro ND2WSI_TRACE "" "Abort phase=EnsureWebView2 guard=$GuardError"
+    Abort
+  !endif
 FunctionEnd
 
 Function WriteSafeUninstaller
@@ -768,7 +915,8 @@ Function WriteSafeUninstaller
   ${If} $UninstallerWriteFailed != 0
     Goto uninstaller_cleanup
   ${EndIf}
-  System::Call 'kernel32::MoveFileExW(w "$0", w "$INSTDIR\Uninstall.exe", i 9)i.r1 ?e'
+  StrCpy $2 "$INSTDIR\Uninstall.exe"
+  System::Call 'kernel32::MoveFileExW(w r0, w r2, i 9)i.r1 ?e'
   Pop $2
   !insertmacro ND2WSI_TRACE "" "WriteSafeUninstaller.MoveFileEx result=$1 win32_error=$2 source=$0 destination=$INSTDIR\Uninstall.exe"
   ${If} $1 == 0
@@ -779,7 +927,7 @@ Function WriteSafeUninstaller
   StrCpy $UninstallerTempPath ""
   Goto uninstaller_done
   uninstaller_cleanup:
-  System::Call 'kernel32::DeleteFileW(w "$0")i.r1 ?e'
+  System::Call 'kernel32::DeleteFileW(w r0)i.r1 ?e'
   Pop $2
   !insertmacro ND2WSI_TRACE "" "WriteSafeUninstaller.cleanup result=$1 win32_error=$2 path=$0"
   ${If} $1 == 0
@@ -999,6 +1147,41 @@ Section "nd2wsi-viewer (required)" SecApplication
     !insertmacro ND2WSI_TRACE "" "Abort phase=SecApplication guard=$GuardError"
     Abort
   ${EndIf}
+  ; If upgrading a registered earlier version in this exact folder, cleanly run
+  ; its own uninstaller from a temporary copy so stale files from the prior
+  ; release are removed while user-created files are preserved.
+  ${If} $ExistingUpgrade == 1
+    !insertmacro ND2WSI_TRACE "" "SecApplication.upgrade.begin instdir=$INSTDIR"
+    DetailPrint "Removing previous nd2wsi-viewer version before upgrading..."
+    InitPluginsDir
+    ClearErrors
+    CopyFiles /SILENT "$INSTDIR\Uninstall.exe" "$PLUGINSDIR\prev-uninstall.exe"
+    ${If} ${Errors}
+      !insertmacro ND2WSI_TRACE "" "SecApplication.upgrade.copy_failed"
+      MessageBox MB_OK|MB_ICONSTOP "Could not prepare the previous uninstaller for upgrade. Close programs using this folder or uninstall the previous version from Windows Settings > Apps, then run Setup again." /SD IDOK
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+    ${If} $SetupMutex != 0
+      StrCpy $0 $SetupMutex
+      System::Call 'kernel32::CloseHandle(p r0)'
+      StrCpy $SetupMutex 0
+    ${EndIf}
+    ClearErrors
+    ExecWait '"$PLUGINSDIR\prev-uninstall.exe" /S _?=$INSTDIR' $0
+    ${If} ${Errors}
+      StrCpy $0 2
+    ${EndIf}
+    Delete "$PLUGINSDIR\prev-uninstall.exe"
+    Call AcquireSetupMutex
+    !insertmacro ND2WSI_TRACE "" "SecApplication.upgrade.complete exit=$0"
+    ${If} $0 != 0
+      MessageBox MB_OK|MB_ICONSTOP "Could not remove the previous nd2wsi-viewer version before upgrading (exit code $0). Close programs using this folder or uninstall the previous version from Windows Settings > Apps, then run Setup again." /SD IDOK
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+    StrCpy $ExistingUpgrade 0
+  ${EndIf}
   ; The preceding final directory check records whether the destination is
   ; empty/new. Capture actual registry absence before creating any metadata.
   StrCpy $InitialRegistryAbsent 0
@@ -1076,7 +1259,7 @@ Function ${PREFIX}DeleteOwnedFile
   Exch $R0
   Push $R1
   Push $R2
-  System::Call 'kernel32::DeleteFileW(w "$R0")i.R1 ?e'
+  System::Call 'kernel32::DeleteFileW(w R0)i.R1 ?e'
   Pop $R2
   ${If} $R1 == 0
   ${AndIf} $R2 != 2
@@ -1094,7 +1277,7 @@ Function ${PREFIX}RemoveEmptyOwnedDirectory
   Exch $R0
   Push $R1
   Push $R2
-  System::Call 'kernel32::RemoveDirectoryW(w "$R0")i.R1 ?e'
+  System::Call 'kernel32::RemoveDirectoryW(w R0)i.R1 ?e'
   Pop $R2
   ${If} $R1 == 0
   ${AndIf} $R2 != 2
@@ -1171,7 +1354,8 @@ Function un.CheckUninstallDirectory
   ${If} $RegistryState != 1
     Return
   ${EndIf}
-  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\${MARKER}")i.r0 ?e'
+  StrCpy $1 "$INSTDIR\${MARKER}"
+  System::Call 'kernel32::GetFileAttributesW(w r1)i.r0 ?e'
   Pop $1
   ${If} $0 != -1
     Return
@@ -1247,7 +1431,7 @@ Function un.DeleteKeyIfTrulyEmpty
   Push $R2
   Push $R3
   Push $R4
-  System::Call 'advapi32::RegOpenKeyExW(p 0x80000001, w "$R0", i 0, i 0x20119, *p.R1)i.R2'
+  System::Call 'advapi32::RegOpenKeyExW(p 0x80000001, w R0, i 0, i 0x20119, *p.R1)i.R2'
   ${If} $R2 == 0
     System::Call 'advapi32::RegQueryInfoKeyW(p R1, p 0, p 0, p 0, *i.R3, p 0, p 0, *i.R4, p 0, p 0, p 0, p 0)i.R2'
     System::Call 'advapi32::RegCloseKey(p R1)'

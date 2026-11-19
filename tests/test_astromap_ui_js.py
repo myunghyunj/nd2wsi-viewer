@@ -678,14 +678,22 @@ c.svgEl=()=>({});c.renderLandmarks=()=>{};c.rememberAnnotationFrame=()=>{};
 c.chip=(layer,x,y,text,id)=>labels.push({id,text});
 c.$('ann-layer').replaceChildren=()=>{labels.length=0;};
 vm.runInContext(production('renderAnnotations'),c);
-c.renderAnnotations();
-return {labels,unchanged:before===JSON.stringify(c.state.annotations),
+// Only the yellow-highlighted active Astromap ROI (plus ordinary boxes) renders a bubble.
+const perActive = [];
+for (const id of ['one', 'two', 'three', 'manual', 'numeric-note']) {
+  c.state.astromap.activeId = id;
+  c.renderAnnotations();
+  perActive.push([...labels]);
+}
+return {perActive,unchanged:before===JSON.stringify(c.state.annotations),
   exported:c.window.Nd2Astromap.selectedRois(c.state.annotations).map(a=>a.note)};
 """)
-    assert out["labels"] == [
-        {"id": "one", "text": "1"}, {"id": "two", "text": "2"},
-        {"id": "three", "text": "3 · capsule"}, {"id": "manual", "text": "4 · 4"},
-        {"id": "numeric-note", "text": "5 · 50"}, {"id": "ordinary", "text": "6"},
+    assert out["perActive"] == [
+        [{"id": "one", "text": "1"}, {"id": "ordinary", "text": "6"}],
+        [{"id": "two", "text": "2"}, {"id": "ordinary", "text": "6"}],
+        [{"id": "three", "text": "3 · capsule"}, {"id": "ordinary", "text": "6"}],
+        [{"id": "manual", "text": "4 · 4"}, {"id": "ordinary", "text": "6"}],
+        [{"id": "numeric-note", "text": "5 · 50"}, {"id": "ordinary", "text": "6"}],
     ]
     assert out["unchanged"]
     assert out["exported"] == ["7", " 19 ", "capsule", "4", "50"]

@@ -66,7 +66,7 @@
 </div></div>
 <button id="update" type="button">Check for Updates…</button>
 <script>
-  let busy = false, polling = null, queuedDrops = [];
+  let busy = false, polling = null, queuedDrops = [], dragDepth = 0;
   const drop = document.getElementById('drop');
   function setStatus(t){ document.getElementById('status').textContent = t || ''; }
   const bar = document.getElementById('bar'), fill = document.getElementById('fill');
@@ -88,8 +88,8 @@
       } else { bar.style.display = 'none'; fill.classList.remove('indet'); pctEl.textContent = ''; }
     });
   }
-  function begin(){ busy = true; polling = setInterval(poll, 400); }
-  function end(msg){ clearInterval(polling); busy = false; setStatus(msg || ''); bar.style.display='none'; document.getElementById('pct').textContent=''; }
+  function begin(){ clearInterval(polling); busy = true; polling = setInterval(poll, 400); }
+  function end(msg){ clearInterval(polling); polling = null; busy = false; setStatus(msg || ''); bar.style.display='none'; document.getElementById('pct').textContent=''; }
   async function drainQueued(lastUrl){
     let url = lastUrl;
     while (queuedDrops.length) {
@@ -113,6 +113,7 @@
       })
       .catch(e => end('failed: ' + e));
   }
+  document.getElementById('recent-files').addEventListener('click', ev => ev.stopPropagation());
   drop.addEventListener('click', () => { if (!busy) go(pywebview.api.open_slide()); });
   // pywebview 6 delivers dropped-file paths through a Python-side DOM
   // handler, which calls __pydrop with the real path. The JS listeners
@@ -124,10 +125,12 @@
   window.__pydrop = path => window.__pydrop_multi([path]);
   document.addEventListener('dragover', ev => ev.preventDefault(), true);
   document.addEventListener('drop', ev => ev.preventDefault(), true);
+  window.addEventListener('dragenter', ev => { ev.preventDefault(); dragDepth += 1; drop.classList.add('over'); });
   window.addEventListener('dragover', ev => { ev.preventDefault(); drop.classList.add('over'); });
-  window.addEventListener('dragleave', () => drop.classList.remove('over'));
+  window.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (dragDepth === 0) drop.classList.remove('over'); });
   window.addEventListener('drop', ev => {
     ev.preventDefault();
+    dragDepth = 0;
     drop.classList.remove('over');
   });
   function bootApiUrl(sub){
@@ -137,6 +140,15 @@
       if (base) return base + sub;
     }
     return sub;
+  }
+  function safeSlideUrl(rawUrl, sid){
+    if (typeof rawUrl === 'string' && /^(\/[A-Za-z0-9._~%-]+)?\/s\/[A-Za-z0-9_-]+\/$/.test(rawUrl)) {
+      return rawUrl.startsWith('/s/') ? bootApiUrl(rawUrl) : rawUrl;
+    }
+    if (typeof sid === 'string' && /^[A-Za-z0-9_-]+$/.test(sid)) {
+      return bootApiUrl('/s/' + encodeURIComponent(sid) + '/');
+    }
+    return '';
   }
   function openRecentPath(path){
     if (busy || !path) return;
@@ -156,8 +168,8 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),
       }).then(r => r.json()).then(d => {
-        if (d?.url) location.replace(d.url);
-        else if (d?.sid) location.replace(bootApiUrl('/s/' + encodeURIComponent(d.sid) + '/'));
+        const nextUrl = safeSlideUrl(d?.url, d?.sid);
+        if (nextUrl) location.replace(nextUrl);
         else end(d?.error || '');
       }).catch(e => end('failed: ' + e));
     }
@@ -201,7 +213,7 @@
   }
   loadRecentFiles();
   window.addEventListener('pywebviewready', () => {
-    pywebview.api.pending().then(p => { if (p) go(pywebview.api.open_slide()); });
+    pywebview.api.pending().then(p => { if (p && !busy) go(pywebview.api.open_slide()); });
     if (typeof pywebview.api?.recent_files === 'function') {
       Promise.resolve(pywebview.api.recent_files())
         .then(data => { if (data && document.getElementById('recent-files')?.hidden) renderRecentFiles(data); })
@@ -209,6 +221,7 @@
     }
     const refreshUpdates = () => pywebview.api.update_status().then(s => {
         const button = document.getElementById('update');
+        button.dataset.available = s.available ? '1' : '0';
         button.disabled = !s.available;
         if (s.mode === 'download') button.textContent = 'Download Updates…';
       });
@@ -222,6 +235,6 @@
       ? window.nd2wsiUpdateCard.check() : pywebview.api.check_for_updates())
       .then(result => { if (result?.ok === false) setStatus(result.message || 'Could not check for updates.'); })
       .catch(error => setStatus('Could not check for updates: ' + error))
-      .finally(() => { button.disabled = false; });
+      .finally(() => { button.disabled = button.dataset?.available === '0'; });
   });
 </script></body></html>

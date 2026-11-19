@@ -249,6 +249,31 @@ def prepare_astromap(state, payload: dict, *, resolve_frame, filename_prefix="")
     window = payload.get("window")
     if window is not None and (not isinstance(window, str) or len(window) > 32768):
         raise AstromapError("Invalid display window")
+    raw_col = payload.get("col")
+    if raw_col is not None:
+        if not isinstance(raw_col, str) or len(raw_col) > 4096:
+            raise AstromapError("Invalid display colors")
+        if raw_col and not meta.get("rgb"):
+            col_tokens = raw_col.split(",")
+            if len(col_tokens) > count:
+                raise AstromapError("Too many channel colors")
+            for tok in col_tokens:
+                if not tok:
+                    continue
+                cleaned = tok.strip().lstrip("#")
+                if len(cleaned) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in cleaned):
+                    raise AstromapError("Invalid display color")
+    attrs_for_export = state.attrs
+    if isinstance(raw_col, str) and raw_col and not meta.get("rgb"):
+        from copy import deepcopy
+
+        attrs_for_export = deepcopy(state.attrs)
+        tokens = raw_col.split(",")
+        for idx, ch in enumerate(attrs_for_export["omero"]["channels"]):
+            if idx < len(tokens):
+                cleaned = tokens[idx].strip().lstrip("#")
+                if len(cleaned) == 6:
+                    ch["color"] = cleaned.upper()
     frame = payload.get("frame")
     base_sel = meta.get("selection") if isinstance(meta.get("selection"), dict) else {}
     sel_p = base_sel.get("p")
@@ -287,7 +312,7 @@ def prepare_astromap(state, payload: dict, *, resolve_frame, filename_prefix="")
     candidates = [lv for lv in levels if lv["width"] >= size[0] and lv["height"] >= size[1]]
     level = min(candidates or [levels[0]], key=lambda lv: lv["width"] * lv["height"])
     stem = filename_prefix + _filename(str(meta.get("source", "slide"))) + suffix
-    return AstromapPlan(root, state.attrs, str(level["path"]), size, boxes, tuple(channels), window, stem,
+    return AstromapPlan(root, attrs_for_export, str(level["path"]), size, boxes, tuple(channels), window, stem,
                        include_pdf, source_boxes, tuple(levels))
 
 

@@ -107,7 +107,7 @@ def main(argv=None):
     os.environ["ND2WSI_APP_NAME"] = "nd2wsi-viewer"
     os.environ["ND2WSI_WINDOW_LAUNCHER"] = str(Path(__file__).resolve().parents[1] / "packaging" / "launch_rc.py")
     if args.session_root:
-        os.environ["ND2WSI_WINDOW_SESSION_ROOT"] = str(args.session_root)
+        os.environ["ND2WSI_WINDOW_SESSION_ROOT"] = str(args.session_root.expanduser().resolve())
     role = "agent" if args.agent_window else "user"
     if (args.diagnostic_fault or args.diagnostic_close_after_present or args.diagnostic_handoff_after_present) and role != "agent":
         parser.error("fault injection requires a new Agent window")
@@ -138,7 +138,8 @@ def main(argv=None):
     if args.handoff_state:
         browser_arguments += ["--handoff-state", str(args.handoff_state)]
     if source:
-        browser_arguments.append(str(source))
+        src_text = str(source)
+        browser_arguments += (["--", src_text] if src_text.startswith("-") else [src_text])
     if not use_metal:
         return app.main(browser_arguments)
     initial_state = None
@@ -164,13 +165,15 @@ def main(argv=None):
     os.environ.setdefault("ND2WSI_GPU_PYRAMID", "1")
     from .metal_viewport import launcher
 
-    native_arguments = [str(source)]
+    native_arguments = []
     for option, value in (("--session-root", args.session_root), ("--report", args.report)):
         if value:
             native_arguments += [option, str(value)]
     for option in ("capture_enabled", "source_info"):
         if getattr(args, option):
             native_arguments.append("--" + option.replace("_", "-"))
+    src_text = str(source)
+    native_arguments += (["--", src_text] if src_text.startswith("-") else [src_text])
     prefix = command_prefix()
     commands = {
         "user": prefix + ["--new-window"],
@@ -233,7 +236,8 @@ def main(argv=None):
             # A disconnected source or full state disk must not cause a loop,
             # role change, or adoption of an unrelated user's existing window.
             print("Display state could not be preserved; opening the same source in the standard viewer.", file=sys.stderr)
-    browser_arguments.append(str(source))
+    src_text = str(source)
+    browser_arguments += (["--", src_text] if src_text.startswith("-") else [src_text])
     try:
         spawn_browser(browser_arguments)
     except OSError:

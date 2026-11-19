@@ -2266,15 +2266,39 @@ class PlateSource:
                 "the source file changed while it was open; close and reopen the slide"
             )
 
-    def frame_view(self, t: int, p: int, z: int) -> np.ndarray:
-        """(C, H, W) zero copy view onto the memory map. Valid until close."""
+    class _LeasedFrame:
+        """Slice-safe view onto one ND2 plate frame guarded by ``PlateSource._life``.
+
+        Unlike returning a bare ``ndarray(buffer=mmap)`` after releasing ``_life``,
+        every slice read acquires ``_life`` and copies only the requested region,
+        preventing use-after-unmap ``SIGSEGV`` if the plate closes concurrently.
+        """
+
+        def __init__(self, source: PlateSource, seq: int):
+            self._source = source
+            self._seq = seq
+            self.shape = source.frame_shape
+            self.dtype = np.dtype(source.dtype)
+            self.ndim = len(self.shape)
+
+        def __getitem__(self, index):
+            with self._source._life:
+                self._source._check_source()
+                view, _ = _frame_to_cyx(self._source._f.read_frame(self._seq), self._source.sizes)
+                return np.array(view[index], copy=True)
+
+        def __array__(self, dtype=None, copy=None):
+            arr = self[slice(None)]
+            return np.asarray(arr, dtype=dtype) if dtype is not None else arr
+
+    def frame_view(self, t: int, p: int, z: int):
+        """(C, H, W) lease-guarded view onto one plate frame. Valid until close."""
         if self._backend in ("czi", "lif"):
             return self.frame(t, p, z)
         with self._life:
             self._check_source()
             seq = self.seq(t, p, z)
-            view, _ = _frame_to_cyx(self._f.read_frame(seq), self.sizes)
-        return view
+        return self._LeasedFrame(self, seq)
 
     def _read_czi_frame(self, t: int, p: int, z: int) -> np.ndarray:
         from .czi import _read_subblock_window

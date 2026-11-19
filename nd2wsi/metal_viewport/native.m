@@ -16,6 +16,7 @@
 #define MEMORY_BUDGET (256ull * 1024 * 1024)
 #define MAX_REQUESTS 4
 #define MAX_BACKPRESSURE_RETRIES 5
+#define MAX_RECORDED_ACTIONS 20000
 
 static BOOL VPNumber(id value, double low, double high) {
     return [value isKindOfClass:NSNumber.class] &&
@@ -77,12 +78,23 @@ static BOOL VPStateValid(id state, double width, double height, NSUInteger chann
 // Validation ABI: pure metadata checks, no window, file access or pixel readback.
 API int nd2wsi_viewport_validate_contract(const char *metadata_json, const char *state_json) {
     @autoreleasepool {
-        if(!metadata_json)return 1;
-        id metadata=[NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:metadata_json] dataUsingEncoding:NSUTF8StringEncoding] options:NSJSONReadingFragmentsAllowed error:nil];
-        if(!VPMetadataValid(metadata))return 1;
-        if(!state_json)return 0;
-        id state=[NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:state_json] dataUsingEncoding:NSUTF8StringEncoding] options:NSJSONReadingFragmentsAllowed error:nil];
-        return VPStateValid(state,[metadata[@"width"] doubleValue],[metadata[@"height"] doubleValue],[metadata[@"channels"] count])?0:2;
+        @try {
+            if(!metadata_json)return 1;
+            NSString *metaText=[NSString stringWithUTF8String:metadata_json];
+            NSData *metaData=metaText?[metaText dataUsingEncoding:NSUTF8StringEncoding]:nil;
+            if(!metaData)return 1;
+            id metadata=[NSJSONSerialization JSONObjectWithData:metaData options:NSJSONReadingFragmentsAllowed error:nil];
+            if(!VPMetadataValid(metadata))return 1;
+            if(!state_json)return 0;
+            NSString *stateText=[NSString stringWithUTF8String:state_json];
+            NSData *stateData=stateText?[stateText dataUsingEncoding:NSUTF8StringEncoding]:nil;
+            if(!stateData)return 2;
+            id state=[NSJSONSerialization JSONObjectWithData:stateData options:NSJSONReadingFragmentsAllowed error:nil];
+            return VPStateValid(state,[metadata[@"width"] doubleValue],[metadata[@"height"] doubleValue],[metadata[@"channels"] count])?0:2;
+        } @catch (NSException *ex) {
+            (void)ex;
+            return 1;
+        }
     }
 }
 
@@ -161,7 +173,7 @@ API int nd2wsi_viewport_composite(const uint16_t *raw, uint32_t channels,
         if (!raw || !windows || !gammas || !colors || !visible || !rgb ||
             !width || !height || !channels || channels > MAX_CHANNELS ||
             width > 16384 || height > 16384 ||
-            (uint64_t)width * height * channels * 2 > MEMORY_BUDGET) {
+            (uint64_t)width * height * ((uint64_t)channels * 2 + 8) > MEMORY_BUDGET) {
             VPError(error, error_capacity, @"Invalid or over-budget validation input"); return 1;
         }
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -195,8 +207,11 @@ API int nd2wsi_viewport_composite(const uint16_t *raw, uint32_t channels,
         pass.colorAttachments[0].loadAction = MTLLoadActionClear;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLCommandQueue> queue = [device newCommandQueue];
-        id<MTLCommandBuffer> command = [queue commandBuffer];
-        id<MTLRenderCommandEncoder> encoder = [command renderCommandEncoderWithDescriptor:pass];
+        id<MTLCommandBuffer> command = queue ? [queue commandBuffer] : nil;
+        id<MTLRenderCommandEncoder> encoder = command ? [command renderCommandEncoderWithDescriptor:pass] : nil;
+        if (!queue || !command || !encoder) {
+            VPError(error, error_capacity, @"Metal command encoding failed"); return 4;
+        }
         [encoder setRenderPipelineState:pipeline];
         [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
         [encoder setFragmentBuffer:buffer offset:0 atIndex:0];
@@ -620,22 +635,27 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
 }
 - (void)fit:(id)sender {
     (void)sender; if(!self.ready)return;
+    double bw=self.view.bounds.size.width, bh=self.view.bounds.size.height;
+    if(!(bw>0 && bh>0 && self.imageWidth>0 && self.imageHeight>0))return;
     self.centerX=self.imageWidth/2; self.centerY=self.imageHeight/2;
-    self.zoom=fmin(self.view.bounds.size.width/self.imageWidth,self.view.bounds.size.height/self.imageHeight)*.96;
+    self.zoom=fmin(32.0,fmax(1e-12,fmin(bw/self.imageWidth,bh/self.imageHeight)*.96));
     [self viewportChanged:@"fit"];
 }
 - (void)zoomIn:(id)sender { (void)sender; [self zoomAt:NSMakePoint(NSMidX(self.view.bounds),NSMidY(self.view.bounds)) delta:.4]; }
 - (void)zoomOut:(id)sender { (void)sender; [self zoomAt:NSMakePoint(NSMidX(self.view.bounds),NSMidY(self.view.bounds)) delta:-.4]; }
 - (void)pan:(NSPoint)delta {
-    if(!self.ready)return; self.centerX-=delta.x/self.zoom; self.centerY+=delta.y/self.zoom;
+    if(!self.ready || !(self.zoom>0) || !isfinite(self.zoom))return;
+    self.centerX-=delta.x/self.zoom; self.centerY+=delta.y/self.zoom;
     self.centerX=fmax(0,fmin(self.imageWidth,self.centerX)); self.centerY=fmax(0,fmin(self.imageHeight,self.centerY));
     [self viewportChanged:@"pan"];
 }
 - (void)zoomAt:(NSPoint)point delta:(double)delta {
-    if(!self.ready)return;
+    if(!self.ready || !(self.zoom>0) || !isfinite(self.zoom) || !isfinite(delta))return;
+    double bw=self.view.bounds.size.width, bh=self.view.bounds.size.height;
+    if(!(bw>0 && bh>0 && self.imageWidth>0 && self.imageHeight>0))return;
     double px=point.x-NSMidX(self.view.bounds), py=NSMidY(self.view.bounds)-point.y;
     double worldX=self.centerX+px/self.zoom, worldY=self.centerY+py/self.zoom;
-    double minimum=fmin(self.view.bounds.size.width/self.imageWidth,self.view.bounds.size.height/self.imageHeight)*.1;
+    double minimum=fmax(1e-12,fmin(bw/self.imageWidth,bh/self.imageHeight)*.1);
     self.zoom=fmin(32,fmax(minimum,self.zoom*exp(delta)));
     self.centerX=worldX-px/self.zoom; self.centerY=worldY-py/self.zoom;
     [self viewportChanged:@"pointer_anchored_zoom"];
@@ -644,7 +664,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
     (void)sender; if(!self.ready)return;
     self.lastInput=CACurrentMediaTime(); self.actionID++; self.frameStreamed=NO;
     for(NSDictionary *item in self.wanted)if(!self.tiles[item[@"key"]])self.frameStreamed=YES;
-    [self.actions addObject:@{@"kind":@"display_only",@"action_id":[self actionToken],@"time":@(self.lastInput),@"request_count":@(self.requestCount),@"uploaded_bytes":@(self.uploadedBytes)}];
+    if(self.actions.count<MAX_RECORDED_ACTIONS)[self.actions addObject:@{@"kind":@"display_only",@"action_id":[self actionToken],@"time":@(self.lastInput),@"request_count":@(self.requestCount),@"uploaded_bytes":@(self.uploadedBytes)}];
     [self.view setNeedsDisplay:YES];
 }
 - (void)viewportChanged:(NSString *)action {
@@ -682,7 +702,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
         double db=pow(([b[@"tx"] doubleValue]+.5)*self.tileSize*ds-self.centerX,2)+pow(([b[@"ty"] doubleValue]+.5)*self.tileSize*ds-self.centerY,2);
         return da<db?NSOrderedAscending:da>db?NSOrderedDescending:NSOrderedSame;
     }];
-    [self.actions addObject:@{@"kind":action,@"action_id":[self actionToken],@"time":@(self.lastInput),@"center":@[@(self.centerX),@(self.centerY)],@"zoom":@(self.zoom),@"level":level[@"path"],@"required_tiles":@(self.wanted.count),@"class":self.frameStreamed?@"streamed":@"resident"}];
+    if(self.actions.count<MAX_RECORDED_ACTIONS)[self.actions addObject:@{@"kind":action,@"action_id":[self actionToken],@"time":@(self.lastInput),@"center":@[@(self.centerX),@(self.centerY)],@"zoom":@(self.zoom),@"level":level[@"path"],@"required_tiles":@(self.wanted.count),@"class":self.frameStreamed?@"streamed":@"resident"}];
     [self scheduleTiles]; [self.view setNeedsDisplay:YES];
 }
 - (BOOL)reserve:(uint64_t)bytes {
@@ -1035,7 +1055,7 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
         @"source":[self.metadata[@"source"] lastPathComponent]?:@"",@"device":self.device.name?:@"",
         @"unified_memory":@(self.device.hasUnifiedMemory),@"backend":self.backendMetrics?:@{},
         @"scope":@"Direct fluorescence display. Input includes source packing and shared-buffer copies plus possible HTTP/NSData copies; no production CPU pixel readback.",
-        @"viewport":@{@"points":@[@(self.view.bounds.size.width),@(self.view.bounds.size.height)],@"drawable_pixels":@[@(self.view.drawableSize.width),@(self.view.drawableSize.height)],@"center":@[@(self.centerX),@(self.centerY)],@"zoom":@(self.zoom),@"level":self.ready?self.levels[self.activeLevel][@"path"]:@""},
+        @"viewport":@{@"points":@[@(isfinite(self.view.bounds.size.width)?self.view.bounds.size.width:0),@(isfinite(self.view.bounds.size.height)?self.view.bounds.size.height:0)],@"drawable_pixels":@[@(isfinite(self.view.drawableSize.width)?self.view.drawableSize.width:0),@(isfinite(self.view.drawableSize.height)?self.view.drawableSize.height:0)],@"center":@[@(isfinite(self.centerX)?self.centerX:0),@(isfinite(self.centerY)?self.centerY:0)],@"zoom":@(isfinite(self.zoom)?self.zoom:0),@"level":self.ready?self.levels[self.activeLevel][@"path"]:@""},
         @"memory":@{@"tile_pipeline_budget_bytes":@(MEMORY_BUDGET),@"resident_bytes":@(self.residentBytes),@"inflight_reserved_bytes":@(self.pendingBytes),@"peak_resident_plus_inflight_reserved_bytes":@(self.peakBytes),@"scope":@"Raw tile buffers plus two-times HTTP in-flight payload reservation; excludes drawable textures, framework caches and backend process."},
         @"transfers":@{@"raw_tile_requests":@(self.requestCount),@"cancelled_requests":@(self.cancelledRequests),@"explicit_shared_buffer_input_copy_bytes":@(self.uploadedBytes),@"production_cpu_pixel_readbacks":@0,@"cpu_rgb_or_jpeg_frames":@0},
         @"backpressure":@{@"http_503_responses":@(self.backpressureResponses),@"retries_scheduled":@(self.backpressureRetries),@"exhausted_tile_retries":@(self.exhaustedRetries),@"max_retries_per_tile_generation":@(MAX_BACKPRESSURE_RETRIES),@"retry_delays_ms":@[@100,@200,@400,@800,@1600]},
@@ -1044,10 +1064,14 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
         @"bandwidth":@{@"measured":@NO,@"bytes_per_tile":[NSNull null],@"note":@"Software input-copy counters are not hardware system-memory bandwidth.",@"available_metal_counter_sets":counters},
         @"capture":self.capture,@"frames":self.frames,@"actions":self.actions,@"errors":self.errors,
         @"presented_frames":@(self.presentedCount),@"dropped_presented_callbacks":@(self.droppedCount),@"encoded_frames":@(self.encodeCount)};
-    NSError *error=nil;
-    NSData *data=[NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted|NSJSONWritingSortedKeys error:&error];
-    if(data)[data writeToFile:self.reportPath options:NSDataWritingAtomic error:&error];
-    if(error)fprintf(stderr,"Metal viewport report: %s\n",error.localizedDescription.UTF8String);
+    @try {
+        NSError *error=nil;
+        NSData *data=[NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted|NSJSONWritingSortedKeys error:&error];
+        if(data)[data writeToFile:self.reportPath options:NSDataWritingAtomic error:&error];
+        if(error)fprintf(stderr,"Metal viewport report: %s\n",error.localizedDescription.UTF8String);
+    } @catch (NSException *ex) {
+        fprintf(stderr,"Metal viewport report exception: %s\n",ex.reason.UTF8String?:"unknown");
+    }
 }
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;if(!self.internalClose)[self finishKind:@"closed" failure:nil reason:nil];
@@ -1056,25 +1080,34 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
 
 API int nd2wsi_viewport_run(const char *base_url,const char *session_json,const char *report_path) {
     @autoreleasepool {
-        if(!NSThread.isMainThread || !base_url || !session_json || !report_path)return 1;
-        NSString *base=[NSString stringWithUTF8String:base_url];
-        NSURL *url=[NSURL URLWithString:base];
-        // The launcher provides an unguessable loopback capability URL. Never
-        // fetch remote slide payloads or let a native window adopt another role.
-        if(![url.scheme isEqual:@"http"] || ![@[@"127.0.0.1",@"localhost",@"::1"] containsObject:url.host] || ![base hasSuffix:@"/"])return 2;
-        NSData *json=[[NSString stringWithUTF8String:session_json] dataUsingEncoding:NSUTF8StringEncoding];
-        NSDictionary *session=[NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
-        if(![session isKindOfClass:NSDictionary.class] || ![session[@"id"] isKindOfClass:NSString.class] || ![@[@"agent",@"user"] containsObject:session[@"role"]])return 3;
-        [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-        VPController *controller=[VPController new]; controller.baseURL=base;controller.session=session;
-        controller.reportPath=[NSString stringWithUTF8String:report_path]; NSApp.delegate=controller;
-        NSError *error=nil;
-        if(![controller open:&error]){
-            if(!controller.outcome)controller.outcome=[@{@"kind":@"fatal",@"failure_kind":@"renderer_initialization_failure",@"first_presented":@NO} mutableCopy];
-            [controller.network invalidateAndCancel];[controller saveReport];
-            fprintf(stderr,"Metal viewport: %s\n",error.localizedDescription.UTF8String?:"No unified-memory Metal device");return 4;
+        @try {
+            if(!NSThread.isMainThread || !base_url || !session_json || !report_path)return 1;
+            NSString *base=[NSString stringWithUTF8String:base_url];
+            NSString *reportPath=[NSString stringWithUTF8String:report_path];
+            NSString *sessionText=[NSString stringWithUTF8String:session_json];
+            if(!base || !reportPath || !sessionText)return 1;
+            NSURL *url=[NSURL URLWithString:base];
+            // The launcher provides an unguessable loopback capability URL. Never
+            // fetch remote slide payloads or let a native window adopt another role.
+            if(!url || ![url.scheme isEqual:@"http"] || ![@[@"127.0.0.1",@"localhost",@"::1"] containsObject:url.host] || ![base hasSuffix:@"/"])return 2;
+            NSData *json=[sessionText dataUsingEncoding:NSUTF8StringEncoding];
+            if(!json)return 3;
+            NSDictionary *session=[NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+            if(![session isKindOfClass:NSDictionary.class] || ![session[@"id"] isKindOfClass:NSString.class] || ![@[@"agent",@"user"] containsObject:session[@"role"]])return 3;
+            [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+            VPController *controller=[VPController new]; controller.baseURL=base;controller.session=session;
+            controller.reportPath=reportPath; NSApp.delegate=controller;
+            NSError *error=nil;
+            if(![controller open:&error]){
+                if(!controller.outcome)controller.outcome=[@{@"kind":@"fatal",@"failure_kind":@"renderer_initialization_failure",@"first_presented":@NO} mutableCopy];
+                [controller.network invalidateAndCancel];[controller saveReport];
+                fprintf(stderr,"Metal viewport: %s\n",error.localizedDescription.UTF8String?:"No unified-memory Metal device");return 4;
+            }
+            [NSApp activateIgnoringOtherApps:NO]; [NSApp run];
+            [controller saveReport]; return [controller.outcome[@"kind"] isEqual:@"fatal"]?5:0;
+        } @catch (NSException *ex) {
+            fprintf(stderr,"Metal viewport exception: %s\n",ex.reason.UTF8String?:"unknown");
+            return 5;
         }
-        [NSApp activateIgnoringOtherApps:NO]; [NSApp run];
-        [controller saveReport]; return [controller.outcome[@"kind"] isEqual:@"fatal"]?5:0;
     }
 }

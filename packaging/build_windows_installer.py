@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parents[1]
 APP = "nd2wsi-viewer"
 # Provenance and licences ship inside the runtime folder (see build_windows.py).
 ABOUT = "_internal/nd2wsi-viewer-about"
-DEFAULT_TIMESTAMP_URL = "http://timestamp.digicert.com"
+DEFAULT_TIMESTAMP_URL = "https://timestamp.digicert.com"
 TRUTHY_ENV = {"1", "true", "yes", "on"}
 RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
@@ -435,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     manifest_path = output.with_suffix(".payload.json")
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    bundled_webview2 = "_internal/webview2-runtime/msedgewebview2.exe" in files
     defines = {
         "APP_VERSION": version,
         "APP_VERSION_QUAD": version + ".0",
@@ -445,6 +446,8 @@ def main(argv: list[str] | None = None) -> int:
         "PAYLOAD_SIZE_KIB": str((sum((payload / n).stat().st_size for n in files) + 1023) // 1024),
         "WEBVIEW2_BOOTSTRAPPER": str(bootstrapper),
     }
+    if bundled_webview2:
+        defines["BUNDLED_WEBVIEW2"] = "1"
     if args.icon:
         defines["APP_ICON"] = str(args.icon.resolve(strict=True))
     compiler = str(args.makensis.resolve(strict=True))
@@ -489,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         "payload_manifest_sha256": sha256(manifest_path),
         "compiler_version": compiler_version,
         "compiler_sha256": sha256(Path(compiler)),
+        "bundled_webview2_runtime": bundled_webview2,
         "webview2_bootstrapper_sha256": args.webview2_sha256,
         "installer_source_sha256": source_hashes,
         "generated_include_sha256": include_hashes,

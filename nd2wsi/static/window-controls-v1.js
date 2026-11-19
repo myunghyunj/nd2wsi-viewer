@@ -64,6 +64,11 @@
         label.focus();
         event.stopPropagation();
       });
+      doc.addEventListener?.("pointerdown", (event) => {
+        if (menu.open && !menu.contains?.(event.target)) {
+          menu.open = false;
+        }
+      }, true);
     }
     let opening = false;
     const controller = {

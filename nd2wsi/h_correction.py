@@ -111,7 +111,7 @@ def _basic_reason(state: Any, method="h") -> str:
                     "requires spatial repetition within a stitched single-frame ND2 slide; "
                     "native plate frames remain unchanged.")
         path = state.source_path
-        if path is None or Path(path).suffix.lower() != ".nd2" or not Path(path).is_file():
+        if path is None or Path(path).suffix.lower() != ".nd2" or Path(path).is_symlink() or not Path(path).is_file():
             return "Shading Correction needs the original ND2 source"
         if meta.get("rgb"):
             return "Shading Correction requires scalar channels"
@@ -149,8 +149,12 @@ def _basic_reason(state: Any, method="h") -> str:
 
 
 def _source_stamp(path: Path) -> tuple[int, int, int, int]:
-    stat = path.stat()
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+    import stat as stat_mod
+
+    st = path.stat(follow_symlinks=False)
+    if stat_mod.S_ISLNK(st.st_mode):
+        raise UnsupportedCorrection("Shading Correction needs the original ND2 file, not a symlink")
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
 
 
 def _estimated_seconds(state: Any, method="h") -> int:
@@ -428,14 +432,16 @@ class ShadingCorrectionController:
     def status(self) -> dict:
         with self._lock:
             active = self._status["state"] in _ACTIVE
-        if not active and not self._closed and not (self._thread and self._thread.is_alive()):
+            can_refresh = not active and not self._closed and not (self._thread and self._thread.is_alive())
+        if can_refresh:
             refresh = getattr(self.state, "refresh_pyramid", None)
             if refresh is not None:
                 refresh()
         with self._lock:
             old_generation = self._status.get("generation")
             self._sync_committed()
-            if old_generation != self.state.generation and not active:
+            now_active = self._status["state"] in _ACTIVE
+            if old_generation != self.state.generation and not active and not now_active and not self._closed:
                 self.generation = self.state.generation
                 self._status.update(state="ready" if self._status["applied"] else "idle",
                                     reason="", pct=100 if self._status["applied"] else 0,

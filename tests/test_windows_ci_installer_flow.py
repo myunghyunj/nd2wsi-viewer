@@ -554,14 +554,13 @@ def test_verify_windows_installer_ps1_structure_ascii_and_smoke_snippet(tmp_path
     assert "-ArgumentList '/S'" in ps1
     assert "Local\\nd2wsi-viewer-Setup-current-user" in ps1
 
-    # Extract and execute the frozen -c Python snippet against this repository
-    match = re.search(r"\$pySnippet\s*=\s*((?:'[^']*'\s*\+?\s*)+)", ps1)
-    assert match is not None, "Could not locate $pySnippet in verify_windows_installer.ps1"
-    snippet = "".join(re.findall(r"'([^']*)'", match.group(1)))
+    # Verify the installer smoke uses --cli-self-check (never arbitrary -c exec)
+    assert "--cli-self-check" in ps1
+    assert "'-c'" not in ps1 and '"-c"' not in ps1
     report_path = tmp_path / "ometiff-cli-report.json"
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
     proc = subprocess.run(
-        [sys.executable, "-c", snippet, str(report_path)],
+        [sys.executable, "-m", "nd2wsi.app", "--cli-self-check", str(report_path)],
         cwd=tmp_path,
         env=env,
         capture_output=True,

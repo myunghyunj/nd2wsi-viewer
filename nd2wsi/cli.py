@@ -525,7 +525,18 @@ def _main(argv: list[str] | None = None) -> int:
                         print(f"would move {stray.name} -> {MANAGED_DIR}/{ANNOTATIONS_DIR}/")
                         continue
                     target.mkdir(parents=True, exist_ok=True)
-                    stray.rename(dest)
+                    try:
+                        os.link(stray, dest)
+                    except FileExistsError:
+                        print(f"kept {stray} (a copy already lives in the managed folder)")
+                        continue
+                    except OSError:
+                        if dest.exists() or dest.is_symlink():
+                            print(f"kept {stray} (a copy already lives in the managed folder)")
+                            continue
+                        stray.rename(dest)
+                    else:
+                        stray.unlink()
                     print(f"moved {stray.name} -> {MANAGED_DIR}/{ANNOTATIONS_DIR}/")
 
             caches = folder / MANAGED_DIR / "caches"
@@ -537,8 +548,14 @@ def _main(argv: list[str] | None = None) -> int:
                 for corpse in sorted(caches.glob("*.corrupt-*")) + sorted(
                     (folder / CACHE_DIR_NAME).glob("*.corrupt-*")
                 ):
-                    if corpse.is_file() or corpse.is_symlink():
-                        print(f"kept {corpse.name} (quarantined single files may contain preserved work; review explicitly)")
+                    try:
+                        expected = corpse.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        print(f"kept {corpse.name} ({exc})", file=sys.stderr)
+                        continue
+                    is_reparse = bool(getattr(expected, "st_file_attributes", 0) & 0x400)
+                    if not stat.S_ISDIR(expected.st_mode) or is_reparse:
+                        print(f"kept {corpse.name} (quarantined single files or links may contain preserved work; review explicitly)")
                         continue
                     if args.dry_run:
                         print(f"would remove {corpse.name}")
@@ -546,7 +563,6 @@ def _main(argv: list[str] | None = None) -> int:
                     # Quarantine keeps old stores whole because an older build
                     # may have put annotations inside; lift them out first.
                     try:
-                        expected = corpse.stat(follow_symlinks=False)
                         rescued = rescue_annotations(corpse, folder / MANAGED_DIR / ANNOTATIONS_DIR)
                         _delete_verified_cache_tree(corpse, expected)
                     except (OSError, ValueError) as exc:
