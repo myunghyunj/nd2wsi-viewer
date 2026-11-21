@@ -371,9 +371,12 @@ def install_sparkle_updater(
         if window is not None:
             def before_load(*_args):
                 main(card.before_load)
+            def page_loaded(*_args):
+                main(card.page_loaded)
             def end_page(*_args):
                 main(card.page_closed)
             window.events.before_load += before_load
+            window.events.loaded += page_loaded
             window.events.closed += end_page
         menu_item = _install_menu_item(controller)
         logger("Sparkle updater started")

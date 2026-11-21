@@ -444,7 +444,7 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
             native = slide.levels[source]
             if h * extra > native.height or w * extra > native.width:
                 raise NotImplementedError("SDPC overview would read a collapsed axis beyond its edge")
-            root[str(k)] = _SvsLevel(readers[source], h, w, extra, life)
+            root[str(k)] = _SvsLevel(readers[source], h, w, extra, life, verify=slide.check_source)
         meta = slide.info()
         src = PlaneSource(
             data=None, dtype=np.dtype(np.uint8), shape=(3, slide.height, slide.width),

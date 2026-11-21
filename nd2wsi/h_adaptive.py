@@ -363,9 +363,9 @@ def enumerate_all_lattice_cells(
         raise base.Unsupported("insufficient_BF_support")
     ph_y = basis[0, 0] * (yy_ov - 0.5) + basis[0, 1] * (xx_ov - 0.5)
     ph_x = basis[1, 0] * (yy_ov - 0.5) + basis[1, 1] * (xx_ov - 0.5)
-    r_min = max(0, int(np.floor(ph_y.min())))
+    r_min = int(np.floor(ph_y.min()))
     r_max = max(r_min, int(np.floor(ph_y.max())))
-    c_min = max(0, int(np.floor(ph_x.min())))
+    c_min = int(np.floor(ph_x.min()))
     c_max = max(c_min, int(np.floor(ph_x.max())))
     # Full-overview support coordinates belong only to discovery, not to the
     # retained-cell peak reserved by adaptive_workspace_plan.
@@ -1282,10 +1282,20 @@ def fit_adaptive_from_config(
         check()
         src_i = fit_indices.index(mapping[name])
         prof_by_grp = {}
-        for grp in ("train", "heldout_columns", "heldout_rows", "heldout_both"):
-            check()
-            reduced = profiles_complete[groups_arr == grp, src_i]
-            prof_by_grp[grp] = base.template(reduced, 1.8)
+        try:
+            for grp in ("train", "heldout_columns", "heldout_rows", "heldout_both"):
+                check()
+                reduced = profiles_complete[groups_arr == grp, src_i]
+                prof_by_grp[grp] = base.template(reduced, 1.8)
+        except base.Unsupported:
+            if name == "BF":
+                raise
+            templates_dict[name] = np.zeros(profiles_complete.shape[-1], dtype=np.float64)
+            template_reproducibility[name] = {
+                "scores": {"heldout_columns": None, "heldout_rows": None, "heldout_both": None},
+                "reproducible": False,
+            }
+            continue
         tr_prof = prof_by_grp["train"]
         scores = {
             grp: base.r2(prof_by_grp[grp], tr_prof)

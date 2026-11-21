@@ -658,6 +658,7 @@ function selectTabByIndex(index) {
   return true;
 }
 window.addEventListener("keydown", (event) => {
+  if ($("shading-confirm")?.open) return;
   const index = ShortcutRouter ? ShortcutRouter.tabIndexForEvent(event) : null;
   if (index === null || !slides[index]) return;
   event.preventDefault();
@@ -997,10 +998,19 @@ function reloadIfRestoredFromCache(event) {
 window.addEventListener("pageshow", reloadIfRestoredFromCache);
 
 function refresh(selectSid, beforeActivate) {
+  const seq = (refresh._seq = (refresh._seq || 0) + 1);
   return fetch("api/slides", { cache: "no-store" })
-    .then((response) => response.json())
+    .then(async (response) => {
+      if (response && response.ok === false) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (!data || !Array.isArray(data.slides)) {
+        throw new Error("Invalid slide list payload");
+      }
+      return data;
+    })
     .then((data) => {
-      slides = data.slides || [];
+      if (seq !== refresh._seq) return;
+      slides = data.slides;
       if (typeof beforeActivate === "function") beforeActivate();
       const openSids = new Set(slides.map((slide) => slide.sid));
       for (const [key, frame] of [...frames]) {
@@ -1039,7 +1049,10 @@ function refresh(selectSid, beforeActivate) {
         render();
       }
     })
-    .catch((error) => showError(`Could not refresh slides: ${error}`));
+    .catch((error) => {
+      if (seq !== refresh._seq) return;
+      showError(`Could not refresh slides: ${error}`);
+    });
 }
 
 function openMany(paths) {
@@ -1679,7 +1692,7 @@ function applyDisplayTransform(sid) {
 }
 
 function applyDisplayTransforms() {
-  if (compare.linkMode === "scale") return;
+  if (compare.linked && compare.linkMode === "scale") return;
   for (const sid of groupSids()) applyDisplayTransform(sid);
 }
 
@@ -2154,7 +2167,7 @@ function commitLandmarkEdit(editId) {
   }
   const next = {
     anchorSet: cloneValue(edit.anchorSet), anchorLandmarks: clonePoints(edit.anchorSet.points),
-    linked: compare.linked, pairs: nextPairs,
+    linked: compare.linked, linkMode: compare.linkMode, pairs: nextPairs,
   };
   clearPendingRequest();
   compare.committedGroup = next;
@@ -2934,6 +2947,13 @@ function panelShortcut(panel) {
 function receiveSceneSelected(senderSid, data) {
   if (!senderSid || quitPreparation || !data || typeof data.sid !== "string" ||
       !/^[A-Za-z0-9_-]{1,64}$/.test(data.sid)) {
+    if (senderSid && typeof postToSlide === "function") {
+      postToSlide(senderSid, {
+        nd2wsi: "scene-select-rejected",
+        version: VIEWPORT_PROTOCOL_VERSION,
+        sid: senderSid,
+      });
+    }
     return false;
   }
   const newSid = data.sid;
@@ -2987,6 +3007,7 @@ function receiveSceneSelected(senderSid, data) {
       })
       .catch(() => refresh(newSid));
   } else {
+    closeSenderTranslucent();
     if (oldIndex >= 0) {
       slides[oldIndex] = { ...slides[oldIndex], sid: newSid, name: newName || slides[oldIndex].name };
     }
@@ -3091,6 +3112,12 @@ $("compare-mirror-policy").onchange = (event) => {
 };
 
 window.addEventListener("keydown", (event) => {
+  if ($("shading-confirm")?.open) return;
+  if (event.key === "Escape" && !$("dropzone")?.hidden) {
+    event.preventDefault();
+    $("dropzone").hidden = true;
+    return;
+  }
   if (ShortcutRouter?.isShortcutHelpEvent?.(event)) {
     event.preventDefault();
     event.stopPropagation();
@@ -3232,6 +3259,11 @@ window.addEventListener("dragover", (event) => event.preventDefault());
 zone.addEventListener("dragleave", (event) => {
   if (event.target === zone) zone.hidden = true;
 });
+zone.addEventListener("pointerdown", () => {
+  if (!zone.hidden) zone.hidden = true;
+});
+window.addEventListener("dragend", () => { zone.hidden = true; });
+window.addEventListener("blur", () => { zone.hidden = true; });
 zone.addEventListener("drop", (event) => {
   event.preventDefault();
   zone.hidden = true;

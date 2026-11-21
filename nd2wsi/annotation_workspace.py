@@ -22,7 +22,19 @@ _READONLY_ERRNOS = (errno.EACCES, errno.EPERM, errno.EROFS)
 _MAX_ANNOTATION_BYTES = 64 * 1024 * 1024
 
 
+def _is_windows_reparse_point(st: os.stat_result) -> bool:
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
 def _read(path: Path) -> bytes | None:
+    try:
+        lstat = os.lstat(str(path))
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(lstat.st_mode) or _is_windows_reparse_point(lstat):
+        raise OSError(errno.ELOOP, "Refusing to read symlinked annotation sidecar")
+    if not stat.S_ISREG(lstat.st_mode):
+        raise OSError(errno.EINVAL, "Annotation sidecar is not a regular file")
     flags = (
         os.O_RDONLY
         | getattr(os, "O_BINARY", 0)
@@ -39,7 +51,11 @@ def _read(path: Path) -> bytes | None:
         raise
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or _is_windows_reparse_point(st)
+            or (st.st_ino != 0 and lstat.st_ino != 0 and (st.st_dev, st.st_ino) != (lstat.st_dev, lstat.st_ino))
+        ):
             raise OSError(errno.EINVAL, "Annotation sidecar is not a regular file")
         if st.st_size > _MAX_ANNOTATION_BYTES:
             raise OSError(errno.EFBIG, "Annotation sidecar exceeds size limit")

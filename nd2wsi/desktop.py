@@ -91,11 +91,19 @@ def main(argv=None):
     parser.add_argument("--handoff-check-report", type=Path)
     args, _ = parser.parse_known_args(arguments)
     if args.check_updates:
+        if os.environ.get("ND2WSI_DISABLE_UPDATES") == "1":
+            result = {
+                "ok": False,
+                "available": False,
+                "message": "Updates are disabled for this build.",
+            }
+            print(json.dumps(result, ensure_ascii=False))
+            return 1
         from .release_selection import check_for_updates
 
         result = check_for_updates()
         print(json.dumps(result, ensure_ascii=False))
-        if not result.get("available"):
+        if not result.get("available") or not result.get("ok"):
             from AppKit import NSAlert, NSApplication
 
             NSApplication.sharedApplication()
@@ -105,7 +113,9 @@ def main(argv=None):
             alert.runModal()
         return 0 if result.get("ok") else 1
     os.environ["ND2WSI_APP_NAME"] = "nd2wsi-viewer"
-    os.environ["ND2WSI_WINDOW_LAUNCHER"] = str(Path(__file__).resolve().parents[1] / "packaging" / "launch_rc.py")
+    launcher_rc = Path(__file__).resolve().parents[1] / "packaging" / "launch_rc.py"
+    if launcher_rc.is_file():
+        os.environ.setdefault("ND2WSI_WINDOW_LAUNCHER", str(launcher_rc))
     if args.session_root:
         os.environ["ND2WSI_WINDOW_SESSION_ROOT"] = str(args.session_root.expanduser().resolve())
     role = "agent" if args.agent_window else "user"
@@ -179,8 +189,9 @@ def main(argv=None):
         "user": prefix + ["--new-window"],
         "agent": prefix + ["--agent-window"],
         "standard": prefix + browser_arguments,
-        "updates": prefix + ["--check-updates"],
     }
+    if role != "agent" and os.environ.get("ND2WSI_DISABLE_UPDATES") != "1":
+        commands["updates"] = prefix + ["--check-updates"]
     try:
         result = launcher.main(native_arguments, role=role, window_commands=commands,
                                return_result=True, open_attempt_id=attempt,

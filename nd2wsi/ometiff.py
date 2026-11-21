@@ -575,7 +575,7 @@ def _normalize_dtype(raw_dtype: Any) -> np.dtype:
     if dt in (np.dtype(np.uint8), np.dtype(np.uint16), np.dtype(np.float32), np.dtype(np.float64)):
         return dt
     if np.issubdtype(dt, np.integer):
-        if dt.itemsize <= 1:
+        if dt.itemsize <= 1 and np.issubdtype(dt, np.unsignedinteger):
             return np.dtype(np.uint8)
         if dt.itemsize <= 2 and np.issubdtype(dt, np.unsignedinteger):
             return np.dtype(np.uint16)
@@ -664,8 +664,10 @@ def _parse_series_axes(
             f"TIFF series combining C={c_dim} and S={s_dim} is not supported"
         )
 
-    samples_raw = s_dim if has_s else c_dim
-    if has_s and not has_c:
+    use_s = has_s and (not has_c or s_dim > 1)
+    use_c = has_c and not use_s
+    samples_raw = s_dim if use_s else (c_dim if use_c else 1)
+    if use_s:
         if is_photo_rgb and s_dim in (3, 4):
             rgb = True
             n_c = 3
@@ -680,7 +682,7 @@ def _parse_series_axes(
         else:
             rgb = False
             n_c = s_dim
-    elif has_c and not has_s:
+    elif use_c:
         if c_dim in (3, 4) and is_photo_rgb and len(ome_chans) <= 1:
             rgb = True
             n_c = 3
@@ -1031,7 +1033,10 @@ def is_ometiff_stack(path: str | Path, *, series: int = 0) -> bool:
                 and STACK_MIN_DIM <= layout.height <= STACK_MAX_DIM
             ):
                 return False
-            return layout.width * layout.height <= STACK_MAX_FRAME_PX
+            if layout.width * layout.height > STACK_MAX_FRAME_PX:
+                return False
+            frame_bytes = layout.width * layout.height * max(1, layout.n_c) * layout.dtype.itemsize
+            return 0 < frame_bytes <= _MAX_STACK_FRAME_BYTES
     except Exception:
         return False
 
@@ -1049,6 +1054,36 @@ def _page_kf(page: Any) -> Any:
     if hasattr(page, "aspage"):
         return page.aspage()
     return page
+
+
+def _box_mean_axes(block: np.ndarray, ky: int, kx: int, out_dtype: np.dtype) -> np.ndarray:
+    """Box-average the last two axes by ``(ky, kx)``, preserving each axis independently."""
+    ky = max(1, int(ky))
+    kx = max(1, int(kx))
+    if ky == 1 and kx == 1:
+        return np.ascontiguousarray(block, dtype=out_dtype)
+    h, w = block.shape[-2], block.shape[-1]
+    if ky == kx and h >= ky and w >= kx:
+        return np.ascontiguousarray(box_mean(block, ky, out_dtype))
+    ey = min(ky, h)
+    ex = min(kx, w)
+    oh = h // ey
+    ow = w // ex
+    view = block[..., : oh * ey, : ow * ex]
+    dt = np.dtype(out_dtype)
+    acc_dtype = (
+        np.float64
+        if block.dtype == np.dtype(np.float64)
+        or dt == np.dtype(np.float64)
+        or (np.issubdtype(block.dtype, np.integer) and block.dtype.itemsize >= 4)
+        or (np.issubdtype(dt, np.integer) and dt.itemsize >= 4)
+        else np.float32
+    )
+    mean = view.reshape((*block.shape[:-2], oh, ey, ow, ex)).mean(axis=(-3, -1), dtype=acc_dtype)
+    if np.issubdtype(dt, np.integer):
+        info = np.iinfo(dt)
+        return np.ascontiguousarray(np.clip(np.rint(mean), info.min, info.max).astype(dt))
+    return np.ascontiguousarray(mean.astype(dt))
 
 
 def _decode_page_segment(page: Any, raw_bytes: bytes, seg: int, tables: dict[str, Any], out_dtype: np.dtype) -> np.ndarray:
@@ -1071,6 +1106,13 @@ def _contig_tile_reader(page: Any, fd: int, cache: _TileCache, tag: Any, out_dty
     h, w = int(page.imagelength), int(page.imagewidth)
     th, tw = int(page.tilelength), int(page.tilewidth)
     samples = int(page.samplesperpixel)
+    if th <= 0 or tw <= 0 or samples <= 0:
+        raise ValueError(f"invalid TIFF tile geometry ({tw}x{th}x{samples})")
+    raw_item = max(np.dtype(page.dtype).itemsize, np.dtype(out_dtype).itemsize)
+    if th * tw * samples * raw_item > _MAX_SEGMENT_BYTES:
+        raise ValueError(
+            f"TIFF tile decoded size ({th * tw * samples * raw_item} B) exceeds safety limit"
+        )
     across = -(-w // tw)
     offsets = page.dataoffsets
     counts = page.databytecounts
@@ -1086,7 +1128,7 @@ def _contig_tile_reader(page: Any, fd: int, cache: _TileCache, tag: Any, out_dty
         if hit is not None:
             return hit
         seg = ty * across + tx
-        if seg >= len(counts) or counts[seg] == 0:
+        if seg >= len(counts) or seg >= len(offsets) or counts[seg] == 0:
             block = np.zeros((keep_samples, th, tw), dtype=out_dtype)
         else:
             raw = _checked_read_segment(fd, file_size, offsets[seg], counts[seg], seg)
@@ -1129,6 +1171,13 @@ def _planar_tile_reader(
     page0 = _page_kf(pages[0])
     h, w = int(page0.imagelength), int(page0.imagewidth)
     th, tw = int(page0.tilelength), int(page0.tilewidth)
+    if th <= 0 or tw <= 0:
+        raise ValueError(f"invalid TIFF tile geometry ({tw}x{th})")
+    raw_item = max(np.dtype(page0.dtype).itemsize, np.dtype(out_dtype).itemsize)
+    if th * tw * raw_item > _MAX_SEGMENT_BYTES:
+        raise ValueError(
+            f"TIFF tile decoded size ({th * tw * raw_item} B) exceeds safety limit"
+        )
     ny = -(-h // th)
     nx = -(-w // tw)
     tiles_per_plane = ny * nx
@@ -1157,7 +1206,7 @@ def _planar_tile_reader(
             seg = ty * nx + tx
         offsets = page.dataoffsets
         counts = page.databytecounts
-        if seg >= len(counts) or counts[seg] == 0:
+        if seg >= len(counts) or seg >= len(offsets) or counts[seg] == 0:
             block = np.zeros((th, tw), dtype=out_dtype)
         else:
             raw = _checked_read_segment(fd, file_size, offsets[seg], counts[seg], seg)
@@ -1199,20 +1248,32 @@ class _OmeTiledLevel:
         extra: int,
         life: _Lifecycle,
         dtype: np.dtype,
+        src_h: int | None = None,
+        src_w: int | None = None,
     ):
         self._read = reader_fn
         self.shape = (n_c, h, w)
         self.dtype = np.dtype(dtype)
         self._extra = int(extra)
+        self._src_h = int(src_h) if src_h is not None else h * int(extra)
+        self._src_w = int(src_w) if src_w is not None else w * int(extra)
         self._life = life
 
     def __getitem__(self, idx: Any) -> np.ndarray:
         cs, y0, y1, x0, x1 = _parse_cyx_index(idx, self.shape)
         e = self._extra
+        ky = min(e, self._src_h)
+        kx = min(e, self._src_w)
         with self._life:
-            block = self._read(cs, y0 * e, y1 * e, x0 * e, x1 * e)
-        if e > 1 and y1 > y0 and x1 > x0:
-            block = box_mean(block, e, self.dtype)
+            block = self._read(
+                cs,
+                y0 * ky,
+                min(self._src_h, y1 * ky),
+                x0 * kx,
+                min(self._src_w, x1 * kx),
+            )
+        if (ky > 1 or kx > 1) and y1 > y0 and x1 > x0:
+            block = _box_mean_axes(block, ky, kx, self.dtype)
         return block
 
 
@@ -1234,16 +1295,19 @@ class _CoarseMemoLevel:
                 c, h, w = self.shape
                 f = self._factor
                 fh, fw = self._finer.shape[1], self._finer.shape[2]
+                ky = min(f, fh)
+                kx = min(f, fw)
                 memo = np.zeros((c, h, w), dtype=self.dtype)
                 for r0 in range(0, h, _MEMO_BAND_ROWS):
                     r1 = min(h, r0 + _MEMO_BAND_ROWS)
-                    fy0, fy1 = r0 * f, min(fh, r1 * f)
-                    fx1 = min(fw, w * f)
+                    fy0, fy1 = r0 * ky, min(fh, r1 * ky)
+                    fx1 = min(fw, w * kx)
+                    if fy1 <= fy0 or fx1 <= 0:
+                        continue
                     band = np.asarray(self._finer[:, fy0:fy1, 0:fx1])
-                    if fy1 - fy0 >= f and fx1 >= f:
-                        reduced = box_mean(band, f, self.dtype)
-                        rh, rw = reduced.shape[-2], reduced.shape[-1]
-                        memo[:, r0 : r0 + rh, :rw] = reduced
+                    reduced = _box_mean_axes(band, ky, kx, self.dtype)
+                    rh, rw = reduced.shape[-2], reduced.shape[-1]
+                    memo[:, r0 : r0 + rh, :rw] = reduced
                 self._memo = memo
             return self._memo
 
@@ -1278,14 +1342,7 @@ class _MemoryPyramidLevel:
         ky = min(d, bh)
         kx = min(d, bw)
         raw = self._base[cs, y0 * ky : min(bh, y1 * ky), x0 * kx : min(bw, x1 * kx)]
-        if ky == d and kx == d and raw.shape[-2] >= d and raw.shape[-1] >= d:
-            return np.ascontiguousarray(box_mean(raw, d, self.dtype))
-        # Narrow edge axis already collapsed to 1 px
-        mean = raw.astype(np.float32).mean(axis=(-2, -1), keepdims=True)
-        mean = np.broadcast_to(mean, (*raw.shape[:-2], y1 - y0, x1 - x0))
-        if np.issubdtype(self.dtype, np.integer):
-            return np.rint(mean).astype(self.dtype)
-        return mean.astype(self.dtype)
+        return _box_mean_axes(raw, ky, kx, self.dtype)
 
     def _whole(self) -> np.ndarray:
         with self._lock:
@@ -1354,7 +1411,8 @@ def _read_untiled_page_rows(
     counts = page.databytecounts
     planar = int(getattr(kf, "planarconfig", 1) or 1)
     samples_in_strip = 1 if planar == 2 else int(getattr(kf, "samplesperpixel", 1) or 1)
-    raw_dt = np.dtype(kf.dtype)
+    byteorder = getattr(getattr(kf, "parent", None), "byteorder", "=") or "="
+    raw_dt = np.dtype(kf.dtype).newbyteorder(byteorder)
     bps = getattr(kf, "bitspersample", None)
     bps_tuple = (bps,) if isinstance(bps, int) else tuple(bps or ())
     direct_uncompressed = (
@@ -1376,7 +1434,7 @@ def _read_untiled_page_rows(
         seg = strip_base + s
         sy0 = max(cy0, s * rps)
         sy1 = min(cy1, (s + 1) * rps, h)
-        if sy1 <= sy0 or seg >= len(counts) or counts[seg] == 0:
+        if sy1 <= sy0 or seg >= len(counts) or seg >= len(offsets) or counts[seg] == 0:
             continue
         sh = min(rps, h - s * rps)
         if direct_uncompressed and int(counts[seg]) >= sh * row_bytes:
@@ -1391,6 +1449,11 @@ def _read_untiled_page_rows(
                 )
                 continue
 
+        decoded_strip_bytes = sh * w * samples_in_strip * max(raw_dt.itemsize, np.dtype(out_dtype).itemsize)
+        if decoded_strip_bytes > _MAX_SEGMENT_BYTES:
+            raise ValueError(
+                f"TIFF strip {seg} decoded size ({decoded_strip_bytes} B) exceeds safety limit"
+            )
         key = (tag, "strip", seg)
         strip_cyx = cache.get(key)
         if strip_cyx is None:
@@ -1531,17 +1594,26 @@ def _untiled_window_reader_for(
 
     # 2. Single-IFD contiguous uncompressed hyperstack (e.g., ImageJ raw dataoffset)
     dataoffset = getattr(series, "dataoffset", None)
+    bps0 = getattr(page0, "bitspersample", None)
+    bps0_tuple = (bps0,) if isinstance(bps0, int) else tuple(bps0 or ())
     if (
         dataoffset is not None
         and lead_axes
         and int(getattr(page0, "compression", 1) or 1) == 1
+        and int(getattr(page0, "predictor", 1) or 1) == 1
+        and int(getattr(page0, "fillorder", 1) or 1) == 1
         and layout.raw_dtype != np.dtype(np.bool_)
+        and bool(bps0_tuple)
+        and all(int(b) == layout.raw_dtype.itemsize * 8 for b in bps0_tuple)
     ):
         frame_axes = axes[len(lead_axes) :]
         frame_shape = shape[len(lead_shape) :]
         elem_bytes = int(math.prod(frame_shape)) * layout.raw_dtype.itemsize
+        byteorder = getattr(getattr(series, "parent", None), "byteorder", "=") or "="
+        disk_dt = layout.raw_dtype.newbyteorder(byteorder)
+        file_size = os.fstat(fd).st_size
         if frame_axes == "YX" and "C" in lead_axes and frame_shape == (h, w):
-            row_bytes = w * layout.raw_dtype.itemsize
+            row_bytes = w * disk_dt.itemsize
 
             def _read_hyper_c(cs: Any, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
                 selected = np.arange(layout.n_c)[cs]
@@ -1561,8 +1633,8 @@ def _untiled_window_reader_for(
                         ]
                         idx_flat = int(np.ravel_multi_index(coords, lead_shape))
                         off = int(dataoffset) + idx_flat * elem_bytes + cy0 * row_bytes
-                        buf = read_at(fd, n_rows * row_bytes, off)
-                        arr_p = np.frombuffer(buf, dtype=layout.raw_dtype).reshape(n_rows, w)
+                        buf = _checked_read_segment(fd, file_size, off, n_rows * row_bytes, idx_flat)
+                        arr_p = np.frombuffer(buf, dtype=disk_dt).reshape(n_rows, w)
                         out[slot, cy0 - y0 : cy1 - y0, cx0 - x0 : cx1 - x0] = np.asarray(
                             arr_p[:, cx0:cx1], dtype=layout.dtype
                         )
@@ -1626,16 +1698,7 @@ class _LazyUntiledLevel:
         for ry0 in range(y0, y1, band_out):
             ry1 = min(y1, ry0 + band_out)
             raw = reader(cs, ry0 * ky, min(bh, ry1 * ky), x0 * kx, min(bw, x1 * kx))
-            if ky == d and kx == d and raw.shape[-2] >= d and raw.shape[-1] >= d:
-                part = np.ascontiguousarray(box_mean(raw, d, self.dtype))
-            else:
-                mean = raw.astype(np.float32).mean(axis=(-2, -1), keepdims=True)
-                mean = np.broadcast_to(mean, (*raw.shape[:-2], ry1 - ry0, x1 - x0))
-                part = (
-                    np.rint(mean).astype(self.dtype)
-                    if np.issubdtype(self.dtype, np.integer)
-                    else mean.astype(self.dtype)
-                )
+            part = _box_mean_axes(raw, ky, kx, self.dtype)
             out[..., ry0 - y0 : ry1 - y0, :] = part
         return out
 
@@ -1668,7 +1731,7 @@ def _series_2d_to_cyx(series: Any, layout: _ParsedSeriesLayout, *, z_idx: int = 
     """Decode one 2D (C, H, W) plane from a TiffPageSeries in native byte order."""
     axes = layout.axes
     shape = layout.shape
-    page0 = series.pages[0]
+    page0 = _page_kf(series.pages[0])
     page_ndim = len(page0.shape)
     lead_axes = axes[: len(axes) - page_ndim]
     lead_shape = shape[: len(shape) - page_ndim]
@@ -1709,11 +1772,25 @@ def _series_2d_to_cyx(series: Any, layout: _ParsedSeriesLayout, *, z_idx: int = 
 
     # Single-IFD contiguous hyperstack (e.g., ImageJ raw dataoffset) or single-page 2D
     dataoffset = getattr(series, "dataoffset", None)
-    if dataoffset is not None and lead_axes and int(getattr(page0, "compression", 1)) == 1:
+    bps0 = getattr(page0, "bitspersample", None)
+    bps0_tuple = (bps0,) if isinstance(bps0, int) else tuple(bps0 or ())
+    if (
+        dataoffset is not None
+        and lead_axes
+        and int(getattr(page0, "compression", 1) or 1) == 1
+        and int(getattr(page0, "predictor", 1) or 1) == 1
+        and int(getattr(page0, "fillorder", 1) or 1) == 1
+        and layout.raw_dtype != np.dtype(np.bool_)
+        and bool(bps0_tuple)
+        and all(int(b) == layout.raw_dtype.itemsize * 8 for b in bps0_tuple)
+    ):
         frame_axes = axes[len(lead_axes) :]
         frame_shape = shape[len(lead_shape) :]
         elem_bytes = int(math.prod(frame_shape)) * layout.raw_dtype.itemsize
-        fd = series.parent.filehandle._fh.fileno()
+        byteorder = getattr(getattr(series, "parent", None), "byteorder", "=") or "="
+        disk_dt = layout.raw_dtype.newbyteorder(byteorder)
+        fh = series.parent.filehandle
+        file_size = fh.size
         if "C" in lead_axes:
             planes = []
             for ci in range(layout.n_c):
@@ -1722,14 +1799,30 @@ def _series_2d_to_cyx(series: Any, layout: _ParsedSeriesLayout, *, z_idx: int = 
                     for ax in lead_axes
                 ]
                 idx_flat = int(np.ravel_multi_index(coords, lead_shape))
-                buf = read_at(fd, elem_bytes, int(dataoffset) + idx_flat * elem_bytes)
-                arr_p = np.frombuffer(buf, dtype=layout.raw_dtype).reshape(frame_shape)
+                off = int(dataoffset) + idx_flat * elem_bytes
+                if off < 0 or elem_bytes <= 0 or elem_bytes > _MAX_STACK_FRAME_BYTES or off + elem_bytes > file_size:
+                    raise ValueError(
+                        f"TIFF contiguous plane ({elem_bytes} B @ {off}) exceeds file bounds"
+                    )
+                fh.seek(off)
+                buf = fh.read(elem_bytes)
+                if len(buf) != elem_bytes:
+                    raise ValueError("truncated TIFF contiguous plane read")
+                arr_p = np.frombuffer(buf, dtype=disk_dt).reshape(frame_shape)
                 planes.append(np.asarray(arr_p, dtype=layout.dtype))
             return np.ascontiguousarray(np.stack(planes, axis=0))
         coords = [t_idx if ax == "T" else z_idx if ax == "Z" else 0 for ax in lead_axes]
         idx_flat = int(np.ravel_multi_index(coords, lead_shape))
-        buf = read_at(fd, elem_bytes, int(dataoffset) + idx_flat * elem_bytes)
-        raw = np.frombuffer(buf, dtype=layout.raw_dtype).reshape(frame_shape)
+        off = int(dataoffset) + idx_flat * elem_bytes
+        if off < 0 or elem_bytes <= 0 or elem_bytes > _MAX_STACK_FRAME_BYTES or off + elem_bytes > file_size:
+            raise ValueError(
+                f"TIFF contiguous plane ({elem_bytes} B @ {off}) exceeds file bounds"
+            )
+        fh.seek(off)
+        buf = fh.read(elem_bytes)
+        if len(buf) != elem_bytes:
+            raise ValueError("truncated TIFF contiguous plane read")
+        raw = np.frombuffer(buf, dtype=disk_dt).reshape(frame_shape)
         return _page_array_to_cyx(raw, frame_axes, layout)
 
     # Fallback: decode full series and index (t, z)
@@ -1751,11 +1844,18 @@ def _series_2d_to_cyx(series: Any, layout: _ParsedSeriesLayout, *, z_idx: int = 
 def _page_array_to_cyx(arr: np.ndarray, axes: str, layout: _ParsedSeriesLayout) -> np.ndarray:
     if arr.dtype == np.bool_:
         arr = arr.astype(np.uint8) * 255
-    # Squeeze any unit axes outside C/S/Y/X
+    # Squeeze any unit axes outside C/S/Y/X, plus any singleton C/S when both exist.
     for i in range(len(axes) - 1, -1, -1):
         if axes[i] not in ("C", "S", "Y", "X") and arr.shape[i] == 1:
             arr = np.squeeze(arr, axis=i)
             axes = axes[:i] + axes[i + 1 :]
+    if "C" in axes and "S" in axes:
+        c_pos = axes.index("C")
+        s_pos = axes.index("S")
+        drop = s_pos if arr.shape[s_pos] == 1 else (c_pos if arr.shape[c_pos] == 1 else None)
+        if drop is not None:
+            arr = np.squeeze(arr, axis=drop)
+            axes = axes[:drop] + axes[drop + 1 :]
     if axes == "YX":
         cyx = arr[None, :, :]
     elif axes in ("CYX", "SYX"):
@@ -1936,7 +2036,15 @@ def open_direct(
                 if e <= MAX_EXTRA:
                     h_k, w_k = max(1, sh // e), max(1, sw // e)
                     levels[str(k)] = _OmeTiledLevel(
-                        reader_fn, layout.n_c, h_k, w_k, e, life, layout.dtype
+                        reader_fn,
+                        layout.n_c,
+                        h_k,
+                        w_k,
+                        e,
+                        life,
+                        layout.dtype,
+                        src_h=sh,
+                        src_w=sw,
                     )
                     served.append((h_k, w_k))
                 else:
@@ -1999,7 +2107,8 @@ def open_direct(
         plane_bytes = layout.n_c * H * W * layout.dtype.itemsize
         eager_ceiling = _resolve_untiled_eager_max_bytes(eager_max_bytes)
 
-        raw_bps = getattr(_page_kf(base_series.pages[0]), "bitspersample", None)
+        page0_kf = _page_kf(base_series.pages[0])
+        raw_bps = getattr(page0_kf, "bitspersample", None)
         if isinstance(raw_bps, (tuple, list)):
             raw_bps = raw_bps[0] if raw_bps else None
 
@@ -2012,8 +2121,16 @@ def open_direct(
             selection_meta["t"] = t_sel
 
         # Large untiled 2D TIFFs (> eager_ceiling, default 64 MiB): stream strips/rows
-        # lazily on demand via pread rather than materializing hundreds of MB in RAM.
-        if plane_bytes > eager_ceiling:
+        # lazily on demand via pread rather than materializing hundreds of MB in RAM,
+        # provided compressed strips fit within the strip cache (avoiding repeated
+        # full-image decompression on single-strip compressed TIFFs).
+        comp0 = int(getattr(page0_kf, "compression", 1) or 1)
+        rps0 = max(1, min(int(getattr(page0_kf, "rowsperstrip", H) or H), H))
+        planar0 = int(getattr(page0_kf, "planarconfig", 1) or 1)
+        spp0 = 1 if planar0 == 2 else int(getattr(page0_kf, "samplesperpixel", 1) or 1)
+        strip_bytes0 = rps0 * W * spp0 * max(layout.raw_dtype.itemsize, layout.dtype.itemsize)
+        can_lazy_stream = (comp0 == 1) or (strip_bytes0 <= _MAX_CACHED_STRIP_BYTES)
+        if plane_bytes > eager_ceiling and can_lazy_stream:
             if fd < 0:
                 fd = os.open(str(path), os.O_RDONLY | BINARY)
             ident = path.stat().st_mtime_ns
@@ -2202,6 +2319,7 @@ class _BaseInteractiveStackSource:
         self._io_lock = threading.Lock()
         self._closed = False
         self._close_event = threading.Event()
+        self._fg_lock = threading.Lock()
         self._fg = 0
         self._bg_tls = threading.local()
         self._inflight_lock = threading.Lock()
@@ -2346,7 +2464,9 @@ class _BaseInteractiveStackSource:
                 if hit is not None:
                     return hit
             fg_delta = 0 if getattr(self._bg_tls, "active", False) else 1
-            self._fg += fg_delta
+            if fg_delta:
+                with self._fg_lock:
+                    self._fg += fg_delta
             try:
                 cyx = self._read_plane_cyx(t, p, z)
                 cyx = np.ascontiguousarray(cyx)
@@ -2354,7 +2474,9 @@ class _BaseInteractiveStackSource:
                     _STACK_FRAME_CACHE.put(key, cyx)
                 return cyx
             finally:
-                self._fg -= fg_delta
+                if fg_delta:
+                    with self._fg_lock:
+                        self._fg -= fg_delta
                 if leader:
                     with self._inflight_lock:
                         self._inflight_frames.pop(tpz, None)
@@ -2483,11 +2605,13 @@ class _BaseInteractiveStackSource:
         win: str | None = None,
         col: str | None = None,
     ) -> bytes:
-        self._fg += 1
+        with self._fg_lock:
+            self._fg += 1
         try:
             region = self.reduced(t, p, z, k)
         finally:
-            self._fg -= 1
+            with self._fg_lock:
+                self._fg -= 1
         windows, colors = render.display_params(self.attrs)
         if col and not self.rgb:
             colors = _apply_col_override(colors, col)
@@ -2689,6 +2813,16 @@ class OmeTiffStackSource(_BaseInteractiveStackSource):
                 raise ValueError(f"series {self.series_index} out of range (0..{len(grouped) - 1})")
             self._series, _lvs, ome_rec = grouped[self.series_index]
             self._layout = _parse_series_axes(self._series, ome_rec, is_qptiff_container=is_qp)
+            frame_bytes = (
+                self._layout.width
+                * self._layout.height
+                * max(1, self._layout.n_c)
+                * self._layout.dtype.itemsize
+            )
+            if frame_bytes <= 0 or frame_bytes > _MAX_STACK_FRAME_BYTES:
+                raise ValueError(
+                    f"TIFF stack plane size ({frame_bytes} B) exceeds safety limit ({_MAX_STACK_FRAME_BYTES} B)"
+                )
 
             self.T = max(1, int(self._layout.n_t))
             self.P = 1

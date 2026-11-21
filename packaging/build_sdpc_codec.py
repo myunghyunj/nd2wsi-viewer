@@ -92,6 +92,14 @@ def download(source: dict[str, str], directory: Path, *, sleep=time.sleep) -> Pa
                 print(f"Download failed ({exc}); retrying in {delay} s", flush=True)
                 sleep(delay)
                 continue
+            if sha256(partial) != source["sha256"]:
+                partial.unlink(missing_ok=True)
+                if attempt == DOWNLOAD_ATTEMPTS:
+                    raise RuntimeError(f"Source checksum mismatch: {path}")
+                delay = DOWNLOAD_BACKOFF[min(attempt - 1, len(DOWNLOAD_BACKOFF) - 1)]
+                print(f"Download checksum mismatch; retrying in {delay} s", flush=True)
+                sleep(delay)
+                continue
             partial.replace(path)
             break
     if sha256(path) != source["sha256"]:
@@ -221,7 +229,8 @@ def main() -> None:
     build_env = build / "python-build"
     venv.EnvBuilder(with_pip=True).create(build_env)
     python = str(python_at(build_env))
-    run([python, "-m", "pip", "install", "--disable-pip-version-check", *BUILD_REQUIREMENTS, repair_requirement], env=env)
+    pip_env = dict(env, PIP_CONFIG_FILE=os.devnull)
+    run([python, "-m", "pip", "install", "--isolated", "--disable-pip-version-check", *BUILD_REQUIREMENTS, repair_requirement], env=pip_env)
     raw = output / "unrepaired-wheel"
     raw.mkdir()
     build_pyav(pyav, prefix, python, raw, args.jobs, env, windows=system == "Windows")

@@ -304,7 +304,11 @@ def is_plate_file(path: str | Path) -> bool:
                 if (getattr(f.attributes, "compressionType", None) or "none") != "none":
                     return False
                 sizes = dict(f.sizes)
-                area = int(sizes.get("Y", 0)) * int(sizes.get("X", 0))
+                h = int(sizes.get("Y", 0))
+                w = int(sizes.get("X", 0))
+                if not (THUMB_K <= h <= CZI_LIF_PLATE_MAX_DIM and THUMB_K <= w <= CZI_LIF_PLATE_MAX_DIM):
+                    return False
+                area = h * w
                 if area <= 0 or area > PLATE_MAX_FRAME_PX:
                     return False
                 loops = sizes.get("T", 1) * sizes.get("P", 1) * sizes.get("Z", 1)
@@ -1806,6 +1810,7 @@ class PlateSource:
         self._last_prefetch_tpz: tuple[int, int, int] | None = None
         self._zpf_dir = 1
         self._fd = -1
+        self._fg_lock = threading.Lock()
         self._fg = 0  # foreground reads in flight; the prefetch worker yields to them
         self._f: Any = None
         suffix = self.path.suffix.lower()
@@ -2419,26 +2424,22 @@ class PlateSource:
                     return hit
             fg_delta = 0 if getattr(self._bg_tls, "active", False) else 1
             try:
-                if self._backend == "czi":
-                    self._fg += fg_delta
-                    try:
+                if fg_delta:
+                    with self._fg_lock:
+                        self._fg += fg_delta
+                try:
+                    if self._backend == "czi":
                         cyx = self._read_czi_frame(t_i, p_i, z_i)
-                    finally:
-                        self._fg -= fg_delta
-                elif self._backend == "lif":
-                    self._fg += fg_delta
-                    try:
+                    elif self._backend == "lif":
                         cyx = self._read_lif_frame(t_i, p_i, z_i)
-                    finally:
-                        self._fg -= fg_delta
-                else:
-                    seq = self.seq(t_i, p_i, z_i)
-                    self._fg += fg_delta
-                    try:
+                    else:
+                        seq = self.seq(t_i, p_i, z_i)
                         raw = self._read_raw(seq)
-                    finally:
-                        self._fg -= fg_delta
-                    cyx, _ = _frame_to_cyx(raw, self.sizes)
+                        cyx, _ = _frame_to_cyx(raw, self.sizes)
+                finally:
+                    if fg_delta:
+                        with self._fg_lock:
+                            self._fg -= fg_delta
                 cyx = np.ascontiguousarray(cyx)
                 if not self._closed:
                     _FRAME_CACHE.put(key, cyx)
@@ -2578,11 +2579,13 @@ class PlateSource:
         win: str | None = None,
         col: str | Sequence[str | None] | None = None,
     ) -> bytes:
-        self._fg += 1
+        with self._fg_lock:
+            self._fg += 1
         try:
             region = self.reduced(t, p, z, k)
         finally:
-            self._fg -= 1
+            with self._fg_lock:
+                self._fg -= 1
         windows, colors = render.display_params(self.attrs, col=col)
         windows, gammas = render.parse_windows(win, windows)
         img = render.composite(region, channels, windows, colors, self.rgb, gammas)

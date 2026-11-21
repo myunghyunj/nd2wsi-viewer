@@ -392,6 +392,9 @@ class UpdateCardSession:
                 "window.nd2wsiUpdateCard?.ready===true ? window.nd2wsiUpdateCard.pageId : null",
                 lambda answer: self._choose(token, answer))
         wrapped = list(args)
+        if self.mode == "probing" and selector in PHASES:
+            for prior in self.replies:
+                prior.retire()
         if selector in BLOCKS:
             index, default, optional = BLOCKS[selector]
             wrapped[index] = Reply(args[index], default, optional=optional)
@@ -599,20 +602,33 @@ class UpdateCardSession:
         self.later(PAGE_TIMEOUT, lambda: self._finish_handoff(token, handoff_id, None))
 
     def before_load(self):
-        """Re-bind the card after an in-window shell handoff; otherwise close the page."""
+        """Keep the session alive during an announced handoff; otherwise close the page."""
+        if self.closed or self.token is None:
+            return
+        if self._handing_off or self.mode == "probing":
+            # WKWebView fires before_load before inject_pywebview defines
+            # window.pywebview on the new document. Wait for page_loaded /
+            # page_ready (bounded by the PAGE_TIMEOUT handoff timer).
+            return
+        self.page_closed()
+
+    def page_loaded(self):
+        """Probe the newly loaded page after pywebview bridge injection completes."""
         if self.closed or self.token is None:
             return
         if self._handing_off or self.mode == "probing":
             token, handoff_id = self.token, self._handoff_id
             self.channel.submit(
                 "window.nd2wsiUpdateCard?.ready===true ? window.nd2wsiUpdateCard.pageId : null",
-                lambda answer: self._finish_handoff(token, handoff_id, answer),
+                lambda answer: (
+                    self._finish_handoff(token, handoff_id, answer)
+                    if isinstance(answer, str) and 0 < len(answer) <= 128
+                    else None
+                ),
             )
-            return
-        self.page_closed()
 
     def page_ready(self, page_id):
-        if (not self.closed and self.token is not None and self._handing_off
+        if (not self.closed and self.token is not None and (self._handing_off or self.mode == "probing")
                 and isinstance(page_id, str) and 0 < len(page_id) <= 128):
             self._finish_handoff(self.token, self._handoff_id, page_id)
 
@@ -643,7 +659,7 @@ class UpdateCardSession:
         self._handing_off = False
         self._handoff_id += 1
         self.events = []
-        for reply in self.replies:
+        for reply in list(self.replies):
             if reply.default is None:
                 reply.retire()  # closing a window must never retry a refused quit
             else:

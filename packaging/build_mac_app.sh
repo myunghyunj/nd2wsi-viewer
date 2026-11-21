@@ -97,6 +97,7 @@ echo "==> pyinstaller"
 
 echo "==> document types (Finder Open With)"
 "$PY" - "$OUT/$APPNAME.app/Contents/Info.plist" "$REPO/pyproject.toml" "$HERE/macos_bundle_identity.py" << 'PLISTEOF'
+import os
 import plistlib
 import re
 import runpy
@@ -123,7 +124,10 @@ info["CFBundleShortVersionString"] = base
 info["CFBundleVersion"] = bundle
 info["ND2WSIPackageVersion"] = version
 info["ND2WSISdpcBundled"] = True
-info["ND2WSIDevelopmentOnly"] = False
+info["ND2WSIDevelopmentOnly"] = (
+    os.environ.get("ND2WSI_SKIP_UPDATER") == "1"
+    or os.environ.get("ND2WSI_SKIP_SMOKE") == "1"
+)
 identity_helper = sys.argv[3] if len(sys.argv) > 3 else Path(sys.argv[2]).parent / "packaging/macos_bundle_identity.py"
 identity = runpy.run_path(str(identity_helper))["bundle_identity"](Path(sys.argv[2]).parent)
 info["CFBundleName"] = identity["bundle_name"]

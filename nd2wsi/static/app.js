@@ -345,6 +345,7 @@ async function init() {
   document.title = info.name + " — nd2wsi-viewer";
   $("file-name").textContent = info.name;
   fillContextBadges(info);
+  wireEarlyInputGuards();
   wireScenePicker();
   $("plane-note").textContent = planeNote(info);
 
@@ -383,6 +384,64 @@ async function init() {
       }
     }
     setAnnStatus("Annotation locked: source file missing");
+  }
+}
+
+function wireEarlyInputGuards() {
+  if (!state.quitBlockersWired) {
+    state.quitBlockersWired = true;
+    for (const kind of ["pointerdown", "keydown", "beforeinput", "wheel"]) {
+      window.addEventListener(kind, (event) => {
+        if (!state.quitPreparing && !state.sceneSwitching) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }, true);
+    }
+  }
+  if (!state.modalKeyGuardWired) {
+    state.modalKeyGuardWired = true;
+    window.addEventListener("keydown", (ev) => {
+      const lutDialog = typeof $ === "function" ? $("lut-dialog") : null;
+      if (lutDialog?.open) {
+        // Keep all viewer/plate/compare shortcuts blocked while the native
+        // LUT <dialog> is open, while allowing typing, Tab, Enter, and Escape
+        // inside the dialog itself.
+        if (!lutDialog.contains?.(ev.target) && ev.key !== "Escape" && ev.key !== "Tab") {
+          ev.preventDefault();
+        }
+        ev.stopImmediatePropagation();
+        return;
+      }
+      const shortcutModal = typeof $ === "function" ? $("shortcuts-modal") : null;
+      if (shortcutModal && !shortcutModal.hidden) {
+        const shortcuts = window.Nd2ShortcutRouter;
+        if (ev.key === "Escape" || shortcuts?.isShortcutHelpEvent?.(ev)) {
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+          if (typeof setShortcutModalOpen === "function") setShortcutModalOpen(false);
+          else shortcutModal.hidden = true;
+          return;
+        }
+        if (ev.key === "Tab") {
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+          $("shortcuts-close")?.focus?.({ preventScroll: true });
+          return;
+        }
+        if (shortcuts?.isNewWindowShortcut?.(ev)) return;
+        if ((ev.key === "Enter" || ev.key === " ") &&
+            ev.target?.closest?.("#shortcuts-modal button, #shortcuts-modal a")) {
+          ev.stopImmediatePropagation();
+          return;
+        }
+        if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(ev.key)) {
+          ev.stopImmediatePropagation();
+          return;
+        }
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+      }
+    }, true);
   }
 }
 
@@ -648,7 +707,7 @@ function setScenePickerOpen(open) {
 
 async function selectScene(seriesIndex) {
   const info = state.info;
-  if (!info || state.quitPreparing) return false;
+  if (!info || state.quitPreparing || state.sceneSwitching) return false;
   const currentIndex = Number.isInteger(info.seriesIndex)
     ? info.seriesIndex : Number(info.selection?.p || 0);
   if (!Number.isInteger(seriesIndex) || seriesIndex < 0 || seriesIndex === currentIndex) {
@@ -656,6 +715,7 @@ async function selectScene(seriesIndex) {
     return false;
   }
   const btn = $("scene-picker-btn");
+  state.sceneSwitching = true;
   setScenePickerOpen(false);
   if ($("ann-editor") && !$("ann-editor").hidden) closeEditor(true);
   state.cancelToolDrag?.();
@@ -664,15 +724,24 @@ async function selectScene(seriesIndex) {
     btn.disabled = true;
     btn.textContent = `Opening ${seriesIndex + 1} / ${info.seriesCount}…`;
   }
-  try {
+  const flushDirtyState = async () => {
     if (typeof annotationStore !== "undefined" && annotationStore?.flushForUpdate) {
       await annotationStore.flushForUpdate();
     } else if (typeof saveAnnotations === "function" && state.annDirty) {
       await saveAnnotations();
+      if (state.annDirty) {
+        throw new Error("Could not save unsaved annotations before switching series");
+      }
     }
     if (state.lutPersistence?.isDirty?.()) {
       await state.lutPersistence.flush();
+      if (state.lutPersistence?.isDirty?.()) {
+        throw new Error("Could not save LUT adjustments before switching series");
+      }
     }
+  };
+  try {
+    await flushDirtyState();
     const response = await fetch("api/select-scene", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -682,6 +751,14 @@ async function selectScene(seriesIndex) {
     if (!response.ok || data?.ok === false || (!data?.sid && !data?.url)) {
       throw new Error(data?.error || `HTTP ${response.status}`);
     }
+    if (state.quitPreparing) {
+      state.sceneSwitching = false;
+      renderScenePicker(info);
+      return false;
+    }
+    // Re-flush after opening the target scene in case any programmatic or
+    // in-flight mutation dirtied annotations/LUTs while the scene opened.
+    await flushDirtyState();
     const targetUrl = resolveSceneUrl(data);
     if (!targetUrl) {
       throw new Error("Invalid scene target URL");
@@ -700,6 +777,7 @@ async function selectScene(seriesIndex) {
     }
     return true;
   } catch (error) {
+    state.sceneSwitching = false;
     showToast("Could not switch series: " + (error?.message || error));
     renderScenePicker(info);
     return false;
@@ -2060,10 +2138,17 @@ function updateScalebar(iz) {
   if (umPerScreenPx > 0) {
     const target = 110 * umPerScreenPx; // aim for a ~110 px bar
     const nice = niceLength(target);
-    shown = {
-      display: "", width: nice / umPerScreenPx + "px",
-      label: nice >= 1000 ? nice / 1000 + " mm" : nice + " µm",
-    };
+    if (nice > 0) {
+      const label = nice >= 1000
+        ? `${Number((nice / 1000).toPrecision(12))} mm`
+        : nice < 0.1
+          ? `${Number((nice * 1000).toPrecision(12))} nm`
+          : `${Number(nice.toPrecision(12))} µm`;
+      shown = {
+        display: "", width: nice / umPerScreenPx + "px",
+        label,
+      };
+    }
   }
   const bar = $("scalebar");
   if (shown.display !== scalebarShown.display) bar.style.display = shown.display;
@@ -2073,12 +2158,17 @@ function updateScalebar(iz) {
 }
 
 function niceLength(um) {
+  if (!Number.isFinite(um) || um <= 0) return 0;
   const pows = [1, 2, 5];
-  let best = 1;
-  for (let e = -1; e <= 5; e++) {
+  const baseExp = Math.floor(Math.log10(um));
+  let best = Number(`1e${baseExp}`);
+  if (!Number.isFinite(best) || best <= 0 || best > um) {
+    best = Number(`1e${baseExp - 1}`);
+  }
+  for (let e = baseExp - 1; e <= baseExp + 1; e++) {
     for (const p of pows) {
-      const v = p * Math.pow(10, e);
-      if (v <= um) best = v;
+      const v = Number(`${p}e${e}`);
+      if (Number.isFinite(v) && v > 0 && v <= um && v > best) best = v;
     }
   }
   return best;
@@ -3086,7 +3176,7 @@ function moveAnnotation(id, dx, dy) {
     return false;
   }
   const a = state.annotations.find((item) => item.id === id);
-  if (!a || (!Number.isFinite(dx) && !Number.isFinite(dy)) || (dx === 0 && dy === 0)) return false;
+  if (!a || !Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) return false;
   const maxW = Number(state.info?.width) || Infinity;
   const maxH = Number(state.info?.height) || Infinity;
   if (a.type === "pin") {
@@ -3262,7 +3352,7 @@ function cancelUpdatePreparation(requestId) {
   updateAnnotationRecoveryNotice();
   // Keep in-flight saves and failed snapshots intact. If saving failed while
   // preparation had cancelled the debounce, ordinary editing can retry it.
-  if (state.annDirty && !annotationRecoveryDrafts()?.every(annotationDraftAccepted)) scheduleAnnSave();
+  if (state.annDirty && !annotationRecoveryDrafts()) scheduleAnnSave();
   return true;
 }
 
@@ -3816,9 +3906,9 @@ function wireAnnotationPointer() {
       window.removeEventListener("pointermove", onMove, true);
       window.removeEventListener("pointerup", onUp, true);
       window.removeEventListener("pointercancel", onCancel, true);
-      hit.removeEventListener?.("lostpointercapture", onCancel);
+      layer.removeEventListener?.("lostpointercapture", onCancel);
       if (pointerId != null) {
-        try { hit.releasePointerCapture?.(pointerId); } catch (_) { /* optional */ }
+        try { layer.releasePointerCapture?.(pointerId); } catch (_) { /* optional */ }
       }
       if (activeDragCancel === abortDrag) activeDragCancel = null;
     };
@@ -3844,7 +3934,7 @@ function wireAnnotationPointer() {
       if (!dragging) {
         dragging = true;
         if (pointerId != null) {
-          try { hit.setPointerCapture?.(pointerId); } catch (_) { /* optional */ }
+          try { layer.setPointerCapture?.(pointerId); } catch (_) { /* optional */ }
         }
         const editorEl = typeof $ === "function" ? $("ann-editor") : null;
         if (editorEl && !editorEl.hidden) closeEditor(false);
@@ -3908,7 +3998,7 @@ function wireAnnotationPointer() {
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
     window.addEventListener("pointercancel", onCancel, true);
-    hit.addEventListener?.("lostpointercapture", onCancel);
+    layer.addEventListener?.("lostpointercapture", onCancel);
   });
   state.cancelAnnotationDrag = () => activeDragCancel?.();
 }
@@ -5937,11 +6027,25 @@ function wireCompareRelay() {
           state.viewportRelay.commandGate.matchesLocal(event.data)) {
         applyOrientationShortcut(event.data.action);
       }
+    } else if (event.data.nd2wsi === "scene-select-rejected") {
+      if (!event.data.sid || event.data.sid === currentSlideSid()) {
+        state.sceneSwitching = false;
+        renderScenePicker(state.info);
+      }
     }
   });
   for (const kind of ["pointerdown", "keydown", "beforeinput"]) {
+    if (state.quitBlockersWired) break;
     window.addEventListener(kind, (event) => {
-      if (!state.quitPreparing) return;
+      if (!state.quitPreparing && !state.sceneSwitching) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+  }
+  if (!state.quitBlockersWired) {
+    state.quitBlockersWired = true;
+    window.addEventListener("wheel", (event) => {
+      if (!state.quitPreparing && !state.sceneSwitching) return;
       event.preventDefault();
       event.stopImmediatePropagation();
     }, true);
@@ -6857,6 +6961,7 @@ function plateFrameChanged() {
 }
 
 function setPlateFocus(p) {
+  if (state.quitPreparing || state.sceneSwitching) return;
   const pl = state.plate;
   const info = state.info.plate;
   const numeric = p === null || p === undefined ? null : Number(p);
@@ -7048,8 +7153,12 @@ function wirePlateKeys() {
   // command keys, alignment and a linked compare (whose arrows nudge) keep
   // their meaning.
   window.addEventListener("keydown", (ev) => {
+    if (state.quitPreparing || state.sceneSwitching) return;
     const pl = state.plate;
     if (!pl) return;
+    if (typeof $ === "function" && ($("lut-dialog")?.open || ($("shortcuts-modal") && !$("shortcuts-modal").hidden))) {
+      return;
+    }
     const shortcuts = window.Nd2ShortcutRouter;
     if (shortcuts && shortcuts.isTypingEvent(ev)) return;
     if (!shortcuts && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
@@ -7207,6 +7316,8 @@ function wireKeys() {
   window.addEventListener("keydown", (ev) => {
     const shortcuts = window.Nd2ShortcutRouter;
     if (ev.defaultPrevented) return;
+    const lutDialog = typeof $ === "function" ? $("lut-dialog") : null;
+    if (lutDialog?.open) return;
     const shortcutModal = typeof $ === "function" ? $("shortcuts-modal") : null;
     if (shortcutModal && !shortcutModal.hidden) {
       if (ev.key === "Escape" || shortcuts?.isShortcutHelpEvent?.(ev)) {
@@ -7221,6 +7332,15 @@ function wireKeys() {
         ev.preventDefault();
         ev.stopPropagation?.();
         $("shortcuts-close")?.focus?.({ preventScroll: true });
+        return;
+      }
+      if ((ev.key === "Enter" || ev.key === " ") &&
+          ev.target?.closest?.("#shortcuts-modal button, #shortcuts-modal a")) {
+        ev.stopPropagation?.();
+        return;
+      }
+      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(ev.key)) {
+        ev.stopPropagation?.();
         return;
       }
       if (!shortcuts?.isNewWindowShortcut?.(ev)) {

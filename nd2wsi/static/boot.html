@@ -66,13 +66,19 @@
 </div></div>
 <button id="update" type="button">Check for Updates…</button>
 <script>
-  let busy = false, polling = null, queuedDrops = [], dragDepth = 0;
+  let busy = false, polling = null, pollGen = 0, queuedDrops = [], dragDepth = 0;
   const drop = document.getElementById('drop');
   function setStatus(t){ document.getElementById('status').textContent = t || ''; }
   const bar = document.getElementById('bar'), fill = document.getElementById('fill');
   function poll(){
-    pywebview.api.status().then(s => { if (s) setStatus(s); });
+    if (!busy || !window.pywebview?.api) return;
+    const gen = pollGen;
+    pywebview.api.status().then(s => {
+      if (!busy || gen !== pollGen) return;
+      if (s) setStatus(s);
+    }).catch(() => {});
     pywebview.api.progress().then(f => {
+      if (!busy || gen !== pollGen) return;
       const pctEl = document.getElementById('pct');
       if (f === 0) {            /* alive, before the first real tick */
         bar.style.display = 'block';
@@ -86,10 +92,10 @@
         fill.style.width = p + '%';
         pctEl.textContent = p + ' %';
       } else { bar.style.display = 'none'; fill.classList.remove('indet'); pctEl.textContent = ''; }
-    });
+    }).catch(() => {});
   }
-  function begin(){ clearInterval(polling); busy = true; polling = setInterval(poll, 400); }
-  function end(msg){ clearInterval(polling); polling = null; busy = false; setStatus(msg || ''); bar.style.display='none'; document.getElementById('pct').textContent=''; }
+  function begin(){ pollGen += 1; clearInterval(polling); busy = true; polling = setInterval(poll, 400); }
+  function end(msg){ pollGen += 1; clearInterval(polling); polling = null; busy = false; setStatus(msg || ''); bar.style.display='none'; document.getElementById('pct').textContent=''; }
   async function drainQueued(lastUrl){
     let url = lastUrl;
     while (queuedDrops.length) {
@@ -114,12 +120,15 @@
       .catch(e => end('failed: ' + e));
   }
   document.getElementById('recent-files').addEventListener('click', ev => ev.stopPropagation());
-  drop.addEventListener('click', () => { if (!busy) go(pywebview.api.open_slide()); });
+  drop.addEventListener('click', () => {
+    if (!busy && window.pywebview?.api?.open_slide) go(pywebview.api.open_slide());
+  });
   // pywebview 6 delivers dropped-file paths through a Python-side DOM
   // handler, which calls __pydrop with the real path. The JS listeners
   // below only run the visuals.
   window.__pydrop_multi = paths => {
     if (busy) { queuedDrops.push(...(paths || [])); return; }
+    if (!window.pywebview?.api?.open_paths) return;
     go(pywebview.api.open_paths(paths));
   };
   window.__pydrop = path => window.__pydrop_multi([path]);

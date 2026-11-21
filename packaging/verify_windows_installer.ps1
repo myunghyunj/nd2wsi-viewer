@@ -517,6 +517,10 @@ function Assert-Installation {
     $markerText = Get-Content -LiteralPath $marker -Raw
     if ($markerText -notmatch ('(?m)^ProductId=' + [regex]::Escape($productId) + '\s*$') -or $markerText -notmatch ('(?m)^Version=' + [regex]::Escape($script:version) + '\s*$')) { throw 'The installer ownership marker is incorrect.' }
     if (-not (Test-LiteralEntry $uninstaller)) { throw 'The installed uninstaller is missing.' }
+    if ($script:expectSigned) {
+        $uninstSig = Get-AuthenticodeSignature -LiteralPath $uninstaller
+        if ($uninstSig.Status -ne 'Valid') { throw "Installed Uninstall.exe does not have a valid Authenticode signature: $($uninstSig.Status)" }
+    }
     Assert-Shortcut $appShortcut $installedExe
     Assert-Shortcut $uninstallShortcut $uninstaller
     Assert-Shortcut $desktopShortcut $installedExe

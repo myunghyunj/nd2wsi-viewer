@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,65 @@ from .cache import (
     fingerprints_match,
     quick_fingerprint,
 )
+from .platform_io import BINARY
+
+# Maximum size of any single cache entry during directory-to-single-file packing
+# (256 MiB accommodates large manifests/chunks while refusing unbounded reads).
+_MAX_PACK_ENTRY_BYTES = 256 * 1024 * 1024
+
+
+def _is_reparse_point(st: os.stat_result) -> bool:
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
+def _check_real_dir(path: Path) -> None:
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise ValueError(f"not a real cache directory: {path}") from exc
+    if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISDIR(st.st_mode):
+        raise ValueError(f"not a real cache directory: {path}")
+
+
+def _read_regular_entry(path: Path) -> tuple[os.stat_result, bytes]:
+    """Read a regular, non-symlink, non-reparse cache entry safely without TOCTOU."""
+    lstat = os.lstat(path)
+    if stat.S_ISLNK(lstat.st_mode) or _is_reparse_point(lstat) or not stat.S_ISREG(lstat.st_mode):
+        raise ValueError(f"not a regular cache entry: {path}")
+    flags = (
+        os.O_RDONLY
+        | BINARY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or _is_reparse_point(st)
+            or (
+                st.st_ino != 0
+                and lstat.st_ino != 0
+                and (st.st_dev, st.st_ino) != (lstat.st_dev, lstat.st_ino)
+            )
+        ):
+            raise ValueError(f"not a regular cache entry: {path}")
+        if st.st_size > _MAX_PACK_ENTRY_BYTES:
+            raise ValueError(f"cache entry exceeds size limit: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_PACK_ENTRY_BYTES:
+                raise ValueError(f"cache entry exceeds size limit: {path}")
+            chunks.append(chunk)
+        return st, b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def cache_entries(container: Path) -> list[tuple[str, Path]]:
@@ -31,16 +91,22 @@ def cache_entries(container: Path) -> list[tuple[str, Path]]:
     Unknown files, symlinks and annotations make this operation fail closed.
     Finder AppleDouble metadata is ignored, not interpreted as image data.
     """
-    if container.is_symlink() or not container.is_dir():
-        raise ValueError(f"not a real cache directory: {container}")
+    _check_real_dir(container)
     entries = []
-    for base, dirs, files in os.walk(container, followlinks=False):
+
+    def _raise_walk_error(exc: OSError) -> None:
+        raise exc
+
+    for base, dirs, files in os.walk(container, followlinks=False, onerror=_raise_walk_error):
         for name in dirs:
-            if (Path(base) / name).is_symlink():
-                raise ValueError(f"symlink in cache: {Path(base) / name}")
+            subdir = Path(base) / name
+            sub_st = os.lstat(subdir)
+            if stat.S_ISLNK(sub_st.st_mode) or _is_reparse_point(sub_st):
+                raise ValueError(f"symlink or junction in cache: {subdir}")
         for name in sorted(files):
             path = Path(base) / name
-            if path.is_symlink() or not path.is_file():
+            file_st = os.lstat(path)
+            if stat.S_ISLNK(file_st.st_mode) or _is_reparse_point(file_st) or not stat.S_ISREG(file_st.st_mode):
                 raise ValueError(f"not a regular cache entry: {path}")
             if name.startswith("._") or name == ".DS_Store":
                 continue
@@ -85,7 +151,7 @@ def pack_directory(
     if target.exists() or target.is_symlink():
         raise FileExistsError(target)
     entries = cache_entries(container)
-    original_manifest = (container / MANIFEST_NAME).read_bytes()
+    _, original_manifest = _read_regular_entry(container / MANIFEST_NAME)
     manifest = json.loads(original_manifest)
     if not isinstance(manifest, dict) or not manifest.get("complete"):
         raise ValueError(f"incomplete cache: {container}")
@@ -138,8 +204,7 @@ def pack_directory(
         # One transaction avoids a journal sync per tiny metadata/chunk entry.
         with store.batch():
             for index, (key, path) in enumerate(entries):
-                st = path.stat()
-                original_payload = path.read_bytes()
+                st, original_payload = _read_regular_entry(path)
                 if key == MANIFEST_NAME and original_payload != original_manifest:
                     raise ValueError(f"source cache manifest changed while packing: {path}")
                 original_stats[key] = (
@@ -163,10 +228,10 @@ def pack_directory(
             payload = store.read_bytes(key)
             if (len(payload), hashlib.sha256(payload).hexdigest()) != expected[key]:
                 raise ValueError(f"entry verification failed: {key}")
-            st = path.stat()
+            st, current_payload = _read_regular_entry(path)
             if (
                 st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
-                hashlib.sha256(path.read_bytes()).hexdigest(),
+                hashlib.sha256(current_payload).hexdigest(),
             ) != original_stats[key]:
                 raise ValueError(f"source cache changed while packing: {path}")
             if on_progress:

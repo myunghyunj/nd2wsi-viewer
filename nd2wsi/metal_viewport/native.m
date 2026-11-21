@@ -451,14 +451,22 @@ static NSDictionary *VPSummary(NSArray<NSNumber *> *values) {
 - (void)standardViewer:(id)sender { (void)sender; [self finishKind:@"handoff" failure:nil reason:nil]; }
 - (void)checkUpdates:(id)sender { (void)sender; [self launchWindowCommand:@"updates"]; }
 - (void)closeOwnWindow:(id)sender { (void)sender; [self.window performClose:nil]; }
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    (void)sender;
+    [self finishKind:@"closed" failure:nil reason:nil];
+    return NSTerminateCancel;
+}
 - (void)installMenus {
-    if(![self.session[@"window_commands"] count])return;
+    NSDictionary *commands=self.session[@"window_commands"];
+    if(![commands count])return;
     NSMenu *main=[NSMenu new];
     NSMenuItem *appItem=[NSMenuItem new]; [main addItem:appItem];
     NSMenu *appMenu=[[NSMenu alloc] initWithTitle:@"nd2wsi-viewer"]; appItem.submenu=appMenu;
-    NSMenuItem *update=[[NSMenuItem alloc] initWithTitle:@"Check for Updates…" action:@selector(checkUpdates:) keyEquivalent:@""];
-    update.target=self; [appMenu addItem:update];
-    [appMenu addItem:NSMenuItem.separatorItem];
+    if([commands[@"updates"] isKindOfClass:NSArray.class] && [commands[@"updates"] count]) {
+        NSMenuItem *update=[[NSMenuItem alloc] initWithTitle:@"Check for Updates…" action:@selector(checkUpdates:) keyEquivalent:@""];
+        update.target=self; [appMenu addItem:update];
+        [appMenu addItem:NSMenuItem.separatorItem];
+    }
     NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@"Quit nd2wsi-viewer" action:@selector(closeOwnWindow:) keyEquivalent:@"q"];
     quit.target=self; [appMenu addItem:quit];
     NSMenuItem *fileItem=[NSMenuItem new]; [main addItem:fileItem];

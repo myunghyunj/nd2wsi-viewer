@@ -68,6 +68,8 @@ class _ShutdownOwnership:
         self._lock = threading.Lock()
         self._holder: tuple[object, str] | None = None
         self._torn_down = False
+        self._browser_lock = threading.Lock()
+        self._browser_tail: threading.Event | None = None
 
     def mark_torn_down(self) -> None:
         with self._lock:
@@ -131,7 +133,6 @@ class UpdateShutdownCoordinator:
         self._wire_request_id = ""
         self._teardown_started = False
         self._install_guard = None
-        self._browser_tail: threading.Event | None = None  # the latest browser call's completion
 
     def prepare_for_update(self, completion, failure) -> bool:
         with self._lock:
@@ -226,15 +227,27 @@ class UpdateShutdownCoordinator:
         rather than one per retry. Returns the call's ``done`` event and the
         list its exception is appended to, or None when it was dropped.
         """
-        with self._lock:
-            previous = self._browser_tail
-        if previous is not None and not queue:
-            deadline = time.monotonic() + wait
-            while not previous.wait(min(0.05, max(0.0, deadline - time.monotonic()))):
-                if (cancelled is not None and cancelled.is_set()) or time.monotonic() >= deadline:
-                    return None
+        ownership = self._ownership()
         done = threading.Event()
         errors: list[Exception] = []
+        deadline = time.monotonic() + wait
+        if queue:
+            with ownership._browser_lock:
+                previous = ownership._browser_tail
+                ownership._browser_tail = done
+        else:
+            while True:
+                with ownership._browser_lock:
+                    previous = ownership._browser_tail
+                    if previous is None or previous.is_set():
+                        ownership._browser_tail = done
+                        break
+                if (cancelled is not None and cancelled.is_set()) or time.monotonic() >= deadline:
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                previous.wait(min(0.05, remaining))
 
         def call():
             try:
@@ -249,9 +262,11 @@ class UpdateShutdownCoordinator:
             finally:
                 done.set()
 
-        threading.Thread(target=call, name="window-evaluate-js", daemon=True).start()
-        with self._lock:
-            self._browser_tail = done
+        try:
+            threading.Thread(target=call, name="window-evaluate-js", daemon=True).start()
+        except BaseException:
+            done.set()
+            raise
         return done, errors
 
     def _browser_call(self, script: str, what: str, *, queue: bool = False) -> None:

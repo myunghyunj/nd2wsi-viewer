@@ -17,6 +17,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
@@ -364,18 +365,36 @@ def sign_windows_binary(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", type=Path, required=True)
-    parser.add_argument("--expected-sha256", required=True)
-    parser.add_argument("--makensis", type=Path, required=True)
+    parser.add_argument("--sign-file", type=Path,
+                        help="Sign one PE binary (e.g. from NSIS !uninstfinalize) using signing env vars and exit")
+    parser.add_argument("--sign-description", default=f"{APP} Uninstaller")
+    parser.add_argument("--archive", type=Path)
+    parser.add_argument("--expected-sha256")
+    parser.add_argument("--makensis", type=Path)
     parser.add_argument("--nsisdir", type=Path)
-    parser.add_argument("--webview2-bootstrapper", type=Path, required=True)
-    parser.add_argument("--webview2-sha256", required=True)
+    parser.add_argument("--webview2-bootstrapper", type=Path)
+    parser.add_argument("--webview2-sha256")
     parser.add_argument("--icon", type=Path)
     parser.add_argument("--readme", type=Path,
                         default=REPO / "packaging/WINDOWS-INSTALLER-README.txt")
-    parser.add_argument("--work", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--work", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
+    if args.sign_file is not None:
+        result = sign_windows_binary(
+            args.sign_file,
+            env=os.environ.copy(),
+            description=args.sign_description,
+        )
+        if not result["signed"]:
+            raise RuntimeError(
+                "--sign-file was invoked without Authenticode signing credentials in the environment"
+            )
+        return 0
+    for field in ("archive", "expected_sha256", "makensis", "webview2_bootstrapper",
+                  "webview2_sha256", "work", "output"):
+        if getattr(args, field) is None:
+            parser.error(f"--{field.replace('_', '-')} is required")
     archive = args.archive.resolve(strict=True)
     bootstrapper = args.webview2_bootstrapper.resolve(strict=True)
     for path, expected in ((archive, args.expected_sha256), (bootstrapper, args.webview2_sha256)):
@@ -385,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.nsisdir:
         env["NSISDIR"] = str(args.nsisdir.resolve(strict=True))
     # Fail closed before extracting or compiling if signing is required without credentials.
-    resolve_signing_config(env)
+    signing_config = resolve_signing_config(env)
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
@@ -476,6 +495,10 @@ def main(argv: list[str] | None = None) -> int:
         defines["BUNDLED_WEBVIEW2"] = "1"
     if args.icon:
         defines["APP_ICON"] = str(args.icon.resolve(strict=True))
+    if signing_config["enabled"]:
+        # Pass only paths (never secrets); !uninstfinalize inherits signing env vars.
+        defines["UNINST_SIGN_PYTHON"] = str(Path(sys.executable).resolve())
+        defines["UNINST_SIGN_SCRIPT"] = str(Path(__file__).resolve())
     compiler = str(args.makensis.resolve(strict=True))
     compiler_version = subprocess.check_output([compiler, "-VERSION"], env=env, text=True).strip()
     script = REPO / "packaging/windows-installer.nsi"
@@ -489,8 +512,9 @@ def main(argv: list[str] | None = None) -> int:
     command.append(str(script))
     result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, errors="replace")
-    output.with_suffix(".compile.log").write_text(result.stdout, encoding="utf-8")
-    print(result.stdout)
+    compile_stdout = _redact_secret(result.stdout or "", signing_config.get("pfx_password"))
+    output.with_suffix(".compile.log").write_text(compile_stdout, encoding="utf-8")
+    print(compile_stdout)
     result.check_returncode()
     if any(sha256(path) != source_hashes[str(path.relative_to(REPO))] for path in source_paths):
         raise RuntimeError("Installer source changed during compilation; rebuild from a stable snapshot")
@@ -533,6 +557,7 @@ def main(argv: list[str] | None = None) -> int:
             "timestamp_digest_algorithm": installer_signing["timestamp_digest_algorithm"],
             "timestamp_url": installer_signing["timestamp_url"],
             "signtool_sha256": installer_signing["signtool_sha256"],
+            "uninstaller_signed": bool(signing_config["enabled"]),
             "unsigned_app_executable_sha256": unsigned_app_exe_hash,
             "app_executable_sha256": files[f"{APP}.exe"],
             "unsigned_installer_sha256": unsigned_installer_hash,

@@ -275,21 +275,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
-          $findMakensis = {
-            @(
-              (Get-Command makensis.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
-              'C:\Program Files (x86)\NSIS\makensis.exe',
-              'C:\Program Files\NSIS\makensis.exe'
-            ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
-          }
-          $makensis = & $findMakensis
-          for ($attempt = 1; (-not $makensis) -and $attempt -le 2; $attempt++) {
-            choco install nsis --no-progress -y
-            $makensis = & $findMakensis
-            if (-not $makensis -and $attempt -lt 2) { Start-Sleep -Seconds 10 }
-          }
+          $makensis = @(
+            (Get-Command makensis.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+            'C:\Program Files (x86)\NSIS\makensis.exe',
+            'C:\Program Files\NSIS\makensis.exe'
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
           if (-not $makensis) {
-            Write-Host 'Chocolatey community feed unavailable; falling back to SHA-256-verified official NSIS 3.13 portable archive.'
+            Write-Host 'Downloading SHA-256-verified official NSIS 3.13 portable archive.'
             $nsisDir = Join-Path $env:RUNNER_TEMP 'nsis-portable'
             New-Item -ItemType Directory -Force -Path $nsisDir | Out-Null
             $nsisZip = Join-Path $nsisDir 'nsis-3.13.zip'
@@ -323,6 +315,7 @@ jobs:
           "webview2_sha256=$webview2Sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Configure optional Authenticode signing
         id: authenticode
+        if: github.event_name != 'pull_request'
         shell: pwsh
         env:
           WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
@@ -361,7 +354,7 @@ jobs:
           MAKENSIS_EXE: ${{ steps.installer-prereqs.outputs.makensis }}
           WEBVIEW2_BOOTSTRAPPER: ${{ steps.installer-prereqs.outputs.bootstrapper }}
           WEBVIEW2_SHA256: ${{ steps.installer-prereqs.outputs.webview2_sha256 }}
-          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.WINDOWS_CERT_PASSWORD || '' }}
         run: |
           $archives = @(Get-ChildItem -LiteralPath dist/windows -Filter 'nd2wsi-viewer-*-windows-x64.zip')
           if ($archives.Count -ne 1) { throw 'Expected exactly one portable ZIP before building NSIS installer' }
