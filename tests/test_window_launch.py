@@ -250,6 +250,9 @@ def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monk
     expected = {"private_mode": True}
     if platform == "win32":
         expected["gui"] = "edgechromium"
+        udf = session.root / "webview2-udf"
+        expected["storage_path"] = str(udf)
+        assert udf.is_dir()
         assert api._webview2_runtime == {"kind": "system", "mode": "auto", "path": None, "system_version": None,
                                          "reason": "no system or bundled runtime found"}
     else:

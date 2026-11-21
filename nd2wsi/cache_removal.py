@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .windows_fs import is_windows_name_surrogate_reparse
+
 
 def _validate_file_cache_for_trash(path: Path, manifest: dict[str, Any]) -> None:
     """Fail closed on embedded user work, unfamiliar formats, or active journals."""
@@ -116,10 +118,6 @@ def _delete_verified_cache_file(path: Path, expected: os.stat_result, root_fd: i
 _MAX_RESCUE_ANNOTATION_BYTES = 64 * 1024 * 1024
 
 
-def _is_windows_reparse_point(st_res: os.stat_result) -> bool:
-    return bool(getattr(st_res, "st_file_attributes", 0) & 0x400)
-
-
 def _iter_safe_annotation_files(folder: Path) -> list[tuple[Path, bytes]]:
     """Collect regular, non-symlink ``annotations_*.json`` files safely inside ``folder``."""
     import fnmatch
@@ -140,7 +138,7 @@ def _iter_safe_annotation_files(folder: Path) -> list[tuple[Path, bytes]]:
                     fd = os.open(path, file_flags)
             else:
                 st_path = path.stat(follow_symlinks=False)
-                if not stat.S_ISREG(st_path.st_mode) or _is_windows_reparse_point(st_path):
+                if not stat.S_ISREG(st_path.st_mode) or is_windows_name_surrogate_reparse(st_path):
                     raise ValueError(f"refusing to read non-regular annotation entry: {path}")
                 expected_stat = st_path
                 fd = os.open(path, file_flags)
@@ -149,7 +147,7 @@ def _iter_safe_annotation_files(folder: Path) -> list[tuple[Path, bytes]]:
                 if (
                     not stat.S_ISREG(st_fd.st_mode)
                     or st_fd.st_nlink != 1
-                    or _is_windows_reparse_point(st_fd)
+                    or is_windows_name_surrogate_reparse(st_fd, fd=handle.fileno())
                     or (expected_stat is not None and not _same_file_identity(st_fd, expected_stat))
                 ):
                     raise ValueError(f"refusing to read non-regular annotation entry: {path}")
@@ -169,7 +167,7 @@ def _iter_safe_annotation_files(folder: Path) -> list[tuple[Path, bytes]]:
             for entry in sorted(os.scandir(directory), key=lambda e: e.name):
                 entry_path = Path(entry.path)
                 st_entry = entry.stat(follow_symlinks=False)
-                if _is_windows_reparse_point(st_entry) or stat.S_ISLNK(st_entry.st_mode):
+                if is_windows_name_surrogate_reparse(st_entry) or stat.S_ISLNK(st_entry.st_mode):
                     if fnmatch.fnmatch(entry.name, "annotations_*.json"):
                         raise ValueError(f"refusing to read symlinked annotation: {entry_path}")
                     continue
@@ -223,7 +221,7 @@ def rescue_annotations(folder: str | Path, home: str | Path) -> list[Path]:
         folder_stat = folder.stat(follow_symlinks=False)
     except OSError as exc:
         raise OSError(f"could not inspect annotation source: {folder}") from exc
-    if not stat.S_ISDIR(folder_stat.st_mode) or _is_windows_reparse_point(folder_stat):
+    if not stat.S_ISDIR(folder_stat.st_mode) or is_windows_name_surrogate_reparse(folder_stat):
         raise ValueError(f"annotation source is not a real directory: {folder}")
     home.mkdir(parents=True, exist_ok=True)
     folder_resolved = folder.resolve()

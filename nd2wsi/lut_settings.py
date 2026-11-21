@@ -20,6 +20,7 @@ from .cache import quick_fingerprint
 from .platform_io import BINARY
 from .session_lock import SessionFileLock
 from .window_sessions import _atomic_json
+from .windows_fs import is_windows_name_surrogate_reparse
 
 FORMAT = "nd2wsi-lut-settings/1"
 RECORD_FORMAT = "nd2wsi-lut-settings-record/1"
@@ -123,7 +124,7 @@ def _stat_signature(path: Path) -> tuple:
             try:
                 def matches(opened):
                     return (stat.S_ISREG(opened.st_mode)
-                            and not getattr(opened, "st_file_attributes", 0) & 0x400
+                            and not is_windows_name_surrogate_reparse(opened, fd=fd)
                             and source_stat_identity(opened) == signature)
 
                 opened = os.fstat(fd)

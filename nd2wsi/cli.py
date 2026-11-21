@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .reader import PlaneSelection, parse_z
+from .windows_fs import is_windows_name_surrogate_reparse
 
 
 def _add_selection_args(p: argparse.ArgumentParser) -> None:
@@ -553,7 +554,7 @@ def _main(argv: list[str] | None = None) -> int:
                     except OSError as exc:
                         print(f"kept {corpse.name} ({exc})", file=sys.stderr)
                         continue
-                    is_reparse = bool(getattr(expected, "st_file_attributes", 0) & 0x400)
+                    is_reparse = is_windows_name_surrogate_reparse(expected)
                     if not stat.S_ISDIR(expected.st_mode) or is_reparse:
                         print(f"kept {corpse.name} (quarantined single files or links may contain preserved work; review explicitly)")
                         continue

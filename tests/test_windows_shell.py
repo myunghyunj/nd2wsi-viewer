@@ -749,7 +749,14 @@ def test_main_passes_edge_renderer_and_writes_gui_report(fake_webview, monkeypat
     # pywebview's bridge threads are daemons before the GUI loop starts, so a
     # reply stranded by the close cannot keep the finished process alive.
     assert bridge_threads == [app._PywebviewDaemonThread]
-    assert webview.start.call_args.kwargs == {"gui": "edgechromium", "private_mode": True}
+    start_kwargs = webview.start.call_args.kwargs
+    assert set(start_kwargs) == {"gui", "private_mode", "storage_path"}
+    assert start_kwargs["gui"] == "edgechromium"
+    assert start_kwargs["private_mode"] is True
+    storage_path = Path(start_kwargs["storage_path"])
+    assert storage_path.name == "webview2-udf"
+    assert storage_path.parent.parent == (tmp_path / "sessions").resolve()
+    assert storage_path.is_dir()
     report = json.loads(path.read_text(encoding="utf-8"))
     assert report["ok"] is True and report["phase"] == "complete"
     # Without a bundled copy the default auto mode keeps the system runtime

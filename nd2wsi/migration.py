@@ -25,14 +25,11 @@ from .cache import (
     quick_fingerprint,
 )
 from .platform_io import BINARY
+from .windows_fs import is_windows_name_surrogate_reparse
 
 # Maximum size of any single cache entry during directory-to-single-file packing
 # (256 MiB accommodates large manifests/chunks while refusing unbounded reads).
 _MAX_PACK_ENTRY_BYTES = 256 * 1024 * 1024
-
-
-def _is_reparse_point(st: os.stat_result) -> bool:
-    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
 
 
 def _check_real_dir(path: Path) -> None:
@@ -40,14 +37,14 @@ def _check_real_dir(path: Path) -> None:
         st = os.lstat(path)
     except OSError as exc:
         raise ValueError(f"not a real cache directory: {path}") from exc
-    if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st) or not stat.S_ISDIR(st.st_mode):
+    if stat.S_ISLNK(st.st_mode) or is_windows_name_surrogate_reparse(st) or not stat.S_ISDIR(st.st_mode):
         raise ValueError(f"not a real cache directory: {path}")
 
 
 def _read_regular_entry(path: Path) -> tuple[os.stat_result, bytes]:
     """Read a regular, non-symlink, non-reparse cache entry safely without TOCTOU."""
     lstat = os.lstat(path)
-    if stat.S_ISLNK(lstat.st_mode) or _is_reparse_point(lstat) or not stat.S_ISREG(lstat.st_mode):
+    if stat.S_ISLNK(lstat.st_mode) or is_windows_name_surrogate_reparse(lstat) or not stat.S_ISREG(lstat.st_mode):
         raise ValueError(f"not a regular cache entry: {path}")
     flags = (
         os.O_RDONLY
@@ -60,7 +57,7 @@ def _read_regular_entry(path: Path) -> tuple[os.stat_result, bytes]:
         st = os.fstat(fd)
         if (
             not stat.S_ISREG(st.st_mode)
-            or _is_reparse_point(st)
+            or is_windows_name_surrogate_reparse(st, fd=fd)
             or (
                 st.st_ino != 0
                 and lstat.st_ino != 0
@@ -101,12 +98,12 @@ def cache_entries(container: Path) -> list[tuple[str, Path]]:
         for name in dirs:
             subdir = Path(base) / name
             sub_st = os.lstat(subdir)
-            if stat.S_ISLNK(sub_st.st_mode) or _is_reparse_point(sub_st):
+            if stat.S_ISLNK(sub_st.st_mode) or is_windows_name_surrogate_reparse(sub_st):
                 raise ValueError(f"symlink or junction in cache: {subdir}")
         for name in sorted(files):
             path = Path(base) / name
             file_st = os.lstat(path)
-            if stat.S_ISLNK(file_st.st_mode) or _is_reparse_point(file_st) or not stat.S_ISREG(file_st.st_mode):
+            if stat.S_ISLNK(file_st.st_mode) or is_windows_name_surrogate_reparse(file_st) or not stat.S_ISREG(file_st.st_mode):
                 raise ValueError(f"not a regular cache entry: {path}")
             if name.startswith("._") or name == ".DS_Store":
                 continue

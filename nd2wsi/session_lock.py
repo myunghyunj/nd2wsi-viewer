@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .platform_io import BINARY
+from .windows_fs import is_windows_name_surrogate_reparse
 
 if os.name == "nt":
     import msvcrt
@@ -47,10 +48,6 @@ else:
 
     def _kernel_lock(fd: int, *, unlock: bool = False) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-
-def _is_reparse_point(st: os.stat_result) -> bool:
-    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
 
 
 class SessionFileLock:
@@ -90,7 +87,7 @@ class SessionFileLock:
                 pre = os.lstat(self.path)
             except FileNotFoundError:
                 pre = None
-            if pre is not None and (stat.S_ISLNK(pre.st_mode) or _is_reparse_point(pre)):
+            if pre is not None and (stat.S_ISLNK(pre.st_mode) or is_windows_name_surrogate_reparse(pre)):
                 raise OSError(
                     errno.ELOOP,
                     "lock coordination path must not be a symlink or reparse point",
@@ -103,7 +100,7 @@ class SessionFileLock:
                 if (
                     not stat.S_ISREG(opened.st_mode)
                     or opened.st_nlink != 1
-                    or _is_reparse_point(opened)
+                    or is_windows_name_surrogate_reparse(opened, fd=fd)
                 ):
                     raise OSError(
                         errno.EPERM,
@@ -131,7 +128,7 @@ class SessionFileLock:
                     current = os.stat(self.path, follow_symlinks=False)
                     path_is_opened_inode = (
                         not stat.S_ISLNK(current.st_mode)
-                        and not _is_reparse_point(current)
+                        and not is_windows_name_surrogate_reparse(current)
                         and (opened.st_dev, opened.st_ino) == (
                             current.st_dev,
                             current.st_ino,

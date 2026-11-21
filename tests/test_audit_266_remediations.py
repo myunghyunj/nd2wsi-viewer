@@ -472,6 +472,7 @@ process.stdout.write(JSON.stringify(res));
 def test_frontend_select_scene_reentrancy_and_static_guards():
     app_js = (ROOT / "nd2wsi/static/app.js").read_text(encoding="utf-8")
     shell_js = (ROOT / "nd2wsi/static/shell-v1.js").read_text(encoding="utf-8")
+    shell_compare_js = (ROOT / "nd2wsi/static/shell-compare-v1.js").read_text(encoding="utf-8")
     shell_css = (ROOT / "nd2wsi/static/native-shell-v1.css").read_text(encoding="utf-8")
     boot_html = (ROOT / "nd2wsi/static/boot.html").read_text(encoding="utf-8")
 
@@ -487,8 +488,8 @@ def test_frontend_select_scene_reentrancy_and_static_guards():
     assert "pollGen" in boot_html and "window.pywebview?.api?.open_slide" in boot_html
     assert 'if ($("shading-confirm")?.open) return;' in shell_js
     assert 'zone.addEventListener("pointerdown"' in shell_js
-    assert 'if (compare.linked && compare.linkMode === "scale") return;' in shell_js
-    assert "linked: compare.linked, linkMode: compare.linkMode, pairs: nextPairs" in shell_js
+    assert 'if (compare.linked && compare.linkMode === "scale") return;' in shell_compare_js
+    assert "linked: compare.linked, linkMode: compare.linkMode, pairs: nextPairs" in shell_compare_js
     assert "close_translucent_viewer" in shell_js[shell_js.index("function receiveSceneSelected("):]
 
     # Re-entrancy guard in selectScene

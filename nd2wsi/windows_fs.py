@@ -10,10 +10,81 @@ from __future__ import annotations
 import ctypes
 import os
 import stat
+import sys
 from functools import lru_cache
 from pathlib import Path
 
 from .platform_io import filesystem_path
+
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
+_FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
+
+
+class _FileAttributeTagInfo(ctypes.Structure):
+    _fields_ = [
+        ("FileAttributes", ctypes.c_uint32),
+        ("ReparseTag", ctypes.c_uint32),
+    ]
+
+
+def _query_fd_reparse_info(fd: int) -> tuple[int, int] | None:
+    """Query (FileAttributes, ReparseTag) from an open Windows CRT descriptor."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import msvcrt
+        from ctypes import wintypes
+
+        handle = msvcrt.get_osfhandle(fd)
+        query = ctypes.WinDLL("kernel32", use_last_error=True).GetFileInformationByHandleEx
+        query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        query.restype = wintypes.BOOL
+        info = _FileAttributeTagInfo()
+        if not query(handle, _FILE_ATTRIBUTE_TAG_INFO_CLASS, ctypes.byref(info), ctypes.sizeof(info)):
+            return None
+        return int(info.FileAttributes), int(info.ReparseTag)
+    except OSError:
+        return None
+
+
+def _is_fd_name_surrogate_reparse(fd: int) -> bool:
+    """Query an open Windows CRT descriptor's reparse tag; fail closed if unavailable."""
+    queried = _query_fd_reparse_info(fd)
+    if queried is not None:
+        q_attrs, q_tag = queried
+        if not (q_attrs & FILE_ATTRIBUTE_REPARSE_POINT):
+            return False
+        if q_tag:
+            return bool(q_tag & IO_REPARSE_TAG_NAME_SURROGATE)
+    return True
+
+
+def is_windows_name_surrogate_reparse(
+    entry: os.stat_result | None,
+    *,
+    fd: int | None = None,
+) -> bool:
+    """Return True for Windows name-surrogate reparse points (symlinks, junctions, mounts).
+
+    Cloud Files (OneDrive placeholders) and NTFS deduplication also set
+    FILE_ATTRIBUTE_REPARSE_POINT (0x400), but leave the name-surrogate bit
+    (0x20000000) clear in st_reparse_tag. When inspecting an os.fstat() result
+    (where CPython does not populate st_reparse_tag), pass fd=... so
+    GetFileInformationByHandleEx(FileAttributeTagInfo) can read the true tag.
+    Fails closed (returns True) if 0x400 is set and no reparse tag can be queried.
+    """
+    if entry is None:
+        return False
+    attrs = int(getattr(entry, "st_file_attributes", 0) or 0)
+    if not (attrs & FILE_ATTRIBUTE_REPARSE_POINT):
+        return False
+    tag = int(getattr(entry, "st_reparse_tag", 0) or 0)
+    if tag:
+        return bool(tag & IO_REPARSE_TAG_NAME_SURROGATE)
+    if fd is not None:
+        return _is_fd_name_surrogate_reparse(fd)
+    return True
 
 
 def open_guard(path: Path, *, allow_rename: bool = False, delete: bool = False) -> int:
@@ -45,8 +116,8 @@ def open_guard(path: Path, *, allow_rename: bool = False, delete: bool = False) 
         raise
 
 
-def _is_reparse(entry: os.stat_result) -> bool:
-    return bool(getattr(entry, "st_file_attributes", 0) & 0x400)
+def _is_reparse(entry: os.stat_result, *, fd: int | None = None) -> bool:
+    return is_windows_name_surrogate_reparse(entry, fd=fd)
 
 
 def allocated_bytes(path: Path) -> int:
@@ -125,14 +196,14 @@ def file_change_time(path: Path, expected: os.stat_result) -> int | None:
     fd = open_guard(path)
     try:
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or _is_reparse(opened) or not matches(opened):
+        if not stat.S_ISREG(opened.st_mode) or _is_reparse(opened, fd=fd) or not matches(opened):
             raise OSError("source identity changed before reading Windows change time")
         filesystem = ctypes.create_unicode_buffer(32)
         identified = volume(msvcrt.get_osfhandle(fd), None, 0, None, None, None,
                             filesystem, len(filesystem))
         if not identified or filesystem.value.upper() not in {"NTFS", "REFS"}:
             after = os.fstat(fd)
-            if (not matches(after) or _is_reparse(after)
+            if (not matches(after) or _is_reparse(after, fd=fd)
                     or after.st_ctime_ns != opened.st_ctime_ns):
                 raise OSError("source identity changed while identifying Windows filesystem")
             return None
@@ -140,7 +211,10 @@ def file_change_time(path: Path, expected: os.stat_result) -> int | None:
         # FileBasicInfo=0; ChangeTime is an exact 100-ns FILETIME integer.
         if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(info), ctypes.sizeof(info)):
             raise ctypes.WinError(ctypes.get_last_error())
-        if info.ChangeTime <= 0 or info.FileAttributes & 0x400:
+        if info.ChangeTime <= 0 or (
+            (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            and _is_fd_name_surrogate_reparse(fd)
+        ):
             raise OSError("Windows source change time is unavailable")
         after = os.fstat(fd)
         if not matches(after) or after.st_ctime_ns != opened.st_ctime_ns:
@@ -324,7 +398,7 @@ def delete_verified_tree(path: Path, expected: os.stat_result, on_progress=None)
         opened = os.fstat(fd)
         freed = 0
         files = 0
-        directory = stat.S_ISDIR(opened.st_mode) and not _is_reparse(opened)
+        directory = stat.S_ISDIR(opened.st_mode) and not _is_reparse(opened, fd=fd)
         if directory:
             # Finish enumeration before deleting entries so the filesystem's
             # continuation cursor cannot skip names as its index changes.
@@ -358,7 +432,7 @@ def delete_verified_tree(path: Path, expected: os.stat_result, on_progress=None)
         opened = os.fstat(fd)
         if not _same(opened, expected):
             raise OSError(f"cache root changed during deletion: {path}")
-        if _is_reparse(opened) or not stat.S_ISDIR(opened.st_mode):
+        if _is_reparse(opened, fd=fd) or not stat.S_ISDIR(opened.st_mode):
             raise OSError(f"cache root is not a real directory: {path}")
         if on_progress:
             _, total = walk(fd, deleting=False)

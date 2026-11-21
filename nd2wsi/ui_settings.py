@@ -303,6 +303,63 @@ def _is_unmounted_volume_path(path_str: str) -> bool:
     return False
 
 
+DRIVE_REMOTE = 4
+
+
+def _windows_drive_type(root: str) -> int:
+    """Query Win32 GetDriveTypeW(root) without initiating SMB network I/O."""
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        win_dll = getattr(ctypes, "WinDLL", None)
+        if win_dll is not None:
+            kernel32 = win_dll("kernel32", use_last_error=True)
+        else:
+            windll = getattr(ctypes, "windll", None)
+            if windll is None:
+                return 0
+            kernel32 = windll.kernel32
+        get_drive_type = kernel32.GetDriveTypeW
+        get_drive_type.argtypes = [wintypes.LPCWSTR]
+        get_drive_type.restype = wintypes.UINT
+        return int(get_drive_type(root))
+    except (AttributeError, OSError):
+        return 0
+
+
+def _is_windows_network_path(path_str: str) -> bool:
+    """True on Windows for UNC shares or mapped network drives (DRIVE_REMOTE).
+
+    ``GetDriveTypeW`` inspects the local drive table without triggering SMB I/O,
+    so offline UNC shares and disconnected mapped drives never stall UI startup
+    or get silently pruned from recent files.
+    """
+    if sys.platform != "win32" or not path_str:
+        return False
+    candidate = path_str
+    if candidate.startswith(("\\\\?\\", "//?/")):
+        inner = candidate[4:]
+        if inner[:4].upper() in ("UNC\\", "UNC/"):
+            return True
+        candidate = inner
+    elif candidate.startswith(("\\\\.\\", "//./")):
+        return False
+    elif candidate.startswith(("\\\\", "//")):
+        return True
+    if (
+        len(candidate) >= 2
+        and candidate[0].isascii()
+        and candidate[0].isalpha()
+        and candidate[1] == ":"
+    ):
+        root = f"{candidate[0].upper()}:\\"
+        return _windows_drive_type(root) == DRIVE_REMOTE
+    return False
+
+
 def _evaluate_recent_files(
     stored: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
@@ -311,6 +368,10 @@ def _evaluate_recent_files(
     pruned = False
     for item in stored:
         p_str = item["path"]
+        if _is_windows_network_path(p_str):
+            kept_stored.append(item)
+            evaluated.append({**item, "available": True, "network": True})
+            continue
         exists = False
         try:
             exists = Path(p_str).exists()
@@ -329,7 +390,8 @@ def _evaluate_recent_files(
 
 def list_recent_files(limit: int = 12, *, prune: bool = True) -> list[dict[str, Any]]:
     """Return recent files, optionally pruning missing local paths while keeping
-    unmounted ``/Volumes/<vol>/...`` entries with ``"available": False``."""
+    unmounted ``/Volumes/<vol>/...`` entries with ``"available": False`` and
+    preserving Windows UNC / mapped network drive paths without blocking I/O."""
     cap = max(0, int(limit))
     path = ui_settings_path()
     with _LOCK:

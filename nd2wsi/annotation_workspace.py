@@ -11,19 +11,20 @@ import hashlib
 import json
 import os
 import stat
+import sys
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 from .session_lock import SessionFileLock
+from .windows_fs import is_windows_name_surrogate_reparse
 
 _LOCK_TIMEOUT = 10.0
 _READONLY_ERRNOS = (errno.EACCES, errno.EPERM, errno.EROFS)
 _MAX_ANNOTATION_BYTES = 64 * 1024 * 1024
-
-
-def _is_windows_reparse_point(st: os.stat_result) -> bool:
-    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+_WINDOWS_REPLACE_ATTEMPTS = 10
+_WINDOWS_REPLACE_DELAY_S = 0.05
 
 
 def _read(path: Path) -> bytes | None:
@@ -31,7 +32,7 @@ def _read(path: Path) -> bytes | None:
         lstat = os.lstat(str(path))
     except FileNotFoundError:
         return None
-    if stat.S_ISLNK(lstat.st_mode) or _is_windows_reparse_point(lstat):
+    if stat.S_ISLNK(lstat.st_mode) or is_windows_name_surrogate_reparse(lstat):
         raise OSError(errno.ELOOP, "Refusing to read symlinked annotation sidecar")
     if not stat.S_ISREG(lstat.st_mode):
         raise OSError(errno.EINVAL, "Annotation sidecar is not a regular file")
@@ -53,7 +54,7 @@ def _read(path: Path) -> bytes | None:
         st = os.fstat(fd)
         if (
             not stat.S_ISREG(st.st_mode)
-            or _is_windows_reparse_point(st)
+            or is_windows_name_surrogate_reparse(st, fd=fd)
             or (st.st_ino != 0 and lstat.st_ino != 0 and (st.st_dev, st.st_ino) != (lstat.st_dev, lstat.st_ino))
         ):
             raise OSError(errno.EINVAL, "Annotation sidecar is not a regular file")
@@ -97,7 +98,14 @@ def _atomic_write(path: Path, raw: bytes) -> None:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-        tmp.replace(path)
+        for attempt in range(_WINDOWS_REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if sys.platform != "win32" or attempt == _WINDOWS_REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(_WINDOWS_REPLACE_DELAY_S)
     finally:
         tmp.unlink(missing_ok=True)
 
