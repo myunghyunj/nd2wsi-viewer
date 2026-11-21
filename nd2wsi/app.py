@@ -736,6 +736,13 @@ class Api:
         card.main(lambda: card.prepare_handoff(page_id))
         return {"ok": True}
 
+    def update_card_ready(self, page_id):
+        card = getattr(self._updater, "card", None)
+        if card is None or not isinstance(page_id, str) or not (0 < len(page_id) <= 128):
+            return {"ok": False}
+        card.main(lambda: card.page_ready(page_id))
+        return {"ok": True}
+
     def _open_manual_update(self, token, *, notes=False):
         import platform
         import webbrowser

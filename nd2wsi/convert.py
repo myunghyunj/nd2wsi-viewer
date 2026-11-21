@@ -164,9 +164,16 @@ def _write_level1_from_source(
         )
         _store_direct(mean, arr, storage, allow_rechunk=False)
         return
-    mean = da.coarsen(np.mean, data.astype(np.float32), {0: 1, 1: 2, 2: 2})
+    acc_dtype = (
+        np.float64
+        if src.dtype == np.dtype(np.float64)
+        or (np.issubdtype(src.dtype, np.integer) and src.dtype.itemsize >= 4)
+        else np.float32
+    )
+    mean = da.coarsen(np.mean, data.astype(acc_dtype), {0: 1, 1: 2, 2: 2})
     if np.issubdtype(src.dtype, np.integer):
-        mean = da.rint(mean)
+        info = np.iinfo(src.dtype)
+        mean = da.clip(da.rint(mean), info.min, info.max)
     _store_direct(
         mean.astype(src.dtype),
         arr,
@@ -1756,12 +1763,16 @@ def open_store(path: str | Path) -> tuple[Any, dict[str, Any]]:
     """Open a converted store, returning (zarr group, attrs dict)."""
     import zarr
 
+    from .storage.zarr_v2 import validate_zarr_v2_directory
+
     if Path(path).is_file():
         from .storage.single_file import open_zarr_group
 
         root = _ClosableGroup(open_zarr_group(path, prefix="store.ome.zarr", mode="r"))
     else:
-        root = zarr.open_group(Path(filesystem_path(path)), mode="r")
+        store_dir = Path(filesystem_path(path))
+        validate_zarr_v2_directory(store_dir)
+        root = zarr.open_group(store_dir, mode="r")
     try:
         attrs = json.loads(json.dumps(dict(root.attrs)))
         if "nd2wsi" not in attrs or "multiscales" not in attrs:

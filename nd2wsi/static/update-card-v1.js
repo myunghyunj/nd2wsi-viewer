@@ -171,12 +171,20 @@
       if (!model) return;
       expanded = !expanded; renderChanges();
     });
+    const isReady = doc.documentElement.dataset.updateCardShell === "true";
+    const announceReady = () => {
+      if (isReady) bridge()?.update_card_ready?.(pageId)?.catch?.(() => {});
+    };
+    if (isReady) {
+      if (bridge()?.update_card_ready) announceReady();
+      win.addEventListener("pywebviewready", announceReady, { once: true });
+    }
     // A reload or native close also ends the Python session via native events;
     // this bridge covers pagehide while those events are still queued.
     win.addEventListener("pagehide", () => {
       if (!handingOff && model && !model.manual) bridge()?.update_card_closed?.(model.token)?.catch?.(() => {});
     });
-    return { ready: doc.documentElement.dataset.updateCardShell === "true", pageId, show, dismiss, manual, check, notice, handoff };
+    return { ready: isReady, pageId, show, dismiss, manual, check, notice, handoff };
   }
   return { mount };
 });

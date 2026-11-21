@@ -194,6 +194,15 @@ def _metadata_for_state(state: Any, method="h") -> dict:
     if not fingerprints_match(registered, fingerprint):
         raise UnsupportedCorrection("The ND2 source changed; reopen the slide")
     with nd2.ND2File(str(path)) as reader:
+        if getattr(reader, "is_legacy", False):
+            raise UnsupportedCorrection(
+                "Shading Correction requires a modern uncompressed ND2 file (legacy ND2 is unsupported)"
+            )
+        comp = getattr(reader.attributes, "compressionType", None)
+        if comp is not None and str(comp) != "none":
+            raise UnsupportedCorrection(
+                f"Shading Correction requires an uncompressed ND2 file (found {comp})"
+            )
         sizes = dict(reader.sizes)
         if bool(reader.is_rgb) or sizes.get("S", 1) != 1:
             raise UnsupportedCorrection("Shading Correction requires scalar channels")

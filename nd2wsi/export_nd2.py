@@ -147,7 +147,14 @@ def _scalar_calibration(pair: Any) -> float | None:
     """
     if not pair:
         return None
-    py, px = float(pair[0]), float(pair[1])
+    import math
+
+    try:
+        py, px = float(pair[0]), float(pair[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (math.isfinite(px) and math.isfinite(py)) or px <= 0 or py <= 0:
+        return None
     if abs(px - py) > 0.001 * max(abs(px), abs(py), 1e-12):
         import warnings
 

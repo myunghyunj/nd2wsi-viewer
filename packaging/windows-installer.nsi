@@ -49,6 +49,9 @@ ManifestDPIAware true
 
 Name "${APP_NAME} ${APP_VERSION}"
 OutFile "${OUTPUT_FILE}"
+!ifdef UNINST_SIGN_PYTHON
+  !uninstfinalize '""${UNINST_SIGN_PYTHON}" "${UNINST_SIGN_SCRIPT}" --sign-file "%1" --sign-description "${APP_NAME} Uninstaller""'
+!endif
 InstallDir "$LOCALAPPDATA\Programs\nd2wsi-viewer"
 BrandingText "nd2wsi-viewer"
 SetCompressor /SOLID lzma
@@ -113,6 +116,7 @@ Var InstallerLogPath
 Var ProcessInspectError
 Var ProcessCheckedCount
 Var ExistingUpgrade
+Var UpgradeExitCode
 
 !macro ND2WSI_TRACE PREFIX MESSAGE
   Push "${MESSAGE}"
@@ -225,6 +229,115 @@ Function ${PREFIX}LogInstaller
   Pop $R0
 FunctionEnd
 
+Function ${PREFIX}NormalizePath
+  ; Normalize a path with GetFullPathNameW and expand 8.3 short names via
+  ; GetLongPathNameW (falling back to the nearest existing ancestor when the
+  ; leaf does not exist yet). Returns "" on Win32 error or overflow.
+  Exch $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  Push $R5
+  Push $R6
+  Push $R7
+  System::Call 'kernel32::GetFullPathNameW(w R0, i ${NSIS_MAX_STRLEN}, w .R1, p 0)i.R2'
+  ${If} $R2 == 0
+  ${OrIf} $R2 >= ${NSIS_MAX_STRLEN}
+    StrCpy $R0 ""
+    Goto norm_done
+  ${EndIf}
+  StrCpy $R3 $R1
+  StrCpy $R5 ""
+  ${Do}
+    System::Call 'kernel32::GetLongPathNameW(w R3, w .R4, i ${NSIS_MAX_STRLEN})i.R2'
+    ${If} $R2 > 0
+    ${AndIf} $R2 < ${NSIS_MAX_STRLEN}
+      ${If} $R5 != ""
+        StrCpy $R6 $R4 "" -1
+        ${If} $R6 == "\"
+          StrCpy $R4 $R4 -1
+        ${EndIf}
+        StrCpy $R1 "$R4$R5"
+      ${Else}
+        StrCpy $R1 $R4
+      ${EndIf}
+      ${ExitDo}
+    ${EndIf}
+    ${GetParent} "$R3" $R4
+    ${If} $R4 == ""
+    ${OrIf} $R4 == $R3
+      ${ExitDo}
+    ${EndIf}
+    StrLen $R7 $R4
+    StrCpy $R6 $R3 "" $R7
+    StrCpy $R7 $R6 1
+    ${If} $R7 != "\"
+      StrCpy $R6 "\$R6"
+    ${EndIf}
+    StrCpy $R5 "$R6$R5"
+    StrCpy $R3 $R4
+  ${Loop}
+  StrCpy $R6 $R1 "" -1
+  ${If} $R6 == "\"
+    StrLen $R2 $R1
+    ${If} $R2 > 3
+      StrCpy $R1 $R1 -1
+    ${EndIf}
+  ${EndIf}
+  StrCpy $R0 $R1
+  norm_done:
+  Pop $R7
+  Pop $R6
+  Pop $R5
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Exch $R0
+FunctionEnd
+
+Function ${PREFIX}IsNameSurrogateReparse
+  ; Inspect a path with FILE_ATTRIBUTE_REPARSE_POINT set. Returns "1" if its
+  ; reparse tag is a name surrogate (symlink, junction, mount point; bit 29 =
+  ; 0x20000000) or if FindFirstFileW fails (fail-closed); returns "0" for
+  ; non-surrogate tags such as OneDrive Cloud Files placeholders.
+  Exch $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  StrCpy $R4 "1"
+  StrCpy $R1 $R0 "" -1
+  ${If} $R1 == "\"
+    StrLen $R2 $R0
+    ${If} $R2 > 3
+      StrCpy $R0 $R0 -1
+    ${EndIf}
+  ${EndIf}
+  System::Alloc 592
+  Pop $R1
+  ${If} $R1 != 0
+    System::Call 'kernel32::FindFirstFileW(w R0, p R1)p.R2'
+    ${If} $R2 != -1
+      System::Call 'kernel32::FindClose(p R2)'
+      IntOp $R3 $R1 + 36
+      System::Call '*$R3(i.R2)'
+      IntOp $R2 $R2 & 0x20000000
+      ${If} $R2 == 0
+        StrCpy $R4 "0"
+      ${EndIf}
+    ${EndIf}
+    System::Free $R1
+  ${EndIf}
+  StrCpy $R0 $R4
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Exch $R0
+FunctionEnd
+
 Function ${PREFIX}CheckPathChain
   ; Check the leaf as well as every existing ancestor. This rejects both
   ; directory junctions and file symlinks before extraction/deletion can
@@ -257,6 +370,11 @@ Function ${PREFIX}CheckPathChain
       ${EndIf}
     ${Else}
       IntOp $R2 $R1 & 0x400
+      ${If} $R2 != 0
+        Push "$R0"
+        Call ${PREFIX}IsNameSurrogateReparse
+        Pop $R2
+      ${EndIf}
       ${If} $R2 != 0
         StrCpy $GuardError "Setup found a linked file or folder:$\r$\n$R0$\r$\n$\r$\nRestore the original app folder before reinstalling or uninstalling. No app files have been changed."
         !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckPathChain.reject path=$R0 attributes=$R1 reason=$GuardError"
@@ -294,6 +412,11 @@ Function ${PREFIX}CheckLeafPath
     ${EndIf}
   ${Else}
     IntOp $R2 $R1 & 0x400
+    ${If} $R2 != 0
+      Push "$R0"
+      Call ${PREFIX}IsNameSurrogateReparse
+      Pop $R2
+    ${EndIf}
     ${If} $R2 != 0
       StrCpy $GuardError "Setup found a linked file or folder:$\r$\n$R0$\r$\n$\r$\nRestore the original app folder before reinstalling or uninstalling. No app files have been changed."
       !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckLeafPath.reject path=$R0 attributes=$R1 reason=$GuardError"
@@ -343,18 +466,24 @@ Function ${PREFIX}CheckPayloadPaths
 FunctionEnd
 
 Function ${PREFIX}AcquireSetupMutex
+  Push $0
+  Push $1
   System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\nd2wsi-viewer-Setup-current-user")p.r0 ?e'
   Pop $1
   StrCpy $SetupMutex $0
   !insertmacro ND2WSI_TRACE "${PREFIX}" "AcquireSetupMutex handle=$0 win32_error=$1"
   ${If} $0 == 0
   ${OrIf} $1 == 183
+    Pop $1
+    Pop $0
     !insertmacro ND2WSI_TRACE "${PREFIX}" "MessageBox phase=${PREFIX}AcquireSetupMutex message=Another nd2wsi-viewer installer or uninstaller is running. Close it before continuing."
     MessageBox MB_OK|MB_ICONEXCLAMATION "Another nd2wsi-viewer installer or uninstaller is running. Close it before continuing." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "${PREFIX}" "Abort phase=${PREFIX}AcquireSetupMutex guard=$GuardError"
     Abort
   ${EndIf}
+  Pop $1
+  Pop $0
 FunctionEnd
 
 Function ${PREFIX}FindRunningApp
@@ -494,7 +623,9 @@ Function ${PREFIX}WriteOwnershipMarker
   ${EndIf}
   ReadINIStr $R3 "$INSTDIR\${MARKER}" "Installation" "InstallLocation"
   ${If} $R3 != ""
-    GetFullPathName $R3 "$R3"
+    Push "$R3"
+    Call ${PREFIX}NormalizePath
+    Pop $R3
   ${EndIf}
   ${If} $R3 != $INSTDIR
     StrCpy $MarkerWriteFailed 1
@@ -527,13 +658,12 @@ Function ${PREFIX}CheckOwnedDirectory
   StrCpy $GuardError ""
   ; A fresh installation is allowed to target a nonexistent folder. Keep
   ; the chosen path intact unless Win32 normalization succeeds completely.
-  StrCpy $2 "$INSTDIR"
-  System::Call 'kernel32::GetFullPathNameW(w r2, i ${NSIS_MAX_STRLEN}, w .r0, p 0)i.r1 ?e'
-  Pop $2
-  ${If} $1 == 0
-  ${OrIf} $1 >= ${NSIS_MAX_STRLEN}
+  Push "$INSTDIR"
+  Call ${PREFIX}NormalizePath
+  Pop $0
+  ${If} $0 == ""
     StrCpy $GuardError "Setup could not resolve the installation folder:$\r$\n$INSTDIR$\r$\n$\r$\nChoose a shorter, valid app folder and try again."
-    !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckOwnedDirectory.normalize_failed instdir=$INSTDIR returned_length=$1 win32_error=$2 reason=$GuardError"
+    !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckOwnedDirectory.normalize_failed instdir=$INSTDIR reason=$GuardError"
     Return
   ${EndIf}
   StrCpy $INSTDIR $0
@@ -553,7 +683,9 @@ Function ${PREFIX}CheckOwnedDirectory
   ReadINIStr $1 "$INSTDIR\${MARKER}" "Installation" "Version"
   ReadRegStr $2 HKCU "${UNINSTALL_KEY}" "InstallLocation"
   ${If} $2 != ""
-    GetFullPathName $2 "$2"
+    Push "$2"
+    Call ${PREFIX}NormalizePath
+    Pop $2
   ${EndIf}
   !if "x${PREFIX}" == "x"
     StrCpy $ExistingUpgrade 0
@@ -712,6 +844,11 @@ Function CheckInstallDirectory
   !insertmacro ND2WSI_TRACE "" "CheckInstallDirectory.attributes value=$0"
   ${If} $0 != -1
     IntOp $1 $0 & 0x400
+    ${If} $1 != 0
+      Push "$INSTDIR"
+      Call IsNameSurrogateReparse
+      Pop $1
+    ${EndIf}
     IntOp $2 $0 & 0x10
     ${If} $1 != 0
     ${OrIf} $2 == 0
@@ -965,7 +1102,9 @@ Function KeepInitialRetryIdentity
     ; Setup ran. An empty partial key is owned by proven initial absence.
     ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallLocation"
     ${If} $0 != ""
-      GetFullPathName $0 "$0"
+      Push "$0"
+      Call NormalizePath
+      Pop $0
       ${If} $0 != $INSTDIR
         DetailPrint "Registration changed during rollback; retry records were not written to it."
         Return
@@ -1168,19 +1307,20 @@ Section "nd2wsi-viewer (required)" SecApplication
       StrCpy $SetupMutex 0
     ${EndIf}
     ClearErrors
-    ExecWait '"$PLUGINSDIR\prev-uninstall.exe" /S _?=$INSTDIR' $0
+    ExecWait '"$PLUGINSDIR\prev-uninstall.exe" /S _?=$INSTDIR' $UpgradeExitCode
     ${If} ${Errors}
-      StrCpy $0 2
+      StrCpy $UpgradeExitCode 2
     ${EndIf}
     Delete "$PLUGINSDIR\prev-uninstall.exe"
     Call AcquireSetupMutex
-    !insertmacro ND2WSI_TRACE "" "SecApplication.upgrade.complete exit=$0"
-    ${If} $0 != 0
-      MessageBox MB_OK|MB_ICONSTOP "Could not remove the previous nd2wsi-viewer version before upgrading (exit code $0). Close programs using this folder or uninstall the previous version from Windows Settings > Apps, then run Setup again." /SD IDOK
+    !insertmacro ND2WSI_TRACE "" "SecApplication.upgrade.complete exit=$UpgradeExitCode"
+    ${If} $UpgradeExitCode != 0
+      MessageBox MB_OK|MB_ICONSTOP "Could not remove the previous nd2wsi-viewer version before upgrading (exit code $UpgradeExitCode). Close programs using this folder or uninstall the previous version from Windows Settings > Apps, then run Setup again." /SD IDOK
       SetErrorLevel 2
       Abort
     ${EndIf}
     StrCpy $ExistingUpgrade 0
+    StrCpy $InitialInstallFresh 1
   ${EndIf}
   ; The preceding final directory check records whether the destination is
   ; empty/new. Capture actual registry absence before creating any metadata.
@@ -1341,7 +1481,9 @@ Function un.CheckUninstallDirectory
     ReadINIStr $2 "$INSTDIR\${MARKER}" "Installation" "UninstallState"
     ReadINIStr $3 "$INSTDIR\${MARKER}" "Installation" "InstallLocation"
     ${If} $3 != ""
-      GetFullPathName $3 "$3"
+      Push "$3"
+      Call un.NormalizePath
+      Pop $3
     ${EndIf}
     ${If} $0 == "${PRODUCT_ID}"
     ${AndIf} $1 == "${APP_VERSION}"
@@ -1369,7 +1511,9 @@ Function un.CheckUninstallDirectory
   ReadRegStr $2 HKCU "${UNINSTALL_KEY}" "UninstallState"
   ReadRegStr $3 HKCU "${UNINSTALL_KEY}" "InstallLocation"
   ${If} $3 != ""
-    GetFullPathName $3 "$3"
+    Push "$3"
+    Call un.NormalizePath
+    Pop $3
   ${EndIf}
   ${If} $0 == "${PRODUCT_ID}"
   ${AndIf} $1 == "${APP_VERSION}"

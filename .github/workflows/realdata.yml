@@ -36,6 +36,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$REQUESTED_REF"
       - uses: astral-sh/setup-uv@v5
         with:
+          version: '0.12.10'
           python-version: "3.13"
       - name: Install the locked environment
         run: uv sync --frozen --all-extras --python 3.13

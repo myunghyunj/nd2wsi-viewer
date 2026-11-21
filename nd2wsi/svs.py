@@ -237,15 +237,22 @@ def _window_reader(page: Any, fd: int):
     on ``fd`` and decodes them with ``page.decode``. imagecodecs releases the
     GIL, so many threads may share one reader and one descriptor.
     """
-    h, w = page.imagelength, page.imagewidth
-    th, tw = page.tilelength, page.tilewidth
-    samples = page.samplesperpixel
+    h, w = int(page.imagelength), int(page.imagewidth)
+    th, tw = int(page.tilelength), int(page.tilewidth)
+    samples = int(page.samplesperpixel)
     dtype = np.dtype(page.dtype)
+    max_segment_bytes = 256 * 1024 * 1024
+    if th <= 0 or tw <= 0 or samples <= 0:
+        raise ValueError(f"invalid TIFF tile geometry ({tw}x{th}x{samples})")
+    decoded_tile_bytes = th * tw * samples * dtype.itemsize
+    if decoded_tile_bytes <= 0 or decoded_tile_bytes > max_segment_bytes:
+        raise ValueError(
+            f"TIFF tile decoded size {decoded_tile_bytes} bytes exceeds safety limit ({max_segment_bytes} bytes)"
+        )
     across = -(-w // tw)
     offsets = page.dataoffsets
     counts = page.databytecounts
     file_size = os.fstat(fd).st_size
-    max_segment_bytes = 256 * 1024 * 1024
     # Aperio's JPEG flavour keeps one shared quantization/Huffman table in
     # TIFF tag 347 and writes abbreviated streams per tile, so the decoder
     # needs the tables handed to it. Every tifffile decoder takes these two
@@ -260,7 +267,7 @@ def _window_reader(page: Any, fd: int):
         for ty in range(y0 // th, -(-y1 // th)):
             for tx in range(x0 // tw, -(-x1 // tw)):
                 seg = ty * across + tx
-                if seg >= len(counts) or counts[seg] == 0:  # sparse tile, leave it at zero
+                if seg >= len(counts) or seg >= len(offsets) or counts[seg] == 0:  # sparse tile
                     continue
                 cnt = int(counts[seg])
                 off = int(offsets[seg])

@@ -19,6 +19,7 @@ import json
 import os
 import socket
 import stat
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -48,17 +49,23 @@ else:
         fcntl.flock(fd, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+def _is_reparse_point(st: os.stat_result) -> bool:
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
 class SessionFileLock:
     """An exclusive, persistent-inode advisory file lock."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._fd: int | None = None
+        self._fd_lock = threading.Lock()
         self._owner = uuid.uuid4().hex
 
     @property
     def acquired(self) -> bool:
-        return self._fd is not None
+        with self._fd_lock:
+            return self._fd is not None
 
     def acquire(self, timeout: float = 0.0, poll: float = 0.05) -> None:
         """Acquire the lock or raise ``TimeoutError`` after ``timeout``.
@@ -67,8 +74,9 @@ class SessionFileLock:
         metadata can never make a live lock expire.
         """
 
-        if self._fd is not None:
-            return
+        with self._fd_lock:
+            if self._fd is not None:
+                return
 
         timeout = max(0.0, float(timeout))
         poll = max(0.001, float(poll))
@@ -78,11 +86,25 @@ class SessionFileLock:
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         while True:
+            try:
+                pre = os.lstat(self.path)
+            except FileNotFoundError:
+                pre = None
+            if pre is not None and (stat.S_ISLNK(pre.st_mode) or _is_reparse_point(pre)):
+                raise OSError(
+                    errno.ELOOP,
+                    "lock coordination path must not be a symlink or reparse point",
+                    str(self.path),
+                )
             fd = os.open(self.path, flags, 0o600)
             locked = False
             try:
                 opened = os.fstat(fd)
-                if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                    or _is_reparse_point(opened)
+                ):
                     raise OSError(
                         errno.EPERM,
                         "lock coordination path must be a regular, singly linked file",
@@ -107,9 +129,13 @@ class SessionFileLock:
 
                 try:
                     current = os.stat(self.path, follow_symlinks=False)
-                    path_is_opened_inode = (opened.st_dev, opened.st_ino) == (
-                        current.st_dev,
-                        current.st_ino,
+                    path_is_opened_inode = (
+                        not stat.S_ISLNK(current.st_mode)
+                        and not _is_reparse_point(current)
+                        and (opened.st_dev, opened.st_ino) == (
+                            current.st_dev,
+                            current.st_ino,
+                        )
                     )
                 except OSError:
                     path_is_opened_inode = False
@@ -127,12 +153,14 @@ class SessionFileLock:
                     time.sleep(min(poll, remaining))
                     continue
 
-                self._fd = fd
+                with self._fd_lock:
+                    self._fd = fd
                 self._write_metadata(fd)
                 return
             except BaseException:
-                if self._fd == fd:
-                    self._fd = None
+                with self._fd_lock:
+                    if self._fd == fd:
+                        self._fd = None
                 if locked:
                     try:
                         _kernel_lock(fd, unlock=True)
@@ -174,7 +202,8 @@ class SessionFileLock:
     def release(self) -> None:
         """Release the kernel lock without unlinking its coordination file."""
 
-        fd, self._fd = self._fd, None
+        with self._fd_lock:
+            fd, self._fd = self._fd, None
         if fd is None:
             return
         try:

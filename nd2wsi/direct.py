@@ -266,6 +266,10 @@ def open_direct(path: str | Path) -> tuple[Any, dict[str, Any]]:
             # serve exactly what the source holds, so a read scaled by
             # ``e`` can never cross the source edge or its tile grid
             h, w = sh // e, sw // e
+            if h < 1 or w < 1:
+                raise NotImplementedError(
+                    f"SVS overview level {k} would collapse axis ({sh}x{sw} / {e})"
+                )
             root[str(k)] = _SvsLevel(readers[src], h, w, e, life, dtype=s_dtype)
             served.append((h, w))
         shapes = served

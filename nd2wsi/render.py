@@ -735,14 +735,31 @@ def compute_histograms(
     def histogram(values, count, low, high):
         if np.issubdtype(values.dtype, np.floating):
             # NumPy cannot construct thousands of distinct edges when a float
-            # window is only a few representable steps wide at a large offset.
-            # Count in normalized coordinates, then map the edges back.
-            scaled = (values.astype(np.float64) - low) / (high - low)
+            # window is only a few representable steps wide at a large offset,
+            # and ``high - low`` can overflow to inf for extreme float64 ranges.
+            # Count in normalized coordinates, then map the edges back safely.
+            span = high - low
+            if math.isfinite(span) and span != 0.0:
+                scaled = (values.astype(np.float64) - low) / span
+                counts, edges = np.histogram(scaled, bins=count, range=(0.0, 1.0))
+                return counts, low + edges * span
+            half_low = low * 0.5
+            half_high = high * 0.5
+            half_span = half_high - half_low
+            if not math.isfinite(half_span) or half_span == 0.0:
+                return np.zeros(count, dtype=np.int64), np.full(count + 1, low, dtype=np.float64)
+            scaled = (values.astype(np.float64) * 0.5 - half_low) / half_span
             counts, edges = np.histogram(scaled, bins=count, range=(0.0, 1.0))
-            return counts, low + edges * (high - low)
+            return counts, low + edges * half_span + edges * half_span
         return np.histogram(values, bins=count, range=(low, high))
 
-    dtype = np.dtype(meta.get("dtype", data.dtype))
+    stored_dtype = np.dtype(meta.get("dtype", data.dtype))
+    display_dtype = np.dtype(meta["display_dtype"]) if meta.get("display_dtype") else data.dtype
+    is_float_display = (
+        np.issubdtype(display_dtype, np.floating)
+        or np.issubdtype(data.dtype, np.floating)
+    )
+    dtype = display_dtype if is_float_display else stored_dtype
     rgb_window = auto_window(data, dtype=dtype, rgb=True) if meta.get("rgb") else None
     out = []
     for ci in range(data.shape[0]):
@@ -772,6 +789,9 @@ def compute_histograms(
             vmin, vmax = 0.0, 1.0
         else:
             bounds = [dmin, dmax]
+            if np.issubdtype(stored_dtype, np.integer):
+                limits = np.iinfo(stored_dtype)
+                bounds.extend((float(limits.min), float(limits.max)))
             bounds.extend(float(win[key]) for key in ("min", "max", "start", "end")
                           if key in win and np.isfinite(float(win[key])))
             vmin, vmax = min(bounds), max(bounds)
@@ -1030,16 +1050,21 @@ def export_roi_tiff(
     # resolution tags at all rather than tags built from an invented value
     px_um: float | None = None
     py_um: float | None = None
-    if meta.get("pixel_size_um"):
-        py, px = meta["pixel_size_um"]
-        px_um = float(px) * factor
-        py_um = float(py) * factor
-        res_kw = {
-            "resolution": (1e4 / px_um, 1e4 / py_um),
-            "resolutionunit": "CENTIMETER",
-        }
-    else:
-        res_kw = {}
+    res_kw: dict[str, Any] = {}
+    if meta.get("pixel_size_um") and factor and factor > 0:
+        try:
+            py, px = meta["pixel_size_um"]
+            cand_px = float(px) * factor
+            cand_py = float(py) * factor
+            if math.isfinite(cand_px) and math.isfinite(cand_py) and cand_px > 0 and cand_py > 0:
+                px_um = cand_px
+                py_um = cand_py
+                res_kw = {
+                    "resolution": (1e4 / px_um, 1e4 / py_um),
+                    "resolutionunit": "CENTIMETER",
+                }
+        except (TypeError, ValueError):
+            pass
 
     def counted(it: Iterator[np.ndarray], total: int) -> Iterator[np.ndarray]:
         for n, block in enumerate(it, 1):

@@ -1139,8 +1139,12 @@ def _pixel_payload(
     pixel_size = meta.get("pixel_size_um")
     um = None
     if pixel_size:
-        py, px = float(pixel_size[0]), float(pixel_size[1])
-        um = [xi * px, yi * py]
+        try:
+            py, px = float(pixel_size[0]), float(pixel_size[1])
+            if math.isfinite(px) and math.isfinite(py) and px > 0 and py > 0:
+                um = [xi * px, yi * py]
+        except (TypeError, ValueError, IndexError):
+            um = None
     calibration = meta.get("calibration") or {}
     path = str(level["path"])
     probed_level: int | str = int(path) if path.isdigit() else path
@@ -1260,16 +1264,17 @@ class SlideRegistry:
     ) -> Path | None:
         readonly_errnos = (errno.EACCES, errno.EPERM, errno.EROFS)
         if frame is not None:
-            from .annotation_workspace import _atomic_write, annotation_lock
+            from .annotation_workspace import _atomic_write, _read, annotation_lock
 
             canonical, legacy = confocal_annotations_sidecar(path, attrs, frame)
             usable_legacy: Path | None = None
             raw: bytes | None = None
             if legacy is not None:
                 try:
-                    raw = legacy.read_bytes()
-                    _sidecar_items(json.loads(raw.decode("utf-8")), require_items=True)
-                    usable_legacy = legacy
+                    raw = _read(legacy)
+                    if raw is not None:
+                        _sidecar_items(json.loads(raw.decode("utf-8")), require_items=True)
+                        usable_legacy = legacy
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     usable_legacy = None
                     raw = None
@@ -1668,7 +1673,10 @@ class SlideRegistry:
                     meta = attrs["nd2wsi"]
                     meta["kind"] = "overview-degraded"
                     for lv in meta["levels"]:
-                        lv["downsample"] //= 2
+                        ds = int(lv["downsample"])
+                        if ds < 2:
+                            raise ValueError(f"invalid overview downsample {ds!r}")
+                        lv["downsample"] = ds // 2
                     # the base level is now the half-resolution overview, so a
                     # pixel is twice as large — otherwise every scalebar and
                     # measurement would read half its true length
@@ -2720,6 +2728,31 @@ def make_handler(
         # Set once a download has sent its status line; reset per request.
         _response_started = False
 
+        def version_string(self) -> str:
+            return self.server_version
+
+        def send_error(
+            self, code: int, message: str | None = None, explain: str | None = None
+        ) -> None:
+            # Never answer unauthenticated probes (OPTIONS/HEAD/PUT/DELETE or
+            # malformed requests) with stdlib HTML or runtime version banners.
+            self.close_connection = True
+            if self._response_started:
+                return
+            if getattr(self, "command", None) == "HEAD":
+                self._send(404, b"", "application/json")
+            else:
+                self._error(404, "not found")
+
+        def handle_expect_100(self) -> bool:
+            if getattr(self, "command", None) != "POST":
+                self.close_connection = True
+                self._error(404, "not found")
+                return False
+            if self._gate() is None:
+                return False
+            return super().handle_expect_100()
+
         def handle_one_request(self) -> None:
             if getattr(self.server, "_shutting_down", False):
                 self.close_connection = True
@@ -3191,7 +3224,7 @@ def make_handler(
             try:
                 data = self._body_json()
                 path = data.get("path") if isinstance(data, dict) else None
-                if not path:
+                if not isinstance(path, str) or not path.strip():
                     return self._error(400, 'expected {"path": "..."}')
                 has_series = isinstance(data, dict) and data.get("series") is not None
                 series_arg: int | None = None
@@ -3296,9 +3329,11 @@ def make_handler(
                 if registry.agent_window:
                     return self._json({"ok": True, "items": []})
                 candidate = Path(raw_path).expanduser().resolve()
+                with registry._lock:
+                    slide_states = list(registry.slides.values())
                 registered = {
                     p.resolve()
-                    for st in list(registry.slides.values())
+                    for st in slide_states
                     for p in (st.source_path, st.store_path, st.container_path)
                     if p is not None
                 }
@@ -3675,25 +3710,15 @@ def make_handler(
                     return self._error(500, f"could not read {p.name}: {e}")
             if p.exists() or p.is_symlink():
                 try:
-                    from .platform_io import BINARY
+                    from .annotation_workspace import _read
 
-                    max_ann_bytes = 64 * 1024 * 1024
-                    flags = (
-                        os.O_RDONLY
-                        | BINARY
-                        | getattr(os, "O_NOFOLLOW", 0)
-                        | getattr(os, "O_NONBLOCK", 0)
-                    )
-                    with os.fdopen(os.open(p, flags), "rb") as handle:
-                        st_fd = os.fstat(handle.fileno())
-                        if not stat.S_ISREG(st_fd.st_mode) or st_fd.st_size > max_ann_bytes:
-                            raise ValueError("annotation sidecar is not a bounded regular file")
-                        raw_bytes = handle.read(max_ann_bytes + 1)
-                    if len(raw_bytes) > max_ann_bytes:
-                        raise ValueError("annotation sidecar exceeds size limit")
-                    document = json.loads(raw_bytes.decode("utf-8"))
-                    items = _sidecar_items(document, require_items=True)
-                    _same_geometry(document)
+                    raw_bytes = _read(p)
+                    if raw_bytes is None:
+                        items = []
+                    else:
+                        document = json.loads(raw_bytes.decode("utf-8"))
+                        items = _sidecar_items(document, require_items=True)
+                        _same_geometry(document)
                 except (ValueError, UnicodeError, OSError) as e:
                     return self._error(500, f"could not read {p.name}: {e}")
             else:
@@ -4072,8 +4097,6 @@ def create_server(
     if isinstance(store_paths, (str, Path)):
         store_paths = [store_paths]
     registry = SlideRegistry(max_render_mpx=max_render_mpx, window_session=window_session)
-    for p in store_paths:
-        registry.add_store(p)
     token = secrets.token_urlsafe(16)
 
     class _Server(ThreadingHTTPServer):
@@ -4093,7 +4116,12 @@ def create_server(
                 max_workers=self.max_workers,
                 thread_name_prefix="nd2wsi-http",
             )
-            super().__init__(*args, **kwargs)
+            try:
+                super().__init__(*args, **kwargs)
+            except BaseException:
+                self._pool_closed = True
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
         def server_bind(self) -> None:
             # Bypass HTTPServer.server_bind()'s socket.getfqdn(host) reverse DNS /
@@ -4235,7 +4263,14 @@ def create_server(
             self._close_registry()
             super().server_close()
 
-    httpd = _Server((host, port), make_handler(registry, token))
+    try:
+        for p in store_paths:
+            registry.add_store(p)
+        httpd = _Server((host, port), make_handler(registry, token))
+    except BaseException:
+        registry.astromap_downloads.close()
+        registry.close_all(immediate=True)
+        raise
     httpd.registry = registry  # for embedders
     httpd.token = token
     return httpd

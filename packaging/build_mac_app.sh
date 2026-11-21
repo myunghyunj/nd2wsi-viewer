@@ -95,6 +95,7 @@ echo "==> pyinstaller"
 
 echo "==> document types (Finder Open With)"
 "$PY" - "$OUT/$APPNAME.app/Contents/Info.plist" "$REPO/pyproject.toml" << 'PLISTEOF'
+import os
 import plistlib
 import re
 import sys
@@ -119,7 +120,10 @@ info["CFBundleShortVersionString"] = base
 info["CFBundleVersion"] = bundle
 info["ND2WSIPackageVersion"] = version
 info["ND2WSISdpcBundled"] = True
-info["ND2WSIDevelopmentOnly"] = False
+info["ND2WSIDevelopmentOnly"] = (
+    os.environ.get("ND2WSI_SKIP_UPDATER") == "1"
+    or os.environ.get("ND2WSI_SKIP_SMOKE") == "1"
+)
 # The README promises macOS 14 or later; older systems refuse to launch it
 # with a clear message instead of failing inside the frozen runtime.
 info["LSMinimumSystemVersion"] = "14.0"

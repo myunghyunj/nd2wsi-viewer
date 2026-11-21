@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import ntpath
 import os
 import queue
@@ -28,7 +29,7 @@ from zarr.abc.store import OffsetByteRequest, RangeByteRequest, Store, SuffixByt
 from zarr.core.buffer import Buffer, BufferPrototype, default_buffer_prototype
 
 from ..platform_io import filesystem_path
-from .zarr_v2 import ZarrV2RegionReader
+from .zarr_v2 import UnsafeZarrArrayError, ZarrV2RegionReader, validate_zarr_v2_metadata
 
 APPLICATION_ID = 0x4E443253
 FORMAT_VERSION = 2
@@ -165,6 +166,8 @@ class SQLiteStore(Store):
         self._active_reads = 0
         self._mutation_seq = 0
         self._connection: sqlite3.Connection | None = None
+        self._pinned_identity: tuple[int, int] | None = None
+        self._pool_pinned_only = False
         self._closed = False
         self._in_batch = False
         self._exclusive = _exclusive
@@ -345,28 +348,21 @@ class SQLiteStore(Store):
                         os.close(fd)
                     created = True
             if not created:
-                # Check identity before asking SQLite to open untrusted data.
-                # In particular, opening a WAL database can create a -shm file
-                # even in mode=ro; this format only accepts rollback journals.
-                with open(native, "rb") as source:
-                    header = source.read(100)
-                version = int.from_bytes(header[60:64], "big")
-                if (
-                    len(header) != 100 or header[:16] != b"SQLite format 3\0"
-                    or header[18:20] != b"\x01\x01"
-                    or version not in _READABLE_VERSIONS
-                    or int.from_bytes(header[68:72], "big") != APPLICATION_ID
-                ):
-                    raise ValueError("not a supported nd2wsi single-file cache (header)")
-                if version not in _WRITABLE_VERSIONS and not self.read_only:
-                    raise ValueError("prototype single-file cache is read-only; rebuild it as format 2")
-                # SQLite may create -shm when a stray -wal exists even if the
-                # main header still says rollback mode. This format never uses
-                # WAL; refuse those companions before any SQLite connection.
-                # A normal active -journal remains supported for readers.
-                if any(os.path.lexists(native + suffix) for suffix in ("-wal", "-shm")):
-                    raise ValueError("unsupported WAL companion beside single-file cache; preserve and recover it")
+                identity = self._check_existing_file(native, read_only=self.read_only)
+            else:
+                identity = None
             connection = self._open_validated(created=created)
+            if self.read_only and identity is not None:
+                try:
+                    post = os.stat(native)
+                    if (post.st_dev, post.st_ino) == identity:
+                        self._pinned_identity = identity
+                    else:
+                        # The path changed while opening; keep this single pinned
+                        # connection rather than lazily opening a second inode.
+                        self._pool_pinned_only = True
+                except OSError:
+                    self._pool_pinned_only = True
             self._connection = connection
             if self.read_only:
                 with self._pool_lock:
@@ -374,6 +370,33 @@ class SQLiteStore(Store):
                     self._read_pool.put_nowait(connection)
             self._is_open = True
             return connection
+
+    @staticmethod
+    def _check_existing_file(native: str, *, read_only: bool) -> tuple[int, int]:
+        """Validate SQLite container header and reject WAL companions before opening."""
+        # Check identity before asking SQLite to open untrusted data.
+        # In particular, opening a WAL database can create a -shm file
+        # even in mode=ro; this format only accepts rollback journals.
+        with open(native, "rb") as source:
+            st = os.fstat(source.fileno())
+            header = source.read(100)
+        version = int.from_bytes(header[60:64], "big")
+        if (
+            len(header) != 100 or header[:16] != b"SQLite format 3\0"
+            or header[18:20] != b"\x01\x01"
+            or version not in _READABLE_VERSIONS
+            or int.from_bytes(header[68:72], "big") != APPLICATION_ID
+        ):
+            raise ValueError("not a supported nd2wsi single-file cache (header)")
+        if version not in _WRITABLE_VERSIONS and not read_only:
+            raise ValueError("prototype single-file cache is read-only; rebuild it as format 2")
+        # SQLite may create -shm when a stray -wal exists even if the
+        # main header still says rollback mode. This format never uses
+        # WAL; refuse those companions before any SQLite connection.
+        # A normal active -journal remains supported for readers.
+        if any(os.path.lexists(native + suffix) for suffix in ("-wal", "-shm")):
+            raise ValueError("unsupported WAL companion beside single-file cache; preserve and recover it")
+        return (st.st_dev, st.st_ino)
 
     def _open_validated(self, *, created: bool) -> sqlite3.Connection:
         for attempt in range(2):
@@ -422,7 +445,14 @@ class SQLiteStore(Store):
             return connection
         raise AssertionError("unreachable cache open retry")
 
-    def _open_pool_reader(self) -> sqlite3.Connection:
+    def _open_pool_reader(self) -> sqlite3.Connection | None:
+        native = filesystem_path(self.path)
+        try:
+            before = self._check_existing_file(native, read_only=True)
+        except (OSError, ValueError):
+            return None
+        if self._pinned_identity is not None and before != self._pinned_identity:
+            return None
         connection = sqlite3.connect(
             _database_uri(self.path, "ro"),
             uri=True, timeout=30, isolation_level=None, check_same_thread=False,
@@ -430,6 +460,14 @@ class SQLiteStore(Store):
         try:
             self._configure(connection, read_only=True, cache_size=self._cache_size)
             self._validate(connection, read_only=True)
+            if self._pinned_identity is not None:
+                after = os.stat(native)
+                if (after.st_dev, after.st_ino) != self._pinned_identity:
+                    connection.close()
+                    return None
+        except OSError:
+            connection.close()
+            return None
         except sqlite3.Error as exc:
             connection.close()
             raise ValueError(f"invalid or unreadable single-file cache: {self.path}") from exc
@@ -447,12 +485,14 @@ class SQLiteStore(Store):
         if not getattr(self, "_is_open", False) and not self._closed:
             self._ensure_open_sync()
         conn: sqlite3.Connection | None = None
+        pinned_only = False
         with self._pool_cv:
             while not self._closed and not self._read_sem.acquire(blocking=False):
                 self._pool_cv.wait()
             if self._closed:
                 raise ValueError("SQLiteStore is closed")
             self._active_reads += 1
+            pinned_only = self._pool_pinned_only
             try:
                 conn = self._read_pool.get_nowait()
             except queue.Empty:
@@ -460,15 +500,34 @@ class SQLiteStore(Store):
         had_error = False
         try:
             if conn is None:
-                opened = self._open_pool_reader()
+                opened = None if pinned_only else self._open_pool_reader()
                 with self._pool_cv:
                     if self._closed:
-                        opened.close()
+                        if opened is not None:
+                            opened.close()
                         raise ValueError("SQLiteStore is closed")
-                    self._read_connections.append(opened)
-                    if self._connection is None:
-                        self._connection = opened
-                    conn = opened
+                    if opened is not None:
+                        self._read_connections.append(opened)
+                        if self._connection is None:
+                            self._connection = opened
+                        conn = opened
+                    else:
+                        # The pathname was replaced, unlinked, or gained invalid
+                        # companions: never mix a second inode into this pool.
+                        # Reuse the already-pinned connection(s) exclusively.
+                        self._pool_pinned_only = True
+                        while not self._closed:
+                            try:
+                                conn = self._read_pool.get_nowait()
+                                break
+                            except queue.Empty:
+                                if not self._read_connections:
+                                    raise ValueError(
+                                        f"single-file cache changed or became unreadable: {self.path}"
+                                    )
+                                self._pool_cv.wait()
+                        if self._closed:
+                            raise ValueError("SQLiteStore is closed")
             try:
                 yield conn
             except BaseException:
@@ -887,6 +946,16 @@ class _DirectReadArray:
         self._array = array
         self._reader: Any = _UNREAD
         self._reader_lock = threading.Lock()
+        store = array.store
+        if isinstance(store, SQLiteStore):
+            zarray_key = f"{array.path}/.zarray" if array.path else ".zarray"
+            raw = store._read_chunk(zarray_key)
+            if raw is not None:
+                try:
+                    meta = json.loads(raw)
+                except (ValueError, TypeError) as exc:
+                    raise UnsafeZarrArrayError(f"invalid .zarray JSON at {zarray_key!r}") from exc
+                validate_zarr_v2_metadata(meta)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._array, name)
@@ -954,6 +1023,25 @@ class _DirectReadGroup:
         return member
 
 
+def _validate_store_zarrays(store: SQLiteStore) -> None:
+    """Validate every Zarr v2 ``.zarray`` entry in a read-only container before reading data."""
+    listing_prefix = store._listing_prefix("")
+    predicate, params = _prefix_predicate(listing_prefix)
+    exact = f"{listing_prefix}.zarray"
+    suffix_like = f"{listing_prefix}%/.zarray" if listing_prefix else "%/.zarray"
+    with store._read_conn() as connection:
+        rows = connection.execute(
+            f"SELECT key, value FROM entries WHERE ({predicate}) AND (key = ? OR key LIKE ?)",
+            (*params, exact, suffix_like),
+        ).fetchall()
+    for key, raw in rows:
+        try:
+            meta = json.loads(bytes(raw))
+        except (ValueError, TypeError) as exc:
+            raise UnsafeZarrArrayError(f"invalid .zarray JSON at {key!r}") from exc
+        validate_zarr_v2_metadata(meta)
+
+
 def open_zarr_group(path: str | os.PathLike, prefix: str = "store.ome.zarr", mode: str = "r"):
     """Open an embedded v2 group; the caller owns ``group.store.close()``.
 
@@ -969,6 +1057,8 @@ def open_zarr_group(path: str | os.PathLike, prefix: str = "store.ome.zarr", mod
         raise FileNotFoundError(path)
     store = SQLiteStore(path, read_only=mode == "r", prefix=prefix)
     try:
+        if mode == "r":
+            _validate_store_zarrays(store)
         group = zarr.open_group(store=store, mode=mode, zarr_format=2)
         return _DirectReadGroup(group) if mode == "r" else group
     except sqlite3.Error as exc:

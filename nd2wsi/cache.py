@@ -703,10 +703,17 @@ class CacheLock:
                         acquired = self._install_claim(fd, payload, gen)
                     except FileExistsError:
                         try:
-                            fd = os.open(
-                                self.path,
-                                os.O_RDWR | BINARY | getattr(os, "O_NOFOLLOW", 0),
-                            )
+                            pre_st = os.lstat(self.path)
+                            if (
+                                stat.S_ISLNK(pre_st.st_mode)
+                                or bool(getattr(pre_st, "st_file_attributes", 0) & 0x400)
+                            ):
+                                fd = None
+                            else:
+                                fd = os.open(
+                                    self.path,
+                                    os.O_RDWR | BINARY | getattr(os, "O_NOFOLLOW", 0),
+                                )
                         except FileNotFoundError:
                             fd = None
                         except OSError as exc:
@@ -720,6 +727,7 @@ class CacheLock:
                             info, st = self._read_fd(fd)
                             if (
                                 self._safe_lock_inode(st)
+                                and not bool(getattr(st, "st_file_attributes", 0) & 0x400)
                                 and self._path_is_fd(fd)
                                 and self._stale_info(info, st.st_mtime)
                             ):
@@ -898,10 +906,21 @@ def sweep_stale_builds(caches_dir: Path) -> int:
             except (TimeoutError, OSError):
                 continue  # another local process is actively coordinating this family
         try:
-            info = lock._read()
+            try:
+                lock_st = os.lstat(lock.path)
+            except FileNotFoundError:
+                lock_st = None
+            except OSError:
+                continue  # unreadable lockfile: assume build may still be active
             live = False
-            if info:
-                if _taken_elsewhere(info):
+            if lock_st is not None:
+                info = lock._read()
+                if info is None:
+                    # Momentarily empty/unreadable while being written: honor 30s grace.
+                    live = not CacheLock._stale_info(None, lock_st.st_mtime)
+                elif info.get("released") is True:
+                    live = False
+                elif _taken_elsewhere(info):
                     live = False  # a builder on another machine or boot is not running here
                 else:
                     try:
@@ -926,8 +945,8 @@ def sweep_stale_builds(caches_dir: Path) -> int:
                         continue  # a local builder started while we inspected this family
                     _remove_artifact(item)
                     n += 1
-                except (OSError, RuntimeError):
-                    pass  # leave inaccessible artifacts in place; do not report them removed
+                except (OSError, RuntimeError, ValueError):
+                    pass  # leave inaccessible or unrescuable artifacts in place
         finally:
             if held_arbiter:
                 lock._arbiter.release()

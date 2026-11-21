@@ -214,7 +214,7 @@ class TranslucentApi:
                 companion = self._window.create_file_dialog(
                     webview.OPEN_DIALOG, allow_multiple=False,
                     directory=str(chosen.parent),
-                    file_types=(("Matching coordinate-reference JPG (*.jpg;*.jpeg)" if image_needed
+                    file_types=(("Matching coordinate reference JPG (*.jpg;*.jpeg)" if image_needed
                                  else "Matching AstroMapper ROI coordinates (*.txt)"),),
                 )
                 if not companion:

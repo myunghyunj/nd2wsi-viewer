@@ -516,15 +516,82 @@ def _decode_subblock_bytes(
         return arr[:, :, 0].copy()
 
     if comp == 4:  # JPEG-XR (jxrlib already outputs RGB channel order)
+        expected_bytes = h * w * samples * dtype.itemsize
+        if expected_bytes <= 0 or expected_bytes > _MAX_SUBBLOCK_BYTES:
+            raise ValueError(f"CZI JPEG-XR SubBlock size {expected_bytes} exceeds safety limit")
+        if len(raw) >= 8 and raw[:4] == b"II\xbc\x01":
+            ifd_off = struct.unpack_from("<I", raw, 4)[0]
+            if ifd_off + 2 <= len(raw):
+                n_tags = struct.unpack_from("<H", raw, ifd_off)[0]
+                jxr_w = jxr_h = None
+                for i in range(min(n_tags, 64)):
+                    off = ifd_off + 2 + i * 12
+                    if off + 12 > len(raw):
+                        break
+                    tag, _typ, _cnt, val = struct.unpack_from("<HHII", raw, off)
+                    if tag == 0xBC80:
+                        jxr_w = val
+                    elif tag == 0xBC81:
+                        jxr_h = val
+                if jxr_w is not None and jxr_h is not None:
+                    if jxr_w <= 0 or jxr_h <= 0 or jxr_w * jxr_h * max(samples, 1) * max(dtype.itemsize, 1) > _MAX_SUBBLOCK_BYTES:
+                        raise ValueError(
+                            f"CZI JPEG-XR header dimensions ({jxr_w}x{jxr_h}) exceed safety limit"
+                        )
         arr = np.asarray(imagecodecs.jpegxr_decode(raw))
-        if arr.ndim == 2:
-            return arr[:h, :w]
+        if samples == 1:
+            if arr.ndim == 3 and arr.shape[2] == 1:
+                arr = arr[:, :, 0]
+            if arr.ndim != 2 or arr.shape[0] < h or arr.shape[1] < w:
+                raise ValueError(f"CZI JPEG-XR decoded shape {arr.shape} does not cover ({h}, {w})")
+            return np.ascontiguousarray(arr[:h, :w])
+        if arr.ndim != 3 or arr.shape[0] < h or arr.shape[1] < w or arr.shape[2] < 3:
+            raise ValueError(f"CZI JPEG-XR decoded shape {arr.shape} does not cover ({h}, {w}, 3)")
         return np.ascontiguousarray(arr[:h, :w, :3])
 
     if comp == 1:  # JPEG
+        expected_bytes = h * w * samples * dtype.itemsize
+        if expected_bytes <= 0 or expected_bytes > _MAX_SUBBLOCK_BYTES:
+            raise ValueError(f"CZI JPEG SubBlock size {expected_bytes} exceeds safety limit")
+        # Scan SOF marker dimensions before decoding to block JPEG decompression bombs.
+        pos = 2 if raw[:2] == b"\xff\xd8" else len(raw)
+        while pos + 4 <= len(raw):
+            while pos < len(raw) and raw[pos] != 0xFF:
+                pos += 1
+            while pos < len(raw) and raw[pos] == 0xFF:
+                pos += 1
+            if pos >= len(raw):
+                break
+            marker = raw[pos]
+            pos += 1
+            if marker in (0xD8, 0xD9, 0x01) or (0xD0 <= marker <= 0xD7):
+                continue
+            if marker == 0xDA or pos + 2 > len(raw):
+                break
+            seg_len = struct.unpack_from(">H", raw, pos)[0]
+            if seg_len < 2 or pos + seg_len > len(raw):
+                break
+            if (0xC0 <= marker <= 0xCF) and marker not in (0xC4, 0xC8, 0xCC) and seg_len >= 8:
+                jpg_h, jpg_w, jpg_c = struct.unpack_from(">HHB", raw, pos + 3)
+                if (
+                    jpg_h <= 0
+                    or jpg_w <= 0
+                    or jpg_h * jpg_w * max(jpg_c, 1) * max(dtype.itemsize, 1) > _MAX_SUBBLOCK_BYTES
+                ):
+                    raise ValueError(
+                        f"CZI JPEG header dimensions ({jpg_w}x{jpg_h}x{jpg_c}) exceed safety limit"
+                    )
+                break
+            pos += seg_len
         arr = np.asarray(imagecodecs.jpeg_decode(raw))
-        if arr.ndim == 2:
-            return arr[:h, :w]
+        if samples == 1:
+            if arr.ndim == 3 and arr.shape[2] == 1:
+                arr = arr[:, :, 0]
+            if arr.ndim != 2 or arr.shape[0] < h or arr.shape[1] < w:
+                raise ValueError(f"CZI JPEG decoded shape {arr.shape} does not cover ({h}, {w})")
+            return np.ascontiguousarray(arr[:h, :w])
+        if arr.ndim != 3 or arr.shape[0] < h or arr.shape[1] < w or arr.shape[2] < 3:
+            raise ValueError(f"CZI JPEG decoded shape {arr.shape} does not cover ({h}, {w}, 3)")
         return np.ascontiguousarray(arr[:h, :w, :3])
 
     if comp == 2:  # LZW
@@ -629,7 +696,10 @@ def _read_subblock_window(
     if sb_rgb != (samples > 1):
         raise ValueError("CZI SubBlock RGB/grayscale mode does not match plane expectation")
 
-    sb_hdr = read_at(fd, 80, sb.file_pos)
+    file_size = os.fstat(fd).st_size
+    if sb.file_pos < 0 or sb.file_pos > file_size - 48:
+        raise ValueError(f"invalid CZI SubBlock header: file offset {sb.file_pos} exceeds file bounds")
+    sb_hdr = read_at(fd, min(80, file_size - sb.file_pos), sb.file_pos)
     if len(sb_hdr) < 48 or not sb_hdr[:14].startswith(b"ZISRAWSUBBLOCK"):
         raise ValueError(f"invalid CZI SubBlock header at offset {sb.file_pos}")
     meta_size, _att_size, data_size = struct.unpack("<IIQ", sb_hdr[32:48])

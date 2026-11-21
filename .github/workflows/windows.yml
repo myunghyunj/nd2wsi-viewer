@@ -173,19 +173,30 @@ jobs:
             'C:\Program Files\NSIS\makensis.exe'
           ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
           if (-not $makensis) {
-            choco install nsis --no-progress -y
-            if ($LASTEXITCODE -ne 0) { throw 'NSIS installation via Chocolatey failed' }
-            $makensis = @(
-              'C:\Program Files (x86)\NSIS\makensis.exe',
-              'C:\Program Files\NSIS\makensis.exe',
-              (Get-Command makensis.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
-            ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+            Write-Host 'Downloading SHA-256-verified official NSIS 3.13 portable archive.'
+            $nsisDir = Join-Path $env:RUNNER_TEMP 'nsis-portable'
+            New-Item -ItemType Directory -Force -Path $nsisDir | Out-Null
+            $nsisZip = Join-Path $nsisDir 'nsis-3.13.zip'
+            & "$env:SystemRoot\System32\curl.exe" --fail --location --silent --show-error --retry 4 --retry-delay 5 `
+              --output $nsisZip 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13.zip'
+            if ($LASTEXITCODE -ne 0) { throw 'Official NSIS 3.13 portable archive download failed' }
+            $nsisHash = (Get-FileHash -LiteralPath $nsisZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($nsisHash -cne 'ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8') {
+              throw "Official NSIS 3.13 archive SHA-256 mismatch: $nsisHash"
+            }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($nsisZip, $nsisDir)
+            $makensis = Join-Path $nsisDir 'nsis-3.13\makensis.exe'
           }
-          if (-not $makensis) { throw 'makensis.exe was not found after installation' }
+          if (-not $makensis -or -not (Test-Path -LiteralPath $makensis -PathType Leaf)) {
+            throw 'makensis.exe was not found after installation'
+          }
           $inputsDir = Join-Path $env:RUNNER_TEMP 'installer-inputs'
           New-Item -ItemType Directory -Force -Path $inputsDir | Out-Null
           $bootstrapper = Join-Path $inputsDir 'MicrosoftEdgeWebview2Setup.exe'
-          Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $bootstrapper
+          & "$env:SystemRoot\System32\curl.exe" --fail --location --silent --show-error --retry 4 --retry-delay 5 `
+            --output $bootstrapper 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft WebView2 bootstrapper download failed' }
           $signature = Get-AuthenticodeSignature -LiteralPath $bootstrapper
           if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
             throw 'Downloaded WebView2 bootstrapper does not have a valid Microsoft Corporation Authenticode signature'
@@ -196,6 +207,7 @@ jobs:
           "webview2_sha256=$webview2Sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Configure optional Authenticode signing
         id: authenticode
+        if: github.event_name != 'pull_request'
         shell: pwsh
         env:
           WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
@@ -234,7 +246,7 @@ jobs:
           MAKENSIS_EXE: ${{ steps.installer-prereqs.outputs.makensis }}
           WEBVIEW2_BOOTSTRAPPER: ${{ steps.installer-prereqs.outputs.bootstrapper }}
           WEBVIEW2_SHA256: ${{ steps.installer-prereqs.outputs.webview2_sha256 }}
-          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.WINDOWS_CERT_PASSWORD || '' }}
         run: |
           $archives = @(Get-ChildItem -LiteralPath dist/windows -Filter 'nd2wsi-viewer-*-windows-x64.zip')
           if ($archives.Count -ne 1) { throw 'Expected exactly one portable ZIP before building NSIS installer' }

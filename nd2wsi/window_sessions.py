@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,7 +42,16 @@ def _atomic_json(path: Path, payload: dict) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        delay = 0.01
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 9:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 1.5, 0.05)
     finally:
         temporary.unlink(missing_ok=True)
 

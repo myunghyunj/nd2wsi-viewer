@@ -72,8 +72,13 @@ def _manifest_source_path(container: Path, manifest: dict[str, Any]) -> Path | N
 
 def _annotation_source_name(path: Path) -> str | None:
     """Return a legacy sidecar's declared source name, when present."""
+    from .annotation_workspace import _read
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = _read(path)
+        if raw is None:
+            return None
+        payload = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
@@ -218,7 +223,11 @@ def annotations_sidecar(
                 else:
                     import uuid
 
-                    raw_bytes = old.read_bytes()
+                    from .annotation_workspace import _read
+
+                    raw_bytes = _read(old)
+                    if raw_bytes is None:
+                        continue
                     tmp = new.with_name(f".{new.name}.{uuid.uuid4().hex}.tmp")
                     try:
                         with tmp.open("xb") as fh:

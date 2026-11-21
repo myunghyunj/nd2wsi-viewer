@@ -43,6 +43,7 @@ button { color:inherit; font:inherit; }
   backdrop-filter: var(--material-popover-filter);
 }
 .window-actions button { display:flex; justify-content:space-between; gap:16px; width:100%; padding:9px; border:0; border-radius:6px; text-align:left; background:transparent; }
+.window-actions button[hidden] { display:none; }
 .window-actions button:hover:not(:disabled) { background:rgba(10,132,255,.16); }
 .window-actions kbd { color:var(--label-3); font:inherit; }
 #window-action-status { display:block; padding:3px 9px; font-size:10px; white-space:normal; }

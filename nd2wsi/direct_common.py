@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -52,9 +53,18 @@ def box_mean(block: np.ndarray, k: int, out_dtype: Any = None) -> np.ndarray:
         or not np.issubdtype(dtype, np.integer)
         or not np.can_cast(block.dtype, dtype)
     ):
-        mean = view.reshape((*lead, h2, k, w2, k)).mean(axis=(-3, -1), dtype=np.float32)
+        acc_dtype = (
+            np.float64
+            if block.dtype == np.dtype(np.float64)
+            or dtype == np.dtype(np.float64)
+            or (np.issubdtype(block.dtype, np.integer) and block.dtype.itemsize >= 4)
+            or (np.issubdtype(dtype, np.integer) and dtype.itemsize >= 4)
+            else np.float32
+        )
+        mean = view.reshape((*lead, h2, k, w2, k)).mean(axis=(-3, -1), dtype=acc_dtype)
         if np.issubdtype(dtype, np.integer):
-            return np.rint(mean).astype(dtype)
+            info = np.iinfo(dtype)
+            return np.clip(np.rint(mean), info.min, info.max).astype(dtype)
         return mean.astype(dtype)
     # Sum k rows at a time over contiguous memory, then k neighbouring
     # columns as k strided adds: far cheaper than a float32 mean over a
@@ -265,12 +275,18 @@ class _SvsLevel:
         extra: int,
         life: _Lifecycle | None = None,
         dtype: np.dtype = np.dtype(np.uint8),
+        verify: Callable[[], None] | None = None,
     ):
         self._read = read
         self.shape = (3, h, w)
         self.dtype = np.dtype(dtype)
         self._extra = extra
         self._life = life
+        self._verify = verify
+
+    def _verify_source(self) -> None:
+        if self._verify is not None:
+            self._verify()
 
     def _window(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         e = self._extra
