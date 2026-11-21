@@ -338,14 +338,170 @@ Function ${PREFIX}IsNameSurrogateReparse
   Exch $R0
 FunctionEnd
 
+Function ${PREFIX}IsOsOwnedAncestor
+  ; Return "1" if a normalized ancestor path matches an OS- or shell-managed
+  ; profile root ($LOCALAPPDATA, $APPDATA, $PROFILE, $SMPROGRAMS, $DESKTOP, or
+  ; the parent of $PROFILE such as C:\Users), else "0".
+  Exch $R0
+  Push $R1
+  Push $R2
+  StrCpy $R1 "0"
+  ${If} $R0 == "$LOCALAPPDATA"
+  ${OrIf} $R0 == "$APPDATA"
+  ${OrIf} $R0 == "$PROFILE"
+  ${OrIf} $R0 == "$SMPROGRAMS"
+  ${OrIf} $R0 == "$DESKTOP"
+    StrCpy $R1 "1"
+  ${Else}
+    ${GetParent} "$PROFILE" $R2
+    ${If} $R2 != ""
+    ${AndIf} $R0 == $R2
+      StrCpy $R1 "1"
+    ${EndIf}
+  ${EndIf}
+  ${If} $R1 == "0"
+    Push "$LOCALAPPDATA"
+    Call ${PREFIX}NormalizePath
+    Pop $R2
+    ${If} $R2 != ""
+    ${AndIf} $R0 == $R2
+      StrCpy $R1 "1"
+    ${EndIf}
+  ${EndIf}
+  ${If} $R1 == "0"
+    Push "$PROFILE"
+    Call ${PREFIX}NormalizePath
+    Pop $R2
+    ${If} $R2 != ""
+      ${If} $R0 == $R2
+        StrCpy $R1 "1"
+      ${Else}
+        ${GetParent} "$R2" $R2
+        ${If} $R2 != ""
+        ${AndIf} $R0 == $R2
+          StrCpy $R1 "1"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ${If} $R1 == "0"
+    Push "$SMPROGRAMS"
+    Call ${PREFIX}NormalizePath
+    Pop $R2
+    ${If} $R2 != ""
+    ${AndIf} $R0 == $R2
+      StrCpy $R1 "1"
+    ${EndIf}
+  ${EndIf}
+  ${If} $R1 == "0"
+    Push "$DESKTOP"
+    Call ${PREFIX}NormalizePath
+    Pop $R2
+    ${If} $R2 != ""
+    ${AndIf} $R0 == $R2
+      StrCpy $R1 "1"
+    ${EndIf}
+  ${EndIf}
+  ${If} $R1 == "0"
+    Push "$APPDATA"
+    Call ${PREFIX}NormalizePath
+    Pop $R2
+    ${If} $R2 != ""
+    ${AndIf} $R0 == $R2
+      StrCpy $R1 "1"
+    ${EndIf}
+  ${EndIf}
+  StrCpy $R0 $R1
+  Pop $R2
+  Pop $R1
+  Exch $R0
+FunctionEnd
+
+Function ${PREFIX}MoveFileExWithRetry
+  ; Atomically replace a staged file (MOVEFILE_REPLACE_EXISTING|WRITE_THROUGH=9),
+  ; retrying transient Windows Defender / AV locks (ERROR_ACCESS_DENIED=5,
+  ; ERROR_SHARING_VIOLATION=32) up to 10 x 150 ms.
+  ; Stack in: source, destination. Stack out: result, win32_error (top).
+  Exch $R1 ; destination
+  Exch
+  Exch $R0 ; source
+  Push $R2
+  Push $R3
+  Push $R4
+  StrCpy $R4 0
+  ${Do}
+    System::Call 'kernel32::MoveFileExW(w R0, w R1, i 9)i.R2 ?e'
+    Pop $R3
+    ${If} $R2 != 0
+      ${ExitDo}
+    ${EndIf}
+    ${If} $R3 != 5
+    ${AndIf} $R3 != 32
+      ${ExitDo}
+    ${EndIf}
+    IntOp $R4 $R4 + 1
+    ${If} $R4 > 10
+      ${ExitDo}
+    ${EndIf}
+    Sleep 150
+  ${Loop}
+  StrCpy $R0 $R2
+  StrCpy $R1 $R3
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Exch $R0
+  Exch
+  Exch $R1
+FunctionEnd
+
+Function ${PREFIX}DeleteFileWithRetry
+  ; Delete a single file, retrying transient Windows Defender / AV locks
+  ; (ERROR_ACCESS_DENIED=5, ERROR_SHARING_VIOLATION=32) up to 10 x 150 ms.
+  ; Stack in: path. Stack out: result, win32_error (top).
+  Exch $R0 ; path
+  Push $R1
+  Push $R2
+  Push $R3
+  StrCpy $R3 0
+  ${Do}
+    System::Call 'kernel32::DeleteFileW(w R0)i.R1 ?e'
+    Pop $R2
+    ${If} $R1 != 0
+      ${ExitDo}
+    ${EndIf}
+    ${If} $R2 != 5
+    ${AndIf} $R2 != 32
+      ${ExitDo}
+    ${EndIf}
+    IntOp $R3 $R3 + 1
+    ${If} $R3 > 10
+      ${ExitDo}
+    ${EndIf}
+    Sleep 150
+  ${Loop}
+  StrCpy $R0 $R1
+  StrCpy $R1 $R2
+  Pop $R3
+  Pop $R2
+  Exch $R1
+  Exch
+  Exch $R0
+  Exch
+FunctionEnd
+
 Function ${PREFIX}CheckPathChain
-  ; Check the leaf as well as every existing ancestor. This rejects both
-  ; directory junctions and file symlinks before extraction/deletion can
-  ; follow them outside the registered installation folder.
+  ; Check the leaf and user-owned ancestors up to OS/profile/volume mount roots.
+  ; This rejects directory junctions and file symlinks under user-owned segments
+  ; without falsely blocking redirected profiles, NTFS volume mount points, or
+  ; ACL-restricted OS ancestors such as C:\Users.
   Exch $R0
   Push $R1
   Push $R2
   Push $R3
+  Push $R4
+  Push $R5
+  Push $R6
   ; NSIS GetFullPathName can clear its output for a nonexistent leaf.
   ; Use lexical Win32 normalization so every existing ancestor is still
   ; inspected even when the destination or a shipped child does not exist.
@@ -358,12 +514,65 @@ Function ${PREFIX}CheckPathChain
     Goto path_done
   ${EndIf}
   StrCpy $R0 $R1
+  StrCpy $R2 $R0 "" -1
+  ${If} $R2 == "\"
+    StrLen $R3 $R0
+    ${If} $R3 > 3
+      StrCpy $R0 $R0 -1
+    ${EndIf}
+  ${EndIf}
+  ; Locate the nearest NTFS volume mount point so mounted volumes are treated
+  ; as OS mount roots when walking ancestors above the target leaf.
+  StrCpy $R6 $R0
+  StrCpy $R5 ""
   ${Do}
+    System::Call 'kernel32::GetVolumePathNameW(w R6, w .R5, i ${NSIS_MAX_STRLEN})i.R2'
+    ${If} $R2 != 0
+      ${ExitDo}
+    ${EndIf}
+    StrCpy $R5 ""
+    ${GetParent} "$R6" $R2
+    ${If} $R2 == ""
+    ${OrIf} $R2 == $R6
+      ${ExitDo}
+    ${EndIf}
+    StrCpy $R6 $R2
+  ${Loop}
+  ${If} $R5 != ""
+    StrCpy $R2 $R5 "" -1
+    ${If} $R2 == "\"
+      StrLen $R3 $R5
+      ${If} $R3 > 3
+        StrCpy $R5 $R5 -1
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  StrCpy $R4 0
+  ${Do}
+    ${If} $R4 != 0
+      ${If} $R5 != ""
+      ${AndIf} $R0 == $R5
+        !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckPathChain.stop_volume_root path=$R0"
+        ${ExitDo}
+      ${EndIf}
+      Push "$R0"
+      Call ${PREFIX}IsOsOwnedAncestor
+      Pop $R2
+      ${If} $R2 != 0
+        !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckPathChain.stop_os_ancestor path=$R0"
+        ${ExitDo}
+      ${EndIf}
+    ${EndIf}
     System::Call 'kernel32::GetFileAttributesW(w R0)i.R1 ?e'
     Pop $R3
     ${If} $R1 == -1
       ${If} $R3 != 2
       ${AndIf} $R3 != 3
+        ${If} $R4 != 0
+        ${AndIf} $R3 == 5
+          !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckPathChain.ancestor_access_denied path=$R0 win32_error=$R3"
+          ${ExitDo}
+        ${EndIf}
         StrCpy $GuardError "Setup could not safely inspect this path:$\r$\n$R0$\r$\n$\r$\nCheck folder access and try again."
         !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckPathChain.reject path=$R0 attributes=$R1 win32_error=$R3 reason=$GuardError"
         ${ExitDo}
@@ -387,8 +596,12 @@ Function ${PREFIX}CheckPathChain
       ${ExitDo}
     ${EndIf}
     StrCpy $R0 $R2
+    StrCpy $R4 1
   ${Loop}
   path_done:
+  Pop $R6
+  Pop $R5
+  Pop $R4
   Pop $R3
   Pop $R2
   Pop $R1
@@ -598,9 +811,11 @@ Function ${PREFIX}WriteOwnershipMarker
   ${If} $MarkerWriteFailed != 0
     Goto marker_cleanup
   ${EndIf}
-  StrCpy $R2 "$INSTDIR\${MARKER}"
-  System::Call 'kernel32::MoveFileExW(w R1, w R2, i 9)i.R3 ?e'
+  Push "$R1"
+  Push "$INSTDIR\${MARKER}"
+  Call ${PREFIX}MoveFileExWithRetry
   Pop $R4
+  Pop $R3
   !insertmacro ND2WSI_TRACE "${PREFIX}" "WriteOwnershipMarker.MoveFileEx result=$R3 win32_error=$R4 source=$R1 destination=$INSTDIR\${MARKER}"
   ${If} $R3 == 0
     StrCpy $MarkerWriteFailed 1
@@ -632,8 +847,10 @@ Function ${PREFIX}WriteOwnershipMarker
   ${EndIf}
   Goto marker_done
   marker_cleanup:
-  System::Call 'kernel32::DeleteFileW(w R1)i.R3 ?e'
+  Push "$R1"
+  Call ${PREFIX}DeleteFileWithRetry
   Pop $R4
+  Pop $R3
   ${If} $R3 == 0
   ${AndIf} $R4 != 2
   ${AndIf} $R4 != 3
@@ -1052,9 +1269,11 @@ Function WriteSafeUninstaller
   ${If} $UninstallerWriteFailed != 0
     Goto uninstaller_cleanup
   ${EndIf}
-  StrCpy $2 "$INSTDIR\Uninstall.exe"
-  System::Call 'kernel32::MoveFileExW(w r0, w r2, i 9)i.r1 ?e'
+  Push "$0"
+  Push "$INSTDIR\Uninstall.exe"
+  Call MoveFileExWithRetry
   Pop $2
+  Pop $1
   !insertmacro ND2WSI_TRACE "" "WriteSafeUninstaller.MoveFileEx result=$1 win32_error=$2 source=$0 destination=$INSTDIR\Uninstall.exe"
   ${If} $1 == 0
     StrCpy $UninstallerWriteFailed 1
@@ -1064,8 +1283,10 @@ Function WriteSafeUninstaller
   StrCpy $UninstallerTempPath ""
   Goto uninstaller_done
   uninstaller_cleanup:
-  System::Call 'kernel32::DeleteFileW(w r0)i.r1 ?e'
+  Push "$0"
+  Call DeleteFileWithRetry
   Pop $2
+  Pop $1
   !insertmacro ND2WSI_TRACE "" "WriteSafeUninstaller.cleanup result=$1 win32_error=$2 path=$0"
   ${If} $1 == 0
   ${AndIf} $2 != 2
@@ -1399,8 +1620,10 @@ Function ${PREFIX}DeleteOwnedFile
   Exch $R0
   Push $R1
   Push $R2
-  System::Call 'kernel32::DeleteFileW(w R0)i.R1 ?e'
+  Push "$R0"
+  Call ${PREFIX}DeleteFileWithRetry
   Pop $R2
+  Pop $R1
   ${If} $R1 == 0
   ${AndIf} $R2 != 2
   ${AndIf} $R2 != 3
@@ -1593,6 +1816,63 @@ Function un.DeleteKeyIfTrulyEmpty
   Pop $R0
 FunctionEnd
 
+Function un.RemoveOwnedAppRegKey
+  ; Only delete HKCU "${APP_REG_KEY}" if its shell\open\command points into
+  ; this $INSTDIR, so uninstalling one installation or edition never wipes
+  ; another installation's "Open with" registration.
+  Push $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  ReadRegStr $R0 HKCU "${APP_REG_KEY}\shell\open\command" ""
+  StrCpy $R4 0
+  ${If} $R0 != ""
+    ${If} $R0 == '"$INSTDIR\${APP_EXE}" "%1"'
+      StrCpy $R4 1
+    ${Else}
+      StrCpy $R1 $R0 1
+      ${If} $R1 == '"'
+        StrCpy $R2 1
+        StrLen $R3 $R0
+        ${DoWhile} $R2 < $R3
+          StrCpy $R1 $R0 1 $R2
+          ${If} $R1 == '"'
+            ${ExitDo}
+          ${EndIf}
+          IntOp $R2 $R2 + 1
+        ${Loop}
+        IntOp $R2 $R2 - 1
+        StrCpy $R1 $R0 $R2 1
+      ${Else}
+        StrCpy $R1 $R0
+      ${EndIf}
+      ${If} $R1 != ""
+        Push "$R1"
+        Call un.NormalizePath
+        Pop $R1
+        ${If} $R1 != ""
+          ${GetParent} "$R1" $R2
+          ${If} $R2 == $INSTDIR
+            StrCpy $R4 1
+          ${EndIf}
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ${If} $R4 == 1
+    DeleteRegKey HKCU "${APP_REG_KEY}"
+  ${Else}
+    !insertmacro ND2WSI_TRACE "un." "RemoveOwnedAppRegKey.preserved command=$R0 instdir=$INSTDIR"
+  ${EndIf}
+  ClearErrors
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+FunctionEnd
+
 Function un.RemoveFileAssociations
   !insertmacro ND2WSI_TRACE "un." "RemoveFileAssociations.begin"
   SetRegView 64
@@ -1601,7 +1881,7 @@ Function un.RemoveFileAssociations
   Push "Software\nd2wsi-viewer"
   Call un.DeleteKeyIfTrulyEmpty
   DeleteRegKey HKCU "Software\Classes\${PROG_ID}"
-  DeleteRegKey HKCU "${APP_REG_KEY}"
+  Call un.RemoveOwnedAppRegKey
   !insertmacro ND2WSI_UNREGISTER_EXTENSION ".nd2"
   !insertmacro ND2WSI_UNREGISTER_EXTENSION ".czi"
   !insertmacro ND2WSI_UNREGISTER_EXTENSION ".lif"

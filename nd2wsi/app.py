@@ -1362,6 +1362,12 @@ def main(argv: list[str] | None = None) -> int:
         kwargs = {"gui": "edgechromium"} if sys.platform == "win32" else {}
         if window_session is not None:
             kwargs["private_mode"] = True
+            if sys.platform == "win32":
+                session_root = getattr(window_session, "root", None)
+                if session_root is not None:
+                    udf = Path(session_root) / "webview2-udf"
+                    udf.mkdir(parents=True, exist_ok=True)
+                    kwargs["storage_path"] = str(udf)
         _daemonize_pywebview_bridge_threads(webview)
         if args.browser_replay_report:
             from .viewport_benchmark import run_browser_replay

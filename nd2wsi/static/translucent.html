@@ -11,6 +11,22 @@
   <div id="translucent-stage" aria-label="Drag to pan; scroll to zoom" title="Right-click or ⌘/Ctrl+O to open an AstroMapper JPG and TXT pair"></div>
   <svg id="roi-overlay" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
   <div id="window-drag" title="Drag to move window · Option/Alt-drag anywhere"></div>
+  <div id="zoom-control">
+    <button id="zoom-badge" type="button" aria-haspopup="dialog" aria-expanded="false" title="Click to enter exact zoom (Shift+scroll: fine, Alt+scroll: ultra-fine)">1.000×</button>
+    <div id="zoom-popover" hidden role="dialog" aria-label="Set zoom">
+      <form id="zoom-form">
+        <input id="zoom-input" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" aria-label="Zoom magnification" />
+        <button id="zoom-apply" type="submit">Set</button>
+      </form>
+      <div class="zoom-steps">
+        <button type="button" data-zoom-step="-0.01">−0.01</button>
+        <button type="button" data-zoom-step="-0.001">−0.001</button>
+        <button type="button" data-zoom-step="0.001">+0.001</button>
+        <button type="button" data-zoom-step="0.01">+0.01</button>
+      </div>
+      <div class="zoom-hint">Shift: fine · Alt: ultra-fine</div>
+    </div>
+  </div>
   <div id="window-controls">
     <div id="roi-controls" hidden>
     <button type="button" id="roi-previous" aria-label="Previous ROI" title="Previous ROI (←)" disabled><span class="overlay-glyph roi-previous-glyph" aria-hidden="true"></span></button>

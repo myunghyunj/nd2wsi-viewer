@@ -16,6 +16,7 @@ Object.defineProperty(globalThis, 'navigator', {
 });
 const Align = require(process.argv[1] + '/align-v1.js');
 const ShortcutRouter = require(process.argv[1] + '/shortcut-router-v1.js');
+const ShellCompare = require(process.argv[1] + '/shell-compare-v1.js');
 const source = fs.readFileSync(process.argv[1] + '/shell-v1.js', 'utf8');
 function production(name) {
   const start = source.indexOf('function ' + name + '(');
@@ -86,9 +87,6 @@ const context = vm.createContext({
     }
   },
 });
-context.useProduction = names => {
-  for (const name of names) vm.runInContext(production(name), context);
-};
 // Exercise real lifecycle, state ownership, cancellation, memory and request
 // guards. Adding a guard must not be papered over with a fixture-only stub.
 for (const match of source.matchAll(/^function (\w+)\(/gm)) {
@@ -97,6 +95,39 @@ for (const match of source.matchAll(/^function (\w+)\(/gm)) {
 const compareStart = source.indexOf('const compare = {');
 vm.runInContext(source.slice(compareStart, source.indexOf('\n};',compareStart)+3),context);
 const compare = vm.runInContext('compare',context);
+const compareEngine = ShellCompare.createCompare({
+  compare, pairPicker: context.pairPicker, frames: context.frames,
+  getSlides: () => context.slides, getActive: () => context.active,
+  setActive: sid => { context.active = sid; },
+  Align, ShortcutRouter, VIEWPORT_PROTOCOL_VERSION: 2, VIEWPORT_THROTTLE_MS: 48,
+  MAX_GROUP: 4, LANDMARKS_NEEDED: 4, $,
+  document: context.document, window: context.window, crypto: context.crypto,
+  setTimeout: context.setTimeout, clearTimeout: context.clearTimeout,
+  requestAnimationFrame: context.requestAnimationFrame,
+  groupSids: () => context.groupSids(), inGroup: sid => context.inGroup(sid),
+  slideName: sid => context.slideName(sid), rememberSlide: sid => context.rememberSlide(sid),
+  ensureFrame: sid => context.ensureFrame(sid), applyFrameLayout: () => context.applyFrameLayout(),
+  render: () => context.render(), stopCompare: () => context.stopCompare(),
+  postToSlide: (sid, msg) => context.postToSlide(sid, msg), showError: msg => context.showError(msg),
+  scheduleNativeGestureScopes: () => context.scheduleNativeGestureScopes(),
+  refreshShellToolButtons: () => context.refreshShellToolButtons?.(),
+  finitePoint: (v, pos) => context.finitePoint(v, pos),
+  localIdentity: st => context.localIdentity(st), sameIdentity: (a, b) => context.sameIdentity(a, b),
+});
+const productionCompare = { ...compareEngine };
+for (const key of Object.keys(compareEngine)) {
+  Object.defineProperty(context, key, {
+    configurable: true, enumerable: true,
+    get: () => compareEngine[key],
+    set: val => { compareEngine[key] = val; },
+  });
+}
+context.useProduction = names => {
+  for (const name of names) {
+    if (name in productionCompare) context[name] = productionCompare[name];
+    else vm.runInContext(production(name), context);
+  }
+};
 Object.assign(compare, {
   enabled: true, toolsVisible: true, linked: true, toolbarHeight: 120,
   anchorSid: 'a', members: ['b'], orientationSid: 'b', split: 50,

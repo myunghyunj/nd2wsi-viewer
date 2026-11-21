@@ -18,6 +18,7 @@ Object.defineProperty(globalThis, 'navigator', {
 });
 const Align = require(process.argv[1] + '/align-v1.js');
 const ShortcutRouter = require(process.argv[1] + '/shortcut-router-v1.js');
+const ShellCompare = require(process.argv[1] + '/shell-compare-v1.js');
 const source = fs.readFileSync(process.argv[1] + '/shell-v1.js', 'utf8');
 // Top-level function closing braces are unindented in the production file.
 function production(name) {
@@ -84,6 +85,32 @@ for (const match of source.matchAll(/^function (\w+)\(/gm)) {
 const compareStart = source.indexOf('const compare = {');
 vm.runInContext(source.slice(compareStart, source.indexOf('\n};',compareStart)+3),context);
 const compare = vm.runInContext('compare',context);
+const compareEngine = ShellCompare.createCompare({
+  compare, pairPicker: context.pairPicker, frames: context.frames,
+  getSlides: () => context.slides, getActive: () => context.active,
+  setActive: sid => { context.active = sid; },
+  Align, ShortcutRouter, VIEWPORT_PROTOCOL_VERSION: 2, VIEWPORT_THROTTLE_MS: 48,
+  MAX_GROUP: 4, LANDMARKS_NEEDED: 4, $: element,
+  document: context.document, window: context.window, crypto: context.crypto,
+  setTimeout: context.setTimeout, clearTimeout: context.clearTimeout,
+  requestAnimationFrame: fn => fn(),
+  groupSids: () => context.groupSids(), inGroup: sid => context.inGroup(sid),
+  slideName: sid => context.slideName(sid), rememberSlide: sid => context.rememberSlide(sid),
+  ensureFrame: sid => context.ensureFrame(sid), applyFrameLayout: () => context.applyFrameLayout(),
+  render: () => context.render(), stopCompare: () => context.stopCompare(),
+  postToSlide: (sid, msg) => context.postToSlide(sid, msg), showError: msg => context.showError(msg),
+  scheduleNativeGestureScopes: () => context.scheduleNativeGestureScopes(),
+  refreshShellToolButtons: () => context.refreshShellToolButtons?.(),
+  finitePoint: (v, pos) => context.finitePoint(v, pos),
+  localIdentity: st => context.localIdentity(st), sameIdentity: (a, b) => context.sameIdentity(a, b),
+});
+for (const key of Object.keys(compareEngine)) {
+  Object.defineProperty(context, key, {
+    configurable: true, enumerable: true,
+    get: () => compareEngine[key],
+    set: val => { compareEngine[key] = val; },
+  });
+}
 Object.assign(compare, {
   enabled:true, toolsVisible:true, anchorSid:'a', members:['b','c'], orientationSid:'b',
   groupSessionId:'group-qa',groupEpoch:1,committedRevision:0,
@@ -167,7 +194,7 @@ context.fitAll = () => {
 // Execute real button, keyboard, and message dispatch bindings too: a disabled
 // Done button alone must not stand in for the shared atomic commit gate.
 const bindingStart=source.indexOf('$("compare-orientation-target").onchange');
-const bindingEnd=source.indexOf('$("compare-picker").addEventListener',bindingStart);
+const bindingEnd=source.indexOf('wireCompareInteractions();',bindingStart);
 vm.runInContext(source.slice(bindingStart,bindingEnd),context);
 const messageStart=source.indexOf('window.addEventListener("message",');
 vm.runInContext(source.slice(messageStart,source.indexOf('\n});',messageStart)+4),context);

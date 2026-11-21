@@ -51,7 +51,7 @@ def _prune_old_logs(log_dir: Path, keep: int = 20) -> None:
 # and give dependencies real streams (some call .flush() without checking).
 # CI sets a fresh path per smoke run; normal launches keep a per-process log.
 if sys.platform == "win32":
-    root = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "nd2wsi-viewer" / "logs"
+    root = Path(os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")) / "nd2wsi-viewer" / "logs"
     explicit_log = os.environ.get("ND2WSI_LOG_FILE")
     logfile = Path(explicit_log) if explicit_log else (root / f"app-{os.getpid()}.log")
     try:

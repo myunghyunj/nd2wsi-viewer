@@ -20,12 +20,20 @@ def native(monkeypatch):
     )
     state = SimpleNamespace(
         expected=value, opened=value, after=value, stamp=133000000000000001,
-        attributes=0, ok=True, opened_calls=[], closed=[], queries=[], fstats=0,
+        attributes=0, ok=True, opened_calls=[], closed=[], queries=[], tag_queries=[],
+        tag_ok=True, reparse_tag=0, fstats=0,
         filesystem="NTFS", volume_ok=True, volume_queries=[],
     )
 
     class Query:
         def __call__(self, handle, information_class, output, size):
+            if information_class == windows_fs._FILE_ATTRIBUTE_TAG_INFO_CLASS:
+                state.tag_queries.append((handle, information_class, size))
+                output._obj.FileAttributes = (
+                    state.attributes or getattr(state.opened, "st_file_attributes", 0)
+                )
+                output._obj.ReparseTag = state.reparse_tag
+                return state.tag_ok
             state.queries.append((handle, information_class, size))
             output._obj.ChangeTime = state.stamp
             output._obj.FileAttributes = state.attributes

@@ -138,6 +138,49 @@
     return result;
   }
 
+  function wheelZoomFactor(event, pageHeight) {
+    if (!event) return 1;
+    const dy = Number(event.deltaY) || 0;
+    const dx = Number(event.deltaX) || 0;
+    const raw = (event.shiftKey && dy === 0 && dx !== 0) ? dx : dy;
+    if (!Number.isFinite(raw) || raw === 0) return 1;
+    const mode = event.deltaMode || 0;
+    let deltaPx = raw;
+    if (mode === 1) {
+      deltaPx = raw * (100 / 3);
+    } else if (mode === 2) {
+      const page = Math.max((Number.isFinite(pageHeight) ? pageHeight : 600) || 600, 100);
+      deltaPx = raw * page;
+    }
+    deltaPx = Math.max(-300, Math.min(300, deltaPx));
+    if (event.ctrlKey && mode === 0 && Math.abs(deltaPx) < 50) {
+      return Math.exp(Math.max(-0.25, Math.min(0.25, -deltaPx * 0.005)));
+    }
+    const k = event.altKey ? 0.00002 : event.shiftKey ? 0.0001 : 0.0005;
+    return Math.exp(-deltaPx * k);
+  }
+
+  function formatZoomValue(z) {
+    if (!Number.isFinite(z) || z <= 0) return "";
+    return z < 0.01 ? z.toFixed(4) : z.toFixed(3);
+  }
+
+  function formatZoomLabel(z) {
+    const value = formatZoomValue(z);
+    return value ? value + "×" : "—";
+  }
+
+  function parseZoomInput(raw) {
+    if (typeof raw === "number") return Number.isFinite(raw) && raw > 0 ? raw : null;
+    if (typeof raw !== "string") return null;
+    const trimmed = raw.trim();
+    const match = /^([+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([xX×%])?$/.exec(trimmed);
+    if (!match) return null;
+    const base = Number(match[1]);
+    const value = match[2] === "%" ? base / 100 : base;
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
   function mount(options) {
     const { window: win, document: doc, api, OSD, context, info } = options;
     const importer = options.importer || win.Nd2AstromapImport;
@@ -156,12 +199,26 @@
     const opacityControl = doc.getElementById("opacity-control");
     const opacitySlider = doc.getElementById("overlay-opacity");
     const opacityValue = doc.getElementById("opacity-value");
+    const windowControls = doc.getElementById("window-controls");
+    const zoomControl = doc.getElementById("zoom-control");
+    const zoomBadge = doc.getElementById("zoom-badge");
+    const zoomPopover = doc.getElementById("zoom-popover");
+    const zoomForm = doc.getElementById("zoom-form");
+    const zoomInput = doc.getElementById("zoom-input");
+    const zoomApply = doc.getElementById("zoom-apply");
+    const zoomStepButtons = Array.from(
+      zoomPopover?.querySelectorAll?.("[data-zoom-step]") ||
+      doc.querySelectorAll?.("#zoom-popover [data-zoom-step]") ||
+      []
+    );
+    if (zoomPopover) zoomPopover.hidden = true;
     const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
     const initialOpacity = validOpacity(context.opacity) ? context.opacity : .55;
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
       rois: [], roiIndex: -1, roiName: "", loadingRois: false,
       importResult: null, importReview: null, importApplied: false,
-      opacity: initialOpacity, confirmedOpacity: initialOpacity };
+      opacity: initialOpacity, confirmedOpacity: initialOpacity,
+      zoomPopoverOpen: false };
     const showStatus = message => { status.textContent = message; status.hidden = !message; };
     let opacityTask = null, opacityError = "";
     const paintOpacity = () => {
@@ -216,22 +273,206 @@
       event.preventDefault(); event.stopPropagation();
     }, { passive: false });
     paintOpacity();
+    const maxZoomRatio = Math.max(16, context.zoom || 1);
     const viewer = OSD({
       element: stage, tileSources: makeTileSource(info, context, OSD),
       showNavigationControl: false, showNavigator: false, showSequenceControl: false,
       prefixUrl: "", drawer: "canvas", crossOriginPolicy: false,
       autoResize: false, preserveImageSizeOnResize: true,
       animationTime: .15, springStiffness: 12, zoomPerScroll: 1.2,
-      minZoomImageRatio: .05, maxZoomPixelRatio: Math.max(8, context.zoom),
+      minZoomImageRatio: .05, maxZoomPixelRatio: maxZoomRatio,
       visibilityRatio: 0, constrainDuringPan: false,
       imageSmoothingEnabled: true, imageLoaderLimit: 6, maxImageCacheCount: 120,
-      gestureSettingsMouse: { clickToZoom: false, dblClickToZoom: false, scrollToZoom: true },
+      gestureSettingsMouse: { clickToZoom: false, dblClickToZoom: false, scrollToZoom: false },
       gestureSettingsTouch: { pinchToZoom: true, flickEnabled: false, clickToZoom: false, dblClickToZoom: false },
     });
     // On a focused canvas OSD's own keys rotate (R), flip (F), pan (W/A/S/D,
     // arrows) or zoom (+/-, 0). This window shows exactly the main viewer's
     // orientation and is aligned by hand, so none of them may act here.
     viewer.addHandler("canvas-key", event => { event.preventDefaultAction = true; });
+    const currentImageZoom = () => {
+      const vp = viewer.viewport;
+      const raw = vp.getZoom(true);
+      return typeof vp.viewportToImageZoom === "function" ? vp.viewportToImageZoom(raw) : raw;
+    };
+    const zoomBounds = () => {
+      const vp = viewer.viewport;
+      let minZ = 1e-4;
+      let maxZ = maxZoomRatio;
+      const hasConvert = typeof vp.viewportToImageZoom === "function";
+      if (typeof vp.getMinZoom === "function") {
+        const rawMin = vp.getMinZoom();
+        const candidate = hasConvert ? vp.viewportToImageZoom(rawMin) : rawMin;
+        if (Number.isFinite(candidate) && candidate > 0) minZ = candidate;
+      } else {
+        const size = vp.getContainerSize?.();
+        if (size?.x > 0 && size?.y > 0 && info.width > 0 && info.height > 0) {
+          minZ = Math.max(1e-6, 0.05 * Math.min(size.x / info.width, size.y / info.height));
+        }
+      }
+      if (typeof vp.getMaxZoom === "function") {
+        const rawMax = vp.getMaxZoom();
+        const candidate = hasConvert ? vp.viewportToImageZoom(rawMax) : rawMax;
+        if (Number.isFinite(candidate) && candidate > minZ) maxZ = candidate;
+      }
+      if (Number.isFinite(context.zoom) && context.zoom > 0) {
+        minZ = Math.min(minZ, context.zoom);
+        maxZ = Math.max(maxZ, context.zoom);
+      }
+      return { min: Math.max(1e-6, minZ), max: Math.max(maxZ, minZ) };
+    };
+    const paintZoom = () => {
+      const z = state.ready ? currentImageZoom() : context.zoom;
+      const disabled = state.locked || state.pending || !state.ready;
+      if (zoomBadge) {
+        zoomBadge.textContent = formatZoomLabel(z);
+        zoomBadge.disabled = disabled;
+        zoomBadge.setAttribute("aria-expanded", String(state.zoomPopoverOpen));
+      }
+      if (zoomInput) zoomInput.disabled = disabled;
+      if (zoomApply) zoomApply.disabled = disabled;
+      for (const button of zoomStepButtons) button.disabled = disabled;
+    };
+    const closeZoomPopover = ({ restoreFocus = false } = {}) => {
+      const wasOpen = state.zoomPopoverOpen;
+      state.zoomPopoverOpen = false;
+      if (zoomPopover) zoomPopover.hidden = true;
+      if (zoomBadge) zoomBadge.setAttribute("aria-expanded", "false");
+      zoomInput?.removeAttribute?.("aria-invalid");
+      if (wasOpen && restoreFocus && zoomBadge && !zoomBadge.disabled) zoomBadge.focus?.();
+      return wasOpen;
+    };
+    const openZoomPopover = () => {
+      if (!zoomPopover || !zoomBadge || state.locked || state.pending || !state.ready) return false;
+      state.zoomPopoverOpen = true;
+      zoomPopover.hidden = false;
+      zoomBadge.setAttribute("aria-expanded", "true");
+      if (zoomInput) {
+        zoomInput.value = formatZoomValue(currentImageZoom());
+        zoomInput.removeAttribute?.("aria-invalid");
+        zoomInput.focus?.();
+        zoomInput.select?.();
+      }
+      return true;
+    };
+    const applyImageZoom = (targetImageZoom, refPoint = null) => {
+      if (!state.ready || state.locked || state.pending) return false;
+      if (!Number.isFinite(targetImageZoom) || targetImageZoom <= 0) return false;
+      const vp = viewer.viewport;
+      const { min, max } = zoomBounds();
+      const clamped = Math.max(min, Math.min(max, targetImageZoom));
+      const vpZoom = typeof vp.imageToViewportZoom === "function"
+        ? vp.imageToViewportZoom(clamped)
+        : clamped;
+      vp.zoomTo(vpZoom, refPoint || null, true);
+      viewer.forceRedraw?.();
+      paintZoom();
+      return true;
+    };
+    const stepZoom = delta => {
+      if (!state.ready || state.locked || state.pending || !Number.isFinite(delta) || delta === 0) return false;
+      const current = currentImageZoom();
+      if (!Number.isFinite(current) || current <= 0) return false;
+      const { min, max } = zoomBounds();
+      const next = Math.max(min, Math.min(max, Math.round((current + delta) * 1e6) / 1e6));
+      const applied = applyImageZoom(next, viewer.viewport.getCenter(true));
+      if (applied && zoomInput) {
+        zoomInput.value = formatZoomValue(currentImageZoom());
+        zoomInput.removeAttribute?.("aria-invalid");
+      }
+      return applied;
+    };
+    const submitZoomForm = event => {
+      event?.preventDefault?.();
+      if (state.locked || state.pending || !state.ready) {
+        closeZoomPopover();
+        return false;
+      }
+      const parsed = parseZoomInput(zoomInput?.value ?? "");
+      if (parsed === null) {
+        zoomInput?.setAttribute?.("aria-invalid", "true");
+        zoomInput?.focus?.();
+        zoomInput?.select?.();
+        return false;
+      }
+      zoomInput?.removeAttribute?.("aria-invalid");
+      const applied = applyImageZoom(parsed, viewer.viewport.getCenter(true));
+      if (applied) closeZoomPopover();
+      return applied;
+    };
+    if (zoomControl) {
+      for (const name of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) {
+        zoomControl.addEventListener(name, event => event.stopPropagation());
+      }
+      zoomControl.addEventListener("wheel", event => {
+        event.preventDefault();
+        event.stopPropagation();
+      }, { passive: false });
+    }
+    if (zoomBadge) {
+      zoomBadge.addEventListener("click", () => {
+        if (state.zoomPopoverOpen) closeZoomPopover();
+        else openZoomPopover();
+      });
+    }
+    if (zoomForm) zoomForm.addEventListener("submit", submitZoomForm);
+    if (zoomInput) {
+      zoomInput.addEventListener("keydown", event => {
+        if (event.altKey || event.ctrlKey || event.metaKey) return;
+        if (event.key === "Escape" && state.zoomPopoverOpen) {
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          closeZoomPopover({ restoreFocus: true });
+          return;
+        }
+        if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+          event.preventDefault();
+          event.stopPropagation?.();
+          const step = event.shiftKey ? 0.01 : 0.001;
+          stepZoom(event.key === "ArrowUp" ? step : -step);
+        }
+      });
+      zoomInput.addEventListener("input", () => {
+        zoomInput.removeAttribute?.("aria-invalid");
+      });
+    }
+    for (const button of zoomStepButtons) {
+      button.addEventListener("click", () => {
+        const delta = Number(button.dataset?.zoomStep ?? button.getAttribute?.("data-zoom-step"));
+        stepZoom(delta);
+      });
+    }
+    const isExcludedWheelTarget = target => {
+      if (!target) return false;
+      for (const node of [zoomPopover, zoomControl, windowControls, opacityControl, importReview]) {
+        if (node && (target === node || node.contains?.(target))) return true;
+      }
+      const hit = target.closest?.("#zoom-popover, #zoom-control, #window-controls, #opacity-control, #roi-import-review");
+      return Boolean(hit && (!hit.id || ["zoom-popover", "zoom-control", "window-controls", "opacity-control", "roi-import-review"].includes(hit.id)));
+    };
+    stage.addEventListener("wheel", event => {
+      if (isExcludedWheelTarget(event.target)) return;
+      if (state.locked || state.pending || !state.ready) return;
+      event.preventDefault?.();
+      const factor = wheelZoomFactor(event, stage.clientHeight || win.innerHeight || 600);
+      if (!Number.isFinite(factor) || factor === 1) return;
+      const current = currentImageZoom();
+      if (!Number.isFinite(current) || current <= 0) return;
+      const vp = viewer.viewport;
+      let refPoint = null;
+      if (typeof vp.pointFromPixel === "function" && Number.isFinite(event.clientX) && Number.isFinite(event.clientY)) {
+        const rect = typeof stage.getBoundingClientRect === "function"
+          ? stage.getBoundingClientRect()
+          : { left: 0, top: 0 };
+        const elemPt = geometry.flipAwareElementPoint(
+          vp,
+          { x: event.clientX - rect.left, y: event.clientY - rect.top },
+          OSD
+        );
+        refPoint = vp.pointFromPixel(elemPt, true);
+      }
+      applyImageZoom(current * factor, refPoint);
+    }, { passive: false });
     let drawnRois = null, roiBoxes = [];
     const renderRoiBoxes = () => {
       if (!state.ready) return;
@@ -290,6 +531,7 @@
       ].join("\n\n") : "";
     };
     const paintLock = () => {
+      if (state.locked) closeZoomPopover();
       overlay.dataset.locked = String(state.locked);
       lock.setAttribute("aria-pressed", String(state.locked));
       lock.setAttribute("aria-label", state.locked ? "Unlock image and window" : "Lock image and window");
@@ -298,6 +540,7 @@
       viewer.setMouseNavEnabled(!state.locked && !state.pending);
       paintOpacity();
       paintRois();
+      paintZoom();
     };
     const cancelGesture = () => {
       if (state.gesture) state.gesture.cancelled = true;
@@ -309,6 +552,7 @@
       state.pending = true;
       state.locked = !previous;
       cancelGesture();
+      closeZoomPopover();
       if (state.ready) restoreCamera(viewer, camera(viewer)); // stop any in-flight pan/zoom
       paintLock();
       try {
@@ -322,6 +566,7 @@
       } finally { state.pending = false; paintLock(); }
     };
     const close = async () => {
+      closeZoomPopover();
       try { requireSuccess(await api.close_translucent(), "Could not close this window"); }
       catch (error) { showStatus(error.message || "Could not close this window"); }
     };
@@ -426,6 +671,7 @@
       state.ready = true;
       showStatus("");
       paintRois();
+      paintZoom();
       resize();
       if (Array.isArray(context.rois) && context.rois.length) {
         setRois({ rois: context.rois, name: context.roiName || "" },
@@ -434,11 +680,14 @@
     });
     viewer.addHandler("open-failed", () => showStatus("Could not load this image. Close and reopen the translucent viewer."));
     viewer.addHandler("tile-load-failed", () => showStatus("Some image tiles could not load. Close and reopen the translucent viewer."));
-    viewer.addHandler("update-viewport", renderRoiBoxes);
+    viewer.addHandler("zoom", paintZoom);
+    viewer.addHandler("animation", paintZoom);
+    viewer.addHandler("update-viewport", () => { renderRoiBoxes(); paintZoom(); });
     const resize = () => {
       if (state.ready) {
         resizePreservingScale(viewer, stage.clientWidth, stage.clientHeight, OSD);
         renderRoiBoxes();
+        paintZoom();
       }
     };
     const observer = win.ResizeObserver ? new win.ResizeObserver(resize) : null;
@@ -492,7 +741,7 @@
     };
     doc.getElementById("window-drag").addEventListener("pointerdown", event => startGesture(event));
     overlay.addEventListener("pointerdown", event => {
-      if (event.altKey && !event.target.closest("button, input, #opacity-control, #roi-import-review, .resize-handle")) startGesture(event);
+      if (event.altKey && !event.target?.closest?.("button, input, #opacity-control, #roi-import-review, #zoom-control, .resize-handle")) startGesture(event);
     }, true);
     for (const handle of doc.querySelectorAll(".resize-handle")) {
       handle.addEventListener("pointerdown", event => startGesture(event, handle.dataset.edge));
@@ -511,15 +760,57 @@
       overlay.releasePointerCapture?.(event.pointerId);
     });
     overlay.addEventListener("pointercancel", cancelGesture);
+    const isInZoomControl = el => {
+      if (!el) return false;
+      if (el === zoomControl || el === zoomBadge || el === zoomPopover || el === zoomInput) return true;
+      if (zoomControl?.contains?.(el)) return true;
+      const hit = el.closest?.("#zoom-control");
+      return Boolean(hit && (!hit.id || hit === zoomControl || hit.id === "zoom-control"));
+    };
+    const isInZoomPopover = el => {
+      if (!el) return false;
+      if (el === zoomPopover || el === zoomInput) return true;
+      if (zoomPopover?.contains?.(el)) return true;
+      const hit = el.closest?.("#zoom-popover");
+      return Boolean(hit && (!hit.id || hit === zoomPopover || hit.id === "zoom-popover"));
+    };
+    const isTextInput = el => {
+      if (!el) return false;
+      const tag = String(el.tagName || "").toUpperCase();
+      if (tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable) return true;
+      if (tag === "INPUT") {
+        const type = String(el.type || "text").toLowerCase();
+        return !["range", "checkbox", "radio", "button", "submit", "reset"].includes(type);
+      }
+      return false;
+    };
+    doc.addEventListener("pointerdown", event => {
+      if (state.zoomPopoverOpen && !isInZoomControl(event.target)) {
+        closeZoomPopover();
+      }
+    }, true);
     doc.addEventListener("keydown", event => {
-      if (event.repeat || event.altKey) return;
+      if (event.repeat) return;
+      if (event.key === "Escape" && !event.altKey && !event.ctrlKey && !event.metaKey) {
+        if (state.zoomPopoverOpen) {
+          event.preventDefault();
+          event.stopPropagation?.();
+          closeZoomPopover({ restoreFocus: true });
+          return;
+        }
+        event.preventDefault();
+        close();
+        return;
+      }
+      if (event.altKey) return;
+      const target = event.target || doc.activeElement;
+      if (isInZoomPopover(target) || isInZoomPopover(doc.activeElement) || isTextInput(target)) return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o") {
         event.preventDefault(); chooseRois(); return;
       }
       if (event.ctrlKey || event.metaKey) return;
       if (event.target?.closest?.("#opacity-control, #roi-import-review") && /^(Arrow|Home$|End$|Page)/.test(event.key)) return;
-      if (event.key === "Escape") { event.preventDefault(); close(); }
-      else if (event.key.toLowerCase() === "l") { event.preventDefault(); toggleLock(); }
+      if (event.key.toLowerCase() === "l") { event.preventDefault(); toggleLock(); }
       else if (event.key === "ArrowLeft") { event.preventDefault(); selectRoi(state.roiIndex - 1); }
       else if (event.key === "ArrowRight") { event.preventDefault(); selectRoi(state.roiIndex + 1); }
     }, true);
@@ -527,11 +818,13 @@
     doc.addEventListener("wheel", event => { if (event.ctrlKey || state.locked) event.preventDefault(); }, { passive: false });
     win.addEventListener("pagehide", () => {
       cancelGesture();
+      closeZoomPopover();
       win.removeEventListener("resize", resize);
       observer?.disconnect();
       viewer.destroy();
     }, { once: true });
-    return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity, repairRois };
+    return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity, repairRois,
+      openZoomPopover, closeZoomPopover, setZoom: applyImageZoom, stepZoom };
   }
 
   async function boot(win) {
@@ -563,5 +856,6 @@
   }
 
   return { validateContext, makeTileSource, camera, restoreCamera, resizePreservingScale,
-    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, mount, boot };
+    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints,
+    wheelZoomFactor, formatZoomLabel, parseZoomInput, mount, boot };
 });

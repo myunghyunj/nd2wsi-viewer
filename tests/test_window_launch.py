@@ -241,6 +241,9 @@ def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monk
     expected = {"private_mode": True}
     if platform == "win32":
         expected["gui"] = "edgechromium"
+        udf = session.root / "webview2-udf"
+        expected["storage_path"] = str(udf)
+        assert udf.is_dir()
     webview.start.assert_called_once_with(**expected)
     api.stop_server_for_update.assert_called_once()
 

@@ -592,9 +592,9 @@ assert.ok(!read('translucent.html').includes('materials-v1.css'));
 # window geometry are covered by tracing tests.
 TRACING_BASELINES = {
     "official": {
-        "translucent.html": "c337995e1119fbf1422661dff513f066c832b80bd07a9ad38939c0c06f7a20b6",
-        "translucent-v1.css": "de69fa3f07c62f675306bac503f3d80199fd7d12698715b42164e3e5b445cf59",
-        "translucent-v1.js": "bf6a3585519c146034867bae20bff92e49794a0a7b8a00ff615d1d20d8f40a4c",
+        "translucent.html": "2c1b5b622ce3d7da88fefdae85a5876ff9e755aeaffcfe217336cc07a3caa304",
+        "translucent-v1.css": "83e79c386c2a37451b92cec4c28b4c0a53d9e58528d46ddb8d49b54eac0d5f86",
+        "translucent-v1.js": "a967166c76e1fa33e1b109c5535adcfb1e60546a2de21f8ea9f6137aa711bf00",
         "../translucent_window.py": "037810024e32419d3a5f60face969d6c2a78fb811e5f08c4c0d3b1b68583165d",
     },
     "SLACS-module": {

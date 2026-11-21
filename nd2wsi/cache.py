@@ -40,6 +40,7 @@ from typing import Any
 
 from .platform_io import BINARY, process_is_alive, read_at, set_fd_times, write_at
 from .session_lock import SessionFileLock
+from .windows_fs import is_windows_name_surrogate_reparse
 
 MANAGED_DIR = "nd2wsi"
 CACHES_DIR = "caches"
@@ -706,7 +707,7 @@ class CacheLock:
                             pre_st = os.lstat(self.path)
                             if (
                                 stat.S_ISLNK(pre_st.st_mode)
-                                or bool(getattr(pre_st, "st_file_attributes", 0) & 0x400)
+                                or is_windows_name_surrogate_reparse(pre_st)
                             ):
                                 fd = None
                             else:
@@ -727,7 +728,7 @@ class CacheLock:
                             info, st = self._read_fd(fd)
                             if (
                                 self._safe_lock_inode(st)
-                                and not bool(getattr(st, "st_file_attributes", 0) & 0x400)
+                                and not is_windows_name_surrogate_reparse(st, fd=fd)
                                 and self._path_is_fd(fd)
                                 and self._stale_info(info, st.st_mtime)
                             ):

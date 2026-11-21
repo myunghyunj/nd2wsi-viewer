@@ -106,6 +106,27 @@ const state = {
 // without relying on CSP-disallowed `contentWindow.eval(...)`.
 window.nd2ViewerState = state;
 
+const plateMode = window.Nd2PlateMode.createMode({
+  state, $, document, window,
+  localStorage: typeof localStorage !== "undefined" ? localStorage : null,
+  ResizeObserver: typeof ResizeObserver === "function" ? ResizeObserver : null,
+  rawValueLabel, activeFrameParams, plateZText, renderParams, plateGroupKey,
+  plateArrange, wirePlateViewMenu, applyPlateView,
+  buildZSlider: () => buildZSlider(),
+  buildTimeLine: () => buildTimeLine(),
+  renderZSlider: () => renderZSlider(),
+  renderTimeLine: () => renderTimeLine(),
+  renderPlateAuto: () => renderPlateAuto(),
+  setPlateAuto: (value) => setPlateAuto(value),
+  wirePlateWheel, wirePlateKeys, paintPlate, setPlateFocus, updateReadout, showToast,
+});
+const {
+  siteLabel, siteLabelText, fmtTickLabel, platePeriodMs, plateInspectionRows,
+  platePlaneLabel, currentFocusSummary, plateFrameUrl, plateCellZoom, fmtHm,
+  fmtPeriodWords, positionPlateViewMenu, setPlateViewMenuOpen,
+  renderPlateViewMenu, layoutPlate,
+} = plateMode;
+
 const {
   setPlateZ, stepPlateZ, setPlateAuto, setPlateT,
   setPlatePlaying, pausePlatePlayback, buildZSlider, renderZSlider, buildTimeLine,
@@ -4614,30 +4635,19 @@ function flyToAnnotation(a) {
   }
 }
 
+const roiExport = window.Nd2RoiExport.createController({
+  state, $, document, activeFrameContext, frameOwnsRoi, pixelSize,
+  dtypeBytes, fmtBytes, drawRoiOverlay, updateScaleStrip,
+  syncFrameScopedControls, refreshAstromapPanel, showToast,
+});
+
 function finishSelection(box) {
   setTool(null);
   if (!box || box.w < 4 || box.h < 4) return; // treat as an aborted drag
   applyRoi(box.x, box.y, box.w, box.h);
 }
 
-function applyRoi(x, y, w, h) {
-  const context = activeFrameContext();
-  if (!context) {
-    showToast("Choose a site before marking a region");
-    return false;
-  }
-  state.roi = { x, y, w, h };
-  state.roiSite = context.frame ? context.frame.p : null;
-  state.renderScale = null; // a new region starts at the finest fitting scale
-  drawRoiOverlay();
-  updateRoiPanel();
-  $("roi-detail").classList.add("active");
-  $("roi-hint").style.display = "none";
-  $("roi-move").disabled = false;
-  syncFrameScopedControls();
-  state.windows.region.fitContent(); // saved heights must not hide the exports
-  return true;
-}
+function applyRoi(x, y, w, h) { return roiExport.applyRoi(x, y, w, h); }
 
 function roiOverlayPoints(r) {
   if (!r) return [];
@@ -4725,32 +4735,7 @@ function clearRoi() {
   syncFrameScopedControls();
 }
 
-function updateRoiPanel() {
-  refreshAstromapPanel();
-  const r = state.roi;
-  if (!r) return;
-  const ps = pixelSize();
-  const put = (id, v) => {
-    const el = $(id);
-    if (document.activeElement !== el) el.value = v; // don't clobber typing
-  };
-  put("roi-px-w", Math.round(r.w));
-  put("roi-px-h", Math.round(r.h));
-  if (ps) {
-    put("roi-um-w", (r.w * ps[1]).toFixed(1));
-    put("roi-um-h", (r.h * ps[0]).toFixed(1));
-  } else {
-    for (const id of ["roi-um-w", "roi-um-h"]) {
-      $(id).value = "";
-      $(id).disabled = true;
-      $(id).title = "Calibration unavailable — the file carries no pixel size";
-    }
-  }
-  const itemsize = dtypeBytes(state.info.dtype);
-  const nCh = state.info.rgb ? 3 : state.channels.length;
-  $("roi-bytes").textContent = "≈ " + fmtBytes(r.w * r.h * nCh * itemsize);
-  updateScaleStrip();
-}
+function updateRoiPanel() { return roiExport.updateRoiPanel(); }
 
 /* ---- export scale: how TIFF, PNG and JPEG leave -------------------------
    Each option is one pyramid level. The strip shows the same field at every
@@ -4921,50 +4906,9 @@ async function estimateRenderBytes(o, winQ, r = state.roi, signal = undefined) {
 /* The calibration for the µm fields is the file's own: ND2 voxel_size() /
    Aperio MPP, carried through the store as pixelSizeUm. Typing a size keeps
    the region's top-left corner, clamps to the slide, and syncs both rows. */
-function applyRoiDims(unit) {
-  const r = state.roi;
-  if (!r || !frameOwnsRoi()) return;
-  const info = state.info;
-  const ps = pixelSize();
-  if (unit === "um" && !ps) return; // no physical entry without calibration
-  const [py, px] = ps || [1, 1];
-  const num = (id) => parseFloat(String($(id).value).replace(/[,\s]/g, ""));
-  let w;
-  let h;
-  if (unit === "um") {
-    w = num("roi-um-w") / px;
-    h = num("roi-um-h") / py;
-  } else {
-    w = num("roi-px-w");
-    h = num("roi-px-h");
-  }
-  if (!isFinite(w) || w < 4) w = r.w;
-  if (!isFinite(h) || h < 4) h = r.h;
-  w = Math.round(Math.min(w, info.width));
-  h = Math.round(Math.min(h, info.height));
-  // keep the requested size: slide the origin back if the box would overflow
-  r.x = Math.min(r.x, info.width - w);
-  r.y = Math.min(r.y, info.height - h);
-  r.w = w;
-  r.h = h;
-  drawRoiOverlay();
-  updateRoiPanel();
-}
+function applyRoiDims(unit) { return roiExport.applyRoiDims(unit); }
 
-function wireRoiDims() {
-  for (const [id, unit] of [
-    ["roi-px-w", "px"], ["roi-px-h", "px"],
-    ["roi-um-w", "um"], ["roi-um-h", "um"],
-  ]) {
-    const el = $(id);
-    el.addEventListener("change", () => applyRoiDims(unit));
-    el.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") { ev.preventDefault(); el.blur(); }
-      ev.stopPropagation();
-    });
-    el.addEventListener("focus", () => el.select());
-  }
-}
+function wireRoiDims() { return roiExport.wireRoiDims(); }
 
 function scaleBarExportIssue() {
   const ps = pixelSize();
@@ -5156,203 +5100,16 @@ function trackExport(job, label) {
 
 /* ---- slide inspector ------------------------------------------------------- */
 
-function wireSlideInspector() {
-  $("info-retry").onclick = () => loadSlideInspector(true);
-  $("info-copy").onclick = () => {
-    const data = state.inspect || state.info;
-    const text = slideInspectionRows(data)
-      .map(([label, value]) => label + ": " + value)
-      .join("\n");
-    copyPlainText(text)
-      .then(() => {
-        $("info-status").textContent = "Metadata copied to the clipboard";
-      })
-      .catch(() => {
-        $("info-status").textContent = "Could not copy metadata";
-      });
-  };
-  $("info-reveal-source").onclick = () => revealSlidePath("source");
-  $("info-reveal-cache").onclick = () => revealSlidePath("cache");
-  $("info-copy").disabled = true;
-  $("info-reveal-source").disabled = true;
-  $("info-reveal-cache").disabled = true;
-}
-
-async function loadSlideInspector(force = false) {
-  if (state.inspectLoading || (state.inspect && !force)) return;
-  const expectedGen = state.info?.generation;
-  state.inspectLoading = true;
-  $("info-loading").hidden = false;
-  $("info-loading").textContent = state.inspect ? "Refreshing slide metadata…" : "Loading slide metadata…";
-  $("info-error").hidden = true;
-  if (!state.inspect) $("info-content").hidden = true;
-  try {
-    const res = await fetch("api/inspect", { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
-    if (!data || typeof data !== "object") throw new Error("invalid response");
-    if (expectedGen && state.info?.generation && state.info.generation !== expectedGen) return;
-    state.inspect = { ...state.info, ...data };
-    renderSlideInspector(state.inspect);
-    $("info-status").textContent = "";
-  } catch (error) {
-    state.inspect = null;
-    renderSlideInspector(state.info, true);
-    $("info-error").hidden = false;
-    $("info-error").querySelector("span").textContent =
-      "Detailed metadata is unavailable (" + error.message + ").";
-    $("info-status").textContent = "Basic viewer metadata is shown below";
-  } finally {
-    state.inspectLoading = false;
-    $("info-loading").hidden = true;
-  }
-}
-
-function formatMetadataValue(value) {
-  if (value === null || value === undefined || value === "") return "Not reported";
-  if (typeof value !== "object") return String(value);
-  if (Array.isArray(value)) return value.map(formatMetadataValue).join(" · ");
-  const parts = Object.entries(value)
-    .filter(([, item]) => item !== null && item !== undefined && item !== "")
-    .map(([key, item]) => key.replace(/_/g, " ") + " " + formatMetadataValue(item));
-  return parts.length ? parts.join(" · ") : "Not reported";
-}
-
-function calibratedPixelSize(data) {
-  const calibration = data && typeof data.calibration === "object" ? data.calibration : {};
-  const value = calibration.pixel_size_um || calibration.pixelSizeUm ||
-    (data && (data.pixelSizeUm || data.pixel_size_um));
-  return Array.isArray(value) && value.length >= 2 ? value.map(Number) : null;
-}
-
-function calibrationLabel(data) {
-  const ps = calibratedPixelSize(data);
-  if (!ps || !ps.every(Number.isFinite)) return "Unknown";
-  const calibration = data && typeof data.calibration === "object" ? data.calibration : {};
-  const source = calibration.source || data.calibration_source;
-  const value = rawValueLabel(ps[1]) + " × " + rawValueLabel(ps[0]) + " µm/px";
-  return source ? value + " · " + source : value;
-}
-
-function selectionLabel(selection) {
-  const source = selection || {};
-  const z = source.z_resolved !== undefined
-    ? source.z_resolved
-    : source.z === undefined ? "mid" : source.z;
-  return "T" + (source.t === undefined ? 0 : source.t) +
-    " · P" + (source.p === undefined ? 0 : source.p) +
-    " · Z" + z;
-}
-
-function byteSizeLabel(logical, allocated) {
-  if (logical === null || logical === undefined || !Number.isFinite(Number(logical))) {
-    return "Unavailable";
-  }
-  let value = "Data " + fmtBytes(Number(logical));
-  if (allocated !== null && allocated !== undefined && Number.isFinite(Number(allocated))) {
-    value += " · Disk " + fmtBytes(Number(allocated));
-  }
-  return value;
-}
-
-function storageLabel(storage) {
-  const labels = {
-    compact: "Compact cache (source-backed)",
-    full: "Portable pyramid",
-    direct: "Direct source",
-    "overview-degraded": "Overview only (source missing)",
-  };
-  return labels[storage] || formatMetadataValue(storage);
-}
-
-function slideInspectionRows(data) {
-  data = data || {};
-  const channels = Array.isArray(data.channels)
-    ? data.channels.map((channel, i) => channel.label || channel.name || "C" + i).join(", ")
-    : "Not reported";
-  const levels = Array.isArray(data.levels)
-    ? data.levels.map((level) =>
-        "L" + level.path + " " + fmtInt(level.width) + " × " + fmtInt(level.height) +
-        " (1/" + rawValueLabel(level.downsample) + ")"
-      ).join(" · ")
-    : "Not reported";
-  const sourcePath = data.source_path || "Unavailable";
-  const cachePath = data.cache_path || (
-    data.storage !== "direct" && data.container_path ? data.container_path : null
-  );
-  const plate = data.kind === "plate" && data.plate && typeof data.plate === "object"
-    ? data.plate
-    : null;
-  const rows = [
-    ["File", data.name || "Unnamed slide"],
-    ...(plate
-      ? [["Kind", "Volumetric temporal · T " + plate.T + " × sites " + plate.P + " × Z " + plate.Z]]
-      : []),
-    ["Dimensions", fmtInt(data.width || 0) + " × " + fmtInt(data.height || 0) + " px" +
-      (plate ? " per frame" : "")],
-    ["Pixel type", (data.dtype || "Unknown") + (data.rgb ? " · RGB" : "")],
-    ["Channels", data.rgb ? "RGB" : channels],
-    ...(plate ? plateInspectionRows(plate) : []),
-    ["Calibration", calibrationLabel(data)],
-    ["Objective", formatMetadataValue(data.objective)],
-    ["Plane", plate ? platePlaneLabel() : selectionLabel(data.selection)],
-    ["Pyramid", levels],
-    ["Storage", storageLabel(data.storage)],
-    ["Source", sourcePath],
-    ["Source size", byteSizeLabel(data.source_bytes, data.source_allocated_bytes)],
-    ["Cache", cachePath || (data.storage === "direct" ? "None (served from the file)" : "Unavailable")],
-    ["Cache size", cachePath
-      ? byteSizeLabel(data.cache_bytes, data.cache_allocated_bytes)
-      : data.storage === "direct" ? "None" : "Unavailable"],
-  ];
-  if (data.storage_details && typeof data.storage_details === "object") {
-    rows.splice(9, 0, ["Storage details", formatMetadataValue(data.storage_details)]);
-  }
-  if (Array.isArray(data.associated) && data.associated.length) {
-    rows.push(["Associated", data.associated.join(", ")]);
-  }
-  if (Array.isArray(data.notes) && data.notes.length) {
-    rows.push(["Notes", data.notes.join(" · ")]);
-  }
-  return rows;
-}
-
-function renderSlideInspector(data, partial = false) {
-  const grid = $("info-grid");
-  grid.replaceChildren();
-  for (const [label, value] of slideInspectionRows(data)) {
-    const term = document.createElement("dt");
-    const detail = document.createElement("dd");
-    term.textContent = label;
-    detail.textContent = value;
-    if (label === "Plane") {
-      detail.dataset.infoField = "plane";
-    }
-    if (label === "Source" || label === "Cache") {
-      detail.classList.add("info-path");
-      detail.title = value;
-    }
-    grid.append(term, detail);
-  }
-  $("info-content").hidden = false;
-  $("info-copy").disabled = false;
-  $("info-reveal-source").disabled = partial || !data.source_path || data.source_bytes === null;
-  $("info-reveal-cache").disabled = partial || !(
-    data.cache_path || (data.storage !== "direct" && data.container_path)
-  );
-  renderAssociatedImages(partial ? [] : data.associated);
-  if (state.windows && state.windows.info) state.windows.info.fitContent();
-}
-
-function updateSlideInspectorPlane() {
-  const grid = $("info-grid");
-  const cell = grid?.querySelector?.('[data-info-field="plane"]');
-  if (!cell) return false;
-  const data = state.inspect || state.info;
-  const plate = data?.kind === "plate" && data.plate && typeof data.plate === "object" ? data.plate : null;
-  cell.textContent = plate ? platePlaneLabel() : selectionLabel(data?.selection);
-  return true;
-}
+const {
+  wireSlideInspector, loadSlideInspector, renderSlideInspector, updateSlideInspectorPlane,
+} = window.Nd2SlideInspector.createInspector({
+  state, $, document,
+  fetch: (url, init) => fetch(url, init),
+  rawValueLabel, fmtBytes, fmtInt,
+  plateInspectionRows: (plate) => plateInspectionRows(plate),
+  platePlaneLabel: () => platePlaneLabel(),
+  renderAssociatedImages, copyPlainText,
+});
 
 function renderAssociatedImages(names) {
   const section = $("info-associated-section");
@@ -5422,35 +5179,6 @@ async function copyPlainText(text) {
   const copied = document.execCommand("copy");
   field.remove();
   if (!copied) throw new Error("clipboard unavailable");
-}
-
-async function revealSlidePath(which) {
-  const button = $(which === "source" ? "info-reveal-source" : "info-reveal-cache");
-  const previous = button.textContent;
-  button.disabled = true;
-  button.textContent = "Revealing…";
-  try {
-    const res = await fetch("api/reveal", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ which }),
-    });
-    let data = null;
-    try { data = await res.json(); } catch (_) { /* response may be empty */ }
-    if (!res.ok || (data && data.error)) {
-      throw new Error((data && data.error) || "HTTP " + res.status);
-    }
-    const label = which === "source" ? "Source" : "Cache";
-    $("info-status").textContent = label + " revealed in the file manager";
-  } catch (error) {
-    $("info-status").textContent = "Could not reveal " + which + ": " + error.message;
-  } finally {
-    button.textContent = previous;
-    const data = state.inspect || {};
-    button.disabled = which === "source"
-      ? !data.source_path || data.source_bytes === null
-      : !(data.cache_path || (data.storage !== "direct" && data.container_path));
-  }
 }
 
 /* ---- linked compare viewport relay ---------------------------------------
@@ -6203,110 +5931,6 @@ function makeMacWindow(el, opts) {
    z change swaps the frames in place, the view never rebuilds. Nothing here
    runs for an ordinary slide. */
 
-function siteLabel(name) {
-  // "10(5)_MOI" -> {dil: "10", exp: "5", cond: "MOI"}; other names verbatim
-  const m = /^(\d+)\((\d+)\)_(.+)$/.exec(String(name || ""));
-  return m ? { dil: m[1], exp: m[2], cond: m[3] } : { dil: String(name || ""), exp: "", cond: "" };
-}
-
-function superscript(digits) {
-  return String(digits).replace(/\d/g, (c) => "⁰¹²³⁴⁵⁶⁷⁸⁹"[Number(c)]);
-}
-
-function siteLabelText(name) {
-  const l = siteLabel(name);
-  return l.exp ? l.dil + superscript(l.exp) + " " + l.cond : l.dil;
-}
-
-function fillSitePill(pill, name) {
-  pill.replaceChildren();
-  const l = siteLabel(name);
-  const dil = document.createElement("span");
-  dil.className = "dil";
-  dil.textContent = l.dil;
-  if (l.exp) {
-    const sup = document.createElement("sup");
-    sup.textContent = l.exp;
-    dil.append(sup);
-  }
-  pill.append(dil);
-  if (l.cond) {
-    const sep = document.createElement("span");
-    sep.className = "sep";
-    sep.textContent = "·";
-    const cond = document.createElement("span");
-    cond.className = "cond";
-    cond.textContent = l.cond;
-    pill.append(sep, cond);
-  }
-}
-
-function fmtClock(ms) {
-  // "0 H 30 M": whole minutes, hours first, as the time badge reads
-  const total = Math.max(0, Math.round(Number(ms || 0) / 60000));
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  return h + " H " + String(m).padStart(2, "0") + " M";
-}
-
-function fmtPeriod(ms) {
-  const total = Math.max(0, Math.round(Number(ms || 0) / 60000));
-  if (total < 60) return total + " M";
-  return fmtClock(ms);
-}
-
-function fmtTickLabel(min) {
-  const h = Math.floor(min / 60);
-  const m = Math.round(min - h * 60);
-  if (h === 0) return m + " m";
-  return m ? h + " h " + m + " m" : h + " h";
-}
-
-function platePeriodMs() {
-  const pl = state.info.plate;
-  if (Number(pl.periodMs) > 0) return Number(pl.periodMs);
-  const times = pl.timesMs || [];
-  if (times.length < 2) return null;
-  const diffs = [];
-  for (let i = 1; i < times.length; i++) diffs.push(times[i] - times[i - 1]);
-  diffs.sort((a, b) => a - b);
-  const mid = diffs[Math.floor(diffs.length / 2)];
-  return mid > 0 ? mid : null;
-}
-
-function plateInspectionRows(plate) {
-  const placed = (plate.sites || []).slice()
-    .sort((a, b) => a.row - b.row || a.col - b.col);
-  const names = placed.map((s) => siteLabelText(s.name)).join(", ");
-  const rows = [
-    ["Sites", plate.P + " · stage arrangement " + plate.cols + " × " + plate.rows +
-      (names ? " · " + names : "")],
-    ["Z", plate.Z + " planes" +
-      (plate.zStepUm ? " · d = " + rawValueLabel(Number(plate.zStepUm)) + " µm" : "") +
-      " · home " + (Number(plate.zHome) + 1)],
-  ];
-  const times = plate.timesMs || [];
-  const period = platePeriodMs();
-  rows.push(["Time", plate.T + " frames" +
-    (times.length ? " · " + fmtClock(times[times.length - 1]) : " · timing unavailable") +
-    (period ? " · every " + fmtPeriod(period) : "")]);
-  if (plate.exposureMs !== null && plate.exposureMs !== undefined) {
-    rows.push(["Exposure", rawValueLabel(Number(plate.exposureMs)) + " ms"]);
-  }
-  return rows;
-}
-
-function platePlaneLabel() {
-  const f = activeFrameParams();
-  return f ? "T" + f.t + " · P" + f.p + " · Z" + f.z : platePlaneNote();
-}
-
-function currentFocusSummary() {
-  const pl = state.plate;
-  const sites = pl.focus === null ? state.info.plate.sites.map((s) => s.i) : [pl.focus];
-  return window.Nd2PlateUI.focusSummary(pl.focusMap, pl.t, sites, pl.z, state.info.plate.Z, pl.auto);
-}
-
 function plateZText() {
   const pl = state.plate;
   const info = state.info.plate;
@@ -6316,42 +5940,7 @@ function plateZText() {
     ? " · AF " + summary.ready + "/" + summary.total + " ready" : "");
 }
 
-function platePlaneNote() {
-  const pl = state.plate;
-  const info = state.info.plate;
-  const bits = [];
-  if (pl.focus !== null && info.sites[pl.focus]) bits.push(siteLabelText(info.sites[pl.focus].name));
-  bits.push("t " + (pl.t + 1) + "/" + info.T);
-  bits.push(plateZText());
-  return bits.join(" · ");
-}
-
-function plateFrameUrl(t, p, z, k) {
-  const q = renderParams(new URLSearchParams({ k: k || state.plate.k }));
-  return "api/plate/frame/" + t + "/" + p + "/" + z + ".jpg?" + q.toString();
-}
-
-function plateCellZoom() {
-  // CSS px per image px of one grid cell; null before the first layout
-  const pl = state.plate;
-  return pl && pl.cellW ? pl.cellW / state.info.plate.frameW : null;
-}
-
-function fmtHm(ms) {
-  // "6:30": hours and minutes, the way a scrubber reads
-  const total = Math.max(0, Math.round(Number(ms || 0) / 60000));
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  return h + ":" + String(m).padStart(2, "0");
-}
-
-function fmtPeriodWords(ms) {
-  const total = Math.max(0, Math.round(Number(ms || 0) / 60000));
-  if (total < 60) return total + " min";
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  return m ? h + " h " + m + " min" : h + " h";
-}
+function platePlaneNote() { return plateMode.platePlaneNote(); }
 
 function plateArrange() {
   // rows and columns of the grid. The stage arrangement puts dilutions in
@@ -6374,117 +5963,6 @@ function plateArrange() {
   pl.headerKind = pl.wellHeaders ? "well" : assay ? "assay" : null;
   pl.structured = !!pl.headerKind;
   if (pl.view.siteLabels === null) pl.view.siteLabels = pl.headerKind !== "well";
-}
-
-function dilNode(l) {
-  const span = document.createElement("span");
-  span.textContent = l.dil;
-  if (l.exp) {
-    const sup = document.createElement("sup");
-    sup.textContent = l.exp;
-    span.append(sup);
-  }
-  return span;
-}
-
-function placePlate() {
-  const pl = state.plate;
-  const block = $("plate-block");
-  block.style.setProperty("--cols", pl.cols);
-  block.style.setProperty("--rows", pl.rows);
-  const grid = $("plate-grid");
-  grid.setAttribute("aria-rowcount", String(pl.rows));
-  grid.setAttribute("aria-colcount", String(pl.cols));
-  const rows = Array.from({ length: pl.rows }, (_, i) => {
-    const row = document.createElement("div");
-    row.className = "plate-accessible-row";
-    row.setAttribute("role", "row");
-    row.setAttribute("aria-rowindex", String(i + 1));
-    return row;
-  });
-  if (!pl.placed.some((s) => s.i === pl.gridActive)) pl.gridActive = pl.placed[0]?.i;
-  pl.placed.forEach((s) => {
-    const el = pl.gridEls[s.i];
-    el.style.gridRow = s.row + 1;
-    el.style.gridColumn = s.col + 1;
-    el.setAttribute("role", "gridcell");
-    el.setAttribute("aria-rowindex", String(s.row + 1));
-    el.setAttribute("aria-colindex", String(s.col + 1));
-    el.tabIndex = s.i === pl.gridActive ? 0 : -1;
-    rows[s.row].append(el);
-  });
-  grid.replaceChildren(...rows);
-  const rowHeads = $("plate-row-heads");
-  const colHeads = $("plate-col-heads");
-  rowHeads.replaceChildren();
-  colHeads.replaceChildren();
-  block.classList.toggle("headed", pl.structured);
-  if (pl.headerKind === "well") {
-    pl.wellHeaders.rows.forEach((label) => {
-      const head = document.createElement("span");
-      head.textContent = label;
-      rowHeads.append(head);
-    });
-    pl.wellHeaders.cols.forEach((label) => {
-      const head = document.createElement("span");
-      head.textContent = label;
-      colHeads.append(head);
-    });
-  } else if (pl.headerKind === "assay") {
-    for (let r = 0; r < pl.rows; r++) {
-      const s = pl.placed.find((x) => x.row === r);
-      const l = siteLabel(s ? s.name : "");
-      const head = document.createElement("span");
-      if (pl.transposed) head.textContent = l.cond; else head.append(dilNode(l));
-      rowHeads.append(head);
-    }
-    for (let c = 0; c < pl.cols; c++) {
-      const s = pl.placed.find((x) => x.col === c);
-      const l = siteLabel(s ? s.name : "");
-      const head = document.createElement("span");
-      if (pl.transposed) head.append(dilNode(l)); else head.textContent = l.cond;
-      colHeads.append(head);
-    }
-  }
-  const btn = $("plate-transpose");
-  btn.classList.toggle("on", pl.transposed);
-  btn.setAttribute("aria-pressed", String(pl.transposed));
-}
-
-function positionPlateViewMenu() {
-  const btn = $("tb-plate-view");
-  const menu = $("plate-view-menu");
-  if (!btn || !menu || menu.hidden) return;
-  const r = btn.getBoundingClientRect();
-  const width = menu.offsetWidth || 184;
-  const height = menu.offsetHeight || 96;
-  menu.style.left = Math.max(8, Math.min(window.innerWidth - width - 8, r.right - width)) + "px";
-  menu.style.top = Math.max(8, Math.min(window.innerHeight - height - 8, r.bottom + 6)) + "px";
-}
-
-function setPlateViewMenuOpen(open) {
-  const btn = $("tb-plate-view");
-  const menu = $("plate-view-menu");
-  if (!btn || !menu) return;
-  const shown = !!open && !btn.hidden;
-  menu.hidden = !shown;
-  btn.classList.toggle("active", shown);
-  btn.setAttribute("aria-expanded", String(shown));
-  if (shown) {
-    positionPlateViewMenu();
-    const items = [...menu.querySelectorAll("[data-plate-view]")];
-    items.forEach((item, i) => { item.tabIndex = i === 0 ? 0 : -1; });
-    const first = items[0];
-    if (first) first.focus({ preventScroll: true });
-  }
-}
-
-function renderPlateViewMenu() {
-  const pl = state.plate;
-  if (!pl) return;
-  $("plate-view-menu").querySelectorAll("[data-plate-view]").forEach((item) => {
-    item.setAttribute("aria-checked", String(!!pl.view[item.dataset.plateView]));
-  });
 }
 
 function applyPlateView(relayout = true) {
@@ -6554,123 +6032,9 @@ function buildPlate() {
   wireNativeGestureScope();
   if (!pl) return;
   const info = state.info.plate;
-  const wrap = $("stage-wrap");
-  wrap.classList.add(pl.focus === null ? "plate-grid" : "plate-focus");
-  wrap.classList.toggle("plate-single", info.P === 1);
-
-  try {
-    const saved = localStorage.getItem("nd2wsi.plate.transposed");
-    pl.transposed = saved === null ? true : saved === "1";
-  } catch (_) { pl.transposed = true; }
-  try {
-    pl.auto = info.Z > 1 && localStorage.getItem("nd2wsi.plate.autofocus") === "1";
-  } catch (_) { pl.auto = false; }
-  plateArrange();
-  wirePlateViewMenu();
-  applyPlateView(false);
-
-  const grid = $("plate-grid");
-  const strip = $("plate-strip");
-  pl.gridEls = [];
-  pl.stripEls = [];
-  (info.sites || []).forEach((site) => {
-    const cell = makeSiteEl(site);
-    grid.append(cell);
-    pl.gridEls[site.i] = cell;
-    const small = makeSiteEl(site);
-    strip.append(small);
-    pl.stripEls[site.i] = small;
+  plateMode.buildPlate(() => {
+    if (info.Z > 1) loadPlateFocus();
   });
-  placePlate();
-  grid.addEventListener("keydown", (ev) => {
-    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.isComposing) return;
-    const cell = ev.target.closest(".site");
-    if (!cell) return;
-    const next = window.Nd2PlateUI.nextGridSite(pl.placed, Number(cell.dataset.p), ev.key);
-    if (next === null) return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    pl.gridActive = next;
-    pl.gridEls.forEach((el, p) => { el.tabIndex = p === next ? 0 : -1; });
-    pl.gridEls[next].focus({ preventScroll: true });
-  });
-  $("plate-back").onclick = () => setPlateFocus(null);
-  $("plate-transpose").onclick = () => {
-    pl.transposed = !pl.transposed;
-    try { localStorage.setItem("nd2wsi.plate.transposed", pl.transposed ? "1" : "0"); } catch (_) { /* private mode */ }
-    plateArrange();
-    placePlate();
-    layoutPlate();
-  };
-
-  buildZSlider();
-  buildTimeLine();
-  wirePlateWheel();
-  wirePlateKeys();
-  $("t-auto").addEventListener("click", () => setPlateAuto(!state.plate.auto));
-  renderPlateAuto();
-  if (info.Z > 1) loadPlateFocus();
-
-  // #plate is inset in the stage, so its observer sees every window resize
-  // too; the window listener is only the fallback, not a second layout pass.
-  if (typeof ResizeObserver === "function") {
-    const plateObserver = new ResizeObserver(() => layoutPlate());
-    plateObserver.observe($("plate"));
-    window.addEventListener("pagehide", () => plateObserver.disconnect(), { once: true });
-  } else {
-    window.addEventListener("resize", layoutPlate);
-    window.addEventListener("pagehide", () => window.removeEventListener("resize", layoutPlate), { once: true });
-  }
-  layoutPlate();
-  paintPlate();
-  renderZSlider();
-  renderTimeLine();
-  $("plane-note").textContent = platePlaneNote();
-}
-
-function makeSiteEl(site) {
-  const el = document.createElement("button");
-  el.type = "button";
-  el.className = "site pending";
-  el.dataset.p = site.i;
-  el.title = siteLabelText(site.name);
-  el.setAttribute("aria-label", siteLabelText(site.name));
-  const img = document.createElement("img");
-  img.alt = "";
-  img.draggable = false;
-  img.addEventListener("load", () => markFrameLoaded(img));
-  img.addEventListener("error", () => {
-    // a frame the server could not read would otherwise leave the cell
-    // in its placeholder for good, with nothing said
-    const cell = img.closest(".site");
-    if (!cell || img.dataset.frame !== cell.dataset.shown) return;
-    cell.classList.remove("pending");
-    cell.classList.add("failed");
-    showToast("A frame of " + siteLabelText(site.name) + " could not be read");
-  });
-  const pill = document.createElement("span");
-  pill.className = "pill";
-  fillSitePill(pill, site.name);
-  el.append(img, pill);
-  el.addEventListener("click", () => setPlateFocus(Number(el.dataset.p)));
-  return el;
-}
-
-function markFrameLoaded(img) {
-  // the cell drops its placeholder on the first frame; a time tick fills in
-  // once every site's frame at that t and z has arrived
-  const pl = state.plate;
-  const cell = img.closest(".site");
-  if (cell) cell.classList.remove("pending");
-  const key = img.dataset.frame;
-  const tz = img.dataset.group;
-  if (!key || !tz) return;
-  // the set counts sites, not frames: with autofocus a site whose plane
-  // moved would otherwise count twice and fill the band on its own
-  const seen = (pl.loaded.get(tz) || new Set());
-  seen.add(key.split("/")[1]);
-  pl.loaded.set(tz, seen);
-  if (seen.size >= state.info.plate.P && tz.endsWith("/" + plateGroupKey())) renderTimeLine();
 }
 
 // Whether the plate shows the current frame in full: every visible site image
@@ -6685,48 +6049,6 @@ function plateFrameShown() {
   }
   const item = pl.focus === null ? null : state.viewer?.world?.getItemAt(0);
   return !item || typeof item.getFullyLoaded !== "function" || item.getFullyLoaded();
-}
-
-function layoutPlate() {
-  const pl = state.plate;
-  if (!pl) return;
-  const info = state.info.plate;
-  const stage = $("stage-wrap").getBoundingClientRect();
-  const r = $("plate").getBoundingClientRect();
-  if (!r.width || !r.height) return;
-  const gap = 12;
-  // The first column holds either headings or the 28 px transpose button;
-  // the first row always holds that button. Account for the actual chrome so
-  // a dense 16 x 16 grid never clips at the bottom.
-  const leadingW = (pl.structured ? 44 : 28) + gap;
-  const topChromeH = 28 + 10;
-  const sliderW = pl.view.zAxis ? 44 + gap : 0;
-  const aspect = info.frameW && info.frameH ? info.frameW / info.frameH : 1;
-  const availW = r.width - leadingW - sliderW;
-  const availH = r.height - topChromeH;
-  const cellW = Math.floor(Math.min(
-    (availW - gap * (pl.cols - 1)) / pl.cols,
-    ((availH - gap * (pl.rows - 1)) / pl.rows) * aspect
-  ));
-  const cellH = Math.floor(cellW / aspect);
-  if (cellW < 8 || cellH < 8) return;
-  pl.cellW = cellW;
-  pl.cellH = cellH;
-  const block = $("plate-block");
-  block.style.setProperty("--cell-w", cellW + "px");
-  block.style.setProperty("--cell-h", cellH + "px");
-  const gridW = cellW * pl.cols + gap * (pl.cols - 1);
-  const gridH = cellH * pl.rows + gap * (pl.rows - 1);
-  block.style.setProperty("--grid-h", gridH + "px");
-  const capsule = Math.max(420, Math.min(stage.width - 32, Math.max(gridW + 140, 760)));
-  $("plate-stage").style.setProperty("--capsule-w", capsule + "px");
-  const k = cellW <= 260 ? 8 : 4;
-  if (k !== pl.k) {
-    pl.k = k;
-    paintPlate();
-  }
-  renderZSlider();
-  if (pl.focus === null) updateReadout();
 }
 
 function paintPlate() {
