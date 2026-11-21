@@ -69,7 +69,9 @@ _RESERVED = ("t", "uptime", "kind", "thread")
 _INSTALLED_MARKERS = ("Uninstall.exe", ".nd2wsi-install.ini")
 _SESSION_NAME = re.compile(r"(session-\d{8}-\d{6}-\d+(?:-\d+)?)\.jsonl")
 _FATAL_NAME = re.compile(r"(session-\d{8}-\d{6}-\d+(?:-\d+)?)-fatal\.txt")
-_CAPABILITY_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):\d+/k/[A-Za-z0-9_-]+/?")
+_CAPABILITY_URL_RE = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost|\[::1\]):\d+/(?:k/)?[A-Za-z0-9_-]+/?"
+)
 
 
 def redact_capability_urls(text: str, *urls: str | None) -> str:
@@ -77,7 +79,10 @@ def redact_capability_urls(text: str, *urls: str | None) -> str:
     result = str(text)
     for url in urls:
         if isinstance(url, str) and url:
+            stripped = url.rstrip("/")
             result = result.replace(url, "")
+            if stripped and stripped != url:
+                result = result.replace(stripped, "")
     return _CAPABILITY_URL_RE.sub("", result)
 
 _lock = threading.RLock()  # re-entrant: a signal handler may log mid-write

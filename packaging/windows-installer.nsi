@@ -36,24 +36,60 @@ ManifestDPIAware true
   !error "WEBVIEW2_BOOTSTRAPPER is required; verify its Microsoft signature before building"
 !endif
 
-!define APP_NAME "nd2wsi-viewer"
+!ifndef APP_NAME
+  !define APP_NAME "nd2wsi-viewer"
+!endif
+!ifndef APP_DISPLAY_NAME
+  !define APP_DISPLAY_NAME "${APP_NAME}"
+!endif
+!ifndef APP_RELEASE_VERSION
+  !define APP_RELEASE_VERSION "${APP_VERSION}"
+!endif
 !define APP_EXE "nd2wsi-viewer.exe"
-!define PRODUCT_ID "nd2wsi-viewer.windows.x64.current-user"
+!ifndef PRODUCT_ID
+  !define PRODUCT_ID "nd2wsi-viewer.windows.x64.current-user"
+!endif
 !define MARKER ".nd2wsi-install.ini"
-!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer"
-!define PROG_ID "nd2wsi-viewer.Slide"
-!define CAPABILITIES_KEY "Software\nd2wsi-viewer\Capabilities"
+!ifndef UNINSTALL_KEY
+  !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer"
+!endif
+!ifndef PROG_ID
+  !define PROG_ID "nd2wsi-viewer.Slide"
+!endif
+!ifndef CAPABILITIES_ROOT_KEY
+  !define CAPABILITIES_ROOT_KEY "Software\nd2wsi-viewer"
+!endif
+!ifndef CAPABILITIES_KEY
+  !define CAPABILITIES_KEY "${CAPABILITIES_ROOT_KEY}\Capabilities"
+!endif
 !define REGISTERED_APPS_KEY "Software\RegisteredApplications"
+!ifndef REGISTERED_APP_NAME
+  !define REGISTERED_APP_NAME "${APP_DISPLAY_NAME}"
+!endif
 !define APP_REG_KEY "Software\Classes\Applications\${APP_EXE}"
+!ifndef SHORTCUT_DIR
+  !define SHORTCUT_DIR "${APP_DISPLAY_NAME}"
+!endif
+!ifndef SHORTCUT_NAME
+  !define SHORTCUT_NAME "${APP_DISPLAY_NAME}"
+!endif
+!ifndef SETUP_MUTEX_NAME
+  !define SETUP_MUTEX_NAME "Local\nd2wsi-viewer-Setup-current-user"
+!endif
 !define WEBVIEW2_KEY "Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
-Name "${APP_NAME} ${APP_VERSION}"
+Name "${APP_DISPLAY_NAME} ${APP_RELEASE_VERSION}"
 OutFile "${OUTPUT_FILE}"
 !ifdef UNINST_SIGN_PYTHON
-  !uninstfinalize '""${UNINST_SIGN_PYTHON}" "${UNINST_SIGN_SCRIPT}" --sign-file "%1" --sign-description "${APP_NAME} Uninstaller""'
+  !uninstfinalize '""${UNINST_SIGN_PYTHON}" "${UNINST_SIGN_SCRIPT}" --sign-file "%1" --sign-description "${APP_DISPLAY_NAME} Uninstaller""'
 !endif
-InstallDir "$LOCALAPPDATA\Programs\nd2wsi-viewer"
-BrandingText "nd2wsi-viewer"
+!ifndef INSTALL_DIR_NAME
+  !define INSTALL_DIR_NAME "nd2wsi-viewer"
+  InstallDir "$LOCALAPPDATA\Programs\nd2wsi-viewer"
+!else
+  InstallDir "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
+!endif
+BrandingText "${APP_DISPLAY_NAME}"
 SetCompressor /SOLID lzma
 SetCompressorDictSize 32
 SetDatablockOptimize on
@@ -62,10 +98,10 @@ AllowSkipFiles off
 ShowInstDetails show
 ShowUninstDetails show
 VIProductVersion "${APP_VERSION_QUAD}"
-VIAddVersionKey /LANG=1033 "ProductName" "${APP_NAME}"
-VIAddVersionKey /LANG=1033 "ProductVersion" "${APP_VERSION}"
+VIAddVersionKey /LANG=1033 "ProductName" "${APP_DISPLAY_NAME}"
+VIAddVersionKey /LANG=1033 "ProductVersion" "${APP_RELEASE_VERSION}"
 VIAddVersionKey /LANG=1033 "FileVersion" "${APP_VERSION}"
-VIAddVersionKey /LANG=1033 "FileDescription" "nd2wsi-viewer Setup"
+VIAddVersionKey /LANG=1033 "FileDescription" "${APP_DISPLAY_NAME} Setup"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "nd2wsi-viewer contributors"
 
 !ifdef APP_ICON
@@ -73,11 +109,11 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "nd2wsi-viewer contributors"
   !define MUI_UNICON "${APP_ICON}"
 !endif
 !define MUI_ABORTWARNING
-!define MUI_WELCOMEPAGE_TITLE "Install nd2wsi-viewer ${APP_VERSION}"
+!define MUI_WELCOMEPAGE_TITLE "Install ${APP_DISPLAY_NAME} ${APP_RELEASE_VERSION}"
 !ifdef BUNDLED_WEBVIEW2
-  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with nd2wsi-viewer.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close nd2wsi-viewer before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. Microsoft Edge WebView2 Fixed Version Runtime is bundled for offline installation."
+  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with ${APP_DISPLAY_NAME}.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close ${APP_DISPLAY_NAME} before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. Microsoft Edge WebView2 Fixed Version Runtime is bundled for offline installation."
 !else
-  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with nd2wsi-viewer.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close nd2wsi-viewer before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. If WebView2 Runtime is missing, Setup can download it from Microsoft using an Internet connection."
+  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with ${APP_DISPLAY_NAME}.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close ${APP_DISPLAY_NAME} before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. If WebView2 Runtime is missing, Setup can download it from Microsoft using an Internet connection."
 !endif
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
@@ -88,9 +124,9 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "nd2wsi-viewer contributors"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
-!define MUI_FINISHPAGE_RUN_TEXT "Open nd2wsi-viewer"
+!define MUI_FINISHPAGE_RUN_TEXT "Open ${APP_DISPLAY_NAME}"
 !insertmacro MUI_PAGE_FINISH
-!define MUI_UNCONFIRMPAGE_TEXT_TOP "Uninstall nd2wsi-viewer from this folder? Setup removes only the app files and shortcuts it installed. Your images, annotations, caches, and other user files are kept."
+!define MUI_UNCONFIRMPAGE_TEXT_TOP "Uninstall ${APP_DISPLAY_NAME} from this folder? Setup removes only the app files and shortcuts it installed. Your images, annotations, caches, and other user files are kept."
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_UNPAGE_FINISH
@@ -146,7 +182,7 @@ Var UpgradeExitCode
   WriteRegStr HKCU "${UNINSTALL_KEY}" "ProductId" "${PRODUCT_ID}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallState" "${STATE}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "nd2wsi-viewer"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${APP_DISPLAY_NAME}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "nd2wsi-viewer"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
@@ -468,7 +504,7 @@ FunctionEnd
 Function ${PREFIX}AcquireSetupMutex
   Push $0
   Push $1
-  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Local\nd2wsi-viewer-Setup-current-user")p.r0 ?e'
+  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "${SETUP_MUTEX_NAME}")p.r0 ?e'
   Pop $1
   StrCpy $SetupMutex $0
   !insertmacro ND2WSI_TRACE "${PREFIX}" "AcquireSetupMutex handle=$0 win32_error=$1"
@@ -476,8 +512,8 @@ Function ${PREFIX}AcquireSetupMutex
   ${OrIf} $1 == 183
     Pop $1
     Pop $0
-    !insertmacro ND2WSI_TRACE "${PREFIX}" "MessageBox phase=${PREFIX}AcquireSetupMutex message=Another nd2wsi-viewer installer or uninstaller is running. Close it before continuing."
-    MessageBox MB_OK|MB_ICONEXCLAMATION "Another nd2wsi-viewer installer or uninstaller is running. Close it before continuing." /SD IDOK
+    !insertmacro ND2WSI_TRACE "${PREFIX}" "MessageBox phase=${PREFIX}AcquireSetupMutex message=Another ${APP_DISPLAY_NAME} installer or uninstaller is running. Close it before continuing."
+    MessageBox MB_OK|MB_ICONEXCLAMATION "Another ${APP_DISPLAY_NAME} installer or uninstaller is running. Close it before continuing." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "${PREFIX}" "Abort phase=${PREFIX}AcquireSetupMutex guard=$GuardError"
     Abort
@@ -731,7 +767,7 @@ Function .onInit
   SetShellVarContext current
   SetRegView 64
   ${If} $INSTDIR == ""
-    StrCpy $INSTDIR "$LOCALAPPDATA\Programs\nd2wsi-viewer"
+    StrCpy $INSTDIR "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
   ${EndIf}
   ${IfNot} ${AtLeastWin10}
     !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=nd2wsi-viewer requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11."
@@ -1235,15 +1271,15 @@ Function WriteFileAssociations
   !insertmacro ND2WSI_TRACE "" "WriteFileAssociations.begin instdir=$INSTDIR"
   SetRegView 64
   ClearErrors
-  WriteRegStr HKCU "Software\Classes\${PROG_ID}" "" "Microscopy Slide or Image (nd2wsi-viewer)"
+  WriteRegStr HKCU "Software\Classes\${PROG_ID}" "" "Microscopy Slide or Image (${APP_DISPLAY_NAME})"
   WriteRegStr HKCU "Software\Classes\${PROG_ID}\DefaultIcon" "" "$INSTDIR\${APP_EXE},0"
   WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell" "" "open"
-  WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell\open" "" "Open with nd2wsi-viewer"
+  WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell\open" "" "Open with ${APP_DISPLAY_NAME}"
   WriteRegStr HKCU "Software\Classes\${PROG_ID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
-  WriteRegStr HKCU "${APP_REG_KEY}" "FriendlyAppName" "${APP_NAME}"
+  WriteRegStr HKCU "${APP_REG_KEY}" "FriendlyAppName" "${APP_DISPLAY_NAME}"
   WriteRegStr HKCU "${APP_REG_KEY}\DefaultIcon" "" "$INSTDIR\${APP_EXE},0"
   WriteRegStr HKCU "${APP_REG_KEY}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
-  WriteRegStr HKCU "${CAPABILITIES_KEY}" "ApplicationName" "${APP_NAME}"
+  WriteRegStr HKCU "${CAPABILITIES_KEY}" "ApplicationName" "${APP_DISPLAY_NAME}"
   WriteRegStr HKCU "${CAPABILITIES_KEY}" "ApplicationDescription" "Local whole-slide and confocal microscopy viewer for ND2, CZI, LIF, OME-TIFF, TIFF, QPTIFF, SVS, SDPC, and ND2SVS"
   !insertmacro ND2WSI_REGISTER_EXTENSION ".nd2"
   !insertmacro ND2WSI_REGISTER_EXTENSION ".czi"
@@ -1254,13 +1290,13 @@ Function WriteFileAssociations
   !insertmacro ND2WSI_REGISTER_EXTENSION ".svs"
   !insertmacro ND2WSI_REGISTER_EXTENSION ".sdpc"
   !insertmacro ND2WSI_REGISTER_EXTENSION ".nd2svs"
-  WriteRegStr HKCU "${REGISTERED_APPS_KEY}" "${APP_NAME}" "${CAPABILITIES_KEY}"
+  WriteRegStr HKCU "${REGISTERED_APPS_KEY}" "${REGISTERED_APP_NAME}" "${CAPABILITIES_KEY}"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
   ClearErrors
   !insertmacro ND2WSI_TRACE "" "WriteFileAssociations.complete"
 FunctionEnd
 
-Section "nd2wsi-viewer (required)" SecApplication
+Section "${APP_DISPLAY_NAME} (required)" SecApplication
   SectionIn RO
   !insertmacro ND2WSI_TRACE "" "SecApplication.begin instdir=$INSTDIR"
   Call CheckInstallDirectory
@@ -1291,7 +1327,7 @@ Section "nd2wsi-viewer (required)" SecApplication
   ; release are removed while user-created files are preserved.
   ${If} $ExistingUpgrade == 1
     !insertmacro ND2WSI_TRACE "" "SecApplication.upgrade.begin instdir=$INSTDIR"
-    DetailPrint "Removing previous nd2wsi-viewer version before upgrading..."
+    DetailPrint "Removing previous ${APP_DISPLAY_NAME} version before upgrading..."
     InitPluginsDir
     ClearErrors
     CopyFiles /SILENT "$INSTDIR\Uninstall.exe" "$PLUGINSDIR\prev-uninstall.exe"
@@ -1315,7 +1351,7 @@ Section "nd2wsi-viewer (required)" SecApplication
     Call AcquireSetupMutex
     !insertmacro ND2WSI_TRACE "" "SecApplication.upgrade.complete exit=$UpgradeExitCode"
     ${If} $UpgradeExitCode != 0
-      MessageBox MB_OK|MB_ICONSTOP "Could not remove the previous nd2wsi-viewer version before upgrading (exit code $UpgradeExitCode). Close programs using this folder or uninstall the previous version from Windows Settings > Apps, then run Setup again." /SD IDOK
+      MessageBox MB_OK|MB_ICONSTOP "Could not remove the previous ${APP_DISPLAY_NAME} version before upgrading (exit code $UpgradeExitCode). Close programs using this folder or uninstall the previous version from Windows Settings > Apps, then run Setup again." /SD IDOK
       SetErrorLevel 2
       Abort
     ${EndIf}
@@ -1333,8 +1369,8 @@ Section "nd2wsi-viewer (required)" SecApplication
   ${If} $RegistryState == 0
     StrCpy $InitialRegistryAbsent 1
   ${ElseIf} $InitialInstallFresh == 1
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=SecApplication message=Setup found an existing or inaccessible nd2wsi-viewer uninstall registry key without a matching installation. Restore or remove that old registration before installing into a new folder. No installation files were created."
-    MessageBox MB_OK|MB_ICONSTOP "Setup found an existing or inaccessible nd2wsi-viewer uninstall registry key without a matching installation. Restore or remove that old registration before installing into a new folder. No installation files were created." /SD IDOK
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=SecApplication message=Setup found an existing or inaccessible ${APP_DISPLAY_NAME} uninstall registry key without a matching installation. Restore or remove that old registration before installing into a new folder. No installation files were created."
+    MessageBox MB_OK|MB_ICONSTOP "Setup found an existing or inaccessible ${APP_DISPLAY_NAME} uninstall registry key without a matching installation. Restore or remove that old registration before installing into a new folder. No installation files were created." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "" "Abort phase=SecApplication guard=$GuardError"
     Abort
@@ -1378,9 +1414,9 @@ Section "nd2wsi-viewer (required)" SecApplication
   !include "${PAYLOAD_INSTALL_INCLUDE}"
   !insertmacro ND2WSI_TRACE "" "SecApplication.payload.after"
   SetOutPath "$INSTDIR"
-  CreateDirectory "$SMPROGRAMS\nd2wsi-viewer"
-  CreateShortcut "$SMPROGRAMS\nd2wsi-viewer\nd2wsi-viewer.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
-  CreateShortcut "$SMPROGRAMS\nd2wsi-viewer\Uninstall nd2wsi-viewer.lnk" "$INSTDIR\Uninstall.exe"
+  CreateDirectory "$SMPROGRAMS\${SHORTCUT_DIR}"
+  CreateShortcut "$SMPROGRAMS\${SHORTCUT_DIR}\${SHORTCUT_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
+  CreateShortcut "$SMPROGRAMS\${SHORTCUT_DIR}\Uninstall ${SHORTCUT_NAME}.lnk" "$INSTDIR\Uninstall.exe"
   Call WriteFileAssociations
   !insertmacro ND2WSI_TRACE "" "SecApplication.complete"
 SectionEnd
@@ -1388,7 +1424,7 @@ SectionEnd
 Section "Desktop shortcut" SecDesktop
   SetOutPath "$INSTDIR"
   CreateDirectory "$DESKTOP"
-  CreateShortcut "$DESKTOP\nd2wsi-viewer.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
+  CreateShortcut "$DESKTOP\${SHORTCUT_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
 SectionEnd
 
 ; These helpers distinguish harmless absence/nonempty user directories from
@@ -1552,7 +1588,7 @@ Function un.RestoreRetryRecords
   WriteRegStr HKCU "${UNINSTALL_KEY}" "ProductId" "${PRODUCT_ID}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallState" "in-progress"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "nd2wsi-viewer"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${APP_DISPLAY_NAME}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "nd2wsi-viewer"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
@@ -1596,9 +1632,9 @@ FunctionEnd
 Function un.RemoveFileAssociations
   !insertmacro ND2WSI_TRACE "un." "RemoveFileAssociations.begin"
   SetRegView 64
-  DeleteRegValue HKCU "${REGISTERED_APPS_KEY}" "${APP_NAME}"
+  DeleteRegValue HKCU "${REGISTERED_APPS_KEY}" "${REGISTERED_APP_NAME}"
   DeleteRegKey HKCU "${CAPABILITIES_KEY}"
-  Push "Software\nd2wsi-viewer"
+  Push "${CAPABILITIES_ROOT_KEY}"
   Call un.DeleteKeyIfTrulyEmpty
   DeleteRegKey HKCU "Software\Classes\${PROG_ID}"
   DeleteRegKey HKCU "${APP_REG_KEY}"
@@ -1653,11 +1689,11 @@ Section "Uninstall"
     Abort
   ${EndIf}
   ; Check shortcut ancestors before following a directory path to a file.
-  Push "$SMPROGRAMS\nd2wsi-viewer\nd2wsi-viewer.lnk"
+  Push "$SMPROGRAMS\${SHORTCUT_DIR}\${SHORTCUT_NAME}.lnk"
   Call un.CheckPathChain
-  Push "$SMPROGRAMS\nd2wsi-viewer\Uninstall nd2wsi-viewer.lnk"
+  Push "$SMPROGRAMS\${SHORTCUT_DIR}\Uninstall ${SHORTCUT_NAME}.lnk"
   Call un.CheckPathChain
-  Push "$DESKTOP\nd2wsi-viewer.lnk"
+  Push "$DESKTOP\${SHORTCUT_NAME}.lnk"
   Call un.CheckPathChain
   ${If} $GuardError != ""
     !insertmacro ND2WSI_TRACE "un." "MessageBox phase=Uninstall message=$GuardError"
@@ -1672,13 +1708,13 @@ Section "Uninstall"
   ${If} $UninstallHadErrors != 0
     Goto removal_failed
   ${EndIf}
-  Push "$SMPROGRAMS\nd2wsi-viewer\nd2wsi-viewer.lnk"
+  Push "$SMPROGRAMS\${SHORTCUT_DIR}\${SHORTCUT_NAME}.lnk"
   Call un.DeleteOwnedFile
-  Push "$SMPROGRAMS\nd2wsi-viewer\Uninstall nd2wsi-viewer.lnk"
+  Push "$SMPROGRAMS\${SHORTCUT_DIR}\Uninstall ${SHORTCUT_NAME}.lnk"
   Call un.DeleteOwnedFile
-  Push "$SMPROGRAMS\nd2wsi-viewer"
+  Push "$SMPROGRAMS\${SHORTCUT_DIR}"
   Call un.RemoveEmptyOwnedDirectory
-  Push "$DESKTOP\nd2wsi-viewer.lnk"
+  Push "$DESKTOP\${SHORTCUT_NAME}.lnk"
   Call un.DeleteOwnedFile
   ${If} $UninstallHadErrors != 0
     Goto removal_failed

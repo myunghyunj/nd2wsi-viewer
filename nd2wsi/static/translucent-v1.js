@@ -610,7 +610,7 @@
       follow.message = message + " Turn Follow off and on to reconnect.";
       paintFollow();
     };
-    const consumeStageState = (result, mayMove) => {
+    const consumeStageState = (result, mayMove, { report = true } = {}) => {
       if (!follow.enabled || follow.status === "paused" || disposed) return false;
       if (result?.enabled !== true || result.session_id !== follow.sessionId) {
         pauseFollow("Stage connection changed."); return false;
@@ -657,7 +657,11 @@
       follow.keys = result.keys && typeof result.keys === "object" ? result.keys : null;
       paintFollow();
       // Also while unlocked, so the app knows which presses the view already shows.
-      if (seqChanged) scheduleViewReport();
+      // When locked, report immediately so laser shots right after a jog do not wait on the 200 ms throttle.
+      if (seqChanged && report) {
+        if (state.locked) reportView();
+        else scheduleViewReport();
+      }
       return true;
     };
     const pollStageFollow = async () => {
@@ -889,6 +893,9 @@
         if (opacityTask) await opacityTask;
         const result = requireSuccess(await api.set_translucent_locked(state.locked), "Could not change the lock");
         if (typeof result?.locked === "boolean") state.locked = result.locked;
+        if (state.locked && follow.enabled && result?.stage_follow?.enabled) {
+          consumeStageState(result.stage_follow, false, { report: false });
+        }
       } catch (error) {
         state.locked = previous;
         showStatus(error.message || "Could not change the lock");

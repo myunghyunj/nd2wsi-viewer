@@ -375,8 +375,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--webview2-bootstrapper", type=Path)
     parser.add_argument("--webview2-sha256")
     parser.add_argument("--icon", type=Path)
-    parser.add_argument("--readme", type=Path,
-                        default=REPO / "packaging/WINDOWS-INSTALLER-README.txt")
+    parser.add_argument("--readme", type=Path, default=None)
     parser.add_argument("--work", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -414,12 +413,6 @@ def main(argv: list[str] | None = None) -> int:
     payload = work / APP
     files = extract_payload(archive, payload)
     original_readme_hash = files["READ-ME.txt"]
-    readme = args.readme.resolve(strict=True)
-    if not readme.is_relative_to(REPO):
-        parser.error("--readme must be a repository source file for provenance")
-    readme_bytes = readme.read_bytes()
-    (payload / "READ-ME.txt").write_bytes(readme_bytes)
-    files["READ-ME.txt"] = hashlib.sha256(readme_bytes).hexdigest()
     build_info_path = payload / ABOUT / "build-info.json"
     original_build_info_hash = files[f"{ABOUT}/build-info.json"]
     info = json.loads(build_info_path.read_text(encoding="utf-8"))
@@ -429,6 +422,19 @@ def main(argv: list[str] | None = None) -> int:
     release_version = str(info.get("release_version") or version)
     edition_name = info.get("edition")
     updates_off = info.get("updates_off")
+    bundled_webview2 = "_internal/webview2-runtime/msedgewebview2.exe" in files
+    if args.readme is not None:
+        readme_arg = args.readme
+    elif edition_name == "SLACS-module" or bundled_webview2:
+        readme_arg = REPO / "packaging/WINDOWS-INSTALLER-README-SLACS.txt"
+    else:
+        readme_arg = REPO / "packaging/WINDOWS-INSTALLER-README.txt"
+    readme = readme_arg.resolve(strict=True)
+    if not readme.is_relative_to(REPO):
+        parser.error("--readme must be a repository source file for provenance")
+    readme_bytes = readme.read_bytes()
+    (payload / "READ-ME.txt").write_bytes(readme_bytes)
+    files["READ-ME.txt"] = hashlib.sha256(readme_bytes).hexdigest()
     app_exe_path = payload / f"{APP}.exe"
     if pe_machine(app_exe_path) != 0x8664:
         raise ValueError("Portable executable must be AMD64/x64")
@@ -480,10 +486,10 @@ def main(argv: list[str] | None = None) -> int:
         }
     manifest_path = output.with_suffix(".payload.json")
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    bundled_webview2 = "_internal/webview2-runtime/msedgewebview2.exe" in files
     defines = {
         "APP_VERSION": version,
         "APP_VERSION_QUAD": version + ".0",
+        "APP_RELEASE_VERSION": release_version,
         "OUTPUT_FILE": str(output),
         "PAYLOAD_INSTALL_INCLUDE": str(install),
         "PAYLOAD_UNINSTALL_INCLUDE": str(uninstall),
@@ -491,6 +497,22 @@ def main(argv: list[str] | None = None) -> int:
         "PAYLOAD_SIZE_KIB": str((sum((payload / n).stat().st_size for n in files) + 1023) // 1024),
         "WEBVIEW2_BOOTSTRAPPER": str(bootstrapper),
     }
+    if edition_name == "SLACS-module":
+        defines.update(
+            {
+                "APP_DISPLAY_NAME": "nd2wsi-viewer SLACS",
+                "INSTALL_DIR_NAME": "nd2wsi-viewer SLACS",
+                "PRODUCT_ID": "nd2wsi-viewer.slacs.windows.x64.current-user",
+                "UNINSTALL_KEY": r"Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer-SLACS",
+                "PROG_ID": "nd2wsi-viewer.SLACS.Slide",
+                "CAPABILITIES_ROOT_KEY": r"Software\nd2wsi-viewer-SLACS",
+                "CAPABILITIES_KEY": r"Software\nd2wsi-viewer-SLACS\Capabilities",
+                "REGISTERED_APP_NAME": "nd2wsi-viewer SLACS",
+                "SHORTCUT_DIR": "nd2wsi-viewer SLACS",
+                "SHORTCUT_NAME": "nd2wsi-viewer SLACS",
+                "SETUP_MUTEX_NAME": r"Local\nd2wsi-viewer-SLACS-Setup-current-user",
+            }
+        )
     if bundled_webview2:
         defines["BUNDLED_WEBVIEW2"] = "1"
     if args.icon:

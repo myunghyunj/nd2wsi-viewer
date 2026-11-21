@@ -14,7 +14,7 @@ import hmac
 import json
 import math
 import secrets
-import select
+import selectors
 import socket
 import sys
 import threading
@@ -156,7 +156,9 @@ class _CancellableReader:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Request timed out")
-            readable, _, _ = select.select([self._connection], [], [], min(self.STEP, remaining))
+            with selectors.DefaultSelector() as sel:
+                sel.register(self._connection, selectors.EVENT_READ)
+                readable = sel.select(min(self.STEP, remaining))
             if not readable:
                 if not stalled:
                     stalled = True
@@ -205,13 +207,15 @@ class _CancellableReader:
             if remaining <= 0:
                 return
             try:
-                readable, _, _ = select.select([self._connection], [], [], min(self.STEP, remaining))
+                with selectors.DefaultSelector() as sel:
+                    sel.register(self._connection, selectors.EVENT_READ)
+                    readable = sel.select(min(self.STEP, remaining))
                 if not readable:
                     if until_quiet:
                         return
                     continue
                 chunk = self._connection.recv(min(65536, size - dropped))
-            except OSError:
+            except (OSError, ValueError):
                 return
             if not chunk:
                 return

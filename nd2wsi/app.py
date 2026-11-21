@@ -661,24 +661,28 @@ class Api:
         """
         if not isinstance(payload, dict):
             return {"ok": False, "message": "Expected an object"}
-        fields = {}
-        for name, limit in _CLIENT_EVENT_LIMITS.items():
+        raw_fields = {}
+        for name in _CLIENT_EVENT_LIMITS:
             value = payload.get(name)
             if value is None:
                 value = ""
             if not isinstance(value, str):
                 return {"ok": False, "message": f"{name} must be text"}
-            fields[name] = value[:limit]
-        if fields["source"] not in _CLIENT_EVENT_SOURCES or not _CLIENT_EVENT_KIND.fullmatch(fields["kind"]):
+            raw_fields[name] = value
+        source = raw_fields["source"][:_CLIENT_EVENT_LIMITS["source"]]
+        kind = raw_fields["kind"][:_CLIENT_EVENT_LIMITS["kind"]]
+        if source not in _CLIENT_EVENT_SOURCES or not _CLIENT_EVENT_KIND.fullmatch(kind):
             return {"ok": False, "message": "Expected a shell or pane source and an event kind"}
         dropped = _CLIENT_EVENTS.take()
         if dropped is None:
             return {"ok": False, "message": "Too many client events; this one was not recorded"}
         with self._server_lock:
-            server = self._httpd
+            server = self._httpd or self._releasing_httpd
         base = _server_url(server) if server is not None else None
+        fields = {"source": source, "kind": kind}
         for name in ("message", "where", "stack"):
-            fields[name] = session_log.redact_capability_urls(fields[name], base)
+            redacted = session_log.redact_capability_urls(raw_fields[name], base)
+            fields[name] = redacted[:_CLIENT_EVENT_LIMITS[name]]
         extra = {"dropped": dropped} if dropped else {}
         session_log.event("client_error", source=fields["source"], client_kind=fields["kind"],
                           message=fields["message"], where=fields["where"], stack=fields["stack"], **extra)
@@ -739,6 +743,7 @@ class Api:
         if sys.platform not in ("darwin", "win32"):
             return {"ok": False, "message": "The translucent viewer requires the macOS or Windows app."}
         claim = None
+        overlay_owns_claim = False
         try:
             from urllib.parse import quote
 
@@ -801,6 +806,7 @@ class Api:
                 flip_store=self._follow_flip_store(), target_store=LaserTargetStore(self._window_session),
                 on_laser_box=deliver, is_active=lambda: self._active_translucent_sid == sid, on_lock=active,
             )
+            overlay_owns_claim = True
             owner_closed = False
             with self._translucent_lock:
                 if self._translucent_owner_closed:
@@ -813,11 +819,11 @@ class Api:
             session_log.event("translucent_opened", sid=sid, id=overlay._window.uid)
             return {"ok": True, "id": overlay._window.uid}
         except Exception as exc:
-            if claim is not None:
-                claim.release()
+            if claim is not None and not overlay_owns_claim:
                 with self._translucent_lock:
                     if self._translucent_claim is claim:
                         self._translucent_claim = None
+                    claim.release()
             _dlog(f"translucent viewer open failed: {exc!r}")
             session_log.event("translucent_open_failed", sid=sid, ok=False, error=str(exc))
             return {"ok": False, "message": f"Could not open translucent viewer: {exc}"}

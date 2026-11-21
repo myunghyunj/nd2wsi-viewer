@@ -998,6 +998,7 @@ def test_slacs_1_1_and_1_2_refresh_interleaving_and_large_annotation_history(sto
 
 
 def test_format_neutral_translucent_wording(payload, monkeypatch):
+    monkeypatch.setattr(app.sys, "platform", "darwin")
     monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
     api = app.Api(None)
     api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda _sid: None))

@@ -6,10 +6,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 OUT="${1:?usage: build_metal_rc.sh /absolute/new-output-directory}"
 PY="$REPO/.venv/bin/python"
-NAME="nd2wsi-viewer"
 [[ "$(uname -sm)" == "Darwin arm64" ]] || exit 2
 [[ "$OUT" == /* && ! -e "$OUT" ]] || { echo "Output must be a new absolute path"; exit 2; }
-: "${SPARKLE_FRAMEWORK:?Set SPARKLE_FRAMEWORK to pinned Sparkle 2.9.6}"
+NAME="$("$PY" "$HERE/macos_bundle_identity.py" --root "$REPO" --field bundle_name)"
+BUNDLE_ID="$("$PY" "$HERE/macos_bundle_identity.py" --root "$REPO" --field bundle_id)"
+VERSION="$("$PY" "$HERE/macos_bundle_identity.py" --root "$REPO" --field release_version)"
+UPDATES_OFF="$("$PY" "$HERE/macos_bundle_identity.py" --root "$REPO" --field updates_off)"
+if [ "${ND2WSI_SKIP_UPDATER:-}" != "1" ] && [ "$UPDATES_OFF" != "True" ]; then
+  : "${SPARKLE_FRAMEWORK:?Set SPARKLE_FRAMEWORK to pinned Sparkle 2.9.6}"
+fi
 : "${ND2WSI_SMOKE_FILE:?Set ND2WSI_SMOKE_FILE to an isolated ND2 fixture}"
 : "${ND2WSI_SDPC_CODEC_MANIFEST:?Set ND2WSI_SDPC_CODEC_MANIFEST to the source-built LGPL codec manifest}"
 "$PY" -c 'import PyInstaller, AppKit, webview, numpy, nd2, limnd2, _tkinter'
@@ -19,7 +24,7 @@ NAME="nd2wsi-viewer"
 STAGE="$(mktemp -d /private/tmp/nd2wsi-rc-build.XXXXXX)"
 echo "RC staging: $STAGE"
 "$PY" -m PyInstaller --noconfirm --windowed --name "$NAME" \
-  --icon "$HERE/AppIcon.icns" --osx-bundle-identifier com.nd2wsi.viewer \
+  --icon "$HERE/AppIcon.icns" --osx-bundle-identifier "$BUNDLE_ID" \
   --collect-all nd2wsi --collect-all nd2 --collect-all zarr --collect-all numcodecs \
   --collect-all dask --collect-all tifffile --collect-all imagecodecs \
   --collect-all limnd2 --collect-all ome_types --collect-all xsdata \
@@ -28,12 +33,10 @@ echo "RC staging: $STAGE"
   --distpath "$STAGE/dist" --workpath "$STAGE/build" --specpath "$STAGE" \
   "$HERE/launch_rc.py"
 APP="$STAGE/dist/$NAME.app"
-"$PY" "$HERE/inject_sparkle.py" --app "$APP" --framework "$SPARKLE_FRAMEWORK" \
-  --feed-url https://raw.githubusercontent.com/myunghyunj/nd2wsi-viewer/main/updates/appcast.xml \
-  --public-ed-key RSPZ8oXqjqXqByfHTCoiskGziFs+zAHNJ/fGa3N/hvk=
-"$PY" - "$APP/Contents/Info.plist" <<'PY'
-import plistlib, re, sys
+"$PY" - "$APP/Contents/Info.plist" "$REPO/pyproject.toml" "$HERE/macos_bundle_identity.py" <<'PY'
+import os, plistlib, re, runpy, sys
 from importlib.metadata import version
+from pathlib import Path
 path = sys.argv[1]
 release = version('nd2wsi-viewer')
 match = re.fullmatch(r'(\d+\.\d+\.\d+)(?:(b|rc)(\d+))?', release)
@@ -45,11 +48,41 @@ stage, number = match.group(2, 3)
 if number is not None and not 1 <= int(number) <= 255:
     raise ValueError(f'Info.plist prerelease build number must be 1–255: {release}')
 bundle_version = match[1] + (f"{'fc' if stage == 'rc' else 'b'}{int(number)}" if stage else '')
+project_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+identity_helper = (
+    Path(sys.argv[3]) if len(sys.argv) > 3
+    else (project_path.parent / 'packaging/macos_bundle_identity.py' if project_path else None)
+)
+if project_path is not None and identity_helper is not None and identity_helper.is_file():
+    identity = runpy.run_path(str(identity_helper))['bundle_identity'](project_path.parent)
+else:
+    identity = {
+        'bundle_name': 'nd2wsi-viewer',
+        'bundle_id': 'com.nd2wsi.viewer',
+        'edition': 'official',
+        'release_version': release,
+        'updates_off': False,
+    }
+dev_only = (
+    os.environ.get('ND2WSI_SKIP_UPDATER') == '1'
+    or os.environ.get('ND2WSI_SKIP_SMOKE') == '1'
+)
 info.update(CFBundleShortVersionString=match[1], CFBundleVersion=bundle_version,
             ND2WSIPackageVersion=release, LSMinimumSystemVersion='12.0',
-            CFBundleDisplayName='nd2wsi-viewer', NSHighResolutionCapable=True,
-            SUEnableAutomaticChecks=True,
-            ND2WSISdpcBundled=True, ND2WSIDevelopmentOnly=False)
+            CFBundleName=identity['bundle_name'],
+            CFBundleDisplayName=identity['bundle_name'],
+            CFBundleIdentifier=identity['bundle_id'],
+            ND2WSIEdition=identity['edition'],
+            ND2WSIReleaseVersion=identity['release_version'],
+            ND2WSIUpdatesOff=identity['updates_off'],
+            NSHighResolutionCapable=True,
+            ND2WSISdpcBundled=True, ND2WSIDevelopmentOnly=dev_only)
+if not identity['updates_off'] and os.environ.get('ND2WSI_SKIP_UPDATER') != '1':
+    info.update(SUEnableAutomaticChecks=True)
+else:
+    info['SUEnableAutomaticChecks'] = False
+    info.pop('SUFeedURL', None)
+    info.pop('SUScheduledCheckInterval', None)
 types = [('nd2', 'com.nikon.nis-elements.nd2', 'Nikon ND2 slide scan'),
          ('czi', 'com.zeiss.czi', 'Zeiss CZI microscopy image'),
          ('lif', 'com.leica.lif', 'Leica LIF microscopy image'),
@@ -67,7 +100,11 @@ info['UTExportedTypeDeclarations'] = declarations[-1:]
 with open(path, 'wb') as f:
     plistlib.dump(info, f)
 PY
-VERSION="$("$PY" -c 'from importlib.metadata import version; print(version("nd2wsi-viewer"))')"
+if [ "${ND2WSI_SKIP_UPDATER:-}" != "1" ] && { [ "$UPDATES_OFF" != "True" ] || [ -n "${SPARKLE_FRAMEWORK:-}" ]; }; then
+  "$PY" "$HERE/inject_sparkle.py" --app "$APP" --framework "$SPARKLE_FRAMEWORK" \
+    --feed-url https://raw.githubusercontent.com/myunghyunj/nd2wsi-viewer/main/updates/appcast.xml \
+    --public-ed-key RSPZ8oXqjqXqByfHTCoiskGziFs+zAHNJ/fGa3N/hvk=
+fi
 "$PY" "$HERE/bundle_sdpc_codec.py" stage --manifest "$ND2WSI_SDPC_CODEC_MANIFEST" \
   --resources "$APP/Contents/Resources" --output "$STAGE/source-assets" --version "$VERSION"
 /bin/bash "$HERE/sign_release.sh" "$APP"
@@ -82,5 +119,5 @@ mkdir "$STAGE/dmgroot"
 ditto --norsrc --noextattr --noqtn "$APP" "$STAGE/dmgroot/$NAME.app"
 ln -s /Applications "$STAGE/dmgroot/Applications"
 hdiutil create -volname "$NAME" -srcfolder "$STAGE/dmgroot" -format UDZO \
-  "$OUT/$NAME-$VERSION-macos-arm64.dmg"
+  "$OUT/nd2wsi-viewer-$VERSION-macos-arm64.dmg"
 echo "RC ready: $OUT (staging retained for explicit development-cache cleanup: $STAGE)"

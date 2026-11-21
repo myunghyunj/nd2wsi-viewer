@@ -32,7 +32,11 @@ def bundle_identity(root: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--field", required=True, choices=("bundle_name", "bundle_id", "executable", "release_version"))
+    parser.add_argument(
+        "--field",
+        required=True,
+        choices=("bundle_name", "bundle_id", "executable", "release_version", "updates_off"),
+    )
     args = parser.parse_args()
     print(bundle_identity(args.root)[args.field])
 

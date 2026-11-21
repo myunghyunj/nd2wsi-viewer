@@ -392,6 +392,7 @@ class TranslucentApi:
         self._last_locked_center = None
         self._realign_from = None
         self._overlay_view = None  # the page's last reported view; replaced whole, never mutated
+        self._overlay_view_epoch = None
         self._on_lock = on_lock
         self._is_active = is_active or (lambda: True)
         self._laser_delivery = None
@@ -819,11 +820,13 @@ class TranslucentApi:
         except (TypeError, ValueError) as exc:
             with self._lock:
                 self._overlay_view = None
+                self._overlay_view_epoch = None
             return {"ok": False, "message": str(exc)}
         with self._lock:
             if self._closed:
                 return {"ok": False}
             self._overlay_view = {**view, "at": time.monotonic()}
+            self._overlay_view_epoch = self._epoch
             locked = view["locked"]
             changed = self._lock_reported is not None and self._lock_reported != locked
             if self._lock_reported is True and not locked:
@@ -896,8 +899,20 @@ class TranslucentApi:
         # Raw Input: bounded enqueue only, no overlay lock, I/O or browser call.
         delivery = self._laser_delivery
         if delivery is not None:
-            delivery.enqueue({**record, "observed_at": time.monotonic(),
-                              "at": dt.datetime.now().astimezone().isoformat(timespec="milliseconds")})
+            lock_epoch = self._epoch
+            prior = self._overlay_view
+            prior_seq = (
+                prior.get("follow_seq")
+                if isinstance(prior, dict) and prior.get("follow_session") == record.get("receiver_id")
+                else None
+            )
+            delivery.enqueue({
+                **record,
+                "observed_at": time.monotonic(),
+                "lock_epoch": lock_epoch,
+                "prior_view_seq": prior_seq,
+                "at": dt.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            })
 
     def _prepare_laser_box(self, record):
         with self._lock:
@@ -906,6 +921,7 @@ class TranslucentApi:
             locked = self._locked
             receiver_id = self._stage_follow_receiver_id
             view = self._overlay_view
+            view_epoch = self._overlay_view_epoch
             context = copy.deepcopy(self._context)
             epoch = self._epoch
             context_epoch = self._context_epoch
@@ -929,7 +945,16 @@ class TranslucentApi:
         if view["follow_seq"] < seq:
             return None, "stale_view"
         if record.get("observed_at") is not None and view["at"] > record["observed_at"]:
-            return None, "view_after_press"
+            rec_epoch = record.get("lock_epoch")
+            prior_seq = record.get("prior_view_seq")
+            same_lock_catchup = (
+                rec_epoch is not None
+                and view_epoch == rec_epoch
+                and rec_epoch == epoch
+                and (prior_seq is None or prior_seq < seq)
+            )
+            if not same_lock_catchup:
+                return None, "view_after_press"
         if not view["locked"]:
             return None, "unlocked"
         if view.get("target_px") is None or view.get("target_corners_px") is None:
@@ -1412,7 +1437,10 @@ class TranslucentApi:
             self._logger(f"translucent lock update failed: {exc!r}")
         if self._on_lock is not None:
             self._on_lock(locked)
-        return {"ok": True, "locked": locked}
+        result = {"ok": True, "locked": locked}
+        if locked and self._stage_follow is not None:
+            result["stage_follow"] = self.stage_follow_state()
+        return result
 
     def start_window_drag(self):
         if self._closed or self._locked or self._drag is None:
@@ -1484,6 +1512,8 @@ class TranslucentApi:
         self.stop_stage_follow()
         was_locked = False
         with self._lock:
+            if self._closed or not self._configured:
+                raise ValueError("The tracing window is still opening or closing.")
             scope_changed = self._laser_scope(context) != self._laser_scope(self._context)
             next_context = copy.deepcopy(context)
             incoming_laser = next_context.pop("laser_items", None)
@@ -1505,6 +1535,7 @@ class TranslucentApi:
             self._context = {**next_context, "opacity": self._context["opacity"],
                              "opacity_mode": self._context["opacity_mode"]}
             self._overlay_view = None
+            self._overlay_view_epoch = None
             self._lock_reported = None
             self._last_locked_center = None
             self._realign_from = None

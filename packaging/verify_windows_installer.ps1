@@ -19,6 +19,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$displayName = 'nd2wsi-viewer'
+$registeredAppName = 'nd2wsi-viewer'
+$setupMutexName = 'Local\nd2wsi-viewer-Setup-current-user'
 $productId = 'nd2wsi-viewer.windows.x64.current-user'
 $registrySubkey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer'
 $progId = 'nd2wsi-viewer.Slide'
@@ -57,6 +60,9 @@ $script:payloadFiles = $null
 # The exact build/payload manifests determine the version under test.
 # Never silently validate a new installer using an older release's identity.
 $script:version = $null
+$script:edition = 'official'
+$script:releaseVersion = $null
+$script:bundledWebView2 = $false
 $script:expectSigned = $false
 $previousLog = [Environment]::GetEnvironmentVariable('ND2WSI_LOG_FILE', 'Process')
 $transcriptStarted = $false
@@ -418,8 +424,8 @@ function Assert-FileAssociations {
     try {
         $regApps = $root.OpenSubKey($registeredAppsSubkey)
         try {
-            if ($null -eq $regApps -or [string]$regApps.GetValue('nd2wsi-viewer', '') -cne $capabilitiesSubkey) {
-                throw 'Per-user RegisteredApplications entry for nd2wsi-viewer is missing or incorrect.'
+            if ($null -eq $regApps -or [string]$regApps.GetValue($registeredAppName, '') -cne $capabilitiesSubkey) {
+                throw "Per-user RegisteredApplications entry for $registeredAppName is missing or incorrect."
             }
         }
         finally { if ($null -ne $regApps) { $regApps.Dispose() } }
@@ -468,7 +474,7 @@ function Assert-FileAssociationsRemoved {
     try {
         $regApps = $root.OpenSubKey($registeredAppsSubkey)
         try {
-            if ($null -ne $regApps -and (@($regApps.GetValueNames()) -contains 'nd2wsi-viewer')) {
+            if ($null -ne $regApps -and (@($regApps.GetValueNames()) -contains $registeredAppName)) {
                 throw 'Uninstall left the per-user RegisteredApplications entry.'
             }
         }
@@ -509,7 +515,7 @@ function Assert-Installation {
     $registration = Get-InstalledRegistration
     if ($null -eq $registration) { throw 'The current-user uninstall registration is missing.' }
     if (-not [string]::Equals([string]$registration.InstallLocation, $Directory, [StringComparison]::OrdinalIgnoreCase)) { throw 'Uninstall InstallLocation does not match this test installation.' }
-    if ($registration.DisplayVersion -ne $script:version -or $registration.Publisher -ne 'nd2wsi-viewer') { throw 'Uninstall display metadata is incorrect.' }
+    if ([string]$registration.DisplayName -cne $displayName -or $registration.DisplayVersion -ne $script:version -or $registration.Publisher -ne 'nd2wsi-viewer') { throw 'Uninstall display metadata is incorrect.' }
     $uninstaller = Join-Path $Directory 'Uninstall.exe'
     $expectedUninstall = '"' + $uninstaller + '"'
     if ([string]$registration.UninstallString -cne $expectedUninstall -or [string]$registration.QuietUninstallString -cne ($expectedUninstall + ' /S')) { throw 'Uninstall commands are not correctly quoted.' }
@@ -525,7 +531,13 @@ function Assert-Installation {
     Assert-Shortcut $uninstallShortcut $uninstaller
     Assert-Shortcut $desktopShortcut $installedExe
     Assert-FileAssociations $Directory
-    if (-not (Get-WebView2Version)) { throw 'The WebView2 Runtime prerequisite is missing after installation.' }
+    if ($script:bundledWebView2) {
+        $bundledWv2 = Join-Path $Directory '_internal\webview2-runtime\msedgewebview2.exe'
+        if (-not (Test-Path -LiteralPath $bundledWv2 -PathType Leaf)) { throw 'The bundled WebView2 Fixed Version Runtime executable is missing after installation.' }
+    }
+    else {
+        if (-not (Get-WebView2Version)) { throw 'The WebView2 Runtime prerequisite is missing after installation.' }
+    }
 }
 
 function Add-Sentinel {
@@ -591,9 +603,26 @@ function Invoke-AppSmoke {
         }
         $commandLine = (($arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
         $timeout = 600
-        Invoke-CheckedProcess $exe $commandLine ($Label + '-' + $mode) $timeout (Join-Path $env:WINDIR 'System32') -EnvironmentOverrides @{ ND2WSI_SESSION_LOG_DIR = $sessionLogsDir; TEMP = $runtimeTemp; TMP = $runtimeTemp }
+        $smokeEnv = @{ ND2WSI_SESSION_LOG_DIR = $sessionLogsDir; TEMP = $runtimeTemp; TMP = $runtimeTemp }
+        if ($script:bundledWebView2) { $smokeEnv['ND2WSI_WEBVIEW2_RUNTIME'] = 'bundled' }
+        Invoke-CheckedProcess $exe $commandLine ($Label + '-' + $mode) $timeout (Join-Path $env:WINDIR 'System32') -EnvironmentOverrides $smokeEnv
         if ($mode -eq 'gui-smoke') {
-            if (-not (Test-LiteralEntry $report) -or (Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json).ok -ne $true) { throw 'Installed GUI smoke did not record success.' }
+            if (-not (Test-LiteralEntry $report)) { throw 'Installed GUI smoke did not write its report.' }
+            $guiReport = Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($guiReport.ok -ne $true) { throw 'Installed GUI smoke did not record success.' }
+            if ($script:bundledWebView2) {
+                if ($null -eq $guiReport.PSObject.Properties['webview2_runtime'] -or $null -eq $guiReport.webview2_runtime.PSObject.Properties['main'] -or $guiReport.webview2_runtime.main.bundled -ne $true) {
+                    throw 'Installed GUI smoke did not prove the main window ran on the bundled WebView2 runtime.'
+                }
+                if ($null -eq $guiReport.webview2_runtime.PSObject.Properties['translucent'] -or $guiReport.webview2_runtime.translucent.bundled -ne $true) {
+                    throw 'Installed GUI smoke did not prove the translucent window ran on the bundled WebView2 runtime.'
+                }
+            }
+            if ($script:edition -eq 'SLACS-module') {
+                if ($null -eq $guiReport.PSObject.Properties['translucent_viewer'] -or $null -eq $guiReport.translucent_viewer.PSObject.Properties['stage_follow'] -or $guiReport.translucent_viewer.stage_follow.ok -ne $true) {
+                    throw 'Installed SLACS GUI smoke did not verify translucent_viewer.stage_follow.ok.'
+                }
+            }
         }
         elseif (-not (Test-LiteralEntry $log)) {
             throw 'Installed scientific smoke did not produce a log.'
@@ -727,7 +756,7 @@ function Assert-Uninstalled {
     if ($null -ne (Get-InstalledRegistration)) { throw 'Uninstall left the current-user uninstall registration.' }
     Assert-FileAssociationsRemoved
     Assert-Sentinels
-    if (-not (Get-WebView2Version)) { throw 'The shared WebView2 runtime was removed during uninstall.' }
+    if (($webviewBefore -or (-not $script:bundledWebView2)) -and (-not (Get-WebView2Version))) { throw 'The shared WebView2 runtime was removed during uninstall.' }
 }
 
 function Invoke-DirectSilentUninstallAndVerifyCleanRemoval {
@@ -752,7 +781,7 @@ function Invoke-DirectSilentUninstallAndVerifyCleanRemoval {
         $dirGone = -not (Test-LiteralEntry $Directory)
         $regGone = $null -eq (Get-InstalledRegistration)
         $mutex = $null
-        $mutexHeld = [Threading.Mutex]::TryOpenExisting('Local\nd2wsi-viewer-Setup-current-user', [ref]$mutex)
+        $mutexHeld = [Threading.Mutex]::TryOpenExisting($setupMutexName, [ref]$mutex)
         if ($null -ne $mutex) { $mutex.Dispose() }
         if ($dirGone -and $regGone -and (-not $mutexHeld)) {
             $cleaned = $true
@@ -969,6 +998,33 @@ try {
     if ($installerHash -cne $buildManifestData.installer_sha256 -or $manifestHash -cne $buildManifestData.payload_manifest_sha256 -or $bootstrapperHash -cne $buildManifestData.webview2_bootstrapper_sha256) { throw 'Setup, payload manifest, or WebView2 bootstrapper does not match the exact installer build manifest.' }
     $script:version = [string]$buildManifestData.app_version
     if ($script:version -cnotmatch '^\d+\.\d+\.\d+$') { throw 'Build manifest app_version must contain three numeric components.' }
+    if ($null -ne $buildManifestData.PSObject.Properties['edition'] -and [string]$buildManifestData.edition) {
+        $script:edition = [string]$buildManifestData.edition
+    }
+    if ($null -ne $buildManifestData.PSObject.Properties['release_version'] -and [string]$buildManifestData.release_version) {
+        $script:releaseVersion = [string]$buildManifestData.release_version
+    }
+    else {
+        $script:releaseVersion = $script:version
+    }
+    if ($null -ne $buildManifestData.PSObject.Properties['bundled_webview2_runtime']) {
+        $script:bundledWebView2 = [bool]$buildManifestData.bundled_webview2_runtime
+    }
+    if ($script:edition -eq 'SLACS-module') {
+        $displayName = 'nd2wsi-viewer SLACS'
+        $registeredAppName = 'nd2wsi-viewer SLACS'
+        $productId = 'nd2wsi-viewer.slacs.windows.x64.current-user'
+        $registrySubkey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer-SLACS'
+        $progId = 'nd2wsi-viewer.SLACS.Slide'
+        $capabilitiesSubkey = 'Software\nd2wsi-viewer-SLACS\Capabilities'
+        $defaultInstall = Join-Path $env:LOCALAPPDATA 'Programs\nd2wsi-viewer SLACS'
+        $menuDirectory = Join-Path $programs 'nd2wsi-viewer SLACS'
+        $appShortcut = Join-Path $menuDirectory 'nd2wsi-viewer SLACS.lnk'
+        $uninstallShortcut = Join-Path $menuDirectory 'Uninstall nd2wsi-viewer SLACS.lnk'
+        $desktopShortcut = Join-Path $desktop 'nd2wsi-viewer SLACS.lnk'
+        $setupMutexName = 'Local\nd2wsi-viewer-SLACS-Setup-current-user'
+        if (Test-InsidePath $resultPath $defaultInstall) { throw 'ResultsDir must be outside the app installation.' }
+    }
     if ($WebView2BootstrapperSha256) {
         if ($WebView2BootstrapperSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'WebView2BootstrapperSha256 must be a 64-character lowercase hex SHA-256.' }
         if ($bootstrapperHash -cne $WebView2BootstrapperSha256) { throw 'The official WebView2 bootstrapper checksum does not match the installer build input.' }
@@ -1086,7 +1142,9 @@ try {
     $script:phase = 'cleanup-owned-qa'
     Remove-OwnedQaRoot
     $report = @{
-        state = 'complete'; version = $script:version; run_id = $runId; quick_mode = [bool]$Quick
+        state = 'complete'; version = $script:version; edition = $script:edition
+        release_version = $script:releaseVersion; bundled_webview2_runtime = $script:bundledWebView2
+        run_id = $runId; quick_mode = [bool]$Quick
         installer_sha256 = $installerHash; payload_manifest_sha256 = $manifestHash
         build_manifest_sha256 = $buildManifestHash; exact_build_inputs_verified = $true
         installer_authenticode = [string]$installerSignature.Status

@@ -15,9 +15,11 @@ os.environ['ND2WSI_APP_NAME'] = 'nd2wsi Stage follow development check'
 import hashlib
 import json
 import math
+import shutil
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 import uuid
 import nd2wsi
@@ -30,15 +32,24 @@ from nd2wsi.window_sessions import create_window_session
 
 assert Path(nd2wsi.__file__).resolve().parent == checkout/'nd2wsi', 'Development source not selected'
 qa = Path(os.environ['ASTROMAP_QA_ROOT'])
-data = Path('/Volumes/Extreme SSD/workspace/ExM-SLACS/261026_SLACS_ITO_calibration')
-source = data/'Merged_SLACS_ITO.nd2'
-cache = data/'nd2wsi/caches/Merged_SLACS_ITO.nd2--t0-p0-zmid.nd2svs'
-annotations = data/'nd2wsi/annotations/annotations_Merged_SLACS_ITO.nd2--t0-p0-z0.json'
-legacy = Path('/Users/myunghyunjeong/Desktop/2610256 ExM SLACS')
-protected = [source, cache, annotations, data/'context.md', legacy/'SLACS.py', legacy/'LPC_ACS.py']
+raw_input = os.environ.get('ND2WSI_QA_STAGE_FOLLOW_INPUT', '').strip()
+source = Path(raw_input).expanduser().resolve() if raw_input else (checkout/'docs/example_tissue.nd2').resolve()
+if not source.is_file():
+    raise FileNotFoundError(
+        f'Stage-follow QA fixture not found: {source}. '
+        'Run scripts/fetch_testdata.py or set ND2WSI_QA_STAGE_FOLLOW_INPUT.'
+    )
+protected = [source]
 def fingerprints():
     return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in protected}
 before = fingerprints()
+if source.suffix.lower() == '.nd2svs':
+    slide_input = source
+else:
+    isolated_dir = qa/'isolated-input'
+    isolated_dir.mkdir(parents=True, exist_ok=True)
+    slide_input = isolated_dir/source.name
+    shutil.copy2(source, slide_input)
 session = create_window_session('agent', qa/'sessions')
 app._dlog = lambda message: None
 api, parent = app.create_app_window(None, window_session=session)
@@ -92,10 +103,10 @@ def run():
         wait_for(lambda: parent.evaluate_js('!!window.pywebview?.api'),description='private Agent bridge')
         context = bridge_result(parent,'pywebview.api.window_context()')
         assert context['role']=='agent' and context['id']==session.id
-        api._httpd,url = app.start_server(cache,window_session=session)
+        api._httpd,url = app.start_server(slide_input,window_session=session)
         parent.load_url(url)
         wait_for(lambda: pane_eval(parent,'!!(state.info && state.annReady && state.viewer.isOpen())'),
-                 timeout=45,description='ITO source image')
+                 timeout=45,description='source slide')
         assert parent.evaluate_js("document.getElementById('slacs-offer').hidden"), 'Offer visible without detection'
         if api._slacs_discovery is not None:
             assert api._slacs_discovery.stop() is True
@@ -110,11 +121,16 @@ def run():
         sid,store=next(iter(api._httpd.registry.slides.items()))
         with urllib.request.urlopen(url.rstrip('/')+'/s/'+sid+'/api/info') as response:
             info=json.load(response)
-        mpp=info['pixelSizeUm']; origin=[1024.,1024.]
+        mpp=info['pixelSizeUm']
+        origin=[float(info['width'])/2.0, float(info['height'])/2.0]
+        channel_count=max(1, len(info.get('channels') or [0]))
+        channels=','.join(str(i) for i in range(min(2, channel_count)))
+        query=f'c={urllib.parse.quote(channels, safe="")}&g={info["generation"]}'
+        marker_pt={'x': max(0.0, origin[0]-24.0), 'y': max(0.0, origin[1]-24.0)}
         # Synthetic test outlines are private and never saved to research annotations.
-        rois=[{'x':950,'y':950,'w':100,'h':100,'index':1,'label':'QA outline'}]
+        rois=[{'x':max(0.0, origin[0]-74.0),'y':max(0.0, origin[1]-74.0),'w':100,'h':100,'index':1,'label':'QA outline'}]
         result=api.open_translucent_viewer(sid,{'version':1,'center':origin,'zoom':1,
-            'rotation':0,'flip':False,'query':'c=0%2C1&g='+info['generation'],'rois':rois,'roiIndex':0})
+            'rotation':0,'flip':False,'query':query,'rois':rois,'roiIndex':0})
         assert result['ok'],result
         overlay=api._translucent_windows[sid]; child=overlay._window
         # The page always asks for the W/A/S/D observer, which only Windows
@@ -151,14 +167,16 @@ def run():
             report['ok'] = True
             return
         wait_for(lambda: child.evaluate_js('nd2Translucent.viewer.world.getItemAt(0).getFullyLoaded()'),
-                 timeout=45,description='real ITO tiles')
+                 timeout=45,description='source slide tiles')
         native_before=native_state(child)
         # Exactly the main viewer's orientation (unrotated, unflipped here); no mirror of its own.
         assert camera(child)['flip'] is False and camera(child)['rotation']==0, 'Overlay changed the main viewer orientation'
         report['main_viewer_orientation_verified']=True
         roi_before=child.evaluate_js('JSON.stringify(nd2Translucent.state.rois)')
         roi_screen_before=child.evaluate_js("document.querySelector('#roi-overlay polygon').getAttribute('points')")
-        marker_before=child.evaluate_js('Nd2ViewerGeometry.imageToViewerElementPoint(nd2Translucent.viewer.viewport,{x:1000,y:1000},OpenSeadragon)')
+        marker_before=child.evaluate_js(
+            f'Nd2ViewerGeometry.imageToViewerElementPoint(nd2Translucent.viewer.viewport,{json.dumps(marker_pt)},OpenSeadragon)'
+        )
         assert bridge_result(child,'nd2Translucent.startStageFollow()')
         descriptor=overlay.start_stage_follow()
         heartbeat_thread=threading.Thread(target=heartbeat,daemon=True); heartbeat_thread.start()
@@ -168,7 +186,9 @@ def run():
         # 1 um right on screen: the view moves right, so the image content moves left.
         step=[origin[0]+1/mpp[1],origin[1]]
         motion(child,2,step,type='delta',delta_um=[1,0])
-        marker_after=child.evaluate_js('Nd2ViewerGeometry.imageToViewerElementPoint(nd2Translucent.viewer.viewport,{x:1000,y:1000},OpenSeadragon)')
+        marker_after=child.evaluate_js(
+            f'Nd2ViewerGeometry.imageToViewerElementPoint(nd2Translucent.viewer.viewport,{json.dumps(marker_pt)},OpenSeadragon)'
+        )
         assert math.isclose(marker_after['x']-marker_before['x'],-1/mpp[1],abs_tol=1e-6)
         assert math.isclose(marker_after['y'],marker_before['y'],abs_tol=1e-6)
         report['content_screen_delta_css_px']=[marker_after['x']-marker_before['x'],marker_after['y']-marker_before['y']]
@@ -225,7 +245,7 @@ def run():
         report['roi_screen_moved']=roi_screen_before!=roi_screen_after
         report['native_frame_preserved']=native_state(child)['frame']==native_before['frame']
         report['opacity_preserved']=child.evaluate_js('nd2Translucent.state.opacity')==.55
-        report['render_query_preserved']=overlay.translucent_context()['query']=='?c=0%2C1&g='+info['generation']
+        report['render_query_preserved']=overlay.translucent_context()['query']=='?'+query
         child.evaluate_js('nd2Translucent.viewer.viewport.setRotation(0,true); true')
         child.evaluate_js("document.getElementById('stage-follow-options').click(); true")
         assert child.evaluate_js("!document.getElementById('overlay-mirror') && !document.getElementById('stage-follow-angle')"), \
@@ -260,7 +280,11 @@ def run():
         heartbeat_stop.set()
         if heartbeat_thread: heartbeat_thread.join(timeout=3)
         api._close_translucent_windows()
-        report['sources_unchanged']=fingerprints()==before
+        try:
+            report['sources_unchanged']=fingerprints()==before
+        except Exception as exc:
+            report['sources_unchanged']=False
+            report['fingerprint_error']=repr(exc)
         report['source_hashes']=before
         if not report['sources_unchanged']: report['ok']=False
         (qa/os.environ['ASTROMAP_QA_REPORT']).write_text(json.dumps(report,ensure_ascii=False,indent=2))
