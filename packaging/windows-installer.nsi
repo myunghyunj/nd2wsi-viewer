@@ -1601,10 +1601,10 @@ Function GrantSidRxOnPath
   ${AndIf} $R3 != 0
     System::Call 'advapi32::GetNamedSecurityInfoW(w R0, i 1, i 4, p 0, p 0, *p.R4, p 0, *p.R5)i.R6'
     ${If} $R6 == 0
-      ; x86 EXPLICIT_ACCESS_W (32 bytes): GENERIC_READ|GENERIC_EXECUTE (0xA0000000),
+      ; x86 EXPLICIT_ACCESS_W (32 bytes): FILE_GENERIC_READ|FILE_GENERIC_EXECUTE (0x001200A9),
       ; GRANT_ACCESS (1), grfInheritance ($R2), TRUSTEE_W (NULL, 0, TRUSTEE_IS_SID=0,
       ; TRUSTEE_IS_WELL_KNOWN_GROUP=5, psid=$R3).
-      System::Call '*(i 0xA0000000, i 1, i R2, p 0, i 0, i 0, i 5, p R3)p.R7'
+      System::Call '*(i 0x001200A9, i 1, i R2, p 0, i 0, i 0, i 5, p R3)p.R7'
       ${If} $R7 != 0
         System::Call 'advapi32::SetEntriesInAclW(i 1, p R7, p R4, *p.R8)i.R6'
         System::Free $R7

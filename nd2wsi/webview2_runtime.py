@@ -930,7 +930,7 @@ def _grant_appcontainer_acl_win32(
         entries = (ExplicitAccessW * len(sid_ptrs))()
         for index, sid_ptr in enumerate(sid_ptrs):
             entry = entries[index]
-            entry.grfAccessPermissions = _GENERIC_READ | _GENERIC_EXECUTE
+            entry.grfAccessPermissions = _READ_EXECUTE
             entry.grfAccessMode = _GRANT_ACCESS
             entry.grfInheritance = inheritance
             entry.Trustee.pMultipleTrustee = None

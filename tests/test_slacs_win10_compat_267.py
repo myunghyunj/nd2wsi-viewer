@@ -230,8 +230,8 @@ def test_webview2_advapi32_acl_grant_in_process_and_checks_browser_exe(tmp_path:
 
     assert recorded["sids"] == ["S-1-15-2-1", "S-1-15-2-2"]
     assert recorded["entries"] == [
-        (0xA0000000, 1, 0x3, 0, 0x1001),
-        (0xA0000000, 1, 0x3, 0, 0x1002),
+        (0x001200A9, 1, 0x3, 0, 0x1001),
+        (0x001200A9, 1, 0x3, 0, 0x1002),
     ]
     assert recorded["set_calls"] == [(str(folder), 1, 4, 0x4000)]
     # All allocated handles (new_dacl, security descriptor, both SIDs) freed.
