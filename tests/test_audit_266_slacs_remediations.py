@@ -285,12 +285,16 @@ def test_slacs_installer_uses_isolated_defines_and_slacs_readme(tmp_path, monkey
         encoding="utf-8",
     )
     mock_makensis.chmod(0o755)
+    makensis_bin = mock_makensis
+    if sys.platform == "win32":
+        makensis_bin = tmp_path / "makensis.cmd"
+        makensis_bin.write_text(f'@echo off\r\n"{sys.executable}" "{mock_makensis}" %*\r\n', encoding="ascii")
 
     out_exe = tmp_path / "out" / "nd2wsi-viewer-2.6.7_SLACS-module-windows-x64-setup.exe"
     rc = builder.main([
         "--archive", str(archive),
         "--expected-sha256", builder.sha256(archive),
-        "--makensis", str(mock_makensis),
+        "--makensis", str(makensis_bin),
         "--webview2-bootstrapper", str(bootstrapper),
         "--webview2-sha256", builder.sha256(bootstrapper),
         "--work", str(tmp_path / "work"),
@@ -355,6 +359,7 @@ def test_build_metal_rc_respects_slacs_edition_and_plist_ordering(tmp_path):
         [sys.executable, "-", str(target), str(tmp_path / "pyproject.toml"), str(ROOT / "packaging/macos_bundle_identity.py")],
         input=script,
         text=True,
+        encoding="utf-8",
         env=env,
         check=True,
         timeout=30,

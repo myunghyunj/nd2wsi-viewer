@@ -752,11 +752,15 @@ def test_build_windows_installer_defines_slacs_edition_only_for_slacs(
             encoding="utf-8",
         )
         makensis.chmod(0o755)
+        makensis_bin = makensis
+        if sys.platform == "win32":
+            makensis_bin = tmp_path / f"{name}-makensis.cmd"
+            makensis_bin.write_text(f'@echo off\r\n"{sys.executable}" "{makensis}" %*\r\n', encoding="ascii")
         out_exe = tmp_path / f"{name}-setup.exe"
         assert builder.main([
             "--archive", str(archive),
             "--expected-sha256", builder.sha256(archive),
-            "--makensis", str(makensis),
+            "--makensis", str(makensis_bin),
             "--webview2-bootstrapper", str(boot),
             "--webview2-sha256", builder.sha256(boot),
             "--work", str(tmp_path / f"{name}-work"),
