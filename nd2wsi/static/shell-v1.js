@@ -161,6 +161,7 @@ const {
   toggleViewLink, setLinkMenuVisible, setLinkMode, changeOrientation,
   swapComparedSlides, wireCompareInteractions,
 } = compareEngine;
+Object.assign(window, compareEngine);
 
 function setShellToolsExpanded(expanded) {
   const tools = $("shell-tools"), toggle = $("shell-tools-toggle");
