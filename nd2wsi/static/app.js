@@ -168,7 +168,7 @@ let frameRequests = null;
 
 window.nd2CaptureViewState = () => window.Nd2ViewState.capture(state);
 
-// Copy display state and validated imported regions; never edit source annotations.
+// Copy display state and enabled Astromap regions; never edit source annotations.
 function captureTranslucentView() {
   if (state.quitPreparing) throw new Error("The viewer is closing");
   if (!state.info || (state.info.rgb && !state.info.raster)) throw new Error("Open a fluorescence image first");
@@ -181,13 +181,21 @@ function captureTranslucentView() {
     zoom: viewport.viewportToImageZoom(viewport.getZoom(true)),
     rotation: viewport.getRotation(), flip: viewport.getFlip(),
   };
-  const imported = state.annReady && annotationOwnerReady()
-    ? state.annotations.filter(item => item.type === "box" && item.astromap === true &&
-      Number.isSafeInteger(item.astromapImportIndex) && item.astromapImportIndex > 0) : [];
-  if (imported.length) {
-    snapshot.rois = imported.map((item, index) => ({ x: item.x, y: item.y, w: item.w, h: item.h,
-      index: index + 1, label: String(item.text || item.astromapImportIndex) }));
-    const selected = imported.findIndex(item => item.id === state.astromap.activeId);
+  const astromapRois = state.annReady && annotationOwnerReady()
+    ? state.annotations
+      .filter(item => item.type === "box" && item.astromap === true)
+      .map((item, pos) => ({ item, number: pos + 1 }))
+      .filter(({ item }) => item.astromapEnabled !== false &&
+        Number.isFinite(item.x) && Number.isFinite(item.y) &&
+        Number.isFinite(item.w) && Number.isFinite(item.h) &&
+        item.x >= 0 && item.y >= 0 && item.w > 0 && item.h > 0)
+    : [];
+  if (astromapRois.length) {
+    snapshot.rois = astromapRois.map(({ item, number }, index) => ({
+      x: item.x, y: item.y, w: item.w, h: item.h,
+      index: index + 1, label: String(item.text || item.astromapImportIndex || number),
+    }));
+    const selected = astromapRois.findIndex(({ item }) => item.id === state.astromap.activeId);
     if (selected >= 0) snapshot.roiIndex = selected;
   }
   return snapshot;

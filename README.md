@@ -20,6 +20,7 @@
 
 ## Recent updates
 
+- **Manually drawn Astromap ROIs in the translucent overlay (`2.6.8`):** carry over all enabled Astromap regions (both manually drawn and imported) into the translucent tracing window with their numbering, notes, and active selection intact. [2.6.8 release notes](docs/release-notes-2.6.8.md).
 - **Fluid translucent zoom, exact zoom popover, Windows hardening & codebase modularization (`2.6.7`):** replace coarse 20% translucent scroll jumps with continuous cursor-anchored zoom (**Shift** fine ~1%, **Alt/Option** ultra-fine ~0.2%) and a clickable magnification readout for exact numeric entry (`1.25x`, `125%`) and `±0.001`/`±0.01` stepping; allow OneDrive Cloud Files placeholders while blocking symlinks/junctions, keep offline SMB recent files non-blocking, isolate WebView2 `UserDataFolder` per session, and harden Windows installer/Defender retries; fix cross-frame channel-swatch serialization and background focus stealing; and modularize core reader, server, and frontend scripts. [2.6.7 release notes](docs/release-notes-2.6.7.md).
 - **Windows installer fixes, cleaner Astromap ROI bubbles, large JPEG memory budget & security hardening (`2.6.6`):** keep the Windows Setup **Install** button active with 64-bit free-space checks, instant fresh-install path checks, bundled WebView2 offline support, and clean in-place upgrades; show Astromapper ROI number bubbles only on the active (yellow) region when clicked or stepped with Left/Right keys; fix overly conservative Windows RAM estimates so 200+ MPx RGB JPEGs open smoothly; and harden launchers, Zarr/format parsing, HTTP headers, and UI focus/z-order handling. [2.6.6 release notes](docs/release-notes-2.6.6.md).
 - **OME-TIFF / TIFF, multi-series scenes, workflow polish, concurrency bounds & Windows installer (`2.6.5`):** open pyramidal `.ome.tif` / `.tif` / `.qptiff` slides directly and multi-plane stacks interactively, switch `.lif`, `.czi`, `.ome.tif`, and multipoint `.nd2` series from the toolbar, customize channel colours or `Option/Alt`-click to solo a channel, undo/redo annotation edits (`⌘Z` / `⌘⇧Z`), reopen recent slides from the start screen, export `2016-06` OME-XML `.tif` regions, bound multi-tab memory and reader pools on multi-GB scans, and install per-user on Windows with `-setup.exe`. [2.6.5 release notes](docs/release-notes-2.6.5.md).
@@ -34,10 +35,10 @@
 
 ## Download
 
-| Platform | Download · 2.6.7 | Requirements |
+| Platform | Download · 2.6.8 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.7/nd2wsi-viewer-2.6.7-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.7/nd2wsi-viewer-2.6.7-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.7/nd2wsi-viewer-2.6.7-windows-x64.zip) | Windows 11 (x64, or ARM64 via x64 emulation) · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.8/nd2wsi-viewer-2.6.8-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.8/nd2wsi-viewer-2.6.8-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.8/nd2wsi-viewer-2.6.8-windows-x64.zip) | Windows 11 (x64, or ARM64 via x64 emulation) · WebView2 |
 
 On macOS, drag the app into **Applications**; on first launch, choose **System Settings → Privacy & Security → Open Anyway** once (ad-hoc signed; signed Sparkle updates run from **nd2wsi-viewer → Check for Updates…** thereafter). On Windows, run the per-user **Installer** (no administrator prompt) or extract the entire **Portable ZIP** keeping `_internal` beside `nd2wsi-viewer.exe`, and allow the SmartScreen unsigned-publisher prompt if shown (verify against the accompanying `.sha256` checksum). See the [installation guide](docs/user-guide.md#get-started).
 
