@@ -360,7 +360,18 @@ def main_orientation():
 
 
 def open_example_slide():
-    source = Path(os.environ.get("ASTROMAP_QA_INPUT", str(qa.parent / "docs/example_tissue.nd2")))
+    import shutil
+
+    from nd2wsi.convert import ensure_cache, existing_cache_store
+
+    source = Path(os.environ.get("ASTROMAP_QA_INPUT", str(qa.parent / "docs/example_tissue.nd2"))).resolve()
+    if source.suffix.lower() != ".nd2svs" and existing_cache_store(source, read_only=True) is None:
+        isolated_dir = qa / "isolated-input"
+        isolated_dir.mkdir(parents=True, exist_ok=True)
+        isolated_copy = isolated_dir / source.name
+        if not isolated_copy.exists():
+            shutil.copy2(source, isolated_copy)
+        source = ensure_cache(isolated_copy)
     report["input"] = {"path": str(source), "from_env": "ASTROMAP_QA_INPUT" in os.environ,
                        "exists": source.is_file()}
     url = api.open_path(str(source))

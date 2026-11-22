@@ -25,6 +25,7 @@ import uuid
 import nd2wsi
 import webview
 from nd2wsi import app
+from nd2wsi.convert import ensure_cache
 from nd2wsi.translucent_smoke import (
     bridge_result, camera, drag_image, native_state, pane_eval, save_cocoa_snapshot, wait_for,
 )
@@ -48,8 +49,9 @@ if source.suffix.lower() == '.nd2svs':
 else:
     isolated_dir = qa/'isolated-input'
     isolated_dir.mkdir(parents=True, exist_ok=True)
-    slide_input = isolated_dir/source.name
-    shutil.copy2(source, slide_input)
+    isolated_copy = isolated_dir/source.name
+    shutil.copy2(source, isolated_copy)
+    slide_input = ensure_cache(isolated_copy)
 session = create_window_session('agent', qa/'sessions')
 app._dlog = lambda message: None
 api, parent = app.create_app_window(None, window_session=session)

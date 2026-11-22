@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import shutil
 import threading
 import time
 import traceback
@@ -13,6 +14,7 @@ os.environ['ND2WSI_DISABLE_UPDATES'] = '1'
 os.environ['ND2WSI_APP_NAME'] = 'nd2wsi-viewer Astromap Beta QA'
 import nd2wsi
 from nd2wsi import app
+from nd2wsi.convert import ensure_cache, existing_cache_store
 from nd2wsi.window_sessions import create_window_session
 import webview
 
@@ -52,7 +54,14 @@ def run():
         bridged = wait_js('window.__qaContext || null')
         check(bridged['id'] == session.id and bridged['role'] == 'agent', 'bridge identity mismatch')
         window.show()
-        source = Path(os.environ.get('ASTROMAP_QA_INPUT', str(qa.parent / 'docs/example_tissue.nd2')))
+        source = Path(os.environ.get('ASTROMAP_QA_INPUT', str(qa.parent / 'docs/example_tissue.nd2'))).resolve()
+        if source.suffix.lower() != '.nd2svs' and existing_cache_store(source, read_only=True) is None:
+            isolated_dir = qa / 'isolated-input'
+            isolated_dir.mkdir(parents=True, exist_ok=True)
+            isolated_copy = isolated_dir / source.name
+            if not isolated_copy.exists():
+                shutil.copy2(source, isolated_copy)
+            source = ensure_cache(isolated_copy)
         url = api.open_path(str(source))
         check(url, f'open failed: {api._status}')
         window.load_url(url)
