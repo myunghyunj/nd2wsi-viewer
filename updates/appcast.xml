@@ -3,6 +3,21 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.7</title>
+            <pubDate>Sun, 22 Nov 2026 06:25:00 +0000</pubDate>
+            <sparkle:version>2.6.7</sparkle:version>
+            <sparkle:shortVersionString>2.6.7</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Fluid translucent zoom, exact zoom popover, Windows hardening, and codebase modularization</h2>
+<ul>
+<li><strong>Fluid translucent overlay zooming and manual zoom input.</strong> Replace stepped 20% scroll jumps with smooth, cursor-anchored exponential wheel zoom (~5% per notch normally, ~1% with <strong>Shift</strong> + scroll, ~0.2% with <strong>Alt / Option</strong> + scroll, plus trackpad pinch support). Click the top-left magnification readout (<code>1.000×</code>) to enter an exact magnification (<code>1.25</code>, <code>1.25x</code>, <code>125%</code>) or step live in <code>±0.001</code> and <code>±0.01</code> increments.</li>
+<li><strong>Windows compatibility and installer hardening.</strong> Distinguish name-surrogate symlinks/junctions from OneDrive Cloud Files and NTFS dedup reparse points, keep offline mapped/UNC recent files non-blocking, isolate session WebView2 <code>UserDataFolder</code> alongside private mode, add Defender retry loops on annotation saves and installer staging, scope installer path checks away from OS-owned ancestors, and guard uninstall file-association cleanup across editions.</li>
+<li><strong>Codebase modularization and stability fixes.</strong> Split core reader, plate, conversion, rendering, server, and frontend scripts into focused sibling modules, move channel swatch button references into a <code>WeakMap</code> so slide metadata stays JSON-serializable across frames, guard background shell focus restoration, and retire stale Sparkle update probes across navigation.</li>
+</ul>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.7/nd2wsi-viewer-2.6.7-macos-arm64.dmg" length="136602380" type="application/octet-stream" sparkle:edSignature="J8SqZyAGidZahOmJ62DsL+ujy2JDDo9oHSWk2j8ZK37grefkH9JAl5Rcaq/v/LWWHkPrtQOvX4LgJhB8MCUTCg=="/>
+        </item>
+        <item>
             <title>2.6.6</title>
             <pubDate>Thu, 19 Nov 2026 09:30:15 +0000</pubDate>
             <sparkle:version>2.6.6</sparkle:version>

@@ -88,15 +88,25 @@ def test_native_failure_is_visible_and_launch_guard_is_released(options, reason)
     assert not result["opening"]
 
 
-def test_only_current_frame_imported_roi_snapshot_is_passed_without_mutation():
+def test_only_current_frame_enabled_astromap_roi_snapshot_is_passed_without_mutation():
     annotations = [
-        {"id": "manual", "type": "box", "x": 1, "y": 2, "w": 3, "h": 4},
+        {"id": "manual-box", "type": "box", "x": 1, "y": 2, "w": 3, "h": 4},
+        {"id": "disabled-astromap", "type": "box", "x": 4, "y": 5, "w": 6, "h": 7,
+         "astromap": True, "astromapEnabled": False, "text": ""},
+        {"id": "manual-astromap", "type": "box", "x": 30, "y": 40, "w": 12, "h": 14,
+         "astromap": True, "astromapEnabled": True, "text": ""},
+        {"id": "manual-named", "type": "box", "x": 50, "y": 60, "w": 8, "h": 9,
+         "astromap": True, "astromapEnabled": True, "text": "fiber"},
         {"id": "imported", "type": "box", "x": 10, "y": 20, "w": 7, "h": 4,
          "astromap": True, "astromapImportIndex": 42, "text": "chosen"},
     ]
-    result = launch(annotations=annotations, selected="imported")
+    result = launch(annotations=annotations, selected="manual-astromap")
     snapshot = result["calls"][0]["value"]
-    assert snapshot["rois"] == [{"x": 10, "y": 20, "w": 7, "h": 4, "index": 1, "label": "chosen"}]
+    assert snapshot["rois"] == [
+        {"x": 30, "y": 40, "w": 12, "h": 14, "index": 1, "label": "2"},
+        {"x": 50, "y": 60, "w": 8, "h": 9, "index": 2, "label": "fiber"},
+        {"x": 10, "y": 20, "w": 7, "h": 4, "index": 3, "label": "chosen"},
+    ]
     assert snapshot["roiIndex"] == 0
     assert result["annotations"] == annotations
     other_frame = launch(annotations=annotations, ownerReady=False)
