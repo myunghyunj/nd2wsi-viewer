@@ -3,6 +3,19 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.8</title>
+            <pubDate>Sun, 22 Nov 2026 08:10:00 +0000</pubDate>
+            <sparkle:version>2.6.8</sparkle:version>
+            <sparkle:shortVersionString>2.6.8</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Manually drawn Astromap ROIs in the translucent overlay</h2>
+<ul>
+<li><strong>Manually drawn Astromap ROIs in the translucent overlay.</strong> Carry over all enabled Astromap regions — both manually drawn boxes and imported AstroMapper TXT regions — when opening the translucent tracing window, preserving their Astromap numbering, custom notes, and active selection while still excluding disabled Astromap regions and non-Astromap box annotations.</li>
+</ul>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.8/nd2wsi-viewer-2.6.8-macos-arm64.dmg" length="135385654" type="application/octet-stream" sparkle:edSignature="HvjubgVmmY7GedK8CPeA/2n2/Pr6iXGges4znv4d9wRNTEVWqWEQ4VbIMZLCv3ra6q/OTwsIP2HtZVthd4LNDQ=="/>
+        </item>
+        <item>
             <title>2.6.7</title>
             <pubDate>Sun, 22 Nov 2026 06:25:00 +0000</pubDate>
             <sparkle:version>2.6.7</sparkle:version>
