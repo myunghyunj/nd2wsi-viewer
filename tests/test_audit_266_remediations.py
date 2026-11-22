@@ -74,6 +74,10 @@ def test_zarr_v2_blocks_unsafe_codecs_filters_oversized_chunks_and_zlib_bombs(tm
         single_file.open_zarr_group(db_path, mode="r")
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows denies os.replace on open SQLite handles; POSIX-only inode pinning test",
+)
 def test_sqlite_store_pins_inode_across_atomic_replacement(tmp_path):
     from nd2wsi.storage import single_file
 
@@ -628,7 +632,7 @@ def test_run_native_check_resolves_python_and_rejects_prod_bundle(tmp_path):
         plistlib.dumps({"CFBundleExecutable": "nd2wsi-viewer", "ND2WSIDevelopmentOnly": True})
     )
     cmd, cwd = runner._resolve_target(prod_app, script)
-    assert cmd[0].endswith("Contents/MacOS/nd2wsi-viewer") and cmd[1] == "-c"
+    assert Path(cmd[0]).as_posix().endswith("Contents/MacOS/nd2wsi-viewer") and cmd[1] == "-c"
     assert cwd == "/private/tmp"
 
 
