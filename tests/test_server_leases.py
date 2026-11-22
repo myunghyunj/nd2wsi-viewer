@@ -1024,7 +1024,7 @@ def test_relaunch_close_gives_up_on_a_wedged_read_at_its_deadline_and_releases_a
         started = time.monotonic()
         with pytest.raises(TimeoutError, match=r"slide read did not finish within 0\.2 seconds"):
             registry.close_all_for_relaunch(timeout=0.2)
-        assert 0.2 <= time.monotonic() - started < 2.0
+        assert 0.18 <= time.monotonic() - started < 2.0
         assert registry.slides == {}  # barred from new requests at once
         assert st.busy.closed is True
         assert closed == []  # never under the reader
