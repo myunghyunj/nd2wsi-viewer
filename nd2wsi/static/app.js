@@ -162,6 +162,12 @@ const {
   fmtPeriodWords, positionPlateViewMenu, setPlateViewMenuOpen,
   renderPlateViewMenu, layoutPlate,
 } = plateMode;
+Object.assign(window, {
+  siteLabel, siteLabelText, fmtTickLabel, platePeriodMs, plateInspectionRows,
+  platePlaneLabel, currentFocusSummary, plateFrameUrl, plateCellZoom, fmtHm,
+  fmtPeriodWords, positionPlateViewMenu, setPlateViewMenuOpen,
+  renderPlateViewMenu, layoutPlate,
+});
 
 const {
   setPlateZ, stepPlateZ, setPlateAuto, setPlateT,
@@ -5209,9 +5215,7 @@ function trackExport(job, label) {
 
 /* ---- slide inspector ------------------------------------------------------- */
 
-const {
-  wireSlideInspector, loadSlideInspector, renderSlideInspector, updateSlideInspectorPlane,
-} = window.Nd2SlideInspector.createInspector({
+const slideInspector = window.Nd2SlideInspector.createInspector({
   state, $, document,
   fetch: (url, init) => fetch(url, init),
   rawValueLabel, fmtBytes, fmtInt,
@@ -5219,6 +5223,10 @@ const {
   platePlaneLabel: () => platePlaneLabel(),
   renderAssociatedImages, copyPlainText,
 });
+const {
+  wireSlideInspector, loadSlideInspector, renderSlideInspector, updateSlideInspectorPlane,
+} = slideInspector;
+Object.assign(window, slideInspector);
 
 function renderAssociatedImages(names) {
   const section = $("info-associated-section");

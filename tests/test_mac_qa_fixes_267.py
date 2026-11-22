@@ -130,3 +130,16 @@ def test_native_qa_scripts_mac_qa_contracts():
         text = (ROOT / "qa" / name).read_text(encoding="utf-8")
         assert "ensure_cache" in text
         assert "isolated-input" in text
+
+
+def test_extracted_js_controllers_expose_window_globals():
+    """Extracted JS controllers must attach their helpers onto window for cross-frame callers."""
+    app_js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "Object.assign(window, slideInspector);" in app_js
+    assert "loadSlideInspector" in app_js
+    assert "layoutPlate" in app_js
+    assert "Object.assign(window, {" in app_js
+
+    shell_js = (STATIC / "shell-v1.js").read_text(encoding="utf-8")
+    assert "Object.assign(window, compareEngine);" in shell_js
+
