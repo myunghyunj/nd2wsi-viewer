@@ -91,6 +91,7 @@ def _extract_links(md_path: Path) -> list[str]:
         "docs/release-notes-2.6.4.md",
         "docs/release-notes-2.6.5.md",
         "docs/release-notes-2.6.6.md",
+        "docs/release-notes-2.6.7.md",
     ],
 )
 def test_relative_links_and_anchors_resolve(doc_rel: str) -> None:
@@ -101,6 +102,7 @@ def test_relative_links_and_anchors_resolve(doc_rel: str) -> None:
         "docs/release-notes-2.6.4.md",
         "docs/release-notes-2.6.5.md",
         "docs/release-notes-2.6.6.md",
+        "docs/release-notes-2.6.7.md",
     )
 
     for raw in targets:
@@ -128,6 +130,7 @@ def test_relative_links_and_anchors_resolve(doc_rel: str) -> None:
         "docs/release-notes-2.6.4.md",
         "docs/release-notes-2.6.5.md",
         "docs/release-notes-2.6.6.md",
+        "docs/release-notes-2.6.7.md",
         "packaging/WINDOWS-README.txt",
         "THIRD_PARTY_NOTICES.md",
     ],
@@ -146,7 +149,7 @@ def test_readme_positioning_and_sections_are_synced() -> None:
     assert ">Astromap<" in readme
     assert "## Latest update" not in readme
     assert "## Recent updates" in readme
-    for ver in ("2.6.6", "2.6.5", "2.6.4", "2.6.3", "2.6.2", "2.6.1", "2.6.0"):
+    for ver in ("2.6.7", "2.6.6", "2.6.5", "2.6.4", "2.6.3", "2.6.2", "2.6.1", "2.6.0"):
         assert f"docs/release-notes-{ver}.md" in readme
     assert (
         'src="docs/overview-sdpc.png" '
