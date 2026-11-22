@@ -1,15 +1,19 @@
 """Read-only discovery of an existing SLACS Python process on Windows.
 
 This does not start/import SLACS, inspect hardware, or open controller sockets.
-The viewer's own PowerShell child reads process metadata; the legacy Python
-installation is untouched. Detection is not proof of a working motion stream.
+Process metadata is read directly in-process through Win32 ``kernel32``
+(``CreateToolhelp32Snapshot``, ``Process32FirstW``/``Process32NextW``,
+``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)``, ``QueryFullProcessImageNameW``,
+``GetProcessTimes``) and ``ntdll`` (``NtQueryInformationProcess`` with
+``ProcessCommandLineInformation``) — zero PowerShell or WMI subprocesses, so it
+runs in milliseconds and works under AppLocker / Constrained Language Mode.
 
-A PowerShell search finds SLACS. Once found, later checks only ask Windows
-whether that exact process (its pid and creation time) is still alive, which
-takes well under a millisecond, so a slow PowerShell start on an old PC can no
-longer make a running SLACS look lost. A check that cannot tell keeps the found
-session for ``FAILURE_GRACE`` seconds before it reports an error. Every
-PowerShell run and every failed or recovered check is written to the session log.
+Once SLACS is found, later checks only ask Windows whether that exact process
+(its pid and creation time) is still alive, which takes well under a millisecond.
+A check that cannot tell keeps the found session for ``FAILURE_GRACE`` seconds
+before it reports an error. If a Python process rejects ``OpenProcess`` with
+``ERROR_ACCESS_DENIED (5)`` (indicating an elevated/Administrator SLACS blocked
+by Windows UIPI), discovery exposes ``status="elevated"`` with a diagnostic hint.
 """
 
 from __future__ import annotations
@@ -21,13 +25,13 @@ import ntpath
 import os
 import re
 import stat
-import subprocess
 import sys
 import threading
 import time
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import session_log
 from . import slacs_identity as _slacs_identity
@@ -37,8 +41,7 @@ _script_argument = _slacs_identity._script_argument
 _split_windows_command_line = _slacs_identity._split_windows_command_line
 
 _PYTHON_NAMES = frozenset(("python.exe", "pythonw.exe"))
-_CREATE_NO_WINDOW = 0x08000000
-# A PowerShell search can take several seconds to start on an old instrument PC.
+# Kept for backwards compatibility with callers/tests configuring query budgets.
 QUERY_TIMEOUT = 10.0
 # Checks that cannot tell (rather than a confirmed exit) keep a found SLACS this long.
 FAILURE_GRACE = 15.0
@@ -46,20 +49,33 @@ FAILURE_GRACE = 15.0
 STOP_JOIN_SECONDS = 2.5
 # How often each monitor summarises its liveness checks in the session log.
 LIVENESS_SUMMARY_SECONDS = 60.0
-_PROCESS_QUERY = r"""
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$rows = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction Stop | ForEach-Object {
-    $created = $null
-    if ($null -ne $_.CreationDate) { $created = $_.CreationDate.ToUniversalTime().ToString('o') }
-    [PSCustomObject]@{pid = $_.ProcessId; created = $created; name = $_.Name; command_line = $_.CommandLine}
-})
-ConvertTo-Json -InputObject $rows -Compress -Depth 3
-"""
+
+_TH32CS_SNAPPROCESS = 0x00000002
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROCESS_COMMAND_LINE_INFORMATION = 60
+_SYNCHRONIZE = 0x00100000
+_WAIT_OBJECT_0, _WAIT_TIMEOUT = 0x0, 0x102
+_ERROR_ACCESS_DENIED = 5
+_ERROR_NO_MORE_FILES = 18
+_ERROR_INVALID_PARAMETER = 87  # OpenProcess on a pid that no longer exists
+_STATUS_ACCESS_DENIED_UNSIGNED = 0xC0000022
+_STATUS_ACCESS_DENIED_SIGNED = -1073741790
+# FILETIME counts 100 ns ticks; tolerate up to 1 s rounding/skew.
+_CREATION_TOLERANCE_TICKS = 10_000_000
+_FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
+
+ELEVATED_HINT = (
+    "SLACS appears to be running as Administrator (elevated). Windows UIPI blocks "
+    "a non-elevated viewer from inspecting or following an elevated SLACS process; "
+    "run SLACS without Administrator privileges or run both at the same privilege level."
+)
 
 
-def _state(available=False, session_id=None, status="not_running"):
-    return {"available": available, "session_id": session_id, "status": status}
+def _state(available=False, session_id=None, status="not_running", *, hint: str | None = None):
+    result = {"available": available, "session_id": session_id, "status": status}
+    if hint is not None:
+        result["hint"] = hint
+    return result
 
 
 def _identify_processes(rows) -> dict:
@@ -72,10 +88,16 @@ def _identify(rows) -> tuple[dict, dict | None]:
     if not isinstance(rows, list):
         return _state(status="error"), None
     matches = []
+    access_denied = False
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("name"), str):
             return _state(status="error"), None
         if row["name"].lower() not in _PYTHON_NAMES:
+            continue
+        if row.get("access_denied") is True or (
+            row.get("winerror") == _ERROR_ACCESS_DENIED and not row.get("command_line")
+        ):
+            access_denied = True
             continue
         command_line = row.get("command_line")
         if not isinstance(command_line, str) or not command_line.strip():
@@ -100,43 +122,271 @@ def _identify(rows) -> tuple[dict, dict | None]:
                         {"pid": pid, "created": created}))
     if len(matches) > 1:
         return _state(status="ambiguous"), None
+    if access_denied:
+        return _state(status="elevated", hint=ELEVATED_HINT), None
     if not matches:
         return _state(), None
     session_id, process = matches[0]
     return _state(True, session_id, "running"), process
 
 
-def _query_windows_processes(*, timeout: float):
-    """Read local CIM metadata with a bounded, hidden viewer-owned child process."""
-    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-    executable = ntpath.join(system_root, r"System32\WindowsPowerShell\v1.0\powershell.exe")
-    result = subprocess.run(
-        [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", _PROCESS_QUERY],
-        stdin=subprocess.DEVNULL, capture_output=True,
-        shell=False, check=True, text=True, encoding="utf-8-sig", errors="strict",
-        timeout=timeout, creationflags=_CREATE_NO_WINDOW,
+def _filetime(created: str) -> int:
+    """An ISO UTC creation time as a Windows FILETIME tick count."""
+    birth = datetime.fromisoformat(created)
+    if birth.tzinfo is None:
+        raise ValueError("creation time has no time zone")
+    return (birth - _FILETIME_EPOCH) // timedelta(microseconds=1) * 10
+
+
+def _filetime_to_iso(ticks: int) -> str:
+    """A Windows FILETIME 100-ns tick count as a UTC ISO-8601 string."""
+    dt = _FILETIME_EPOCH + timedelta(microseconds=int(ticks) // 10)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+@lru_cache(maxsize=1)
+def _kernel32():
+    """A private, prototyped kernel32; never the shared ``ctypes.windll``. Windows only."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    for name, restype, argtypes in (
+            ("OpenProcess", wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)),
+            ("CloseHandle", wintypes.BOOL, (wintypes.HANDLE,)),
+            ("WaitForSingleObject", wintypes.DWORD, (wintypes.HANDLE, wintypes.DWORD)),
+            ("GetProcessTimes", wintypes.BOOL, (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4)):
+        function = getattr(kernel32, name)
+        function.restype, function.argtypes = restype, list(argtypes)
+    return ctypes, wintypes, kernel32
+
+
+@lru_cache(maxsize=1)
+def _win32_process_api():
+    """Private prototyped kernel32 + ntdll handles and Win32 structs for zero-subprocess discovery."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_int32),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [
+            ("Length", ctypes.c_uint16),
+            ("MaximumLength", ctypes.c_uint16),
+            ("Buffer", ctypes.c_void_p),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+
+    for dll, name, restype, argtypes in (
+        (kernel32, "CreateToolhelp32Snapshot", wintypes.HANDLE, (wintypes.DWORD, wintypes.DWORD)),
+        (kernel32, "Process32FirstW", wintypes.BOOL, (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))),
+        (kernel32, "Process32NextW", wintypes.BOOL, (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))),
+        (kernel32, "OpenProcess", wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)),
+        (kernel32, "QueryFullProcessImageNameW", wintypes.BOOL,
+         (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))),
+        (kernel32, "GetProcessTimes", wintypes.BOOL, (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4),
+        (kernel32, "CloseHandle", wintypes.BOOL, (wintypes.HANDLE,)),
+        (ntdll, "NtQueryInformationProcess", ctypes.c_int32,
+         (wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG))),
+    ):
+        fn = getattr(dll, name)
+        fn.restype = restype
+        fn.argtypes = list(argtypes)
+
+    return SimpleNamespace(
+        ctypes=ctypes,
+        wintypes=wintypes,
+        kernel32=kernel32,
+        ntdll=ntdll,
+        PROCESSENTRY32W=PROCESSENTRY32W,
+        UNICODE_STRING=UNICODE_STRING,
+        get_last_error=ctypes.get_last_error,
+        set_last_error=ctypes.set_last_error,
     )
-    return json.loads(result.stdout)
+
+
+def _is_invalid_handle(handle, ptr_size: int) -> bool:
+    if not handle:
+        return True
+    mask = (1 << (ptr_size * 8)) - 1
+    return handle in (-1, mask)
+
+
+def _is_status_access_denied(status: int) -> bool:
+    return status in (_STATUS_ACCESS_DENIED_SIGNED, _STATUS_ACCESS_DENIED_UNSIGNED) or (
+        (status & 0xFFFFFFFF) == _STATUS_ACCESS_DENIED_UNSIGNED
+    )
+
+
+def _read_process_command_line(api, handle) -> tuple[str | None, bool]:
+    """Read a process's command line via ``NtQueryInformationProcess(ProcessCommandLineInformation)``.
+
+    Returns ``(command_line, access_denied)``. Read-only; requires only
+    ``PROCESS_QUERY_LIMITED_INFORMATION`` on Windows 8.1 / 10 / 11.
+    """
+    ctypes = api.ctypes
+    length = api.wintypes.ULONG(0)
+    status = api.ntdll.NtQueryInformationProcess(
+        handle, _PROCESS_COMMAND_LINE_INFORMATION, None, 0, ctypes.byref(length),
+    )
+    if _is_status_access_denied(int(status)):
+        return None, True
+    if length.value == 0 or length.value > 1 << 20:
+        return None, False
+    buffer = ctypes.create_string_buffer(length.value)
+    status = api.ntdll.NtQueryInformationProcess(
+        handle, _PROCESS_COMMAND_LINE_INFORMATION, buffer, length.value, ctypes.byref(length),
+    )
+    if _is_status_access_denied(int(status)):
+        return None, True
+    if status != 0:
+        return None, False
+    unicode_string = ctypes.cast(buffer, ctypes.POINTER(api.UNICODE_STRING)).contents
+    if not unicode_string.Buffer or unicode_string.Length == 0:
+        return None, False
+    return ctypes.wstring_at(unicode_string.Buffer, unicode_string.Length // ctypes.sizeof(ctypes.c_wchar)), False
+
+
+def _query_windows_processes(*, timeout: float = QUERY_TIMEOUT, api=None) -> list[dict]:
+    """Enumerate local Python processes directly via Win32 Toolhelp32 + NtQueryInformationProcess.
+
+    Zero subprocesses (never spawns PowerShell or WMI). Detects elevated Python
+    processes that return ``ERROR_ACCESS_DENIED (5)`` on ``OpenProcess`` (or
+    ``STATUS_ACCESS_DENIED`` on command-line inspection) so UIPI blocks surface
+    a clear ``status="elevated"`` diagnostic instead of a silent timeout/miss.
+    """
+    del timeout  # kept for signature compatibility; in-process Toolhelp32 finishes in <5 ms
+    if api is None:
+        if sys.platform != "win32":
+            raise OSError("Win32 process enumeration is only available on Windows")
+        api = _win32_process_api()
+
+    ctypes = api.ctypes
+    wintypes = api.wintypes
+    kernel32 = api.kernel32
+    ptr_size = ctypes.sizeof(ctypes.c_void_p)
+
+    api.set_last_error(0)
+    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if _is_invalid_handle(snapshot, ptr_size):
+        err = int(api.get_last_error())
+        raise OSError(err, f"CreateToolhelp32Snapshot failed (error {err})")
+
+    rows: list[dict] = []
+    try:
+        entry = api.PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(api.PROCESSENTRY32W)
+        api.set_last_error(0)
+        ok = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+        if not ok:
+            err = int(api.get_last_error())
+            if err in (0, _ERROR_NO_MORE_FILES):
+                return rows
+            raise OSError(err, f"Process32FirstW failed (error {err})")
+
+        while True:
+            exe_name = str(entry.szExeFile)
+            if exe_name.lower() in _PYTHON_NAMES:
+                pid = int(entry.th32ProcessID)
+                api.set_last_error(0)
+                handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if not handle:
+                    err = int(api.get_last_error())
+                    if err == _ERROR_INVALID_PARAMETER:
+                        pass  # process exited between snapshot and OpenProcess
+                    elif err == _ERROR_ACCESS_DENIED:
+                        rows.append({
+                            "pid": pid,
+                            "created": None,
+                            "name": exe_name,
+                            "command_line": None,
+                            "access_denied": True,
+                            "winerror": _ERROR_ACCESS_DENIED,
+                        })
+                    else:
+                        rows.append({"pid": pid, "created": None, "name": exe_name, "command_line": None})
+                else:
+                    try:
+                        size = wintypes.DWORD(32768)
+                        image_buf = ctypes.create_unicode_buffer(size.value)
+                        image_ok = bool(kernel32.QueryFullProcessImageNameW(
+                            handle, 0, image_buf, ctypes.byref(size),
+                        ))
+                        if image_ok and image_buf.value:
+                            resolved_name = ntpath.basename(image_buf.value)
+                            if resolved_name.lower() not in _PYTHON_NAMES:
+                                resolved_name = None
+                        else:
+                            resolved_name = exe_name
+
+                        if resolved_name is not None:
+                            times = [wintypes.FILETIME() for _ in range(4)]
+                            created_iso = None
+                            if kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                                ticks = int((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+                                created_iso = _filetime_to_iso(ticks)
+                            command_line, cmd_denied = _read_process_command_line(api, handle)
+                            row: dict = {
+                                "pid": pid,
+                                "created": created_iso,
+                                "name": resolved_name,
+                                "command_line": command_line,
+                            }
+                            if cmd_denied:
+                                row["access_denied"] = True
+                                row["winerror"] = _ERROR_ACCESS_DENIED
+                            rows.append(row)
+                    finally:
+                        kernel32.CloseHandle(handle)
+
+            entry.dwSize = ctypes.sizeof(api.PROCESSENTRY32W)
+            api.set_last_error(0)
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                err = int(api.get_last_error())
+                if err not in (0, _ERROR_NO_MORE_FILES):
+                    raise OSError(err, f"Process32NextW failed (error {err})")
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return rows
 
 
 def _query_failure(exc) -> str:
-    """A short, private-data-free reason for a failed PowerShell query."""
-    if isinstance(exc, subprocess.TimeoutExpired):
+    """A short, private-data-free reason for a failed process query."""
+    if isinstance(exc, TimeoutError) or type(exc).__name__ == "TimeoutExpired":
         return "timeout"
-    if isinstance(exc, subprocess.CalledProcessError):
-        return f"exit code {exc.returncode}"
+    returncode = getattr(exc, "returncode", None)
+    if returncode is not None:
+        return f"exit code {returncode}"
     if isinstance(exc, (ValueError, UnicodeError)):
         return "invalid output"
     if isinstance(exc, OSError):
-        return f"could not start PowerShell ({type(exc).__name__})"
+        winerr = getattr(exc, "winerror", None)
+        if winerr is not None:
+            return f"win32 error {winerr}"
+        return f"process query failed ({type(exc).__name__})"
     return type(exc).__name__
 
 
 class _ProcessQueryCache:
-    """Coalesce default monitors' CIM reads, including failed queries.
+    """Coalesce default monitors' process reads, including failed queries.
 
-    Each real PowerShell run is logged with its duration, its outcome and, on
-    failure, the reason, so the query cadence on an instrument PC can be read back.
+    Each query is logged with its duration, its outcome and, on failure, the
+    reason, so the query cadence on an instrument PC can be read back.
     """
 
     def __init__(self, *, lifetime=2.0, clock=time.monotonic, query=None):
@@ -166,39 +416,6 @@ class _ProcessQueryCache:
 
 
 _DEFAULT_QUERY_CACHE = _ProcessQueryCache()
-
-_FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
-_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_SYNCHRONIZE = 0x00100000
-_WAIT_OBJECT_0, _WAIT_TIMEOUT = 0x0, 0x102
-_ERROR_INVALID_PARAMETER = 87  # OpenProcess on a pid that no longer exists
-# CIM reports creation times in microseconds; FILETIME counts 100 ns ticks.
-_CREATION_TOLERANCE_TICKS = 10_000_000
-
-
-def _filetime(created: str) -> int:
-    """CIM's ISO creation time as a Windows FILETIME tick count."""
-    birth = datetime.fromisoformat(created)
-    if birth.tzinfo is None:
-        raise ValueError("creation time has no time zone")
-    return (birth - _FILETIME_EPOCH) // timedelta(microseconds=1) * 10
-
-
-@lru_cache(maxsize=1)
-def _kernel32():
-    """A private, prototyped kernel32; never the shared ``ctypes.windll``. Windows only."""
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    for name, restype, argtypes in (
-            ("OpenProcess", wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)),
-            ("CloseHandle", wintypes.BOOL, (wintypes.HANDLE,)),
-            ("WaitForSingleObject", wintypes.DWORD, (wintypes.HANDLE, wintypes.DWORD)),
-            ("GetProcessTimes", wintypes.BOOL, (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4)):
-        function = getattr(kernel32, name)
-        function.restype, function.argtypes = restype, list(argtypes)
-    return ctypes, wintypes, kernel32
 
 
 def _process_creation_filetime(pid: int) -> int | None:
@@ -486,7 +703,7 @@ class SlacsDiscovery:
             self._snapshot = stopped
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
-            # Never wait out a slow PowerShell run; its late result is dropped.
+            # Never wait out a slow query; its late result is dropped.
             thread.join(timeout=min(self._query_timeout + 0.5, STOP_JOIN_SECONDS))
         if changed:
             self._notify(stopped)

@@ -3,325 +3,93 @@
 The overlay uses the owning viewer's gated tile server, but has its own native
 top-level window. It never joins the parent's native child-window hierarchy,
 which would make it disappear when the parent is minimized.
+
+This module is the public facade for the translucent overlay subsystem. Pure
+validation helpers live in ``nd2wsi.translucent_validation`` and stage-follow /
+Win32 focus & click-through coordination live in
+``nd2wsi.translucent_stage_follow``.
 """
 
 from __future__ import annotations
 
 import copy
-import datetime as dt
 import json
-import math
-import os
-import re
 import sys
-import tempfile
 import threading
 import time
-import urllib.parse
 from pathlib import Path
 
-from . import follow_flips, laser_target, session_log
+from . import follow_flips as follow_flips
+from . import laser_target, session_log
+from . import translucent_stage_follow as _stage_follow_mod
+from .translucent_stage_follow import (
+    GWL_EXSTYLE,
+    HOVER_POLL_INTERVAL_S,
+    HOVER_RECT_PADDING_CSS,
+    HWND_TOPMOST,
+    LOCKED_CLICKTHROUGH_EXSTYLE,
+    LOCKED_MAX_OPACITY,
+    SW_SHOWNOACTIVATE,
+    SWP_FRAMECHANGED,
+    SWP_NOACTIVATE,
+    SWP_NOMOVE,
+    SWP_NOSIZE,
+    SWP_NOZORDER,
+    SWP_SHOWWINDOW,
+    WS_EX_APPWINDOW,
+    WS_EX_LAYERED,
+    WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT,
+    StageFollowMixin,
+    Win32OverlayFocusController,
+    point_in_interactive_rects,
+)
+from .translucent_stage_follow import _hwnd_from_native as _hwnd_from_native
+from .translucent_validation import _HEX_COLOR_RE as _HEX_COLOR_RE
+from .translucent_validation import (
+    CLIENT_LOG_FIELD_LIMIT,
+    CLIENT_LOG_MAX,
+    CLIENT_LOG_STACK_LIMIT,
+    CLIENT_LOG_WINDOW,
+    DEFAULT_STEP_UM,
+    MARK_CONTEXT_KEYS,
+    MAX_LOCKED_INTERACTIVE_RECTS,
+    MAX_SIZE,
+    MAX_STEP_UM,
+    MIN_OPACITY,
+    MIN_SIZE,
+    OPACITY,
+    OPACITY_TIMEOUT,
+    TARGET_KEYS,
+    VIEW_KEYS,
+    _number,
+    laser_scope,
+    normalize_laser_items,
+    normalize_source_format,
+    roi_pair_paths,
+    validate_context,
+    validate_follow_flips,
+    validate_laser_item,
+    validate_laser_target_request,
+    validate_locked_interactive_rects,
+    validate_overlay_view,
+    validate_roi,
+    validate_stage_follow_options,
+)
+from .translucent_validation import _optional_numbers as _optional_numbers
+from .translucent_validation import _polygon_area as _polygon_area
 from .window_chrome import NativeTitlebarDrag
 
-OPACITY = 0.55
-MIN_OPACITY = 0.10
-OPACITY_TIMEOUT = 5
-MIN_SIZE = (220, 160)
-MAX_SIZE = 8192
-DEFAULT_STEP_UM = 10.0
-MAX_STEP_UM = 10000.0
-# Client-error forwarding is rate limited so a looping page cannot flood the log.
-CLIENT_LOG_MAX = 20
-CLIENT_LOG_WINDOW = 10.0
-CLIENT_LOG_FIELD_LIMIT = 1000
-CLIENT_LOG_STACK_LIMIT = 4000
-# What the page may report of its current view (report_overlay_view).
-TARGET_KEYS = ("target_px", "target_offset_css", "target_side_um", "target_rotation_deg",
-               "target_corners_px", "target_calibrated")
-VIEW_KEYS = frozenset(("version", "center_px", "zoom", "rotation", "flip", "locked", "follow_session",
-                       "follow_seq", "follow_displacement_um", "container", "window", *TARGET_KEYS))
-# The overlay's state in each slacs_key record (_mark_context), in record order.
-MARK_CONTEXT_KEYS = ("slacs_session", "image_name", "source_format", "image_px", *TARGET_KEYS, "view", "view_age_ms",
-                     "view_follow_seq", "view_displacement_um", "locked", "follow_status", "follow_seq",
-                     "displacement_um", "counted", "step_source", "step_um", "effective_step_um", "roughness_um", "mirror_h",
-                     "mirror_v", "reading_age_ms", "slacs_busy", "flip_x", "flip_y")
+_ORIG_WIN32_OVERLAY_API = _stage_follow_mod._win32_overlay_api
+_win32_overlay_api = _ORIG_WIN32_OVERLAY_API
 
 
-def _number(value, name, minimum, maximum):
-    if isinstance(value, bool) or not isinstance(value, (float, int)):
-        raise ValueError(f"{name} must be a number")
-    if not math.isfinite(value) or not minimum <= value <= maximum:
-        raise ValueError(f"{name} is outside the supported range")
-    return float(value)
-
-
-def _optional_numbers(value, length, name, minimum=-math.inf, maximum=math.inf):
-    """None, or ``length`` finite numbers within the bounds, as floats."""
-    if value is None:
-        return None
-    if not isinstance(value, list) or len(value) != length:
-        raise ValueError(f"Invalid {name}")
-    return [_number(item, name, minimum, maximum) for item in value]
-
-
-def validate_roi(store, payload):
-    if not isinstance(payload, dict):
-        raise ValueError("Invalid ROI rectangle")
-    level = store.attrs["nd2wsi"]["levels"][0]
-    width, height = level["width"], level["height"]
-    rectangle = {key: _number(payload.get(key), "ROI rectangle", 0, limit)
-                 for key, limit in (("x", width), ("y", height), ("w", width), ("h", height))}
-    if (rectangle["w"] <= 0 or rectangle["h"] <= 0
-            or rectangle["x"] + rectangle["w"] > width
-            or rectangle["y"] + rectangle["h"] > height):
-        raise ValueError("ROI rectangle is outside the slide")
-    return rectangle
-
-
-_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-
-
-def _polygon_area(points):
-    return abs(sum(
-        points[i][0] * points[(i + 1) % len(points)][1]
-        - points[(i + 1) % len(points)][0] * points[i][1]
-        for i in range(len(points))
-    )) / 2.0
-
-
-def validate_laser_item(store, payload):
-    if not isinstance(payload, dict):
-        raise ValueError("Invalid laser annotation")
-    slacs = payload.get("slacs")
-    is_slacs_dict = isinstance(slacs, dict) and slacs.get("kind") == "laser_shot"
-    if not is_slacs_dict and payload.get("kind") != "laser_shot":
-        raise ValueError("Invalid laser annotation kind")
-    item_id = payload.get("id")
-    if not isinstance(item_id, str) or not 1 <= len(item_id) <= 256:
-        raise ValueError("Invalid laser annotation id")
-    raw_text = payload.get("text") if "text" in payload else payload.get("label", "")
-    if not isinstance(raw_text, str) or len(raw_text) > 65536:
-        raise ValueError("Invalid laser annotation label")
-    raw_label = payload.get("label", raw_text)
-    if not isinstance(raw_label, str) or len(raw_label) > 65536:
-        raise ValueError("Invalid laser annotation label")
-    raw_note = payload.get("note", "")
-    if not isinstance(raw_note, str) or len(raw_note) > 65536:
-        raise ValueError("Invalid laser annotation note")
-    display_text = (raw_text or raw_label)[:1000]
-    display_label = (raw_label or raw_text)[:1000]
-    display_note = raw_note[:1000]
-    color = payload.get("color", "#a0a6ae")
-    if not isinstance(color, str) or not _HEX_COLOR_RE.match(color):
-        raise ValueError("Invalid laser annotation color")
-    shots = slacs.get("shots", 1) if isinstance(slacs, dict) else payload.get("shots", 1)
-    if type(shots) is not int or not 1 <= shots <= 1_000_000:
-        raise ValueError("Invalid laser shot count")
-    cleaned_slacs = {"kind": "laser_shot", "shots": shots}
-    if isinstance(slacs, dict) and "isolation" in slacs:
-        isolation = slacs["isolation"]
-        if type(isolation) is not int or not 1 <= isolation <= 2**53 - 1:
-            raise ValueError("Invalid laser isolation number")
-        cleaned_slacs["isolation"] = isolation
-    item_type = payload.get("type")
-    level = store.attrs["nd2wsi"]["levels"][0]
-    width, height = level["width"], level["height"]
-    if item_type == "box":
-        rectangle = validate_roi(store, payload)
-        return {
-            "id": item_id,
-            "kind": "laser_shot",
-            "type": "box",
-            **rectangle,
-            "text": display_text,
-            "label": display_label,
-            "note": display_note,
-            "color": color,
-            "slacs": cleaned_slacs,
-        }
-    if item_type == "geojson":
-        geojson = payload.get("geojson")
-        geometry = geojson.get("geometry") if isinstance(geojson, dict) else None
-        coords = geometry.get("coordinates") if isinstance(geometry, dict) else None
-        if (not isinstance(geojson, dict) or geojson.get("type") != "Feature"
-                or not isinstance(geometry, dict) or geometry.get("type") != "Polygon"
-                or not isinstance(coords, list) or len(coords) != 1
-                or not isinstance(coords[0], list) or not 4 <= len(coords[0]) <= 32):
-            raise ValueError("Invalid laser polygon geometry")
-        ring = []
-        for point in coords[0]:
-            if not isinstance(point, list) or len(point) != 2:
-                raise ValueError("Invalid laser polygon vertex")
-            px = _number(point[0], "Laser vertex", 0, width)
-            py = _number(point[1], "Laser vertex", 0, height)
-            ring.append([px, py])
-        if ring[0] != ring[-1] or _polygon_area(ring[:-1]) <= 0:
-            raise ValueError("Invalid laser polygon ring")
-        return {
-            "id": item_id,
-            "kind": "laser_shot",
-            "type": "geojson",
-            "text": display_text,
-            "label": display_label,
-            "note": display_note,
-            "color": color,
-            "slacs": cleaned_slacs,
-            "geojson": {
-                "type": "Feature",
-                "geometry": {"type": "Polygon", "coordinates": [ring]},
-                "properties": {"name": display_text},
-            },
-        }
-    raise ValueError("Invalid laser annotation type")
-
-
-def validate_context(store, payload, *, slide_url):
-    """Accept only a camera and tile-render settings for a registered slide."""
-    if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
-        raise ValueError("Unsupported translucent-viewer state")
-    meta = store.attrs["nd2wsi"]
-    width, height = (meta["levels"][0][key] for key in ("width", "height"))
-    center = payload.get("center")
-    if not isinstance(center, list) or len(center) != 2:
-        raise ValueError("Invalid image center")
-    # OSD permits a little space outside an image while panning. Preserve it.
-    center = [_number(value, "Image center", -8 * limit, 9 * limit)
-              for value, limit in zip(center, (width, height))]
-    zoom = _number(payload.get("zoom"), "Image scale", 1e-12, 1024)
-    rotation = _number(payload.get("rotation", 0), "Rotation", -360000, 360000) % 360
-    flip = payload.get("flip", False)
-    if type(flip) is not bool:
-        raise ValueError("Flip must be boolean")
-    # The overlay shows exactly the main viewer's rotation and flip; it has no
-    # orientation settings of its own. An older handoff's "mirror_scan" is
-    # ignored. Follow's flips reverse its movement only, never the orientation.
-    query = payload.get("query", "")
-    if not isinstance(query, str) or len(query) > 16384:
-        raise ValueError("Invalid display settings")
-    pairs = urllib.parse.parse_qsl(query.removeprefix("?"), keep_blank_values=True,
-                                  strict_parsing=True, max_num_fields=7)
-    params = dict(pairs)
-    if len(params) != len(pairs) or set(params) - {"c", "win", "col", "g", "t", "p", "z"}:
-        raise ValueError("Unsupported display setting")
-    channels = store.attrs["omero"]["channels"]
-    selected = params.get("c")
-    if selected not in (None, "", "none"):
-        indices = selected.split(",")
-        if (any(not index.isascii() or not index.isdecimal() or not 0 <= int(index) < len(channels)
-                for index in indices) or len(set(indices)) != len(indices)):
-            raise ValueError("Invalid channel selection")
-    if "col" in params and params["col"] != "":
-        col_tokens = params["col"].split(",")
-        if len(col_tokens) > len(channels):
-            raise ValueError("Too many channel colors")
-        for token in col_tokens:
-            if not token:
-                continue
-            cleaned = token[1:] if token.startswith("#") else token
-            if len(cleaned) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in cleaned):
-                raise ValueError("Invalid channel color")
-    if "win" in params:
-        windows = params["win"].split(",")
-        if len(windows) > len(channels):
-            raise ValueError("Too many channel windows")
-        for window in windows:
-            if not window:
-                continue
-            values = window.split(":")
-            if len(values) not in (2, 3):
-                raise ValueError("Invalid channel window")
-            values = [float(value) for value in values]
-            if not all(math.isfinite(value) for value in values) or values[1] <= values[0]:
-                raise ValueError("Invalid channel window")
-            if len(values) == 3 and not 0.1 <= values[2] <= 10:
-                raise ValueError("Invalid channel gamma")
-    if "col" in params:
-        colors = params["col"].split(",")
-        if len(colors) > len(channels):
-            raise ValueError("Too many channel colors")
-        for color in colors:
-            if color and (len(color) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in color)):
-                raise ValueError("Invalid channel color")
-    generation = getattr(store, "generation", "")
-    if params.get("g", "") != generation:
-        raise ValueError("The image changed; refresh the slide before opening the overlay")
-    plate = getattr(store, "plate", None)
-    if plate is not None:
-        for name, size in (("t", plate.T), ("p", plate.P), ("z", plate.Z)):
-            value = params.get(name, "")
-            if not value.isascii() or not value.isdecimal() or not 0 <= int(value) < size:
-                raise ValueError("Choose a valid plate site, time and Z plane first")
-    elif set(params) & {"t", "p", "z"}:
-        raise ValueError("Plane selection does not match this slide")
-    cleaned = urllib.parse.urlencode(pairs)
-    plate_meta = meta.get("plate") if isinstance(meta.get("plate"), dict) else {}
-    store_scope = "plane" if plate is not None and plate_meta.get("annotationScope") == "plane" else "site"
-    if "annotation_scope" in payload and payload["annotation_scope"] is not None:
-        if payload["annotation_scope"] not in ("plane", "site"):
-            raise ValueError("Invalid annotation scope")
-        if plate is None and payload["annotation_scope"] != "site":
-            raise ValueError("Invalid annotation scope")
-        if plate is not None and "annotationScope" in plate_meta and payload["annotation_scope"] != store_scope:
-            raise ValueError("Annotation scope does not match this slide")
-        annotation_scope = payload["annotation_scope"]
-    else:
-        annotation_scope = store_scope
-    source_path = getattr(store, "source_path", None)
-    raw_source = meta.get("source")
-    image_name = (
-        Path(str(source_path)).name
-        if isinstance(source_path, (str, os.PathLike)) and str(source_path)
-        else (
-            Path(str(raw_source)).name
-            if isinstance(raw_source, (str, os.PathLike)) and str(raw_source)
-            else "image"
-        )
-    )
-    context = {"version": 1, "slide_url": slide_url, "query": "?" + cleaned if cleaned else "",
-               "center": center, "zoom": zoom, "rotation": rotation, "flip": flip,
-               "dimensions": [width, height],
-               "pixel_size_um": copy.deepcopy(meta.get("pixel_size_um")),
-               "image_name": image_name,
-               # Follow's flips are remembered per format of the original file.
-               "source_format": follow_flips.source_format(store.attrs, getattr(store, "source_path", None)),
-               "annotation_scope": annotation_scope,
-               "opacity": OPACITY, "opacity_mode": "native" if sys.platform == "win32" else "layer",
-               "locked": False}
-    if payload.get("roi") is not None:
-        context["roi"] = validate_roi(store, payload["roi"])
-    if "rois" in payload:
-        rois = payload["rois"]
-        if not isinstance(rois, list) or len(rois) > 2000:
-            raise ValueError("The translucent viewer supports at most 2000 imported ROIs")
-        cleaned_rois, indices = [], set()
-        for roi in rois:
-            rectangle = validate_roi(store, roi)
-            label, index = roi.get("label"), roi.get("index")
-            if not isinstance(label, str) or len(label) > 1000:
-                raise ValueError("Invalid ROI label")
-            if type(index) is not int or not 1 <= index <= 2**53 - 1 or index in indices:
-                raise ValueError("ROI indices must be positive, unique safe integers")
-            indices.add(index)
-            cleaned_rois.append({**rectangle, "label": label, "index": index})
-        context["rois"] = cleaned_rois
-    if "roiIndex" in payload:
-        selected = payload["roiIndex"]
-        if type(selected) is not int or not 0 <= selected < len(context.get("rois", [])):
-            raise ValueError("Invalid selected ROI")
-        context["roiIndex"] = selected
-    if "laser_items" in payload and payload["laser_items"] is not None:
-        laser_items = payload["laser_items"]
-        if not isinstance(laser_items, list) or len(laser_items) > 10000:
-            raise ValueError("The translucent viewer supports at most 10000 laser annotations")
-        cleaned_laser, laser_ids = [], set()
-        for item in laser_items:
-            cleaned_item = validate_laser_item(store, item)
-            if cleaned_item["id"] in laser_ids:
-                raise ValueError("Laser annotation IDs must be unique")
-            laser_ids.add(cleaned_item["id"])
-            cleaned_laser.append(cleaned_item)
-        context["laser_items"] = cleaned_laser
-    return context
+def _resolve_win32_overlay_api():
+    """Allow tests to monkeypatch either translucent_window or translucent_stage_follow."""
+    if _win32_overlay_api is not _ORIG_WIN32_OVERLAY_API:
+        return _win32_overlay_api()
+    return _stage_follow_mod._win32_overlay_api()
 
 
 class _OverlayDrag(NativeTitlebarDrag):
@@ -337,24 +105,41 @@ class _OverlayDrag(NativeTitlebarDrag):
 
             event, native = self._press, self.native
             self._clear()
-            if (self.api._locked or self.api._closed or event is None or native is None
-                    or event.window() != native or time.monotonic() - self._pressed_at > 1
-                    or not (AppKit.NSEvent.pressedMouseButtons() & 1) or not native.isVisible()):
+            if (
+                self.api._locked
+                or self.api._closed
+                or event is None
+                or native is None
+                or event.window() != native
+                or time.monotonic() - self._pressed_at > 1
+                or not (AppKit.NSEvent.pressedMouseButtons() & 1)
+                or not native.isVisible()
+            ):
                 return
             native.performWindowDragWithEvent_(event)
         except Exception as exc:
             self.logger(f"translucent window drag failed: {exc!r}")
 
 
-class TranslucentApi:
+class TranslucentApi(StageFollowMixin):
     """Display-only bridge with read-only, user-selected JPG/TXT ROI import.
 
     ``flip_store`` (a ``follow_flips.FollowFlipStore``) remembers Follow's flips
     per image format; without one they last only as long as this overlay.
     """
 
-    def __init__(self, context, *, logger, on_closed, flip_store=None, target_store=None,
-                 on_laser_box=None, is_active=None, on_lock=None):
+    def __init__(
+        self,
+        context,
+        *,
+        logger,
+        on_closed,
+        flip_store=None,
+        target_store=None,
+        on_laser_box=None,
+        is_active=None,
+        on_lock=None,
+    ):
         self._context = copy.deepcopy(context)
         self._context.setdefault("opacity", OPACITY)
         self._context["opacity_mode"] = "native" if sys.platform == "win32" else "layer"
@@ -383,8 +168,7 @@ class TranslucentApi:
         self._slacs_snapshot = {"available": False, "session_id": None, "status": "waiting"}
         self._slacs_logged = None  # the last detection state written to the session log
         self._discovery = None
-        source_format = self._context.get("source_format")
-        self._source_format = source_format if source_format in follow_flips.FORMATS else "other"
+        self._source_format = normalize_source_format(self._context.get("source_format"))
         self._flip_store = flip_store
         self._flip_save_lock = threading.Lock()
         self._follow_flips = (False, False)  # (flip_x, flip_y); replaced whole, never mutated
@@ -397,10 +181,7 @@ class TranslucentApi:
         self._is_active = is_active or (lambda: True)
         self._laser_delivery = None
         self._on_laser_box = on_laser_box
-        self._laser_items = {}
-        for item in self._context.pop("laser_items", None) or ():
-            if isinstance(item, dict) and isinstance(item.get("id"), str):
-                self._laser_items[item["id"]] = copy.deepcopy(item)
+        self._laser_items = normalize_laser_items(self._context.pop("laser_items", None))
         self._pending_laser_scope = None
         self._pending_laser_epoch = None
         self._pending_laser_context_epoch: int | None = None
@@ -408,6 +189,11 @@ class TranslucentApi:
         self._target_store = target_store
         self._target_save_lock = threading.Lock()
         self._laser_target = laser_target.validate(laser_target.DEFAULT)
+        self._win32_focus = Win32OverlayFocusController(
+            slacs_pid_provider=self._slacs_pid,
+            logger=logger,
+            api_factory=_resolve_win32_overlay_api,
+        )
         if target_store is not None:
             self._laser_target, warning = target_store.load()
             if warning:
@@ -415,774 +201,17 @@ class TranslucentApi:
         if flip_store is not None:
             self._restore_flips()
 
-    def _orientation(self):
-        """The main viewer's rotation and flip at handoff, as Follow records name them."""
-        return {"view_rotation": self._context.get("rotation", 0), "view_flip": self._context.get("flip", False)}
-
-    def _restore_flips(self):
-        """Start with the flips remembered for this image's format; never raises."""
-        try:
-            stored, warning = self._flip_store.load(self._source_format)
-        except Exception as exc:  # noqa: BLE001 - a broken store only loses the memory
-            stored, warning = None, f"Saved Follow flips were not restored: {exc}"
-        if warning:
-            session_log.event("follow_flip_load_failed", source_format=self._source_format, message=warning)
-        if stored is None:
-            return
-        self._follow_flips = stored
-        session_log.event("follow_flip", source="remembered", source_format=self._source_format,
-                          flip_x=stored[0], flip_y=stored[1], image_name=self._context.get("image_name"),
-                          **self._orientation())
-
-    def _ensure_slacs_discovery(self):
-        from .slacs_discovery import SlacsDiscovery
-
-        with self._lock:
-            if not self._closed and self._discovery is None:
-                self._discovery = SlacsDiscovery(on_change=self._on_slacs_change, name="translucent")
-                self._slacs_snapshot = self._discovery.snapshot()
-                logged = self._detection_to_log()
-            else:
-                logged = None
-            discovery = self._discovery
-        self._log_detection(logged)
-        return discovery
-
-    def _detection_to_log(self):
-        """The detection state to record, once per change; call with the lock held."""
-        current = self._slacs_snapshot
-        state = (current.get("available") is True, current.get("session_id"), current.get("status"))
-        if state == self._slacs_logged:
-            return None
-        self._slacs_logged = state
-        return state
-
-    @staticmethod
-    def _log_detection(state):
-        # So a detection that fails on the instrument PC can be diagnosed afterwards.
-        if state is not None:
-            session_log.event("slacs_detection", window="translucent", available=state[0],
-                              session_id=state[1], status=state[2])
-
-    def _on_slacs_change(self, snapshot):
-        """Stop an active receiver as soon as its detected process is lost or replaced.
-
-        Every stage_follow_state reply computed after this point reports the loss
-        and carries no movement. A reply computed just before it may still be on its
-        way to the page, so the page is also told at once; it drops any follow reply
-        that arrives after this revocation (translucent-v1.js revokeStageFollow).
-        """
-        receiver = follower = source = revoked = message = None
-        with self._lock:
-            if self._closed:
-                return
-            available = (snapshot.get("available") is True and snapshot.get("status") == "running"
-                         and isinstance(snapshot.get("session_id"), str) and bool(snapshot["session_id"]))
-            session = snapshot.get("session_id") if available else None
-            self._slacs_snapshot = {"available": available, "session_id": session,
-                                    "status": snapshot.get("status", "unavailable")}
-            logged = self._detection_to_log()
-            # Every Follow is bound to the SLACS process detected when it started;
-            # that process's loss or replacement ends it.
-            if (self._stage_follow is not None and self._stage_follow_session is not None
-                    and session != self._stage_follow_session):
-                receiver, self._stage_follow = self._stage_follow, None
-                follower, self._stage_follower = self._stage_follower, None
-                source, self._stage_follow_source = self._stage_follow_source, None
-                self._stage_follow_status = None
-                revoked, self._stage_follow_receiver_id = self._stage_follow_receiver_id, None
-                self._stage_follow_session = None
-                message = self._stage_follow_lost = "SLACS program stopped or changed. Follow stopped; reconnect manually."
-        self._log_detection(logged)
-        if receiver is not None:
-            if self._laser_delivery is not None:
-                self._laser_delivery.view_changed()
-            self._revoke_follow_in_page(revoked, message)
-            if follower is not None:
-                follower.stop("slacs_lost")
-            receiver.close()
-            session_log.event("follow_stop", source=source, reason="slacs_lost")
-
-    def _revoke_follow_in_page(self, receiver_id, message):
-        """Queue the revocation on the same script channel that carries bridge replies.
-
-        pywebview delivers every bridge reply through ``evaluate_js``, so replies queued
-        after this revocation reach the page after it. A separate thread keeps the
-        discovery callback quick and never waits on the UI thread.
-        """
-        window = self._window
-        if window is None:
-            return
-        script = ("window.nd2TranslucentRevokeFollow?.(" +
-                  json.dumps({"session_id": receiver_id, "message": message}, allow_nan=False) + "); true")
-        try:
-            threading.Thread(target=self._push_revocation, args=(window, script),
-                             name="nd2wsi-stage-follow-revoke", daemon=True).start()
-        except RuntimeError as exc:  # the receiver must still be closed by the caller
-            self._logger(f"stage follow revocation could not start: {exc!r}")
-
-    def _push_revocation(self, window, script):
-        if self._closed:
-            return
-        try:
-            window.evaluate_js(script)
-        except Exception as exc:
-            self._logger(f"stage follow revocation could not reach the page: {exc!r}")
-
-    def slacs_discovery_state(self):
-        """Report program detection; this does not establish a motion connection."""
-        self._ensure_slacs_discovery()
-        with self._lock:
-            return dict(self._slacs_snapshot)
-
     def translucent_context(self):
         with self._lock:
             flip_x, flip_y = self._follow_flips
-            return {**copy.deepcopy(self._context), "locked": self._locked, "source_format": self._source_format,
-                    "follow_flips": {"flip_x": flip_x, "flip_y": flip_y},
-                    "laser_target": copy.deepcopy(self._laser_target),
-                    "laser_items": copy.deepcopy(list(self._laser_items.values()))}
-
-    def save_laser_target(self, payload):
-        """Validate and remember a completed calibration or resize/rotation gesture."""
-        try:
-            if (not isinstance(payload, dict) or set(payload) != {"target", "calibrate", "zoom"}
-                    or type(payload["calibrate"]) is not bool):
-                raise ValueError("Invalid laser target request")
-            target = laser_target.validate(payload["target"])
-            zoom = _number(payload["zoom"], "Target scale", 1e-12, 1e6)
-            if payload["calibrate"] and target["window"] is None:
-                raise ValueError("Calibration needs the current window frame")
-        except (ValueError, TypeError) as exc:
-            return {"ok": False, "message": str(exc)}
-        with self._lock:
-            if self._closed or self._locked:
-                return {"ok": False, "message": "Unlock to set the laser target."}
-            self._laser_target = target
-        saved, message = False, None
-        with self._target_save_lock:
-            if self._target_store is not None:
-                try:
-                    self._target_store.save(self._laser_target)
-                    saved = True
-                except (OSError, ValueError) as exc:
-                    message = f"Applied for this window, but could not be remembered: {exc}"
-        session_log.event("laser_target_set", calibrated=payload["calibrate"], **copy.deepcopy(target), zoom=zoom)
-        if message:
-            session_log.event("laser_target_save_failed", message=message)
-        return {"ok": True, "saved": saved, "message": message, "target": copy.deepcopy(target)}
-
-    def _stage_follow_options(self, options):
-        """Resolve the stage-follow source, per-key step and step source; never raise.
-
-        The step source is "slacs" (each press moves by SLACS's Roughness, with
-        ``step_um`` as the fallback while it cannot be read) or "manual" (always
-        ``step_um``). Roughness is read only on Windows, so by default only the
-        Windows key source reads it.
-        """
-        default_source = "keys" if sys.platform == "win32" else "adapter"
-
-        def default_step_source(source):
-            return "slacs" if sys.platform == "win32" and source == "keys" else "manual"
-
-        source, step_um = default_source, DEFAULT_STEP_UM
-        if options is None:
-            return source, step_um, default_step_source(source), None
-        if not isinstance(options, dict):
-            return source, step_um, default_step_source(source), "Invalid stage follow options."
-        requested = options.get("source", default_source)
-        if requested not in ("keys", "adapter"):
-            return source, step_um, default_step_source(source), "Unknown stage follow source."
-        source = requested
-        step_source = options.get("step_source", default_step_source(source))
-        if step_source not in ("slacs", "manual"):
-            return source, step_um, default_step_source(source), "Unknown stage follow step source."
-        if "step_um" in options:
-            value = options["step_um"]
-            if (isinstance(value, bool) or not isinstance(value, (int, float))
-                    or not math.isfinite(value) or not 0 < value <= MAX_STEP_UM):
-                return (source, step_um, step_source,
-                        "Step per key press must be a number between 0.001 and 10000 µm.")
-            step_um = float(value)
-        return source, step_um, step_source, None
-
-    def _slacs_pid(self):
-        """The detected SLACS process ID for read-only control reads, or None; never raises.
-
-        Runs on the controls monitor's thread, so it takes no overlay lock. The
-        detector reports a pid only for the session it currently reports, and a
-        lost or replaced session stops Follow (_on_slacs_change).
-        """
-        discovery = self._discovery
-        if self._closed or discovery is None:
-            return None
-        try:
-            pid = discovery.slacs_pid()
-        except Exception:  # noqa: BLE001 - an unknown pid only skips a read
-            return None
-        return pid if type(pid) is int and pid > 0 else None
-
-    def _slacs_identifier(self):
-        """Process-identity callback bound to the detected SLACS at Follow start, or None."""
-        from .slacs_discovery import _bound_process_identifier
-
-        bound_pid = self._slacs_pid()
-        if bound_pid is None:
-            return None
-        bound_created = None
-        discovery = self._discovery
-        if discovery is not None:
-            try:
-                created = discovery.slacs_creation_filetime()
-            except Exception:  # noqa: BLE001 - optional creation timestamp
-                created = None
-            if type(created) is int and created >= 0:
-                bound_created = created
-        return _bound_process_identifier(bound_pid, bound_created)
-
-    def _slacs_controls_monitor(self):
-        """A read-only monitor of SLACS's Roughness and Mirror controls, or None and why not.
-
-        Follow never depends on it: without one the key follower moves by the
-        manual step, recorded as a fallback.
-        """
-        try:
-            from .slacs_controls import SlacsControlsMonitor
-
-            return SlacsControlsMonitor(self._slacs_pid), None
-        except Exception as exc:  # noqa: BLE001 - a missing reader must not stop Follow
-            self._logger(f"SLACS controls monitor unavailable: {exc!r}")
-            return None, f"{type(exc).__name__}: {exc}"[:CLIENT_LOG_FIELD_LIMIT]
-
-    def start_stage_follow(self, options=None):
-        """Opt in to this overlay's receiver; never connect to a controller.
-
-        ``options`` may set ``source`` ("keys" to observe SLACS W/A/S/D presses,
-        "adapter" for an external in-process/HTTP sender), the per-key
-        ``step_um`` and ``step_source`` ("slacs" to move each press by SLACS's
-        Roughness, read from its window, or "manual"). The key follower is a
-        strict observer and never blocks, delays, or alters a keystroke; it owns
-        the Roughness monitor's start and stop. It starts with this overlay's
-        Follow flips and logs SLACS's "," and "." presses with ``_mark_context``.
-        Follow is refused unless SLACS is detected, and is bound to that
-        detected process.
-        """
-        from .stage_follow import StageFollowReceiver
-        from .stage_keys import SlacsKeyFollower
-
-        source, step_um, step_source, option_error = self._stage_follow_options(options)
-        with self._lock:
-            if self._closed:
-                return {"ok": False, "message": "This translucent viewer is closed."}
-            if option_error is not None:
-                return {"ok": False, "message": option_error}
-            detected = self._slacs_snapshot
-            if not (detected.get("available") is True and isinstance(detected.get("session_id"), str)
-                    and detected["session_id"]):
-                return {"ok": False, "message": "SLACS is not detected. Start SLACS, then turn on Follow."}
-            pixels = self._context.get("pixel_size_um")
-            if (not isinstance(pixels, (list, tuple)) or len(pixels) != 2
-                    or any(isinstance(v, bool) or not isinstance(v, (float, int))
-                           or not math.isfinite(v) or v <= 0 for v in pixels)):
-                return {"ok": False, "message": "Stage follow requires a calibrated image."}
-            if self._stage_follow is not None:
-                descriptor = self._stage_follow.start()
-                return {"ok": True, "source": self._stage_follow_source, **descriptor}
-            # Not re-read from the store: a toggle just before Follow may still be saving.
-            flip_x, flip_y = self._follow_flips
-            receiver = StageFollowReceiver()
-            try:
-                descriptor = receiver.start()
-            except (OSError, RuntimeError) as exc:
-                receiver.close()
-                return {"ok": False, "message": "Could not start the local motion receiver: " + str(exc)}
-            follower = controls_error = None
-            made_delivery = False
-            if source == "keys":
-                if self._on_laser_box is not None and self._laser_delivery is None:
-                    from .slacs_laser import LaserDelivery
-
-                    made_delivery = True
-                    self._laser_delivery = LaserDelivery(prepare=self._prepare_laser_box,
-                        deliver=self._deliver_laser_box, confirmed=self._confirm_laser_box)
-                controls = None
-                if step_source == "slacs":
-                    controls, controls_error = self._slacs_controls_monitor()
-                identifier = self._slacs_identifier()
-                identifier_kwargs = {"identifier": identifier} if identifier is not None else {}
-                try:
-                    # The context's calibration is [Y, X]; the follower takes (X, Y).
-                    follower = SlacsKeyFollower(receiver, descriptor["session_id"], step_um=step_um,
-                                                step_source=step_source, controls=controls,
-                                                pixel_size_um=(float(pixels[1]), float(pixels[0])),
-                                                flip_x=flip_x, flip_y=flip_y, mark_context=self._mark_context,
-                                                on_mark=self._on_mark_record, **identifier_kwargs)
-                    snapshot = follower.start()
-                except (ValueError, OSError, RuntimeError) as exc:
-                    snapshot = {"running": False, "error": str(exc)}
-                if not snapshot.get("running"):
-                    if follower is not None:
-                        follower.stop("start_failed")
-                    receiver.close()
-                    if made_delivery:
-                        self._laser_delivery.close()
-                        self._laser_delivery = None
-                    message = snapshot.get("error") or "Could not start key following."
-                    session_log.event("follow_start", source=source, step_source=step_source, ok=False,
-                                      message=message)
-                    return {"ok": False, "message": message}
-            self._stage_follow = receiver
-            self._stage_follower = follower
-            self._stage_follow_source = source
-            self._stage_follow_status = None
-            # Bound to the detected SLACS process; see _on_slacs_change.
-            bound = self._stage_follow_session = detected["session_id"]
-            self._stage_follow_receiver_id = descriptor.get("session_id")
-            self._stage_follow_lost = ""
-        if self._locked and self._on_lock is not None:
-            self._on_lock(True)
-        extra = {"controls_error": controls_error} if controls_error else {}
-        session_log.event("follow_start", source=source, step_source=step_source, step_um=step_um, ok=True,
-                          slacs_session=bound, source_format=self._source_format, flip_x=flip_x, flip_y=flip_y,
-                          **self._orientation(), **extra)
-        return {"ok": True, "source": source, **descriptor}
-
-    def set_stage_follow_flips(self, payload):
-        """Reverse Follow's on-screen A/D (flip_x) or W/S (flip_y) move; never the image.
-
-        Applies from the next key press, also while Follow runs or the overlay
-        is locked: the page applies only differences of the cumulative
-        displacement, so its sequence and displacement stay consistent. The new
-        pair is remembered for this image's format when the window has a store.
-        """
-        def current(ok, **extra):
-            flip_x, flip_y = self._follow_flips
-            return {"ok": ok, "flip_x": flip_x, "flip_y": flip_y, "source_format": self._source_format, **extra}
-
-        if (not isinstance(payload, dict) or set(payload) != {"flip_x", "flip_y"}
-                or type(payload["flip_x"]) is not bool or type(payload["flip_y"]) is not bool):
-            return current(False, message="Follow flips must be two true/false values.")
-        flips = (payload["flip_x"], payload["flip_y"])
-        with self._lock:
-            if self._closed:
-                return current(False, message="This translucent viewer is closed.")
-            previous = self._follow_flips
-            if flips == previous:
-                return current(True, changed=False)
-            self._follow_flips = flips
-            follower, receiver = self._stage_follower, self._stage_follow
-            # Lock order: overlay, then follower, as in stage_follow_state.
-            if follower is not None:
-                follower.set_flips(*flips)
-            # Only the receiver's progress at the toggle: a press already on its way
-            # may still arrive later with the old flips. Each follow_key names the
-            # flips that press used.
-            follow_seq = receiver.snapshot().get("seq") if receiver is not None else None
-        saved, message = self._remember_flips()
-        session_log.event("follow_flip", source="user", source_format=self._source_format, flip_x=flips[0],
-                          flip_y=flips[1], previous=list(previous), following=follower is not None,
-                          follow_seq=follow_seq, saved=saved, image_name=self._context.get("image_name"),
-                          **self._orientation())
-        result = {"ok": True, "changed": True, "flip_x": flips[0], "flip_y": flips[1],
-                  "source_format": self._source_format, "saved": saved}
-        if message:
-            result["message"] = message
-        return result
-
-    def _remember_flips(self):
-        """Save the current flips for this format: (saved, a message for the page or None).
-
-        Saves the pair current when the save lock is taken, so the last toggle
-        always wins on disk.
-        """
-        store = self._flip_store
-        if store is None:
-            return False, None
-        with self._flip_save_lock:
-            flip_x, flip_y = self._follow_flips
-            try:
-                store.save(self._source_format, flip_x, flip_y)
-            except (OSError, ValueError) as exc:
-                message = f"Applied for this window, but could not be remembered: {exc}"
-                session_log.event("follow_flip_save_failed", source_format=self._source_format,
-                                  flip_x=flip_x, flip_y=flip_y, message=message)
-                return False, message
-        return True, None
-
-    def report_overlay_view(self, payload):
-        """Keep the page's current view for SLACS laser-shot records; never logged.
-
-        A refused report forgets the kept view, so a later record shows no
-        image centre rather than an old one as if it were current.
-        """
-        try:
-            view = self._validated_view(payload)
-        except (TypeError, ValueError) as exc:
-            with self._lock:
-                self._overlay_view = None
-                self._overlay_view_epoch = None
-            return {"ok": False, "message": str(exc)}
-        with self._lock:
-            if self._closed:
-                return {"ok": False}
-            self._overlay_view = {**view, "at": time.monotonic()}
-            self._overlay_view_epoch = self._epoch
-            locked = view["locked"]
-            changed = self._lock_reported is not None and self._lock_reported != locked
-            if self._lock_reported is True and not locked:
-                self._realign_from = self._last_locked_center
-            realign = None
-            if locked:
-                if changed and self._realign_from is not None:
-                    realign = {"from_px": self._realign_from, "to_px": view["center_px"],
-                               "delta_px": [b - a for a, b in zip(self._realign_from, view["center_px"])]}
-                    self._realign_from = None
-                self._last_locked_center = view["center_px"]
-            self._lock_reported = locked
-        if changed:
-            session_log.event("overlay_lock", locked=locked, center_px=view["center_px"], target_px=view.get("target_px"))
-        if realign is not None:
-            session_log.event("overlay_realign", **realign)
-        if self._laser_delivery is not None:
-            self._laser_delivery.view_changed()
-        return {"ok": True}
-
-    def _validated_view(self, payload):
-        if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
-            raise ValueError("Unsupported overlay view")
-        if set(payload) - VIEW_KEYS:
-            raise ValueError("Unknown overlay view field")
-        center = payload.get("center_px")
-        if not isinstance(center, list) or len(center) != 2:
-            raise ValueError("Invalid view centre")
-        flip, locked = payload.get("flip", False), payload.get("locked", False)
-        if type(flip) is not bool or type(locked) is not bool:
-            raise ValueError("View flip and lock must be boolean")
-        session = payload.get("follow_session")
-        if session is not None and (not isinstance(session, str) or len(session) > 128):
-            raise ValueError("Invalid Follow session")
-        seq = payload.get("follow_seq")
-        if seq is not None and (type(seq) is not int or not 0 <= seq <= 2**53 - 1):
-            raise ValueError("Invalid Follow sequence number")
-        target = {}
-        if any(key in payload for key in TARGET_KEYS):
-            if not all(key in payload for key in TARGET_KEYS):
-                raise ValueError("Incomplete laser target view")
-            calibrated = payload["target_calibrated"]
-            if type(calibrated) is not bool:
-                raise ValueError("Invalid target calibration flag")
-            point = _optional_numbers(payload["target_px"], 2, "target point", -1e9, 1e9)
-            corners = payload["target_corners_px"]
-            if corners is not None:
-                if not isinstance(corners, list) or len(corners) != 4:
-                    raise ValueError("Invalid target corners")
-                corners = [laser_target.vector(p, 2, -1e9, 1e9) for p in corners]
-            if (point is None) != (corners is None) or (calibrated and point is None):
-                raise ValueError("Incomplete target geometry")
-            target = {"target_px": point,
-                      "target_offset_css": laser_target.vector(payload["target_offset_css"], 2, -16384, 16384),
-                      "target_side_um": _number(payload["target_side_um"], "target side", 2, 200),
-                      "target_rotation_deg": _number(payload["target_rotation_deg"], "target angle", 0, 90) % 90,
-                      "target_corners_px": corners, "target_calibrated": calibrated}
-        # The centre is only logged, never used to place a camera, so it is bounded
-        # generously: the page can pan the image far outside validate_context's slack.
-        return {"center_px": [_number(value, "View centre", -1e9, 1e9) for value in center],
-                "zoom": _number(payload.get("zoom"), "View scale", 1e-12, 1e6),
-                "rotation": _number(payload.get("rotation", 0), "View rotation", -360000, 360000) % 360,
-                "flip": flip, "locked": locked, "follow_session": session, "follow_seq": seq,
-                "follow_displacement_um": _optional_numbers(payload.get("follow_displacement_um"), 2,
-                                                            "Follow displacement"),
-                "container": _optional_numbers(payload.get("container"), 2, "view size", 0),
-                "window": _optional_numbers(payload.get("window"), 4, "window frame", -1e6, 1e6), **target}
-
-    def _on_mark_record(self, record):
-        # Raw Input: bounded enqueue only, no overlay lock, I/O or browser call.
-        delivery = self._laser_delivery
-        if delivery is not None:
-            lock_epoch = self._epoch
-            prior = self._overlay_view
-            prior_seq = (
-                prior.get("follow_seq")
-                if isinstance(prior, dict) and prior.get("follow_session") == record.get("receiver_id")
-                else None
-            )
-            delivery.enqueue({
-                **record,
-                "observed_at": time.monotonic(),
-                "lock_epoch": lock_epoch,
-                "prior_view_seq": prior_seq,
-                "at": dt.datetime.now().astimezone().isoformat(timespec="milliseconds"),
-            })
-
-    def _prepare_laser_box(self, record):
-        with self._lock:
-            closed = self._closed
-            stage_follow = self._stage_follow
-            locked = self._locked
-            receiver_id = self._stage_follow_receiver_id
-            view = self._overlay_view
-            view_epoch = self._overlay_view_epoch
-            context = copy.deepcopy(self._context)
-            epoch = self._epoch
-            context_epoch = self._context_epoch
-        if closed or stage_follow is None:
-            return None, "follow_stopped"
-        if not self._is_active():
-            return None, "not_active_overlay"
-        if record.get("locked") is not True or not locked:
-            return None, "unlocked"
-        if record.get("receiver_id") != receiver_id:
-            return None, "session_changed"
-        if type(record.get("press")) is not int or record["press"] <= 0:
-            return None, "invalid_press"
-        seq = record.get("follow_seq")
-        if type(seq) is not int:
-            return None, "stale_view"
-        if view is None or view["follow_session"] != record["receiver_id"] or view["follow_seq"] is None:
-            return None, "stale_view"
-        if view["follow_seq"] > seq:
-            return None, "view_moved"
-        if view["follow_seq"] < seq:
-            return None, "stale_view"
-        if record.get("observed_at") is not None and view["at"] > record["observed_at"]:
-            rec_epoch = record.get("lock_epoch")
-            prior_seq = record.get("prior_view_seq")
-            same_lock_catchup = (
-                rec_epoch is not None
-                and view_epoch == rec_epoch
-                and rec_epoch == epoch
-                and (prior_seq is None or prior_seq < seq)
-            )
-            if not same_lock_catchup:
-                return None, "view_after_press"
-        if not view["locked"]:
-            return None, "unlocked"
-        if view.get("target_px") is None or view.get("target_corners_px") is None:
-            return None, "target_unavailable"
-        scope = self._laser_scope(context)
-        with self._lock:
-            self._pending_laser_scope = scope
-            self._pending_laser_epoch = epoch
-            self._pending_laser_context_epoch = context_epoch
-        query = dict(urllib.parse.parse_qsl(context.get("query", "").lstrip("?")))
-        return {**{key: copy.deepcopy(view[key]) for key in TARGET_KEYS},
-                "g": query.get("g", ""),
-                "t": int(query["t"]) if "t" in query else None,
-                "p": int(query["p"]) if "p" in query else None,
-                "z": int(query["z"]) if "z" in query else None,
-                "press": record["press"], "receiver_id": record["receiver_id"], "at": record["at"],
-                "slacs_session": record.get("slacs_session"),
-                "pixel_size_um": context["pixel_size_um"]}, None
-
-    def _deliver_laser_box(self, payload):
-        if self._on_laser_box is None:
-            return False
-        with self._lock:
-            if (self._closed or self._stage_follow is None or not self._locked
-                    or payload.get("receiver_id") != self._stage_follow_receiver_id
-                    or (self._pending_laser_epoch is not None and self._pending_laser_epoch != self._epoch)
-                    or (self._pending_laser_context_epoch is not None
-                        and self._pending_laser_context_epoch != self._context_epoch)
-                    or (self._pending_laser_scope is not None
-                        and self._pending_laser_scope != self._laser_scope(self._context))):
-                return False
-        return self._on_laser_box(payload)
-
-    @staticmethod
-    def _laser_scope(context: dict) -> tuple:
-        query = dict(urllib.parse.parse_qsl(str(context.get("query", "")).lstrip("?")))
-        if context.get("annotation_scope") == "plane":
-            return (context.get("slide_url"), query.get("t", ""), query.get("p", ""), query.get("z", ""), query.get("g", ""))
-        return (context.get("slide_url"), query.get("p", ""), query.get("g", ""))
-
-    def _confirm_laser_box(self, outcome):
-        if self._closed or self._window is None:
-            return False
-        item = outcome.get("item")
-        with self._lock:
-            pending_context_epoch = self._pending_laser_context_epoch
-            pending_scope = self._pending_laser_scope
-            self._pending_laser_epoch = None
-            self._pending_laser_context_epoch = None
-            self._pending_laser_scope = None
-            if (self._closed or self._window is None
-                    or (pending_context_epoch is not None
-                        and pending_context_epoch != self._context_epoch)
-                    or (pending_scope is not None
-                        and pending_scope != self._laser_scope(self._context))):
-                return False
-            if isinstance(item, dict) and isinstance(item.get("id"), str):
-                self._laser_items[item["id"]] = copy.deepcopy(item)
-        script = "window.nd2TranslucentLaserItem?.(" + json.dumps(outcome["item"], allow_nan=False) + "); true"
-        return self._window.evaluate_js(script)
-
-    def report_slacs_laser_box(self, payload):
-        return self._laser_delivery.accept(payload) if self._laser_delivery is not None else {"ok": False}
-
-    def _mark_context(self):
-        """This overlay's state for a SLACS "," or "." record, or None once closed; never raises.
-
-        Runs on the Raw Input thread inside the key follower. Like ``_slacs_pid``
-        it never takes the overlay lock, because ``start_stage_follow`` holds it
-        across the follower's start and stop. References are read one by one and
-        may straddle a concurrent start or stop, which is acceptable for a log
-        record; the receiver and follower snapshots take only their own locks.
-        """
-        try:
-            if self._closed:
-                return None
-            receiver, follower = self._stage_follow, self._stage_follower
-            receiver_id, view = self._stage_follow_receiver_id, self._overlay_view
-            flip_x, flip_y = self._follow_flips
-            context = dict.fromkeys(MARK_CONTEXT_KEYS)
-            context.update(slacs_session=self._stage_follow_session, image_name=self._context.get("image_name"),
-                           source_format=self._source_format, locked=self._locked, flip_x=flip_x, flip_y=flip_y)
-            if view is not None:
-                context.update({key: copy.deepcopy(view.get(key)) for key in TARGET_KEYS})
-                if context["target_px"] is not None:
-                    context["target_px"] = [round(v, 1) + 0.0 for v in context["target_px"]]
-                center_x, center_y = view["center_px"]
-                context.update(image_px=[round(center_x, 1) + 0.0, round(center_y, 1) + 0.0],
-                               view={key: view[key] for key in ("zoom", "rotation", "flip", "container", "window")},
-                               view_age_ms=int(round((time.monotonic() - view["at"]) * 1000)))
-                if receiver_id is not None and view["follow_session"] == receiver_id:
-                    context.update(view_follow_seq=view["follow_seq"],
-                                   view_displacement_um=view["follow_displacement_um"])
-            if receiver is not None:
-                snapshot = receiver.snapshot()
-                context.update(follow_status=snapshot.get("status"), follow_seq=snapshot.get("seq"),
-                               displacement_um=snapshot.get("displacement_um"))
-            else:
-                context["follow_status"] = "lost" if self._stage_follow_lost else "off"
-            if follower is not None:
-                keys = follower.snapshot()
-                context.update({key: keys.get(key) for key in (
-                    "counted", "step_source", "step_um", "roughness_um", "mirror_h", "mirror_v",
-                    "reading_age_ms", "slacs_busy")})
-                context["effective_step_um"] = (keys.get("roughness_um")
-                    if keys.get("step_source") == "slacs" and keys.get("controls_ok") is True
-                    and type(keys.get("roughness_um")) in (int, float) and keys["roughness_um"] > 0
-                    else keys.get("step_um"))
-            return context
-        except Exception as exc:  # noqa: BLE001 - a log record must never break the key observer
-            return {"context_error": type(exc).__name__}
-
-    def stage_follow_state(self):
-        with self._lock:
-            receiver = self._stage_follow
-            follower = self._stage_follower
-            source = self._stage_follow_source
-            if self._closed or receiver is None:
-                if not self._closed and self._stage_follow_lost:
-                    return {"enabled": False, "status": "paused", "message": self._stage_follow_lost}
-                return {"enabled": False, "status": "off", "message": "Stage follow is off."}
-            snapshot = receiver.snapshot()
-            if follower is not None:
-                snapshot = {**snapshot, "keys": follower.snapshot()}
-            status = snapshot.get("status")
-            changed = status != self._stage_follow_status
-            self._stage_follow_status = status
-        if changed:
-            session_log.event("follow_state", source=source, status=status)
-        if self._laser_delivery is not None:
-            snapshot = {**snapshot, "laser_delivery": self._laser_delivery.status}
-        return snapshot
-
-    def stop_stage_follow(self):
-        with self._lock:
-            receiver, self._stage_follow = self._stage_follow, None
-            follower, self._stage_follower = self._stage_follower, None
-            source, self._stage_follow_source = self._stage_follow_source, None
-            self._stage_follow_status = None
-            self._stage_follow_session = None
-            self._stage_follow_receiver_id = None
-            self._stage_follow_lost = ""
-        if self._laser_delivery is not None:
-            self._laser_delivery.view_changed()
-        if follower is not None:
-            follower.stop("stopped")
-        if receiver is not None:
-            receiver.close()
-            session_log.event("follow_stop", source=source)
-        return {"ok": True}
-
-    def log_client_event(self, payload):
-        """Record a rate-limited overlay-page diagnostic in the session log."""
-        with self._lock:
-            if self._closed:
-                return {"ok": False}
-            now = time.monotonic()
-            if (self._client_log_window_start is None
-                    or now - self._client_log_window_start > CLIENT_LOG_WINDOW):
-                self._client_log_window_start = now
-                self._client_log_count = 0
-            if self._client_log_count >= CLIENT_LOG_MAX:
-                return {"ok": True, "rate_limited": True}
-            self._client_log_count += 1
-            slide_url = self._context.get("slide_url")
-            page_url = self._page_url
-        if not isinstance(payload, dict):
-            return {"ok": False}
-        slide_base = slide_url.split("/s/", 1)[0] + "/" if isinstance(slide_url, str) and "/s/" in slide_url else slide_url
-        page_base = page_url.split("/static/", 1)[0] + "/" if isinstance(page_url, str) and "/static/" in page_url else page_url
-
-        def capped(key, limit, *, redact=False):
-            value = payload.get(key)
-            if value is None:
-                return None
-            text = str(value)
-            if redact:
-                text = session_log.redact_capability_urls(text, slide_base, page_base)
-            return text[:limit]
-
-        # "client_kind" rather than "kind": session_log.event's first positional
-        # parameter is itself named "kind", so a "kind" field would collide.
-        session_log.event(
-            "client_error",
-            source=capped("source", CLIENT_LOG_FIELD_LIMIT),
-            client_kind=capped("kind", CLIENT_LOG_FIELD_LIMIT),
-            message=capped("message", CLIENT_LOG_FIELD_LIMIT, redact=True),
-            where=capped("where", CLIENT_LOG_FIELD_LIMIT, redact=True),
-            stack=capped("stack", CLIENT_LOG_STACK_LIMIT, redact=True),
-        )
-        return {"ok": True}
-
-    def save_stage_follow_connection(self):
-        """Export only an explicitly chosen local bridge connection file."""
-        import webview
-
-        with self._lock:
-            receiver = self._stage_follow
-            if self._closed or receiver is None:
-                return {"ok": False, "message": "Enable stage follow first."}
-            descriptor = {**receiver.start(), "version": 1,
-                          "image_name": self._context.get("image_name", "image"),
-                          "dimensions": self._context.get("dimensions"),
-                          "pixel_size_um_yx": self._context.get("pixel_size_um"),
-                          "motion_source": "commanded", "units": "um"}
-        selected = self._window.create_file_dialog(
-            webview.SAVE_DIALOG, save_filename="stage-follow-connection.json",
-            file_types=("Stage follow connection (*.json)",),
-        )
-        if not selected:
-            return {"ok": True, "cancelled": True}
-        target = Path(selected if isinstance(selected, str) else selected[0])
-        temporary = None
-        try:
-            with self._lock:
-                if self._closed or self._stage_follow is not receiver:
-                    return {"ok": False, "message": "The motion connection changed. Save it again."}
-                fd, temporary = tempfile.mkstemp(prefix=".stage-follow-", dir=target.parent)
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    json.dump(descriptor, stream, ensure_ascii=False, indent=2, allow_nan=False)
-                    stream.write("\n")
-                os.replace(temporary, target)
-            return {"ok": True}
-        except (OSError, ValueError) as exc:
-            return {"ok": False, "message": "Could not save the motion connection: " + str(exc)}
-        finally:
-            if temporary is not None:
-                Path(temporary).unlink(missing_ok=True)
+            return {
+                **copy.deepcopy(self._context),
+                "locked": self._locked,
+                "source_format": self._source_format,
+                "follow_flips": {"flip_x": flip_x, "flip_y": flip_y},
+                "laser_target": copy.deepcopy(self._laser_target),
+                "laser_items": copy.deepcopy(list(self._laser_items.values())),
+            }
 
     def choose_roi_file(self):
         """Choose a coordinate-reference JPG and its AstroMapper TXT together."""
@@ -1191,7 +220,8 @@ class TranslucentApi:
         import webview
 
         selected = self._window.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=True,
+            webview.OPEN_DIALOG,
+            allow_multiple=True,
             file_types=("AstroMapper JPG and ROI coordinates (*.jpg;*.jpeg;*.txt)",),
         )
         if not selected:
@@ -1204,10 +234,16 @@ class TranslucentApi:
                 chosen = paths[0]
                 image_needed = chosen.suffix.casefold() == ".txt"
                 companion = self._window.create_file_dialog(
-                    webview.OPEN_DIALOG, allow_multiple=False,
+                    webview.OPEN_DIALOG,
+                    allow_multiple=False,
                     directory=str(chosen.parent),
-                    file_types=(("Matching coordinate reference JPG (*.jpg;*.jpeg)" if image_needed
-                                 else "Matching AstroMapper ROI coordinates (*.txt)"),),
+                    file_types=(
+                        (
+                            "Matching coordinate reference JPG (*.jpg;*.jpeg)"
+                            if image_needed
+                            else "Matching AstroMapper ROI coordinates (*.txt)"
+                        ),
+                    ),
                 )
                 if not companion:
                     return {"ok": False, "cancelled": True}
@@ -1219,32 +255,7 @@ class TranslucentApi:
     @staticmethod
     def _roi_pair_paths(paths, *, require_pair=True):
         """Resolve one explicitly selected pair; never guess among siblings."""
-        if not isinstance(paths, (list, tuple)) or not 1 <= len(paths) <= 2:
-            raise ValueError("Choose one matching JPG and TXT pair.")
-        paths = [Path(path) for path in paths]
-        if any(path.suffix.casefold() not in (".txt", ".jpg", ".jpeg") for path in paths):
-            raise ValueError("Choose a coordinate-reference JPG and AstroMapper TXT.")
-        if len(paths) == 1:
-            chosen = paths[0]
-            suffixes = (".jpg", ".jpeg") if chosen.suffix.casefold() == ".txt" else (".txt",)
-            companions = [path for path in chosen.parent.iterdir()
-                          if path.stem.casefold() == chosen.stem.casefold()
-                          and path.suffix.casefold() in suffixes and path.is_file()]
-            if len(companions) == 1:
-                paths.append(companions[0])
-            elif require_pair:
-                message = ("More than one matching reference file was found. Drop the intended JPG and TXT together."
-                           if companions else "The matching JPG/TXT is missing. Drop both files together.")
-                raise ValueError(message)
-            else:
-                return paths
-        text = [path for path in paths if path.suffix.casefold() == ".txt"]
-        images = [path for path in paths if path.suffix.casefold() in (".jpg", ".jpeg")]
-        if len(text) != 1 or len(images) != 1:
-            raise ValueError("Choose one JPG and one TXT file.")
-        if text[0].stem.casefold() != images[0].stem.casefold():
-            raise ValueError("The reference JPG and TXT must have the same filename before the extension.")
-        return [text[0], images[0]]
+        return roi_pair_paths(paths, require_pair=require_pair)
 
     def _load_roi_files(self, paths):
         """Read the chosen pair for the shared AstroMapper browser importer."""
@@ -1276,12 +287,17 @@ class TranslucentApi:
         self._drop_document = document
 
         def dropped(event):
-            paths = [item.get("pywebviewFullPath") for item in
-                     (event.get("dataTransfer", {}).get("files", []))]
+            paths = [
+                item.get("pywebviewFullPath")
+                for item in (event.get("dataTransfer", {}).get("files", []))
+            ]
             paths = [path for path in paths if isinstance(path, str)]
             result = self._load_roi_files(paths)
-            self._window.evaluate_js("window.nd2TranslucentSetRois?.(" +
-                                     json.dumps(result, allow_nan=False) + "); true")
+            self._window.evaluate_js(
+                "window.nd2TranslucentSetRois?.("
+                + json.dumps(result, allow_nan=False)
+                + "); true"
+            )
 
         document.events.drop += DOMEventHandler(dropped, prevent_default=True)
 
@@ -1298,19 +314,39 @@ class TranslucentApi:
 
             NSOperationQueue.mainQueue().addOperationWithBlock_(guarded)
         elif sys.platform == "win32":
-            from System import Action
-
             native = self._window.native
-            if native.InvokeRequired:
+            if getattr(native, "InvokeRequired", False):
+                from System import Action
+
                 native.BeginInvoke(Action(guarded))
             else:
                 guarded()
         else:
             raise RuntimeError("The translucent viewer requires macOS or Windows")
 
+    def _on_before_show(self, *_args):
+        """Apply ``WS_EX_TOOLWINDOW`` before the WinForms BrowserForm is shown."""
+        if self._closed or sys.platform != "win32":
+            return
+        window = self._window
+        native = getattr(window, "native", None) if window is not None else None
+        if native is None:
+            return
+        try:
+            self._win32_focus.apply_toolwindow(native)
+        except Exception as exc:
+            self._logger(f"translucent before_show style setup failed: {exc!r}")
+
+    def _show_windows_noactivate_if_needed(self, native, *, force_noactivate: bool = False) -> bool:
+        """Show without stealing activation when locked or SLACS is foreground."""
+        if not (force_noactivate or self._locked or self._win32_focus.is_slacs_foreground()):
+            return False
+        return self._win32_focus.show_noactivate(native)
+
     def _configure_and_show(self, *_args):
         if self._load_timer is not None:
             self._load_timer.cancel()
+
         def configure():
             if self._closed or self._configured:
                 return
@@ -1341,7 +377,11 @@ class TranslucentApi:
                 native.TopMost = True
                 native.ShowInTaskbar = False
                 self._round_windows_region()
-                native.Show()
+                self._win32_focus.apply_toolwindow(native)
+                if self._locked:
+                    self._win32_focus.apply_locked(native, self._context["opacity"])
+                if not self._show_windows_noactivate_if_needed(native):
+                    native.Show()
             self._configured = True
 
         try:
@@ -1359,8 +399,12 @@ class TranslucentApi:
         diameter = radius * 2
         width, height = native.ClientSize.Width, native.ClientSize.Height
         path = GraphicsPath()
-        for x, y, angle in ((0, 0, 180), (width - diameter, 0, 270),
-                            (width - diameter, height - diameter, 0), (0, height - diameter, 90)):
+        for x, y, angle in (
+            (0, 0, 180),
+            (width - diameter, 0, 270),
+            (width - diameter, height - diameter, 0),
+            (0, height - diameter, 90),
+        ):
             path.AddArc(x, y, diameter, diameter, angle, 90)
         path.CloseFigure()
         previous = native.Region
@@ -1397,7 +441,9 @@ class TranslucentApi:
             try:
                 with self._lock:
                     if cancelled.is_set() or self._closed or self._locked or epoch != self._epoch:
-                        outcome.update(rejected("Opacity change was cancelled because the window state changed."))
+                        outcome.update(
+                            rejected("Opacity change was cancelled because the window state changed.")
+                        )
                         return
                     native = self._window.native
                     native.Opacity = value
@@ -1426,10 +472,28 @@ class TranslucentApi:
                 return {"ok": False, "locked": self._locked}
             self._locked = locked
             self._epoch += 1
+            epoch = self._epoch
+        if sys.platform == "win32" and not locked:
+            # Stop the hover timer immediately so no tick can race with unlock.
+            self._win32_focus.stop_hover_timer()
 
         def apply():
-            if not self._closed and sys.platform == "darwin":
-                self._window.native.setMovable_(not self._locked)
+            with self._lock:
+                if self._closed or epoch != self._epoch:
+                    return
+                current_locked = self._locked
+                current_opacity = self._context["opacity"]
+            window = self._window
+            native = getattr(window, "native", None) if window is not None else None
+            if native is None:
+                return
+            if sys.platform == "darwin":
+                native.setMovable_(not current_locked)
+            elif sys.platform == "win32":
+                if current_locked:
+                    self._win32_focus.apply_locked(native, current_opacity)
+                else:
+                    self._win32_focus.apply_unlocked(native, current_opacity)
 
         try:
             self._dispatch(apply)
@@ -1437,6 +501,8 @@ class TranslucentApi:
             self._logger(f"translucent lock update failed: {exc!r}")
         if self._on_lock is not None:
             self._on_lock(locked)
+        if locked:
+            self._yield_focus_to_slacs()
         result = {"ok": True, "locked": locked}
         if locked and self._stage_follow is not None:
             result["stage_follow"] = self.stage_follow_state()
@@ -1485,8 +551,10 @@ class TranslucentApi:
 
     def resize_window(self, width, height):
         try:
-            width, height = (int(round(_number(value, "Window size", 1, MAX_SIZE)))
-                             for value in (width, height))
+            width, height = (
+                int(round(_number(value, "Window size", 1, MAX_SIZE)))
+                for value in (width, height)
+            )
         except ValueError:
             return {"ok": False}
         width, height = max(MIN_SIZE[0], width), max(MIN_SIZE[1], height)
@@ -1518,22 +586,20 @@ class TranslucentApi:
             next_context = copy.deepcopy(context)
             incoming_laser = next_context.pop("laser_items", None)
             if incoming_laser is not None:
-                self._laser_items = {
-                    item["id"]: copy.deepcopy(item)
-                    for item in incoming_laser
-                    if isinstance(item, dict) and isinstance(item.get("id"), str)
-                }
+                self._laser_items = normalize_laser_items(incoming_laser)
             elif scope_changed:
                 self._laser_items = {}
             if "source_format" in next_context:
-                new_format = next_context.get("source_format")
-                new_format = new_format if new_format in follow_flips.FORMATS else "other"
+                new_format = normalize_source_format(next_context.get("source_format"))
                 format_changed = new_format != self._source_format
                 self._source_format = new_format
             else:
                 format_changed = False
-            self._context = {**next_context, "opacity": self._context["opacity"],
-                             "opacity_mode": self._context["opacity_mode"]}
+            self._context = {
+                **next_context,
+                "opacity": self._context["opacity"],
+                "opacity_mode": self._context["opacity_mode"],
+            }
             self._overlay_view = None
             self._overlay_view_epoch = None
             self._lock_reported = None
@@ -1544,14 +610,25 @@ class TranslucentApi:
                 was_locked = True
             self._epoch += 1
             self._context_epoch += 1
+            requested_opacity = self._context["opacity"]
         if format_changed:
             self._follow_flips = (False, False)
             if self._flip_store is not None:
                 self._restore_flips()
         if was_locked:
+            if sys.platform == "win32":
+                self._win32_focus.stop_hover_timer()
+
             def unlock():
-                if not self._closed and sys.platform == "darwin" and getattr(self._window, "native", None) is not None:
-                    self._window.native.setMovable_(True)
+                if self._closed:
+                    return
+                native = getattr(self._window, "native", None)
+                if native is None:
+                    return
+                if sys.platform == "darwin":
+                    native.setMovable_(True)
+                elif sys.platform == "win32":
+                    self._win32_focus.apply_unlocked(native, requested_opacity)
 
             try:
                 self._dispatch(unlock)
@@ -1560,6 +637,23 @@ class TranslucentApi:
             if self._on_lock is not None:
                 self._on_lock(False)
         self._window.load_url(self._page_url)
+        if sys.platform == "win32" and (
+            was_locked or self._locked or self._win32_focus.is_slacs_foreground()
+        ):
+            native = getattr(self._window, "native", None)
+            if self._win32_focus.can_control(native):
+                def show_noactivate():
+                    if self._closed:
+                        return
+                    if not self._win32_focus.show_noactivate(native):
+                        self._window.show()
+
+                try:
+                    self._dispatch(show_noactivate)
+                except Exception:
+                    if not self._win32_focus.show_noactivate(native):
+                        self._window.show()
+                return
         self._window.show()
 
     def _initial_load_timeout(self):
@@ -1587,6 +681,7 @@ class TranslucentApi:
             self._pending_laser_epoch = None
             self._pending_laser_context_epoch = None
             self._pending_laser_scope = None
+        self._win32_focus.close()
         if self._laser_delivery is not None:
             self._laser_delivery.close()
         self.stop_stage_follow()
@@ -1612,6 +707,7 @@ class TranslucentApi:
             self._pending_laser_epoch = None
             self._pending_laser_context_epoch = None
             self._pending_laser_scope = None
+        self._win32_focus.close()
         if self._laser_delivery is not None:
             self._laser_delivery.close()
         self.stop_stage_follow()
@@ -1620,18 +716,47 @@ class TranslucentApi:
         self._on_closed(self)
 
 
-def create_translucent_window(context, *, url, title, logger, on_closed, flip_store=None, target_store=None,
-                              on_laser_box=None, is_active=None, on_lock=None):
+def create_translucent_window(
+    context,
+    *,
+    url,
+    title,
+    logger,
+    on_closed,
+    flip_store=None,
+    target_store=None,
+    on_laser_box=None,
+    is_active=None,
+    on_lock=None,
+):
     import webview
 
-    api = TranslucentApi(context, logger=logger, on_closed=on_closed, flip_store=flip_store, target_store=target_store,
-                         on_laser_box=on_laser_box, is_active=is_active, on_lock=on_lock)
+    api = TranslucentApi(
+        context,
+        logger=logger,
+        on_closed=on_closed,
+        flip_store=flip_store,
+        target_store=target_store,
+        on_laser_box=on_laser_box,
+        is_active=is_active,
+        on_lock=on_lock,
+    )
     try:
         window = webview.create_window(
-            title, url=url, js_api=api, width=640, height=480, min_size=MIN_SIZE,
-            frameless=True, easy_drag=False, resizable=False, on_top=True,
-            transparent=sys.platform == "darwin", shadow=False,
-            hidden=True, background_color="#000000",
+            title,
+            url=url,
+            js_api=api,
+            width=640,
+            height=480,
+            min_size=MIN_SIZE,
+            frameless=True,
+            easy_drag=False,
+            resizable=False,
+            on_top=True,
+            transparent=sys.platform == "darwin",
+            shadow=False,
+            hidden=True,
+            background_color="#000000",
         )
         if window is None:
             raise RuntimeError("The overlay window could not be created")
@@ -1642,6 +767,9 @@ def create_translucent_window(context, *, url, title, logger, on_closed, flip_st
     api._window = window
     if sys.platform == "darwin":
         api._drag = _OverlayDrag(api, window, logger=logger)
+    before_show = getattr(getattr(window, "events", None), "before_show", None)
+    if before_show is not None:
+        before_show += api._on_before_show
     window.events.loaded += api._configure_and_show
     window.events.loaded += api._wire_drop
     window.events.closed += api._did_close
@@ -1653,3 +781,55 @@ def create_translucent_window(context, *, url, title, logger, on_closed, flip_st
         api._configure_and_show()
         api._wire_drop()
     return api
+
+
+__all__ = [
+    "CLIENT_LOG_FIELD_LIMIT",
+    "CLIENT_LOG_MAX",
+    "CLIENT_LOG_STACK_LIMIT",
+    "CLIENT_LOG_WINDOW",
+    "DEFAULT_STEP_UM",
+    "GWL_EXSTYLE",
+    "HOVER_POLL_INTERVAL_S",
+    "HOVER_RECT_PADDING_CSS",
+    "HWND_TOPMOST",
+    "LOCKED_CLICKTHROUGH_EXSTYLE",
+    "LOCKED_MAX_OPACITY",
+    "MARK_CONTEXT_KEYS",
+    "MAX_LOCKED_INTERACTIVE_RECTS",
+    "MAX_SIZE",
+    "MAX_STEP_UM",
+    "MIN_OPACITY",
+    "MIN_SIZE",
+    "OPACITY",
+    "OPACITY_TIMEOUT",
+    "SWP_FRAMECHANGED",
+    "SWP_NOACTIVATE",
+    "SWP_NOMOVE",
+    "SWP_NOSIZE",
+    "SWP_NOZORDER",
+    "SWP_SHOWWINDOW",
+    "SW_SHOWNOACTIVATE",
+    "TARGET_KEYS",
+    "VIEW_KEYS",
+    "WS_EX_APPWINDOW",
+    "WS_EX_LAYERED",
+    "WS_EX_NOACTIVATE",
+    "WS_EX_TOOLWINDOW",
+    "WS_EX_TRANSPARENT",
+    "StageFollowMixin",
+    "TranslucentApi",
+    "Win32OverlayFocusController",
+    "create_translucent_window",
+    "laser_scope",
+    "point_in_interactive_rects",
+    "roi_pair_paths",
+    "validate_context",
+    "validate_follow_flips",
+    "validate_laser_item",
+    "validate_laser_target_request",
+    "validate_locked_interactive_rects",
+    "validate_overlay_view",
+    "validate_roi",
+    "validate_stage_follow_options",
+]

@@ -100,6 +100,9 @@ PRUNED_DIRS = {"tests", "__pycache__"}
 SHIPPED_EXTRAS = ("app", "legacy", "nd2export", "sdpc", "svs")
 # The PyInstaller bootloader and runtime hooks are inside the executable.
 SHIPPED_BUILD_TOOLS = ("pyinstaller", "pyinstaller-hooks-contrib")
+# VS 2022 MSVC C/C++ runtime DLLs required on clean Windows 10 machines without
+# the Visual C++ 2015-2022 Redistributable preinstalled.
+REQUIRED_MSVC_CRT_DLLS = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
 
 
 def sdpc_bundle_options() -> tuple[Path, list[str]]:
@@ -387,6 +390,38 @@ def check_assembly_locations(internal: Path) -> None:
         raise RuntimeError(f".NET assemblies outside {ASSEMBLY_DIRS} would keep a download mark: {stray}")
 
 
+def verify_msvc_crt_dlls(bundle: Path) -> dict[str, str]:
+    """Verify VS 2022 MSVC CRT runtime DLLs are present in the packaged Windows dist bundle.
+
+    Clean Windows 10 machines without the Visual C++ 2015-2022 Redistributable fail
+    at startup if ``vcruntime140.dll``, ``vcruntime140_1.dll``, or ``msvcp140.dll``
+    is missing from the bundle's DLL search path.
+    """
+    internal = bundle / "_internal"
+    if not internal.is_dir():
+        raise RuntimeError(f"The PyInstaller bundle has no _internal folder: {bundle}")
+    found: dict[str, Path] = {}
+    for directory in (internal, bundle):
+        for entry in directory.iterdir():
+            if entry.is_file():
+                lowered = entry.name.lower()
+                if lowered in REQUIRED_MSVC_CRT_DLLS and lowered not in found:
+                    found[lowered] = entry
+    missing = [name for name in REQUIRED_MSVC_CRT_DLLS if name not in found]
+    if missing:
+        raise RuntimeError(
+            "Packaged Windows bundle is missing required VS 2022 MSVC CRT runtime DLL(s): "
+            + ", ".join(missing)
+            + ". Ensure PyInstaller bundles these DLLs into _internal/ so clean Windows 10 PCs can launch."
+        )
+    for name in REQUIRED_MSVC_CRT_DLLS:
+        dll = found[name]
+        machine = pe_machine(dll)
+        if machine != PE_MACHINE_AMD64:
+            raise RuntimeError(f"{dll} is not an x64 (AMD64) DLL: PE machine 0x{machine:04x}")
+    return {name: found[name].relative_to(bundle).as_posix() for name in REQUIRED_MSVC_CRT_DLLS}
+
+
 def shipped_distributions() -> set[str]:
     """Canonical names of the app's runtime dependency closure in this environment."""
     from packaging.requirements import Requirement
@@ -607,6 +642,8 @@ def main() -> int:
     internal = bundle / "_internal"
     print(f"Pruned {prune_bundle(internal)} test and cache files")
     check_assembly_locations(internal)
+    msvc_crt = verify_msvc_crt_dlls(bundle)
+    print(f"Verified VS 2022 MSVC CRT DLLs: {', '.join(sorted(msvc_crt.values()))}")
     pyz = open_windows_archive(exe)
     verify_bundled_source(pyz.toc, pyz.extract, internal)
     about = internal / ABOUT

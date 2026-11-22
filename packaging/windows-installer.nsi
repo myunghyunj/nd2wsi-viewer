@@ -737,22 +737,38 @@ FunctionEnd
 
 Function ${PREFIX}FindRunningApp
   ; The default Unicode NSIS stub is x86. PROCESSENTRY32W is 556 bytes,
-  ; with szExeFile at byte 36. A process snapshot includes x64/ARM64 apps.
+  ; with th32ProcessID at byte 8 and szExeFile at byte 36. A process snapshot
+  ; includes x64/ARM64 apps. Scope matching to $INSTDIR\${APP_EXE} via
+  ; OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + QueryFullProcessImageNameW
+  ; so public and SLACS installations do not collide, failing safe as running
+  ; when a matching executable's image path cannot be queried.
   ; Return ProcessState: 0 absent, 1 present, 2 inspection failed.
+  Push $R0
+  Push $5
+  Push $6
+  Push $7
+  Push $8
+  Push $9
   StrCpy $ProcessState 2
   StrCpy $ProcessCheckedCount 0
+  StrCpy $R0 ""
+  ${If} $INSTDIR != ""
+    Push "$INSTDIR\${APP_EXE}"
+    Call ${PREFIX}NormalizePath
+    Pop $R0
+  ${EndIf}
   System::Call 'kernel32::CreateToolhelp32Snapshot(i 2, i 0)p.r0 ?e'
   Pop $ProcessInspectError
   !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.snapshot handle=$0 win32_error=$ProcessInspectError"
   ${If} $0 == -1
-    Return
+    Goto find_done
   ${EndIf}
   System::Alloc 556
   Pop $1
   ${If} $1 == 0
     !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.allocate_failed bytes=556"
     System::Call 'kernel32::CloseHandle(p r0)'
-    Return
+    Goto find_done
   ${EndIf}
   System::Call '*$1(i 556)'
   System::Call 'kernel32::Process32FirstW(p r0, p r1)i.r2 ?e'
@@ -762,11 +778,45 @@ Function ${PREFIX}FindRunningApp
     StrCpy $ProcessState 0
     ${Do}
       IntOp $ProcessCheckedCount $ProcessCheckedCount + 1
-      System::Call '*$1(i, i, i, p, i, i, i, i, i, &w260.r3)'
+      System::Call '*$1(i, i, i.r5, p, i, i, i, i, i, &w260.r3)'
       ${If} $3 == "${APP_EXE}"
-        StrCpy $ProcessState 1
-        !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.match name=$3"
-        ${ExitDo}
+        ${If} $R0 == ""
+          StrCpy $ProcessState 1
+          !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.match_unscoped pid=$5 name=$3"
+          ${ExitDo}
+        ${EndIf}
+        System::Call 'kernel32::OpenProcess(i 0x1000, i 0, i r5)p.r6 ?e'
+        Pop $7
+        ${If} $6 == 0
+          ${If} $7 != 87
+            StrCpy $ProcessState 1
+            !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.match_fallback_open pid=$5 win32_error=$7"
+            ${ExitDo}
+          ${EndIf}
+        ${Else}
+          StrCpy $8 ${NSIS_MAX_STRLEN}
+          System::Call 'kernel32::QueryFullProcessImageNameW(p r6, i 0, w .r7, *i r8r8)i.r9'
+          System::Call 'kernel32::CloseHandle(p r6)'
+          ${If} $9 == 0
+          ${OrIf} $7 == ""
+            StrCpy $ProcessState 1
+            !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.match_fallback_query pid=$5"
+            ${ExitDo}
+          ${EndIf}
+          Push "$7"
+          Call ${PREFIX}NormalizePath
+          Pop $8
+          ${If} $8 != ""
+            StrCpy $7 $8
+          ${EndIf}
+          ${If} $7 == $R0
+            StrCpy $ProcessState 1
+            !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.match pid=$5 path=$7"
+            ${ExitDo}
+          ${Else}
+            !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.other_install pid=$5 path=$7 expected=$R0"
+          ${EndIf}
+        ${EndIf}
       ${EndIf}
       System::Call 'kernel32::Process32NextW(p r0, p r1)i.r2 ?e'
       Pop $4
@@ -781,7 +831,14 @@ Function ${PREFIX}FindRunningApp
   ${EndIf}
   System::Free $1
   System::Call 'kernel32::CloseHandle(p r0)'
+  find_done:
   !insertmacro ND2WSI_TRACE "${PREFIX}" "FindRunningApp.complete state=$ProcessState checked=$ProcessCheckedCount"
+  Pop $9
+  Pop $8
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $R0
 FunctionEnd
 
 Function ${PREFIX}RequireAppClosed
@@ -792,11 +849,11 @@ Function ${PREFIX}RequireAppClosed
     Return
   ${EndIf}
   ${If} $ProcessState == 1
-    !insertmacro ND2WSI_TRACE "${PREFIX}" "MessageBox phase=${PREFIX}RequireAppClosed message=nd2wsi-viewer is running. Save your work and close every nd2wsi-viewer window, then choose Retry."
-    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "nd2wsi-viewer is running. Save your work and close every nd2wsi-viewer window, then choose Retry." /SD IDCANCEL IDRETRY retry
+    !insertmacro ND2WSI_TRACE "${PREFIX}" "MessageBox phase=${PREFIX}RequireAppClosed message=${APP_DISPLAY_NAME} is running. Save your work and close every ${APP_DISPLAY_NAME} window, then choose Retry."
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "${APP_DISPLAY_NAME} is running. Save your work and close every ${APP_DISPLAY_NAME} window, then choose Retry." /SD IDCANCEL IDRETRY retry
   ${Else}
-    !insertmacro ND2WSI_TRACE "${PREFIX}" "MessageBox phase=${PREFIX}RequireAppClosed message=Setup could not check whether nd2wsi-viewer is running. Close the app, then choose Retry."
-    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Setup could not check whether nd2wsi-viewer is running. Close the app, then choose Retry." /SD IDCANCEL IDRETRY retry
+    !insertmacro ND2WSI_TRACE "${PREFIX}" "MessageBox phase=${PREFIX}RequireAppClosed message=Setup could not check whether ${APP_DISPLAY_NAME} is running. Close the app, then choose Retry."
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Setup could not check whether ${APP_DISPLAY_NAME} is running. Close the app, then choose Retry." /SD IDCANCEL IDRETRY retry
   ${EndIf}
   SetErrorLevel 2
   !insertmacro ND2WSI_TRACE "${PREFIX}" "Abort phase=${PREFIX}RequireAppClosed guard=$GuardError"
@@ -954,16 +1011,16 @@ Function ${PREFIX}CheckOwnedDirectory
       ${AndIf} ${FileExists} "$INSTDIR\Uninstall.exe"
         StrCpy $ExistingUpgrade 1
       ${Else}
-        StrCpy $GuardError "This folder is not a registered nd2wsi-viewer ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
+        StrCpy $GuardError "This folder is not a registered ${APP_DISPLAY_NAME} ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
       ${EndIf}
     ${Else}
-      StrCpy $GuardError "This folder is not a registered nd2wsi-viewer ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
+      StrCpy $GuardError "This folder is not a registered ${APP_DISPLAY_NAME} ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
     ${EndIf}
   !else
     ${If} $0 != "${PRODUCT_ID}"
     ${OrIf} $1 != "${APP_VERSION}"
     ${OrIf} $2 != $INSTDIR
-      StrCpy $GuardError "This folder is not a registered nd2wsi-viewer ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
+      StrCpy $GuardError "This folder is not a registered ${APP_DISPLAY_NAME} ${APP_VERSION} installation. Choose a new, empty folder, or the folder used by this version of Setup."
     ${EndIf}
   !endif
   !insertmacro ND2WSI_TRACE "${PREFIX}" "CheckOwnedDirectory.complete marker_product=$0 marker_version=$1 registered_path=$2 instdir=$INSTDIR guard=$GuardError"
@@ -987,16 +1044,16 @@ Function .onInit
     StrCpy $INSTDIR "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
   ${EndIf}
   ${IfNot} ${AtLeastWin10}
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=nd2wsi-viewer requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11."
-    MessageBox MB_OK|MB_ICONSTOP "nd2wsi-viewer requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11." /SD IDOK
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=${APP_DISPLAY_NAME} requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11."
+    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "" "Abort phase=.onInit guard=$GuardError"
     Abort
   ${EndIf}
   ${IfNot} ${AtLeastWin11}
   ${AndIfNot} ${AtLeastBuild} 16299
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=nd2wsi-viewer requires Windows 10 version 1709 (build 16299) or later for Microsoft WebView2. Update Windows before running Setup. Windows 10 Education version 22H2 is recommended."
-    MessageBox MB_OK|MB_ICONSTOP "nd2wsi-viewer requires Windows 10 version 1709 (build 16299) or later for Microsoft WebView2. Update Windows before running Setup. Windows 10 Education version 22H2 is recommended." /SD IDOK
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=${APP_DISPLAY_NAME} requires Windows 10 version 1709 (build 16299) or later for Microsoft WebView2. Update Windows before running Setup. Windows 10 Education version 22H2 is recommended."
+    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires Windows 10 version 1709 (build 16299) or later for Microsoft WebView2. Update Windows before running Setup. Windows 10 Education version 22H2 is recommended." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "" "Abort phase=.onInit guard=$GuardError"
     Abort
@@ -1005,8 +1062,8 @@ Function .onInit
   !insertmacro ND2WSI_TRACE "" ".onInit.installation_type value=$0"
   ${If} $0 == "Server Core"
   ${OrIf} $0 == "Nano Server"
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=nd2wsi-viewer requires a Windows desktop shell (Windows 10/11 or Windows Server with Desktop Experience). Headless Server Core editions are not supported."
-    MessageBox MB_OK|MB_ICONSTOP "nd2wsi-viewer requires a Windows desktop shell (Windows 10/11 or Windows Server with Desktop Experience). Headless Server Core editions are not supported." /SD IDOK
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=${APP_DISPLAY_NAME} requires a Windows desktop shell (Windows 10/11 or Windows Server with Desktop Experience). Headless Server Core editions are not supported."
+    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires a Windows desktop shell (Windows 10/11 or Windows Server with Desktop Experience). Headless Server Core editions are not supported." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "" "Abort phase=.onInit guard=$GuardError"
     Abort
@@ -1058,8 +1115,8 @@ Function RequireDotNetFramework
   !insertmacro ND2WSI_TRACE "" "RequireDotNetFramework.view32 release=$0"
   SetRegView 64
   ${If} $0 < 394802
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=RequireDotNetFramework message=nd2wsi-viewer requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.8 or update Windows, then run Setup again. Windows 10 version 22H2 already includes .NET Framework 4.8."
-    MessageBox MB_OK|MB_ICONSTOP "nd2wsi-viewer requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.8 or update Windows, then run Setup again. Windows 10 version 22H2 already includes .NET Framework 4.8." /SD IDOK
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=RequireDotNetFramework message=${APP_DISPLAY_NAME} requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.8 or update Windows, then run Setup again. Windows 10 version 22H2 already includes .NET Framework 4.8."
+    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.8 or update Windows, then run Setup again. Windows 10 version 22H2 already includes .NET Framework 4.8." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "" "Abort phase=RequireDotNetFramework guard=$GuardError"
     Abort
@@ -1083,7 +1140,7 @@ Function CheckInstallDirectory
   ; second one. Uninstall it first; the user's data is retained.
   ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallLocation"
   ${If} $0 != ""
-    StrCpy $GuardError "nd2wsi-viewer is already registered in:$\r$\n$0$\r$\n$\r$\nChoose that folder to reinstall or upgrade, or uninstall the existing app first."
+    StrCpy $GuardError "${APP_DISPLAY_NAME} is already registered in:$\r$\n$0$\r$\n$\r$\nChoose that folder to reinstall or upgrade, or uninstall the existing app first."
     Return
   ${EndIf}
   ${GetRoot} "$INSTDIR" $0
@@ -1136,8 +1193,8 @@ Function VerifyDirectoryPage
   GetInstDirError $0
   !insertmacro ND2WSI_TRACE "" "VerifyDirectoryPage.instdir_error code=$0 instdir=$INSTDIR"
   ${If} $0 == 1
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=VerifyDirectoryPage message=Choose a valid local installation folder (for example, $LOCALAPPDATA\Programs\nd2wsi-viewer). A drive root or malformed path cannot be used."
-    MessageBox MB_OK|MB_ICONEXCLAMATION "Choose a valid local installation folder (for example, $LOCALAPPDATA\Programs\nd2wsi-viewer). A drive root or malformed path cannot be used." /SD IDOK
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=VerifyDirectoryPage message=Choose a valid local installation folder (for example, $LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}). A drive root or malformed path cannot be used."
+    MessageBox MB_OK|MB_ICONEXCLAMATION "Choose a valid local installation folder (for example, $LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}). A drive root or malformed path cannot be used." /SD IDOK
     Abort
   ${EndIf}
   ${If} $0 == 2
@@ -1174,7 +1231,7 @@ Function VerifyDirectoryPage
         IntOp $R4 ${PAYLOAD_SIZE_KIB} + 1023
         IntOp $R4 $R4 / 1024
         !insertmacro ND2WSI_TRACE "" "VerifyDirectoryPage.low_disk_space free_kib=$R3 required_kib=${PAYLOAD_SIZE_KIB} root=$R0"
-        MessageBox MB_OK|MB_ICONEXCLAMATION "There is not enough free disk space on $R0 to install nd2wsi-viewer.$\r$\n$\r$\nRequired: $R4 MB$\r$\nAvailable: $R1 MB$\r$\n$\r$\nFree up space or choose another folder." /SD IDOK
+        MessageBox MB_OK|MB_ICONEXCLAMATION "There is not enough free disk space on $R0 to install ${APP_DISPLAY_NAME}.$\r$\n$\r$\nRequired: $R4 MB$\r$\nAvailable: $R1 MB$\r$\n$\r$\nFree up space or choose another folder." /SD IDOK
         Pop $R4
         Pop $R3
         Pop $R2
@@ -1239,8 +1296,8 @@ Function EnsureWebView2
     Return
   !else
     IfSilent install_runtime
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=EnsureWebView2 message=nd2wsi-viewer needs Microsoft Edge WebView2 Runtime. Choose OK to download and install it from Microsoft. An Internet connection is required."
-    MessageBox MB_OKCANCEL|MB_ICONINFORMATION "nd2wsi-viewer needs Microsoft Edge WebView2 Runtime. Choose OK to download and install it from Microsoft. An Internet connection is required." IDCANCEL cancelled
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=EnsureWebView2 message=${APP_DISPLAY_NAME} needs Microsoft Edge WebView2 Runtime. Choose OK to download and install it from Microsoft. An Internet connection is required."
+    MessageBox MB_OKCANCEL|MB_ICONINFORMATION "${APP_DISPLAY_NAME} needs Microsoft Edge WebView2 Runtime. Choose OK to download and install it from Microsoft. An Internet connection is required." IDCANCEL cancelled
     install_runtime:
     InitPluginsDir
     SetOutPath "$PLUGINSDIR"
@@ -1517,6 +1574,311 @@ Function WriteFileAssociations
   !insertmacro ND2WSI_TRACE "" "WriteFileAssociations.complete"
 FunctionEnd
 
+!ifdef BUNDLED_WEBVIEW2
+Function GrantSidRxOnPath
+  ; Grant GENERIC_READ|GENERIC_EXECUTE to a well-known SID in-process via advapi32
+  ; (no icacls.exe subprocess; safe under AppLocker/SRP). Non-fatal; preserves all registers.
+  ; Stack in: path, sid_string, inherit_flags (top).
+  Exch $R2 ; inherit_flags
+  Exch
+  Exch $R1 ; sid_string
+  Exch 2
+  Exch $R0 ; path
+  Push $R3
+  Push $R4
+  Push $R5
+  Push $R6
+  Push $R7
+  Push $R8
+  StrCpy $R3 0 ; psid
+  StrCpy $R4 0 ; old_dacl
+  StrCpy $R5 0 ; security_descriptor
+  StrCpy $R6 0 ; win32 status / bool
+  StrCpy $R7 0 ; EXPLICIT_ACCESS_W buffer
+  StrCpy $R8 0 ; new_dacl
+  System::Call 'advapi32::ConvertStringSidToSidW(w R1, *p.R3)i.R6'
+  ${If} $R6 != 0
+  ${AndIf} $R3 != 0
+    System::Call 'advapi32::GetNamedSecurityInfoW(w R0, i 1, i 4, p 0, p 0, *p.R4, p 0, *p.R5)i.R6'
+    ${If} $R6 == 0
+      ; x86 EXPLICIT_ACCESS_W (32 bytes): GENERIC_READ|GENERIC_EXECUTE (0xA0000000),
+      ; GRANT_ACCESS (1), grfInheritance ($R2), TRUSTEE_W (NULL, 0, TRUSTEE_IS_SID=0,
+      ; TRUSTEE_IS_WELL_KNOWN_GROUP=5, psid=$R3).
+      System::Call '*(i 0xA0000000, i 1, i R2, p 0, i 0, i 0, i 5, p R3)p.R7'
+      ${If} $R7 != 0
+        System::Call 'advapi32::SetEntriesInAclW(i 1, p R7, p R4, *p.R8)i.R6'
+        System::Free $R7
+        ${If} $R6 == 0
+        ${AndIf} $R8 != 0
+          System::Call 'advapi32::SetNamedSecurityInfoW(w R0, i 1, i 4, p 0, p 0, p R8, p 0)i.R6'
+          System::Call 'kernel32::LocalFree(p R8)'
+        ${EndIf}
+      ${EndIf}
+      ${If} $R5 != 0
+        System::Call 'kernel32::LocalFree(p R5)'
+      ${EndIf}
+    ${EndIf}
+    System::Call 'kernel32::LocalFree(p R3)'
+  ${EndIf}
+  !insertmacro ND2WSI_TRACE "" "GrantSidRxOnPath path=$R0 sid=$R1 inherit=$R2 status=$R6"
+  Pop $R8
+  Pop $R7
+  Pop $R6
+  Pop $R5
+  Pop $R4
+  Pop $R3
+  Pop $R0
+  Pop $R2
+  Pop $R1
+FunctionEnd
+
+Function GrantBundledWebView2Acl
+  ; Windows 10 (< Win11 build 22000) requires AppContainer groups to have read+execute
+  ; access on the bundled Fixed Version WebView2 folder and msedgewebview2.exe.
+  ${If} ${AtLeastWin11}
+    !insertmacro ND2WSI_TRACE "" "GrantBundledWebView2Acl.skipped_win11"
+    Return
+  ${EndIf}
+  ${If} ${FileExists} "$INSTDIR\_internal\webview2-runtime\msedgewebview2.exe"
+    DetailPrint "Configuring Windows 10 AppContainer permissions for bundled WebView2..."
+    Push "$INSTDIR\_internal\webview2-runtime"
+    Push "S-1-15-2-1"
+    Push 3 ; OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    Call GrantSidRxOnPath
+    Push "$INSTDIR\_internal\webview2-runtime"
+    Push "S-1-15-2-2"
+    Push 3
+    Call GrantSidRxOnPath
+    Push "$INSTDIR\_internal\webview2-runtime\msedgewebview2.exe"
+    Push "S-1-15-2-1"
+    Push 0
+    Call GrantSidRxOnPath
+    Push "$INSTDIR\_internal\webview2-runtime\msedgewebview2.exe"
+    Push "S-1-15-2-2"
+    Push 0
+    Call GrantSidRxOnPath
+  ${EndIf}
+FunctionEnd
+!endif
+
+!ifdef SLACS_EDITION
+!define LEGACY_SLACS_UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\nd2wsi-viewer"
+!define LEGACY_SLACS_DIR "$LOCALAPPDATA\Programs\nd2wsi-viewer"
+
+Function StrContains
+  ; Stack in: haystack, needle (top). Stack out: "1" if found, else "0".
+  Exch $R1 ; needle
+  Exch
+  Exch $R0 ; haystack
+  Push $R2
+  Push $R3
+  Push $R4
+  Push $R5
+  Push $R6
+  StrLen $R2 $R0
+  StrLen $R3 $R1
+  StrCpy $R4 0
+  StrCpy $R5 "0"
+  ${If} $R3 == 0
+    StrCpy $R5 "1"
+  ${ElseIf} $R2 >= $R3
+    IntOp $R2 $R2 - $R3
+    ${DoWhile} $R4 <= $R2
+      StrCpy $R6 $R0 $R3 $R4
+      ${If} $R6 == $R1
+        StrCpy $R5 "1"
+        ${ExitDo}
+      ${EndIf}
+      IntOp $R4 $R4 + 1
+    ${Loop}
+  ${EndIf}
+  StrCpy $R0 $R5
+  Pop $R6
+  Pop $R5
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Exch $R0
+  Exch
+  Pop $R1
+FunctionEnd
+
+Function FileContainsSlacsEdition
+  ; Safely inspect a non-symlink regular JSON file for `"edition": "SLACS-module"`.
+  ; Stack in: path. Stack out: "1" if verified SLACS edition, else "0".
+  Exch $R0 ; path
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  Push $R5
+  Push $GuardError
+  StrCpy $R5 "0"
+  StrCpy $GuardError ""
+  System::Call 'kernel32::GetFileAttributesW(w R0)i.R1'
+  ${If} $R1 != -1
+    IntOp $R2 $R1 & 0x10 ; FILE_ATTRIBUTE_DIRECTORY
+    ${If} $R2 == 0
+      IntOp $R2 $R1 & 0x400 ; FILE_ATTRIBUTE_REPARSE_POINT
+      ${If} $R2 != 0
+        Push "$R0"
+        Call IsNameSurrogateReparse
+        Pop $R2
+      ${EndIf}
+      ${If} $R2 == 0
+        Push "$R0"
+        Call CheckPathChain
+        ${If} $GuardError == ""
+          ClearErrors
+          FileOpen $R1 "$R0" r
+          ${IfNot} ${Errors}
+            StrCpy $R3 0
+            ${DoWhile} $R3 < 64
+              ClearErrors
+              FileRead $R1 $R2
+              ${If} ${Errors}
+              ${OrIf} $R2 == ""
+                ${ExitDo}
+              ${EndIf}
+              Push "$R2"
+              Push '"edition": "SLACS-module"'
+              Call StrContains
+              Pop $R4
+              ${If} $R4 == "1"
+                StrCpy $R5 "1"
+                ${ExitDo}
+              ${EndIf}
+              Push "$R2"
+              Push '"edition":"SLACS-module"'
+              Call StrContains
+              Pop $R4
+              ${If} $R4 == "1"
+                StrCpy $R5 "1"
+                ${ExitDo}
+              ${EndIf}
+              IntOp $R3 $R3 + 1
+            ${Loop}
+            FileClose $R1
+          ${EndIf}
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ClearErrors
+  Pop $GuardError
+  StrCpy $R0 $R5
+  Pop $R5
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Exch $R0
+FunctionEnd
+
+Function MigrateLegacySlacsInstall
+  ; Cleanly migrate legacy 2.6.5-SLACS / 2.6.6-SLACS installs that shared
+  ; $LOCALAPPDATA\Programs\nd2wsi-viewer before SLACS isolation in 2.6.7.
+  ; NEVER touches a real public nd2wsi-viewer installation: migration runs ONLY
+  ; when a non-symlink build-info.json explicitly contains "edition": "SLACS-module".
+  Push $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  Push $GuardError
+  StrCpy $GuardError ""
+  Push "${LEGACY_SLACS_DIR}"
+  Call NormalizePath
+  Pop $R0
+  ${If} $R0 == ""
+  ${OrIf} $R0 == $INSTDIR
+    !insertmacro ND2WSI_TRACE "" "MigrateLegacySlacsInstall.skip_same_or_empty legacy=$R0 instdir=$INSTDIR"
+    Goto migrate_done
+  ${EndIf}
+  System::Call 'kernel32::GetFileAttributesW(w R0)i.R1'
+  ${If} $R1 == -1
+    !insertmacro ND2WSI_TRACE "" "MigrateLegacySlacsInstall.absent dir=$R0"
+    Goto migrate_done
+  ${EndIf}
+  IntOp $R2 $R1 & 0x10
+  ${If} $R2 == 0
+    Goto migrate_done
+  ${EndIf}
+  Push "$R0"
+  Call CheckPathChain
+  ${If} $GuardError != ""
+    !insertmacro ND2WSI_TRACE "" "MigrateLegacySlacsInstall.unsafe_path dir=$R0 guard=$GuardError"
+    Goto migrate_done
+  ${EndIf}
+  ; Check both _internal\nd2wsi-viewer-about\build-info.json and root build-info.json.
+  StrCpy $R1 "$R0\_internal\nd2wsi-viewer-about\build-info.json"
+  Push "$R1"
+  Call FileContainsSlacsEdition
+  Pop $R2
+  ${If} $R2 != "1"
+    StrCpy $R1 "$R0\build-info.json"
+    Push "$R1"
+    Call FileContainsSlacsEdition
+    Pop $R2
+  ${EndIf}
+  ${If} $R2 != "1"
+    !insertmacro ND2WSI_TRACE "" "MigrateLegacySlacsInstall.preserved_non_slacs dir=$R0"
+    Goto migrate_done
+  ${EndIf}
+  !insertmacro ND2WSI_TRACE "" "MigrateLegacySlacsInstall.verified_slacs dir=$R0 info=$R1"
+  DetailPrint "Migrating legacy ${APP_DISPLAY_NAME} installation from $R0..."
+  StrCpy $R3 "$R0\Uninstall.exe"
+  System::Call 'kernel32::GetFileAttributesW(w R3)i.R1'
+  ${If} $R1 != -1
+    IntOp $R2 $R1 & 0x10
+    ${If} $R2 == 0
+      StrCpy $GuardError ""
+      Push "$R3"
+      Call CheckPathChain
+      ${If} $GuardError == ""
+        InitPluginsDir
+        ClearErrors
+        CopyFiles /SILENT "$R3" "$PLUGINSDIR\legacy-slacs-uninstall.exe"
+        ${IfNot} ${Errors}
+          ClearErrors
+          ExecWait '"$PLUGINSDIR\legacy-slacs-uninstall.exe" /S _?=$R0' $R4
+          ${If} ${Errors}
+            StrCpy $R4 2
+          ${EndIf}
+          Delete "$PLUGINSDIR\legacy-slacs-uninstall.exe"
+          !insertmacro ND2WSI_TRACE "" "MigrateLegacySlacsInstall.uninstall_complete dir=$R0 exit=$R4"
+        ${Else}
+          !insertmacro ND2WSI_TRACE "" "MigrateLegacySlacsInstall.copy_uninstaller_failed dir=$R0"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ; Clean up stale legacy SLACS uninstall entry ONLY when bound to this verified
+  ; legacy SLACS folder and its Uninstall.exe is no longer present.
+  SetRegView 64
+  ReadRegStr $R4 HKCU "${LEGACY_SLACS_UNINSTALL_KEY}" "InstallLocation"
+  ${If} $R4 != ""
+    Push "$R4"
+    Call NormalizePath
+    Pop $R4
+    ${If} $R4 == $R0
+    ${AndIfNot} ${FileExists} "$R0\Uninstall.exe"
+      ClearErrors
+      DeleteRegKey HKCU "${LEGACY_SLACS_UNINSTALL_KEY}"
+      !insertmacro ND2WSI_TRACE "" "MigrateLegacySlacsInstall.cleaned_stale_reg key=${LEGACY_SLACS_UNINSTALL_KEY} dir=$R0"
+    ${EndIf}
+  ${EndIf}
+  ClearErrors
+  migrate_done:
+  Pop $GuardError
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+FunctionEnd
+!endif
+
 Section "${APP_DISPLAY_NAME} (required)" SecApplication
   SectionIn RO
   !insertmacro ND2WSI_TRACE "" "SecApplication.begin instdir=$INSTDIR"
@@ -1634,6 +1996,12 @@ Section "${APP_DISPLAY_NAME} (required)" SecApplication
   !insertmacro ND2WSI_TRACE "" "SecApplication.payload.before"
   !include "${PAYLOAD_INSTALL_INCLUDE}"
   !insertmacro ND2WSI_TRACE "" "SecApplication.payload.after"
+  !ifdef BUNDLED_WEBVIEW2
+    Call GrantBundledWebView2Acl
+  !endif
+  !ifdef SLACS_EDITION
+    Call MigrateLegacySlacsInstall
+  !endif
   SetOutPath "$INSTDIR"
   CreateDirectory "$SMPROGRAMS\${SHORTCUT_DIR}"
   CreateShortcut "$SMPROGRAMS\${SHORTCUT_DIR}\${SHORTCUT_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
@@ -1727,7 +2095,7 @@ Function un.CheckUninstallDirectory
   ${If} $GuardError != ""
     Return
   ${EndIf}
-  StrCpy $GuardError "This folder is not a registered nd2wsi-viewer ${APP_VERSION} installation or a recoverable interrupted uninstall. No app files have been removed."
+  StrCpy $GuardError "This folder is not a registered ${APP_DISPLAY_NAME} ${APP_VERSION} installation or a recoverable interrupted uninstall. No app files have been removed."
   ${GetRoot} "$INSTDIR" $0
   ${If} $INSTDIR == $0
   ${OrIf} $INSTDIR == "$0\"

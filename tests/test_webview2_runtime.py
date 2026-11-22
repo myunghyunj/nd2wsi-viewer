@@ -549,7 +549,7 @@ def test_the_grant_is_not_needed_off_windows_or_without_a_windows_version(monkey
     assert rt.needs_appcontainer_grant() is False
 
 
-def _grant_harness(*, before=False, after=True, returncode=0, stdout="", stderr="", raises=None):
+def _grant_harness(*, before=False, after=True, raises=None):
     states = iter([before, after])
     calls = []
 
@@ -560,60 +560,53 @@ def _grant_harness(*, before=False, after=True, returncode=0, stdout="", stderr=
         # True/False read as appcontainer_state's "allowed"/"missing".
         return {True: "allowed", False: "missing"}.get(state, state)
 
-    def run(command, **kwargs):
-        calls.append((command, kwargs))
+    def grant(path, *, inherit=True):
+        calls.append((path, inherit))
         if raises:
             raise raises
-        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
-    return check, run, calls
+    return check, grant, calls
 
 
 def test_windows_11_skips_the_grant_without_touching_the_folder(tmp_path):
-    check, run, calls = _grant_harness()
-    assert rt.ensure_appcontainer_access(tmp_path, build=26100, check=check, run=run) == "not-needed"
+    check, grant, calls = _grant_harness()
+    assert rt.ensure_appcontainer_access(tmp_path, build=26100, check=check, grant=grant) == "not-needed"
     assert calls == []
 
 
 def test_an_existing_grant_is_left_alone(tmp_path):
-    check, run, calls = _grant_harness(before=True)
-    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, run=run) == "present"
+    check, grant, calls = _grant_harness(before=True)
+    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, grant=grant) == "present"
     assert calls == []
 
 
-def test_windows_10_grants_inheritable_read_execute_to_both_appcontainer_groups(tmp_path, monkeypatch):
-    monkeypatch.setenv("SystemRoot", "C:\\Windows")
-    check, run, calls = _grant_harness()
-    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, run=run) == "granted"
-    [(command, kwargs)] = calls
-    # The system icacls, never one found on PATH.
-    assert command == [os.path.join("C:\\Windows", "System32", "icacls.exe"), str(tmp_path), "/grant",
-                       "*S-1-15-2-1:(OI)(CI)(RX)", "*S-1-15-2-2:(OI)(CI)(RX)", "/Q"]
-    assert kwargs["stdin"] is subprocess.DEVNULL and kwargs["capture_output"] and kwargs["timeout"] == 120
+def test_windows_10_grants_inheritable_read_execute_to_both_appcontainer_groups(tmp_path):
+    check, grant, calls = _grant_harness()
+    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, grant=grant) == "granted"
+    assert calls == [(tmp_path, True)]
 
 
 def test_the_ci_diagnostic_forces_the_grant_on_windows_11(tmp_path):
-    check, run, calls = _grant_harness()
-    assert rt.ensure_appcontainer_access(tmp_path, force=True, build=26100, check=check, run=run) == "granted"
+    check, grant, calls = _grant_harness()
+    assert rt.ensure_appcontainer_access(tmp_path, force=True, build=26100, check=check, grant=grant) == "granted"
     assert len(calls) == 1
 
 
 @pytest.mark.parametrize("harness, expected", [
-    (dict(returncode=5, stderr="Access is denied.\r\n"), "failed: icacls exit 5: Access is denied."),
-    (dict(returncode=2, stdout=""), "failed: icacls exit 2"),
-    (dict(raises=FileNotFoundError("icacls.exe")), "failed: icacls.exe"),
-    (dict(raises=subprocess.TimeoutExpired("icacls", 120)), "failed: Command 'icacls' timed out after 120 seconds"),
-    (dict(after=False), "failed: icacls succeeded but the folder is still missing"),
+    (dict(raises=OSError(5, "SetNamedSecurityInfoW failed (error 5)")),
+     "failed: [Errno 5] SetNamedSecurityInfoW failed (error 5)"),
+    (dict(raises=PermissionError("Access is denied.")), "failed: Access is denied."),
+    (dict(after=False), "failed: ACL grant succeeded but the folder is still missing"),
     (dict(after=OSError("unreadable")), "granted (could not re-check: unreadable)"),
 ])
 def test_grant_failures_are_reported_never_raised(tmp_path, harness, expected):
-    check, run, _calls = _grant_harness(**harness)
-    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, run=run) == expected
+    check, grant, _calls = _grant_harness(**harness)
+    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, grant=grant) == expected
 
 
 def test_an_unreadable_folder_still_attempts_the_grant(tmp_path):
-    check, run, calls = _grant_harness(before=OSError("denied"))
-    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, run=run) == "granted"
+    check, grant, calls = _grant_harness(before=OSError("denied"))
+    assert rt.ensure_appcontainer_access(tmp_path, build=19045, check=check, grant=grant) == "granted"
     assert len(calls) == 1
 
 
@@ -709,7 +702,7 @@ def test_appcontainer_decision(aces, expected):
 def test_a_deny_rule_is_reported_and_never_overridden_by_a_grant(tmp_path):
     calls = []
     state = rt.ensure_appcontainer_access(tmp_path, build=19045, check=lambda folder: "denied",
-                                          run=lambda *args, **kwargs: calls.append(args))
+                                          grant=lambda *args, **kwargs: calls.append((args, kwargs)))
     assert state == "failed: a deny rule blocks the app-sandbox groups; the folder was left unchanged"
     assert calls == []
 

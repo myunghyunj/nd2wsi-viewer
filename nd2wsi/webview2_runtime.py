@@ -3,31 +3,55 @@
 A Windows build may ship Microsoft's WebView2 Fixed Version runtime in
 ``_internal/webview2-runtime``. Three modes, read from ``ND2WSI_WEBVIEW2_RUNTIME``:
 
-- ``auto`` (default) prefers a valid system Evergreen runtime, which updates
-  itself, and falls back to the bundled copy so a PC without WebView2 still
-  opens the viewer.
+- ``auto`` (default) prefers a valid system Evergreen runtime (major version
+  ``>= 109`` with ``msedgewebview2.exe`` verified on disk), which updates
+  itself, and falls back to the bundled copy so a PC without a modern WebView2
+  still opens the viewer.
 - ``bundled`` forces the bundled copy. CI uses it to prove the copy renders.
 - ``system`` keeps the behaviour from before bundling.
 
 System detection follows Microsoft's documented rule: a ``pv`` value under the
-EdgeUpdate client key that is present, non-empty and not ``0.0.0.0``. pywebview's
-own check stops at the first unparsable value, so it can report a missing runtime
-when an empty per-user value hides a valid per-machine install.
+EdgeUpdate client key that is present, non-empty and not ``0.0.0.0``, backed by
+an actual ``msedgewebview2.exe`` on disk. pywebview's own check stops at the
+first unparsable value, so it can report a missing runtime when an empty
+per-user value hides a valid per-machine install.
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 MODE_ENV = "ND2WSI_WEBVIEW2_RUNTIME"
+FALLBACK_TRIED_ENV = "ND2WSI_WEBVIEW2_FALLBACK_TRIED"
 MODES = ("auto", "bundled", "system")
 BUNDLED_DIRNAME = "webview2-runtime"
 BROWSER_EXE = "msedgewebview2.exe"
 CLIENT_KEY = r"Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+# Minimum accepted system Evergreen WebView2 major version for auto mode.
+# Required by pywebview 6.2.1 (IsInPrivateModeEnabled) and modern CSS/JS
+# (:has(), Object.hasOwn()) used by the viewer shell.
+MIN_SYSTEM_MAJOR = 109
+
+# pywebview 6.2.1 (platforms/winforms.py _is_chromium) inspects these four
+# EdgeUpdate channels (HKCU before HKLM) and requires .NET Framework >= 4.6.2.
+_PYWEBVIEW_CHANNEL_KEYS = (
+    "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",  # runtime
+    "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}",  # beta
+    "{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}",  # dev
+    "{65C35B14-6C1D-4122-AC46-7148CC9D6497}",  # canary
+)
+_CHANNEL_APP_DIRS = {
+    "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}": ("EdgeWebView",),
+    "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}": ("Edge Beta", "EdgeWebView"),
+    "{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}": ("Edge Dev", "EdgeWebView"),
+    "{65C35B14-6C1D-4122-AC46-7148CC9D6497}": ("Edge SxS", "EdgeWebView"),
+}
+_NET_462_RELEASE = 394802
 
 
 @dataclass(frozen=True)
@@ -78,30 +102,136 @@ def parse_version(value) -> tuple[int, ...] | None:
     return numbers if any(numbers) else None
 
 
-def system_runtime_version(registry=None) -> str | None:
-    """Highest valid Evergreen runtime version registered for this machine or user."""
-    if registry is None:
-        if sys.platform != "win32":
-            return None
+def system_version_meets_floor(version: str | None, *, min_major: int = MIN_SYSTEM_MAJOR) -> bool:
+    """Whether ``version`` parses as a valid WebView2 version at or above ``min_major``."""
+    parsed = parse_version(version)
+    return parsed is not None and parsed[0] >= min_major
+
+
+def _load_winreg(registry=None):
+    if registry is not None:
+        return registry
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+    except ImportError:  # a patched platform on a non-Windows test runner
+        return None
+    return winreg
+
+
+def _channel_registry_entries(registry):
+    """Yield ``(channel, hive, subkey)`` across all channels in pywebview's order."""
+    for channel in _PYWEBVIEW_CHANNEL_KEYS:
+        suffix = "Microsoft\\EdgeUpdate\\Clients\\" + channel
+        yield channel, registry.HKEY_CURRENT_USER, "SOFTWARE\\" + suffix
+        yield channel, registry.HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\" + suffix
+        yield channel, registry.HKEY_LOCAL_MACHINE, "SOFTWARE\\" + suffix
+
+
+def _system_binary_candidates(
+    version: str,
+    *,
+    hive=None,
+    channel: str = _PYWEBVIEW_CHANNEL_KEYS[0],
+    location: str | None = None,
+    registry=None,
+    environ=None,
+) -> list[Path]:
+    """Candidate disk locations for ``msedgewebview2.exe`` of a registered system channel."""
+    candidates: list[Path] = []
+    if isinstance(location, str) and location.strip():
+        loc = Path(location.strip())
+        candidates.append(loc / version / BROWSER_EXE)
+        candidates.append(loc / BROWSER_EXE)
+    source = os.environ if environ is None else environ
+    hkcu = getattr(registry, "HKEY_CURRENT_USER", "HKCU")
+    hklm = getattr(registry, "HKEY_LOCAL_MACHINE", "HKLM")
+    roots: list[Path] = []
+    if hive is None or hive == hkcu:
+        local_app = source.get("LOCALAPPDATA")
+        if local_app:
+            roots.append(Path(local_app))
+        elif environ is None:
+            roots.append(Path.home() / "AppData" / "Local")
+    if hive is None or hive == hklm:
+        for env_key, fallback in (("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                                  ("ProgramFiles", r"C:\Program Files")):
+            raw = source.get(env_key) or (fallback if environ is None else "")
+            if raw:
+                path = Path(raw)
+                if path not in roots:
+                    roots.append(path)
+    app_dirs = _CHANNEL_APP_DIRS.get(channel, ("EdgeWebView",))
+    for root in roots:
+        for app_dir in app_dirs:
+            candidates.append(root / "Microsoft" / app_dir / "Application" / version / BROWSER_EXE)
+    return candidates
+
+
+def system_runtime_binary_exists(
+    version: str,
+    *,
+    hive=None,
+    channel: str = _PYWEBVIEW_CHANNEL_KEYS[0],
+    location: str | None = None,
+    registry=None,
+    environ=None,
+) -> bool:
+    """True when ``msedgewebview2.exe`` for ``version`` actually exists on disk."""
+    for candidate in _system_binary_candidates(
+        version, hive=hive, channel=channel, location=location, registry=registry, environ=environ,
+    ):
         try:
-            import winreg as registry
-        except ImportError:  # a patched platform on a non-Windows test runner
-            return None
-    candidates = (
-        (registry.HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\" + CLIENT_KEY),  # 64-bit Windows
-        (registry.HKEY_LOCAL_MACHINE, "SOFTWARE\\" + CLIENT_KEY),  # 32-bit Windows
-        (registry.HKEY_CURRENT_USER, "Software\\" + CLIENT_KEY),
-    )
+            if candidate.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _read_optional_location(registry, key) -> str | None:
+    try:
+        value, _kind = registry.QueryValueEx(key, "location")
+    except (OSError, AssertionError):
+        return None
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def system_runtime_version(
+    registry=None,
+    *,
+    verify_binary: bool | None = None,
+    binary_exists=None,
+) -> str | None:
+    """Highest valid Evergreen/Edge channel WebView2 runtime version for this PC or user.
+
+    Inspects the same EdgeUpdate channels as ``pywebview_accepts_system``.
+    On real Windows lookups (``registry is None``) or when ``verify_binary=True``
+    / ``binary_exists`` is supplied, also verifies that ``msedgewebview2.exe``
+    exists on disk so stale Windows 10 registry keys are ignored.
+    """
+    should_verify = (registry is None) or (binary_exists is not None) if verify_binary is None else bool(verify_binary)
+    reg = _load_winreg(registry)
+    if reg is None:
+        return None
+    checker = system_runtime_binary_exists if binary_exists is None else binary_exists
     best = None
-    for hive, subkey in candidates:
+    for channel, hive, subkey in _channel_registry_entries(reg):
         try:
-            with registry.OpenKey(hive, subkey) as key:
-                value, _kind = registry.QueryValueEx(key, "pv")
+            with reg.OpenKey(hive, subkey) as key:
+                value, _kind = reg.QueryValueEx(key, "pv")
+                location = _read_optional_location(reg, key) if should_verify else None
         except OSError:
             continue
         parsed = parse_version(value)
-        if parsed is not None and (best is None or parsed > best[0]):
-            best = (parsed, value.strip())
+        if parsed is None:
+            continue
+        cleaned = value.strip()
+        if should_verify and not checker(cleaned, hive=hive, channel=channel, location=location, registry=reg):
+            continue
+        if best is None or parsed > best[0]:
+            best = (parsed, cleaned)
     return None if best is None else best[1]
 
 
@@ -115,51 +245,47 @@ def bundled_runtime_dir(app_root=None) -> Path | None:
     return folder if (folder / BROWSER_EXE).is_file() else None
 
 
-# pywebview 6.2.1 (platforms/winforms.py _is_chromium) only uses a system runtime
-# when .NET Framework is at least 4.6.2 and the first parsable channel `pv`, read
-# HKCU before HKLM, has a major version of at least 86. An unparsable value ends
-# its search. Auto mode must not pick a system runtime that pywebview rejects.
-_PYWEBVIEW_CHANNEL_KEYS = (
-    "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",  # runtime
-    "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}",  # beta
-    "{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}",  # dev
-    "{65C35B14-6C1D-4122-AC46-7148CC9D6497}",  # canary
-)
-_NET_462_RELEASE = 394802
-
-
-def pywebview_accepts_system(registry=None) -> bool:
-    """Whether pywebview's own check would render with a system WebView2 runtime."""
-    if registry is None:
-        if sys.platform != "win32":
-            return False
-        try:
-            import winreg as registry
-        except ImportError:
-            return False
+def pywebview_accepts_system(
+    registry=None,
+    *,
+    min_major: int = MIN_SYSTEM_MAJOR,
+    verify_binary: bool | None = None,
+    binary_exists=None,
+) -> bool:
+    """Whether pywebview would render with a valid system WebView2 runtime (>= ``min_major``)."""
+    should_verify = (registry is None) or (binary_exists is not None) if verify_binary is None else bool(verify_binary)
+    reg = _load_winreg(registry)
+    if reg is None:
+        return False
+    checker = system_runtime_binary_exists if binary_exists is None else binary_exists
 
     def read(hive, subkey, name):
-        with registry.OpenKey(hive, subkey) as key:
-            return registry.QueryValueEx(key, name)[0]
+        with reg.OpenKey(hive, subkey) as key:
+            return reg.QueryValueEx(key, name)[0]
 
     try:
-        net = read(registry.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full", "Release")
+        net = read(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full", "Release")
         if not isinstance(net, int) or net < _NET_462_RELEASE:
             return False
     except OSError:
         return False
-    for channel in _PYWEBVIEW_CHANNEL_KEYS:
-        for hive, prefix in ((registry.HKEY_CURRENT_USER, "SOFTWARE\\"),
-                             (registry.HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\")):
-            try:
-                build = str(read(hive, prefix + "Microsoft\\EdgeUpdate\\Clients\\" + channel, "pv"))
-            except OSError:
-                build = "0"
-            major = build.split(".")[0].strip()
-            if not major.isdigit():
-                return False  # pywebview's int() raises here and it gives up entirely
-            if int(major) >= 86:
-                return True
+    for channel, hive, subkey in _channel_registry_entries(reg):
+        location = None
+        try:
+            with reg.OpenKey(hive, subkey) as key:
+                build = str(reg.QueryValueEx(key, "pv")[0])
+                if should_verify:
+                    location = _read_optional_location(reg, key)
+        except OSError:
+            build = "0"
+        major = build.split(".")[0].strip()
+        if not major.isdigit():
+            return False  # pywebview's int() raises here and it gives up entirely
+        if int(major) < min_major:
+            continue
+        if should_verify and not checker(build.strip(), hive=hive, channel=channel, location=location, registry=reg):
+            continue
+        return True
     return False
 
 
@@ -174,12 +300,20 @@ def choose_runtime(mode: str, *, bundled: Path | None, system_version: str | Non
         if bundled is None:
             raise RuntimeError("This build does not contain the bundled Microsoft Edge WebView2 runtime.")
         return _bundled(mode, bundled, system_version, "bundled runtime requested")
-    usable = bool(system_version) if system_usable is None else bool(system_version) and system_usable
+    meets_floor = system_version_meets_floor(system_version)
+    usable = meets_floor if system_usable is None else (meets_floor and bool(system_usable))
     if usable:
         return RuntimeChoice("system", mode, None, system_version, "valid system runtime found")
     if bundled is not None:
-        reason = ("system runtime registered but pywebview would not use it; using the bundled copy"
-                  if system_version else "no valid system runtime; using the bundled copy")
+        if system_version and not meets_floor:
+            reason = (
+                f"system runtime {system_version} is below minimum major version "
+                f"{MIN_SYSTEM_MAJOR}; using the bundled copy"
+            )
+        elif system_version:
+            reason = "system runtime registered but pywebview would not use it; using the bundled copy"
+        else:
+            reason = "no valid system runtime; using the bundled copy"
         return _bundled(mode, bundled, system_version, reason)
     if system_version:
         return RuntimeChoice("system", mode, None, system_version,
@@ -217,7 +351,15 @@ def _bundled(mode, path, system_version, reason) -> RuntimeChoice:
     return RuntimeChoice("bundled", mode, Path(path), system_version, reason)
 
 
-def select_runtime(webview_module=None, *, environ=None, app_root=None, registry=None) -> RuntimeChoice:
+def select_runtime(
+    webview_module=None,
+    *,
+    environ=None,
+    app_root=None,
+    registry=None,
+    verify_binary: bool | None = None,
+    binary_exists=None,
+) -> RuntimeChoice:
     """Choose a runtime and, for the bundled copy, point pywebview at it.
 
     Must run before ``webview.start``: pywebview reads the setting when it imports
@@ -226,43 +368,193 @@ def select_runtime(webview_module=None, *, environ=None, app_root=None, registry
     choice = choose_runtime(
         runtime_mode(environ),
         bundled=bundled_runtime_dir(app_root),
-        system_version=system_runtime_version(registry),
-        system_usable=pywebview_accepts_system(registry),
+        system_version=system_runtime_version(
+            registry, verify_binary=verify_binary, binary_exists=binary_exists,
+        ),
+        system_usable=pywebview_accepts_system(
+            registry, verify_binary=verify_binary, binary_exists=binary_exists,
+        ),
     )
     if choice.kind == "bundled" and webview_module is not None:
         webview_module.settings["WEBVIEW2_RUNTIME_PATH"] = str(choice.path)
     return choice
 
 
+def fallback_runtime_mode(
+    selection: dict | None,
+    *,
+    environ=None,
+    app_root=None,
+    registry=None,
+    verify_binary: bool | None = None,
+    binary_exists=None,
+) -> str | None:
+    """Alternate runtime mode for a 1-shot ``auto`` fallback after WebView2 init failure.
+
+    Returns ``"bundled"`` when ``system`` failed and a usable local bundled copy
+    exists, ``"system"`` when ``bundled`` failed and a valid system Evergreen
+    runtime exists, or ``None`` when fallback is disallowed or already tried.
+    """
+    if not isinstance(selection, dict) or selection.get("mode") != "auto":
+        return None
+    source = os.environ if environ is None else environ
+    if (source.get(FALLBACK_TRIED_ENV) or "").strip() == "1":
+        return None
+    kind = selection.get("kind")
+    if kind == "system":
+        bundled = bundled_runtime_dir(app_root)
+        if bundled is not None and not _is_network_path(bundled):
+            return "bundled"
+        return None
+    if kind == "bundled":
+        sys_ver = selection.get("system_version")
+        if sys_ver is None and registry is None:
+            return None
+        if registry is not None:
+            sys_ver = system_runtime_version(
+                registry, verify_binary=verify_binary, binary_exists=binary_exists,
+            )
+        if not system_version_meets_floor(sys_ver):
+            return None
+        if registry is not None or verify_binary or binary_exists is not None:
+            if not pywebview_accepts_system(
+                registry, verify_binary=verify_binary, binary_exists=binary_exists,
+            ):
+                return None
+        elif sys.platform == "win32" and _load_winreg(None) is not None:
+            if not pywebview_accepts_system():
+                return None
+        return "system"
+    return None
+
+
+# Watch CoreWebView2 initialization (pre-before_show & synchronous-safe) -------
+
+_EDGECHROME_HOOK_LOCK = threading.Lock()
+_EDGECHROME_WATCHERS: dict[int, tuple[object, object]] = {}
+
+
+def _install_edgechromium_hook() -> bool:
+    """Wrap ``EdgeChrome.on_webview_ready`` once so synchronous init failures are never missed."""
+    module = sys.modules.get("webview.platforms.edgechromium")
+    edge_chrome = getattr(module, "EdgeChrome", None)
+    if edge_chrome is None:
+        return False
+    with _EDGECHROME_HOOK_LOCK:
+        original = getattr(edge_chrome, "on_webview_ready", None)
+        if original is None:
+            return False
+        if getattr(original, "_nd2wsi_init_wrapped", False):
+            return True
+
+        def wrapped(self, sender, args):
+            target = getattr(self, "pywebview_window", None)
+            watcher = None
+            if target is not None:
+                with _EDGECHROME_HOOK_LOCK:
+                    entry = _EDGECHROME_WATCHERS.get(id(target))
+                    if entry is not None and entry[0] is target:
+                        watcher = entry[1]
+            if watcher is not None:
+                watcher(sender, args)
+            return original(self, sender, args)
+
+        wrapped._nd2wsi_init_wrapped = True
+        edge_chrome.on_webview_ready = wrapped
+        return True
+
+
 def watch_initialization(window, record) -> bool:
     """Report how WebView2 started for ``window`` instead of a silent blank window.
 
-    pywebview only logs a failed CoreWebView2 initialization (edgechromium.py
-    on_webview_ready). ``before_show`` runs on the UI thread after the control
-    exists and before its completion message is pumped, so subscribing there
-    sees the result. ``record(ok, detail)`` is called on the UI thread.
-    Returns False when the window offers no ``before_show`` event.
+    pywebview calls ``EnsureCoreWebView2Async`` inside ``EdgeChrome.__init__``
+    before ``before_show`` fires, so subscribing only in ``before_show`` can miss
+    a synchronous initialization failure. This hooks ``EdgeChrome.on_webview_ready``
+    during ``initialized`` (before ``BrowserForm`` is constructed) and also attaches
+    directly to ``window.native.webview.CoreWebView2InitializationCompleted`` as
+    soon as the control exists. ``record(ok, detail)`` is invoked at most once.
+    Returns False when the window exposes neither native control nor lifecycle hooks.
     """
-    hook = getattr(getattr(window, "events", None), "before_show", None)
-    if hook is None:
-        return False
+    events = getattr(window, "events", None)
+    before_show = getattr(events, "before_show", None)
+    initialized = getattr(events, "initialized", None)
+    closed = getattr(events, "closed", None)
+
+    state_lock = threading.Lock()
+    state = {"attached": False, "reported": False}
+
+    def unregister_watcher(*_args):
+        with _EDGECHROME_HOOK_LOCK:
+            entry = _EDGECHROME_WATCHERS.get(id(window))
+            if entry is not None and entry[0] is window:
+                _EDGECHROME_WATCHERS.pop(id(window), None)
+
+    def emit(ok: bool, detail) -> None:
+        with state_lock:
+            if state["reported"]:
+                return
+            state["reported"] = True
+        unregister_watcher()
+        record(ok, detail)
 
     def completed(_sender, args):
         try:
             if args.IsSuccess:
-                record(True, None)
+                emit(True, None)
             else:
-                record(False, str(args.InitializationException))
+                emit(False, str(args.InitializationException))
         except Exception as exc:  # never let a diagnostic break the UI thread
-            record(False, f"could not read the WebView2 initialization result: {exc!r}")
+            emit(False, f"could not read the WebView2 initialization result: {exc!r}")
 
-    def attach(*_args):
+    def try_attach(*_args, report_missing: bool = False) -> bool:
+        with state_lock:
+            if state["attached"] or state["reported"]:
+                return True
+        native = getattr(window, "native", None)
+        webview_ctrl = getattr(native, "webview", None)
+        if webview_ctrl is None:
+            if report_missing:
+                emit(False, "could not watch WebView2 initialization: native webview control is unavailable")
+            return False
         try:
-            window.native.webview.CoreWebView2InitializationCompleted += completed
+            webview_ctrl.CoreWebView2InitializationCompleted += completed
+            with state_lock:
+                state["attached"] = True
+            if getattr(webview_ctrl, "CoreWebView2", None) is not None:
+                emit(True, None)
+            return True
         except Exception as exc:
-            record(False, f"could not watch WebView2 initialization: {exc!r}")
+            emit(False, f"could not watch WebView2 initialization: {exc!r}")
+            return False
 
-    hook += attach
+    # Register early watcher for EdgeChrome.on_webview_ready before BrowserForm exists.
+    with _EDGECHROME_HOOK_LOCK:
+        _EDGECHROME_WATCHERS[id(window)] = (window, completed)
+    if closed is not None:
+        closed += unregister_watcher
+
+    attached_now = try_attach(report_missing=False)
+    edge_hooked = _install_edgechromium_hook()
+
+    if initialized is not None:
+        def on_initialized(*_args):
+            _install_edgechromium_hook()
+            try_attach(report_missing=False)
+            # Never return False: pywebview treats False from initialized as a veto.
+            return True
+
+        initialized += on_initialized
+
+    if before_show is not None:
+        def on_before_show(*_args):
+            _install_edgechromium_hook()
+            try_attach(report_missing=True)
+
+        before_show += on_before_show
+
+    if not attached_now and before_show is None and initialized is None and not edge_hooked:
+        unregister_watcher()
+        return False
     return True
 
 
@@ -397,18 +689,27 @@ def window_evidence(window, call, *, timeout=30, image_path=process_image_path,
 # Windows 10 folder permission for the Fixed Version runtime -----------------
 # Microsoft's WebView2 distribution docs ("The Fixed Version runtime distribution
 # mode", step 6): on Windows 10, unpackaged apps using Fixed Version 120 or later
-# must give the AppContainer
-# groups read and execute access to the runtime folder, or its sandboxed
-# processes cannot start. Windows 11 (build 22000 and later) does not need it.
+# must give the AppContainer groups read and execute access to the runtime folder,
+# or its sandboxed processes cannot start. Windows 11 (build 22000 and later) does
+# not need it. Grants run in-process through advapi32 (never spawning icacls.exe,
+# which AppLocker / SRP policies may block on hospital and university PCs).
 APPCONTAINER_SIDS = ("S-1-15-2-1", "S-1-15-2-2")  # ALL [RESTRICTED] APPLICATION PACKAGES
 WINDOWS_11_BUILD = 22000
 GRANT_SMOKE_ENV = "ND2WSI_SMOKE_WEBVIEW2_ACL"  # CI only: run the grant where Windows does not need it
 _READ_EXECUTE = 0x1200A9  # FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+_GENERIC_READ = 0x80000000
+_GENERIC_EXECUTE = 0x20000000
 # Generic rights as Windows maps them for files: inherited grants are often
 # stored with generic bits (for example GR,GE under Program Files).
 _GENERIC_FILE_RIGHTS = ((0x80000000, 0x120089), (0x20000000, 0x1200A0), (0x10000000, 0x1F01FF))
 _INHERITABLE = 0x3  # OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+_NO_INHERITANCE = 0x0
 _INHERIT_ONLY = 0x8
+_SE_FILE_OBJECT = 1
+_DACL_SECURITY_INFORMATION = 0x00000004
+_GRANT_ACCESS = 1
+_TRUSTEE_IS_SID = 0
+_TRUSTEE_IS_WELL_KNOWN_GROUP = 5
 
 
 def needs_appcontainer_grant(build=None) -> bool:
@@ -430,17 +731,16 @@ def _file_rights(mask: int) -> int:
 _READ_EXECUTE_BITS = 0xA9  # FILE_READ_DATA | FILE_READ_EA | FILE_EXECUTE | FILE_READ_ATTRIBUTES
 
 
-def appcontainer_decision(aces, groups: int = len(APPCONTAINER_SIDS)) -> str:
+def appcontainer_decision(aces, groups: int = len(APPCONTAINER_SIDS), *, require_inherit: bool = True) -> str:
     """Decide from a DACL's ACEs, in order: "allowed", "missing" or "denied".
 
     ``aces`` holds ``(ace_type, flags, mask, group)``; ``group`` is the index of the
     matching AppContainer SID or None. An explicit deny that overlaps read or
     execute for either group wins over any allow (Windows checks access-denied
     entries first), so it is reported, never papered over by adding a grant.
-    Allowed needs, per group, some allow ACE that gives read/execute on the folder
-    itself (not inherit-only) and some that passes it on (OI|CI); icacls
-    (OI)(CI)(RX) is one ACE doing both, while an inherited grant under Program
-    Files is split into an effective and an inherit-only ACE.
+    Allowed needs, per group, some allow ACE that gives read/execute on the target
+    itself (not inherit-only) and, for directories (``require_inherit=True``), some
+    that passes it on (OI|CI).
     """
     applies, inherits = set(), set()
     for ace_type, flags, mask, group in aces:
@@ -456,6 +756,8 @@ def appcontainer_decision(aces, groups: int = len(APPCONTAINER_SIDS)) -> str:
         if flags & _INHERITABLE == _INHERITABLE:
             inherits.add(group)
     everyone = set(range(groups))
+    if not require_inherit:
+        return "allowed" if applies == everyone else "missing"
     return "allowed" if applies == everyone and inherits == everyone else "missing"
 
 
@@ -468,15 +770,21 @@ def appcontainer_access(folder) -> bool | None:
     return None if state is None else state == "allowed"
 
 
-def appcontainer_state(folder) -> str | None:
+def appcontainer_state(folder, *, require_inherit: bool | None = None) -> str | None:
     """``appcontainer_decision`` for ``folder``'s DACL; None off Windows.
 
-    Raises OSError when the folder's DACL cannot be read.
+    Raises OSError when the path's DACL cannot be read.
     """
     if sys.platform != "win32":
         return None
     import ctypes
     from ctypes import wintypes
+
+    if require_inherit is None:
+        try:
+            require_inherit = not Path(folder).is_file()
+        except OSError:
+            require_inherit = True
 
     advapi = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -501,7 +809,7 @@ def appcontainer_state(folder) -> str | None:
         _fields_ = [("type", ctypes.c_ubyte), ("flags", ctypes.c_ubyte), ("size", wintypes.WORD)]
 
     dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
-    status = advapi.GetNamedSecurityInfoW(str(folder), 1, 4,  # SE_FILE_OBJECT, DACL_SECURITY_INFORMATION
+    status = advapi.GetNamedSecurityInfoW(str(folder), _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION,
                                           None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor))
     if status != 0:
         raise OSError(status, "Could not read the folder's permissions", str(folder))
@@ -526,7 +834,7 @@ def appcontainer_state(folder) -> str | None:
             group = next((position for position, target in enumerate(targets)
                           if advapi.EqualSid(ctypes.c_void_p(ace.value + 8), target)), None)
             aces.append((header.type, header.flags, mask, group))
-        return appcontainer_decision(aces, len(targets))
+        return appcontainer_decision(aces, len(targets), require_inherit=require_inherit)
     finally:
         for sid in targets:
             kernel.LocalFree(sid)
@@ -534,39 +842,198 @@ def appcontainer_state(folder) -> str | None:
             kernel.LocalFree(descriptor)
 
 
-def ensure_appcontainer_access(folder, *, force=False, build=None, check=None, run=subprocess.run) -> str:
-    """Grant the AppContainer groups read/execute on ``folder`` where Windows needs it.
+def _grant_appcontainer_acl_win32(
+    path: Path,
+    *,
+    sids=APPCONTAINER_SIDS,
+    inherit: bool = True,
+    advapi=None,
+    kernel=None,
+) -> None:
+    """Grant ``GENERIC_READ | GENERIC_EXECUTE`` to AppContainer SIDs via Win32 ``advapi32``.
+
+    In-process replacement for ``icacls.exe`` so AppLocker/SRP rules blocking
+    command-line tools cannot break Windows 10 startup. Raises ``OSError`` on failure.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    if advapi is None or kernel is None:
+        if sys.platform != "win32":
+            raise OSError("Win32 ACL APIs are only available on Windows")
+        pointer = ctypes.POINTER(ctypes.c_void_p)
+        if advapi is None:
+            advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+            advapi.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, pointer]
+            advapi.ConvertStringSidToSidW.restype = wintypes.BOOL
+            advapi.GetNamedSecurityInfoW.argtypes = [
+                wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+                pointer, pointer, pointer, pointer, pointer,
+            ]
+            advapi.GetNamedSecurityInfoW.restype = wintypes.DWORD
+            advapi.SetEntriesInAclW.argtypes = [wintypes.ULONG, ctypes.c_void_p, ctypes.c_void_p, pointer]
+            advapi.SetEntriesInAclW.restype = wintypes.DWORD
+            advapi.SetNamedSecurityInfoW.argtypes = [
+                wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ]
+            advapi.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        if kernel is None:
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.LocalFree.argtypes = [ctypes.c_void_p]
+            kernel.LocalFree.restype = ctypes.c_void_p
+
+    class TrusteeW(ctypes.Structure):
+        _fields_ = [
+            ("pMultipleTrustee", ctypes.c_void_p),
+            ("MultipleTrusteeOperation", ctypes.c_int32),
+            ("TrusteeForm", ctypes.c_int32),
+            ("TrusteeType", ctypes.c_int32),
+            ("ptstrName", ctypes.c_void_p),
+        ]
+
+    class ExplicitAccessW(ctypes.Structure):
+        _fields_ = [
+            ("grfAccessPermissions", ctypes.c_uint32),
+            ("grfAccessMode", ctypes.c_int32),
+            ("grfInheritance", ctypes.c_uint32),
+            ("Trustee", TrusteeW),
+        ]
+
+    target_str = str(path)
+    sid_ptrs: list[ctypes.c_void_p] = []
+    old_dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    new_dacl = ctypes.c_void_p()
+    try:
+        for sid_text in sids:
+            sid_ptr = ctypes.c_void_p()
+            if not advapi.ConvertStringSidToSidW(sid_text, ctypes.byref(sid_ptr)):
+                err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
+                raise OSError(err, f"ConvertStringSidToSidW failed for {sid_text} (error {err})", target_str)
+            sid_ptrs.append(sid_ptr)
+
+        status = advapi.GetNamedSecurityInfoW(
+            target_str,
+            _SE_FILE_OBJECT,
+            _DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            ctypes.byref(old_dacl),
+            None,
+            ctypes.byref(descriptor),
+        )
+        if status != 0:
+            raise OSError(status, f"GetNamedSecurityInfoW failed (error {status})", target_str)
+
+        inheritance = _INHERITABLE if inherit else _NO_INHERITANCE
+        entries = (ExplicitAccessW * len(sid_ptrs))()
+        for index, sid_ptr in enumerate(sid_ptrs):
+            entry = entries[index]
+            entry.grfAccessPermissions = _GENERIC_READ | _GENERIC_EXECUTE
+            entry.grfAccessMode = _GRANT_ACCESS
+            entry.grfInheritance = inheritance
+            entry.Trustee.pMultipleTrustee = None
+            entry.Trustee.MultipleTrusteeOperation = 0
+            entry.Trustee.TrusteeForm = _TRUSTEE_IS_SID
+            entry.Trustee.TrusteeType = _TRUSTEE_IS_WELL_KNOWN_GROUP
+            entry.Trustee.ptstrName = sid_ptr
+
+        status = advapi.SetEntriesInAclW(len(sid_ptrs), entries, old_dacl, ctypes.byref(new_dacl))
+        if status != 0:
+            raise OSError(status, f"SetEntriesInAclW failed (error {status})", target_str)
+
+        status = advapi.SetNamedSecurityInfoW(
+            target_str,
+            _SE_FILE_OBJECT,
+            _DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            new_dacl,
+            None,
+        )
+        if status != 0:
+            raise OSError(status, f"SetNamedSecurityInfoW failed (error {status})", target_str)
+    finally:
+        if new_dacl.value:
+            kernel.LocalFree(new_dacl)
+        if descriptor.value:
+            kernel.LocalFree(descriptor)
+        for sid_ptr in sid_ptrs:
+            if sid_ptr.value:
+                kernel.LocalFree(sid_ptr)
+
+
+def ensure_appcontainer_access(folder, *, force=False, build=None, check=None, grant=None) -> str:
+    """Grant the AppContainer groups read/execute on ``folder`` and ``msedgewebview2.exe``.
 
     Returns "not-needed", "present", "granted" or "failed: <reason>"; never raises.
-    The grant is inheritable, so Windows applies it to the files inside. Changing
-    a folder the user extracted needs no administrator rights. ``check`` returns
-    an ``appcontainer_state`` value. A deny rule is reported and left alone.
+    Uses in-process Win32 ``advapi32`` ACL APIs (never ``icacls.exe``). The grant on
+    ``folder`` is inheritable (OI|CI) and, when ``msedgewebview2.exe`` exists inside
+    ``folder``, its ACL is also verified and explicitly granted if inheritance is
+    blocked. ``check`` returns an ``appcontainer_state`` value. A deny rule is
+    reported and left alone.
     """
     check = appcontainer_state if check is None else check
+    grant = _grant_appcontainer_acl_win32 if grant is None else grant
     if not force and not needs_appcontainer_grant(build):
         return "not-needed"
+    folder_path = Path(folder)
+    browser_exe = folder_path / BROWSER_EXE
+    has_exe = browser_exe.is_file()
+
     try:
         state = check(folder)
     except Exception:  # an unreadable DACL: the grant below reports its own error
         state = None
-    if state == "allowed":
-        return "present"
     if state == "denied":
         return "failed: a deny rule blocks the app-sandbox groups; the folder was left unchanged"
-    icacls = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "icacls.exe")
-    command = [icacls, str(folder), "/grant", *(f"*{sid}:(OI)(CI)(RX)" for sid in APPCONTAINER_SIDS), "/Q"]
-    try:
-        result = run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                     timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"failed: {exc}"
-    if result.returncode != 0:
-        lines = (result.stderr or result.stdout or "").strip().splitlines()
-        return f"failed: icacls exit {result.returncode}" + (f": {lines[-1].strip()}" if lines else "")
+
+    exe_state = None
+    if has_exe:
+        try:
+            exe_state = check(browser_exe)
+        except Exception:
+            exe_state = None
+        if exe_state == "denied":
+            return f"failed: a deny rule blocks the app-sandbox groups on {BROWSER_EXE}; left unchanged"
+
+    if state == "allowed" and (not has_exe or exe_state == "allowed"):
+        return "present"
+
+    if state != "allowed":
+        try:
+            grant(folder_path, inherit=True)
+        except OSError as exc:
+            return f"failed: {exc}"
+
+    if has_exe:
+        # Re-check after granting the parent folder in case inheritance applied it.
+        try:
+            exe_after_folder = check(browser_exe)
+        except Exception:
+            exe_after_folder = None
+        if exe_after_folder == "denied":
+            return f"failed: a deny rule blocks the app-sandbox groups on {BROWSER_EXE}; left unchanged"
+        if exe_after_folder != "allowed":
+            try:
+                grant(browser_exe, inherit=False)
+            except OSError as exc:
+                return f"failed: {exc}"
+
     try:
         after = check(folder)
     except Exception as exc:
         return f"granted (could not re-check: {exc})"
     if after not in ("allowed", None):
-        return f"failed: icacls succeeded but the folder is still {after}"
+        return f"failed: ACL grant succeeded but the folder is still {after}"
+
+    if has_exe:
+        try:
+            exe_after = check(browser_exe)
+        except Exception as exc:
+            return f"granted (could not re-check {BROWSER_EXE}: {exc})"
+        if exe_after not in ("allowed", None):
+            return f"failed: ACL grant succeeded but {BROWSER_EXE} is still {exe_after}"
+
     return "granted"

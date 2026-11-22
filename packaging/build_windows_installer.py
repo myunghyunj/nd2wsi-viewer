@@ -500,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     if edition_name == "SLACS-module":
         defines.update(
             {
+                "SLACS_EDITION": "1",
                 "APP_DISPLAY_NAME": "nd2wsi-viewer SLACS",
                 "INSTALL_DIR_NAME": "nd2wsi-viewer SLACS",
                 "PRODUCT_ID": "nd2wsi-viewer.slacs.windows.x64.current-user",

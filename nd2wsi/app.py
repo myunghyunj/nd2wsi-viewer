@@ -21,6 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import app_slacs as _app_slacs
 from . import edition, session_log
 from . import gui_smoke as _gui_smoke_mod
 from . import window_chrome as _window_chrome
@@ -689,54 +690,15 @@ class Api:
         return {"ok": True}
 
     def slacs_discovery_state(self, claim_offer: bool = False) -> dict:
-        """Read-only detection for the main-window connection offer.
-
-        ``offer`` is True only in the one viewer window of this role that first
-        claimed the detected process, so the offer appears once across windows.
-        The shell asks to claim only while the user is looking at that window.
-        """
-        from .slacs_discovery import SlacsDiscovery
-
-        with self._translucent_lock:
-            if self._translucent_owner_closed:
-                return {"available": False, "session_id": None, "status": "closed", "offer": False}
-            if self._slacs_discovery is None:
-                self._slacs_discovery = SlacsDiscovery(name="main")
-            detector = self._slacs_discovery
-        snapshot = detector.snapshot()
-        self._log_slacs_detection(snapshot)
-        snapshot["offer"] = self._claim_slacs_offer(snapshot, claim_offer is True)
-        return snapshot
+        """Read-only detection for the main-window connection offer."""
+        return _app_slacs.slacs_discovery_state(self, claim_offer=claim_offer)
 
     def _log_slacs_detection(self, snapshot) -> None:
         """Record each detection change, so a failed detection can be diagnosed afterwards."""
-        state = (snapshot.get("available") is True, snapshot.get("session_id"), snapshot.get("status"))
-        with self._slacs_offer_lock:
-            if state == self._slacs_logged:
-                return
-            self._slacs_logged = state
-        session_log.event("slacs_detection", window="main", available=state[0], session_id=state[1],
-                          status=state[2])
+        _app_slacs.log_slacs_detection(self, snapshot)
 
     def _claim_slacs_offer(self, snapshot, claim: bool) -> bool:
-        from .slacs_discovery import SlacsOfferClaims
-
-        session = snapshot.get("session_id")
-        if snapshot.get("available") is not True or snapshot.get("status") != "running" or not isinstance(session, str):
-            return False
-        with self._slacs_offer_lock:
-            if session not in self._slacs_offers:
-                if not claim:
-                    return False  # a background window neither claims nor gives up the offer
-                if self._window_session is None:
-                    self._slacs_offers[session] = True  # no shared window identity: this is the only window
-                else:
-                    if self._slacs_offer_claims is None:
-                        self._slacs_offer_claims = SlacsOfferClaims(
-                            self._window_session.root.parent / "slacs-offers" / self._window_session.role,
-                            claimant=self._window_session.id)
-                    self._slacs_offers[session] = self._slacs_offer_claims.claim(session)
-            return self._slacs_offers[session]
+        return _app_slacs.claim_slacs_offer(self, snapshot, claim)
 
     def open_translucent_viewer(self, sid: str, payload: dict) -> dict:
         """Open a display-only tracing window for this viewer's registered slide."""
@@ -745,141 +707,36 @@ class Api:
         claim = None
         overlay_owns_claim = False
         try:
-            from urllib.parse import quote
-
-            from .laser_target import LaserTargetStore
-            from .translucent_claim import tracing_claim
-            from .translucent_window import create_translucent_window, validate_context
-
-            with self._server_lock:
-                server = self._httpd
-                store = server.registry.get(sid) if server is not None and isinstance(sid, str) else None
-                if store is None:
-                    raise ValueError("Open an image before opening the translucent viewer")
-                base_url = _server_url(server).rstrip("/") + "/"
-                context = validate_context(store, payload, slide_url=base_url + "s/" + quote(sid, safe="") + "/")
-
-            with self._translucent_lock:
-                if self._translucent_owner_closed:
-                    raise ValueError("The source viewer is closing")
-                previous = self._translucent_windows.get(sid)
-                if previous is None:
-                    if self._translucent_windows or self._translucent_claim is not None:
-                        session_log.event("translucent_refused", reason="another_open", sid=sid)
-                        return {"ok": False, "reason": "another_open",
-                                "message": "A tracing window is already open. Close it before opening another."}
-                    claim = tracing_claim(self._window_session)
-                    try:
-                        claim.acquire()
-                    except TimeoutError:
-                        session_log.event("translucent_refused", reason="another_open", sid=sid)
-                        return {"ok": False, "reason": "another_open",
-                                "message": "A tracing window is already open. Close it before opening another."}
-                    self._translucent_claim = claim
-
+            base_url, context = _app_slacs.prepare_translucent_context(self, sid, payload, server_url=_server_url)
+            previous, claim, refusal = _app_slacs.acquire_translucent_slot(self, sid)
+            if refusal is not None:
+                return refusal
             if previous is not None:
                 previous.refresh_context(context)
                 return {"ok": True, "id": previous._window.uid}
-
-            def remove(closed):
-                with self._translucent_lock:
-                    if self._translucent_windows.get(sid) is closed:
-                        self._translucent_windows.pop(sid, None)
-                    if self._translucent_claim is claim:
-                        self._translucent_claim = None
-                    claim.release()
-                session_log.event("translucent_closed", sid=sid)
-
-            def active(locked):
-                if locked:
-                    self._active_translucent_sid = sid
-
-            def deliver(message):
-                # Called only by the overlay's bounded delivery worker, without either lock.
-                owner = self._lut_clipboard_owner()
-                return owner.evaluate_js("window.nd2wsiSlacsLaserBox?.(" +
-                                         json.dumps({**message, "sid": sid}, allow_nan=False) + ") === true")
-
-            overlay = create_translucent_window(
-                context, url=base_url + "static/translucent.html",
-                title=APP_NAME + " — Translucent", logger=_dlog, on_closed=remove,
-                flip_store=self._follow_flip_store(), target_store=LaserTargetStore(self._window_session),
-                on_laser_box=deliver, is_active=lambda: self._active_translucent_sid == sid, on_lock=active,
+            overlay = _app_slacs.launch_translucent_overlay(
+                self, sid, context, base_url=base_url, claim=claim, app_name=APP_NAME, logger=_dlog,
             )
             overlay_owns_claim = True
-            owner_closed = False
-            with self._translucent_lock:
-                if self._translucent_owner_closed:
-                    owner_closed = True
-                else:
-                    self._translucent_windows[sid] = overlay
-            if owner_closed:
-                overlay.close_translucent()
-                raise ValueError("The source viewer is closing")
-            session_log.event("translucent_opened", sid=sid, id=overlay._window.uid)
-            return {"ok": True, "id": overlay._window.uid}
+            return _app_slacs.register_translucent_overlay(self, sid, overlay)
         except Exception as exc:
             if claim is not None and not overlay_owns_claim:
-                with self._translucent_lock:
-                    if self._translucent_claim is claim:
-                        self._translucent_claim = None
-                    claim.release()
-            _dlog(f"translucent viewer open failed: {exc!r}")
-            session_log.event("translucent_open_failed", sid=sid, ok=False, error=str(exc))
-            return {"ok": False, "message": f"Could not open translucent viewer: {exc}"}
+                _app_slacs.release_translucent_claim(self, claim)
+            return _app_slacs.handle_translucent_open_error(sid, exc, logger=_dlog)
 
     def report_slacs_laser_box(self, payload):
-        if not isinstance(payload, dict) or not isinstance(payload.get("sid"), str):
-            return {"ok": False}
-        with self._translucent_lock:
-            overlay = self._translucent_windows.get(payload["sid"])
-        return overlay.report_slacs_laser_box(payload) if overlay is not None else {"ok": False}
+        return _app_slacs.report_slacs_laser_box(self, payload)
 
     def _follow_flip_store(self):
-        """This window process's store of Follow flips per image format.
-
-        An Agent window's store keeps a private copy under its session root.
-        """
-        from .follow_flips import FollowFlipStore
-
-        with self._translucent_lock:
-            if self._follow_flips_store is None:
-                self._follow_flips_store = FollowFlipStore(self._window_session)
-            return self._follow_flips_store
+        """This window process's store of Follow flips per image format."""
+        return _app_slacs.follow_flip_store(self)
 
     def close_translucent_viewer(self, sid: str) -> dict:
         """Close the translucent tracing window for one slide tab, if open."""
-        with self._translucent_lock:
-            overlay = self._translucent_windows.pop(sid, None) if isinstance(sid, str) else None
-        if overlay is not None:
-            try:
-                overlay.close_translucent()
-            except Exception as exc:
-                _dlog(f"translucent viewer close failed: {exc!r}")
-                return {"ok": False, "message": str(exc)}
-        return {"ok": True, "closed": overlay is not None}
+        return _app_slacs.close_translucent_viewer(self, sid, logger=_dlog)
 
     def _close_translucent_windows(self, *_args, owner_closing: bool = True):
-        with self._translucent_lock:
-            if owner_closing:
-                self._translucent_owner_closed = True
-            overlays = list(self._translucent_windows.values())
-            self._translucent_windows.clear()
-            detector, self._slacs_discovery = self._slacs_discovery, None
-        if overlays:
-            session_log.event("translucent_closing", count=len(overlays), reason="source viewer closing")
-        if detector is not None:
-            try:
-                detector.stop()
-            except Exception as exc:
-                _dlog(f"SLACS discovery close failed: {exc!r}")
-        for overlay in overlays:
-            try:
-                overlay.close_translucent()
-            except Exception as exc:
-                _dlog(f"translucent viewer close failed: {exc!r}")
-        # The native closed callback releases the claim. Keep it held if destruction
-        # fails, until the OS reclaims it at process exit.
+        _app_slacs.close_translucent_windows(self, owner_closing=owner_closing, logger=_dlog)
 
     def open_in_metal(self, sid: str, view_state: dict, retry: bool = False) -> dict:
         """Open only a registered slide in a fresh process of this same role."""
@@ -1448,31 +1305,19 @@ def smoke(nd2_path: Path) -> int:
     return run(nd2_path)
 
 
-def _dismiss_failed_webview2_window(api, window, *, spawn=None) -> None:
-    """Close a window whose WebView2 never started, so its error shows at once.
-
-    The page never loaded, so the window holds no unsaved work and the close is
-    approved without the save handshake. destroy() runs on its own thread, not
-    inside the WebView2 completion callback (on the UI thread) that reported the
-    failure; pywebview marshals it back to the UI thread.
-    """
-    coordinator = getattr(api, "_close_coordinator", None)
-    if coordinator is not None:
-        coordinator.approve_close("WebView2 failed to start, so the page never loaded")
-    (spawn or threading.Thread)(target=window.destroy, name="webview2-failed-close", daemon=True).start()
+def _dismiss_failed_webview2_window(api, window, *, spawn=None, shown_timeout: float = 1.5) -> None:
+    """Close a window whose WebView2 never started, so its error or fallback runs at once."""
+    _app_slacs.dismiss_failed_webview2_window(api, window, spawn=spawn, shown_timeout=shown_timeout)
 
 
 def _startup_error(message: str, *, show_dialog: bool = True) -> None:
-    _dlog(message)
-    session_log.event("error", where="startup", message=message)
-    print(message, file=sys.stderr)
-    if sys.platform == "win32" and show_dialog:
-        try:
-            import ctypes
+    _app_slacs.startup_error(message, app_name=APP_NAME, show_dialog=show_dialog, logger=_dlog)
 
-            ctypes.windll.user32.MessageBoxW(None, message, APP_NAME, 0x10)
-        except Exception:
-            pass
+
+# Facade re-exports from app_slacs so callers and tests can import from nd2wsi.app.
+build_relaunch_command = _app_slacs.build_relaunch_command
+configure_win32_webview2 = _app_slacs.configure_win32_webview2
+maybe_relaunch_webview2_fallback = _app_slacs.maybe_relaunch_webview2_fallback
 
 
 _GUI_SMOKE_KEYBOARD_SETUP = _gui_smoke_mod._GUI_SMOKE_KEYBOARD_SETUP
@@ -1639,7 +1484,9 @@ def main(argv: list[str] | None = None) -> int:
     role_args = ap.add_mutually_exclusive_group()
     role_args.add_argument("--new-window", action="store_true", help="open a fresh User window")
     role_args.add_argument("--agent-window", action="store_true", help="open an isolated Agent window")
-    args, _ = ap.parse_known_args(argv)  # tolerate Finder's -psn_* args
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args, _ = ap.parse_known_args(raw_argv)  # tolerate Finder's -psn_* args
+    args._raw_argv = raw_argv
 
     # The session log covers the whole run, diagnostic runs included. It stays
     # open after main() returns so that a crash during interpreter shutdown
@@ -1752,39 +1599,14 @@ def _main(args) -> int:
             api._handoff_source = initial.resolve()
         kwargs = {"gui": "edgechromium"} if sys.platform == "win32" else {}
         if sys.platform == "win32":
-            from .webview2_runtime import select_runtime
-
-            # pywebview reads the runtime folder when webview.start imports its
-            # WinForms backend, so choose before any start. A forced bundled
-            # copy that is missing fails startup here, never silently falls back.
-            api._webview2_runtime = select_runtime(webview).report()
-            if api._webview2_runtime.get("kind") == "bundled" and api._webview2_runtime.get("path"):
-                from .webview2_runtime import GRANT_SMOKE_ENV, ensure_appcontainer_access
-
-                # Windows 10 only (or a CI diagnostic): the sandboxed WebView2
-                # processes need read access to the bundled runtime folder.
-                api._webview2_runtime["appcontainer_access"] = ensure_appcontainer_access(
-                    Path(api._webview2_runtime["path"]), force=os.environ.get(GRANT_SMOKE_ENV) == "1")
-            _dlog(f"WebView2 runtime: {api._webview2_runtime}")
-            session_log.event("webview2_runtime", selection=api._webview2_runtime)
-            from .webview2_runtime import watch_initialization
-
-            def webview2_started(ok, detail, *, diagnostic=bool(args.gui_smoke)):
-                api._webview2_init = {"ok": ok, "error": detail}
-                session_log.event("webview2_init", ok=ok, error=detail)
-                if not ok:
-                    _dlog(f"WebView2 initialization failed: {detail}")
-                    if not diagnostic and not api._startup_error:
-                        # Shown after the blank window closes; the smoke reports it itself.
-                        runtime = api._webview2_runtime or {}
-                        access = str(runtime.get("appcontainer_access") or "")
-                        hint = f" (folder permission step {access})" if access.startswith("failed") else ""
-                        api._startup_error = (f"Microsoft Edge WebView2 ({runtime.get('kind', 'system')} runtime) "
-                                              f"could not start: {detail}{hint}")
-                    if not diagnostic:
-                        _dismiss_failed_webview2_window(api, window)
-
-            watch_initialization(window, webview2_started)
+            configure_win32_webview2(
+                api,
+                window,
+                webview,
+                diagnostic=bool(args.gui_smoke),
+                logger=_dlog,
+                dismiss=_dismiss_failed_webview2_window,
+            )
         if window_session is not None:
             kwargs["private_mode"] = True
             if sys.platform == "win32":
@@ -1812,6 +1634,10 @@ def _main(args) -> int:
         else:
             webview.start(**kwargs)
         if api._startup_error:
+            if maybe_relaunch_webview2_fallback(
+                api, args, raw_argv=getattr(args, "_raw_argv", None), logger=_dlog,
+            ):
+                return 0
             raise RuntimeError(api._startup_error)
         # Snapshot: the smoke records its close outcome before the loop returns.
         report = dict(getattr(api, "_gui_smoke_report", {"ok": False, "error": "GUI closed before verification"}))

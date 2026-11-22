@@ -598,10 +598,10 @@ TRACING_BASELINES = {
         "../translucent_window.py": "037810024e32419d3a5f60face969d6c2a78fb811e5f08c4c0d3b1b68583165d",
     },
     "SLACS-module": {
-        "translucent.html": "ab0ee024a2e0baba972f74f0555b9f8addae49869930b18529c23e53fb46ac0a",
-        "translucent-v1.css": "87abdf0c460773baa40547749ad2074bb3adf996112e9128dcbb72d51921907d",
-        "translucent-v1.js": "4bd217284a8bb60208577eaf5dd6876074cc56692e31a7b5235892f27f1d47e2",
-        "../translucent_window.py": "0482fbc04265b4c23ec7a36333254d819be0e7596773334b4c70d9d07d1e7fca",
+        "translucent.html": "fb5ef3993e655633ee3284252145e984701c5051a937ccace5bad4fcf7f75994",
+        "translucent-v1.css": "7e12d08f4aa41c30524c27e6e669c936a8010d229ea474f54c8e1e46f42e5e07",
+        "translucent-v1.js": "1e30a0580da1a825349f2740f3ff672117edd910e498b40afe218cb9a381f17f",
+        "../translucent_window.py": "218fbada4b955aeb716b0e7e7d8425dcd21fb0ea83031b73451c2cbaf365226e",
     },
 }
 

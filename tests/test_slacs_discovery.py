@@ -7,7 +7,6 @@ import subprocess
 import sys
 import threading
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -179,24 +178,13 @@ def test_pending_query_cannot_publish_after_stop():
     assert [entry["status"] for entry in notifications] == ["stopped"]
 
 
-def test_default_query_is_hidden_bounded_and_read_only(monkeypatch):
-    calls = []
-
-    def run(arguments, **kwargs):
-        calls.append((arguments, kwargs))
-        return SimpleNamespace(stdout=json.dumps([process()]))
-
-    monkeypatch.setenv("SystemRoot", r"C:\Windows")
-    monkeypatch.setattr(discovery.subprocess, "run", run)
-    assert discovery._query_windows_processes(timeout=1.25) == [process()]
-    arguments, options = calls[0]
-    assert arguments[0] == r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-    assert "-NoProfile" in arguments and "-NonInteractive" in arguments
-    assert options["timeout"] == 1.25 and options["creationflags"] == 0x08000000
-    assert options["shell"] is False and options["stdin"] is subprocess.DEVNULL
-    assert "Get-CimInstance" in arguments[-1] and "CreationDate" in arguments[-1]
-    assert "ExecutionPolicy" not in " ".join(arguments)
-    assert SCRIPT not in " ".join(arguments)
+def test_default_query_uses_zero_subprocess_win32_toolhelp32(monkeypatch):
+    # Verify slacs_discovery does not import or spawn PowerShell / subprocess.
+    assert not hasattr(discovery, "subprocess")
+    assert not hasattr(discovery, "_PROCESS_QUERY")
+    monkeypatch.setattr(discovery.sys, "platform", "darwin")
+    with pytest.raises(OSError, match="Windows"):
+        discovery._query_windows_processes(timeout=1.25)
 
 
 def test_default_cache_coalesces_success_and_error_without_reusing_stale_success():
@@ -352,7 +340,7 @@ def test_each_powershell_query_is_logged_with_its_duration_and_reason(monkeypatc
     assert [e["kind"] for e in events] == ["slacs_query"] * 5
     assert events[0]["ok"] is True and events[0]["python_processes"] == 2
     assert [e["reason"] for e in events[1:]] == [
-        "timeout", "exit code 1", "invalid output", "could not start PowerShell (FileNotFoundError)"]
+        "timeout", "exit code 1", "invalid output", "process query failed (FileNotFoundError)"]
     assert all(isinstance(e["seconds"], float) for e in events)
     assert SCRIPT not in json.dumps(events) and "other.py" not in json.dumps(events)
 

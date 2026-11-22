@@ -1,38 +1,50 @@
 /* Independent tiled tracing window. Source display is a read-only snapshot. */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
-    module.exports = factory(require("./viewer-geometry-v1.js"), require("./laser-target-v1.js"));
+    module.exports = factory(
+      require("./viewer-geometry-v1.js"),
+      require("./laser-target-v1.js"),
+      require("./translucent-stage-follow-v1.js")
+    );
   } else {
-    const api = factory(root.Nd2ViewerGeometry, root.Nd2LaserTarget);
+    const api = factory(root.Nd2ViewerGeometry, root.Nd2LaserTarget, root.Nd2TranslucentStageFollow);
     root.Nd2Translucent = api;
     api.boot(root);
   }
-})(typeof globalThis !== "undefined" ? globalThis : this, function (geometry, laserTarget) {
+})(typeof globalThis !== "undefined" ? globalThis : this, function (geometry, laserTargetArg, stageFollowArg) {
   "use strict";
 
-  // The per-key stage step, kept for this app run. SLACS jogs the stage by its
-  // Roughness in micrometres (1 Roughness = 1 µm per press). By default Follow
-  // reads Roughness from SLACS and this step is only the fallback while it
-  // cannot be read; with reading turned off every press moves by this step.
-  const STEP_STORAGE_KEY = "nd2wsi.stageFollow.stepUm";
-  const STEP_AUTO_STORAGE_KEY = "nd2wsi.stageFollow.stepAuto";
-  const DEFAULT_STEP_UM = 10;
-  const MIN_STEP_UM = 0.001;
-  const MAX_STEP_UM = 10000;
-  // Follow's two flips are remembered per file format by the app
-  // (follow_flips.py), never in this page's storage: its origin changes with
-  // every launch. "other" names every format not listed here.
-  const FOLLOW_FORMAT_LABELS = {
-    nd2: "ND2", czi: "CZI", lif: "LIF", ometiff: "OME-TIFF", tiff: "TIFF", qptiff: "QPTIFF",
-    svs: "SVS", sdpc: "SDPC", jpeg: "JPEG", png: "PNG"
+  const laserTarget = (laserTargetArg && typeof laserTargetArg.validate === "function" &&
+    typeof laserTargetArg.mount === "function") ? laserTargetArg : {
+    validate: value => value || null,
+    mount: () => ({ render() {}, report() { return {}; }, cancel() {}, begin() { return false; },
+      contextmenu() { return false; }, calibrating: false, target: null }),
   };
-  // The current view is reported at most this often, for SLACS laser-shot records.
-  const VIEW_REPORT_MS = 200;
 
-  function followFormat(value) {
-    return typeof value === "string" && Object.prototype.hasOwnProperty.call(FOLLOW_FORMAT_LABELS, value) ?
-      value : "other";
-  }
+  const stageFollow = (stageFollowArg && typeof stageFollowArg.mount === "function") ? stageFollowArg : {
+    followFormat: () => "other", stagePixelSize: () => null, screenImageDelta: () => ({ x: 0, y: 0 }),
+    slacsRoughnessText: () => "SLACS Roughness is read while Follow runs", loadStep: () => 10, loadStepAuto: () => true,
+    createLaserAnnotations: () => ({ hydrate() {}, render() {} }),
+    createViewReporter: () => ({ windowFrame: () => null, reportView: async () => false,
+      scheduleViewReport() {}, reportMovedWindow() {}, dispose() {} }),
+    attachClientErrorForwarder: () => () => {},
+    mount: ({ state }) => {
+      state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
+        seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "" };
+      state.slacs = { available: false, session_id: null, status: "checking" };
+      return { paintFollow() {}, pauseFollow() {}, consumeStageState: () => false,
+        pollStageFollow: async () => {}, startStageFollow: async () => false,
+        stopStageFollow: () => Promise.resolve(true), pollSlacsDiscovery: async () => false,
+        revokeStageFollow: () => false, setStepUm: () => false, setStepAuto: () => false,
+        setFollowFlips: async () => false, setFormat() {}, dispose() {} };
+    },
+  };
+
+  // Visible controls that remain clickable while the tracing window is locked.
+  const LOCKED_INTERACTIVE_IDS = [
+    "overlay-lock", "overlay-close", "stage-follow-control", "stage-follow-settings",
+    "opacity-control", "roi-controls", "roi-import-review",
+  ];
 
   function validateContext(value, pageUrl) {
     if (!value || value.version !== 1 || !Array.isArray(value.center) ||
@@ -60,7 +72,7 @@
     return { ...value, slide_url: slide.href, query: query.toString(),
       opacity: Math.max(.1, Math.min(1, Number.isFinite(value.opacity) ? value.opacity : .55)),
       // An older context without these starts unflipped and names no format.
-      source_format: followFormat(value.source_format),
+      source_format: stageFollow.followFormat(value.source_format),
       laser_target: laserTarget.validate(value.laser_target),
       follow_flips: { flip_x: value.follow_flips?.flip_x === true, flip_y: value.follow_flips?.flip_y === true } };
   }
@@ -166,75 +178,48 @@
     return result;
   }
 
-  function stagePixelSize(info) {
-    const size = info.pixelSizeUm; // Metadata is [Y, X], not [X, Y].
-    return Array.isArray(size) && size.length === 2 && size.every(value => Number.isFinite(value) && value > 0)
-      ? { x: size[1], y: size[0] } : null;
-  }
-
-  // Quarter turns are exact, as in OSD's Point.rotate, so 90° views stay exact.
-  function rotationTerms(degrees) {
-    const turn = ((degrees % 360) + 360) % 360;
-    if (turn === 0) return { cos: 1, sin: 0 };
-    if (turn === 90) return { cos: 0, sin: 1 };
-    if (turn === 180) return { cos: -1, sin: 0 };
-    if (turn === 270) return { cos: 0, sin: -1 };
-    const radians = degrees * Math.PI / 180;
-    return { cos: Math.cos(radians), sin: Math.sin(radians) };
-  }
-
-  // A Follow displacement [dx, dy] in micrometres moves the view centre dx to
-  // the right and dy down on screen, as displayed: the overlay moves in the
-  // directions the user sees, whatever rotation or flip the main viewer handed
-  // over. Returns the canonical image-pixel move of the centre. Screen axes are
-  // converted as OpenSeadragon 5.0.1 converts a mouse drag: its point
-  // conversions undo the rotation but not the flip, so x is negated on a
-  // flipped viewport first. Each screen axis then spans its micrometres at the
-  // image's pixel size along that direction, which differs per axis when the
-  // pixels are not square.
-  function screenImageDelta(displacementUm, pixelSize, rotationDegrees, flipped) {
-    const { cos, sin } = rotationTerms(rotationDegrees);
-    const sign = flipped ? -1 : 1;
-    // Unit image-pixel directions of screen right and screen down.
-    const axes = [{ x: sign * cos, y: -sign * sin }, { x: sin, y: cos }];
-    let x = 0, y = 0;
-    axes.forEach((axis, index) => {
-      const um = displacementUm[index];
-      if (!um) return;
-      const umPerPixel = Math.hypot(axis.x * pixelSize.x, axis.y * pixelSize.y);
-      x += um * axis.x / umPerPixel;
-      y += um * axis.y / umPerPixel;
-    });
-    return { x, y };
-  }
-
-  // What the key follower's snapshot says the next W/A/S/D press moves by while
-  // Follow reads Roughness from SLACS: the last good Roughness (kept while SLACS
-  // is busy), or the fallback step while none can be read. Image pixels are at
-  // the overlay's own calibration; Mirror shows which keys SLACS reverses.
-  function slacsRoughnessText(keys, fallbackUm, pixelSize) {
-    if (!keys || typeof keys !== "object") return "SLACS Roughness is read while Follow runs";
-    const micrometres = value => String(Math.round(value * 1000) / 1000) + " µm";
-    const valid = value => typeof value === "number" && Number.isFinite(value) && value > 0 && value <= MAX_STEP_UM;
-    const roughness = valid(keys.roughness_um) ? keys.roughness_um : null;
-    const fallback = valid(keys.step_um) ? keys.step_um : fallbackUm;
-    if (keys.slacs_busy === true) {
-      return roughness !== null ? "SLACS busy — last Roughness " + micrometres(roughness) :
-        "SLACS busy — using " + micrometres(fallback);
+  function wheelZoomFactor(event, pageHeight) {
+    if (!event) return 1;
+    const dy = Number(event.deltaY) || 0;
+    const dx = Number(event.deltaX) || 0;
+    const raw = (event.shiftKey && dy === 0 && dx !== 0) ? dx : dy;
+    if (!Number.isFinite(raw) || raw === 0) return 1;
+    const mode = event.deltaMode || 0;
+    let deltaPx = raw;
+    if (mode === 1) deltaPx = raw * (100 / 3);
+    else if (mode === 2) deltaPx = raw * Math.max((Number.isFinite(pageHeight) ? pageHeight : 600) || 600, 100);
+    deltaPx = Math.max(-300, Math.min(300, deltaPx));
+    if (event.ctrlKey && mode === 0 && Math.abs(deltaPx) < 50) {
+      return Math.exp(Math.max(-0.25, Math.min(0.25, -deltaPx * 0.005)));
     }
-    if (roughness === null || keys.controls_ok !== true) {
-      return "SLACS Roughness unreadable — using " + micrometres(roughness ?? fallback);
-    }
-    const flag = value => value === true ? "on" : value === false ? "off" : "unknown";
-    const pixels = !pixelSize ? "" : pixelSize.x === pixelSize.y ?
-      " = " + (roughness / pixelSize.x).toFixed(1) + " px" :
-      " = X " + (roughness / pixelSize.x).toFixed(1) + " · Y " + (roughness / pixelSize.y).toFixed(1) + " px";
-    return "SLACS Roughness: " + micrometres(roughness) + pixels +
-      " · Mirror H " + flag(keys.mirror_h) + ", V " + flag(keys.mirror_v);
+    const k = event.altKey ? 0.00002 : event.shiftKey ? 0.0001 : 0.0005;
+    return Math.exp(-deltaPx * k);
+  }
+
+  function formatZoomValue(z) {
+    if (!Number.isFinite(z) || z <= 0) return "";
+    return z < 0.01 ? z.toFixed(4) : z.toFixed(3);
+  }
+
+  function formatZoomLabel(z) {
+    const value = formatZoomValue(z);
+    return value ? value + "×" : "—";
+  }
+
+  function parseZoomInput(raw) {
+    if (typeof raw === "number") return Number.isFinite(raw) && raw > 0 ? raw : null;
+    if (typeof raw !== "string") return null;
+    const trimmed = raw.trim();
+    const match = /^([+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([xX×%])?$/.exec(trimmed);
+    if (!match) return null;
+    const base = Number(match[1]);
+    const value = match[2] === "%" ? base / 100 : base;
+    return Number.isFinite(value) && value > 0 ? value : null;
   }
 
   function mount(options) {
     const { window: win, document: doc, api, OSD, context, info } = options;
+    const activeContext = { ...context };
     const importer = options.importer || win.Nd2AstromapImport;
     const stage = doc.getElementById("translucent-stage");
     const overlay = doc.getElementById("overlay");
@@ -251,54 +236,37 @@
     const opacityControl = doc.getElementById("opacity-control");
     const opacitySlider = doc.getElementById("overlay-opacity");
     const opacityValue = doc.getElementById("opacity-value");
-    const followButton = doc.getElementById("stage-follow");
+    const windowControls = doc.getElementById("window-controls");
+    const zoomControl = doc.getElementById("zoom-control");
+    const zoomBadge = doc.getElementById("zoom-badge");
+    const zoomPopover = doc.getElementById("zoom-popover");
+    const zoomForm = doc.getElementById("zoom-form");
+    const zoomInput = doc.getElementById("zoom-input");
+    const zoomApply = doc.getElementById("zoom-apply");
+    const zoomStepButtons = Array.from(
+      zoomPopover?.querySelectorAll?.("[data-zoom-step]") ||
+      doc.querySelectorAll?.("#zoom-popover [data-zoom-step]") || []
+    );
     const followControl = doc.getElementById("stage-follow-control");
-    const followDisconnected = doc.getElementById("stage-follow-disconnected");
-    const followStatus = doc.getElementById("stage-follow-status");
     const followSettings = doc.getElementById("stage-follow-settings");
-    const followSave = doc.getElementById("stage-follow-save");
-    const followStep = doc.getElementById("stage-follow-step");
-    const followStepAuto = doc.getElementById("stage-follow-step-auto");
-    const followStepLabel = doc.getElementById("stage-follow-step-label");
-    const followStepHint = doc.getElementById("stage-follow-step-hint");
-    const followRoughness = doc.getElementById("stage-follow-roughness");
-    const followCount = doc.getElementById("stage-follow-count");
-    const flipBoxes = { y: doc.getElementById("stage-follow-flip-ud"), x: doc.getElementById("stage-follow-flip-lr") };
-    const followFlipHint = doc.getElementById("stage-follow-flip-hint");
-    const sourceFormat = followFormat(context.source_format);
-    const flipHint = "Reverses Follow's movement only, never the image. Remembered for " +
-      (sourceFormat === "other" ? "other image types" : FOLLOW_FORMAT_LABELS[sourceFormat] + " files") + " on this PC.";
-    const pixelSize = stagePixelSize(info);
+    const laserTargetCapture = doc.getElementById("laser-target-capture");
+    if (zoomPopover) zoomPopover.hidden = true;
+    const sourceFormat = stageFollow.followFormat(activeContext.source_format);
+    const pixelSize = stageFollow.stagePixelSize(info);
     const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
-    const initialOpacity = validOpacity(context.opacity) ? context.opacity : .55;
-    const clampStep = value =>
-      Number.isFinite(value) && value >= MIN_STEP_UM && value <= MAX_STEP_UM ? value : null;
-    const loadStep = () => {
-      try { const stored = clampStep(Number(win.localStorage.getItem(STEP_STORAGE_KEY))); if (stored) return stored; }
-      catch (_) { /* private mode or blocked storage: fall back to the default */ }
-      return DEFAULT_STEP_UM;
-    };
-    // Reading Roughness from SLACS is on unless this viewer turned it off.
-    const loadStepAuto = () => {
-      try { return win.localStorage.getItem(STEP_AUTO_STORAGE_KEY) !== "false"; }
-      catch (_) { return true; }
-    };
-    const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
-      rois: [], roiIndex: -1, roiName: "", loadingRois: false, stepUm: loadStep(), stepAuto: loadStepAuto(),
+    const initialOpacity = validOpacity(activeContext.opacity) ? activeContext.opacity : .55;
+    const state = { locked: activeContext.locked === true, pending: false, gesture: null, ready: false,
+      rois: [], roiIndex: -1, roiName: "", loadingRois: false,
+      stepUm: stageFollow.loadStep(win), stepAuto: stageFollow.loadStepAuto(win),
       importResult: null, importReview: null, importApplied: false,
-      opacity: initialOpacity, confirmedOpacity: initialOpacity,
+      opacity: initialOpacity, confirmedOpacity: initialOpacity, zoomPopoverOpen: false,
       // Follow's flips as the app last confirmed them (remembered for this format).
-      followFlips: { x: context.follow_flips?.flip_x === true, y: context.follow_flips?.flip_y === true },
-      flipPending: false, flipMessage: "", target: laserTarget.validate(context.laser_target) };
-    const follow = state.follow = { enabled: false, pending: false, status: "off", sessionId: "",
-      seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "" };
-    state.slacs = { available: false, session_id: null, status: "checking" };
-    let followEpoch = 0, followTimer = null, followInFlight = false, disposed = false;
-    // Bumped whenever the lock changes or settles, so a follow reply can tell
-    // whether the overlay stayed locked since its request left.
-    let lockEpoch = 0;
-    let discoveryTask = null, discoveryInterval = null, discoveryGeneration = 0, disconnected = "";
-    let followLifecycle = Promise.resolve();
+      followFlips: { x: activeContext.follow_flips?.flip_x === true, y: activeContext.follow_flips?.flip_y === true },
+      flipPending: false, flipMessage: "", target: laserTarget.validate(activeContext.laser_target),
+      follow: { enabled: false, pending: false, status: "off", sessionId: "",
+        seq: 0, displacement: [0, 0], lastDelta: { x: 0, y: 0 }, message: "", keys: null, slacsSession: "" },
+      slacs: { available: false, session_id: null, status: "checking" } };
+    let disposed = false, lockEpoch = 0, discoveryInterval = null;
     const showStatus = message => { status.textContent = message; status.hidden = !message; };
     let opacityTask = null, opacityError = "";
     const paintOpacity = () => {
@@ -307,7 +275,7 @@
       opacitySlider.setAttribute("aria-valuetext", percent + "%");
       opacitySlider.disabled = state.locked || state.pending;
       opacityValue.textContent = percent + "%";
-      stage.style.opacity = context.opacity_mode === "native" ? "1" : String(state.opacity);
+      stage.style.opacity = activeContext.opacity_mode === "native" ? "1" : String(state.opacity);
     };
     const setOpacity = value => {
       if (state.locked || state.pending || !validOpacity(value)) {
@@ -353,51 +321,26 @@
       event.preventDefault(); event.stopPropagation();
     }, { passive: false });
     paintOpacity();
+    let maxZoomRatio = Math.max(16, activeContext.zoom || 1);
     const viewer = OSD({
       element: stage, tileSources: makeTileSource(info, context, OSD),
       showNavigationControl: false, showNavigator: false, showSequenceControl: false,
       prefixUrl: "", drawer: "canvas", crossOriginPolicy: false,
       autoResize: false, preserveImageSizeOnResize: true,
       animationTime: .15, springStiffness: 12, zoomPerScroll: 1.2,
-      minZoomImageRatio: .05, maxZoomPixelRatio: Math.max(8, context.zoom),
+      minZoomImageRatio: .05, maxZoomPixelRatio: maxZoomRatio,
       visibilityRatio: 0, constrainDuringPan: false,
       imageSmoothingEnabled: true, imageLoaderLimit: 6, maxImageCacheCount: 120,
-      gestureSettingsMouse: { clickToZoom: false, dblClickToZoom: false, scrollToZoom: true },
+      gestureSettingsMouse: { clickToZoom: false, dblClickToZoom: false, scrollToZoom: false },
       gestureSettingsTouch: { pinchToZoom: true, flickEnabled: false, clickToZoom: false, dblClickToZoom: false },
     });
     // On a focused canvas OSD's own keys rotate (R), flip (F), pan (W/A/S/D,
     // arrows) or zoom (+/-, 0). This window shows exactly the main viewer's
     // orientation and is aligned by hand, so none of them may act here.
     viewer.addHandler("canvas-key", event => { event.preventDefaultAction = true; });
-    const laserItems = new Map(), laserLayer = doc.getElementById("laser-annotations");
-    if (Array.isArray(context.laser_items)) {
-      for (const item of context.laser_items) {
-        if (item?.slacs?.kind === "laser_shot" && typeof item.id === "string") {
-          laserItems.set(item.id, item);
-        }
-      }
-    }
-    const renderLaserItems = () => {
-      laserLayer.replaceChildren();
-      if (!state.ready) return;
-      const size = viewer.viewport.getContainerSize();
-      laserLayer.setAttribute("viewBox", "0 0 " + size.x + " " + size.y);
-      for (const item of laserItems.values()) {
-        const ring = item.type === "box" ? [[item.x,item.y],[item.x+item.w,item.y],
-          [item.x+item.w,item.y+item.h],[item.x,item.y+item.h]] : item.geojson?.geometry?.coordinates?.[0];
-        if (!Array.isArray(ring) || !ring.every(p=>Array.isArray(p) && p.length >= 2 && p.slice(0,2).every(Number.isFinite))) continue;
-        const points = ring.map(([x,y])=>geometry.imageToViewerElementPoint(viewer.viewport,{x,y},OSD));
-        const polygon = doc.createElementNS("http://www.w3.org/2000/svg","polygon");
-        polygon.setAttribute("points",points.map(p=>p.x+","+p.y).join(" "));laserLayer.appendChild(polygon);
-        const label = doc.createElementNS("http://www.w3.org/2000/svg","text");
-        label.setAttribute("x",Math.min(...points.map(p=>p.x))); label.setAttribute("y",Math.min(...points.map(p=>p.y))-5);
-        label.textContent = String(item.text) + " · " + item.slacs.shots + (item.slacs.shots === 1 ? " shot" : " shots");laserLayer.appendChild(label);
-      }
-    };
-    win.nd2TranslucentLaserItem = item => {
-      if (disposed || item?.slacs?.kind !== "laser_shot" || typeof item.id !== "string") return false;
-      laserItems.set(item.id, item);renderLaserItems();return true;
-    };
+    const laserAnnotations = stageFollow.createLaserAnnotations({
+      win, doc, viewer, OSD, state, initialItems: activeContext.laser_items, isDisposed: () => disposed,
+    });
     let drawnRois = null, roiBoxes = [];
     const renderRoiBoxes = () => {
       if (!state.ready) return;
@@ -426,54 +369,211 @@
       const selected = roiBoxes[state.roiIndex];
       if (selected && roiLayer.lastElementChild !== selected) roiLayer.appendChild(selected);
     };
-    // The app keeps the current view so each SLACS laser shot (",") and next
-    // well (".") it logs carries the image-pixel centre of this window, with
-    // the Follow progress already shown. Reports are never logged themselves.
-    let viewReportTimer = null, viewReportInFlight = false, viewReportAgain = false, reportedFrame = "", reportedDpr = null;
-    const finiteValues = values => values.every(Number.isFinite) ? values : null;
-    const windowFrame = () => finiteValues([win.screenX, win.screenY, win.innerWidth, win.innerHeight]);
-    const overlayView = () => {
-      const viewport = viewer.viewport;
-      const center = viewport.viewportToImageCoordinates(viewport.getCenter(true));
-      const size = viewport.getContainerSize();
-      const following = follow.enabled && !!follow.sessionId;
-      return { version: 1, center_px: [center.x, center.y],
-        zoom: viewport.viewportToImageZoom(viewport.getZoom(true)),
-        rotation: viewport.getRotation(), flip: viewport.getFlip(), locked: state.locked,
-        follow_session: following ? follow.sessionId : null, follow_seq: following ? follow.seq : null,
-        follow_displacement_um: following ? follow.displacement.slice() : null,
-        container: finiteValues([size.x, size.y]), window: windowFrame(), ...target.report() };
+    const renderOverlays = () => { renderRoiBoxes(); laserAnnotations.render(); };
+    let target = null;
+    const viewReporter = stageFollow.createViewReporter({
+      win, viewer, state, api, getTarget: () => target, isDisposed: () => disposed,
+    });
+    const { windowFrame, reportView, scheduleViewReport, reportMovedWindow } = viewReporter;
+    target = laserTarget.mount({
+      win, doc, viewer, OSD, pixelSize, state, api,
+      frame: windowFrame, changed: scheduleViewReport, message: showStatus,
+    });
+
+    const currentImageZoom = () => {
+      const vp = viewer.viewport;
+      const raw = vp.getZoom(true);
+      return typeof vp.viewportToImageZoom === "function" ? vp.viewportToImageZoom(raw) : raw;
     };
-    const reportView = async () => {
-      if (disposed || !state.ready || typeof api.report_overlay_view !== "function") return false;
-      if (viewReportTimer !== null) { win.clearTimeout(viewReportTimer); viewReportTimer = null; }
-      // One request in flight; a change meanwhile is sent once it returns.
-      if (viewReportInFlight) { viewReportAgain = true; return false; }
-      viewReportInFlight = true;
-      try {
-        const view = overlayView();
-        const ok = (await api.report_overlay_view(view))?.ok === true;
-        if (ok) { reportedFrame = JSON.stringify(view.window); reportedDpr = win.devicePixelRatio; }
-        return ok;
-      } catch (_) { return false; }
-      finally {
-        viewReportInFlight = false;
-        if (viewReportAgain) { viewReportAgain = false; scheduleViewReport(); }
+    const zoomBounds = () => {
+      const vp = viewer.viewport;
+      let minZ = 1e-4, maxZ = maxZoomRatio;
+      const hasConvert = typeof vp.viewportToImageZoom === "function";
+      if (typeof vp.getMinZoom === "function") {
+        const rawMin = vp.getMinZoom();
+        const candidate = hasConvert ? vp.viewportToImageZoom(rawMin) : rawMin;
+        if (Number.isFinite(candidate) && candidate > 0) minZ = candidate;
+      } else {
+        const size = vp.getContainerSize?.();
+        if (size?.x > 0 && size?.y > 0 && info.width > 0 && info.height > 0) {
+          minZ = Math.max(1e-6, 0.05 * Math.min(size.x / info.width, size.y / info.height));
+        }
       }
+      if (typeof vp.getMaxZoom === "function") {
+        const rawMax = vp.getMaxZoom();
+        const candidate = hasConvert ? vp.viewportToImageZoom(rawMax) : rawMax;
+        if (Number.isFinite(candidate) && candidate > minZ) maxZ = candidate;
+      }
+      if (Number.isFinite(activeContext.zoom) && activeContext.zoom > 0) {
+        minZ = Math.min(minZ, activeContext.zoom);
+        maxZ = Math.max(maxZ, activeContext.zoom);
+      }
+      return { min: Math.max(1e-6, minZ), max: Math.max(maxZ, minZ) };
     };
-    // A trailing throttle: the report sent when it fires describes the latest view.
-    const scheduleViewReport = () => {
-      if (disposed || viewReportTimer !== null || typeof api.report_overlay_view !== "function") return;
-      viewReportTimer = win.setTimeout(() => { viewReportTimer = null; reportView(); }, VIEW_REPORT_MS);
+    const paintZoom = () => {
+      const z = state.ready ? currentImageZoom() : activeContext.zoom;
+      const disabled = state.locked || state.pending || !state.ready;
+      if (zoomBadge) {
+        zoomBadge.textContent = formatZoomLabel(z);
+        zoomBadge.disabled = disabled;
+        zoomBadge.setAttribute("aria-expanded", String(state.zoomPopoverOpen));
+      }
+      if (zoomInput) zoomInput.disabled = disabled;
+      if (zoomApply) zoomApply.disabled = disabled;
+      for (const button of zoomStepButtons) button.disabled = disabled;
     };
-    // Moving the window changes no camera, and a native drag ends outside the
-    // page, so the 1 s discovery tick also reports a window frame that changed.
-    const reportMovedWindow = () => {
+    const closeZoomPopover = ({ restoreFocus = false } = {}) => {
+      const wasOpen = state.zoomPopoverOpen;
+      state.zoomPopoverOpen = false;
+      if (zoomPopover) zoomPopover.hidden = true;
+      if (zoomControl?.dataset) zoomControl.dataset.open = "false";
+      if (zoomBadge) zoomBadge.setAttribute("aria-expanded", "false");
+      zoomInput?.removeAttribute?.("aria-invalid");
+      if (wasOpen && restoreFocus && zoomBadge && !zoomBadge.disabled) zoomBadge.focus?.();
+      return wasOpen;
+    };
+    const openZoomPopover = () => {
+      if (!zoomPopover || !zoomBadge || state.locked || state.pending || !state.ready) return false;
+      if (target.calibrating) target.cancel();
+      state.zoomPopoverOpen = true;
+      zoomPopover.hidden = false;
+      if (zoomControl?.dataset) zoomControl.dataset.open = "true";
+      zoomBadge.setAttribute("aria-expanded", "true");
+      if (zoomInput) {
+        zoomInput.value = formatZoomValue(currentImageZoom());
+        zoomInput.removeAttribute?.("aria-invalid");
+        zoomInput.focus?.();
+        zoomInput.select?.();
+      }
+      return true;
+    };
+    const applyImageZoom = (targetImageZoom, refPoint = null) => {
+      if (!state.ready || state.locked || state.pending) return false;
+      if (!Number.isFinite(targetImageZoom) || targetImageZoom <= 0) return false;
+      const vp = viewer.viewport;
+      const { min, max } = zoomBounds();
+      const clamped = Math.max(min, Math.min(max, targetImageZoom));
+      const vpZoom = typeof vp.imageToViewportZoom === "function" ? vp.imageToViewportZoom(clamped) : clamped;
+      vp.zoomTo(vpZoom, refPoint || null, true);
+      viewer.forceRedraw?.();
+      renderOverlays();
       target.render();
-      if (state.ready && (JSON.stringify(windowFrame()) !== reportedFrame || reportedDpr !== win.devicePixelRatio)) scheduleViewReport();
+      paintZoom();
+      reportView();
+      return true;
     };
-    const target = laserTarget.mount({ win, doc, viewer, OSD, pixelSize, state, api,
-      frame: windowFrame, changed: scheduleViewReport, message: showStatus });
+    const stepZoom = delta => {
+      if (!state.ready || state.locked || state.pending || !Number.isFinite(delta) || delta === 0) return false;
+      const current = currentImageZoom();
+      if (!Number.isFinite(current) || current <= 0) return false;
+      const { min, max } = zoomBounds();
+      const next = Math.max(min, Math.min(max, Math.round((current + delta) * 1e6) / 1e6));
+      const applied = applyImageZoom(next, viewer.viewport.getCenter(true));
+      if (applied && zoomInput) {
+        zoomInput.value = formatZoomValue(currentImageZoom());
+        zoomInput.removeAttribute?.("aria-invalid");
+      }
+      return applied;
+    };
+    const submitZoomForm = event => {
+      event?.preventDefault?.();
+      if (state.locked || state.pending || !state.ready) { closeZoomPopover(); return false; }
+      const parsed = parseZoomInput(zoomInput?.value ?? "");
+      if (parsed === null) {
+        zoomInput?.setAttribute?.("aria-invalid", "true");
+        zoomInput?.focus?.();
+        zoomInput?.select?.();
+        return false;
+      }
+      zoomInput?.removeAttribute?.("aria-invalid");
+      const applied = applyImageZoom(parsed, viewer.viewport.getCenter(true));
+      if (applied) closeZoomPopover();
+      return applied;
+    };
+    if (zoomControl) {
+      for (const name of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) {
+        zoomControl.addEventListener(name, event => event.stopPropagation());
+      }
+      zoomControl.addEventListener("wheel", event => { event.preventDefault(); event.stopPropagation(); }, { passive: false });
+    }
+    zoomBadge?.addEventListener("click", () => { if (state.zoomPopoverOpen) closeZoomPopover(); else openZoomPopover(); });
+    zoomForm?.addEventListener("submit", submitZoomForm);
+    if (zoomInput) {
+      zoomInput.addEventListener("keydown", event => {
+        if (event.altKey || event.ctrlKey || event.metaKey) return;
+        if (event.key === "Escape" && state.zoomPopoverOpen) {
+          event.preventDefault?.(); event.stopPropagation?.();
+          closeZoomPopover({ restoreFocus: true });
+          return;
+        }
+        if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+          event.preventDefault(); event.stopPropagation?.();
+          stepZoom((event.shiftKey ? 0.01 : 0.001) * (event.key === "ArrowUp" ? 1 : -1));
+        }
+      });
+      zoomInput.addEventListener("input", () => { zoomInput.removeAttribute?.("aria-invalid"); });
+    }
+    for (const button of zoomStepButtons) {
+      button.addEventListener("click", () => {
+        stepZoom(Number(button.dataset?.zoomStep ?? button.getAttribute?.("data-zoom-step")));
+      });
+    }
+    const isExcludedWheelTarget = el => {
+      if (!el) return false;
+      for (const node of [zoomPopover, zoomControl, windowControls, opacityControl, importReview,
+        followControl, followSettings, laserTargetCapture]) {
+        if (node && (el === node || node.contains?.(el))) return true;
+      }
+      const hit = el.closest?.(
+        "#zoom-popover, #zoom-control, #window-controls, #opacity-control, #roi-import-review, #stage-follow-control, #stage-follow-settings, #laser-target-capture"
+      );
+      return Boolean(hit && typeof hit === "object" && (!hit.id || [
+        "zoom-popover", "zoom-control", "window-controls", "opacity-control",
+        "roi-import-review", "stage-follow-control", "stage-follow-settings", "laser-target-capture",
+      ].includes(hit.id)));
+    };
+    stage.addEventListener("wheel", event => {
+      if (isExcludedWheelTarget(event.target)) return;
+      if (state.locked || state.pending || !state.ready) return;
+      event.preventDefault?.();
+      const factor = wheelZoomFactor(event, stage.clientHeight || win.innerHeight || 600);
+      if (!Number.isFinite(factor) || factor === 1) return;
+      const current = currentImageZoom();
+      if (!Number.isFinite(current) || current <= 0) return;
+      const vp = viewer.viewport;
+      let refPoint = null;
+      if (typeof vp.pointFromPixel === "function" && Number.isFinite(event.clientX) && Number.isFinite(event.clientY)) {
+        const rect = typeof stage.getBoundingClientRect === "function" ? stage.getBoundingClientRect() : { left: 0, top: 0 };
+        const elemPt = geometry.flipAwareElementPoint(vp, { x: event.clientX - rect.left, y: event.clientY - rect.top }, OSD);
+        refPoint = vp.pointFromPixel(elemPt, true);
+      }
+      applyImageZoom(current * factor, refPoint);
+    }, { passive: false });
+
+    const collectLockedInteractiveRects = () => {
+      const rects = [];
+      for (const id of LOCKED_INTERACTIVE_IDS) {
+        const el = doc.getElementById(id);
+        if (!el || el.hidden || el.style?.display === "none" || typeof el.getBoundingClientRect !== "function") continue;
+        const rect = el.getBoundingClientRect();
+        const left = Number(rect?.left ?? rect?.x), top = Number(rect?.top ?? rect?.y);
+        const width = Number(rect?.width ?? (Number(rect?.right) - left));
+        const height = Number(rect?.height ?? (Number(rect?.bottom) - top));
+        if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) continue;
+        rects.push({ x: left, y: top, width, height });
+      }
+      return rects;
+    };
+    const reportLockedInteractiveRects = () => {
+      if (disposed || typeof api.set_locked_interactive_rects !== "function") return false;
+      const rects = state.locked ? collectLockedInteractiveRects() : [];
+      try {
+        const result = api.set_locked_interactive_rects(rects);
+        if (result && typeof result.catch === "function") result.catch(() => {});
+        return true;
+      } catch (_) { return false; }
+    };
+
     const paintRois = () => {
       const hasRois = state.rois.length > 0;
       doc.getElementById("roi-controls").hidden = !hasRois;
@@ -503,9 +603,12 @@
         ...review.issues.map(issue => `${issue.repaired ? "Repaired" : "Skipped"}: ${issue.message}\n${issue.raw}`),
       ].join("\n\n") : "";
     };
+    let stageFollowCtrl = null;
     const paintLock = () => {
+      if (state.locked) closeZoomPopover();
       overlay.dataset.locked = String(state.locked);
       lock.setAttribute("aria-pressed", String(state.locked));
+      const follow = state.follow;
       const lockLabel = follow.enabled ? (state.locked ? "Unlock to align by hand" : "Lock to follow SLACS keys") :
         (state.locked ? "Unlock image and window" : "Lock image and window");
       lock.setAttribute("aria-label", lockLabel);
@@ -514,366 +617,27 @@
       viewer.setMouseNavEnabled(!state.locked && !state.pending);
       paintOpacity();
       paintRois();
-      paintFollow();
+      paintZoom();
+      stageFollowCtrl?.paintFollow();
     };
-    const paintFollow = () => {
-      if (disposed) return;
-      // Follow appears only while SLACS is detected. The loss notice is its own
-      // element, so it stays visible after the control hides.
-      const detected = state.slacs.available === true;
-      followControl.hidden = !detected;
-      target.render();
-      if (!detected) {
-        followSettings.hidden = true;
-        doc.getElementById("stage-follow-options").setAttribute("aria-expanded", "false");
-      }
-      followDisconnected.hidden = !disconnected;
-      followDisconnected.textContent = disconnected;
-      const available = typeof api.start_stage_follow === "function" && typeof api.stage_follow_state === "function" &&
-        typeof api.stop_stage_follow === "function";
-      followButton.disabled = follow.pending || !state.ready || !pixelSize || !available || !detected;
-      followButton.setAttribute("aria-pressed", String(follow.enabled));
-      followButton.title = !pixelSize ? "Follow needs a calibrated image pixel size" : !available ? "Stage follow is unavailable" :
-        !detected ? "SLACS is not detected" :
-        follow.enabled ? "Stop following SLACS keys" : "Follow SLACS W/A/S/D keys";
-      // Unlocked and SLACS losing the foreground are hints that never stop Follow.
-      // A pause stops polling, so it must not hide behind either stale hint.
-      const live = follow.enabled && ["waiting", "following"].includes(follow.status);
-      const unlocked = live && !state.locked;
-      const notInFront = live && !!follow.keys && follow.keys.slacs_in_front === false;
-      followStatus.textContent = follow.pending ? "Connecting…" :
-        live && follow.laserDelivery === "delivery_disabled" ? "Laser boxes paused: viewer busy" :
-        unlocked ? "Unlocked: align by hand, lock to follow" : notInFront ? "SLACS not in front" :
-        follow.status === "following" ? "Following SLACS keys" :
-        follow.status === "waiting" ? "Waiting for W/A/S/D in SLACS" :
-        follow.status === "paused" ? "Paused" : "Off";
-      followStatus.dataset.status = follow.pending ? follow.status : unlocked ? "unlocked" :
-        notInFront ? "not-in-front" : follow.status;
-      followStatus.title = follow.laserDelivery === "delivery_disabled" ?
-        "Shots are being skipped. Laser boxes resume when the viewer responds." : follow.message;
-      if (followStep) {
-        followStep.value = String(state.stepUm);
-        // The step is fixed for a run: changing it mid-follow would desync counts.
-        followStep.disabled = follow.enabled || follow.pending;
-      }
-      if (followStepAuto) {
-        followStepAuto.checked = state.stepAuto;
-        followStepAuto.disabled = follow.enabled || follow.pending;  // fixed for a run, like the step
-      }
-      if (followStepLabel) {
-        followStepLabel.textContent = state.stepAuto ? "Fallback" : "Step";
-      }
-      if (followStepHint) {
-        followStepHint.textContent = state.stepAuto ?
-          "Each press moves by SLACS's Roughness (1 Roughness = 1 µm), and SLACS's Mirror Horizontal and Mirror Vertical reverse W/S and A/D here too. Counts W/A/S/D only while SLACS is in front." :
-          "Set this to SLACS's Roughness (1 Roughness = 1 µm per press). Counts W/A/S/D only while SLACS is in front.";
-      }
-      if (followStepLabel) followStepLabel.title = followStepHint?.textContent || "";
-      if (followRoughness) {
-        followRoughness.hidden = !state.stepAuto;
-        followRoughness.title = state.stepAuto ? slacsRoughnessText(follow.keys, state.stepUm, pixelSize) : "";
-        followRoughness.textContent = followRoughness.title.replace("SLACS Roughness: ", "").replace(" = ", " · ")
-          .replace(" · Mirror H ", " · Mirror ").replace(", V ", "/");
-      }
-      if (followCount) {
-        const counted = follow.keys && Number.isFinite(follow.keys.counted) ? follow.keys.counted : 0;
-        followCount.textContent = "Key presses: " + counted;
-      }
-      // Unlike the step, a flip applies from the next press: it stays live while
-      // following and while locked.
-      const flipAvailable = typeof api.set_stage_follow_flips === "function";
-      for (const axis of ["x", "y"]) {
-        if (!flipBoxes[axis]) continue;
-        flipBoxes[axis].checked = state.followFlips[axis];
-        flipBoxes[axis].disabled = state.flipPending || !flipAvailable;
-      }
-      if (followFlipHint) {
-        followFlipHint.textContent = state.flipMessage || flipHint;
-        followFlipHint.hidden = !state.flipMessage;
-      }
-      for (const input of Object.values(flipBoxes)) if (input) input.title = state.flipMessage || flipHint;
-      followSave.disabled = !follow.enabled || follow.pending || typeof api.save_stage_follow_connection !== "function";
-      doc.getElementById("stage-follow-message").textContent = follow.message ||
-        (!pixelSize ? "A calibrated pixel size is needed." : "Commanded motion · moves in on-screen directions");
-      doc.getElementById("stage-follow-delta").textContent = "Last image move: " +
-        follow.lastDelta.x.toFixed(3) + ", " + follow.lastDelta.y.toFixed(3) + " px";
-      doc.getElementById("stage-follow-scale").textContent = pixelSize ?
-        "Pixel size: X " + pixelSize.x.toFixed(3) + " · Y " + pixelSize.y.toFixed(3) + " µm/px" : "Pixel size unavailable";
-    };
-    const clearFollowTimer = () => {
-      if (followTimer !== null) win.clearTimeout(followTimer);
-      followTimer = null;
-    };
-    const pauseFollow = message => {
-      clearFollowTimer();
-      follow.status = "paused";
-      follow.message = message + " Turn Follow off and on to reconnect.";
-      paintFollow();
-    };
-    const consumeStageState = (result, mayMove, { report = true } = {}) => {
-      if (!follow.enabled || follow.status === "paused" || disposed) return false;
-      if (result?.enabled !== true || result.session_id !== follow.sessionId) {
-        pauseFollow("Stage connection changed."); return false;
-      }
-      if (result.status === "paused") { pauseFollow(result.message || "Stage updates stopped."); return false; }
-      const cumulative = result.displacement_um;
-      if (!["waiting", "following"].includes(result.status) || !Number.isSafeInteger(result.seq) || result.seq < follow.seq ||
-          !Array.isArray(cumulative) || cumulative.length !== 2 || !cumulative.every(Number.isFinite)) {
-        pauseFollow("Stage update could not be read."); return false;
-      }
-      const delta = [cumulative[0] - follow.displacement[0], cumulative[1] - follow.displacement[1]];
-      if (result.seq === follow.seq && (delta[0] || delta[1])) {
-        pauseFollow("Stage update changed unexpectedly."); return false;
-      }
-      // Only a locked overlay follows. While unlocked the user aligns by hand:
-      // the reply is still consumed below, so presses made meanwhile are
-      // discarded rather than replayed after locking. mayMove is decided per
-      // request (pollStageFollow), because a reply carries presses counted
-      // before it was sent.
-      if (mayMove && state.locked && !state.pending && result.status === "following" && (delta[0] || delta[1])) {
-        // Orientation is the main viewer's, shown unchanged; the target rotation
-        // is the one OSD's own drag conversion uses.
-        const imageDelta = screenImageDelta(delta, pixelSize, viewer.viewport.getRotation(),
-          viewer.viewport.getFlip());
-        const center = viewer.viewport.viewportToImageCoordinates(viewer.viewport.getCenter(true));
-        const target = { x: center.x + imageDelta.x, y: center.y + imageDelta.y };
-        if (![target.x, target.y, imageDelta.x, imageDelta.y].every(Number.isFinite)) {
-          pauseFollow("Stage movement is outside the image coordinate range."); return false;
-        }
-        // Add to the current camera, so following continues from wherever the
-        // user left the view while unlocked.
-        geometry.centerOnPreservingZoom(viewer.viewport, target, OSD);
-        viewer.forceRedraw();
-        renderRoiBoxes();
-        renderLaserItems();
-        follow.lastDelta = imageDelta;
-      }
-      const seqChanged = result.seq !== follow.seq;
-      follow.displacement = cumulative.slice();
-      follow.seq = result.seq;
-      follow.status = result.status;
-      follow.laserDelivery = result.laser_delivery || "ready";
-      follow.message = "";
-      follow.keys = result.keys && typeof result.keys === "object" ? result.keys : null;
-      paintFollow();
-      // Also while unlocked, so the app knows which presses the view already shows.
-      // When locked, report immediately so laser shots right after a jog do not wait on the 200 ms throttle.
+    // Also report while unlocked so the app knows which presses the view already shows.
+    // When locked, report immediately so laser shots right after a jog do not wait on the 200 ms throttle.
+    const onFollowSeq = (seqChanged, report) => {
       if (seqChanged && report) {
         if (state.locked) reportView();
         else scheduleViewReport();
       }
-      return true;
     };
-    const pollStageFollow = async () => {
-      if (disposed || !follow.enabled || follow.status === "paused" || followInFlight) return;
-      clearFollowTimer();
-      const epoch = followEpoch;
-      // The lock state when the request leaves decides, not when the reply
-      // lands: a reply requested while unlocked or mid-lock, or answered after
-      // the lock changed, carries presses made while not locked and never moves.
-      const lockAtRequest = state.locked && !state.pending ? lockEpoch : -1;
-      followInFlight = true;
-      const watchdog = win.setTimeout(() => {
-        if (epoch === followEpoch && follow.enabled && !disposed) pauseFollow("Stage connection is not responding.");
-      }, 3000);
-      try {
-        const result = await api.stage_follow_state();
-        if (epoch === followEpoch && !disposed) consumeStageState(result, lockAtRequest === lockEpoch);
-      } catch (_) {
-        if (epoch === followEpoch && follow.enabled && !disposed) pauseFollow("Stage connection was lost.");
-      } finally {
-        win.clearTimeout(watchdog);
-        followInFlight = false;
-        if (!disposed && follow.enabled && follow.status !== "paused") scheduleStagePoll();
-      }
-    };
-    const scheduleStagePoll = () => {
-      clearFollowTimer();
-      followTimer = win.setTimeout(pollStageFollow, 50);
-    };
-    const startStageFollow = async () => {
-      target.cancel();
-      // A discovery reply still on its way decides; Follow needs a detected SLACS.
-      if (!state.slacs.available && discoveryTask) await discoveryTask;
-      if (disposed || follow.enabled || follow.pending || !state.ready || !pixelSize || !state.slacs.available ||
-          typeof api.start_stage_follow !== "function" || typeof api.stage_follow_state !== "function" ||
-          typeof api.stop_stage_follow !== "function") return false;
-      const epoch = ++followEpoch;
-      disconnected = "";
-      // Every Follow is bound to the SLACS process detected now; its loss or
-      // replacement stops it (pollSlacsDiscovery, revokeStageFollow).
-      follow.slacsSession = state.slacs.session_id;
-      follow.pending = true; follow.message = ""; paintFollow();
-      // Serialize native starts/stops, including a close during a pending start.
-      const task = followLifecycle.catch(() => {}).then(async () => {
-        if (epoch !== followEpoch || disposed) return false;
-        // Observe SLACS's W/A/S/D keys, moving by SLACS's Roughness when it is read
-        // (the step is then the fallback), or by the step alone.
-        const result = requireSuccess(await api.start_stage_follow({ source: "keys", step_um: state.stepUm,
-          step_source: state.stepAuto ? "slacs" : "manual" }), "Could not connect to the stage");
-        if (epoch !== followEpoch || disposed) return false;
-        if (typeof result?.session_id !== "string" || !result.session_id) throw new Error("Stage session is unavailable");
-        follow.enabled = true; follow.sessionId = result.session_id; follow.status = "waiting";
-        follow.seq = 0; follow.displacement = [0, 0]; follow.lastDelta = { x: 0, y: 0 }; follow.keys = null;
-        scheduleStagePoll();
-        reportView();
-        return true;
-      }).catch(error => {
-        if (epoch === followEpoch && !disposed) { follow.status = "off"; follow.message = error.message || "Could not connect to the stage"; }
-        return false;
-      }).finally(() => {
-        if (epoch === followEpoch && !disposed) { follow.pending = false; paintLock(); }
-      });
-      followLifecycle = task;
-      return task;
-    };
-    const stopStageFollow = () => {
-      const wasActive = follow.enabled || follow.pending;
-      const epoch = ++followEpoch;
-      clearFollowTimer();
-      follow.enabled = false; follow.status = "off"; follow.sessionId = ""; follow.message = ""; follow.keys = null;
-      follow.slacsSession = "";
-      follow.pending = wasActive;
-      if (!disposed) paintLock();
-      if (!wasActive) return Promise.resolve(true);
-      reportView();
-      const task = followLifecycle.catch(() => {}).then(async () => {
-        requireSuccess(await api.stop_stage_follow(), "Could not stop stage follow");
-        return true;
-      }).catch(error => {
-        if (epoch === followEpoch && !disposed) follow.message = error.message || "Could not stop stage follow";
-        return false;
-      }).finally(() => {
-        if (epoch === followEpoch && !disposed) { follow.pending = false; paintLock(); }
-      });
-      followLifecycle = task;
-      return task;
-    };
-    const pollSlacsDiscovery = () => {
-      if (disposed) return Promise.resolve(false);
-      if (discoveryTask) return discoveryTask;
-      const generation = ++discoveryGeneration;
-      const task = (async () => {
-        let watchdog;
-        let next = { available: false, session_id: null, status: "error" };
-        try {
-          if (typeof api.slacs_discovery_state !== "function") throw new Error("Discovery unavailable");
-          const timeout = new Promise((_, reject) => {
-            watchdog = win.setTimeout(() => reject(new Error("Discovery timed out")), 3000);
-          });
-          const value = await Promise.race([Promise.resolve(api.slacs_discovery_state()), timeout]);
-          if (value?.available === true && value.status === "running" && typeof value.session_id === "string" && value.session_id) {
-            next = { available: true, session_id: value.session_id, status: String(value.status || "running") };
-          } else next.status = String(value?.status || "not_running");
-        } catch (_) { /* Fail closed if process metadata is unavailable. */ }
-        finally { if (watchdog !== undefined) win.clearTimeout(watchdog); }
-        if (disposed || generation !== discoveryGeneration) return false;
-        state.slacs = next;
-        if (follow.slacsSession && (!next.available || next.session_id !== follow.slacsSession) &&
-            (follow.enabled || follow.pending)) {
-          stopStageFollow();
-          follow.status = "paused";
-          disconnected = "SLACS program stopped or changed. Follow stopped; reconnect manually.";
-        }
-        paintFollow();
-        return next.available;
-      })();
-      discoveryTask = task;
-      task.finally(() => { if (discoveryTask === task) discoveryTask = null; });
-      return task;
-    };
-    // The backend pushes this as soon as discovery reports the program lost or
-    // replaced. stopStageFollow bumps followEpoch, so a follow reply that arrives
-    // after the revocation, even one computed before the loss, never moves the image.
-    const revokeStageFollow = revocation => {
-      if (disposed || (!follow.enabled && !follow.pending)) return false;
-      const sessionId = typeof revocation?.session_id === "string" ? revocation.session_id : "";
-      if (sessionId && follow.sessionId && sessionId !== follow.sessionId) return false;
-      stopStageFollow();
-      follow.status = "paused";
-      disconnected = typeof revocation?.message === "string" && revocation.message ? revocation.message :
-        "SLACS program stopped or changed. Follow stopped; reconnect manually.";
-      // Forget the lost detection; a discovery reply already in flight is from before the loss.
-      state.slacs = { available: false, session_id: null, status: "checking" };
-      discoveryTask = null;
-      paintFollow();
-      pollSlacsDiscovery();
-      return true;
-    };
-    win.nd2TranslucentRevokeFollow = revokeStageFollow;
-    followButton.addEventListener("click", () => follow.enabled ? stopStageFollow() : startStageFollow());
-    doc.getElementById("stage-follow-options").addEventListener("click", () => {
-      followSettings.hidden = !followSettings.hidden;
-      doc.getElementById("stage-follow-options").setAttribute("aria-expanded", String(!followSettings.hidden));
+    stageFollowCtrl = stageFollow.mount({
+      win, doc, api, OSD, viewer, state, pixelSize, sourceFormat, target,
+      getLockEpoch: () => lockEpoch, isDisposed: () => disposed,
+      paintLock, renderOverlays, reportView, onFollowSeq,
+      onControlsChanged: () => { if (state.locked && !state.pending) reportLockedInteractiveRects(); },
+      requireSuccess,
     });
-    const setStepUm = value => {
-      const next = clampStep(value);
-      if (next === null || follow.enabled || follow.pending) { paintFollow(); return false; }
-      state.stepUm = next;
-      try { win.localStorage.setItem(STEP_STORAGE_KEY, String(next)); }
-      catch (_) { /* storage may be unavailable; keep the value for this session */ }
-      paintFollow();
-      return true;
-    };
-    followStep?.addEventListener("change", () => setStepUm(Number(followStep.value)));
-    const setStepAuto = value => {
-      if (typeof value !== "boolean" || follow.enabled || follow.pending) { paintFollow(); return false; }
-      state.stepAuto = value;
-      try { win.localStorage.setItem(STEP_AUTO_STORAGE_KEY, String(value)); }
-      catch (_) { /* storage may be unavailable; keep the choice for this session */ }
-      paintFollow();
-      return true;
-    };
-    followStepAuto?.addEventListener("change", () => setStepAuto(followStepAuto.checked === true));
-    // Flip up/down reverses W/S (flip_y) and Flip left/right reverses A/D
-    // (flip_x) for Follow's key source, from the next press on. The app applies
-    // and remembers them; this page never turns or flips the image for them.
-    const setFollowFlips = async ({ x, y } = {}) => {
-      if (state.flipPending || disposed || typeof x !== "boolean" || typeof y !== "boolean" ||
-          typeof api.set_stage_follow_flips !== "function") { paintFollow(); return false; }
-      const previous = state.followFlips;
-      if (x === previous.x && y === previous.y) { paintFollow(); return true; }
-      state.followFlips = { x, y };
-      state.flipPending = true;
-      paintFollow();
-      try {
-        const result = requireSuccess(await api.set_stage_follow_flips({ flip_x: x, flip_y: y }),
-          "Could not change Follow's direction");
-        state.followFlips = { x: typeof result?.flip_x === "boolean" ? result.flip_x : x,
-          y: typeof result?.flip_y === "boolean" ? result.flip_y : y };
-        state.flipMessage = typeof result?.message === "string" ? result.message : "";
-        return true;
-      } catch (error) {
-        state.followFlips = previous;
-        state.flipMessage = error.message || "Could not change Follow's direction";
-        return false;
-      } finally {
-        state.flipPending = false;
-        paintFollow();
-      }
-    };
-    flipBoxes.y?.addEventListener("change", () =>
-      setFollowFlips({ x: state.followFlips.x, y: flipBoxes.y.checked === true }));
-    flipBoxes.x?.addEventListener("change", () =>
-      setFollowFlips({ x: flipBoxes.x.checked === true, y: state.followFlips.y }));
-    followSave.addEventListener("click", async () => {
-      if (!follow.enabled || follow.pending) return;
-      const epoch = followEpoch;
-      try {
-        const result = requireSuccess(await api.save_stage_follow_connection(), "Could not save the connection");
-        if (epoch === followEpoch && !disposed && !result?.cancelled) {
-          follow.message = "Connection saved. Open it in the stage sender."; paintFollow();
-        }
-      } catch (error) {
-        if (epoch === followEpoch && !disposed) { follow.message = error.message || "Could not save the connection"; paintFollow(); }
-      }
-    });
-    for (const id of ["stage-follow-control", "stage-follow-settings"]) {
-      const control = doc.getElementById(id);
-      for (const name of ["pointerdown", "pointermove", "pointerup", "pointercancel", "wheel"]) {
-        control.addEventListener(name, event => event.stopPropagation());
-      }
-    }
+    const { consumeStageState, pollStageFollow, startStageFollow, stopStageFollow,
+      pollSlacsDiscovery, revokeStageFollow, setStepUm, setStepAuto, setFollowFlips } = stageFollowCtrl;
+
     const cancelGesture = () => {
       if (state.gesture) state.gesture.cancelled = true;
       state.gesture = null;
@@ -885,6 +649,7 @@
       state.locked = !previous;
       lockEpoch++;
       cancelGesture();
+      closeZoomPopover();
       target.cancel();
       if (state.ready) restoreCamera(viewer, camera(viewer)); // stop any in-flight pan/zoom
       paintLock();
@@ -893,21 +658,22 @@
         if (opacityTask) await opacityTask;
         const result = requireSuccess(await api.set_translucent_locked(state.locked), "Could not change the lock");
         if (typeof result?.locked === "boolean") state.locked = result.locked;
-        if (state.locked && follow.enabled && result?.stage_follow?.enabled) {
+        if (state.locked && state.follow.enabled && result?.stage_follow?.enabled) {
           consumeStageState(result.stage_follow, false, { report: false });
         }
       } catch (error) {
         state.locked = previous;
         showStatus(error.message || "Could not change the lock");
-      } finally { state.pending = false; lockEpoch++; paintLock(); reportView(); }
+      } finally { state.pending = false; lockEpoch++; paintLock(); reportLockedInteractiveRects(); reportView(); }
     };
     const close = async () => {
+      closeZoomPopover();
       target.cancel();
       stopStageFollow();
       try { requireSuccess(await api.close_translucent(), "Could not close this window"); }
       catch (error) { showStatus(error.message || "Could not close this window"); }
     };
-    lock.addEventListener("click", toggleLock);
+    lock.addEventListener("click", () => { lock.blur?.(); return toggleLock(); });
     doc.getElementById("overlay-close").addEventListener("click", close);
     paintLock();
     const selectRoi = index => {
@@ -999,37 +765,92 @@
       try { return focusRoi(viewer, rect, info); }
       catch (error) { showStatus(error.message); return false; }
     };
+    const applyContext = nextContext => {
+      if (disposed || !nextContext || typeof nextContext !== "object") return false;
+      const wasLocked = state.locked;
+      const hasZoom = Number.isFinite(nextContext.zoom) && nextContext.zoom > 0;
+      const hasCenter = Array.isArray(nextContext.center) && nextContext.center.length === 2 &&
+        nextContext.center.every(Number.isFinite);
+      if (hasZoom) { activeContext.zoom = nextContext.zoom; maxZoomRatio = Math.max(maxZoomRatio, nextContext.zoom); }
+      if (hasCenter) activeContext.center = nextContext.center.slice();
+      if (Number.isFinite(nextContext.rotation)) activeContext.rotation = nextContext.rotation;
+      if (typeof nextContext.flip === "boolean") activeContext.flip = nextContext.flip;
+      if (validOpacity(nextContext.opacity)) {
+        activeContext.opacity = state.opacity = state.confirmedOpacity = nextContext.opacity;
+      }
+      if (typeof nextContext.opacity_mode === "string") activeContext.opacity_mode = nextContext.opacity_mode;
+      if (typeof nextContext.locked === "boolean") state.locked = nextContext.locked;
+      if (typeof nextContext.source_format === "string") {
+        activeContext.source_format = stageFollow.followFormat(nextContext.source_format);
+        stageFollowCtrl.setFormat(activeContext.source_format);
+      }
+      if (nextContext.follow_flips && typeof nextContext.follow_flips === "object") {
+        state.followFlips = { x: nextContext.follow_flips.flip_x === true, y: nextContext.follow_flips.flip_y === true };
+      }
+      if (Array.isArray(nextContext.laser_items)) laserAnnotations.hydrate(nextContext.laser_items);
+      if (state.ready) {
+        const vp = viewer.viewport;
+        if (Number.isFinite(nextContext.rotation)) vp.setRotation(nextContext.rotation, true);
+        if (typeof nextContext.flip === "boolean") vp.setFlip(nextContext.flip);
+        if (hasCenter || hasZoom) {
+          const saved = camera(viewer);
+          const nextCenter = hasCenter ? vp.imageToViewportCoordinates(new OSD.Point(...nextContext.center)) : saved.center;
+          restoreCamera(viewer, { zoom: hasZoom ? nextContext.zoom : saved.zoom, center: nextCenter });
+        }
+        if (Array.isArray(nextContext.rois)) {
+          if (nextContext.rois.length) {
+            setRois({ rois: nextContext.rois, name: nextContext.roiName || "" },
+              { pan: false, index: nextContext.roiIndex ?? -1, initial: true });
+          } else {
+            state.rois = []; state.roiIndex = -1; state.roiName = "";
+            state.importResult = state.importReview = null; state.importApplied = false;
+            paintImportReview();
+          }
+        }
+        renderOverlays();
+        target.render();
+      }
+      paintLock();
+      if (state.locked || wasLocked) reportLockedInteractiveRects();
+      if (state.ready) reportView();
+      return true;
+    };
+    win.nd2TranslucentApplyContext = applyContext;
 
     viewer.addHandler("open", () => {
       const viewport = viewer.viewport;
       // Exactly the main viewer's orientation; this window has no orientation
       // settings of its own (an older handoff's mirror_scan is ignored, and
       // Follow's flips reverse its movement only).
-      viewport.setRotation(context.rotation || 0, true);
-      viewport.setFlip(context.flip === true);
-      restoreCamera(viewer, { zoom: context.zoom,
-        center: viewport.imageToViewportCoordinates(new OSD.Point(...context.center)) });
+      viewport.setRotation(activeContext.rotation || 0, true);
+      viewport.setFlip(activeContext.flip === true);
+      restoreCamera(viewer, { zoom: activeContext.zoom,
+        center: viewport.imageToViewportCoordinates(new OSD.Point(...activeContext.center)) });
       state.ready = true;
       showStatus("");
       paintRois();
-      paintFollow();
+      paintZoom();
+      stageFollowCtrl.paintFollow();
       resize();
       reportView();
-      if (Array.isArray(context.rois) && context.rois.length) {
-        setRois({ rois: context.rois, name: context.roiName || "" },
-          { pan: false, index: context.roiIndex ?? -1, initial: true });
+      if (Array.isArray(activeContext.rois) && activeContext.rois.length) {
+        setRois({ rois: activeContext.rois, name: activeContext.roiName || "" },
+          { pan: false, index: activeContext.roiIndex ?? -1, initial: true });
       }
+      if (state.locked) reportLockedInteractiveRects();
     });
     viewer.addHandler("open-failed", () => showStatus("Could not load this image. Close and reopen the translucent viewer."));
     viewer.addHandler("tile-load-failed", () => showStatus("Some image tiles could not load. Close and reopen the translucent viewer."));
-    // One handler: the outlines and the view report follow every camera change.
-    viewer.addHandler("update-viewport", () => { renderRoiBoxes(); renderLaserItems(); target.render(); scheduleViewReport(); });
+    viewer.addHandler("zoom", paintZoom);
+    viewer.addHandler("animation", paintZoom);
+    // One handler: the outlines, zoom badge, and view report follow every camera change.
+    viewer.addHandler("update-viewport", () => { renderOverlays(); target.render(); paintZoom(); scheduleViewReport(); });
     const resize = () => {
       if (state.ready) {
         resizePreservingScale(viewer, stage.clientWidth, stage.clientHeight, OSD);
-        renderRoiBoxes(); renderLaserItems();
-        target.render(); scheduleViewReport();
+        renderOverlays(); target.render(); paintZoom(); scheduleViewReport();
       }
+      if (state.locked) reportLockedInteractiveRects();
     };
     const observer = win.ResizeObserver ? new win.ResizeObserver(resize) : null;
     observer?.observe(stage);
@@ -1043,11 +864,11 @@
           gesture.dirty = false;
           const x = gesture.x, y = gesture.y;
           if (gesture.edge) {
-            const target = resizeGeometry(gesture.width, gesture.height, gesture.edge,
+            const box = resizeGeometry(gesture.width, gesture.height, gesture.edge,
               x - gesture.startX, y - gesture.startY);
-            const result = requireSuccess(await api.resize_window(target.width, target.height), "Could not resize this window");
-            const width = Number(result?.width) || target.width;
-            const height = Number(result?.height) || target.height;
+            const result = requireSuccess(await api.resize_window(box.width, box.height), "Could not resize this window");
+            const width = Number(result?.width) || box.width;
+            const height = Number(result?.height) || box.height;
             const dx = gesture.edge.includes("w") ? gesture.appliedWidth - width : 0;
             const dy = gesture.edge.includes("n") ? gesture.appliedHeight - height : 0;
             if (dx || dy) requireSuccess(await api.move_window(dx, dy), "Could not move this window");
@@ -1086,7 +907,9 @@
     };
     doc.getElementById("window-drag").addEventListener("pointerdown", event => startGesture(event));
     overlay.addEventListener("pointerdown", event => {
-      if (event.altKey && !event.target.closest("button, input, #opacity-control, #roi-import-review, #stage-follow-control, #stage-follow-settings, #laser-target, #laser-target-capture, .resize-handle")) startGesture(event);
+      if (event.altKey && !event.target?.closest?.("button, input, #opacity-control, #roi-import-review, #zoom-control, #stage-follow-control, #stage-follow-settings, #laser-target, #laser-target-capture, .resize-handle")) {
+        startGesture(event);
+      }
     }, true);
     for (const handle of doc.querySelectorAll(".resize-handle")) {
       handle.addEventListener("pointerdown", event => startGesture(event, handle.dataset.edge));
@@ -1105,64 +928,76 @@
       overlay.releasePointerCapture?.(event.pointerId);
     });
     overlay.addEventListener("pointercancel", cancelGesture);
+
+    const closestMatch = (el, selector, ids) => {
+      const hit = el?.closest?.(selector);
+      return Boolean(hit && typeof hit === "object" && (!hit.id || ids.includes(hit.id)));
+    };
+    const isInZoomControl = el => !!(el && (el === zoomControl || el === zoomBadge || el === zoomPopover ||
+      el === zoomInput || zoomControl?.contains?.(el) || closestMatch(el, "#zoom-control", ["zoom-control"])));
+    const isInZoomPopover = el => !!(el && (el === zoomPopover || el === zoomInput ||
+      zoomPopover?.contains?.(el) || closestMatch(el, "#zoom-popover", ["zoom-popover"])));
+    const isTextInput = el => {
+      if (!el) return false;
+      const tag = String(el.tagName || "").toUpperCase();
+      if (tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable) return true;
+      return tag === "INPUT" && !["range", "checkbox", "radio", "button", "submit", "reset"].includes(String(el.type || "text").toLowerCase());
+    };
+    doc.addEventListener("pointerdown", event => {
+      if (state.zoomPopoverOpen && !isInZoomControl(event.target)) closeZoomPopover();
+    }, true);
     doc.addEventListener("keydown", event => {
       if (event.key === "Escape" && target.calibrating) {
         event.preventDefault(); event.stopImmediatePropagation(); target.cancel(); return;
       }
-      if (event.repeat || event.altKey) return;
-      if (event.target?.closest?.("#stage-follow-control, #stage-follow-settings") && event.key !== "Escape") return;
+      if (event.repeat) return;
+      if (event.key === "Escape" && !event.altKey && !event.ctrlKey && !event.metaKey) {
+        if (state.zoomPopoverOpen) {
+          event.preventDefault(); event.stopPropagation?.();
+          closeZoomPopover({ restoreFocus: true });
+          return;
+        }
+        event.preventDefault(); close(); return;
+      }
+      if (event.altKey) return;
+      const eventTarget = event.target || doc.activeElement;
+      if (isInZoomPopover(eventTarget) || isInZoomPopover(doc.activeElement) || isTextInput(eventTarget)) return;
+      if (closestMatch(eventTarget, "#stage-follow-control, #stage-follow-settings",
+        ["stage-follow-control", "stage-follow-settings"])) return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o") {
         event.preventDefault(); chooseRois(); return;
       }
       if (event.ctrlKey || event.metaKey) return;
-      if (event.target?.closest?.("#opacity-control, #roi-import-review") && /^(Arrow|Home$|End$|Page)/.test(event.key)) return;
-      if (event.key === "Escape") { event.preventDefault(); close(); }
-      else if (event.key.toLowerCase() === "l") { event.preventDefault(); toggleLock(); }
+      if (closestMatch(eventTarget, "#opacity-control, #roi-import-review", ["opacity-control", "roi-import-review"]) &&
+          /^(Arrow|Home$|End$|Page)/.test(event.key)) return;
+      if (event.key.toLowerCase() === "l") { event.preventDefault(); toggleLock(); }
       else if (event.key === "ArrowLeft") { event.preventDefault(); selectRoi(state.roiIndex - 1); }
       else if (event.key === "ArrowRight") { event.preventDefault(); selectRoi(state.roiIndex + 1); }
     }, true);
     // Keep the embedded page itself at 100%; zoom belongs to the image.
     doc.addEventListener("wheel", event => { if (event.ctrlKey || state.locked) event.preventDefault(); }, { passive: false });
-    // Forward uncaught overlay errors to the session log. Rate limited, and it
-    // must never throw from inside an error handler.
-    let clientLogCount = 0, clientLogWindowStart = 0;
-    const forwardClientError = payload => {
-      try {
-        if (typeof api.log_client_event !== "function") return;
-        const now = win.performance?.now ? win.performance.now() : Date.now();
-        if (now - clientLogWindowStart > 10000) { clientLogWindowStart = now; clientLogCount = 0; }
-        if (clientLogCount >= 20) return;
-        clientLogCount += 1;
-        const result = api.log_client_event(payload);
-        if (result && typeof result.catch === "function") result.catch(() => {});
-      } catch (_) { /* logging must not surface a new error */ }
-    };
-    win.addEventListener("error", event => forwardClientError({ source: "translucent", kind: "error",
-      message: String(event?.message || event?.error || "error"),
-      where: event?.filename ? event.filename + ":" + event.lineno + ":" + event.colno : "",
-      stack: event?.error?.stack ? String(event.error.stack) : "" }));
-    win.addEventListener("unhandledrejection", event => {
-      const reason = event?.reason;
-      forwardClientError({ source: "translucent", kind: "unhandledrejection",
-        message: String(reason?.message ?? reason ?? "unhandledrejection"),
-        stack: reason?.stack ? String(reason.stack) : "" });
-    });
+    const forwardClientError = stageFollow.attachClientErrorForwarder(win, api);
     win.addEventListener("pagehide", () => {
-      target.cancel(); stopStageFollow(); disposed = true;
-      discoveryGeneration++;
-      if (discoveryInterval !== null) win.clearInterval(discoveryInterval);
-      if (viewReportTimer !== null) win.clearTimeout(viewReportTimer);
-      viewReportTimer = null;
+      closeZoomPopover();
+      target.cancel();
+      stageFollowCtrl.dispose();
+      disposed = true;
+      if (discoveryInterval !== null && typeof win.clearInterval === "function") win.clearInterval(discoveryInterval);
+      viewReporter.dispose();
       cancelGesture();
       win.removeEventListener?.("resize", resize);
       observer?.disconnect();
       viewer.destroy();
     }, { once: true });
     pollSlacsDiscovery();
-    discoveryInterval = win.setInterval(() => { reportMovedWindow(); pollSlacsDiscovery(); }, 1000);
+    if (typeof win.setInterval === "function") {
+      discoveryInterval = win.setInterval(() => { reportMovedWindow(); pollSlacsDiscovery(); }, 1000);
+    }
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity, repairRois,
       startStageFollow, stopStageFollow, pollStageFollow, pollSlacsDiscovery, revokeStageFollow,
-      setStepUm, setStepAuto, setFollowFlips, reportView, forwardClientError, target };
+      setStepUm, setStepAuto, setFollowFlips, reportView, forwardClientError, target,
+      openZoomPopover, closeZoomPopover, setZoom: applyImageZoom, stepZoom,
+      applyContext, reportLockedInteractiveRects };
   }
 
   async function boot(win) {
@@ -1194,6 +1029,9 @@
   }
 
   return { validateContext, makeTileSource, camera, restoreCamera, resizePreservingScale,
-    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints, stagePixelSize, screenImageDelta,
-    slacsRoughnessText, mount, boot };
+    resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints,
+    stagePixelSize: stageFollow.stagePixelSize,
+    screenImageDelta: stageFollow.screenImageDelta,
+    slacsRoughnessText: stageFollow.slacsRoughnessText,
+    wheelZoomFactor, formatZoomLabel, parseZoomInput, mount, boot };
 });

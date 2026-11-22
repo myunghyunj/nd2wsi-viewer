@@ -65,6 +65,7 @@ _BS_TYPEMASK = 0x000F
 _CHECKBOX_STYLES = frozenset((0x2, 0x3, 0x5, 0x6))
 _GWL_STYLE = -16
 _GA_ROOT = 2
+_ERROR_ACCESS_DENIED = 5
 _ERROR_TIMEOUT = 1460
 
 # Kept sample latencies per summary window; the window's read count is exact.
@@ -388,6 +389,11 @@ class _Win32Windows:
             raise _Unreadable("A SLACS control closed while it was being read.")
         if code in (0, _ERROR_TIMEOUT):
             raise _Busy(f"SLACS did not answer within {timeout_ms} ms.")
+        if code == _ERROR_ACCESS_DENIED:
+            raise _Unreadable(
+                "Windows blocked reading SLACS's controls (error 5 / UIPI — "
+                "SLACS may be running as Administrator while the viewer is not)."
+            )
         raise _Unreadable(f"Reading a SLACS control failed (Windows error {code}).")
 
 
