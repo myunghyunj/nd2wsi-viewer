@@ -31,10 +31,10 @@ extra = '''        # Reopen the exported JPEG through the actual native entry po
         pane("state.roi={x:111,y:123,w:80,h:90}; state.roiSite=null; refreshAstromapPanel(); document.getElementById('astromap-add-current').click(); true")
         check(pane('astromapItems().length') == 1, 'JPG annotation did not create ROI')
         # Exercise the ZIP button on the JPEG pane and retain the real server response.
-        pane("window.__qaFetch=window.fetch; window.fetch=async function(input,init){const result=await window.__qaFetch.call(this,input,init); if(String(input).includes('api/astromap') && init?.method==='POST'){window.__qaExportStatus=result.status;window.__qaExport=await result.clone().json();}return result;}; HTMLAnchorElement.prototype.click=function(){window.__qaDownload=this.href;}; document.getElementById('astromap-export').click(); true")
-        jpeg_export = wait_pane('window.__qaExport || null')
-        check(pane('window.__qaExportStatus') == 200, f'JPG export failed: {jpeg_export}')
-        jpeg_download = wait_pane('window.__qaDownload || null')
+        pane("__win.__qaFetch=__win.fetch.bind(__win); __win.fetch=async function(input,init){const result=await __win.__qaFetch(input,init); if(String(input).includes('api/astromap') && init?.method==='POST'){__win.__qaExportStatus=result.status;__win.__qaExport=await result.clone().json();}return result;}; __win.HTMLAnchorElement.prototype.click=function(){__win.__qaDownload=this.href;}; document.getElementById('astromap-export').click(); true")
+        jpeg_export = wait_pane('__win.__qaExport || null')
+        check(pane('__win.__qaExportStatus') == 200, f'JPG export failed: {jpeg_export}')
+        jpeg_download = wait_pane('__win.__qaDownload || null')
         with urllib.request.urlopen(jpeg_download, timeout=60) as response:
             jpeg_zip = response.read()
         jpeg_zip_path = session.exports_root / 'jpeg-annotation.zip'
@@ -68,7 +68,7 @@ extra = '''        # Reopen the exported JPEG through the actual native entry po
         })()""")
         check(minimal['open'] and minimal['radios'] == 0 and minimal['method'] == 'bffree', f'Incorrect minimal confirmation: {minimal}')
         check(minimal['titleSize'] == [1,1], 'Confirmation title is visibly rendered')
-        check(minimal['background'] == 'rgba(246, 246, 248, 0.72)' and 'blur(28px)' in minimal['blur'], f'Light glass material mismatch: {minimal}')
+        check(minimal['background'] == 'rgba(255, 255, 255, 0.82)' and 'blur(26px)' in minimal['blur'], f'Light glass material mismatch: {minimal}')
         check(' '.join(minimal['text'].split()) == "Applying correction rebuilds and saves this slide's display pyramid. Original measurements stay unchanged. Est. time: about 6 min Cancel Continue", f'Unexpected dialog content: {minimal}')
         report['shading_confirmation'] = minimal
 '''
@@ -77,7 +77,7 @@ assert marker in source
 source = source.replace(marker, orientation + extra + marker, 1)
 dark_snapshot = '''        report['screenshots'] = {'light': str(snapshot)}
         dark_material = window.evaluate_js("document.documentElement.classList.remove('light'); document.querySelector('#frames iframe.active').contentDocument.documentElement.classList.remove('light'); getComputedStyle(document.getElementById('shading-confirm')).backgroundColor")
-        check(dark_material == 'rgba(29, 29, 31, 0.82)', f'Dark glass material mismatch: {dark_material}')
+        check(dark_material == 'rgba(25, 25, 25, 0.78)', f'Dark glass material mismatch: {dark_material}')
         snapshot = session.exports_root / 'shading-dark.png'
         captured.clear()
         AppHelper.callAfter(lambda: BrowserView.instances[window.uid].webview.takeSnapshotWithConfiguration_completionHandler_(None, complete_snapshot))

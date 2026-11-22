@@ -94,6 +94,7 @@ def shell_toolbar_checks():
       const ids=['astromap-toggle','shading-correction','compare-toggle',
         'translucent-toggle','info-toggle'];
       return {hidden:group.hidden,expanded:toggle.getAttribute('aria-expanded'),
+        width:window.innerWidth,
         chevron:getComputedStyle(chevron).maskImage || getComputedStyle(chevron).webkitMaskImage,
         active:document.querySelector('#frames iframe.active')?.src,
         buttons:ids.map(id=>{const b=document.getElementById(id),r=b.getBoundingClientRect();
@@ -114,13 +115,24 @@ def shell_toolbar_checks():
             return {"path": str(path), "top": str(top_path), "size": [image.width, image.height]}
 
     initial = wait_for(lambda: parent.evaluate_js(state_script), description="shell tool disclosure")
-    check(initial["hidden"] and initial["expanded"] == "false", "Top tools are not initially collapsed")
-    check("angle-left.svg" in initial["chevron"], f"Collapsed disclosure is not the requested angle-left: {initial}")
-    check(all(button["rect"][2] == 0 for button in initial["buttons"]),
-          "Collapsed group still occupies visible button space")
+    expect_expanded = initial["width"] >= 900
     check(pane_eval(parent, "!document.getElementById('tb-translucent') && !document.getElementById('tb-info')"),
           "Cloud or Info remains in the lower toolbar")
     wait_for(lambda: pane_eval(parent, "state.viewer.world.getItemAt(0).getFullyLoaded()"), description="parent screenshot tiles")
+    if expect_expanded:
+        check(not initial["hidden"] and initial["expanded"] == "true",
+              f"Top tools should start expanded on >=900px desktop windows: {initial}")
+        parent.evaluate_js("document.getElementById('shell-tools-toggle').click(); true")
+        collapsed = wait_for(lambda: (value if value["hidden"] and value["expanded"] == "false" else None)
+                             if (value := parent.evaluate_js(state_script)) else None,
+                             description="collapsed shell tools")
+    else:
+        check(initial["hidden"] and initial["expanded"] == "false",
+              f"Top tools are not initially collapsed on narrow window: {initial}")
+        collapsed = initial
+    check("angle-left.svg" in collapsed["chevron"], f"Collapsed disclosure is not the requested angle-left: {collapsed}")
+    check(all(button["rect"][2] == 0 for button in collapsed["buttons"]),
+          "Collapsed group still occupies visible button space")
     collapsed_snapshot = capture("collapsed")
     parent.evaluate_js("document.getElementById('shell-tools-toggle').click(); true")
     expanded = wait_for(lambda: (value if not value["hidden"] and value["expanded"] == "true" else None)
@@ -147,7 +159,7 @@ def shell_toolbar_checks():
     wait_for(lambda: parent.evaluate_js("document.getElementById('shell-tools').hidden && "
                                        "document.getElementById('shell-tools-toggle').getAttribute('aria-expanded')==='false'"),
              description="shell tools collapse roundtrip")
-    return {"collapsed": initial, "expanded": expanded, "lower_cloud_info_absent": True,
+    return {"initial": initial, "collapsed": collapsed, "expanded": expanded, "lower_cloud_info_absent": True,
             "info_active_pane_open_close": True, "collapse_roundtrip": True,
             "snapshots": {"collapsed": collapsed_snapshot, "expanded": expanded_snapshot, "info_open": info_snapshot}}
 
@@ -207,15 +219,17 @@ def pair_checks(overlay, child):
 
 
 def minimum_size_checks(child):
-    """Keep the slider separate from ROI navigation and resize handles at 220 px."""
+    """Keep the slider and zoom badge separate from ROI navigation and resize handles at 220 px."""
     before = camera(child)
     check(bridge_result(child, "pywebview.api.resize_window(220,160)")["ok"], "Minimum native resize failed")
     wait_for(lambda: child.evaluate_js("innerWidth===220 && innerHeight===160"), description="minimum overlay size")
     bridge_result(child, "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))")
     geometry = child.evaluate_js("""(() => {
       const rect=element=>{const r=element.getBoundingClientRect();return [r.x,r.y,r.width,r.height];};
+      const zoomEl=document.getElementById('zoom-control');
       return {opacity:rect(document.getElementById('opacity-control')),
         navigation:rect(document.getElementById('window-controls')),
+        zoomControl:zoomEl ? rect(zoomEl) : null,
         handles:[...document.querySelectorAll('.resize-handle')].map(rect),
         navVisible:!document.getElementById('roi-controls').hidden};
     })()""")
@@ -226,6 +240,13 @@ def minimum_size_checks(child):
     for rx, ry, rw, rh in [geometry["navigation"], *geometry["handles"]]:
         check(min(x + width, rx + rw) <= max(x, rx) or min(y + height, ry + rh) <= max(y, ry),
               f"Opacity control overlaps navigation or a resize handle: {geometry}")
+    if geometry["zoomControl"] is not None:
+        zx, zy, zw, zh = geometry["zoomControl"]
+        check(zw > 0 and zh > 0 and zx >= 0 and zy >= 0 and zx + zw <= 220 and zy + zh <= 160,
+              f"Minimum-size zoom control is clipped: {geometry}")
+        for rx, ry, rw, rh in [geometry["navigation"], geometry["opacity"], *geometry["handles"]]:
+            check(min(zx + zw, rx + rw) <= max(zx, rx) or min(zy + zh, ry + rh) <= max(zy, ry),
+                  f"Zoom control overlaps another control or resize handle: {geometry}")
     time.sleep(.2)
     path = save_cocoa_snapshot(child, session.exports_root / "translucent-minimum-size.png")
     check_camera(camera(child), before, description="minimum-size resize")

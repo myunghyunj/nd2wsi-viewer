@@ -75,6 +75,8 @@ def pane_eval(parent, expression):
         " const annotationsChanged = __win.annotationsChanged;"
         " const imageToViewerElementPoint = __win.imageToViewerElementPoint;"
         " const lutParam = __win.lutParam;"
+        " const pixelSize = __win.pixelSize;"
+        " const astromapItems = __win.astromapItems;"
         " " + stmt +
         "})()"
     )

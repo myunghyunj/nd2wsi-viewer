@@ -423,11 +423,11 @@ async function refreshShadingPyramid(generation, captured) {
     if (!updated) return;
     const prevColor = channel.color;
     const prevMeta = channel.metadataColor;
-    const prevSwatch = channel._swatchBtn;
+    // Swatch button references live in channelSwatchButtons (WeakMap keyed by channel)
+    // so Object.assign preserves them without attaching DOM nodes onto state.info.
     Object.assign(channel, updated);
     if (prevMeta) channel.metadataColor = prevMeta;
     if (prevColor) channel.color = prevColor;
-    if (prevSwatch) channel._swatchBtn = prevSwatch;
   });
   state.lutAutoPending.fill(false);
   frameRequests?.pixels.invalidate(true);
@@ -1211,6 +1211,7 @@ const CHANNEL_COLOR_PRESETS = [
 ];
 
 let activeSwatchPopover = null;
+const channelSwatchButtons = new WeakMap();
 
 function normalizeChannelHex(raw) {
   const s = typeof raw === "string" ? raw.trim().replace(/^#/, "").toUpperCase() : "";
@@ -1237,7 +1238,7 @@ function setChannelColor(index, rawHex, swatchEl = null) {
   if (!ch.metadataColor) ch.metadataColor = normalizeChannelHex(ch.color) || "FFFFFF";
   const prev = normalizeChannelHex(ch.color);
   ch.color = hex;
-  const btn = swatchEl || ch._swatchBtn;
+  const btn = swatchEl || channelSwatchButtons.get(ch);
   if (btn?.style) btn.style.background = "#" + hex;
   if (prev !== hex) {
     if (!state.lutHandoffOutsideSavedRange) state.lutPersistence?.changed?.();
@@ -1392,7 +1393,7 @@ function buildChannelPanel() {
         openChannelColorPopover(i, sw);
       });
     }
-    ch._swatchBtn = sw;
+    channelSwatchButtons.set(ch, sw);
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = chLabel;
