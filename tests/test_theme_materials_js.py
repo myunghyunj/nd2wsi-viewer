@@ -588,14 +588,15 @@ assert.ok(!read('translucent.html').includes('materials-v1.css'));
 # lock when the theme changes merge into the lab line. No tracing file is themed.
 # Official baseline includes the intentional 2.6.4 ROI recovery controls,
 # 2.6.5 custom channel-color (`col`), URL validation, and AppKit safety fixes,
-# and 2.6.7 pywebview file-type filter fix; existing opacity, locking and
-# window geometry are covered by tracing tests.
+# 2.6.7 pywebview file-type filter fix, and 2.6.9 pre-1607 Windows 10 system-DPI
+# scale fallback; existing opacity, locking and window geometry are covered by
+# tracing tests.
 TRACING_BASELINES = {
     "official": {
         "translucent.html": "2c1b5b622ce3d7da88fefdae85a5876ff9e755aeaffcfe217336cc07a3caa304",
         "translucent-v1.css": "83e79c386c2a37451b92cec4c28b4c0a53d9e58528d46ddb8d49b54eac0d5f86",
         "translucent-v1.js": "a967166c76e1fa33e1b109c5535adcfb1e60546a2de21f8ea9f6137aa711bf00",
-        "../translucent_window.py": "037810024e32419d3a5f60face969d6c2a78fb811e5f08c4c0d3b1b68583165d",
+        "../translucent_window.py": "7f0456798b3997addd8b5876ee28eaf528a857aa2dd881e61e968047fe34dedd",
     },
     "SLACS-module": {
         "translucent.html": "b5c65681de88c19a027d99957084a678205338b862a3d51bc9b84c087864a6a5",

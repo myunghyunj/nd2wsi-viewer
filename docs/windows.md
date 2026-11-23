@@ -6,9 +6,9 @@
 
 | Channel | Download | Verification |
 | --- | --- | --- |
-| Stable 2.6.8 | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.8/nd2wsi-viewer-2.6.8-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.8/nd2wsi-viewer-2.6.8-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.6.8) |
+| Stable 2.6.9 | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.9/nd2wsi-viewer-2.6.9-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.9/nd2wsi-viewer-2.6.9-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.6.9) |
 
-Run the per-user Setup installer (`nd2wsi-viewer-2.6.8-windows-x64-setup.exe`, no administrator prompt) or extract the entire portable ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
+Run the per-user Setup installer (`nd2wsi-viewer-2.6.9-windows-x64-setup.exe`, no administrator prompt) or extract the entire portable ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
 From 2.5.7 the extracted `nd2wsi-viewer` folder holds only `nd2wsi-viewer.exe`,
 `_internal` and `READ-ME.txt`. Licences, build provenance, and the SDPC decoder's
 LGPL notice and source information are in `_internal\nd2wsi-viewer-about`.
@@ -16,10 +16,13 @@ The archive includes Python and the scientific libraries. Install Microsoft
 Edge WebView2 Runtime separately if it is missing. The app also requires .NET
 Framework 4.6.2 or later.
 
-The x64 app targets Windows 11 on Intel/AMD. Windows 11 ARM64 uses the same
-executable through x64 emulation; this is not a native ARM64 build. Release
-records identify the exact executable and the x64/ARM64 execution targets
-checked. Windows 10 is not tested and is not a supported target.
+The x64 app is verified in CI on Windows 11 (Intel/AMD x64 and ARM64 through
+x64 emulation; this is not a native ARM64 build) and Windows Server 2025 x64.
+Release records identify the exact executable and execution targets checked.
+Setup's preflight also permits 64-bit Windows 10 (build 10240+, including
+Enterprise LTSC with cumulative OS UCRT updates) and Windows Server 2016+ with
+Desktop Experience when `.NET Framework 4.6.2+` and WebView2 (`>= 109`) are
+available, though Windows 10 is not tested in CI.
 
 Unless built with Authenticode signing credentials, the executable and Setup
 installer are unsigned (`"signing": "unsigned"` in `build-info.json`), so
@@ -32,16 +35,16 @@ Supported Milestone 1 formats include Nikon ND2 (`.nd2`), Zeiss CZI (`.czi`),
 Leica LIF (`.lif`), OME-TIFF and TIFF (`.ome.tif`, `.ome.tiff`, `.tif`,
 `.tiff`), QPTIFF (`.qptiff`), Aperio SVS (`.svs`), SQRAY SDPC (`.sdpc`), and
 single-file viewing caches (`.nd2svs`), with calibrated OME-TIFF / ND2 / PNG
-ROI export and Astromap ROI import/export. Stable 2.6.8 publishes both the
-per-user NSIS Setup installer (`nd2wsi-viewer-2.6.8-windows-x64-setup.exe`) and
-the portable ZIP (`nd2wsi-viewer-2.6.8-windows-x64.zip`) linked above.
+ROI export and Astromap ROI import/export. Stable 2.6.9 publishes both the
+per-user NSIS Setup installer (`nd2wsi-viewer-2.6.9-windows-x64-setup.exe`) and
+the portable ZIP (`nd2wsi-viewer-2.6.9-windows-x64.zip`) linked above.
 Shading Correction assesses supported FITC and CY3 channels on stitched single-frame ND2 scans; BF and DAPI remain
 unchanged. See the [current method and limits](shading-correction-validation.md).
 
 It has the collapsible top tools and the translucent viewer, with ROI boxes,
 navigation, locking and a 10–100% opacity slider. Windows applies opacity to
 the whole floating window, including its controls and ROI outlines. See the
-[2.6.8 notes](release-notes-2.6.8.md) for what changed in this release.
+[2.6.9 notes](release-notes-2.6.9.md) for what changed in this release.
 
 ### If the viewer won't start
 
@@ -91,7 +94,7 @@ The Windows app uses a native frame and Microsoft Edge WebView2.
 `packaging/build_windows_installer.py` and `packaging/windows-installer.nsi`
 wrap the checksum-verified portable ZIP into a per-user NSIS Setup executable
 (`nd2wsi-viewer-<version>-windows-x64-setup.exe`) while keeping the portable ZIP
-(`nd2wsi-viewer-<version>-windows-x64.zip`) intact alongside it. Stable 2.6.8
+(`nd2wsi-viewer-<version>-windows-x64.zip`) intact alongside it. Stable 2.6.9
 publishes both the per-user Setup installer and the portable ZIP above; check
 each GitHub Release's attached assets, `.sha256` sidecars, and `build-info.json`
 for the exact artifacts published for that tag.
@@ -114,9 +117,9 @@ Download an available Setup and its adjacent SHA-256 checksum from the
 [release page](https://github.com/myunghyunj/nd2wsi-viewer/releases).
 Check that release's artifact version and Windows test evidence: the historical
 v1.2.8 results below do not establish verification of later releases.
-The current 2.6.8 release provides both the per-user Setup installer and the portable ZIP described above.
+The current 2.6.9 release provides both the per-user Setup installer and the portable ZIP described above.
 
-Target execution modes (the verified CI environments are listed above):
+CI-verified execution modes (the verified CI environments are listed above):
 
 | Computer | Execution |
 | --- | --- |
@@ -124,10 +127,12 @@ Target execution modes (the verified CI environments are listed above):
 | Windows 11 on ARM64 | Same x64 EXE through Windows x64 emulation |
 | Windows Server 2025 x64 (Desktop Experience CI) | Native x64 |
 
-Windows 10, headless Server Core, and 32-bit Windows are not supported targets.
-While the NSIS `.onInit` preflight gate permits 64-bit Windows build 16299+
-(Windows 10 version 1709+) when `.NET Framework 4.6.2+` and WebView2 are
-present, Windows 10 is not tested in CI.
+Setup's `.onInit` preflight gate also permits 64-bit Windows build 10240+
+(Windows 10, including Enterprise LTSC with cumulative OS UCRT updates, and
+Windows Server 2016+ with Desktop Experience) when `.NET Framework 4.6.2+` and
+WebView2 (`>= 109`) are available, though Windows 10 is not tested in CI.
+Windows 8.1 and earlier, Windows 10 ARM64, headless Server Core / Nano Server,
+and 32-bit Windows are refused outright.
 
 There is no GPU compute requirement. ARM64-native packaging is not claimed:
 the locked Python/.NET bridge and some scientific dependencies do not provide
@@ -222,16 +227,16 @@ uv pip install --python .venv/Scripts/python.exe --no-deps --reinstall (Join-Pat
 ```
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.6.8-windows-x64.zip` and its `.sha256` (plus
-`dist/windows/nd2wsi-viewer-2.6.8-windows-x64-setup.exe` when building the NSIS
+`dist/windows/nd2wsi-viewer-2.6.9-windows-x64.zip` and its `.sha256` (plus
+`dist/windows/nd2wsi-viewer-2.6.9-windows-x64-setup.exe` when building the NSIS
 installer).
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
 
-Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.1 or later:
+Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.0 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.6.8-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.6.9-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks

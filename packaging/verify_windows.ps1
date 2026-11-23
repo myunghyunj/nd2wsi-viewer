@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 5.0
 param(
     [Parameter(Mandatory = $true)][string]$Archive,
     [Parameter(Mandatory = $true)][string]$SmokeFile,
@@ -21,7 +21,7 @@ function ConvertTo-NativeArgument {
 
 function Invoke-Packaged {
     param([string]$Executable, [string[]]$Arguments, [int]$Timeout, [string]$Mode)
-    # Use Windows CRT argument quoting with .NET Framework on PS5.1.
+    # Use Windows CRT argument quoting with .NET Framework on PS5.0+.
     # No shell parses this string; no Python is used to run the application.
     $start = [System.Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $Executable

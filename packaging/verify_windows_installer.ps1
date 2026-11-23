@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 5.0
 <#
 Verify the exact local Setup.exe without Python or a development environment.
 The initial installation is in a private, marked QA directory. Successful
@@ -33,7 +33,7 @@ $qaBase = Join-Path $env:LOCALAPPDATA 'nd2wsi-installer-qa'
 $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $qaRoot = Join-Path $qaBase $runId
 $qaMarker = Join-Path $qaRoot '.nd2wsi-installer-qa.json'
-# Keep the script ASCII: Windows PowerShell 5.1 does not default to UTF-8.
+# Keep the script ASCII: Windows PowerShell 5.0 does not default to UTF-8.
 $koreanPath = [string][char]0xD55C + [char]0xAE00 + ' ' + [char]0xACBD + [char]0xB85C
 $koreanCell = [string][char]0xC138 + [char]0xD3EC
 $installPath = Join-Path $qaRoot $koreanPath
@@ -230,6 +230,7 @@ function Get-TargetReadiness {
         if ($null -eq $osKey) { throw 'Windows edition/build information is unavailable.' }
         $netKey = $root.OpenSubKey('Software\Microsoft\NET Framework Setup\NDP\v4\Full')
         $vcKey = $root.OpenSubKey('Software\Microsoft\VisualStudio\14.0\VC\Runtimes\x64')
+        $arch = if ($env:PROCESSOR_ARCHITEW6432) { [string]$env:PROCESSOR_ARCHITEW6432 } else { [string]$env:PROCESSOR_ARCHITECTURE }
         $result = @{
             product_name = [string]$osKey.GetValue('ProductName', '')
             edition_id = [string]$osKey.GetValue('EditionID', '')
@@ -237,6 +238,7 @@ function Get-TargetReadiness {
             build = [int]$osKey.GetValue('CurrentBuildNumber', 0)
             update_revision = [int]$osKey.GetValue('UBR', 0)
             installation_type = [string]$osKey.GetValue('InstallationType', '')
+            os_architecture = $arch
             os_is_64_bit = [Environment]::Is64BitOperatingSystem
             verifier_is_64_bit = [Environment]::Is64BitProcess
             net_framework_release = 0
@@ -953,7 +955,8 @@ try {
     $buildManifestPath = (Resolve-Path -LiteralPath $BuildManifest).Path
     $target = Get-TargetReadiness
     $target | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $resultPath 'target-readiness.json') -Encoding UTF8
-    if (-not $target.os_is_64_bit -or $target.build -lt 16299 -or $target.installation_type -notin @('Client', 'Server')) { throw 'This verification requires 64-bit Windows 10 version 1709 or newer, Windows 11, or Windows Server with Desktop Experience (build 16299+).' }
+    if (-not $target.os_is_64_bit -or $target.build -lt 10240 -or $target.installation_type -notin @('Client', 'Server')) { throw 'This verification requires 64-bit Windows 10, Windows 11, or Windows Server 2016 or newer with Desktop Experience (build 10240+).' }
+    if ($target.os_architecture -eq 'ARM64' -and $target.build -lt 22000) { throw 'This x64 app requires Windows 11 (build 22000+) on an ARM64 computer.' }
     if (-not $target.net_framework_462_or_newer) { throw '.NET Framework 4.6.2 or newer is required. No system component was installed or changed by this preflight.' }
     $installerHash = Get-Sha256 $installerPath
     $manifestHash = Get-Sha256 $manifestPath

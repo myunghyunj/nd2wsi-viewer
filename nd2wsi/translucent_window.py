@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from functools import lru_cache
 from pathlib import Path
 
 from .window_chrome import NativeTitlebarDrag
@@ -23,6 +24,83 @@ MIN_OPACITY = 0.10
 OPACITY_TIMEOUT = 5
 MIN_SIZE = (220, 160)
 MAX_SIZE = 8192
+_LOGPIXELSX = 88
+
+
+@lru_cache(maxsize=1)
+def _win32_has_per_window_dpi() -> bool:
+    """True when ``user32.GetDpiForWindow`` (Windows 10 build 14393+) is exported."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        windll_cls = getattr(ctypes, "WinDLL", None)
+        if windll_cls is None:
+            return False
+        user32 = windll_cls("user32", use_last_error=True)
+        return getattr(user32, "GetDpiForWindow", None) is not None
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _win32_system_dpi_scale() -> float:
+    """Cached logon-session system DPI scale (LOGPIXELSX / 96) for pre-1607 Windows 10."""
+    if sys.platform != "win32":
+        return 1.0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        windll_cls = getattr(ctypes, "WinDLL", None)
+        if windll_cls is None:
+            return 1.0
+        user32 = windll_cls("user32", use_last_error=True)
+        gdi32 = windll_cls("gdi32", use_last_error=True)
+        get_dc = user32.GetDC
+        get_dc.argtypes = [wintypes.HWND]
+        get_dc.restype = wintypes.HDC
+        release_dc = user32.ReleaseDC
+        release_dc.argtypes = [wintypes.HWND, wintypes.HDC]
+        release_dc.restype = ctypes.c_int
+        get_caps = gdi32.GetDeviceCaps
+        get_caps.argtypes = [wintypes.HDC, ctypes.c_int]
+        get_caps.restype = ctypes.c_int
+        hdc = get_dc(0)
+        if not hdc or isinstance(hdc, bool):
+            return 1.0
+        try:
+            dpi = get_caps(hdc, _LOGPIXELSX)
+        finally:
+            release_dc(0, hdc)
+        if (
+            not isinstance(dpi, bool)
+            and isinstance(dpi, (int, float))
+            and math.isfinite(dpi)
+            and dpi > 0
+        ):
+            return float(dpi) / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def win32_window_scale(native) -> float:
+    """Physical-per-CSS pixel scale for a Windows BrowserForm (including pre-1607 Win10)."""
+    if sys.platform == "win32" and not _win32_has_per_window_dpi():
+        sys_scale = _win32_system_dpi_scale()
+        if sys_scale != 1.0:
+            return sys_scale
+    scale = getattr(native, "_scale", None)
+    if (
+        not isinstance(scale, bool)
+        and isinstance(scale, (int, float))
+        and math.isfinite(scale)
+        and scale > 0
+    ):
+        return float(scale)
+    return 1.0
 
 
 def _number(value, name, minimum, maximum):
@@ -361,7 +439,7 @@ class TranslucentApi:
         from System.Drawing.Drawing2D import GraphicsPath
 
         native = self._window.native
-        radius = max(2, int(18 * getattr(native, "_scale", 1)))
+        radius = max(2, int(18 * win32_window_scale(native)))
         diameter = radius * 2
         width, height = native.ClientSize.Width, native.ClientSize.Height
         path = GraphicsPath()
@@ -478,7 +556,7 @@ class TranslucentApi:
                 # offset bug when moving the overlay across multiple displays.
                 native.setFrameOrigin_(AppKit.NSMakePoint(origin.x + dx, origin.y - dy))
             else:
-                scale = getattr(native, "_scale", 1)
+                scale = win32_window_scale(native)
                 native.Left += round(dx * scale)
                 native.Top += round(dy * scale)
 
@@ -499,7 +577,7 @@ class TranslucentApi:
                 frame.size.width, frame.size.height = width, height
                 native.setFrame_display_(frame, True)
             else:
-                scale = getattr(native, "_scale", 1)
+                scale = win32_window_scale(native)
                 native.Width, native.Height = round(width * scale), round(height * scale)
                 self._round_windows_region()
 

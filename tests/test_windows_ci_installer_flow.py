@@ -748,3 +748,192 @@ def test_windows_installer_docs_cover_milestone_1_formats_and_never_leak_agent_t
             path_part, _, _ = raw.partition("#")
             target = (doc_path.parent / path_part).resolve() if path_part else doc_path.resolve()
             assert target.exists(), f"{doc_rel}: broken relative link {raw!r} -> {target}"
+
+
+# ---------------------------------------------------------------------------
+# 5. Pre-1709 Windows 10 (build 10240+) Installer, CRT & DPI Safeguards (2.6.9)
+# ---------------------------------------------------------------------------
+
+
+def test_nsis_and_verifier_allow_pre1709_win10_builds() -> None:
+    nsi = (ROOT / "packaging" / "windows-installer.nsi").read_text(encoding="utf-8")
+    ps1 = (ROOT / "packaging" / "verify_windows_installer.ps1").read_text(encoding="utf-8")
+    verify_portable = (ROOT / "packaging" / "verify_windows.ps1").read_text(encoding="utf-8")
+
+    # 1. Zero 16299 / 1709 gates in NSIS Setup, PowerShell verifiers, or installer docs.
+    for rel in (
+        "packaging/windows-installer.nsi",
+        "packaging/verify_windows_installer.ps1",
+        "packaging/verify_windows.ps1",
+        "packaging/WINDOWS-INSTALLER-README.txt",
+        "packaging/windows-installer.md",
+        "docs/windows.md",
+    ):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "16299" not in text, f"{rel} still contains build 16299 gate"
+        assert "1709" not in text, f"{rel} still contains version 1709 gate"
+
+    # 2. .onInit records Major/Minor/Build, gates on Win10 10240+, keeps ARM64 Win11 + .NET 4.6.2+.
+    init_start = nsi.index("Function .onInit")
+    init_end = nsi.index("FunctionEnd", init_start)
+    init_body = nsi[init_start:init_end]
+    assert "GetWinVer $WinMajor Major" in init_body
+    assert "GetWinVer $WinMinor Minor" in init_body
+    assert "GetWinVer $WinBuild Build" in init_body
+    assert ".onInit.windows_version major=$WinMajor minor=$WinMinor build=$WinBuild" in init_body
+    assert "${IfNot} ${AtLeastWin10}" in init_body
+    assert "${OrIfNot} ${AtLeastBuild} 10240" in init_body
+    assert "requires 64-bit Windows 10 or Windows 11 on x64" in init_body
+    assert "Detected Windows $WinMajor.$WinMinor (build $WinBuild)." in init_body
+    assert "${If} ${IsNativeARM64}" in init_body
+    assert "${AndIfNot} ${AtLeastWin11}" in init_body
+    assert "Server Core" in init_body and "Nano Server" in init_body
+    assert "Call RequireDotNetFramework" in init_body
+
+    # 3. SecApplication prints detected Windows version visibly; un.onInit traces it too.
+    assert 'DetailPrint "Windows version: $WinMajor.$WinMinor (build $WinBuild)"' in nsi
+    un_start = nsi.index("Function un.onInit")
+    un_end = nsi.index("FunctionEnd", un_start)
+    assert "un.onInit.windows_version major=$WinMajor minor=$WinMinor build=$WinBuild" in nsi[un_start:un_end]
+
+    # 4. RequireDotNetFramework directs 1507/1511 users to 4.6.2 and 1607+ users to 4.8.
+    net_start = nsi.index("Function RequireDotNetFramework")
+    net_end = nsi.index("FunctionEnd", net_start)
+    net_body = nsi[net_start:net_end]
+    assert "394802" in net_body
+    assert "Install Microsoft .NET Framework 4.6.2 (or 4.8 on Windows 10 version 1607 and later)" in net_body
+
+    # 5. AcceptWebView2Version enforces major >= 109 in FindWebView2.
+    wv_start = nsi.index("Function AcceptWebView2Version")
+    wv_end = nsi.index("FunctionEnd", wv_start)
+    wv_body = nsi[wv_start:wv_end]
+    assert "${If} $R4 >= 109" in wv_body
+    assert "FindWebView2.below_floor" in wv_body
+    find_start = nsi.index("Function FindWebView2")
+    find_end = nsi.index("FunctionEnd", find_start)
+    assert nsi[find_start:find_end].count("Call AcceptWebView2Version") == 3
+
+    # 6. Full NSIS structural delimiter balance.
+    assert len(re.findall(r"(?m)^\s*Function\s+", nsi)) == len(re.findall(r"(?m)^\s*FunctionEnd\s*$", nsi))
+    assert len(re.findall(r"(?m)^\s*Section\s+", nsi)) == len(re.findall(r"(?m)^\s*SectionEnd\s*$", nsi))
+    assert len(re.findall(r"(?m)^\s*!macro\s+", nsi)) == len(re.findall(r"(?m)^\s*!macroend\s*$", nsi))
+    assert len(re.findall(r"(?m)^\s*!if(?:def|ndef)?\b", nsi)) == len(re.findall(r"(?m)^\s*!endif\b", nsi))
+    assert len(re.findall(r"\$\{(?:If|IfNot)\}", nsi)) == len(re.findall(r"\$\{EndIf\}", nsi))
+    assert len(re.findall(r"\$\{(?:Do|DoWhile)\}", nsi)) == len(re.findall(r"\$\{Loop\}", nsi))
+
+    # 7. PowerShell verifiers support PS 5.0 (Win10 10240/10586) and check build >= 10240 + ARM64 >= 22000.
+    assert ps1.splitlines()[0] == "#requires -Version 5.0"
+    assert verify_portable.splitlines()[0] == "#requires -Version 5.0"
+    assert "$target.build -lt 10240" in ps1
+    assert "$target.os_architecture -eq 'ARM64' -and $target.build -lt 22000" in ps1
+    for line in (ROOT / "packaging" / "WINDOWS-INSTALLER-README.txt").read_text(encoding="utf-8").splitlines():
+        assert len(line) <= 80, f"README line exceeds 80 columns: {line!r}"
+
+
+def test_build_windows_verifies_msvc_crt_dlls(tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "build_windows_269_crt",
+        ROOT / "packaging" / "build_windows.py",
+    )
+    assert spec is not None and spec.loader is not None
+    bw = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bw)
+    assert bw.REQUIRED_MSVC_CRT_DLLS == ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
+
+    bundle = tmp_path / "nd2wsi-viewer"
+    internal = bundle / "_internal"
+    internal.mkdir(parents=True)
+    for name in ("vcruntime140.dll", "msvcp140.dll"):
+        (internal / name).write_bytes(_minimal_pe(0x8664))
+    with pytest.raises(RuntimeError, match="vcruntime140_1.dll"):
+        bw.verify_msvc_crt_dlls(bundle)
+
+    (internal / "vcruntime140_1.dll").write_bytes(_minimal_pe(0x014C))
+    with pytest.raises(RuntimeError, match="not an x64"):
+        bw.verify_msvc_crt_dlls(bundle)
+
+    (internal / "vcruntime140_1.dll").write_bytes(_minimal_pe(0x8664))
+    found = bw.verify_msvc_crt_dlls(bundle)
+    assert set(found) == set(bw.REQUIRED_MSVC_CRT_DLLS)
+
+
+def test_win32_window_scale_cached_pre1607_system_dpi_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ctypes
+    from types import SimpleNamespace
+
+    from nd2wsi import translucent_window as tw
+
+    tw._win32_has_per_window_dpi.cache_clear()
+    tw._win32_system_dpi_scale.cache_clear()
+    released: list[tuple[int, int]] = []
+
+    class _FakeFunc:
+        def __init__(self, fn):
+            self._fn = fn
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):
+            return self._fn(*args)
+
+    def make_windll(has_per_window: bool, hdc_val, dpi_val):
+        user32_attrs = {
+            "GetDC": _FakeFunc(lambda hwnd: hdc_val),
+            "ReleaseDC": _FakeFunc(lambda hwnd, hdc: released.append((hwnd, hdc)) or 1),
+        }
+        if has_per_window:
+            user32_attrs["GetDpiForWindow"] = _FakeFunc(lambda _h: 120)
+        gdi32_attrs = {
+            "GetDeviceCaps": _FakeFunc(
+                lambda hdc, idx: (_ for _ in ()).throw(RuntimeError("boom"))
+                if dpi_val == "raise"
+                else dpi_val
+            ),
+        }
+
+        def fake_windll(name, **_kwargs):
+            if name == "user32":
+                return SimpleNamespace(**user32_attrs)
+            if name == "gdi32":
+                return SimpleNamespace(**gdi32_attrs)
+            raise OSError(name)
+
+        return fake_windll
+
+    try:
+        # 1. Pre-1607 Win10 (no GetDpiForWindow) at 150% DPI (144) overrides native._scale=1.0 once.
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "WinDLL", make_windll(False, 0xABCD, 144), raising=False)
+        native_broken = SimpleNamespace(_scale=1.0)
+        assert tw.win32_window_scale(native_broken) == 1.5
+        assert tw.win32_window_scale(native_broken) == 1.5
+        # Cached: GetDC(0) / ReleaseDC(0, 0xABCD) ran only once!
+        assert released == [(0, 0xABCD)]
+
+        # 2. Null HDC (None from c_void_p) never calls GetDeviceCaps or ReleaseDC; falls back to native._scale.
+        tw._win32_has_per_window_dpi.cache_clear()
+        tw._win32_system_dpi_scale.cache_clear()
+        released.clear()
+        monkeypatch.setattr(ctypes, "WinDLL", make_windll(False, None, 192), raising=False)
+        assert tw.win32_window_scale(SimpleNamespace(_scale=1.25)) == 1.25
+        assert released == []
+
+        # 3. Exception in GetDeviceCaps still calls ReleaseDC in finally and falls back cleanly.
+        tw._win32_has_per_window_dpi.cache_clear()
+        tw._win32_system_dpi_scale.cache_clear()
+        released.clear()
+        monkeypatch.setattr(ctypes, "WinDLL", make_windll(False, 0xBEEF, "raise"), raising=False)
+        assert tw.win32_window_scale(SimpleNamespace(_scale=1.0)) == 1.0
+        assert released == [(0, 0xBEEF)]
+
+        # 4. 1607+ Win10/11 (GetDpiForWindow present) uses native._scale without touching GDI DC.
+        tw._win32_has_per_window_dpi.cache_clear()
+        tw._win32_system_dpi_scale.cache_clear()
+        released.clear()
+        monkeypatch.setattr(ctypes, "WinDLL", make_windll(True, 0xCAFE, 192), raising=False)
+        assert tw.win32_window_scale(SimpleNamespace(_scale=1.75)) == 1.75
+        assert released == []
+    finally:
+        tw._win32_has_per_window_dpi.cache_clear()
+        tw._win32_system_dpi_scale.cache_clear()
+
