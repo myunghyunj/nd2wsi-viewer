@@ -3,6 +3,20 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.9</title>
+            <pubDate>Mon, 23 Nov 2026 09:52:00 +0000</pubDate>
+            <sparkle:version>2.6.9</sparkle:version>
+            <sparkle:shortVersionString>2.6.9</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Pre-1709 Windows 10 &amp; LTSC Setup support and pre-1607 DPI scaling</h2>
+<ul>
+<li><strong>Pre-1709 Windows 10 Setup &amp; LTSC workstation support.</strong> Remove the artificial Windows 10 build <code>16299</code> (version 1709) gate in NSIS Setup and <code>verify_windows_installer.ps1</code>, permitting 64-bit desktop Windows 10 (<code>10.0.10240+</code>) and Windows Server 2016+ (<code>14393+</code>) installations gated on actual runtime prerequisites (<code>.NET Framework 4.6.2+</code>, 64-bit architecture, desktop shell, and WebView2 <code>&gt;= 109</code> or bundled Fixed Version), while recording the exact OS version in Setup details and rejection prompts.</li>
+<li><strong>Pre-1607 Windows 10 DPI fallback &amp; runtime parity.</strong> Add a cached system-DPI (<code>LOGPIXELSX</code>) fallback when <code>GetDpiForWindow</code> is unavailable on early Windows 10 builds (<code>10240</code>/<code>10586</code>) so translucent overlay dragging, resizing, and corner rounding stay accurate at &gt;100% display scaling, enforce <code>&gt;= 109</code> WebView2 major version detection during Setup, verify bundled VS 2022 MSVC CRT DLLs at build time, and lower PowerShell verifier parse requirements to <code>5.0</code>.</li>
+</ul>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.9/nd2wsi-viewer-2.6.9-macos-arm64.dmg" length="133261450" type="application/octet-stream" sparkle:edSignature="v+nPDpJuYraGJPp38W4/d2guRoXA+a0bmJpEVwcjF3OrzU4ei3iu3PFvML+Jr/BEXogZbemL5fOifuprV/24BQ=="/>
+        </item>
+        <item>
             <title>2.6.8</title>
             <pubDate>Sun, 22 Nov 2026 08:10:00 +0000</pubDate>
             <sparkle:version>2.6.8</sparkle:version>
