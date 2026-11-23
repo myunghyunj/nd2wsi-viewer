@@ -840,3 +840,116 @@ def test_app_facade_reexports_and_delegates_to_app_slacs() -> None:
 
     assert callable(app._dismiss_failed_webview2_window)
     assert callable(app._startup_error)
+
+
+# ---------------------------------------------------------------------------
+# 9. 2.6.9 pre-1709 / LTSC Windows 10 SLACS compatibility contracts
+# ---------------------------------------------------------------------------
+
+
+def test_slacs_readme_and_nsis_allow_pre1709_ltsc_win10() -> None:
+    slacs_readme = (ROOT / "packaging/WINDOWS-INSTALLER-README-SLACS.txt").read_text(encoding="utf-8")
+    nsi = (ROOT / "packaging/windows-installer.nsi").read_text(encoding="utf-8")
+
+    assert "16299" not in slacs_readme
+    assert "1709" not in slacs_readme
+    assert "build 10240+" in slacs_readme
+    assert "Enterprise LTSC" in slacs_readme
+    for line in slacs_readme.splitlines():
+        assert len(line) <= 80, f"SLACS README line exceeds 80 columns: {line!r}"
+
+    assert "16299" not in nsi
+    assert "1709" not in nsi
+    assert '${APP_DISPLAY_NAME} requires 64-bit Windows 10 or Windows 11 on x64' in nsi
+    assert '${APP_DISPLAY_NAME} requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.6.2 (or 4.8 on Windows 10 version 1607 and later)' in nsi
+
+
+def test_webview2_pre_lpac_win10_appcontainer_sid_fallback(tmp_path: Path) -> None:
+    assert rt.WINDOWS_10_LPAC_BUILD == 14393
+    assert rt.required_appcontainer_sids(10240) == ("S-1-15-2-1",)
+    assert rt.required_appcontainer_sids(10586) == ("S-1-15-2-1",)
+    assert rt.required_appcontainer_sids(14393) == ("S-1-15-2-1", "S-1-15-2-2")
+
+    calls: list[list[str]] = []
+    batch: list[str] = []
+
+    class _FakeAdvapi:
+        def ConvertStringSidToSidW(self, sid_text: str, out_ptr) -> int:
+            batch.append(sid_text)
+            if sid_text == "S-1-15-2-2":
+                return 0
+            ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_void_p))[0] = 0x1001
+            return 1
+
+        def GetNamedSecurityInfoW(self, *_args) -> int:
+            calls.append(list(batch))
+            batch.clear()
+            return 0
+
+        def SetEntriesInAclW(self, count: int, _entries, _old_dacl, new_dacl_ptr) -> int:
+            assert count == 1
+            ctypes.cast(new_dacl_ptr, ctypes.POINTER(ctypes.c_void_p))[0] = 0x2002
+            return 0
+
+        def SetNamedSecurityInfoW(self, *_args) -> int:
+            return 0
+
+    freed: list[int] = []
+
+    class _FakeKernel:
+        def LocalFree(self, ptr) -> int:
+            val = getattr(ptr, "value", ptr)
+            if val:
+                freed.append(int(val))
+            return 0
+
+    advapi = _FakeAdvapi()
+    kernel = _FakeKernel()
+    target = tmp_path / "webview2-runtime"
+    target.mkdir()
+
+    # Build 10240 (pre-LPAC): S-1-15-2-2 fails ConvertStringSidToSidW -> retries S-1-15-2-1 cleanly.
+    rt._grant_appcontainer_acl_win32(target, advapi=advapi, kernel=kernel, build=10240)
+    assert calls == [["S-1-15-2-1", "S-1-15-2-2", "S-1-15-2-1"]]
+    assert 0x2002 in freed
+
+    # Build 14393 (LPAC supported): S-1-15-2-2 failure still raises OSError.
+    batch.clear()
+    with pytest.raises(OSError, match="S-1-15-2-2"):
+        rt._grant_appcontainer_acl_win32(target, advapi=advapi, kernel=kernel, build=14393)
+
+
+def test_stage_follow_window_dpi_scale_pre1607_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nd2wsi import translucent_stage_follow as tsf
+
+    tsf._win32_has_per_window_dpi.cache_clear()
+    tsf._win32_system_dpi_scale.cache_clear()
+
+    class _FakeFunc:
+        def __init__(self, fn):
+            self._fn = fn
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):
+            return self._fn(*args)
+
+    def fake_windll(name, **_kwargs):
+        if name == "user32":
+            return SimpleNamespace(
+                GetDC=_FakeFunc(lambda _h: 0x1234),
+                ReleaseDC=_FakeFunc(lambda _h, _dc: 1),
+            )
+        if name == "gdi32":
+            return SimpleNamespace(GetDeviceCaps=_FakeFunc(lambda _dc, _idx: 144))
+        raise OSError(name)
+
+    try:
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "WinDLL", fake_windll, raising=False)
+        api = SimpleNamespace(get_dpi_for_window=None)
+        native = SimpleNamespace(_scale=1.0)
+        assert tsf._window_dpi_scale(api, 0x9999, native) == 1.5
+    finally:
+        tsf._win32_has_per_window_dpi.cache_clear()
+        tsf._win32_system_dpi_scale.cache_clear()

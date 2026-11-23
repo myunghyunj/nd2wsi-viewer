@@ -27,9 +27,12 @@ Supported target systems
 - Windows 11 x64 on Intel/AMD.
 - Windows 11 ARM64 using Windows x64 emulation (not a native ARM64 binary).
 - Windows Server 2025 x64 with Desktop Experience (CI verification environment).
-Windows 10, headless Server Core, and 32-bit Windows are not supported targets.
-While the Setup preflight gate permits 64-bit Windows build 16299+ (Windows 10
-1709+) when .NET Framework 4.6.2+ is present, Windows 10 is not tested in CI.
+Setup's preflight also permits 64-bit Windows 10 (build 10240+, including
+Enterprise LTSC with cumulative OS UCRT updates) and Windows Server 2016+ with
+Desktop Experience when .NET Framework 4.6.2+ is present (using the bundled
+offline WebView2 runtime when needed); Windows 10 is not tested in CI. Windows
+8.1 and earlier, Windows 10 ARM64, headless Server Core, and 32-bit Windows are
+not supported.
 
 Prerequisites and offline WebView2 runtime
 .NET Framework 4.6.2 or newer is required; Setup checks this before installing.

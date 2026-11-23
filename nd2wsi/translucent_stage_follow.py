@@ -68,6 +68,83 @@ SWP_SHOWWINDOW = 0x0040
 LOCKED_MAX_OPACITY = 254.0 / 255.0
 HOVER_POLL_INTERVAL_S = 0.030
 HOVER_RECT_PADDING_CSS = 3.0
+_LOGPIXELSX = 88
+
+
+@lru_cache(maxsize=1)
+def _win32_has_per_window_dpi() -> bool:
+    """True when ``user32.GetDpiForWindow`` (Windows 10 build 14393+) is exported."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        windll_cls = getattr(ctypes, "WinDLL", None)
+        if windll_cls is None:
+            return False
+        user32 = windll_cls("user32", use_last_error=True)
+        return getattr(user32, "GetDpiForWindow", None) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@lru_cache(maxsize=1)
+def _win32_system_dpi_scale() -> float:
+    """Cached logon-session system DPI scale (LOGPIXELSX / 96) for pre-1607 Windows 10."""
+    if sys.platform != "win32":
+        return 1.0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        windll_cls = getattr(ctypes, "WinDLL", None)
+        if windll_cls is None:
+            return 1.0
+        user32 = windll_cls("user32", use_last_error=True)
+        gdi32 = windll_cls("gdi32", use_last_error=True)
+        get_dc = user32.GetDC
+        get_dc.argtypes = [wintypes.HWND]
+        get_dc.restype = wintypes.HDC
+        release_dc = user32.ReleaseDC
+        release_dc.argtypes = [wintypes.HWND, wintypes.HDC]
+        release_dc.restype = ctypes.c_int
+        get_caps = gdi32.GetDeviceCaps
+        get_caps.argtypes = [wintypes.HDC, ctypes.c_int]
+        get_caps.restype = ctypes.c_int
+        hdc = get_dc(0)
+        if not hdc or isinstance(hdc, bool):
+            return 1.0
+        try:
+            dpi = get_caps(hdc, _LOGPIXELSX)
+        finally:
+            release_dc(0, hdc)
+        if (
+            not isinstance(dpi, bool)
+            and isinstance(dpi, (int, float))
+            and math.isfinite(dpi)
+            and dpi > 0
+        ):
+            return float(dpi) / 96.0
+    except Exception:  # noqa: BLE001
+        pass
+    return 1.0
+
+
+def win32_window_scale(native) -> float:
+    """Physical-per-CSS pixel scale for a Windows BrowserForm (including pre-1607 Win10)."""
+    if sys.platform == "win32" and not _win32_has_per_window_dpi():
+        sys_scale = _win32_system_dpi_scale()
+        if sys_scale != 1.0:
+            return sys_scale
+    scale = getattr(native, "_scale", None)
+    if (
+        not isinstance(scale, bool)
+        and isinstance(scale, (int, float))
+        and math.isfinite(scale)
+        and scale > 0
+    ):
+        return float(scale)
+    return 1.0
 
 
 @lru_cache(maxsize=1)
@@ -185,6 +262,10 @@ def _window_dpi_scale(api, hwnd: int, native=None) -> float:
                 return float(dpi) / 96.0
         except Exception:  # noqa: BLE001
             pass
+    if sys.platform == "win32" and not _win32_has_per_window_dpi():
+        sys_scale = _win32_system_dpi_scale()
+        if sys_scale != 1.0:
+            return sys_scale
     scale = getattr(native, "_scale", None)
     if not isinstance(scale, bool) and isinstance(scale, (int, float)) and math.isfinite(scale) and scale > 0:
         return float(scale)

@@ -694,6 +694,7 @@ def window_evidence(window, call, *, timeout=30, image_path=process_image_path,
 # not need it. Grants run in-process through advapi32 (never spawning icacls.exe,
 # which AppLocker / SRP policies may block on hospital and university PCs).
 APPCONTAINER_SIDS = ("S-1-15-2-1", "S-1-15-2-2")  # ALL [RESTRICTED] APPLICATION PACKAGES
+WINDOWS_10_LPAC_BUILD = 14393
 WINDOWS_11_BUILD = 22000
 GRANT_SMOKE_ENV = "ND2WSI_SMOKE_WEBVIEW2_ACL"  # CI only: run the grant where Windows does not need it
 _READ_EXECUTE = 0x1200A9  # FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
@@ -712,13 +713,26 @@ _TRUSTEE_IS_SID = 0
 _TRUSTEE_IS_WELL_KNOWN_GROUP = 5
 
 
+def _current_build(build=None) -> int | None:
+    if build is not None:
+        return int(build)
+    version = getattr(sys, "getwindowsversion", None)
+    if sys.platform != "win32" or version is None:
+        return None
+    return int(version().build)
+
+
+def required_appcontainer_sids(build=None) -> tuple[str, ...]:
+    """AppContainer SIDs required on ``build`` (pre-14393 Win10 lacks LPAC ``S-1-15-2-2``)."""
+    resolved = _current_build(build)
+    if resolved is not None and resolved < WINDOWS_10_LPAC_BUILD:
+        return (APPCONTAINER_SIDS[0],)
+    return APPCONTAINER_SIDS
+
+
 def needs_appcontainer_grant(build=None) -> bool:
-    if build is None:
-        version = getattr(sys, "getwindowsversion", None)
-        if sys.platform != "win32" or version is None:
-            return False
-        build = version().build
-    return build < WINDOWS_11_BUILD
+    resolved = _current_build(build)
+    return resolved is not None and resolved < WINDOWS_11_BUILD
 
 
 def _file_rights(mask: int) -> int:
@@ -770,7 +784,7 @@ def appcontainer_access(folder) -> bool | None:
     return None if state is None else state == "allowed"
 
 
-def appcontainer_state(folder, *, require_inherit: bool | None = None) -> str | None:
+def appcontainer_state(folder, *, require_inherit: bool | None = None, build=None) -> str | None:
     """``appcontainer_decision`` for ``folder``'s DACL; None off Windows.
 
     Raises OSError when the path's DACL cannot be read.
@@ -815,7 +829,7 @@ def appcontainer_state(folder, *, require_inherit: bool | None = None) -> str | 
         raise OSError(status, "Could not read the folder's permissions", str(folder))
     targets = []
     try:
-        for text in APPCONTAINER_SIDS:
+        for text in required_appcontainer_sids(build):
             sid = ctypes.c_void_p()
             if not advapi.ConvertStringSidToSidW(text, ctypes.byref(sid)):
                 raise ctypes.WinError(ctypes.get_last_error())
@@ -849,6 +863,7 @@ def _grant_appcontainer_acl_win32(
     inherit: bool = True,
     advapi=None,
     kernel=None,
+    build=None,
 ) -> None:
     """Grant ``GENERIC_READ | GENERIC_EXECUTE`` to AppContainer SIDs via Win32 ``advapi32``.
 
@@ -954,6 +969,23 @@ def _grant_appcontainer_acl_win32(
         )
         if status != 0:
             raise OSError(status, f"SetNamedSecurityInfoW failed (error {status})", target_str)
+    except OSError:
+        resolved = _current_build(build)
+        if (
+            tuple(sids) == APPCONTAINER_SIDS
+            and resolved is not None
+            and resolved < WINDOWS_10_LPAC_BUILD
+        ):
+            _grant_appcontainer_acl_win32(
+                path,
+                sids=(APPCONTAINER_SIDS[0],),
+                inherit=inherit,
+                advapi=advapi,
+                kernel=kernel,
+                build=resolved,
+            )
+            return
+        raise
     finally:
         if new_dacl.value:
             kernel.LocalFree(new_dacl)
@@ -974,8 +1006,12 @@ def ensure_appcontainer_access(folder, *, force=False, build=None, check=None, g
     blocked. ``check`` returns an ``appcontainer_state`` value. A deny rule is
     reported and left alone.
     """
-    check = appcontainer_state if check is None else check
-    grant = _grant_appcontainer_acl_win32 if grant is None else grant
+    if check is None:
+        def check(target):
+            return appcontainer_state(target, build=build)
+    if grant is None:
+        def grant(target, *, inherit: bool = True) -> None:
+            _grant_appcontainer_acl_win32(target, inherit=inherit, build=build)
     if not force and not needs_appcontainer_grant(build):
         return "not-needed"
     folder_path = Path(folder)

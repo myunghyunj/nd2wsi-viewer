@@ -642,8 +642,8 @@ def main() -> int:
     internal = bundle / "_internal"
     print(f"Pruned {prune_bundle(internal)} test and cache files")
     check_assembly_locations(internal)
-    msvc_crt = verify_msvc_crt_dlls(bundle)
-    print(f"Verified VS 2022 MSVC CRT DLLs: {', '.join(sorted(msvc_crt.values()))}")
+    msvc_crt_dlls = verify_msvc_crt_dlls(bundle)
+    print(f"Verified VS 2022 MSVC CRT DLLs: {', '.join(sorted(msvc_crt_dlls.values()))}")
     pyz = open_windows_archive(exe)
     verify_bundled_source(pyz.toc, pyz.extract, internal)
     about = internal / ABOUT
@@ -673,6 +673,7 @@ def main() -> int:
         "windows_arm64_mode": "Windows 11 x64 emulation",
         "web_renderer": web_renderer,
         "webview2_runtime": webview2_info or {"distribution": "system-evergreen"},
+        "msvc_crt_dlls": msvc_crt_dlls,
         "sdpc_codec_bundled": True,
         "distribution_status": "source-built-lgpl-codec",
         "sdpc_codec_manifest_sha256": sha256(sdpc_manifest),

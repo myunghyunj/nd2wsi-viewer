@@ -588,20 +588,21 @@ assert.ok(!read('translucent.html').includes('materials-v1.css'));
 # lock when the theme changes merge into the lab line. No tracing file is themed.
 # Both baselines include the intentional 2.6.4 ROI recovery controls,
 # 2.6.6 custom channel-color (`col`), URL validation, and AppKit safety fixes,
-# and 2.6.7 pywebview file-type filter / stage-follow laser delivery fixes;
-# existing opacity, locking and window geometry are covered by tracing tests.
+# 2.6.7 pywebview file-type filter / stage-follow laser delivery fixes, and
+# 2.6.9 pre-1607 Windows 10 system-DPI scale fallback; existing opacity,
+# locking and window geometry are covered by tracing tests.
 TRACING_BASELINES = {
     "official": {
         "translucent.html": "2c1b5b622ce3d7da88fefdae85a5876ff9e755aeaffcfe217336cc07a3caa304",
         "translucent-v1.css": "83e79c386c2a37451b92cec4c28b4c0a53d9e58528d46ddb8d49b54eac0d5f86",
         "translucent-v1.js": "a967166c76e1fa33e1b109c5535adcfb1e60546a2de21f8ea9f6137aa711bf00",
-        "../translucent_window.py": "037810024e32419d3a5f60face969d6c2a78fb811e5f08c4c0d3b1b68583165d",
+        "../translucent_window.py": "7f0456798b3997addd8b5876ee28eaf528a857aa2dd881e61e968047fe34dedd",
     },
     "SLACS-module": {
         "translucent.html": "fb5ef3993e655633ee3284252145e984701c5051a937ccace5bad4fcf7f75994",
         "translucent-v1.css": "7e12d08f4aa41c30524c27e6e669c936a8010d229ea474f54c8e1e46f42e5e07",
         "translucent-v1.js": "1e30a0580da1a825349f2740f3ff672117edd910e498b40afe218cb9a381f17f",
-        "../translucent_window.py": "218fbada4b955aeb716b0e7e7d8425dcd21fb0ea83031b73451c2cbaf365226e",
+        "../translucent_window.py": "2dc1d37a137438e67bbd807282179509f0ccf58ba1510aa4980dfc72a088a62d",
     },
 }
 

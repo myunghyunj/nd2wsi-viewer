@@ -44,8 +44,11 @@ from .translucent_stage_follow import (
     StageFollowMixin,
     Win32OverlayFocusController,
     point_in_interactive_rects,
+    win32_window_scale,
 )
 from .translucent_stage_follow import _hwnd_from_native as _hwnd_from_native
+from .translucent_stage_follow import _win32_has_per_window_dpi as _win32_has_per_window_dpi
+from .translucent_stage_follow import _win32_system_dpi_scale as _win32_system_dpi_scale
 from .translucent_validation import _HEX_COLOR_RE as _HEX_COLOR_RE
 from .translucent_validation import (
     CLIENT_LOG_FIELD_LIMIT,
@@ -395,7 +398,7 @@ class TranslucentApi(StageFollowMixin):
         from System.Drawing.Drawing2D import GraphicsPath
 
         native = self._window.native
-        radius = max(2, int(18 * getattr(native, "_scale", 1)))
+        radius = max(2, int(18 * win32_window_scale(native)))
         diameter = radius * 2
         width, height = native.ClientSize.Width, native.ClientSize.Height
         path = GraphicsPath()
@@ -543,7 +546,7 @@ class TranslucentApi(StageFollowMixin):
                 # offset bug when moving the overlay across multiple displays.
                 native.setFrameOrigin_(AppKit.NSMakePoint(origin.x + dx, origin.y - dy))
             else:
-                scale = getattr(native, "_scale", 1)
+                scale = win32_window_scale(native)
                 native.Left += round(dx * scale)
                 native.Top += round(dy * scale)
 
@@ -566,7 +569,7 @@ class TranslucentApi(StageFollowMixin):
                 frame.size.width, frame.size.height = width, height
                 native.setFrame_display_(frame, True)
             else:
-                scale = getattr(native, "_scale", 1)
+                scale = win32_window_scale(native)
                 native.Width, native.Height = round(width * scale), round(height * scale)
                 self._round_windows_region()
 

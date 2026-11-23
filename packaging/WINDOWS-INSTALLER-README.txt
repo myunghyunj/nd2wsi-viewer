@@ -21,13 +21,15 @@ Default Apps capabilities under HKCU\Software\Classes for .nd2, .czi, .lif,
 existing default image handlers or changing system PATH.
 
 Supported target systems
-- Windows 11 x64 on Intel/AMD.
-- Windows 11 ARM64 using Windows x64 emulation (not a native ARM64 binary).
-- Windows Server 2025 x64 with Desktop Experience (CI verification environment).
-Windows 10, headless Server Core, and 32-bit Windows are not supported targets.
-While the Setup preflight gate permits 64-bit Windows build 16299+ (Windows 10
-1709+) when .NET Framework 4.6.2+ and WebView2 are present, Windows 10 is not
-tested in CI.
+- CI-verified targets: Windows 11 x64 on Intel/AMD, Windows 11 ARM64 using
+  Windows x64 emulation (not a native ARM64 binary), and Windows Server 2025
+  x64 with Desktop Experience.
+- Compatible targets (permitted by Setup preflight, not tested in CI): 64-bit
+  Windows 10 (build 10240+, including Enterprise LTSC with cumulative OS UCRT
+  updates) and Windows Server 2016+ with Desktop Experience when .NET Framework
+  4.6.2+ and WebView2 Runtime (>= 109) are available.
+- Unsupported / refused targets: Windows 8.1 and earlier, 32-bit Windows,
+  Windows 10 ARM64, and headless Server Core / Nano Server.
 
 Prerequisites
 .NET Framework 4.6.2 or newer is required; Setup checks this before installing.

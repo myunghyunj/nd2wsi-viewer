@@ -111,9 +111,9 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "nd2wsi-viewer contributors"
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "Install ${APP_DISPLAY_NAME} ${APP_RELEASE_VERSION}"
 !ifdef BUNDLED_WEBVIEW2
-  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with ${APP_DISPLAY_NAME}.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close ${APP_DISPLAY_NAME} before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. Microsoft Edge WebView2 Fixed Version Runtime is bundled for offline installation."
+  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with ${APP_DISPLAY_NAME}.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close ${APP_DISPLAY_NAME} before continuing.$\r$\n$\r$\nUse 64-bit Windows 10 or Windows 11 on x64 (or Windows Server 2016 or later with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. Microsoft Edge WebView2 Fixed Version Runtime is bundled for offline installation."
 !else
-  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with ${APP_DISPLAY_NAME}.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close ${APP_DISPLAY_NAME} before continuing.$\r$\n$\r$\nUse Windows 10 version 1709 or later, or Windows 11, on x64 (or Windows Server with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. If WebView2 Runtime is missing, Setup can download it from Microsoft using an Internet connection."
+  !define MUI_WELCOMEPAGE_TEXT "View Nikon ND2, Zeiss CZI, Leica LIF, OME-TIFF / TIFF / QPTIFF, Aperio SVS, SDPC, and ND2SVS microscopy slides with ${APP_DISPLAY_NAME}.$\r$\n$\r$\nSetup installs the app for your Windows account without administrator privileges. Close ${APP_DISPLAY_NAME} before continuing.$\r$\n$\r$\nUse 64-bit Windows 10 or Windows 11 on x64 (or Windows Server 2016 or later with Desktop Experience). ARM64 requires Windows 11 and uses x64 emulation.$\r$\n$\r$\nMicrosoft .NET Framework 4.6.2 or later is required. If WebView2 Runtime is missing, Setup can download it from Microsoft using an Internet connection."
 !endif
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
@@ -153,6 +153,9 @@ Var ProcessInspectError
 Var ProcessCheckedCount
 Var ExistingUpgrade
 Var UpgradeExitCode
+Var WinMajor
+Var WinMinor
+Var WinBuild
 
 !macro ND2WSI_TRACE PREFIX MESSAGE
   Push "${MESSAGE}"
@@ -1043,17 +1046,14 @@ Function .onInit
   ${If} $INSTDIR == ""
     StrCpy $INSTDIR "$LOCALAPPDATA\Programs\${INSTALL_DIR_NAME}"
   ${EndIf}
+  GetWinVer $WinMajor Major
+  GetWinVer $WinMinor Minor
+  GetWinVer $WinBuild Build
+  !insertmacro ND2WSI_TRACE "" ".onInit.windows_version major=$WinMajor minor=$WinMinor build=$WinBuild"
   ${IfNot} ${AtLeastWin10}
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=${APP_DISPLAY_NAME} requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11."
-    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires Windows 10 version 1709 or later, or Windows 11, on x64. ARM64 requires Windows 11." /SD IDOK
-    SetErrorLevel 2
-    !insertmacro ND2WSI_TRACE "" "Abort phase=.onInit guard=$GuardError"
-    Abort
-  ${EndIf}
-  ${IfNot} ${AtLeastWin11}
-  ${AndIfNot} ${AtLeastBuild} 16299
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=${APP_DISPLAY_NAME} requires Windows 10 version 1709 (build 16299) or later for Microsoft WebView2. Update Windows before running Setup. Windows 10 Education version 22H2 is recommended."
-    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires Windows 10 version 1709 (build 16299) or later for Microsoft WebView2. Update Windows before running Setup. Windows 10 Education version 22H2 is recommended." /SD IDOK
+  ${OrIfNot} ${AtLeastBuild} 10240
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=.onInit message=${APP_DISPLAY_NAME} requires 64-bit Windows 10 or Windows 11 on x64 (or Windows Server 2016 or later with Desktop Experience). ARM64 requires Windows 11. Detected Windows $WinMajor.$WinMinor (build $WinBuild)."
+    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires 64-bit Windows 10 or Windows 11 on x64 (or Windows Server 2016 or later with Desktop Experience). ARM64 requires Windows 11.$\r$\n$\r$\nDetected Windows $WinMajor.$WinMinor (build $WinBuild)." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "" "Abort phase=.onInit guard=$GuardError"
     Abort
@@ -1115,8 +1115,8 @@ Function RequireDotNetFramework
   !insertmacro ND2WSI_TRACE "" "RequireDotNetFramework.view32 release=$0"
   SetRegView 64
   ${If} $0 < 394802
-    !insertmacro ND2WSI_TRACE "" "MessageBox phase=RequireDotNetFramework message=${APP_DISPLAY_NAME} requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.8 or update Windows, then run Setup again. Windows 10 version 22H2 already includes .NET Framework 4.8."
-    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.8 or update Windows, then run Setup again. Windows 10 version 22H2 already includes .NET Framework 4.8." /SD IDOK
+    !insertmacro ND2WSI_TRACE "" "MessageBox phase=RequireDotNetFramework message=${APP_DISPLAY_NAME} requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.6.2 (or 4.8 on Windows 10 version 1607 and later), then run Setup again."
+    MessageBox MB_OK|MB_ICONSTOP "${APP_DISPLAY_NAME} requires Microsoft .NET Framework 4.6.2 or later. Install Microsoft .NET Framework 4.6.2 (or 4.8 on Windows 10 version 1607 and later), then run Setup again." /SD IDOK
     SetErrorLevel 2
     !insertmacro ND2WSI_TRACE "" "Abort phase=RequireDotNetFramework guard=$GuardError"
     Abort
@@ -1255,31 +1255,73 @@ Function VerifyDirectoryPage
   ${EndIf}
 FunctionEnd
 
+Function AcceptWebView2Version
+  ; Accept $0 into $WebView2Version only when its leading major version integer
+  ; before the first '.' is >= 109 (matching pywebview 6.2.1 + viewer CSS/JS floor).
+  Push $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  StrLen $R0 $0
+  StrCpy $R1 0
+  StrCpy $R2 ""
+  ${DoWhile} $R1 < $R0
+    StrCpy $R3 $0 1 $R1
+    ${If} $R3 == "."
+      ${ExitDo}
+    ${EndIf}
+    ${If} $R3 != "0"
+    ${AndIf} $R3 != "1"
+    ${AndIf} $R3 != "2"
+    ${AndIf} $R3 != "3"
+    ${AndIf} $R3 != "4"
+    ${AndIf} $R3 != "5"
+    ${AndIf} $R3 != "6"
+    ${AndIf} $R3 != "7"
+    ${AndIf} $R3 != "8"
+    ${AndIf} $R3 != "9"
+      StrCpy $R2 ""
+      ${ExitDo}
+    ${EndIf}
+    StrCpy $R2 "$R2$R3"
+    IntOp $R1 $R1 + 1
+  ${Loop}
+  ${If} $R2 != ""
+    IntOp $R4 $R2 + 0
+    ${If} $R4 >= 109
+      StrCpy $WebView2Version $0
+    ${Else}
+      !insertmacro ND2WSI_TRACE "" "FindWebView2.below_floor value=$0 major=$R4 min_major=109"
+    ${EndIf}
+  ${EndIf}
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Pop $R0
+FunctionEnd
+
 Function FindWebView2
   StrCpy $WebView2Version ""
   SetRegView 64
   ReadRegStr $0 HKCU "${WEBVIEW2_KEY}" "pv"
   !insertmacro ND2WSI_TRACE "" "FindWebView2.HKCU64 value=$0"
-  ${If} $0 != ""
-  ${AndIf} $0 != "0.0.0.0"
-    StrCpy $WebView2Version $0
+  Call AcceptWebView2Version
+  ${If} $WebView2Version != ""
     Return
   ${EndIf}
   ReadRegStr $0 HKLM "${WEBVIEW2_KEY}" "pv"
   !insertmacro ND2WSI_TRACE "" "FindWebView2.HKLM64 value=$0"
-  ${If} $0 != ""
-  ${AndIf} $0 != "0.0.0.0"
-    StrCpy $WebView2Version $0
+  Call AcceptWebView2Version
+  ${If} $WebView2Version != ""
     Return
   ${EndIf}
   SetRegView 32
   ReadRegStr $0 HKLM "${WEBVIEW2_KEY}" "pv"
   !insertmacro ND2WSI_TRACE "" "FindWebView2.HKLM32 value=$0"
   SetRegView 64
-  ${If} $0 != ""
-  ${AndIf} $0 != "0.0.0.0"
-    StrCpy $WebView2Version $0
-  ${EndIf}
+  Call AcceptWebView2Version
 FunctionEnd
 
 Function EnsureWebView2
@@ -1882,6 +1924,7 @@ FunctionEnd
 Section "${APP_DISPLAY_NAME} (required)" SecApplication
   SectionIn RO
   !insertmacro ND2WSI_TRACE "" "SecApplication.begin instdir=$INSTDIR"
+  DetailPrint "Windows version: $WinMajor.$WinMinor (build $WinBuild)"
   Call CheckInstallDirectory
   !insertmacro ND2WSI_TRACE "" "SecApplication.directory_check guard=$GuardError fresh=$InitialInstallFresh"
   ${If} $GuardError != ""
@@ -2303,6 +2346,10 @@ FunctionEnd
 Function un.onInit
   Call un.InitInstallerLog
   !insertmacro ND2WSI_TRACE "un." "un.onInit.begin instdir=$INSTDIR exepath=$EXEPATH"
+  GetWinVer $WinMajor Major
+  GetWinVer $WinMinor Minor
+  GetWinVer $WinBuild Build
+  !insertmacro ND2WSI_TRACE "un." "un.onInit.windows_version major=$WinMajor minor=$WinMinor build=$WinBuild"
   SetShellVarContext current
   SetRegView 64
   Call un.AcquireSetupMutex

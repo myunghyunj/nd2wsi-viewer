@@ -6,8 +6,8 @@ abstract: "Local whole-slide and confocal microscopy viewer for Nikon ND2, Zeiss
 authors:
   - family-names: "Jeong"
     given-names: "Myunghyun"
-version: 2.6.8
-date-released: '2026-11-22'
+version: 2.6.9
+date-released: '2026-11-23'
 license: MIT
 repository-code: "https://github.com/myunghyunj/nd2wsi-viewer"
 url: "https://github.com/myunghyunj/nd2wsi-viewer"
