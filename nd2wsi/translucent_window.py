@@ -402,6 +402,7 @@ class TranslucentApi:
         self._closed = False
         self._close_notified = False
         self._configured = False
+        self._revealing = False
         self._drop_document = None
         self._epoch = 0
         self._lock = threading.RLock()
@@ -652,39 +653,46 @@ class TranslucentApi:
     def _configure_and_show(self, *_args):
         def configure():
             with self._lock:
-                if self._closed or self._configured:
+                if self._closed or self._configured or self._revealing:
                     return
+                self._revealing = True
                 opacity = self._context["opacity"]
-            native = self._window.native
-            if sys.platform == "darwin":
-                import AppKit
+            completed = False
+            try:
+                native = self._window.native
+                if sys.platform == "darwin":
+                    import AppKit
 
-                frame = native.frame()
-                native.setStyleMask_(AppKit.NSWindowStyleMaskBorderless)
-                native.setFrame_display_(frame, True)
-                native.setOpaque_(False)
-                native.setBackgroundColor_(AppKit.NSColor.clearColor())
-                native.setHasShadow_(False)
-                native.setHidesOnDeactivate_(False)
-                native.setMovable_(True)
-                native.setMovableByWindowBackground_(False)
-                native.setLevel_(AppKit.NSFloatingWindowLevel)
-                native.setCollectionBehavior_(AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary)
-                # transparent=True configures WKWebView itself before loading.
-                native.makeKeyAndOrderFront_(None)
-                if self._drag is not None:
-                    self._drag._install()
-            else:
-                # WebView2's ordinary HWND host does not provide per-pixel
-                # desktop alpha. Native form opacity supplies the tracing
-                # effect (including controls) without applying alpha twice.
-                native.Opacity = opacity
-                native.TopMost = True
-                native.ShowInTaskbar = False
-                self._round_windows_region()
-                native.Show()
-            with self._lock:
-                self._configured = True
+                    frame = native.frame()
+                    native.setStyleMask_(AppKit.NSWindowStyleMaskBorderless)
+                    native.setFrame_display_(frame, True)
+                    native.setOpaque_(False)
+                    native.setBackgroundColor_(AppKit.NSColor.clearColor())
+                    native.setHasShadow_(False)
+                    native.setHidesOnDeactivate_(False)
+                    native.setMovable_(True)
+                    native.setMovableByWindowBackground_(False)
+                    native.setLevel_(AppKit.NSFloatingWindowLevel)
+                    native.setCollectionBehavior_(AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary)
+                    # transparent=True configures WKWebView itself before loading.
+                    native.makeKeyAndOrderFront_(None)
+                    if self._drag is not None:
+                        self._drag._install()
+                else:
+                    # WebView2's ordinary HWND host does not provide per-pixel
+                    # desktop alpha. Native form opacity supplies the tracing
+                    # effect (including controls) without applying alpha twice.
+                    native.Opacity = opacity
+                    native.TopMost = True
+                    native.ShowInTaskbar = False
+                    self._round_windows_region()
+                    native.Show()
+                completed = True
+            finally:
+                with self._lock:
+                    if completed:
+                        self._configured = True
+                    self._revealing = False
 
         try:
             self._dispatch(configure)
@@ -852,12 +860,14 @@ class TranslucentApi:
             self._session.cond.notify_all()
             win = self._window
             configured = self._configured
+            revealing = self._revealing
         shown_event = getattr(getattr(win, "events", None), "shown", None)
         unshown = (
             win is not None
             and callable(getattr(shown_event, "is_set", None))
             and not shown_event.is_set()
             and not configured
+            and not revealing
         )
         try:
             if win is not None:

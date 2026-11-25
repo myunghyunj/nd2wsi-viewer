@@ -1062,8 +1062,10 @@
           const native = await api.start_window_drag();
           if (native === true) {
             gesture.cancelled = true;
-            if (state.gesture === gesture) state.gesture = null;
-            releaseGestureCapture(gesture.pointerId);
+            if (state.gesture === gesture) {
+              state.gesture = null;
+              releaseGestureCapture(gesture.pointerId);
+            }
           }
         } catch (_) { /* The incremental bridge is available when native dragging is unavailable. */ }
         gesture.nativePending = false;

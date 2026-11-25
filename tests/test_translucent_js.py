@@ -1709,3 +1709,62 @@ def test_overlay_pointer_capture_guards_errors_idle_pointerup_cancel_and_lostcap
     assert result["afterLost"] == {"gesture": None, "log": [["set", 12]]}
     assert result["activeDespiteSetThrow"] is True
     assert result["gestureAfterReleaseThrow"] is None
+
+
+def test_async_native_drag_resolution_does_not_release_superseding_gesture_capture():
+    result = run("""
+      const pendingDrags = [];
+      const h = harness({
+        bridgeOverrides: {
+          start_window_drag() {
+            return new Promise(resolve => { pendingDrags.push(resolve); });
+          },
+          async move_window() { return { ok: true }; },
+        },
+      });
+      const ov = h.element('overlay');
+      const dragBtn = h.element('window-drag');
+      const captured = new Set();
+      const log = [];
+      ov.setPointerCapture = (id) => { log.push(['set', id]); captured.add(id); };
+      ov.hasPointerCapture = (id) => captured.has(id);
+      ov.releasePointerCapture = (id) => { log.push(['release', id]); captured.delete(id); };
+      const ev = (extra = {}) => ({
+        button: 0, pointerId: 1, screenX: 100, screenY: 120,
+        preventDefault() {}, stopImmediatePropagation() {}, ...extra,
+      });
+
+      // First drag starts and awaits start_window_drag() with pointerId 1.
+      const first = dragBtn.listeners.pointerdown(ev({ pointerId: 1 }));
+      // Before first resolves, a superseding drag starts with the same pointerId 1.
+      const second = dragBtn.listeners.pointerdown(ev({ pointerId: 1, screenX: 150 }));
+      const secondGesture = h.mounted.state.gesture;
+
+      // Now the stale first start_window_drag() resolves to true.
+      pendingDrags[0](true);
+      await first;
+      const afterStaleResolve = {
+        sameGesture: h.mounted.state.gesture === secondGesture,
+        stillCaptured: captured.has(1),
+        log: log.slice(),
+      };
+
+      // When the active second drag resolves to true, it releases capture and clears gesture.
+      pendingDrags[1](true);
+      await second;
+      return {
+        afterStaleResolve,
+        finalGesture: h.mounted.state.gesture,
+        finalCaptured: [...captured],
+        finalLog: log.slice(),
+      };
+    """)
+    assert result["afterStaleResolve"] == {
+        "sameGesture": True,
+        "stillCaptured": True,
+        "log": [["set", 1], ["release", 1], ["set", 1]],
+    }
+    assert result["finalGesture"] is None
+    assert result["finalCaptured"] == []
+    assert result["finalLog"] == [["set", 1], ["release", 1], ["set", 1], ["release", 1]]
+
