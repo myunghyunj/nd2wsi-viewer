@@ -247,3 +247,62 @@ def test_process_exit_releases_kernel_lock_without_cleanup(tmp_path):
             child.join(timeout=10)
         result.close()
         result.join_thread()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies replacement of the open lock file")
+def test_inode_mismatch_with_zero_timeout_never_double_closes_fd(tmp_path: Path, monkeypatch):
+    from nd2wsi import session_lock as lock_mod
+
+    path = tmp_path / "update.lock"
+    lock = SessionFileLock(path)
+    real_flock = lock_mod.fcntl.flock
+    real_close = os.close
+    closed_fds: list[int] = []
+    swapped = {"done": False}
+
+    def swap_after_lock(fd, operation):
+        result = real_flock(fd, operation)
+        if (
+            not swapped["done"]
+            and operation & lock_mod.fcntl.LOCK_EX
+            and operation & lock_mod.fcntl.LOCK_NB
+        ):
+            swapped["done"] = True
+            replacement = path.with_name(path.name + ".replacement")
+            replacement.write_text("replaced", encoding="utf-8")
+            replacement.replace(path)
+        return result
+
+    def track_close(fd):
+        closed_fds.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(lock_mod.fcntl, "flock", swap_after_lock)
+    monkeypatch.setattr(os, "close", track_close)
+
+    with pytest.raises(TimeoutError, match="lock coordination path changed"):
+        lock.acquire(timeout=0.0, poll=0.005)
+    assert swapped["done"]
+    assert not lock.acquired
+    # Exactly one os.close call for the opened descriptor — never a double-close.
+    assert len(closed_fds) == 1
+
+
+def test_session_file_lock_routes_os_calls_through_filesystem_path(tmp_path: Path, monkeypatch):
+    from nd2wsi import session_lock as lock_mod
+
+    seen: list[str] = []
+    real_fs_path = lock_mod.filesystem_path
+
+    def spy_fs_path(p, **kw):
+        out = real_fs_path(p, **kw)
+        seen.append(out)
+        return out
+
+    monkeypatch.setattr(lock_mod, "filesystem_path", spy_fs_path)
+    path = tmp_path / "nested" / "session.lock"
+    lock = SessionFileLock(path)
+    with lock:
+        assert lock.acquired
+    assert str(path) in seen
+    assert str(path.parent) in seen

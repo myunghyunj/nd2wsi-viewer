@@ -166,6 +166,77 @@ def test_delayed_press_rejects_a_hand_realigned_view_with_the_same_follow_sequen
     assert overlay._prepare_laser_box(record) == (None, "view_after_press")
 
 
+def test_stationary_duplicate_view_preserves_moved_at_while_real_move_rejects_press(monkeypatch):
+    from nd2wsi import translucent_stage_follow as tsf
+
+    clock = iter([100.0, 102.0, 103.0, 104.0])
+    monkeypatch.setattr(tsf.time, "monotonic", lambda: next(clock))
+    overlay = TranslucentApi(
+        {"query": "?g=pixels&t=1&p=2&z=3", "pixel_size_um": [2, 0.5]},
+        logger=Mock(),
+        on_closed=Mock(),
+    )
+    overlay._stage_follow = Mock()
+    overlay._stage_follow_receiver_id = "receiver"
+    overlay._locked = True
+    base_view = {
+        "version": 1,
+        "center_px": [20.0, 30.0],
+        "zoom": 2.0,
+        "rotation": 359.99995,
+        "flip": False,
+        "locked": True,
+        "follow_session": "receiver",
+        "follow_seq": 8,
+        "target_px": [25.0, 35.0],
+        "target_offset_css": [10.0, 10.0],
+        "target_side_um": 18.0,
+        "target_rotation_deg": 45.0,
+        "target_calibrated": True,
+        "target_corners_px": [[20.0, 30.0], [30.0, 30.0], [30.0, 40.0], [20.0, 40.0]],
+    }
+    # 1. Initial report at t=100 sets both at and moved_at to 100.
+    assert overlay.report_overlay_view(base_view)["ok"]
+    assert overlay._overlay_view["at"] == 100.0
+    assert overlay._overlay_view["moved_at"] == 100.0
+
+    # 2. Trailing stationary heartbeat at t=102 (with sub-epsilon jitter and 360->0 wraparound)
+    #    after press observed_at=101 must advance `at` but retain `moved_at=100` so the shot passes.
+    assert overlay.report_overlay_view({
+        **base_view,
+        "center_px": [20.0005, 29.9995],
+        "zoom": 2.0 + 5e-7,
+        "rotation": 0.0,
+        "target_px": [25.0004, 35.0004],
+        "target_corners_px": [[20.0005, 30.0], [30.0, 30.0005], [30.0, 40.0], [20.0, 40.0]],
+    })["ok"]
+    assert overlay._overlay_view["at"] == 102.0
+    assert overlay._overlay_view["moved_at"] == 100.0
+    record = {
+        "receiver_id": "receiver",
+        "press": 1,
+        "follow_seq": 8,
+        "locked": True,
+        "observed_at": 101.0,
+        "lock_epoch": overlay._epoch,
+        "prior_view_seq": 8,
+        "at": "2026-01-01T00:00:00Z",
+    }
+    prepared, reason = overlay._prepare_laser_box(record)
+    assert reason is None and prepared is not None
+
+    # 3. Genuine geometry move (> 1e-3 px) at t=103 with the same follow_seq advances moved_at
+    #    and rejects the earlier press as view_after_press.
+    assert overlay.report_overlay_view({**base_view, "center_px": [20.5, 30.0]})["ok"]
+    assert overlay._overlay_view["at"] == 103.0
+    assert overlay._overlay_view["moved_at"] == 103.0
+    assert overlay._prepare_laser_box(record) == (None, "view_after_press")
+
+    # 4. Rotation move (> 1e-4 deg) also advances moved_at.
+    assert overlay.report_overlay_view({**base_view, "center_px": [20.5, 30.0], "rotation": 1.0})["ok"]
+    assert overlay._overlay_view["moved_at"] == 104.0
+
+
 @pytest.mark.parametrize("running", [True, False])
 def test_laser_worker_is_lazy_reused_and_closed_on_failed_start_or_window_exit(monkeypatch, running):
     from nd2wsi import stage_follow, stage_keys

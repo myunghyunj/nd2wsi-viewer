@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from .cache import (
     is_file_container,
     managed_dir,
     names_match,
+    normalize_name,
     quarantine,
     quick_fingerprint,
     read_manifest,
@@ -267,6 +269,25 @@ def _plate_group(container: Path, mode: str):
     if is_file_container(container):
         from .storage.single_file import open_zarr_group
         return open_zarr_group(container, prefix=THUMBS_NAME, mode=mode)
+    if mode in ("r", "r+", "a") and (
+        os.path.isdir(filesystem_path(container)) or os.path.lexists(filesystem_path(container))
+    ):
+        from .storage.zarr_v2 import UnsafeZarrArrayError, validate_zarr_v2_directory
+        from .windows_fs import is_windows_name_surrogate_reparse
+
+        try:
+            container_st = os.lstat(filesystem_path(container))
+        except OSError as exc:
+            raise UnsafeZarrArrayError(f"cannot inspect plate cache directory: {container}") from exc
+        if (
+            stat.S_ISLNK(container_st.st_mode)
+            or is_windows_name_surrogate_reparse(container_st)
+            or not stat.S_ISDIR(container_st.st_mode)
+        ):
+            raise UnsafeZarrArrayError(f"refusing unsafe plate cache directory: {container}")
+        thumbs_dir = container / THUMBS_NAME
+        if os.path.lexists(filesystem_path(thumbs_dir)):
+            validate_zarr_v2_directory(thumbs_dir)
     import zarr
     return zarr.open_group(Path(filesystem_path(container / THUMBS_NAME)), mode=mode, zarr_format=2)
 
@@ -281,7 +302,8 @@ def _close_plate_group(root: Any) -> None:
 def plate_session_lock_path(container: str | Path) -> Path:
     """Persistent inode used by current builds to arbitrate a plate writer."""
     container = Path(container)
-    return container.with_name(container.name + ".writer-session.lock")
+    canonical = container.with_name(normalize_name(container.name) + ".writer-session.lock")
+    return resolve_existing_path(canonical, kind="file")
 
 
 def _empty_plate_status(n_t: int, n_p: int, n_z: int) -> dict[str, Any]:
@@ -330,7 +352,7 @@ class PlateWriterLock:
         self.container = Path(container)
         self._session = SessionFileLock(plate_session_lock_path(self.container))
         self._legacy = CacheLock(
-            self.container.with_name(self.container.name + ".writer")
+            self.container.with_name(normalize_name(self.container.name) + ".writer")
         )
         self._acquired = False
         self._stop = threading.Event()

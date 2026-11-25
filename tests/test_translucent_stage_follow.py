@@ -733,7 +733,8 @@ def test_report_overlay_view_validates_and_caches_without_logging(monkeypatch):
     events.clear()
     assert api.report_overlay_view(_view()) == {"ok": True}
     cached = api._overlay_view
-    assert {key: value for key, value in cached.items() if key != "at"} == {
+    assert cached["moved_at"] == cached["at"]
+    assert {key: value for key, value in cached.items() if key not in ("at", "moved_at")} == {
         "center_px": [100.0, 200.0], "zoom": 2.0, "rotation": 90.0, "flip": True, "locked": False,
         "follow_session": None, "follow_seq": None, "follow_displacement_um": None,
         "container": [800.0, 500.0], "window": [10.0, 20.0, 800.0, 500.0]}
@@ -752,7 +753,11 @@ def test_report_overlay_view_validates_and_caches_without_logging(monkeypatch):
     # The page can pan the image far past validate_context's slack; that centre is still logged as it is.
     far = api.report_overlay_view(_view(center_px=[-8 * 2048 - 1, 9 * 2048 + 1]))
     assert far == {"ok": True} and api._overlay_view["center_px"] == [-8 * 2048 - 1.0, 9 * 2048 + 1.0]
-    assert api.report_overlay_view(_view())["ok"] and api._overlay_view == {**cached, "at": api._overlay_view["at"]}
+    assert api.report_overlay_view(_view())["ok"] and api._overlay_view == {
+        **cached,
+        "at": api._overlay_view["at"],
+        "moved_at": api._overlay_view["moved_at"],
+    }
     # Optional fields may be left out.
     loose = TranslucentApi({}, logger=Mock(), on_closed=Mock())
     assert loose.report_overlay_view({"version": 1, "center_px": [-5e8, 5e8], "zoom": 1})["ok"]
@@ -811,3 +816,110 @@ def test_mark_context_never_waits_for_the_overlay_lock(keys_overlay):
     assert lost["follow_status"] == "lost" and lost["slacs_session"] is None and lost["counted"] is None
     api.close_translucent()
     assert api._mark_context() is None
+
+
+def test_start_stage_follow_binds_all_attributes_before_follower_start_and_rolls_back(monkeypatch):
+    from nd2wsi import slacs_laser, stage_follow, stage_keys
+
+    def _run_case(mode: str):
+        seen_during_start = {}
+        receiver = Mock()
+        receiver.start.return_value = {"session_id": "recv-42"}
+        receiver.snapshot.return_value = {"status": "waiting", "seq": 0, "displacement_um": [0, 0]}
+        delivery = Mock()
+        monkeypatch.setattr(stage_follow, "StageFollowReceiver", lambda: receiver)
+        monkeypatch.setattr(slacs_laser, "LaserDelivery", lambda **_kw: delivery)
+
+        class _FakeFollower:
+            def __init__(self, *_args, mark_context, **_kwargs):
+                self._mark_context = mark_context
+                self.stop = Mock()
+
+            def snapshot(self):
+                return {"counted": 0, "step_source": "manual", "step_um": 10.0}
+
+            def start(self):
+                seen_during_start.update(
+                    stage_follow=api._stage_follow,
+                    stage_follower=api._stage_follower,
+                    session=api._stage_follow_session,
+                    receiver_id=api._stage_follow_receiver_id,
+                    source=api._stage_follow_source,
+                    status=api._stage_follow_status,
+                    lost=api._stage_follow_lost,
+                    mark_ctx=self._mark_context(),
+                )
+                if mode == "ok":
+                    return {"running": True}
+                if mode == "not_running":
+                    return {"running": False, "error": "hook rejected"}
+                raise KeyboardInterrupt("aborted during start")
+
+        follower_holder = []
+
+        def _make_follower(*args, **kwargs):
+            inst = _FakeFollower(*args, **kwargs)
+            follower_holder.append(inst)
+            return inst
+
+        monkeypatch.setattr(stage_keys, "SlacsKeyFollower", _make_follower)
+        api = TranslucentApi(
+            {"pixel_size_um": [1.0, 1.0], "dimensions": [1024, 1024], "image_name": "test.nd2"},
+            logger=Mock(),
+            on_closed=Mock(),
+            on_laser_box=Mock(),
+        )
+        api._window = Mock()
+        api._dispatch = lambda _op: None
+        api._on_slacs_change({"available": True, "session_id": "slacs-proc-1", "status": "running"})
+        api._stage_follow_lost = "stale loss message"
+        return api, receiver, delivery, follower_holder, seen_during_start
+
+    # 1. Successful start: all 7 attributes are already bound when follower.start() runs.
+    api, receiver, delivery, followers, seen = _run_case("ok")
+    res = api.start_stage_follow({"source": "keys", "step_source": "manual"})
+    assert res["ok"] is True
+    assert seen["stage_follow"] is receiver
+    assert seen["stage_follower"] is followers[0]
+    assert seen["session"] == "slacs-proc-1"
+    assert seen["receiver_id"] == "recv-42"
+    assert seen["source"] == "keys"
+    assert seen["status"] is None
+    assert seen["lost"] == ""
+    assert seen["mark_ctx"]["slacs_session"] == "slacs-proc-1"
+    assert seen["mark_ctx"]["follow_status"] == "waiting"
+    api.close_translucent()
+
+    # 2. Failed start (running=False): all 7 attributes rolled back and resources closed.
+    api2, receiver2, delivery2, followers2, seen2 = _run_case("not_running")
+    res2 = api2.start_stage_follow({"source": "keys", "step_source": "manual"})
+    assert res2 == {"ok": False, "message": "hook rejected"}
+    assert seen2["session"] == "slacs-proc-1"
+    assert api2._stage_follow is None
+    assert api2._stage_follower is None
+    assert api2._stage_follow_session is None
+    assert api2._stage_follow_receiver_id is None
+    assert api2._stage_follow_source is None
+    assert api2._stage_follow_status is None
+    assert api2._stage_follow_lost == ""
+    assert api2._laser_delivery is None
+    followers2[0].stop.assert_called_once_with("start_failed")
+    receiver2.close.assert_called_once_with()
+    delivery2.close.assert_called_once_with()
+
+    # 3. Unexpected BaseException during follower.start(): all 7 attributes rolled back and re-raised.
+    api3, receiver3, delivery3, followers3, seen3 = _run_case("base_exc")
+    with pytest.raises(KeyboardInterrupt, match="aborted during start"):
+        api3.start_stage_follow({"source": "keys", "step_source": "manual"})
+    assert seen3["session"] == "slacs-proc-1"
+    assert api3._stage_follow is None
+    assert api3._stage_follower is None
+    assert api3._stage_follow_session is None
+    assert api3._stage_follow_receiver_id is None
+    assert api3._stage_follow_source is None
+    assert api3._stage_follow_status is None
+    assert api3._stage_follow_lost == ""
+    assert api3._laser_delivery is None
+    followers3[0].stop.assert_called_once_with("start_failed")
+    receiver3.close.assert_called_once_with()
+    delivery3.close.assert_called_once_with()

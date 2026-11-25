@@ -802,3 +802,68 @@ def test_helpers_open_modes_read_only_cloning_and_buffer_type_validation(tmp_pat
                     pass
             with pytest.raises(RuntimeError, match="inside"):
                 store.close()
+
+
+@pytest.mark.parametrize("mode", ["r", "r+", "a"])
+def test_open_zarr_group_validates_existing_zarrays_across_read_and_append_modes(
+    tmp_path, monkeypatch, mode
+):
+    from nd2wsi.storage import single_file, zarr_v2
+
+    path = tmp_path / f"unsafe-{mode}.nd2svs"
+    unsafe_zarray = {
+        "zarr_format": 2,
+        "shape": [1, 8, 8],
+        "chunks": [1, 4, 4],
+        "dtype": "<u2",
+        "fill_value": 0,
+        "order": "C",
+        "filters": None,
+        "compressor": {"id": "pickle"},
+    }
+    with SQLiteStore(path, read_only=False, prefix="store.ome.zarr") as store:
+        store.write_bytes(".zgroup", b'{"zarr_format": 2}')
+        store.write_bytes("0/.zarray", json.dumps(unsafe_zarray).encode("utf-8"))
+
+    closed_connections = []
+    real_close = SQLiteStore.close
+
+    def record_close(self):
+        if self._connection is not None:
+            closed_connections.append(self._connection)
+        real_close(self)
+
+    monkeypatch.setattr(SQLiteStore, "close", record_close)
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        single_file.open_zarr_group(path, mode=mode)
+    assert closed_connections
+    for conn in closed_connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+
+def test_open_zarr_group_mode_a_on_new_file_skips_existing_validation(tmp_path, monkeypatch):
+    from nd2wsi.storage import single_file
+
+    path = tmp_path / "brand-new.nd2svs"
+    calls = []
+    real_validate = single_file._validate_store_zarrays
+
+    def spy_validate(store):
+        calls.append(store.path)
+        return real_validate(store)
+
+    monkeypatch.setattr(single_file, "_validate_store_zarrays", spy_validate)
+    group = single_file.open_zarr_group(path, mode="a")
+    try:
+        assert calls == []
+        group.create_array("0", shape=(2, 2), chunks=(2, 2), dtype="u1")[:] = 1
+    finally:
+        group.store.close()
+
+    reopened = single_file.open_zarr_group(path, mode="a")
+    try:
+        assert calls == [path.resolve()] or calls == [path]
+        assert int(reopened["0"][0, 0]) == 1
+    finally:
+        reopened.store.close()

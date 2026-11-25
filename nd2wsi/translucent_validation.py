@@ -16,6 +16,7 @@ import urllib.parse
 from pathlib import Path
 
 from . import follow_flips, laser_target, session_log
+from .roi_list import roi_pair_paths as _roi_pair_paths
 
 OPACITY = 0.55
 MIN_OPACITY = 0.10
@@ -86,6 +87,8 @@ _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 # Match nd2wsi/render.py without eagerly importing numpy at module load time.
 _FLOAT32_SAFE_BOUND = 3e38
 _HEX6_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+_ROI_BOUND_EPS = 1e-6
+_MAX_QUERY_BYTES = 16384
 
 
 def _number(value, name, minimum, maximum):
@@ -125,9 +128,13 @@ def validate_roi(store, payload):
     if (
         rectangle["w"] <= 0
         or rectangle["h"] <= 0
-        or rectangle["x"] + rectangle["w"] > width
-        or rectangle["y"] + rectangle["h"] > height
+        or rectangle["x"] + rectangle["w"] > width + _ROI_BOUND_EPS
+        or rectangle["y"] + rectangle["h"] > height + _ROI_BOUND_EPS
     ):
+        raise ValueError("ROI rectangle is outside the slide")
+    rectangle["w"] = min(rectangle["w"], width - rectangle["x"])
+    rectangle["h"] = min(rectangle["h"], height - rectangle["y"])
+    if rectangle["w"] <= 0 or rectangle["h"] <= 0:
         raise ValueError("ROI rectangle is outside the slide")
     return rectangle
 
@@ -316,7 +323,7 @@ def validate_display_params(store, params) -> list[tuple[str, str]]:
 
 def validate_display_query(store, display_query: str) -> list[tuple[str, str]]:
     """Validate a display-only query string containing only c, win, and/or col."""
-    if not isinstance(display_query, str) or len(display_query) > 16384:
+    if not isinstance(display_query, str) or len(display_query) > _MAX_QUERY_BYTES:
         raise ValueError("Invalid display settings")
     body = display_query.removeprefix("?")
     pairs = urllib.parse.parse_qsl(
@@ -331,6 +338,17 @@ def validate_display_query(store, display_query: str) -> list[tuple[str, str]]:
     return validate_display_params(store, params)
 
 
+def encode_validated_query(pairs) -> str:
+    """Encode validated query pairs and enforce the post-encode 16,384-byte limit."""
+    cleaned = urllib.parse.urlencode(pairs)
+    if not cleaned:
+        return ""
+    encoded = "?" + cleaned
+    if len(encoded) > _MAX_QUERY_BYTES:
+        raise ValueError("Query too long")
+    return encoded
+
+
 def merge_display_query(store, base_query: str, display_query: str) -> str:
     """Merge validated display overrides onto immutable launch base keys (g, t, p, z)."""
     display_pairs = validate_display_query(store, display_query)
@@ -339,8 +357,7 @@ def merge_display_query(store, base_query: str, display_query: str) -> str:
     base_pairs = urllib.parse.parse_qsl(base_query.removeprefix("?"), keep_blank_values=True)
     base_map = dict(base_pairs)
     preserved = [(key, base_map[key]) for key in ("g", "t", "p", "z") if key in base_map]
-    merged = display_pairs + preserved
-    return "?" + urllib.parse.urlencode(merged) if merged else ""
+    return encode_validated_query(display_pairs + preserved)
 
 
 def validate_context(store, payload, *, slide_url):
@@ -396,7 +413,7 @@ def validate_context(store, payload, *, slide_url):
                 canonical_pairs.append((key, display_map[key]))
         else:
             canonical_pairs.append((key, value))
-    cleaned = urllib.parse.urlencode(canonical_pairs)
+    encoded_query = encode_validated_query(canonical_pairs)
     plate_meta = meta.get("plate") if isinstance(meta.get("plate"), dict) else {}
     store_scope = "plane" if plate is not None and plate_meta.get("annotationScope") == "plane" else "site"
     if "annotation_scope" in payload and payload["annotation_scope"] is not None:
@@ -423,7 +440,7 @@ def validate_context(store, payload, *, slide_url):
     context = {
         "version": 1,
         "slide_url": slide_url,
-        "query": "?" + cleaned if cleaned else "",
+        "query": encoded_query,
         "center": center,
         "zoom": zoom,
         "rotation": rotation,
@@ -448,7 +465,7 @@ def validate_context(store, payload, *, slide_url):
         for roi in rois:
             rectangle = validate_roi(store, roi)
             label, index = roi.get("label"), roi.get("index")
-            if not isinstance(label, str) or len(label) > 1000:
+            if not isinstance(label, str) or len(label) > 4096:
                 raise ValueError("Invalid ROI label")
             if type(index) is not int or not 1 <= index <= 2**53 - 1 or index in indices:
                 raise ValueError("ROI indices must be positive, unique safe integers")
@@ -632,40 +649,8 @@ def validate_locked_interactive_rects(rects) -> list[dict[str, float]]:
 
 
 def roi_pair_paths(paths, *, require_pair: bool = True) -> list[Path]:
-    """Resolve one explicitly selected JPG/TXT pair; never guess among siblings."""
-    if not isinstance(paths, (list, tuple)) or not 1 <= len(paths) <= 2:
-        raise ValueError("Choose one matching JPG and TXT pair.")
-    paths = [Path(path) for path in paths]
-    if any(path.suffix.casefold() not in (".txt", ".jpg", ".jpeg") for path in paths):
-        raise ValueError("Choose a coordinate-reference JPG and AstroMapper TXT.")
-    if len(paths) == 1:
-        chosen = paths[0]
-        suffixes = (".jpg", ".jpeg") if chosen.suffix.casefold() == ".txt" else (".txt",)
-        companions = [
-            path
-            for path in chosen.parent.iterdir()
-            if path.stem.casefold() == chosen.stem.casefold()
-            and path.suffix.casefold() in suffixes
-            and path.is_file()
-        ]
-        if len(companions) == 1:
-            paths.append(companions[0])
-        elif require_pair:
-            message = (
-                "More than one matching reference file was found. Drop the intended JPG and TXT together."
-                if companions
-                else "The matching JPG/TXT is missing. Drop both files together."
-            )
-            raise ValueError(message)
-        else:
-            return paths
-    text = [path for path in paths if path.suffix.casefold() == ".txt"]
-    images = [path for path in paths if path.suffix.casefold() in (".jpg", ".jpeg")]
-    if len(text) != 1 or len(images) != 1:
-        raise ValueError("Choose one JPG and one TXT file.")
-    if text[0].stem.casefold() != images[0].stem.casefold():
-        raise ValueError("The reference JPG and TXT must have the same filename before the extension.")
-    return [text[0], images[0]]
+    """Resolve one explicitly selected JPG/PNG + TXT pair; never guess among siblings."""
+    return _roi_pair_paths(paths, require_pair=require_pair)
 
 
 def laser_scope(context: dict) -> tuple:

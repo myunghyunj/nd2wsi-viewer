@@ -237,7 +237,7 @@ def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monk
     monkeypatch.delenv("ND2WSI_WEBVIEW2_RUNTIME", raising=False)
     monkeypatch.setitem(sys.modules, "winreg", None)
     monkeypatch.setattr("nd2wsi.webview2_runtime.default_app_root", lambda: tmp_path / "app-root")
-    api = SimpleNamespace(_startup_error=None, stop_server_for_update=Mock())
+    api = SimpleNamespace(_startup_error=None, _stop_server_for_update=Mock())
     create = Mock(return_value=(api, object()))
     monkeypatch.setattr(app, "create_app_window", create)
     # No settings attribute: the system runtime choice must never write one.
@@ -258,7 +258,7 @@ def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monk
     else:
         assert not hasattr(api, "_webview2_runtime")
     webview.start.assert_called_once_with(**expected)
-    api.stop_server_for_update.assert_called_once()
+    api._stop_server_for_update.assert_called_once()
 
 
 class MainQueue:

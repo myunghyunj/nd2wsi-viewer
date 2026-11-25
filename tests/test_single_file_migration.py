@@ -165,16 +165,25 @@ def test_migration_releases_all_connections_before_return_or_failure(tmp_path, m
 
 
 def test_final_durability_flush_uses_nontruncating_writable_handle(tmp_path, monkeypatch):
+    import builtins
+
+    from nd2wsi.platform_io import filesystem_path
+
     _, legacy, _ = make_legacy(tmp_path)
     target = tmp_path / "durable.nd2svs"
+    target_native = filesystem_path(target)
     target_handles = []
-    real_open = Path.open
+    real_open = builtins.open
     real_fsync = os.fsync
     flushed = []
 
-    def record_open(self, mode="r", *args, **kwargs):
-        handle = real_open(self, mode, *args, **kwargs)
-        if self == target:
+    def record_open(file, mode="r", *args, **kwargs):
+        handle = real_open(file, mode, *args, **kwargs)
+        try:
+            same_target = isinstance(file, (str, os.PathLike)) and os.fspath(file) == target_native
+        except TypeError:
+            same_target = False
+        if same_target and mode == "r+b":
             target_handles.append((mode, handle))
         return handle
 
@@ -192,7 +201,7 @@ def test_final_durability_flush_uses_nontruncating_writable_handle(tmp_path, mon
         flushed.append(fd)
         return real_fsync(fd)
 
-    monkeypatch.setattr(Path, "open", record_open)
+    monkeypatch.setattr(builtins, "open", record_open)
     monkeypatch.setattr(os, "fsync", checked_fsync)
     result = pack_directory(legacy, target)
     assert result["verified"]
@@ -409,3 +418,45 @@ def test_invalid_single_file_is_not_a_reusable_manifest(tmp_path):
     with pytest.raises(ValueError):
         open_store(path)
     assert path.read_bytes() == before
+
+
+def test_pack_directory_and_cache_entries_work_past_windows_max_path_via_filesystem_path(
+    tmp_path, monkeypatch
+):
+    import shutil
+
+    from nd2wsi import migration as migration_mod
+    from nd2wsi.platform_io import filesystem_path
+
+    subtree = tmp_path / ("mig-" + "a" * 80)
+    deep_base = subtree / ("nested-" + "b" * 80) / ("stage-" + "c" * 80)
+    deep_base.mkdir(parents=True)
+    try:
+        source, legacy, expected = make_legacy(deep_base)
+        target = deep_base / "packed.nd2svs"
+        assert len(str(legacy)) > 260
+        assert len(str(target)) > 260
+
+        seen: list[str] = []
+        real_fs_path = migration_mod.filesystem_path
+
+        def spy_fs_path(p, **kw):
+            out = real_fs_path(p, **kw)
+            seen.append(out)
+            return out
+
+        monkeypatch.setattr(migration_mod, "filesystem_path", spy_fs_path)
+        entries = cache_entries(legacy)
+        assert any(key == MANIFEST_NAME for key, _ in entries)
+        result = pack_directory(legacy, target, source=source)
+        assert result["verified"] is True
+        assert result["file_bytes"] > 0
+        assert filesystem_path(legacy) in seen
+        assert filesystem_path(target) in seen
+        group, _ = open_store(target)
+        try:
+            assert np.array_equal(group["0"][:], expected)
+        finally:
+            group.close()
+    finally:
+        shutil.rmtree(filesystem_path(subtree))

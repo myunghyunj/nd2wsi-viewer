@@ -130,7 +130,7 @@ class Api:
         self.probed.set()
         return self.reason
 
-    def stop_server_for_update(self, timeout=None):
+    def _stop_server_for_update(self, timeout=None):
         self.close_timeouts.append(timeout)
         self.close_threads.append(threading.current_thread())
         self.trace.append("close-server")
@@ -334,7 +334,7 @@ def test_a_read_that_outlasts_the_first_wait_still_lets_the_update_install(drive
     assert driver.failures == []
     assert driver.window.cancellations == []
     assert read.api._httpd is None and read.api._releasing_httpd is None
-    assert driver.coordinator._ownership().torn_down is False
+    assert driver.coordinator._ownership().torn_down is True
 
 
 def test_a_read_that_never_ends_fails_the_update_after_the_limit_with_what_to_do(driver):
@@ -366,7 +366,7 @@ def test_a_read_that_never_ends_fails_the_update_after_the_limit_with_what_to_do
         assert read.registry.slides == {} and read.closed == []
     finally:
         read.busy.__exit__(None, None, None)
-    read.api.stop_server_for_update()
+    read.api._stop_server_for_update()
     assert read.closed == [(0, 0)]
     assert read.api._releasing_httpd is None
 

@@ -187,3 +187,63 @@ def test_updater_ui_and_annotation_flush_are_wired():
     assert 'event.data.nd2wsi === "prepare-quit"' in pane_js
     assert "await flushAnnotationsForUpdate()" in pane_js
     assert "handle.check_for_updates" in app_py
+
+
+def test_internal_lifecycle_methods_are_private_while_update_block_reason_stays_public():
+    from nd2wsi import app
+
+    api = app.Api(None)
+    assert not hasattr(api, "attach_updater")
+    assert not hasattr(api, "stop_server_for_update")
+    assert callable(getattr(api, "_attach_updater", None))
+    assert callable(getattr(api, "_stop_server_for_update", None))
+    # shell-v1.js intentionally queries window.pywebview.api.update_block_reason() on tab close.
+    assert callable(getattr(api, "update_block_reason", None))
+
+    handle = SimpleNamespace(check_for_updates=lambda: None)
+    api._attach_updater(handle)
+    assert api._updater is handle
+
+
+def test_stop_server_for_update_clears_httpd_under_lock_before_closing_overlays(monkeypatch):
+    from unittest.mock import Mock
+
+    from nd2wsi import app
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    api = app.Api(None)
+    events = []
+    store = SimpleNamespace(
+        attrs={"nd2wsi": {"rgb": False, "levels": [{"width": 100, "height": 100}]}, "omero": {"channels": [{}]}},
+        generation="g1",
+        plate=None,
+    )
+    server = SimpleNamespace(
+        registry=SimpleNamespace(get=lambda sid: store if sid == "s1" else None),
+        shutdown_for_relaunch=lambda timeout=None: events.append(("shutdown", api._httpd is None)),
+        server_close=lambda: events.append(("server_close", api._httpd is None)),
+    )
+    api._httpd = server
+
+    def on_overlay_close():
+        events.append(("overlay_close", api._httpd is None, api._releasing_httpd is server))
+        # A concurrent launch racing overlay teardown must not see the dying server.
+        concurrent = api.open_translucent_viewer(
+            "s1",
+            {"version": 1, "query": "?g=g1", "center": [50, 50], "zoom": 1.0, "rotation": 0, "flip": False},
+        )
+        assert concurrent["ok"] is False
+
+    overlay = SimpleNamespace(close_translucent=Mock(side_effect=on_overlay_close))
+    api._translucent_windows["s1"] = overlay
+
+    api._stop_server_for_update()
+    assert events == [
+        ("overlay_close", True, True),
+        ("shutdown", True),
+        ("server_close", True),
+    ]
+    assert api._httpd is None
+    assert api._releasing_httpd is None
+    assert api._translucent_windows == {}
+    assert api._translucent_owner_closed is False

@@ -3,6 +3,21 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.10</title>
+            <pubDate>Wed, 25 Nov 2026 07:51:15 +0000</pubDate>
+            <sparkle:version>2.6.10</sparkle:version>
+            <sparkle:shortVersionString>2.6.10</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Live translucent LUT updates and cross-OS exFAT cache portability</h2>
+<ul>
+<li><strong>Live LUT updates in the translucent viewer.</strong> Adjusting channel visibility, contrast ranges, gamma, presets, or channel colours in the main viewer now updates the open translucent overlay in real time during continuous drags and slider edits while keeping tracing pan/zoom and locked ROI alignment intact. Slow-tile redraws are gated on paint completion with retry handling so the floating image never flashes blank, shading-correction cache rebuilds display a clear expiry notice instead of showing stale pixels, and overlay teardown and session lifecycle handling are hardened.</li>
+<li><strong>Cross-OS external-SSD cache portability (macOS ↔ Windows on exFAT).</strong> Reuse existing <code>.nd2svs</code> viewing caches across macOS and Windows on external exFAT drives by tolerating expected exFAT timestamp skew (whole-hour UTC/DST offsets and 2-second/sub-second rounding) without triggering unnecessary cache quarantine or rebuilds while keeping stale-source protection intact. Normalize Unicode NFC/NFD paths consistently for Korean and other non-ASCII filenames across caches, plates, and annotation sidecars.</li>
+</ul>
+<p>See the <a href="https://github.com/myunghyunj/nd2wsi-viewer/blob/v2.6.10/docs/release-notes-2.6.10.md">2.6.10 release notes</a> for full details and download checksums.</p>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.10/nd2wsi-viewer-2.6.10-macos-arm64.dmg" length="135423193" type="application/octet-stream" sparkle:edSignature="EhNTtFxXfUJt4uILkO3rh/cwHDHjZCkn6iig9KQdPyOOuhzQWm/t0B1Iq+g64njM0MqOz8bcvSODqm+96QJaDg=="/>
+        </item>
+        <item>
             <title>2.6.9</title>
             <pubDate>Mon, 23 Nov 2026 09:52:00 +0000</pubDate>
             <sparkle:version>2.6.9</sparkle:version>

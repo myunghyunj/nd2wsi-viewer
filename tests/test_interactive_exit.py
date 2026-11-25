@@ -52,11 +52,11 @@ def under_run(hard_exit_follows):
 def stalled_api(release):
     calls = []
 
-    def stop_server_for_update():
+    def _stop_server_for_update():
         calls.append(threading.current_thread())
         release.wait(30)
 
-    return SimpleNamespace(_startup_error=None, stop_server_for_update=stop_server_for_update), calls
+    return SimpleNamespace(_startup_error=None, _stop_server_for_update=_stop_server_for_update), calls
 
 
 def test_interactive_exit_stops_waiting_for_a_teardown_that_never_finishes(monkeypatch, unfinished, under_run):
@@ -80,14 +80,14 @@ def test_interactive_exit_stops_waiting_for_a_teardown_that_never_finishes(monke
 
 def test_interactive_exit_that_finishes_in_time_ends_normally(monkeypatch, unfinished, under_run):
     monkeypatch.setattr(app, "_EXIT_TEARDOWN_TIMEOUT", 5.0)
-    api = SimpleNamespace(stop_server_for_update=Mock())
+    api = SimpleNamespace(_stop_server_for_update=Mock())
     app._stop_server_at_exit(api, diagnostic=False)
-    api.stop_server_for_update.assert_called_once_with()
+    api._stop_server_for_update.assert_called_once_with()
     assert not unfinished.is_set()
 
 
 def test_a_teardown_error_still_reaches_the_caller(unfinished, under_run):
-    api = SimpleNamespace(stop_server_for_update=Mock(side_effect=OSError("socket already gone")))
+    api = SimpleNamespace(_stop_server_for_update=Mock(side_effect=OSError("socket already gone")))
     with pytest.raises(OSError, match="socket already gone"):
         app._stop_server_at_exit(api, diagnostic=False)
     assert not unfinished.is_set()
@@ -105,11 +105,11 @@ def test_exits_nothing_hard_ends_keep_the_strict_unbounded_teardown(monkeypatch,
     caller = threading.current_thread()
     seen = []
 
-    def stop_server_for_update():
+    def _stop_server_for_update():
         time.sleep(0.3)  # longer than the interactive bound
         seen.append(threading.current_thread())
 
-    app._stop_server_at_exit(SimpleNamespace(stop_server_for_update=stop_server_for_update), diagnostic=diagnostic)
+    app._stop_server_at_exit(SimpleNamespace(_stop_server_for_update=_stop_server_for_update), diagnostic=diagnostic)
     # Appended after the sleep, on the caller's own thread: the whole
     # teardown ran synchronously and finished before the call returned.
     assert seen == [caller]
@@ -138,7 +138,7 @@ def test_exit_after_an_update_gave_up_on_a_wedged_read_waits_for_that_release(mo
         st.busy.__enter__()  # the wedged read
         try:
             with pytest.raises(TimeoutError, match="slide read did not finish"):
-                api.stop_server_for_update(timeout=0.2)
+                api._stop_server_for_update(timeout=0.2)
             assert api._httpd is None and api._releasing_httpd is httpd
             app._stop_server_at_exit(api, diagnostic=False)
             assert unfinished.is_set()
@@ -220,11 +220,11 @@ def test_gui_smoke_main_waits_for_the_whole_teardown_on_its_own_thread(monkeypat
     caller = threading.current_thread()
     seen = []
 
-    def stop_server_for_update():
+    def _stop_server_for_update():
         time.sleep(0.2)
         seen.append(threading.current_thread())
 
-    api = SimpleNamespace(_startup_error=None, stop_server_for_update=stop_server_for_update)
+    api = SimpleNamespace(_startup_error=None, _stop_server_for_update=_stop_server_for_update)
     result, session = run_native_main(monkeypatch, tmp_path, api, ["--gui-smoke"])
     assert result == 4  # no smoke report: the fake GUI loop never ran it
     assert seen == [caller]
@@ -233,10 +233,10 @@ def test_gui_smoke_main_waits_for_the_whole_teardown_on_its_own_thread(monkeypat
 
 
 def failing_teardown_api():
-    def stop_server_for_update():
+    def _stop_server_for_update():
         raise OSError("plate writer lease already gone")
 
-    return SimpleNamespace(_startup_error=None, stop_server_for_update=stop_server_for_update)
+    return SimpleNamespace(_startup_error=None, _stop_server_for_update=_stop_server_for_update)
 
 
 def test_a_failed_teardown_still_writes_the_smoke_report_and_fails_it(monkeypatch, tmp_path, unfinished, under_run,

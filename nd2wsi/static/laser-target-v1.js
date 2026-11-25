@@ -15,8 +15,11 @@
       rotation_deg: Number.isFinite(v.rotation_deg) ? ((v.rotation_deg % 90) + 90) % 90 : 45,
       window: calibrated ? v.window.slice() : null, dpr: calibrated ? v.dpr : null };
   }
-  const isCalibrated = (target, frame, dpr) => !!target.window && !!frame &&
-    target.dpr === dpr && target.window.every((v, i) => v === frame[i]);
+  const isCalibrated = (target, frame, dpr) => {
+    if (!target) return false;
+    return !!target.window && !!frame &&
+      target.dpr === dpr && target.window.every((v, i) => v === frame[i]);
+  };
   function shape(viewport, OSD, target, pixelSize) {
     const size = viewport.getContainerSize(), center = { x: size.x / 2 + target.offset_css[0], y: size.y / 2 + target.offset_css[1] };
     const angle = target.rotation_deg * Math.PI / 180, c = Math.cos(angle), s = Math.sin(angle);

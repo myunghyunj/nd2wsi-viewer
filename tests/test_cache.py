@@ -1347,3 +1347,79 @@ def test_unicode_nfc_nfd_cache_matches_ensure_cache_and_pack(tmp_path, sample, m
     (scattered / ".zattrs").write_text('{"nd2wsi": {}}', encoding="utf-8")
     summary = tidy_caches(tmp_path, dry_run=True)
     assert summary["moved"] == []
+
+
+def test_convert_overwrite_guards_non_zarr_dir_regular_file_symlink_and_toctou(
+    slide, tmp_path, monkeypatch, symlink_support
+):
+    from nd2wsi import convert_cache
+
+    # _is_zarr_directory rejects symlinked .zattrs / .zgroup markers.
+    spoof_dir = tmp_path / "spoof.ome.zarr"
+    spoof_dir.mkdir()
+    outside_marker = tmp_path / "outside.json"
+    outside_marker.write_text("{}", encoding="utf-8")
+    (spoof_dir / ".zattrs").symlink_to(outside_marker)
+    assert convert_cache._is_zarr_directory(spoof_dir) is False
+    (spoof_dir / ".zattrs").unlink()
+    (spoof_dir / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
+    assert convert_cache._is_zarr_directory(spoof_dir) is True
+
+    # Directory overwrite=True refuses a non-Zarr user directory and preserves user files.
+    user_dir = tmp_path / "my_notes.ome.zarr"
+    user_dir.mkdir()
+    (user_dir / "important.txt").write_bytes(b"precious-data")
+    with pytest.raises(IsADirectoryError, match="non-Zarr"):
+        convert_mod.convert(slide, user_dir, overwrite=True, progress=False)
+    assert (user_dir / "important.txt").read_bytes() == b"precious-data"
+
+    # Directory overwrite=True refuses overwriting an existing regular file.
+    regular_file = tmp_path / "existing.ome.zarr"
+    regular_file.write_bytes(b"do-not-delete")
+    with pytest.raises(FileExistsError, match="existing file"):
+        convert_mod.convert(slide, regular_file, overwrite=True, progress=False)
+    assert regular_file.read_bytes() == b"do-not-delete"
+
+    # Directory overwrite=True refuses symlinked target.
+    sym_out = tmp_path / "sym_out.ome.zarr"
+    sym_out.symlink_to(user_dir, target_is_directory=True)
+    with pytest.raises(ValueError, match="symbolic links"):
+        convert_mod.convert(slide, sym_out, overwrite=True, progress=False)
+    assert (user_dir / "important.txt").read_bytes() == b"precious-data"
+
+    # TOCTOU: if target becomes a non-Zarr directory right before commit, refuse it.
+    toctou_target = tmp_path / "toctou.ome.zarr"
+    real_sweep = convert_mod.sweep_appledouble
+
+    def inject_non_zarr_dir(path):
+        toctou_target.mkdir(exist_ok=True)
+        (toctou_target / "race.txt").write_bytes(b"created-during-build")
+        return real_sweep(path)
+
+    monkeypatch.setattr(convert_mod, "sweep_appledouble", inject_non_zarr_dir)
+    with pytest.raises(IsADirectoryError, match="non-Zarr"):
+        convert_mod.convert(slide, toctou_target, overwrite=True, progress=False)
+    assert (toctou_target / "race.txt").read_bytes() == b"created-during-build"
+
+
+def test_cache_lock_uses_filesystem_path_for_os_operations(tmp_path, monkeypatch):
+    from nd2wsi import cache as cache_mod
+    from nd2wsi import session_lock as session_mod
+
+    seen: list[str] = []
+    real_fs_path = cache_mod.filesystem_path
+
+    def spy_fs_path(p, **kw):
+        result = real_fs_path(p, **kw)
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(cache_mod, "filesystem_path", spy_fs_path)
+    monkeypatch.setattr(session_mod, "filesystem_path", spy_fs_path)
+
+    container = tmp_path / "long-path-lock.nd2svs"
+    lock = CacheLock(container)
+    with lock:
+        assert lock.refresh()
+    assert str(lock.path) in seen
+    assert str(lock._arbiter.path) in seen

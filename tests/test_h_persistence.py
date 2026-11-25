@@ -481,3 +481,74 @@ def test_previous_named_consensus_cache_remains_readable_without_rewrite(
         finally:
             loaded.data.close()
     assert hp._sha(target.read_bytes()) == digest
+
+
+def test_prepared_replacement_close_isolates_unlink_and_rmtree_and_releases_lock(
+    original, monkeypatch
+):
+    # Case 1: staging unlink raises OSError -> directory is still removed and CacheLock is released.
+    repl = hp.PreparedReplacement(original, threading.Event())
+    repl._owned_file = True
+    repl.staging.write_bytes(b"staged-file")
+    staging_dir = repl.directory
+    assert staging_dir is not None and staging_dir.is_dir()
+
+    real_unlink = Path.unlink
+
+    def fail_staging_unlink(self, *args, **kwargs):
+        if self.name == repl.staging.name:
+            raise PermissionError("simulated antivirus lock on staging file")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_staging_unlink)
+    repl.close()
+    assert not staging_dir.exists()
+    # Lock must have been released despite unlink failure.
+    with CacheLock(original.container_path):
+        pass
+    monkeypatch.undo()
+    repl.staging.unlink(missing_ok=True)
+
+    # Case 2: shutil.rmtree raises OSError -> CacheLock is still released.
+    repl2 = hp.PreparedReplacement(original, threading.Event())
+    staging_dir2 = repl2.directory
+    monkeypatch.setattr(shutil, "rmtree", lambda *_a, **_k: (_ for _ in ()).throw(PermissionError("locked dir")))
+    repl2.close()
+    with CacheLock(original.container_path):
+        pass
+    monkeypatch.undo()
+    shutil.rmtree(staging_dir2, ignore_errors=True)
+
+
+def test_prepared_replacement_mkdtemp_uses_filesystem_path_and_keeps_plain_directory(
+    original, monkeypatch
+):
+    import tempfile
+
+    seen_dirs: list[object] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def spy_mkdtemp(*args, **kwargs):
+        seen_dirs.append(kwargs.get("dir"))
+        return real_mkdtemp(*args, **kwargs)
+
+    seen_fs_paths: list[str] = []
+    real_fs_path = hp.filesystem_path
+
+    def spy_fs_path(p, **kw):
+        out = real_fs_path(p, **kw)
+        seen_fs_paths.append(out)
+        return out
+
+    monkeypatch.setattr(hp, "filesystem_path", spy_fs_path)
+    monkeypatch.setattr(tempfile, "mkdtemp", spy_mkdtemp)
+    repl = hp.PreparedReplacement(original, threading.Event())
+    try:
+        assert seen_dirs == [real_fs_path(original.container_path.parent)]
+        assert repl.directory is not None
+        assert repl.directory.parent == original.container_path.parent
+        assert not str(repl.directory).startswith("\\\\?\\")
+        assert real_fs_path(original.container_path) in seen_fs_paths
+        assert real_fs_path(original.source_path) in seen_fs_paths
+    finally:
+        repl.close()

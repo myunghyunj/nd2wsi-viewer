@@ -174,13 +174,16 @@ def test_stale_sweep_does_not_detach_a_cache_from_its_companion(tmp_path, suffix
 
 
 def test_publication_preserves_previous_file_if_atomic_replace_fails(tmp_path, monkeypatch):
+    from nd2wsi.platform_io import filesystem_path
+
     staging = tmp_path / ("source.nd2svs.building-" + "f" * 32)
     final = tmp_path / "source.nd2svs"
     _write_cache(staging, b"new cache")
     _write_cache(final, b"old cache")
     before = _snapshot(tmp_path)
+
     def fail_publish(source, destination):
-        assert source == staging and destination == final
+        assert source == filesystem_path(staging) and destination == filesystem_path(final)
         raise OSError("injected publication failure")
 
     monkeypatch.setattr(os, "replace", fail_publish)
@@ -198,3 +201,71 @@ def test_closed_single_file_publication_keeps_only_the_new_final_file(tmp_path):
     commit_container(staging, final)
     assert list(tmp_path.iterdir()) == [final]
     assert read_entry(final, "marker") == b"new cache"
+
+
+def test_commit_container_and_remove_artifact_refuse_symlinks_and_junctions(
+    tmp_path, monkeypatch, symlink_support
+):
+    import shutil
+
+    from nd2wsi import cache as cache_mod
+    from nd2wsi.cache import _remove_artifact
+
+    # Directory staging -> symlinked final directory is refused before branching.
+    staging_dir = tmp_path / "staged.ome.zarr"
+    staging_dir.mkdir()
+    (staging_dir / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
+    real_user_dir = tmp_path / "real_user_dir"
+    real_user_dir.mkdir()
+    (real_user_dir / "keep.txt").write_bytes(b"user-data")
+    sym_final = tmp_path / "sym_final.ome.zarr"
+    sym_final.symlink_to(real_user_dir, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symbolic links"):
+        commit_container(staging_dir, sym_final)
+    assert (real_user_dir / "keep.txt").read_bytes() == b"user-data"
+    assert staging_dir.is_dir()
+
+    # Dangling symlink at final is also refused.
+    dangling = tmp_path / "dangling.nd2svs"
+    dangling.symlink_to(tmp_path / "nonexistent-target")
+    staging_file = tmp_path / "staged.nd2svs"
+    _write_cache(staging_file, b"new")
+    with pytest.raises(ValueError, match="symbolic links"):
+        commit_container(staging_file, dangling)
+    assert dangling.is_symlink()
+
+    # Symlinked staging is refused.
+    sym_staging = tmp_path / "sym_staging.nd2svs"
+    sym_staging.symlink_to(staging_file)
+    with pytest.raises(ValueError, match="symbolic links"):
+        commit_container(sym_staging, tmp_path / "dest.nd2svs")
+
+    # Simulated Windows junction at final is refused for directory and file commits.
+    junc_dir = tmp_path / "junc_dir"
+    junc_dir.mkdir()
+    (junc_dir / "keep.txt").write_bytes(b"junction-target")
+    junc_ino = os.lstat(junc_dir).st_ino
+    monkeypatch.setattr(
+        cache_mod,
+        "is_windows_name_surrogate_reparse",
+        lambda st, fd=None: getattr(st, "st_ino", None) == junc_ino,
+    )
+    with pytest.raises(ValueError, match="junctions"):
+        commit_container(staging_dir, junc_dir)
+    with pytest.raises(ValueError, match="junctions"):
+        commit_container(staging_file, junc_dir)
+
+    # _remove_artifact refuses a Windows junction before calling shutil.rmtree.
+    rmtree_calls = []
+    real_rmtree = shutil.rmtree
+
+    def spy_rmtree(p, *a, **kw):
+        rmtree_calls.append(p)
+        return real_rmtree(p, *a, **kw)
+
+    monkeypatch.setattr(shutil, "rmtree", spy_rmtree)
+    with pytest.raises(ValueError, match="junction"):
+        _remove_artifact(junc_dir)
+    assert rmtree_calls == []
+    assert (junc_dir / "keep.txt").read_bytes() == b"junction-target"

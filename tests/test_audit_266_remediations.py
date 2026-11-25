@@ -164,8 +164,8 @@ def test_cache_sweep_honors_grace_period_for_empty_lockfile(tmp_path):
     assert not old_stage.exists()
 
 
-def test_export_calibration_validation_and_roi_reference_bomb(tmp_path, monkeypatch):
-    from PIL import Image
+def test_export_calibration_validation_and_roi_reference_bomb(tmp_path):
+    import struct
 
     from nd2wsi import export_nd2, render, roi_list
 
@@ -201,16 +201,15 @@ def test_export_calibration_validation_and_roi_reference_bomb(tmp_path, monkeypa
     )
     assert buf.getvalue()  # Non-finite calibration skipped safely instead of writing NaN resolution
 
-    def _raise_bomb(*_a, **_kw):
-        raise Image.DecompressionBombError("too many pixels")
-
-    ref_jpg = tmp_path / "ref.jpg"
-    Image.new("RGB", (8, 8)).save(ref_jpg, format="JPEG")
+    # Pure-stdlib header reader rejects >2B pixel headers without touching Pillow.
+    ref_png = tmp_path / "ref.png"
+    ref_png.write_bytes(
+        b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 50_000, 50_000) + (b"\x00" * 9)
+    )
     roi_txt = tmp_path / "ref.txt"
     roi_txt.write_text("1,2\n3,4\n", encoding="utf-8")
-    monkeypatch.setattr(Image, "open", _raise_bomb)
     with pytest.raises(ValueError, match="exceed safety limits"):
-        roi_list.load_roi_file(roi_txt, width=100, height=100, image_path=ref_jpg)
+        roi_list.load_roi_file(roi_txt, width=100, height=100, image_path=ref_png)
 
 
 # ---------------------------------------------------------------------------

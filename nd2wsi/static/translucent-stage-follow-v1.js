@@ -322,6 +322,9 @@
       if (isDisposed()) return;
       const prevControlHidden = followControl?.hidden;
       const prevSettingsHidden = followSettings?.hidden;
+      const prevDisconnectedHidden = followDisconnected?.hidden;
+      const prevRoughnessHidden = followRoughness?.hidden;
+      const prevFlipHintHidden = followFlipHint?.hidden;
       // Follow appears only while SLACS is detected. The loss notice is its own
       // element, so it stays visible after the control hides.
       const detected = state.slacs.available === true;
@@ -417,8 +420,12 @@
         followScale.textContent = pixelSize ?
           "Pixel size: X " + pixelSize.x.toFixed(3) + " · Y " + pixelSize.y.toFixed(3) + " µm/px" : "Pixel size unavailable";
       }
-      if (state.locked && !state.pending &&
-          (followControl?.hidden !== prevControlHidden || followSettings?.hidden !== prevSettingsHidden)) {
+      if (state.locked && !state.pending && (
+          followControl?.hidden !== prevControlHidden ||
+          followSettings?.hidden !== prevSettingsHidden ||
+          followDisconnected?.hidden !== prevDisconnectedHidden ||
+          followRoughness?.hidden !== prevRoughnessHidden ||
+          followFlipHint?.hidden !== prevFlipHintHidden)) {
         onControlsChanged?.();
       }
     };
@@ -737,9 +744,24 @@
       }
     }
 
+    const followDetails = typeof followSettings?.querySelectorAll === "function"
+      ? Array.from(followSettings.querySelectorAll("details"))
+      : (typeof doc?.querySelectorAll === "function"
+        ? Array.from(doc.querySelectorAll("#stage-follow-settings details"))
+        : []);
+    const onFollowDetailsToggle = () => {
+      if (state.locked && !state.pending) onControlsChanged?.();
+    };
+    for (const details of followDetails) {
+      details?.addEventListener?.("toggle", onFollowDetailsToggle);
+    }
+
     const dispose = () => {
       stopStageFollow();
       discoveryGeneration++;
+      for (const details of followDetails) {
+        details?.removeEventListener?.("toggle", onFollowDetailsToggle);
+      }
     };
 
     return {

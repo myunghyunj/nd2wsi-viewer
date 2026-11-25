@@ -1320,5 +1320,5 @@ except Exception:
     write_report()
 finally:
     if api._httpd is not None:
-        api.stop_server_for_update()
+        api._stop_server_for_update()
     session.mark_closed()

@@ -2852,3 +2852,405 @@ def test_lut_redraw_update_viewport_skips_view_report_and_laser_annotation_rebui
     assert result["afterPan"]["laserRebuilds"] == 1
     assert result["afterPan"]["viewTimersAdded"] == 1
 
+
+def test_set_rois_aspect_mismatch_withholds_import_result_and_hides_repair_while_keeping_diagnostics():
+    result = run(r"""
+      const h = harness({ initialContext: { rois: [{ x: 10, y: 10, w: 1, h: 1, index: 99 }], roiIndex: 0 } });
+      const m = h.mounted;
+      // Valid 2-step resized pair on 31578x22409 succeeds via setRois.
+      const h2step = harness({ infoOverrides: { width: 31578, height: 22409 } });
+      const accepted2step = h2step.mounted.setRois({
+        ok: true, name: '3-1.txt', coordinateSize: { width: 8000, height: 5676 },
+        text: 'INDEX\tX1\tY1\tX2\tY2\tNOTE\n1\t10\t20\t30\t40\ttwo-step',
+      });
+
+      // Aspect-mismatched TXT with a repairable zero-area row must withhold importResult,
+      // hide & disable Repair, surface both dimensions in status, and keep diagnostics visible.
+      const acceptedMismatch = m.setRois({
+        ok: true, name: 'wrong.txt', coordinateSize: { width: 1000, height: 1000 },
+        text: 'INDEX\tX1\tY1\tX2\tY2\tNOTE\n41\t50\t43\t50\t42\tpoint\n42\t10\t10\t20\t20\tok',
+      });
+      return {
+        accepted2step,
+        twoStepCount: h2step.mounted.state.rois.length,
+        acceptedMismatch,
+        importResult: m.state.importResult,
+        reviewHidden: h.element('roi-import-review').hidden,
+        repairHidden: h.element('roi-import-repair').hidden,
+        repairDisabled: h.element('roi-import-repair').disabled,
+        repairCall: m.repairRois(),
+        issues: h.element('roi-import-issues').textContent,
+        status: h.element('overlay-status').textContent,
+        preservedRois: m.state.rois,
+      };
+    """)
+    assert result["accepted2step"] is True and result["twoStepCount"] == 1
+    assert result["acceptedMismatch"] is False
+    assert result["importResult"] is None
+    assert result["reviewHidden"] is False
+    assert result["repairHidden"] is True
+    assert result["repairDisabled"] is True
+    assert result["repairCall"] is False
+    assert "INDEX 41" in result["issues"]
+    assert "JPG/PNG (1000 × 1000)" in result["status"]
+    assert "current image (1000 × 500)" in result["status"]
+    assert result["preservedRois"] == [{"x": 10, "y": 10, "w": 1, "h": 1, "index": 99, "label": ""}]
+
+
+def test_start_display_loop_advances_revision_past_rejected_snapshots_without_spinning():
+    result = run("""
+      const waitCalls = [];
+      let statePulls = 0;
+      const queue = [
+        // Rejected snapshot (oversized query >16384 bytes) at rev 4 must advance cursor to 4.
+        { ok: true, launch_token: 'tok-spin', revision: 4, query: '?c=' + '0,'.repeat(9000) + '&g=original&t=2&p=4&z=1', expired: false, unchanged: false },
+        // Mismatched launch_token must NOT advance displayRevision.
+        { ok: true, launch_token: 'other-tok', revision: 9, query: '?c=0&p=999&g=original&t=2&p=4&z=1', expired: false, unchanged: false },
+        // Next valid update arrives at rev 5 and applies cleanly.
+        { ok: true, launch_token: 'tok-spin', revision: 5, query: '?c=0&g=original&t=2&p=4&z=1', expired: false, unchanged: false },
+        { ok: false, closed: true },
+      ];
+      const h = harness({
+        withWorld: true,
+        initialContext: { launch_token: 'tok-spin', display_revision: 0 },
+        bridgeOverrides: {
+          async translucent_display_state() {
+            statePulls += 1;
+            // Initial pull returns a rejected snapshot at rev 3 (wrong base param p=999) -> cursor advances to 3.
+            return { ok: true, launch_token: 'tok-spin', revision: 3, query: '?c=0&p=999&g=original&t=2&z=1', expired: false };
+          },
+          async wait_translucent_display(token, afterRev, timeoutMs) {
+            waitCalls.push([token, afterRev, timeoutMs]);
+            return queue.shift();
+          },
+        },
+      });
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      return {
+        statePulls,
+        waitCalls,
+        finalRev: h.mounted.state.displayRevision,
+        finalQuery: h.mounted.state.query,
+        status: h.element('overlay-status').textContent,
+      };
+    """)
+    assert result["statePulls"] == 1
+    assert result["waitCalls"] == [
+        ["tok-spin", 3, 25000],
+        ["tok-spin", 4, 25000],
+        ["tok-spin", 4, 25000],
+        ["tok-spin", 5, 25000],
+    ]
+    assert result["finalRev"] == 5
+    assert result["finalQuery"] == "c=0&g=original&t=2&p=4&z=1"
+    assert result["status"] == ""
+
+
+def test_overlay_pointer_capture_guards_errors_idle_pointerup_cancel_and_lostcapture():
+    result = run("""
+      const h = harness({
+        bridgeOverrides: {
+          async start_window_drag() { return false; },
+          async move_window() { return { ok: true }; },
+        },
+      });
+      const ov = h.element('overlay');
+      const dragBtn = h.element('window-drag');
+      const captured = new Set();
+      const log = [];
+      let throwOnSet = false;
+      let throwOnRelease = false;
+      ov.setPointerCapture = (id) => {
+        log.push(['set', id]);
+        if (throwOnSet) throw new Error('NotFoundError');
+        captured.add(id);
+      };
+      ov.hasPointerCapture = (id) => captured.has(id);
+      ov.releasePointerCapture = (id) => {
+        log.push(['release', id]);
+        if (throwOnRelease) throw new Error('NotFoundError');
+        captured.delete(id);
+      };
+      const ev = (extra = {}) => ({
+        button: 0, pointerId: 7, screenX: 100, screenY: 120,
+        preventDefault() {}, stopImmediatePropagation() {}, ...extra,
+      });
+
+      // 1) Plain pointerup without active gesture must NOT call releasePointerCapture.
+      ov.listeners.pointerup(ev({ pointerId: 99 }));
+      const logAfterIdleUp = log.slice();
+
+      // 2) Active drag tracks pointerId, ignores foreign pointerup, and releases only when held.
+      await dragBtn.listeners.pointerdown(ev({ pointerId: 7 }));
+      const gesturePtrId = h.mounted.state.gesture?.pointerId;
+      ov.listeners.pointerup(ev({ pointerId: 8, screenX: 200, screenY: 200 }));
+      const stillActiveAfterForeignUp = Boolean(h.mounted.state.gesture);
+      ov.listeners.pointerup(ev({ pointerId: 7, screenX: 110, screenY: 130 }));
+      const afterNormalUp = { gesture: h.mounted.state.gesture, captured: [...captured], log: log.slice() };
+
+      // 3) pointercancel releases capture and clears gesture.
+      log.length = 0;
+      await dragBtn.listeners.pointerdown(ev({ pointerId: 11 }));
+      ov.listeners.pointercancel(ev({ pointerId: 11 }));
+      const afterCancel = { gesture: h.mounted.state.gesture, captured: [...captured], log: log.slice() };
+
+      // 4) lostpointercapture clears gesture without calling releasePointerCapture.
+      log.length = 0;
+      await dragBtn.listeners.pointerdown(ev({ pointerId: 12 }));
+      captured.delete(12);
+      ov.listeners.lostpointercapture(ev({ pointerId: 12 }));
+      const afterLost = { gesture: h.mounted.state.gesture, log: log.slice() };
+
+      // 5) Throwing setPointerCapture / releasePointerCapture never crashes handlers.
+      log.length = 0;
+      throwOnSet = true;
+      await dragBtn.listeners.pointerdown(ev({ pointerId: 15 }));
+      const activeDespiteSetThrow = Boolean(h.mounted.state.gesture);
+      captured.add(15);
+      throwOnRelease = true;
+      ov.listeners.pointerup(ev({ pointerId: 15 }));
+      const gestureAfterReleaseThrow = h.mounted.state.gesture;
+
+      return {
+        logAfterIdleUp,
+        gesturePtrId,
+        stillActiveAfterForeignUp,
+        afterNormalUp,
+        afterCancel,
+        afterLost,
+        activeDespiteSetThrow,
+        gestureAfterReleaseThrow,
+      };
+    """)
+    assert result["logAfterIdleUp"] == []
+    assert result["gesturePtrId"] == 7
+    assert result["stillActiveAfterForeignUp"] is True
+    assert result["afterNormalUp"] == {
+        "gesture": None, "captured": [], "log": [["set", 7], ["release", 7]],
+    }
+    assert result["afterCancel"] == {
+        "gesture": None, "captured": [], "log": [["set", 11], ["release", 11]],
+    }
+    assert result["afterLost"] == {"gesture": None, "log": [["set", 12]]}
+    assert result["activeDespiteSetThrow"] is True
+    assert result["gestureAfterReleaseThrow"] is None
+
+
+def test_read_view_signature_uses_local_laser_target_is_calibrated_and_handles_null():
+    result = run("""
+      const laserTargetMod = require(require('path').join(require('path').dirname(process.argv[1]), 'laser-target-v1.js'));
+      const nullSafe = laserTargetMod.isCalibrated(null, [10, 20, 800, 500], 1);
+      const undefSafe = laserTargetMod.isCalibrated(undefined, [10, 20, 800, 500], 1);
+
+      const reports = [];
+      const h = followHarness({
+        initialContext: {
+          laser_target: {
+            offset_css: [0, 0], side_um: 18, rotation_deg: 45,
+            window: [10, 20, 800, 500], dpr: 2,
+          },
+        },
+        winOverrides: { screenX: 10, screenY: 20, innerWidth: 800, innerHeight: 500, devicePixelRatio: 2 },
+        bridgeOverrides: {
+          async report_overlay_view(view) { reports.push(view); return { ok: true }; },
+        },
+      });
+      const settle = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+      await settle();
+
+      const viewTimers = () => [...h.timers.values()].filter(t => t.delay === 200);
+      const baseTimers = viewTimers().length;
+
+      // Without moving window or changing calibration, update-viewport does NOT schedule a view report.
+      h.viewer.handlers['update-viewport']();
+      const afterSame = viewTimers().length - baseTimers;
+
+      // Moving the window invalidates laserTarget.isCalibrated(state.target, frame, dpr)
+      // even though state.target has no `.calibrated` property -> update-viewport schedules view report.
+      h.win.screenX = 50;
+      h.viewer.handlers['update-viewport']();
+      const afterMoved = viewTimers().length - baseTimers;
+      const targetStatus = h.element('laser-target-status').textContent;
+
+      h.windowListeners.pagehide();
+      return { nullSafe, undefSafe, afterSame, afterMoved, targetStatus };
+    """)
+    assert result["nullSafe"] is False
+    assert result["undefSafe"] is False
+    assert result["afterSame"] == 0
+    assert result["afterMoved"] == 1
+    assert "Recalibrate" in result["targetStatus"]
+
+
+def test_locked_hover_rects_refresh_via_resize_observer_details_toggle_and_visibility_fallbacks():
+    result = run("""
+      const rectReports = [];
+      const observers = [];
+      class FakeResizeObserver {
+        constructor(cb) {
+          this.cb = cb;
+          this.observed = [];
+          this.disconnected = false;
+          observers.push(this);
+        }
+        observe(el) { this.observed.push(el); }
+        disconnect() { this.disconnected = true; }
+      }
+      const rafQueue = [];
+      let rafSeq = 0;
+      const fakeDetails = {
+        listeners: {},
+        addEventListener(name, cb) { this.listeners[name] = cb; },
+        removeEventListener(name, cb) { if (this.listeners[name] === cb) delete this.listeners[name]; },
+      };
+      const rectsById = {
+        'overlay-lock': { left: 18, top: 456, width: 36, height: 36 },
+        'overlay-close': { left: 755, top: 9, width: 36, height: 36 },
+        'stage-follow-control': { left: 12, top: 50, width: 140, height: 28 },
+        'stage-follow-settings': { left: 12, top: 85, width: 275, height: 180 },
+        'opacity-control': { left: 60, top: 464, width: 190, height: 24 },
+        'roi-controls': { left: 620, top: 9, width: 120, height: 36 },
+        'roi-import-review': { left: 12, top: 320, width: 260, height: 42 },
+      };
+
+      const h = followHarness({
+        winOverrides: {
+          ResizeObserver: FakeResizeObserver,
+          requestAnimationFrame(cb) { const id = ++rafSeq; rafQueue.push({ id, cb }); return id; },
+          cancelAnimationFrame(id) {
+            const idx = rafQueue.findIndex(item => item.id === id);
+            if (idx >= 0) rafQueue.splice(idx, 1);
+          },
+        },
+        docOverrides: {
+          querySelectorAll(sel) {
+            if (sel === '#stage-follow-settings details') return [fakeDetails];
+            return [];
+          },
+        },
+        bridgeOverrides: {
+          async set_locked_interactive_rects(rects) {
+            rectReports.push(JSON.parse(JSON.stringify(rects)));
+            return { ok: true, count: rects.length };
+          },
+          async set_stage_follow_flips(v) {
+            return { ok: true, ...v, message: 'Applied temporarily' };
+          },
+        },
+      });
+      for (const [id, rect] of Object.entries(rectsById)) {
+        h.element(id).getBoundingClientRect = () => ({ ...rect });
+      }
+      const settle = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+      await h.mounted.pollSlacsDiscovery();
+      await settle();
+
+      // Interactive ResizeObserver observes all 7 LOCKED_INTERACTIVE_IDS elements.
+      const interactiveObs = observers[1];
+      const observedIds = interactiveObs.observed.map(el => el.id);
+
+      // While unlocked, ResizeObserver callbacks do not report rects.
+      interactiveObs.cb();
+      while (rafQueue.length) rafQueue.shift().cb();
+      const countWhileUnlocked = rectReports.length;
+
+      // Lock overlay and open follow settings.
+      await h.mounted.toggleLock();
+      h.element('stage-follow-options').listeners.click();
+      await settle();
+      const afterOpenCount = rectReports.length;
+
+      // 1) Coalesced + deduplicated ResizeObserver: unchanged rects produce 0 reports.
+      interactiveObs.cb();
+      interactiveObs.cb();
+      const queuedUnchanged = rafQueue.length;
+      while (rafQueue.length) rafQueue.shift().cb();
+      const afterUnchangedObs = rectReports.length;
+
+      // 2) Settings grows taller (e.g. <details> expanded): 3 burst callbacks coalesce into 1 report.
+      rectsById['stage-follow-settings'].height = 310;
+      interactiveObs.cb();
+      interactiveObs.cb();
+      interactiveObs.cb();
+      const queuedBurst = rafQueue.length;
+      while (rafQueue.length) rafQueue.shift().cb();
+      const afterExpandedObs = rectReports.length;
+      const expandedHeight = rectReports.at(-1).find(r => r.y === 85)?.height;
+
+      // 3) Mock-DOM fallback: <details> toggle inside stage-follow-settings & roi-import-review.
+      const beforeDetailsToggle = rectReports.length;
+      fakeDetails.listeners.toggle();
+      const afterFollowDetailsToggle = rectReports.length;
+      h.element('roi-import-review').hidden = false;
+      h.element('roi-import-review').listeners.toggle();
+      const afterReviewToggle = rectReports.length;
+
+      // 4) Visibility fallbacks: followFlipHint, followRoughness, followDisconnected, and importReview.
+      const beforeFlipHint = rectReports.length;
+      await h.mounted.setFollowFlips({ x: true, y: false });
+      await settle();
+      const afterFlipHint = rectReports.length;
+
+      const beforeRoughness = rectReports.length;
+      h.mounted.setStepAuto(false);
+      const afterRoughness = rectReports.length;
+
+      // Unlock briefly to start follow & re-lock, then trigger revokeStageFollow to show followDisconnected.
+      await h.mounted.toggleLock();
+      await h.mounted.startStageFollow();
+      await h.mounted.toggleLock();
+      await settle();
+      const beforeDisconnected = rectReports.length;
+      h.mounted.revokeStageFollow({ session_id: 'session-one', message: 'SLACS exited' });
+      const afterDisconnected = rectReports.length;
+
+      // importReview visibility change (visible -> hidden via applyContext while locked).
+      h.element('roi-import-review').hidden = false;
+      const beforeImportReviewHide = rectReports.length;
+      h.mounted.applyContext({ rois: [] });
+      const afterImportReviewHide = rectReports.length;
+
+      // 5) pagehide disconnects ResizeObserver and removes <details> toggle listeners.
+      h.windowListeners.pagehide();
+      return {
+        observedIds,
+        countWhileUnlocked,
+        queuedUnchanged,
+        afterOpenCount,
+        afterUnchangedObs,
+        queuedBurst,
+        afterExpandedObs,
+        expandedHeight,
+        beforeDetailsToggle,
+        afterFollowDetailsToggle,
+        afterReviewToggle,
+        beforeFlipHint,
+        afterFlipHint,
+        beforeRoughness,
+        afterRoughness,
+        beforeDisconnected,
+        afterDisconnected,
+        beforeImportReviewHide,
+        afterImportReviewHide,
+        disconnected: interactiveObs.disconnected,
+        detailsListenerAfterHide: Boolean(fakeDetails.listeners.toggle),
+      };
+    """)
+    assert result["observedIds"] == [
+        "overlay-lock", "overlay-close", "stage-follow-control", "stage-follow-settings",
+        "opacity-control", "roi-controls", "roi-import-review",
+    ]
+    assert result["countWhileUnlocked"] == 0
+    assert result["queuedUnchanged"] == 1
+    assert result["afterUnchangedObs"] == result["afterOpenCount"]
+    assert result["queuedBurst"] == 1
+    assert result["afterExpandedObs"] == result["afterOpenCount"] + 1
+    assert result["expandedHeight"] == 310
+    assert result["afterFollowDetailsToggle"] == result["beforeDetailsToggle"] + 1
+    assert result["afterReviewToggle"] == result["afterFollowDetailsToggle"] + 1
+    assert result["afterFlipHint"] > result["beforeFlipHint"]
+    assert result["afterRoughness"] > result["beforeRoughness"]
+    assert result["afterDisconnected"] > result["beforeDisconnected"]
+    assert result["afterImportReviewHide"] > result["beforeImportReviewHide"]
+    assert result["disconnected"] is True
+    assert result["detailsListenerAfterHide"] is False

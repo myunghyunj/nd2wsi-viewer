@@ -400,3 +400,80 @@ def test_png_and_jpeg_shared_header_reader_never_reads_image_data():
     assert out["sizes"] == [{"width": 8000, "height": 4000}] * 2
     assert out["pngReads"] == [[0, 24]]
     assert "PNG" in out["error"]
+
+
+def test_check_aspect_ratio_accepts_two_step_resizes_and_rejects_crops_and_small_distortion():
+    out = run("""
+const rows = [{ index: 1, x1: 10, y1: 10, x2: 20, y2: 20, note: 'ok' }];
+const accepted = [
+  [{ width: 8000, height: 5676 }, { width: 31578, height: 22409 }], // 3-1.nd2 2-step resize (1.117 px, 0.0197%)
+  [{ width: 8000, height: 4679 }, { width: 38357, height: 22439 }], // A-1.nd2 2-step resize (1.032 px, 0.0221%)
+  [{ width: 8000, height: 5471 }, { width: 32768, height: 22415 }], // 2-step resize
+  [{ width: 10, height: 10 }, { width: 10, height: 11 }],            // 1 px base tolerance preserved on small images
+].map(([grid, source]) => ({
+  checked: api.checkAspectRatio(grid, source),
+  mappedCount: api.mapToSource([{ index: 1, x1: 0, y1: 0, x2: 1, y2: 1, note: 'a' }], grid, source).length,
+}));
+const rejected = [
+  [{ width: 8000, height: 5675 }, { width: 31578, height: 22409 }], // >2 px minor-axis drift (2.117 px)
+  [{ width: 8000, height: 5674 }, { width: 31578, height: 22409 }], // >2 px minor-axis drift (3.117 px)
+  [{ width: 10, height: 10 }, { width: 10, height: 12 }],            // 2 px on tiny image exceeds 0.5% relative cap
+  [null, { width: 100, height: 100 }],
+  [{ width: 0, height: 100 }, { width: 100, height: 100 }],
+  [{ width: 100, height: 100 }, { width: 100.5, height: 100 }],
+].map(([grid, source]) => {
+  try { api.checkAspectRatio(grid, source); return null; }
+  catch (e) { return e.message; }
+});
+let mapErr = null;
+try { api.mapToSource(rows, { width: 8000, height: 5674 }, { width: 31578, height: 22409 }); }
+catch (e) { mapErr = e.message; }
+process.stdout.write(JSON.stringify({ accepted, rejected, mapErr }));
+""")
+    assert [entry["mappedCount"] for entry in out["accepted"]] == [1, 1, 1, 1]
+    assert out["accepted"][0]["checked"] == {
+        "grid": {"width": 8000, "height": 5676},
+        "source": {"width": 31578, "height": 22409},
+    }
+    assert out["rejected"][0] == (
+        "JPG/PNG (8000 × 5675) and current image (31578 × 22409) have different aspect ratios. "
+        "Use the matching uncropped reference image."
+    )
+    assert out["rejected"][1] == (
+        "JPG/PNG (8000 × 5674) and current image (31578 × 22409) have different aspect ratios. "
+        "Use the matching uncropped reference image."
+    )
+    assert out["rejected"][2] == (
+        "JPG/PNG (10 × 10) and current image (10 × 12) have different aspect ratios. "
+        "Use the matching uncropped reference image."
+    )
+    assert out["mapErr"] == out["rejected"][1]
+    assert all(isinstance(msg, str) and msg for msg in out["rejected"][3:])
+
+
+def test_reference_header_pixel_product_cap_applies_to_jpeg_and_png():
+    out = run(JPEG_SCRIPT + """
+(async () => {
+  const bigJpeg = blob([0xff, 0xd8, ...frame(0xc0, 50000, 40001), 0xff, 0xd9]);
+  const okJpeg = blob([0xff, 0xd8, ...frame(0xc0, 50000, 40000), 0xff, 0xd9]);
+  const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+  const makePng = (w, h) => blob([
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+    ...u32(w), ...u32(h), 8, 2, 0, 0, 0, 0, 0, 0, 0,
+  ]);
+  const errors = [];
+  for (const [fn, input] of [
+    ['readJpegSize', bigJpeg],
+    ['readImageSize', bigJpeg],
+    ['readImageSize', makePng(50000, 40001)],
+  ]) {
+    try { await api[fn](input); errors.push(null); }
+    catch (e) { errors.push(e.message); }
+  }
+  const ok = [await api.readJpegSize(okJpeg), await api.readImageSize(makePng(50000, 40000))];
+  process.stdout.write(JSON.stringify({ maxPixels: api.MAX_REFERENCE_HEADER_PIXELS, errors, ok }));
+})();
+""")
+    assert out["maxPixels"] == 2_000_000_000
+    assert out["errors"] == ["The reference image dimensions exceed safety limits."] * 3
+    assert out["ok"] == [{"width": 50000, "height": 40000}] * 2

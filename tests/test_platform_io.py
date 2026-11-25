@@ -130,7 +130,7 @@ def test_windows_allocation_probe_uses_the_mounted_volume_geometry(tmp_path, mon
     from nd2wsi import platform_io
 
     def get_volume(path, root, length):
-        assert path == str(tmp_path.resolve())
+        assert path == platform_io.filesystem_path(tmp_path.resolve())
         assert length >= 260
         root.value = "X:\\mounted\\"
         return True
@@ -145,6 +145,32 @@ def test_windows_allocation_probe_uses_the_mounted_volume_geometry(tmp_path, mon
         GetVolumePathNameW=get_volume, GetDiskFreeSpaceW=disk_free,
     ))
     assert platform_io.windows_allocation_block_bytes(tmp_path) == 1024 * 1024
+
+
+def test_windows_allocation_probe_passes_extended_filesystem_path(tmp_path, monkeypatch):
+    from nd2wsi import platform_io
+
+    received: list[str] = []
+
+    def fake_fs_path(p, **_kw):
+        return "\\\\?\\C:\\very\\long\\path"
+
+    def get_volume(path, root, length):
+        received.append(path)
+        root.value = "\\\\?\\C:\\"
+        return True
+
+    def disk_free(root, sectors, sector_bytes, free, total):
+        sectors._obj.value = 8
+        sector_bytes._obj.value = 512
+        return True
+
+    monkeypatch.setattr(platform_io, "filesystem_path", fake_fs_path)
+    monkeypatch.setattr(platform_io, "_windows_api", lambda: SimpleNamespace(
+        GetVolumePathNameW=get_volume, GetDiskFreeSpaceW=disk_free,
+    ))
+    assert platform_io.windows_allocation_block_bytes(tmp_path) == 4096
+    assert received == ["\\\\?\\C:\\very\\long\\path"]
 
 
 def test_windows_memory_probe_uses_available_physical_bytes(monkeypatch):

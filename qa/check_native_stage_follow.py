@@ -296,5 +296,5 @@ def run():
 try:
     webview.start(run,private_mode=True)
 finally:
-    if api._httpd is not None: api.stop_server_for_update()
+    if api._httpd is not None: api._stop_server_for_update()
     session.mark_closed()

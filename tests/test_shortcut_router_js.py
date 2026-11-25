@@ -429,3 +429,79 @@ def test_windows_labels_localize_accessible_shortcut_names_too():
     out = json.loads(result.stdout)
     assert [row["shortcut"] for row in out] == ["Control+C", "Control+A", "Control+I", "E"]
     assert all(row["title"] == "Panels (Ctrl+C, Ctrl+A); Export (E)" for row in out)
+
+
+def test_checkbox_focus_allows_undo_redo_and_shortcut_help_while_blocking_text_controls():
+    script = r"""
+    const R = require(process.argv[1]);
+    function makeTarget(spec = {}) {
+      return {
+        tagName: spec.tag || "DIV",
+        type: spec.type,
+        isContentEditable: !!spec.contentEditable,
+        parentElement: null,
+        closest(selector) {
+          if (spec.insideEditable && selector.includes("contenteditable")) return {};
+          if (spec.insideTextbox && selector.includes('role="textbox"')) return {};
+          if (spec.insideCheckbox && selector === "input," + selector.slice(selector.indexOf("select"))) return {};
+          return null;
+        },
+      };
+    }
+    const checkbox = makeTarget({ tag: "INPUT", type: "checkbox" });
+    const shadowCheckboxEvent = (ev) => ({
+      ...ev, target: makeTarget({ tag: "DIV" }), composedPath: () => [checkbox, makeTarget({ tag: "DIV" })],
+    });
+    const textControls = [
+      makeTarget({ tag: "INPUT" }),
+      makeTarget({ tag: "INPUT", type: "text" }),
+      makeTarget({ tag: "TEXTAREA" }),
+      makeTarget({ tag: "SELECT" }),
+      makeTarget({ contentEditable: true }),
+      makeTarget({ insideEditable: true }),
+      makeTarget({ insideTextbox: true }),
+    ];
+    const out = {
+      isFocusCheckbox: R.isFocusControl(checkbox),
+      isTextFocusCheckbox: R.isTextFocusControl({ target: checkbox }),
+      isTextFocusShadowCheckbox: R.isTextFocusControl(shadowCheckboxEvent({})),
+      isTextFocusControls: textControls.map(t => R.isTextFocusControl({ target: t })),
+      macCheckbox: [
+        R.historyActionForEvent({ key: "z", code: "KeyZ", metaKey: true, target: checkbox }, "MacIntel"),
+        R.historyActionForEvent({ key: "Z", code: "KeyZ", metaKey: true, shiftKey: true, target: checkbox }, "MacIntel"),
+        R.isHistoryShortcut({ key: "z", code: "KeyZ", metaKey: true, target: checkbox }, "MacIntel"),
+        R.isShortcutHelpEvent({ key: "?", code: "Slash", shiftKey: true, target: checkbox }),
+      ],
+      winCheckbox: [
+        R.historyActionForEvent({ key: "z", code: "KeyZ", ctrlKey: true, target: checkbox }, "Win32"),
+        R.historyActionForEvent({ key: "Z", code: "KeyZ", ctrlKey: true, shiftKey: true, target: checkbox }, "Win32"),
+        R.historyActionForEvent({ key: "y", code: "KeyY", ctrlKey: true, target: checkbox }, "Win32"),
+        R.isShortcutHelpEvent({ key: "?", code: "Slash", shiftKey: true, target: checkbox }),
+      ],
+      shadowCheckbox: [
+        R.historyActionForEvent(shadowCheckboxEvent({ key: "z", code: "KeyZ", metaKey: true }), "MacIntel"),
+        R.isShortcutHelpEvent(shadowCheckboxEvent({ key: "?", code: "Slash", shiftKey: true })),
+      ],
+      nativeCopySelectStillBlocked: [
+        R.panelForEvent({ key: "c", code: "KeyC", metaKey: true, target: checkbox }, "MacIntel"),
+        R.panelForEvent({ key: "a", code: "KeyA", metaKey: true, target: checkbox }, "MacIntel"),
+        R.isAstromapShortcut({ key: "A", code: "KeyA", metaKey: true, shiftKey: true, target: checkbox }, "MacIntel"),
+      ],
+      blockedInTextControls: textControls.map(target => ({
+        undo: R.historyActionForEvent({ key: "z", code: "KeyZ", metaKey: true, target }, "MacIntel"),
+        redo: R.historyActionForEvent({ key: "y", code: "KeyY", ctrlKey: true, target }, "Win32"),
+        help: R.isShortcutHelpEvent({ key: "?", code: "Slash", shiftKey: true, target }),
+      })),
+    };
+    process.stdout.write(JSON.stringify(out));
+    """
+    out = json.loads(run_node(script, MODULE, check=True).stdout)
+    assert out["isFocusCheckbox"] is True
+    assert out["isTextFocusCheckbox"] is False
+    assert out["isTextFocusShadowCheckbox"] is False
+    assert out["isTextFocusControls"] == [True] * 7
+    assert out["macCheckbox"] == ["undo", "redo", True, True]
+    assert out["winCheckbox"] == ["undo", "redo", "redo", True]
+    assert out["shadowCheckbox"] == ["undo", True]
+    assert out["nativeCopySelectStillBlocked"] == [None, None, False]
+    assert out["blockedInTextControls"] == [{"undo": None, "redo": None, "help": False}] * 7

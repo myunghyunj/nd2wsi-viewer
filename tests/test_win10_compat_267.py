@@ -639,7 +639,7 @@ def test_app_win32_passes_session_storage_path_alongside_private_mode(
 ) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path))
-    api = SimpleNamespace(_startup_error=None, stop_server_for_update=Mock())
+    api = SimpleNamespace(_startup_error=None, _stop_server_for_update=Mock())
     create = Mock(return_value=(api, object()))
     monkeypatch.setattr(app, "create_app_window", create)
     webview = SimpleNamespace(start=Mock())
@@ -662,7 +662,7 @@ def test_app_win32_guards_lightweight_window_session_without_root(
     monkeypatch.setattr(sys, "platform", "win32")
     lightweight = SimpleNamespace(role="user", id="mock-id", mark_closed=Mock())
     monkeypatch.setattr("nd2wsi.window_sessions.create_window_session", lambda _role: lightweight)
-    api = SimpleNamespace(_startup_error=None, stop_server_for_update=Mock())
+    api = SimpleNamespace(_startup_error=None, _stop_server_for_update=Mock())
     monkeypatch.setattr(app, "create_app_window", Mock(return_value=(api, object())))
     webview = SimpleNamespace(start=Mock())
     monkeypatch.setitem(sys.modules, "webview", webview)
@@ -677,7 +677,7 @@ def test_app_darwin_does_not_pass_storage_path(
 ) -> None:
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path))
-    api = SimpleNamespace(_startup_error=None, stop_server_for_update=Mock())
+    api = SimpleNamespace(_startup_error=None, _stop_server_for_update=Mock())
     monkeypatch.setattr(app, "create_app_window", Mock(return_value=(api, object())))
     webview = SimpleNamespace(start=Mock())
     monkeypatch.setitem(sys.modules, "webview", webview)

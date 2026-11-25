@@ -156,7 +156,7 @@ class Api:
     def update_block_reason(self):
         return EXPORT_WAIT if self.exports else None
 
-    def stop_server_for_update(self, timeout=None):
+    def _stop_server_for_update(self, timeout=None):
         self.teardown_timeouts.append(timeout)
         self.frozen_at_teardown = self.shell.frozen
         self._httpd = None
@@ -363,10 +363,12 @@ def test_sparkle_quit_after_the_installer_resumes_reaches_the_close_guard(pair):
 
     assert p.update.prepare_for_update(resume_installer, p.failures.append) is True
     until(lambda: quits)
-    assert quits == [False]  # the save handshake runs, as before
-    assert p.shell.destroyed.wait(5)
-    until(lambda: not p.close._running)
-    assert p.close._approved is True
+    # Teardown is marked complete before releasing ownership, so Sparkle's quit
+    # passes immediately without vetoing or re-flushing against a stopped server.
+    assert quits == [True]
+    assert p.close._running is False
+    assert len(p.shell.prepares) == 1
+    assert p.update._ownership().torn_down is True
     assert NOTICE not in p.shell.notices
     assert p.api.frozen_at_teardown is True
     assert p.update._running is True  # still waiting for Sparkle to end the process

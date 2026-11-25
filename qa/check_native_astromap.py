@@ -1,8 +1,10 @@
 """Exercise only a newly-created private Agent window, without OS input."""
+import importlib.util
 import io
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -12,11 +14,18 @@ from pathlib import Path
 
 os.environ['ND2WSI_DISABLE_UPDATES'] = '1'
 os.environ['ND2WSI_APP_NAME'] = 'nd2wsi-viewer Astromap Beta QA'
-import nd2wsi
-from nd2wsi import app
-from nd2wsi.convert import ensure_cache, existing_cache_store
-from nd2wsi.window_sessions import create_window_session
-import webview
+
+if importlib.util.find_spec('nd2wsi') is None:
+    _ROOT = Path(__file__).resolve().parents[1]
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+
+import webview  # noqa: E402
+
+import nd2wsi  # noqa: E402
+from nd2wsi import app  # noqa: E402
+from nd2wsi.convert import ensure_cache, existing_cache_store  # noqa: E402
+from nd2wsi.window_sessions import create_window_session  # noqa: E402
 
 qa = Path(os.environ['ASTROMAP_QA_ROOT']).resolve()
 report_path = qa / os.environ.get('ASTROMAP_QA_REPORT', 'native-check.json')
@@ -174,7 +183,7 @@ def run():
         report['updates'] = api.update_status()
         check(report['updates']['available'] is False, 'beta updater enabled')
         # Snapshot only this private Agent WKWebView, without moving OS focus.
-        from AppKit import NSBitmapImageRep, NSBitmapImageFileTypePNG
+        from AppKit import NSBitmapImageFileTypePNG, NSBitmapImageRep
         from PyObjCTools import AppHelper
         from webview.platforms.cocoa import BrowserView
         captured = threading.Event()
@@ -205,5 +214,5 @@ try:
     webview.start(run, private_mode=True)
 finally:
     if api._httpd is not None:
-        api.stop_server_for_update()
+        api._stop_server_for_update()
     session.mark_closed()

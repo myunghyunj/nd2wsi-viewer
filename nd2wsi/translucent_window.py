@@ -71,6 +71,7 @@ from .translucent_validation import (
     TARGET_KEYS,
     VIEW_KEYS,
     _number,
+    encode_validated_query,
     laser_scope,
     merge_display_query,
     normalize_laser_items,
@@ -89,7 +90,7 @@ from .translucent_validation import (
 )
 from .translucent_validation import _optional_numbers as _optional_numbers
 from .translucent_validation import _polygon_area as _polygon_area
-from .window_chrome import NativeTitlebarDrag
+from .window_chrome import NativeTitlebarDrag, _direct_destroy_window
 
 _ORIG_WIN32_OVERLAY_API = _stage_follow_mod._win32_overlay_api
 _win32_overlay_api = _ORIG_WIN32_OVERLAY_API
@@ -382,7 +383,7 @@ class TranslucentApi(StageFollowMixin):
             return False
 
     def choose_roi_file(self):
-        """Choose a coordinate-reference JPG and its AstroMapper TXT together."""
+        """Choose a coordinate-reference JPG/PNG and its AstroMapper TXT together."""
         if self._closed or self._locked:
             return {"ok": False, "message": "Unlock the translucent viewer to load ROIs."}
         import webview
@@ -390,7 +391,7 @@ class TranslucentApi(StageFollowMixin):
         selected = self._window.create_file_dialog(
             webview.OPEN_DIALOG,
             allow_multiple=True,
-            file_types=("AstroMapper JPG and ROI coordinates (*.jpg;*.jpeg;*.txt)",),
+            file_types=("ROI list and image (*.txt;*.jpg;*.jpeg;*.png)",),
         )
         if not selected:
             return {"ok": False, "cancelled": True}
@@ -407,7 +408,7 @@ class TranslucentApi(StageFollowMixin):
                     directory=str(chosen.parent),
                     file_types=(
                         (
-                            "Matching coordinate reference JPG (*.jpg;*.jpeg)"
+                            "Reference image (*.jpg;*.jpeg;*.png)"
                             if image_needed
                             else "Matching AstroMapper ROI coordinates (*.txt)"
                         ),
@@ -891,17 +892,31 @@ class TranslucentApi(StageFollowMixin):
             self._pending_laser_scope = None
             self._session.retired = True
             self._session.cond.notify_all()
+            win = self._window
+            configured = self._configured
         self._win32_focus.close()
         if self._laser_delivery is not None:
             self._laser_delivery.close()
         self.stop_stage_follow()
         if self._discovery is not None:
             self._discovery.stop()
-        if self._window is not None:
-            self._window.destroy()
-        # Native closed owns claim release; destroy may return before the event.
-        if self._window is None:
+        shown_event = getattr(getattr(win, "events", None), "shown", None)
+        unshown = (
+            win is not None
+            and callable(getattr(shown_event, "is_set", None))
+            and not shown_event.is_set()
+            and not configured
+        )
+        if win is None:
             self._did_close()
+        elif unshown:
+            try:
+                _direct_destroy_window(win)
+            finally:
+                self._did_close()
+        else:
+            # Native closed owns claim release; destroy may return before the event.
+            win.destroy()
         return True
 
     def _did_close(self, *_args):
@@ -1040,6 +1055,7 @@ __all__ = [
     "TranslucentApi",
     "Win32OverlayFocusController",
     "create_translucent_window",
+    "encode_validated_query",
     "laser_scope",
     "merge_display_query",
     "point_in_interactive_rects",

@@ -69,7 +69,8 @@ from .cache_removal import (
     rescue_annotations,
 )
 from .direct_common import LeaseClosed, _Lifecycle
-from .region_export import JOB_RE, ExportRequestError, prepare_export
+from .platform_io import filesystem_path
+from .region_export import JOB_RE, ExportRequestError, parse_job_id, prepare_export
 from .server_registry import (
     SlideRegistry,
     ViewerState,
@@ -1141,19 +1142,27 @@ def make_handler(
             meta = st.attrs["nd2wsi"]
             lv0 = meta["levels"][0]
             is_raster = bool(meta.get("raster", False))
+            is_overview_degraded = _storage_mode(meta) == "overview-degraded"
             try:
                 dtype_name = np.dtype(meta["dtype"]).name
             except Exception:
                 dtype_name = str(meta.get("dtype") or "")
             limnd2_ok = _limnd2_available()
             nd2_export = bool(
-                limnd2_ok and not is_raster and dtype_name in ("uint8", "uint16")
+                limnd2_ok
+                and not is_raster
+                and not is_overview_degraded
+                and dtype_name in ("uint8", "uint16")
             )
             if nd2_export:
                 nd2_export_reason = ""
             elif is_raster:
                 nd2_export_reason = (
                     "ND2 export is unavailable for JPEG and PNG images; use TIFF export instead."
+                )
+            elif is_overview_degraded:
+                nd2_export_reason = (
+                    "ND2 export requires the original full-resolution slide; use TIFF export instead."
                 )
             elif dtype_name not in ("uint8", "uint16"):
                 nd2_export_reason = (
@@ -1472,17 +1481,21 @@ def make_handler(
                 return self._json({"ok": True, "path": str(p), "count": len(data["items"]), "revision": rev})
             from contextlib import ExitStack
 
-            from .annotation_workspace import _atomic_write, annotation_lock
+            from .annotation_workspace import (
+                _atomic_write,
+                annotation_lock,
+                annotation_lock_path,
+            )
 
             # unique, fsynced temp + per-slide and window lock: two tabs or
             # windows saving at once cannot interleave or clobber each other.
             # The window lock is advisory: when it cannot be used here (another
             # account's file, no flock on this filesystem, ...) the atomic
             # write proceeds as in 2.6.2; only real contention is refused.
-            lock_path = p.with_name("." + p.name + ".window-lock")
+            lock_path = annotation_lock_path(p)
             failure: tuple[int, str] | None = None
             with st.lock, ExitStack() as held:
-                if lock_path.exists():
+                if Path(filesystem_path(lock_path)).exists():
                     try:
                         held.enter_context(annotation_lock(p))
                     except TimeoutError as e:
@@ -1618,7 +1631,7 @@ def make_handler(
 
         def _astromap(self, st: ViewerState):
             try:
-                payload = self._body_json(limit=1_000_000)
+                payload = self._body_json(limit=26_000_000)
             except (ValueError, json.JSONDecodeError) as exc:
                 return self._error(400, str(exc))
             prefix = (f"agent-{registry.window_session.id[:12]}_" if registry.agent_window else "")
@@ -1664,11 +1677,23 @@ def make_handler(
                 return self._error(409, "slide was closed")
 
         def _roi(self, st: ViewerState, q: dict):
+            job = parse_job_id(q)
+            entered = False
             try:
                 with st.busy:
+                    entered = True
                     return self._roi_impl(st, q)
+            except LeaseClosed as e:
+                _job_update(job, state="error", error=str(e))
+                return self._error(409, "slide was closed")
             except ValueError as e:
+                if not entered:
+                    _job_update(job, state="error", error=str(e))
+                    return self._error(
+                        409, "slide was closed" if "closed" in str(e) else str(e)
+                    )
                 if "closed" in str(e):
+                    _job_update(job, state="error", error=str(e))
                     return self._error(409, "slide was closed")
                 raise
 
@@ -1676,6 +1701,7 @@ def make_handler(
             from contextlib import nullcontext
             from dataclasses import replace as _dc_replace
 
+            job = parse_job_id(q)
             prefix = (
                 f"agent-{registry.window_session.id[:12]}_"
                 if registry.agent_window else ""
@@ -1746,6 +1772,7 @@ def make_handler(
                         {"Content-Disposition": content_disposition(artifact.filename)},
                     )
             except ExportRequestError as e:
+                _job_update(job, state="error", error=str(e))
                 return self._error(400, str(e))
 
     return Handler

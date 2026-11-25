@@ -324,3 +324,168 @@ def test_failed_write_preserves_the_existing_output(fluor_nd2, tmp_path):
                   pixel_size_um=0.5, planes=[{"name": "A", "color": "FF0000"}])
     assert out.read_bytes() == b"precious previous export"
     assert not list(tmp_path.glob("*.partial-*"))
+
+
+def test_multichannel_ome_tiff_writes_little_endian_multi_ifd_and_roundtrips_via_ometiff(tmp_path):
+    """B5: Non-RGB multi-channel OME-TIFF uses C grayscale IFDs, BigEndian=false, and opens via nd2wsi.ometiff."""
+    import xml.etree.ElementTree as ET
+
+    import tifffile
+
+    from nd2wsi import ometiff, render
+
+    ome_ns = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
+    rng = np.random.default_rng(73)
+    raw = rng.integers(0, 50000, size=(3, 150, 170), dtype=np.uint16)
+    attrs = {
+        "nd2wsi": {
+            "source": "multi_ifd.nd2",
+            "selection": {"t": 0, "p": 0, "z": 0},
+            "levels": [{"path": "0", "width": 170, "height": 150, "downsample": 1}],
+            "tile": 64,
+            "dtype": "uint16",
+            "rgb": False,
+            "pixel_size_um": [0.5, 0.25],
+        },
+        "omero": {
+            "channels": [
+                {"label": "DAPI", "color": "0000FF", "window": {"start": 0.0, "end": 50000.0}},
+                {"label": "FITC", "color": "00FF00", "window": {"start": 0.0, "end": 50000.0}},
+                {"label": "CY5", "color": "FF0000", "window": {"start": 0.0, "end": 50000.0}},
+            ]
+        },
+    }
+    progress: list[float] = []
+    out = tmp_path / "roi_multi.ome.tif"
+    render.export_roi_tiff(
+        {"0": raw}, attrs, out, 0, 7, 5, 140, 130, [0, 2, 1], on_progress=progress.append
+    )
+    assert progress and progress[-1] == 1.0
+    assert progress == sorted(progress)
+    assert all(0.0 < p <= 1.0 for p in progress)
+
+    with tifffile.TiffFile(out) as tf:
+        assert tf.byteorder == "<"
+        assert tf.is_ome is True
+        assert tf.is_shaped is False
+        assert len(tf.series) == 1
+        assert tf.series[0].kind == "ome"
+        assert tf.series[0].axes == "CYX"
+        assert len(tf.pages) == 3
+        for idx, raw_page in enumerate(tf.pages):
+            page = raw_page.aspage()
+            assert page.shape == (130, 140)
+            assert page.samplesperpixel == 1
+            assert page.is_tiled is True
+            assert page.tags["ResolutionUnit"].value == 3  # CENTIMETER
+            if idx == 0:
+                assert page.description.startswith("<?xml")
+            else:
+                assert "ImageDescription" not in page.tags
+        px_el = ET.fromstring(tf.ome_metadata).find(".//ome:Pixels", ome_ns)
+        assert px_el is not None
+        assert px_el.attrib["BigEndian"] == "false"
+        assert px_el.attrib["SizeC"] == "3"
+        assert px_el.attrib["Interleaved"] == "false"
+        ch_els = px_el.findall("ome:Channel", ome_ns)
+        assert [(c.attrib["ID"], c.attrib["SamplesPerPixel"], c.attrib["Name"]) for c in ch_els] == [
+            ("Channel:0:0", "1", "DAPI"),
+            ("Channel:0:1", "1", "CY5"),
+            ("Channel:0:2", "1", "FITC"),
+        ]
+        td_els = px_el.findall("ome:TiffData", ome_ns)
+        assert [
+            (td.attrib["FirstC"], td.attrib["FirstZ"], td.attrib["FirstT"], td.attrib["IFD"], td.attrib["PlaneCount"])
+            for td in td_els
+        ] == [
+            ("0", "0", "0", "0", "1"),
+            ("1", "0", "0", "1", "1"),
+            ("2", "0", "0", "2", "1"),
+        ]
+        np.testing.assert_array_equal(tf.asarray(), raw[[0, 2, 1], 5:135, 7:147])
+
+    # Round-trip through nd2wsi.ometiff.open_direct
+    root_rt, attrs_rt = ometiff.open_direct(out)
+    try:
+        assert attrs_rt["nd2wsi"]["rgb"] is False
+        assert attrs_rt["nd2wsi"]["pixel_size_um"] == pytest.approx([0.5, 0.25])
+        assert [ch["label"] for ch in attrs_rt["omero"]["channels"]] == ["DAPI", "CY5", "FITC"]
+        np.testing.assert_array_equal(root_rt["0"][:, :, :], raw[[0, 2, 1], 5:135, 7:147])
+    finally:
+        root_rt.close()
+
+    # RGB single-IFD export also declares BigEndian="false" and little-endian byteorder
+    rgb_raw = rng.integers(0, 255, size=(3, 80, 90), dtype=np.uint8)
+    rgb_attrs = {
+        "nd2wsi": {
+            "source": "rgb.svs",
+            "selection": {"t": 0, "p": 0, "z": 0},
+            "levels": [{"path": "0", "width": 90, "height": 80, "downsample": 1}],
+            "tile": 64,
+            "dtype": "uint8",
+            "rgb": True,
+            "pixel_size_um": [0.5, 0.5],
+        },
+        "omero": {
+            "channels": [
+                {"label": name, "color": col, "window": {"start": 0.0, "end": 255.0}}
+                for name, col in (("R", "FF0000"), ("G", "00FF00"), ("B", "0000FF"))
+            ]
+        },
+    }
+    rgb_out = tmp_path / "roi_rgb.ome.tif"
+    render.export_roi_tiff({"0": rgb_raw}, rgb_attrs, rgb_out, 0, 0, 0, 90, 80, [0, 1, 2])
+    with tifffile.TiffFile(rgb_out) as tf_rgb:
+        assert tf_rgb.byteorder == "<"
+        assert len(tf_rgb.pages) == 1
+        px_rgb = ET.fromstring(tf_rgb.ome_metadata).find(".//ome:Pixels", ome_ns)
+        assert px_rgb is not None
+        assert px_rgb.attrib["BigEndian"] == "false"
+        assert px_rgb.attrib["Interleaved"] == "true"
+
+
+def test_pre_stream_roi_errors_record_job_error_state(fluor_nd2, tmp_path):
+    """B7: Pre-stream 400 and 409 /api/roi rejections record error state in EXPORT_JOBS."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    from nd2wsi.convert import convert
+    from nd2wsi.region_export import parse_job_id
+    from nd2wsi.server import _job_get
+
+    assert parse_job_id({"job": ["valid_1-a"]}) == "valid_1-a"
+    assert parse_job_id({"job": ["bad/job!"]}) is None
+    assert parse_job_id({}) is None
+
+    src_path, _ = fluor_nd2
+    store = tmp_path / "job_err.ome.zarr"
+    convert(src_path, store, progress=False)
+    with running_server(store) as httpd:
+        base = server_url(httpd).rstrip("/")
+        # 400 pre-stream validation error (level out of range)
+        with pytest.raises(urllib.error.HTTPError) as err_400:
+            urllib.request.urlopen(
+                base + "/api/roi?level=99&x=0&y=0&w=64&h=64&format=tiff&job=pre400"
+            )
+        assert err_400.value.code == 400
+        prog_400 = json.loads(
+            urllib.request.urlopen(base + "/api/roi/progress?job=pre400").read()
+        )
+        assert prog_400["state"] == "error"
+        assert "level 99 out of range" in prog_400["error"]
+
+        # 409 pre-stream busy lease closed
+        st = next(iter(httpd.registry.slides.values()))
+        st.busy.close()
+        try:
+            with pytest.raises(urllib.error.HTTPError) as err_409:
+                urllib.request.urlopen(
+                    base + "/api/roi?level=0&x=0&y=0&w=64&h=64&format=tiff&job=pre409"
+                )
+            assert err_409.value.code == 409
+            prog_409 = _job_get("pre409")
+            assert prog_409["state"] == "error"
+            assert "closed" in prog_409["error"]
+        finally:
+            st.busy.reopen()

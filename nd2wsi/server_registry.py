@@ -231,6 +231,11 @@ class ViewerState:
             if not self._closed:
                 self.busy.reopen()
 
+    def is_admitted(self) -> bool:
+        """Whether this slide is currently open and admitting tile reads."""
+        with self._admission, self.busy._cv:
+            return not self._closed and not self.busy.closed
+
     def _pyramid_identity(self):
         path = self.cache_path
         try:
@@ -284,34 +289,28 @@ class ViewerState:
             if not self.busy.close(timeout=30):
                 self._readmit()
                 raise ValueError("A slide read/export is still running; retry the replacement")
-            admitted = False
+            self._cache_identity = None
+            self._close_root(self.root)
             try:
-                self._close_root(self.root)
-                try:
-                    replacement.publish()
-                except BaseException:
-                    # A denied rename (including another Windows reader) keeps
-                    # the original file intact. Reopen it before admitting reads.
-                    root, attrs = self._open_pyramid(replacement.final, replacement.prior_manifest)
-                    self._adopt_pyramid(root, attrs, replacement.prior_manifest)
-                    admitted = True
-                    raise
-                try:
-                    root, attrs = self._open_pyramid(replacement.final, replacement.manifest)
-                except Exception as exc:
-                    self.manifest = dict(replacement.manifest)
-                    self.generation = str(replacement.manifest["generation"])
-                    self._cache_identity = None  # Status retries activation of the saved cache.
-                    raise RuntimeError(
-                        "The new pyramid was saved but could not be opened; reopen the slide"
-                    ) from exc
-                self._adopt_pyramid(root, attrs, replacement.manifest)
-                admitted = True
-            finally:
-                # If the OS denies reopening after a successful publish, the
-                # validated cache remains on disk. Keep reads barred until reopen.
-                if admitted:
-                    self._readmit()
+                replacement.publish()
+            except BaseException:
+                # A denied rename (including another Windows reader) keeps
+                # the original file intact. Reopen it before admitting reads.
+                root, attrs = self._open_pyramid(replacement.final, replacement.prior_manifest)
+                self._adopt_pyramid(root, attrs, replacement.prior_manifest)
+                self._readmit()
+                raise
+            try:
+                root, attrs = self._open_pyramid(replacement.final, replacement.manifest)
+            except Exception as exc:
+                # Leave manifest/generation untouched until the saved cache
+                # is actually opened; _cache_identity is already None so
+                # refresh_pyramid() will retry activation on the next poll.
+                raise RuntimeError(
+                    "The new pyramid was saved but could not be opened; reopen the slide"
+                ) from exc
+            self._adopt_pyramid(root, attrs, replacement.manifest)
+            self._readmit()
 
     def refresh_pyramid(self):
         """Observe another window's atomic replacement without resetting sidecars."""
@@ -1759,16 +1758,21 @@ class SlideRegistry:
                 store_guard_fd = open_guard(store, allow_rename=True)
             else:
                 store_guard_fd = os.open(store, guard_flags)
-            guarded_stat = os.fstat(store_guard_fd)
-            if not same_identity(guarded_stat, store_stat) or is_reparse(
-                guarded_stat, fd=store_guard_fd
-            ):
-                os.close(store_guard_fd)
-                store_guard_fd = None
-                raise ValueError(
-                    f"refusing to delete {store}: cache root changed during validation"
-                )
-            store_stat = guarded_stat
+            validated_guard = False
+            try:
+                guarded_stat = os.fstat(store_guard_fd)
+                if not same_identity(guarded_stat, store_stat) or is_reparse(
+                    guarded_stat, fd=store_guard_fd
+                ):
+                    raise ValueError(
+                        f"refusing to delete {store}: cache root changed during validation"
+                    )
+                store_stat = guarded_stat
+                validated_guard = True
+            finally:
+                if not validated_guard and store_guard_fd is not None:
+                    os.close(store_guard_fd)
+                    store_guard_fd = None
 
         # Plate mutation uses the same order as open/create: the session writer
         # first, then the short build lock. A locally writable store already

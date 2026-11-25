@@ -28,6 +28,7 @@
     '[role="textbox"]',
   ].join(",");
   const FOCUS_CONTROL_SELECTOR = "input," + EDITABLE_SELECTOR;
+  const TEXT_FOCUS_CONTROL_SELECTOR = 'input:not([type="checkbox"]),' + EDITABLE_SELECTOR;
 
   function isMac(platform) {
     if (platform === undefined) {
@@ -104,6 +105,25 @@
     if (target.isContentEditable === true) return true;
     const element = targetElement(target);
     return Boolean(element && element.closest(FOCUS_CONTROL_SELECTOR));
+  }
+
+  function isTextFocusTarget(target) {
+    if (!target) return false;
+    const tag = String(target.tagName || "").toUpperCase();
+    if (tag === "INPUT") return String(target.type || "text").toLowerCase() !== "checkbox";
+    if (tag === "SELECT" || tag === "TEXTAREA") return true;
+    if (target.isContentEditable === true) return true;
+    const element = targetElement(target);
+    return Boolean(element && element.closest(TEXT_FOCUS_CONTROL_SELECTOR));
+  }
+
+  function isTextFocusControl(event) {
+    if (!event) return false;
+    if ("target" in event || typeof event.composedPath === "function") {
+      const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+      return [event.target, ...path].some(isTextFocusTarget);
+    }
+    return isTextFocusTarget(event);
   }
 
   function isBlocked(event) {
@@ -198,8 +218,7 @@
 
   function rawHistoryAction(event, platform) {
     if (isBlocked(event) || !commandPressed(event, platform) || event.altKey) return null;
-    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-    if ([event.target, ...path].some(isFocusControl)) return null;
+    if (isTextFocusControl(event)) return null;
     const code = letterCode(event);
     if (code === "KeyZ") return event.shiftKey ? "redo" : "undo";
     if (code === "KeyY" && !event.shiftKey) return "redo";
@@ -219,13 +238,12 @@
     if (isBlocked(event) || event.repeat || event.metaKey || event.ctrlKey || event.altKey) {
       return false;
     }
-    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-    if ([event.target, ...path].some(isFocusControl)) return false;
+    if (isTextFocusControl(event)) return false;
     return event.key === "?" || (String(event.code || "") === "Slash" && Boolean(event.shiftKey));
   }
 
   return {
-    isTypingEvent, isFocusControl, hasTextSelection, letterCode, plainLetterForEvent,
+    isTypingEvent, isFocusControl, isTextFocusControl, hasTextSelection, letterCode, plainLetterForEvent,
     isPanelShortcut, panelForEvent, isAstromapShortcut, isOrientationShortcut,
     isNewWindowShortcut, newWindowRoleForEvent,
     orientationForEvent, tabIndexForEvent,

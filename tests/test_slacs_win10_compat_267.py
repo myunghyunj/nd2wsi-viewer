@@ -424,7 +424,7 @@ def test_app_main_performs_one_shot_fallback_without_error_dialog(
     )
 
     api_box = SimpleNamespace(_startup_error=None, _webview2_runtime=None, _webview2_init=None,
-                              stop_server_for_update=Mock())
+                              _stop_server_for_update=Mock())
     monkeypatch.setattr(app, "create_app_window", Mock(return_value=(api_box, SimpleNamespace())))
     fake_wv = SimpleNamespace(start=Mock(side_effect=lambda **_kw: watched["rec"](False, "0x80070005")), settings={})
     monkeypatch.setitem(sys.modules, "webview", fake_wv)
@@ -840,6 +840,8 @@ def test_app_facade_reexports_and_delegates_to_app_slacs() -> None:
 
     assert callable(app._dismiss_failed_webview2_window)
     assert callable(app._startup_error)
+    from nd2wsi import window_chrome
+    assert app_slacs._direct_destroy_window is window_chrome._direct_destroy_window
 
 
 # ---------------------------------------------------------------------------

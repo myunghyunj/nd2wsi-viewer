@@ -441,20 +441,34 @@ class ShadingCorrectionController:
     def status(self) -> dict:
         with self._lock:
             active = self._status["state"] in _ACTIVE
-            can_refresh = not active and not self._closed and not (self._thread and self._thread.is_alive())
+            thread_alive = bool(self._thread and self._thread.is_alive())
+            can_refresh = not active and not self._closed and not thread_alive
         if can_refresh:
             refresh = getattr(self.state, "refresh_pyramid", None)
             if refresh is not None:
-                refresh()
+                try:
+                    refresh()
+                except Exception:
+                    pass
+        admitted = (
+            check()
+            if callable(check := getattr(self.state, "is_admitted", None))
+            else not getattr(getattr(self.state, "busy", None), "closed", False)
+        )
         with self._lock:
-            old_generation = self._status.get("generation")
-            self._sync_committed()
             now_active = self._status["state"] in _ACTIVE
-            if old_generation != self.state.generation and not active and not now_active and not self._closed:
-                self.generation = self.state.generation
-                self._status.update(state="ready" if self._status["applied"] else "idle",
-                                    reason="", pct=100 if self._status["applied"] else 0,
-                                    operation=None)
+            now_thread_alive = bool(self._thread and self._thread.is_alive())
+            if not (active or now_active or thread_alive or now_thread_alive or not admitted):
+                old_generation = self._status.get("generation")
+                self._sync_committed()
+                if old_generation != self.state.generation and not self._closed:
+                    self.generation = self.state.generation
+                    self._status.update(
+                        state="ready" if self._status["applied"] else "idle",
+                        reason="",
+                        pct=100 if self._status["applied"] else 0,
+                        operation=None,
+                    )
             result = json.loads(json.dumps(self._status))
             estimate = self._estimated_seconds
             if result["applied"] and estimate is not None:
@@ -641,8 +655,17 @@ class ShadingCorrectionController:
         finally:
             _close_maps(inputs)
             if replacement is not None:
-                replacement.close()
+                try:
+                    replacement.close()
+                except OSError:
+                    pass
             if model is not None and getattr(model, "data", None) is not None:
-                model.data.close()
+                try:
+                    model.data.close()
+                except OSError:
+                    pass
             if temporary is not None:
-                temporary.cleanup()
+                try:
+                    temporary.cleanup()
+                except OSError:
+                    pass

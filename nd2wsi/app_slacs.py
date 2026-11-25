@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from . import session_log, webview2_runtime
+from .window_chrome import _direct_destroy_window as _direct_destroy_window
 
 # -- SLACS discovery & offer claiming ------------------------------------------
 
@@ -448,43 +449,6 @@ def close_translucent_windows(api, *, owner_closing: bool = True, logger) -> Non
 _DISMISS_SHOWN_TIMEOUT = 1.5
 
 
-def _direct_destroy_window(window) -> bool:
-    """Close a pywebview window directly when ``events.shown`` never fired.
-
-    pywebview's ``Window.destroy()`` is wrapped in ``@_shown_call``, which waits
-    20 s for ``window.events.shown`` and raises ``WebViewException`` if it never
-    fires (e.g., when WebView2 fails before the WinForms ``Shown`` event). Calling
-    ``window.gui.destroy_window(window.uid)`` or ``window.native.Close()`` closes
-    the hung form cleanly without hanging on ``shown``.
-    """
-    gui = getattr(window, "gui", None)
-    uid = getattr(window, "uid", None)
-    if gui is not None and uid is not None and callable(getattr(gui, "destroy_window", None)):
-        try:
-            gui.destroy_window(uid)
-            return True
-        except Exception:
-            pass
-    native = getattr(window, "native", None)
-    if native is not None:
-        close = getattr(native, "Close", None)
-        if callable(close):
-            try:
-                if getattr(native, "InvokeRequired", False) and callable(getattr(native, "BeginInvoke", None)):
-                    try:
-                        from System import Action
-
-                        native.BeginInvoke(Action(close))
-                        return True
-                    except Exception:
-                        pass
-                close()
-                return True
-            except Exception:
-                pass
-    return False
-
-
 def dismiss_failed_webview2_window(
     api,
     window,
@@ -504,6 +468,12 @@ def dismiss_failed_webview2_window(
     if coordinator is not None:
         coordinator.approve_close("WebView2 failed to start, so the page never loaded")
 
+    def _try_direct_destroy() -> bool:
+        try:
+            return bool(_direct_destroy_window(window))
+        except Exception:
+            return False
+
     def close_window() -> None:
         shown = getattr(getattr(window, "events", None), "shown", None)
         has_waitable_shown = callable(getattr(shown, "is_set", None)) and callable(getattr(shown, "wait", None))
@@ -513,10 +483,10 @@ def dismiss_failed_webview2_window(
                     window.destroy()
                     return
                 except Exception:
-                    _direct_destroy_window(window)
+                    _try_direct_destroy()
                     return
             # ``shown`` never fired: bypass pywebview's 20 s @_shown_call wait.
-            if not _direct_destroy_window(window):
+            if not _try_direct_destroy():
                 try:
                     window.destroy()
                 except Exception:
@@ -525,7 +495,7 @@ def dismiss_failed_webview2_window(
         try:
             window.destroy()
         except Exception:
-            _direct_destroy_window(window)
+            _try_direct_destroy()
 
     (spawn or threading.Thread)(target=close_window, name="webview2-failed-close", daemon=True).start()
 

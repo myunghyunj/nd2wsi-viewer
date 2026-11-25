@@ -10,6 +10,7 @@
   const MAX_ROIS = 2000;
   const MAX_NOTE = 4096;
   const MAX_TEXT = MAX_ROIS * (MAX_NOTE + 128) + 64;
+  const MAX_REFERENCE_HEADER_PIXELS = 2_000_000_000;
   const HEADER = ["INDEX", "X1", "Y1", "X2", "Y2", "NOTE"];
 
   function integer(value, label, minimum = 0) {
@@ -186,17 +187,32 @@
     return [pixel, pixel + 1];
   }
 
+  function checkAspectRatio(coordinateSize, sourceSize) {
+    const grid = validateSize(coordinateSize, "Coordinate JPG");
+    const source = validateSize(sourceSize, "Current image");
+    // A 1-step resize can round either edge by 1 px; a 2-step whole-slide
+    // integer floor downscale can drift up to 2 px on the minor axis when the
+    // relative aspect-ratio difference stays within 0.5%.
+    const p1 = BigInt(grid.width) * BigInt(source.height);
+    const p2 = BigInt(grid.height) * BigInt(source.width);
+    const cross = p1 >= p2 ? p1 - p2 : p2 - p1;
+    const maxDim = BigInt(Math.max(grid.width, grid.height, source.width, source.height));
+    const minProd = p1 < p2 ? p1 : p2;
+    if (!(cross <= maxDim || (cross <= 2n * maxDim && cross * 200n <= minProd))) {
+      throw new Error(
+        `JPG/PNG (${grid.width} × ${grid.height}) and current image (${source.width} × ${source.height}) ` +
+        "have different aspect ratios. Use the matching uncropped reference image."
+      );
+    }
+    return { grid, source };
+  }
+
   function mapToSource(rows, coordinateSize, sourceSize) {
     const grid = validateSize(coordinateSize, "Coordinate JPG");
     const source = validateSize(sourceSize, "Current image");
     if (!Array.isArray(rows) || !rows.length || rows.length > MAX_ROIS)
       throw new Error(`Import between 1 and ${MAX_ROIS} regions.`);
-    // A whole-image resize can round either edge by a pixel. A crop or an
-    // unrelated image needs an origin/rotation transform, not just scaling.
-    const cross = BigInt(grid.width) * BigInt(source.height) - BigInt(grid.height) * BigInt(source.width);
-    const tolerance = BigInt(Math.max(grid.width, grid.height, source.width, source.height));
-    if ((cross < 0n ? -cross : cross) > tolerance)
-      throw new Error("JPG and current image have different aspect ratios. Use the matching uncropped JPG.");
+    checkAspectRatio(grid, source);
     const indices = new Set();
     rows.forEach((row, i) => {
       const label = `Region ${i + 1}`;
@@ -245,7 +261,10 @@
         if (length < 8) throw new Error("The JPG frame header is invalid.");
         const frame = await read(offset + 2, 6);
         if (length < 8 + 3 * frame[5]) throw new Error("The JPG frame header is truncated.");
-        return validateSize({ width: frame[3] * 256 + frame[4], height: frame[1] * 256 + frame[2] }, "JPG");
+        const size = validateSize({ width: frame[3] * 256 + frame[4], height: frame[1] * 256 + frame[2] }, "JPG");
+        if (size.width * size.height > MAX_REFERENCE_HEADER_PIXELS)
+          throw new Error("The reference image dimensions exceed safety limits.");
+        return size;
       }
       offset += length;
     }
@@ -266,8 +285,10 @@
       header[offset + 2] * 256 + header[offset + 3];
     const size = validateSize({ width: u32(16), height: u32(20) }, "PNG");
     if (size.width > 2147483647 || size.height > 2147483647) throw new Error("The PNG dimensions are invalid.");
+    if (BigInt(size.width) * BigInt(size.height) > BigInt(MAX_REFERENCE_HEADER_PIXELS))
+      throw new Error("The reference image dimensions exceed safety limits.");
     return size;
   }
 
-  return { MAX_ROIS, parse, review, validateSize, mapToSource, readJpegSize, readImageSize };
+  return { MAX_ROIS, MAX_REFERENCE_HEADER_PIXELS, parse, review, validateSize, checkAspectRatio, mapToSource, readJpegSize, readImageSize };
 });

@@ -96,11 +96,12 @@ def test_saved_but_activation_failed_is_recoverable(activation, monkeypatch):
     monkeypatch.setattr(st, "_open_pyramid", fail_final)
     with pytest.raises(RuntimeError, match="was saved but could not be opened"):
         st.replace_pyramid(replacement)
-    assert st.manifest["h_correction"]["applied"] and st.generation == "new"
+    assert st.manifest == replacement.prior_manifest and st.generation == "old"
     assert st.busy.closed and replacement.final.read_bytes() == b"new-pyramid"
     monkeypatch.setattr(st, "_open_pyramid", open_root)
     monkeypatch.setattr("nd2wsi.cache.read_manifest", lambda *a, **k: replacement.manifest)
     st.refresh_pyramid()
+    assert st.manifest["h_correction"]["applied"] and st.generation == "new"
     assert not st.busy.closed and not st.root.closed
 
 

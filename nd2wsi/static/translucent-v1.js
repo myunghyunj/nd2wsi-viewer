@@ -17,6 +17,7 @@
   const laserTarget = (laserTargetArg && typeof laserTargetArg.validate === "function" &&
     typeof laserTargetArg.mount === "function") ? laserTargetArg : {
     validate: value => value || null,
+    isCalibrated: () => false,
     mount: () => ({ render() {}, report() { return {}; }, cancel() {}, begin() { return false; },
       contextmenu() { return false; }, calibrating: false, target: null }),
   };
@@ -388,6 +389,7 @@
       ? win.clearTimeout.bind(win)
       : (typeof clearTimeout === "function" ? clearTimeout : null);
     let viewer = null;
+    let viewReporter = null;
     let backdropVisible = false;
     let lastViewportPose = null;
     let lastViewSignature = null;
@@ -414,6 +416,11 @@
       const tgt = state.target;
       const disp = Array.isArray(follow?.displacement) ? follow.displacement : null;
       const off = Array.isArray(tgt?.offset_css) ? tgt.offset_css : null;
+      const frame = viewReporter ? viewReporter.windowFrame() : null;
+      const dpr = Number.isFinite(win?.devicePixelRatio) ? win.devicePixelRatio : 1;
+      const targetCalibrated = typeof laserTarget.isCalibrated === "function"
+        ? Boolean(laserTarget.isCalibrated(tgt, frame, dpr))
+        : false;
       return {
         pose,
         followEnabled: Boolean(follow?.enabled),
@@ -421,7 +428,7 @@
         followSeq: follow?.seq ?? 0,
         followDx: disp ? disp[0] : 0,
         followDy: disp ? disp[1] : 0,
-        targetCalibrated: Boolean(tgt?.calibrated),
+        targetCalibrated,
         targetOx: off ? off[0] : null,
         targetOy: off ? off[1] : null,
         targetSide: tgt?.side_um ?? null,
@@ -561,6 +568,18 @@
       else displayGate.resetState(nextQuery);
       return true;
     };
+    const advanceRejectedRevision = snap => {
+      if (
+        !disposed &&
+        !state.expired &&
+        snap?.expired !== true &&
+        (!state.launchToken || !snap.launch_token || snap.launch_token === state.launchToken) &&
+        Number.isInteger(snap.revision) &&
+        snap.revision > state.displayRevision
+      ) {
+        state.displayRevision = snap.revision;
+      }
+    };
     const startDisplayLoop = () => {
       if (disposed || displayLoopStarted) return;
       displayLoopStarted = true;
@@ -575,7 +594,7 @@
             if (disposed || initialSnap?.closed) return;
             if (initialSnap?.ok) {
               if (initialSnap.expired !== true) clearSyncStatus();
-              applyDisplaySnapshot(initialSnap);
+              if (!applyDisplaySnapshot(initialSnap)) advanceRejectedRevision(initialSnap);
             }
           } catch (_) {
             // Transient initial pull errors fall through to the long-poll loop.
@@ -598,7 +617,9 @@
               continue;
             }
             clearSyncStatus();
-            if (!res.unchanged) applyDisplaySnapshot(res);
+            if (!res.unchanged && !applyDisplaySnapshot(res)) {
+              advanceRejectedRevision(res);
+            }
             continue;
           }
           consecutiveErrors += 1;
@@ -648,7 +669,7 @@
     };
     const renderOverlays = () => { renderRoiBoxes(); laserAnnotations.render(); };
     let target = null;
-    const viewReporter = stageFollow.createViewReporter({
+    viewReporter = stageFollow.createViewReporter({
       win, viewer, state, api, getTarget: () => target, isDisposed: () => disposed,
     });
     const { windowFrame, reportView: rawReportView, scheduleViewReport: rawScheduleViewReport, reportMovedWindow } = viewReporter;
@@ -829,6 +850,9 @@
       applyImageZoom(current * factor, refPoint);
     }, { passive: false });
 
+    let lastLockedRectsKey = null;
+    let lockedRectsScheduled = false;
+    let lockedRectsRafId = null;
     const collectLockedInteractiveRects = () => {
       const rects = [];
       for (const id of LOCKED_INTERACTIVE_IDS) {
@@ -843,14 +867,42 @@
       }
       return rects;
     };
-    const reportLockedInteractiveRects = () => {
+    const serializeLockedRects = rects => rects
+      .map(rect => `${rect.x},${rect.y},${rect.width},${rect.height}`)
+      .join("|");
+    const reportLockedInteractiveRects = ({ deduplicate = false } = {}) => {
       if (disposed || typeof api.set_locked_interactive_rects !== "function") return false;
       const rects = state.locked ? collectLockedInteractiveRects() : [];
+      const key = serializeLockedRects(rects);
+      if (deduplicate && key === lastLockedRectsKey) return false;
+      lastLockedRectsKey = key;
       try {
         const result = api.set_locked_interactive_rects(rects);
         if (result && typeof result.catch === "function") result.catch(() => {});
         return true;
       } catch (_) { return false; }
+    };
+    const cancelScheduledLockedRects = () => {
+      lockedRectsScheduled = false;
+      if (lockedRectsRafId !== null && typeof win.cancelAnimationFrame === "function") {
+        win.cancelAnimationFrame(lockedRectsRafId);
+      }
+      lockedRectsRafId = null;
+    };
+    const flushLockedInteractiveRects = () => {
+      lockedRectsScheduled = false;
+      lockedRectsRafId = null;
+      if (disposed || !state.locked || state.pending) return;
+      reportLockedInteractiveRects({ deduplicate: true });
+    };
+    const scheduleLockedInteractiveRects = () => {
+      if (disposed || !state.locked || state.pending || lockedRectsScheduled) return;
+      lockedRectsScheduled = true;
+      if (typeof win.requestAnimationFrame === "function") {
+        lockedRectsRafId = win.requestAnimationFrame(flushLockedInteractiveRects);
+      } else {
+        Promise.resolve().then(flushLockedInteractiveRects);
+      }
     };
 
     const paintRois = () => {
@@ -871,9 +923,10 @@
       renderRoiBoxes();
     };
     const paintImportReview = () => {
+      const prevHidden = importReview?.hidden;
       const review = state.importReview;
       importReview.hidden = !review?.issues.length;
-      importRepair.hidden = !review?.issues.some(issue => issue.repairable && !issue.repaired);
+      importRepair.hidden = !state.importResult || !review?.issues.some(issue => issue.repairable && !issue.repaired);
       importSummary.textContent = review ?
         `${state.importApplied ? "Imported" : "Ready"} ${review.count} ROIs · ${review.skippedCount} skipped · ${review.repairedCount} repaired` : "";
       importIssues.textContent = review ? [
@@ -881,6 +934,9 @@
         "Original TXT unchanged. Skipped rows are not shown on the image.",
         ...review.issues.map(issue => `${issue.repaired ? "Repaired" : "Skipped"}: ${issue.message}\n${issue.raw}`),
       ].join("\n\n") : "";
+      if (state.locked && !state.pending && importReview?.hidden !== prevHidden) {
+        reportLockedInteractiveRects();
+      }
     };
     let stageFollowCtrl = null;
     const paintLock = () => {
@@ -917,9 +973,20 @@
     const { consumeStageState, pollStageFollow, startStageFollow, stopStageFollow,
       pollSlacsDiscovery, revokeStageFollow, setStepUm, setStepAuto, setFollowFlips } = stageFollowCtrl;
 
-    const cancelGesture = () => {
-      if (state.gesture) state.gesture.cancelled = true;
+    const releaseGestureCapture = pointerId => {
+      if (pointerId == null || typeof overlay.releasePointerCapture !== "function") return;
+      try {
+        if (typeof overlay.hasPointerCapture !== "function" || overlay.hasPointerCapture(pointerId)) {
+          overlay.releasePointerCapture(pointerId);
+        }
+      } catch (_) { /* Ignore capture loss or synthetic pointer events. */ }
+    };
+    const cancelGesture = ({ releaseCapture = true } = {}) => {
+      const gesture = state.gesture;
+      if (!gesture) return;
+      gesture.cancelled = true;
       state.gesture = null;
+      if (releaseCapture) releaseGestureCapture(gesture.pointerId);
     };
     const toggleLock = async () => {
       if (state.pending) return;
@@ -982,9 +1049,19 @@
           paintRois();
           if (!importer?.review || !importer?.mapToSource) throw new Error("AstroMapper import is unavailable");
           const review = importer.review(result.text, result.coordinateSize, { repairZeroArea });
-          state.importResult = { ...result, coordinateSize: { ...result.coordinateSize } };
           state.importReview = review;
           state.importApplied = false;
+          if (typeof importer.checkAspectRatio === "function") {
+            try {
+              importer.checkAspectRatio(result.coordinateSize, { width: info.width, height: info.height });
+            } catch (aspectError) {
+              state.importResult = null;
+              paintImportReview();
+              paintRois();
+              throw aspectError;
+            }
+          }
+          state.importResult = { ...result, coordinateSize: { ...result.coordinateSize } };
           paintImportReview();
           paintRois();
           if (!review.count) throw new Error("No valid ROIs to import. Review the skipped rows.");
@@ -1021,6 +1098,10 @@
       return success;
     };
     importRepair.addEventListener("click", repairRois);
+    const onImportReviewToggle = () => {
+      if (state.locked && !state.pending) reportLockedInteractiveRects();
+    };
+    importReview?.addEventListener?.("toggle", onImportReviewToggle);
     for (const name of ["pointerdown", "pointermove", "pointerup", "pointercancel", "wheel"])
       importReview.addEventListener(name, event => event.stopPropagation());
     const chooseRois = async () => {
@@ -1203,6 +1284,15 @@
     };
     const observer = win.ResizeObserver ? new win.ResizeObserver(resize) : null;
     observer?.observe(stage);
+    const interactiveObserver = typeof win.ResizeObserver === "function"
+      ? new win.ResizeObserver(() => scheduleLockedInteractiveRects())
+      : null;
+    if (interactiveObserver) {
+      for (const id of LOCKED_INTERACTIVE_IDS) {
+        const el = doc.getElementById(id);
+        if (el) interactiveObserver.observe(el);
+      }
+    }
     win.addEventListener("resize", resize);
 
     const pumpGeometry = async gesture => {
@@ -1239,16 +1329,23 @@
       if (state.locked || state.pending || event.button !== 0) return;
       event.preventDefault(); event.stopImmediatePropagation();
       cancelGesture();
-      const gesture = { edge, startX: event.screenX, startY: event.screenY,
+      const gesture = { edge, pointerId: event.pointerId, startX: event.screenX, startY: event.screenY,
         x: event.screenX, y: event.screenY, appliedX: event.screenX, appliedY: event.screenY,
         width: win.innerWidth, height: win.innerHeight, appliedWidth: win.innerWidth,
         appliedHeight: win.innerHeight, nativePending: !edge, dirty: false };
       state.gesture = gesture;
-      overlay.setPointerCapture?.(event.pointerId);
+      if (event.pointerId != null) {
+        try { overlay.setPointerCapture?.(event.pointerId); }
+        catch (_) { /* Ignore synthetic or unsupported pointer capture. */ }
+      }
       if (!edge) {
         try {
           const native = await api.start_window_drag();
-          if (native === true) { gesture.cancelled = true; if (state.gesture === gesture) state.gesture = null; }
+          if (native === true) {
+            gesture.cancelled = true;
+            if (state.gesture === gesture) state.gesture = null;
+            releaseGestureCapture(gesture.pointerId);
+          }
         } catch (_) { /* The incremental bridge is available when native dragging is unavailable. */ }
         gesture.nativePending = false;
         pumpGeometry(gesture);
@@ -1266,17 +1363,32 @@
     const moveGesture = event => {
       const gesture = state.gesture;
       if (!gesture) return;
+      if (gesture.pointerId != null && event?.pointerId != null && event.pointerId !== gesture.pointerId) return;
       event.preventDefault();
       gesture.x = event.screenX; gesture.y = event.screenY; gesture.dirty = true;
       pumpGeometry(gesture);
     };
     overlay.addEventListener("pointermove", moveGesture);
     overlay.addEventListener("pointerup", event => {
+      const gesture = state.gesture;
+      if (!gesture) return;
+      if (gesture.pointerId != null && event?.pointerId != null && event.pointerId !== gesture.pointerId) return;
       moveGesture(event);
       state.gesture = null;
-      overlay.releasePointerCapture?.(event.pointerId);
+      releaseGestureCapture(gesture.pointerId ?? event?.pointerId);
     });
-    overlay.addEventListener("pointercancel", cancelGesture);
+    overlay.addEventListener("pointercancel", event => {
+      const gesture = state.gesture;
+      if (!gesture) return;
+      if (gesture.pointerId != null && event?.pointerId != null && event.pointerId !== gesture.pointerId) return;
+      cancelGesture();
+    });
+    overlay.addEventListener("lostpointercapture", event => {
+      const gesture = state.gesture;
+      if (!gesture) return;
+      if (gesture.pointerId != null && event?.pointerId != null && event.pointerId !== gesture.pointerId) return;
+      cancelGesture({ releaseCapture: false });
+    });
 
     const closestMatch = (el, selector, ids) => {
       const hit = el?.closest?.(selector);
@@ -1351,6 +1463,9 @@
       doc.removeEventListener?.("pointerdown", onDocPointerDown, true);
       doc.removeEventListener?.("keydown", onDocKeyDown, true);
       doc.removeEventListener?.("wheel", onDocWheel, { passive: false });
+      importReview?.removeEventListener?.("toggle", onImportReviewToggle);
+      cancelScheduledLockedRects();
+      interactiveObserver?.disconnect();
       observer?.disconnect();
       viewer.destroy();
     }, { once: true });

@@ -11,7 +11,10 @@ import bz2
 import json
 import lzma
 import math
+import os
+import stat
 import zlib
+from collections import deque
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -19,7 +22,8 @@ from typing import Any
 
 import numpy as np
 
-from ..platform_io import filesystem_path
+from ..platform_io import BINARY, filesystem_path
+from ..windows_fs import is_windows_name_surrogate_reparse
 
 _ALLOWED_COMPRESSOR_IDS = frozenset({"blosc", "zstd", "zlib", "gzip", "lz4", "bz2", "lzma"})
 _ALLOWED_FILTER_IDS = frozenset(
@@ -28,6 +32,9 @@ _ALLOWED_FILTER_IDS = frozenset(
 # Upper bound on a single decoded chunk (64 MiB). Normal pyramid tiles are
 # 512x512..1024x1024 uint16 (~0.5..2 MiB); bounding rejects crafted zip/chunk bombs.
 MAX_CHUNK_BYTES = 64 * 1024 * 1024
+MAX_ZARR_WALK_DEPTH = 16
+MAX_ZARR_WALK_DIRS = 4096
+MAX_ZARRAY_BYTES = 1_048_576
 
 
 class UnsafeZarrArrayError(ValueError):
@@ -96,22 +103,140 @@ def validate_zarr_v2_metadata(metadata: Any) -> int:
     return chunk_bytes
 
 
+def _read_zarray_bounded(zarray_path: Path) -> Any:
+    native = filesystem_path(zarray_path)
+    try:
+        st = os.lstat(native)
+    except OSError as exc:
+        raise UnsafeZarrArrayError(f"cannot inspect Zarr metadata at {zarray_path}") from exc
+    if (
+        stat.S_ISLNK(st.st_mode)
+        or is_windows_name_surrogate_reparse(st)
+        or not stat.S_ISREG(st.st_mode)
+    ):
+        raise UnsafeZarrArrayError(f"refusing unsafe Zarr metadata: {zarray_path}")
+    if st.st_size > MAX_ZARRAY_BYTES:
+        raise UnsafeZarrArrayError(
+            f"Zarr metadata at {zarray_path} exceeds size limit ({MAX_ZARRAY_BYTES} bytes)"
+        )
+    flags = (
+        os.O_RDONLY
+        | BINARY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(native, flags)
+    except OSError as exc:
+        raise UnsafeZarrArrayError(f"cannot open Zarr metadata at {zarray_path}") from exc
+    try:
+        fst = os.fstat(fd)
+        if (
+            not stat.S_ISREG(fst.st_mode)
+            or is_windows_name_surrogate_reparse(fst, fd=fd)
+            or (
+                fst.st_ino != 0
+                and st.st_ino != 0
+                and (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino)
+            )
+        ):
+            raise UnsafeZarrArrayError(f"refusing unsafe Zarr metadata: {zarray_path}")
+        if fst.st_size > MAX_ZARRAY_BYTES:
+            raise UnsafeZarrArrayError(
+                f"Zarr metadata at {zarray_path} exceeds size limit ({MAX_ZARRAY_BYTES} bytes)"
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_ZARRAY_BYTES:
+                raise UnsafeZarrArrayError(
+                    f"Zarr metadata at {zarray_path} exceeds size limit ({MAX_ZARRAY_BYTES} bytes)"
+                )
+            chunks.append(chunk)
+    except UnsafeZarrArrayError:
+        raise
+    except OSError as exc:
+        raise UnsafeZarrArrayError(f"cannot read Zarr metadata at {zarray_path}") from exc
+    finally:
+        os.close(fd)
+    try:
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise UnsafeZarrArrayError(f"invalid Zarr metadata at {zarray_path}") from exc
+
+
 def validate_zarr_v2_directory(store_dir: Path) -> None:
     """Validate every Zarr v2 array metadata file inside a directory store."""
-    if not store_dir.is_dir():
-        return
-    candidates = [*sorted(store_dir.glob("*/.zarray"))]
-    root_zarray = store_dir / ".zarray"
-    if root_zarray.exists() or root_zarray.is_symlink():
-        candidates.append(root_zarray)
-    for zarray_path in candidates:
-        if zarray_path.is_symlink():
-            raise UnsafeZarrArrayError(f"refusing symlinked Zarr metadata: {zarray_path}")
+    store_path = Path(store_dir)
+    root_native = filesystem_path(store_path)
+    try:
+        root_st = os.lstat(root_native)
+    except OSError as exc:
+        raise UnsafeZarrArrayError(f"cannot inspect Zarr store directory {store_path}") from exc
+    if (
+        stat.S_ISLNK(root_st.st_mode)
+        or is_windows_name_surrogate_reparse(root_st)
+        or not stat.S_ISDIR(root_st.st_mode)
+    ):
+        raise UnsafeZarrArrayError(f"refusing unsafe or non-directory Zarr store: {store_path}")
+
+    queue: deque[tuple[Path, int]] = deque([(store_path, 0)])
+    discovered_dirs = 1
+    visited_dirs = 0
+    while queue:
+        dirpath, depth = queue.popleft()
+        visited_dirs += 1
+        if visited_dirs > MAX_ZARR_WALK_DIRS:
+            raise UnsafeZarrArrayError(
+                f"Zarr store exceeds directory walk limit ({MAX_ZARR_WALK_DIRS}): {store_path}"
+            )
         try:
-            meta = json.loads(zarray_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError) as exc:
-            raise UnsafeZarrArrayError(f"invalid Zarr metadata at {zarray_path}") from exc
-        validate_zarr_v2_metadata(meta)
+            with os.scandir(filesystem_path(dirpath)) as it:
+                entries = sorted(it, key=lambda item: item.name)
+        except OSError as exc:
+            raise UnsafeZarrArrayError(f"cannot scan Zarr directory {dirpath}") from exc
+        for entry in entries:
+            name = entry.name
+            entry_path = dirpath / name
+            if name == ".zarray":
+                meta = _read_zarray_bounded(entry_path)
+                validate_zarr_v2_metadata(meta)
+                continue
+            try:
+                is_link = entry.is_symlink()
+                is_junc = entry.is_junction() if hasattr(entry, "is_junction") else False
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError as exc:
+                raise UnsafeZarrArrayError(f"cannot inspect Zarr entry {entry_path}") from exc
+            if is_link or is_junc:
+                raise UnsafeZarrArrayError(f"refusing symlinked or junctioned Zarr entry: {entry_path}")
+            if not is_dir:
+                continue
+            try:
+                sub_st = os.lstat(filesystem_path(entry_path))
+            except OSError as exc:
+                raise UnsafeZarrArrayError(f"cannot inspect Zarr subdirectory {entry_path}") from exc
+            if (
+                stat.S_ISLNK(sub_st.st_mode)
+                or is_windows_name_surrogate_reparse(sub_st)
+                or not stat.S_ISDIR(sub_st.st_mode)
+            ):
+                raise UnsafeZarrArrayError(f"refusing unsafe Zarr subdirectory: {entry_path}")
+            next_depth = depth + 1
+            if next_depth > MAX_ZARR_WALK_DEPTH:
+                raise UnsafeZarrArrayError(
+                    f"Zarr store exceeds directory depth limit ({MAX_ZARR_WALK_DEPTH}): {entry_path}"
+                )
+            discovered_dirs += 1
+            if discovered_dirs > MAX_ZARR_WALK_DIRS:
+                raise UnsafeZarrArrayError(
+                    f"Zarr store exceeds directory walk limit ({MAX_ZARR_WALK_DIRS}): {store_path}"
+                )
+            queue.append((entry_path, next_depth))
 
 
 def _decode_chunk_bounded(

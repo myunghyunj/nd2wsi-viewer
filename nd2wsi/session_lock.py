@@ -25,7 +25,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .platform_io import BINARY
+from .platform_io import BINARY, filesystem_path
 from .windows_fs import is_windows_name_surrogate_reparse
 
 if os.name == "nt":
@@ -78,13 +78,14 @@ class SessionFileLock:
         timeout = max(0.0, float(timeout))
         poll = max(0.001, float(poll))
         deadline = time.monotonic() + timeout
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        native = filesystem_path(self.path)
+        os.makedirs(filesystem_path(self.path.parent), exist_ok=True)
         flags = os.O_CREAT | os.O_RDWR | BINARY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         while True:
             try:
-                pre = os.lstat(self.path)
+                pre = os.lstat(native)
             except FileNotFoundError:
                 pre = None
             if pre is not None and (stat.S_ISLNK(pre.st_mode) or is_windows_name_surrogate_reparse(pre)):
@@ -93,7 +94,7 @@ class SessionFileLock:
                     "lock coordination path must not be a symlink or reparse point",
                     str(self.path),
                 )
-            fd = os.open(self.path, flags, 0o600)
+            fd = os.open(native, flags, 0o600)
             locked = False
             try:
                 opened = os.fstat(fd)
@@ -125,7 +126,7 @@ class SessionFileLock:
                         time.sleep(min(poll, remaining))
 
                 try:
-                    current = os.stat(self.path, follow_symlinks=False)
+                    current = os.stat(native, follow_symlinks=False)
                     path_is_opened_inode = (
                         not stat.S_ISLNK(current.st_mode)
                         and not is_windows_name_surrogate_reparse(current)
@@ -141,7 +142,8 @@ class SessionFileLock:
                     # detached inode while a contender locks its replacement.
                     _kernel_lock(fd, unlock=True)
                     locked = False
-                    os.close(fd)
+                    closed_fd, fd = fd, -1
+                    os.close(closed_fd)
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError(
@@ -156,17 +158,18 @@ class SessionFileLock:
                 return
             except BaseException:
                 with self._fd_lock:
-                    if self._fd == fd:
+                    if fd >= 0 and self._fd == fd:
                         self._fd = None
-                if locked:
+                if locked and fd >= 0:
                     try:
                         _kernel_lock(fd, unlock=True)
                     except OSError:
                         pass
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 raise
 
     def _write_metadata(self, fd: int) -> None:

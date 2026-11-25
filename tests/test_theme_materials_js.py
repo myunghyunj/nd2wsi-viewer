@@ -589,21 +589,23 @@ assert.ok(!read('translucent.html').includes('materials-v1.css'));
 # Both baselines include the intentional 2.6.4 ROI recovery controls,
 # 2.6.5/2.6.6 custom channel-color (`col`), URL validation, and AppKit safety fixes,
 # 2.6.7 pywebview file-type filter / stage-follow laser delivery fixes,
-# 2.6.9 pre-1607 Windows 10 system-DPI scale fallback, and 2.6.10 live LUT sync,
-# backdrop snapshot, and paint gate; existing opacity, locking and window
-# geometry are covered by tracing tests.
+# 2.6.9 pre-1607 Windows 10 system-DPI scale fallback, 2.6.10 live LUT sync,
+# backdrop snapshot, and paint gate, and 2.6.11 AstroMapper aspect guard,
+# query-length cap, display-loop cursor, pointer-capture safety, hidden-window
+# teardown, and SLACS calibration/hover-rect hardening; existing opacity,
+# locking and window geometry are covered by tracing tests.
 TRACING_BASELINES = {
     "official": {
         "translucent.html": "4abe2b84b3e9ca060d51cab5a40bc655fb6836a93c75fa2b4a997f798815f237",
         "translucent-v1.css": "682a0bfe03429c544d93da6a16fe73fc381aa526878828170e3c6d852d889957",
-        "translucent-v1.js": "1ed0d67112d8657e911b1d2bdbf50464037e6e8609ea4d61f1ff2e40bbff6176",
-        "../translucent_window.py": "10110d293f1be08830d5abdcb0a8945c03209f0d2ecde2b24a17cd2aa1dfd780",
+        "translucent-v1.js": "f8bb41682d49570887d51c5303d6d5831b7eddc102d9b89c9ae0a53b1fcd10d4",
+        "../translucent_window.py": "e3b845c3da25a9934acb0052a795ec004faa2f2254e0ad5a0fc86116e2666a98",
     },
     "SLACS-module": {
         "translucent.html": "0d9503a25a731d116d6553c39fa089dd750f75ceb197c6de24215f4cdac96b98",
         "translucent-v1.css": "7a2456cf6418dcf98498521b7d3d1af3de5d5e99b5a25317d2acbe7ad04a33d7",
-        "translucent-v1.js": "c96a2b3f1ae1d0c13cec672565331ac6ae30a078706af092078bd87b3e51c3ec",
-        "../translucent_window.py": "e337c1a4a7e43d7ab265410e13f6a5cc95aac933459f3d0c10ffe68e96e36deb",
+        "translucent-v1.js": "b1428481b8e0935da6e86f46ded0f32e15e2963c94c44f09cab9b914bcb760b2",
+        "../translucent_window.py": "8cfe49e934ad69a6420617ba432dc7269b2232a5aa511c86758588454fc400e6",
     },
 }
 

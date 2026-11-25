@@ -74,7 +74,7 @@ const state = {
   roiOverlayEl: null, // projected SVG polygon in raw image coordinates
   tool: null, // null | "roi" | "measure" | "pin" | "box"
   renderScale: null, // chosen PNG/JPEG downsample; null = finest that fits
-  astromap: { exporting: false, rows: new Map(), activeId: null },
+  astromap: { exporting: false, rows: new Map(), activeId: null, importSizeError: false },
   annotations: [], // {id, type: "line"|"pin"|"box", ...image coords, text}
   annPath: null, // sidecar file, reported by the server
   annSite: null, // plate site whose sidecar is displayed; null in the grid
@@ -238,6 +238,9 @@ function captureTranslucentView() {
     ...(annotationScope === "plane" ? { annotation_scope: "plane" } : {}),
   };
   const ownerReady = Boolean(state.annReady && annotationOwnerReady());
+  const hasBounds = Number.isFinite(state.info?.width) && Number.isFinite(state.info?.height);
+  const maxW = hasBounds ? Math.max(0, state.info.width) : 0;
+  const maxH = hasBounds ? Math.max(0, state.info.height) : 0;
   const astromapRois = ownerReady
     ? state.annotations
       .filter(item => item.type === "box" && item.astromap === true)
@@ -245,12 +248,24 @@ function captureTranslucentView() {
       .filter(({ item }) => item.astromapEnabled !== false &&
         Number.isFinite(item.x) && Number.isFinite(item.y) &&
         Number.isFinite(item.w) && Number.isFinite(item.h) &&
-        item.x >= 0 && item.y >= 0 && item.w > 0 && item.h > 0)
+        item.w > 0 && item.h > 0 &&
+        (hasBounds || (item.x >= 0 && item.y >= 0)))
+      .map(({ item, number }) => {
+        if (!hasBounds) return { item, number, x: item.x, y: item.y, w: item.w, h: item.h };
+        const x0 = Math.max(0, Math.min(maxW, item.x));
+        const y0 = Math.max(0, Math.min(maxH, item.y));
+        const x1 = Math.max(0, Math.min(maxW, item.x + item.w));
+        const y1 = Math.max(0, Math.min(maxH, item.y + item.h));
+        return { item, number, x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+      })
+      .filter(({ w, h }) => w > 0 && h > 0)
+      .slice(0, 2000)
     : [];
   if (astromapRois.length) {
-    snapshot.rois = astromapRois.map(({ item, number }, index) => ({
-      x: item.x, y: item.y, w: item.w, h: item.h,
-      index: index + 1, label: String(item.text || item.astromapImportIndex || number),
+    snapshot.rois = astromapRois.map(({ item, number, x, y, w, h }, index) => ({
+      x, y, w, h,
+      index: index + 1,
+      label: String(item.text || item.astromapImportIndex || number).slice(0, 4096),
     }));
     const selected = astromapRois.findIndex(({ item }) => item.id === state.astromap.activeId);
     if (selected >= 0) snapshot.roiIndex = selected;
@@ -461,6 +476,7 @@ function publishTranslucentDisplay({ isRetry = false } = {}) {
         if (res?.invalid || res?.invalid_query) {
           if (typeof cancelTranslucentRetry === "function") cancelTranslucentRetry(sync);
           sync.retryCount = 0;
+          if (displayQuery() !== target) continue;
           break;
         }
         shouldRetry = true;
@@ -3060,6 +3076,12 @@ function requestAstromap() {
 
 function addAstromapRoi(rect) {
   if (!astromapReady()) return null;
+  if (astromapItems().length >= 2000) {
+    const status = typeof $ === "function" ? $("astromap-status") : null;
+    if (status) status.textContent = "Astromap supports up to 2000 regions";
+    showToast("Astromap supports up to 2000 regions");
+    return null;
+  }
   const normalized = window.Nd2Astromap.normalizeRect(rect, state.info.width, state.info.height);
   if (!normalized) { showToast("Draw a region inside the image"); return null; }
   if (astromapItems().some((a) => window.Nd2Astromap.overlaps(normalized, a))) {
@@ -3288,20 +3310,46 @@ function refreshAstromapImport(ready = astromapReady()) {
     disarmAstromapClearConfirm();
   }
   $("astromap-import-options").hidden = !pending;
+  if (!pending) state.astromap.importSizeError = false;
   const size = [Number($("astromap-import-width").value), Number($("astromap-import-height").value)];
   const validSize = size.every((n) => Number.isSafeInteger(n) && n > 0);
   const current = pending && pending.contextKey === activeFrameContext()?.key;
   let review = null;
-  if (pending && current && validSize) {
-    try {
-      review = reviewAstromapImport(pending);
-      $("astromap-import-name").textContent = `${pending.name} · ${review.count} of ${review.total} regions ready`;
-      $("astromap-import-repair-row").hidden = !review.issues.some(issue => issue.repairable);
-      showAstromapImportReview(review);
-    } catch (error) { $("astromap-import-status").textContent = error.message; }
+  if (pending && current) {
+    if (!validSize) {
+      $("astromap-import-repair-row").hidden = true;
+      if (typeof showAstromapImportReview === "function") showAstromapImportReview(null);
+      else $("astromap-import-review").hidden = true;
+      $("astromap-import-status").textContent = "Enter positive whole-number image dimensions.";
+      state.astromap.importSizeError = true;
+    } else {
+      try {
+        window.Nd2AstromapImport.checkAspectRatio?.(
+          { width: size[0], height: size[1] },
+          { width: state.info.width, height: state.info.height }
+        );
+        review = reviewAstromapImport(pending);
+        if (state.astromap.importSizeError) {
+          $("astromap-import-status").textContent = "";
+          state.astromap.importSizeError = false;
+        }
+        $("astromap-import-name").textContent = `${pending.name} · ${review.count} of ${review.total} regions ready`;
+        $("astromap-import-repair-row").hidden = !review.issues.some(issue => issue.repairable);
+        showAstromapImportReview(review);
+      } catch (error) {
+        review = null;
+        $("astromap-import-repair-row").hidden = true;
+        if (typeof showAstromapImportReview === "function") showAstromapImportReview(null);
+        else $("astromap-import-review").hidden = true;
+        $("astromap-import-status").textContent = error.message;
+        state.astromap.importSizeError = true;
+      }
+    }
   }
-  if (pending && !current)
+  if (pending && !current) {
+    state.astromap.importSizeError = false;
     $("astromap-import-status").textContent = "The displayed image changed. Choose the TXT again for the intended image.";
+  }
   $("astromap-import-confirm").disabled = !ready || busy || !current || !review?.count;
   $("astromap-import-confirm").textContent = review?.skippedCount ? `Import ${review.count} valid regions` : "Import regions";
   $("astromap-import-repair").disabled = busy || !current;
@@ -3321,7 +3369,20 @@ async function readAstromapImportFile(file) {
   refreshAstromapImport();
   try {
     if (file.size > 16 * 1024 * 1024) throw new Error("ROI TXT must be smaller than 16 MiB");
-    const text = await file.text();
+    let text;
+    if (typeof file.arrayBuffer === "function") {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let enc = "utf-8";
+      if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) enc = "utf-16le";
+      else if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) enc = "utf-16be";
+      try {
+        text = new TextDecoder(enc, { fatal: true }).decode(bytes);
+      } catch (_) {
+        throw new Error("Save the ROI text as UTF-8 or UTF-16");
+      }
+    } else {
+      text = await file.text();
+    }
     if (seq !== state.astromap.importSeq) return false;
     if (contextKey !== activeFrameContext()?.key || !astromapReady())
       throw new Error("The displayed image changed. Choose the TXT again for the intended image.");
@@ -3333,6 +3394,7 @@ async function readAstromapImportFile(file) {
     state.astromap.pendingImport = { text, contextKey, name: file.name };
     $("astromap-import-width").value = size.width;
     $("astromap-import-height").value = size.height;
+    state.astromap.importSizeError = false;
     $("astromap-import-status").textContent = "Confirm the coordinate image size and review any skipped regions. The original TXT stays unchanged.";
     return true;
   } catch (error) {
@@ -3359,6 +3421,7 @@ async function readAstromapImportJpg(file) {
       throw new Error("The displayed image changed. Choose the TXT again for the intended image.");
     $("astromap-import-width").value = size.width;
     $("astromap-import-height").value = size.height;
+    state.astromap.importSizeError = false;
     $("astromap-import-status").textContent = `${file.name}: ${fmtInt(size.width)} × ${fmtInt(size.height)} px. Ready to import.`;
     return true;
   } catch (error) {
@@ -3745,6 +3808,12 @@ function cancelUpdatePreparation(requestId) {
   // Keep in-flight saves and failed snapshots intact. If saving failed while
   // preparation had cancelled the debounce, ordinary editing can retry it.
   if (state.annDirty && !annotationRecoveryDrafts()) scheduleAnnSave();
+  if (typeof postShadingState === "function") postShadingState();
+  if (state.translucentSync?.launchToken && typeof displayQuery === "function" &&
+      displayQuery() !== state.translucentSync.acceptedQuery &&
+      typeof publishTranslucentDisplay === "function") {
+    publishTranslucentDisplay();
+  }
   return true;
 }
 
@@ -4340,8 +4409,12 @@ function wireAnnotationPointer() {
         a.x = clamp(origin.x + dx, 0, maxW);
         a.y = clamp(origin.y + dy, 0, maxH);
       } else if (a.type === "box") {
-        const nx = clamp(origin.x + dx, 0, Math.max(0, maxW - a.w));
-        const ny = clamp(origin.y + dy, 0, Math.max(0, maxH - a.h));
+        const nx = a.astromap === true
+          ? clamp(Math.round(origin.x + dx), 0, Math.max(0, Math.floor(maxW - a.w)))
+          : clamp(origin.x + dx, 0, Math.max(0, maxW - a.w));
+        const ny = a.astromap === true
+          ? clamp(Math.round(origin.y + dy), 0, Math.max(0, Math.floor(maxH - a.h)))
+          : clamp(origin.y + dy, 0, Math.max(0, maxH - a.h));
         if (!(a.astromap === true && window.Nd2Astromap &&
             astromapItems().some((other) => other.id !== a.id &&
               window.Nd2Astromap.overlaps({ x: nx, y: ny, w: a.w, h: a.h }, other)))) {
@@ -5448,6 +5521,15 @@ function downloadRoi(fmt, scaleBar = false) {
     if (sel) {
       d = sel.d;
       level = Number(levelPathFor(d));
+    } else {
+      const base = state.info?.levels?.[0];
+      if (base && base.downsample === 1) {
+        d = 1;
+        level = Number(levelPathFor(1));
+      } else if (base && state.info?.storage === "overview-degraded") {
+        d = base.downsample || 1;
+        level = Number(levelPathFor(d));
+      }
     }
   }
   const q = new URLSearchParams({
@@ -5476,7 +5558,7 @@ function downloadRoi(fmt, scaleBar = false) {
   a.click();
   a.remove();
   if (job) trackExport(job, fmt.toUpperCase());
-  else if (level > 0) {
+  else if (d > 1) {
     showToast("export started at 1/" + d + " scale (" +
       Math.round((r.w / d) * (r.h / d) / 1e6) + " MPx) — check your downloads");
   } else showToast("export started — check your downloads");

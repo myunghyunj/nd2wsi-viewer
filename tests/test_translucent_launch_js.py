@@ -1460,3 +1460,199 @@ def test_translucent_sync_bounded_retry_recovery_exhaustion_and_cancellation():
     pagehide_slice = pagehide_slice[: pagehide_slice.index("}, { once: true });")]
     assert "clearTranslucentSync()" in pagehide_slice
 
+def test_capture_translucent_view_clamps_bounds_caps_2000_before_roi_index_and_truncates_labels():
+    script = r"""
+    const fs = require('fs'), vm = require('vm');
+    const source = fs.readFileSync(process.argv[1], 'utf8');
+    function production(name) {
+      const start = source.indexOf('function ' + name + '(');
+      if (start < 0) throw Error('Missing function ' + name);
+      return source.slice(start, source.indexOf('\n}', start) + 2);
+    }
+    const viewport = {
+      getCenter: () => ({ x: 0.5, y: 0.5 }),
+      viewportToImageCoordinates: () => ({ x: 50, y: 50 }),
+      getZoom: () => 1, viewportToImageZoom: () => 1, getRotation: () => 0, getFlip: () => false,
+    };
+    const annotations = [
+      // Clamped slightly inside [0, 100] x [0, 80], label > 4096 chars truncated to 4096.
+      { id: 'clamp-ok', type: 'box', astromap: true, x: 95, y: 75, w: 5.00001, h: 6, text: 'A'.repeat(4500) },
+      // Completely outside bounds -> dropped (w <= 0 after clamp).
+      { id: 'outside', type: 'box', astromap: true, x: 105, y: 10, w: 10, h: 10, text: 'drop' },
+      // Negative origin partially inside -> clamped to [0, 4] x [0, 3].
+      { id: 'neg-partial', type: 'box', astromap: true, x: -2, y: -3, w: 6, h: 6, text: 'partial' },
+      ...Array.from({ length: 2005 }, (_, i) => ({
+        id: 'bulk-' + i, type: 'box', astromap: true, x: 1, y: 1, w: 2, h: 2, text: 'r' + i,
+      })),
+    ];
+    const state = {
+      info: { rgb: false, raster: false, width: 100, height: 80 },
+      plate: null, viewer: { viewport }, quitPreparing: false,
+      annotations, annReady: true, astromap: { activeId: 'bulk-2004' },
+    };
+    const ctx = vm.createContext({
+      window: {},
+      state, spatialImageReady: () => true, activeFrameParams: () => null,
+      annotationOwnerReady: () => true, tileQuery: () => '?g=g1',
+    });
+    vm.runInContext(production('captureTranslucentView'), ctx);
+    const snap = ctx.captureTranslucentView();
+    state.astromap.activeId = 'neg-partial';
+    const snapSelected = ctx.captureTranslucentView();
+    process.stdout.write(JSON.stringify({
+      count: snap.rois.length,
+      first: { ...snap.rois[0], labelLen: snap.rois[0].label.length, label: undefined },
+      second: snap.rois[1],
+      outOfCapRoiIndex: 'roiIndex' in snap ? snap.roiIndex : null,
+      inCapRoiIndex: snapSelected.roiIndex,
+      unmutatedFirst: { x: annotations[0].x, w: annotations[0].w, len: annotations[0].text.length },
+    }));
+    """
+    out = json.loads(run_node(script, APP, check=True, timeout=10).stdout)
+    assert out["count"] == 2000
+    assert out["first"] == {"x": 95, "y": 75, "w": 5, "h": 5, "index": 1, "labelLen": 4096}
+    assert out["second"] == {"x": 0, "y": 0, "w": 4, "h": 3, "index": 2, "label": "partial"}
+    assert out["outOfCapRoiIndex"] is None
+    assert out["inCapRoiIndex"] == 1
+    assert out["unmutatedFirst"] == {"x": 95, "w": 5.00001, "len": 4500}
+
+
+def test_publish_translucent_display_drains_newer_valid_query_after_invalid_reply_and_cancel_resumes():
+    out = _run_live_sync(r"""
+      await context.openTranslucentViewer();
+      const first = deferred();
+      const calls = [];
+      native.update_translucent_display = async (sid, token, revision, query) => {
+        calls.push({ sid, token, revision, query });
+        if (revision === 1) return first.promise;
+        return { ok: true, applied: true, revision };
+      };
+      // Q1 starts in flight; user edits to valid Q2 before Q1 returns invalid.
+      state.luts = [{ lo: 0, hi: 80, gamma: 1 }, null];
+      context.refreshTiles();
+      state.luts = [{ lo: 0, hi: 160, gamma: 1 }, null];
+      context.refreshTiles();
+      first.resolve({ ok: false, invalid: true, message: 'Q1 rejected' });
+      await flush();
+      const afterInvalidContinue = {
+        calls: calls.slice(),
+        acceptedQuery: state.translucentSync.acceptedQuery,
+        inflight: state.translucentSync.inflight,
+      };
+
+      // Also verify invalid_query continues draining Q2 when displayQuery() moved on.
+      const second = deferred();
+      native.update_translucent_display = async (sid, token, revision, query) => {
+        calls.push({ sid, token, revision, query });
+        if (query === 'win=0%3A70%2C') return second.promise;
+        return { ok: true, applied: true, revision };
+      };
+      state.luts = [{ lo: 0, hi: 70, gamma: 1 }, null];
+      context.refreshTiles();
+      state.luts = [{ lo: 0, hi: 140, gamma: 1 }, null];
+      context.refreshTiles();
+      second.resolve({ ok: false, invalid_query: true });
+      await flush();
+
+      // cancelUpdatePreparation invokes postShadingState() and resumes publishTranslucentDisplay().
+      let shadingPosts = 0;
+      context.postShadingState = () => { shadingPosts += 1; };
+      context.updateAnnotationRecoveryNotice = () => {};
+      context.annotationRecoveryDrafts = () => null;
+      context.scheduleAnnSave = () => {};
+      vm.runInContext(production('cancelUpdatePreparation'), context);
+      state.quitPreparing = true;
+      state.quitRequestId = 'req-cancel';
+      state.luts = [{ lo: 0, hi: 200, gamma: 1 }, null];
+      context.publishTranslucentDisplay(); // blocked while quitPreparing === true
+      const callsBeforeCancel = calls.length;
+      const cancelled = context.cancelUpdatePreparation('req-cancel');
+      await flush();
+      const callsAfterCancel = calls.length;
+      // Calling cancelUpdatePreparation when already synced must NOT republish.
+      state.quitPreparing = true;
+      state.quitRequestId = 'req-synced';
+      context.cancelUpdatePreparation('req-synced');
+      await flush();
+
+      return {
+        afterInvalidContinue,
+        calls,
+        acceptedAfterInvalidQuery: state.translucentSync.acceptedQuery,
+        shadingPosts,
+        cancelled,
+        callsBeforeCancel,
+        callsAfterCancel,
+        callsAfterSyncedCancel: calls.length,
+      };
+    """)
+    assert [(c["revision"], c["query"]) for c in out["afterInvalidContinue"]["calls"]] == [
+        (1, "win=0%3A80%2C"),
+        (2, "win=0%3A160%2C"),
+    ]
+    assert out["afterInvalidContinue"]["acceptedQuery"] == "win=0%3A160%2C"
+    assert out["afterInvalidContinue"]["inflight"] is False
+    assert out["acceptedAfterInvalidQuery"] == "win=0%3A200%2C"
+    assert out["shadingPosts"] == 2
+    assert out["cancelled"] is True
+    assert out["callsBeforeCancel"] == 4
+    assert out["callsAfterCancel"] == 5
+    assert out["callsAfterSyncedCancel"] == 5
+    assert out["calls"][-1]["query"] == "win=0%3A200%2C"
+
+
+def test_download_roi_degraded_overview_tiff_and_scale_toast_guard():
+    script = r"""
+    const fs = require('fs'), vm = require('vm');
+    const src = fs.readFileSync(process.argv[1], 'utf8');
+    const downloads = [], toasts = [];
+    const state = {
+      roi: { x: 0, y: 0, w: 4000, h: 4000 },
+      channels: [0],
+      renderScale: null,
+      info: {
+        storage: 'overview-degraded',
+        channels: [0],
+        levels: [{ path: '1', downsample: 1 }, { path: '2', downsample: 2 }],
+        maxRenderMpx: 10,
+      },
+    };
+    let mockScale = null;
+    const ctx = vm.createContext({
+      URLSearchParams, Number, Math, state,
+      activeFrameContext: () => ({ frame: null }),
+      frameOwnsRoi: () => true,
+      pixelSize: () => [1, 1],
+      roiScale: () => mockScale,
+      lutParam: () => '',
+      appendFrameParams: (q) => q,
+      scopedButton() {},
+      showToast: (t) => toasts.push(t),
+      trackExport() {},
+      document: { body: { append() {} }, createElement: () => ({ click() { downloads.push(this.href); }, remove() {} }) },
+    });
+    const lpStart = src.indexOf('function levelPathFor(');
+    const lpEnd = src.indexOf('\n}', lpStart) + 2;
+    const dlStart = src.indexOf('function scaleBarExportIssue(');
+    const dlEnd = src.indexOf('/* Poll the server', dlStart);
+    const qStart = src.indexOf('function channelQuery(');
+    const qEnd = src.indexOf('function activeFrameParams(', qStart);
+    vm.runInContext(src.slice(lpStart, lpEnd) + '\n' + src.slice(qStart, qEnd) + '\n' + src.slice(dlStart, dlEnd), ctx);
+
+    // 1) Huge ROI where roiScale() === null on overview-degraded -> TIFF uses level 1, d = 1 (not nonexistent level 0).
+    mockScale = null;
+    ctx.downloadRoi('tiff');
+    // 2) Rendered PNG at d = 1 on overview-degraded (level = 1) -> must NOT toast "1/1 scale".
+    mockScale = { d: 1, w: 1000, h: 1000 };
+    ctx.downloadRoi('png');
+    // 3) Rendered PNG at d = 2 on overview-degraded (level = 2) -> DOES toast "1/2 scale".
+    mockScale = { d: 2, w: 500, h: 500 };
+    ctx.downloadRoi('png');
+    process.stdout.write(JSON.stringify({ downloads, toasts }));
+    """
+    out = json.loads(run_node(script, APP, check=True, timeout=10).stdout)
+    assert "level=1&x=0&y=0&w=4000&h=4000&format=tiff" in out["downloads"][0]
+    assert "level=1&x=0&y=0&w=4000&h=4000&format=png" in out["downloads"][1]
+    assert "level=2&x=0&y=0&w=2000&h=2000&format=png" in out["downloads"][2]
+    assert out["toasts"][0] == "export started — check your downloads"
+    assert "1/2 scale" in out["toasts"][1]

@@ -960,6 +960,27 @@ class StageFollowMixin:
                     }
                 follower = controls_error = None
                 made_delivery = False
+                bound = detected["session_id"]
+
+                def _rollback_stage_follow(*, stop_reason: str | None = None) -> None:
+                    self._stage_follow = None
+                    self._stage_follower = None
+                    self._stage_follow_session = None
+                    self._stage_follow_receiver_id = None
+                    self._stage_follow_source = None
+                    self._stage_follow_status = None
+                    self._stage_follow_lost = ""
+                    try:
+                        if follower is not None and stop_reason is not None:
+                            follower.stop(stop_reason)
+                    finally:
+                        try:
+                            receiver.close()
+                        finally:
+                            if made_delivery and self._laser_delivery is not None:
+                                self._laser_delivery.close()
+                                self._laser_delivery = None
+
                 if source == "keys":
                     if self._on_laser_box is not None and self._laser_delivery is None:
                         from .slacs_laser import LaserDelivery
@@ -989,16 +1010,24 @@ class StageFollowMixin:
                             on_mark=self._on_mark_record,
                             **identifier_kwargs,
                         )
+                        # Bind all 7 attributes before starting the Raw Input thread so
+                        # lock-free _mark_context / _on_mark_record callbacks never see
+                        # unbound session or follower state.
+                        self._stage_follow = receiver
+                        self._stage_follower = follower
+                        self._stage_follow_session = bound
+                        self._stage_follow_receiver_id = descriptor.get("session_id")
+                        self._stage_follow_source = source
+                        self._stage_follow_status = None
+                        self._stage_follow_lost = ""
                         snapshot = follower.start()
                     except (ValueError, OSError, RuntimeError) as exc:
                         snapshot = {"running": False, "error": str(exc)}
+                    except BaseException:
+                        _rollback_stage_follow(stop_reason="start_failed")
+                        raise
                     if not snapshot.get("running"):
-                        if follower is not None:
-                            follower.stop("start_failed")
-                        receiver.close()
-                        if made_delivery:
-                            self._laser_delivery.close()
-                            self._laser_delivery = None
+                        _rollback_stage_follow(stop_reason="start_failed")
                         message = snapshot.get("error") or "Could not start key following."
                         session_log.event(
                             "follow_start",
@@ -1008,14 +1037,14 @@ class StageFollowMixin:
                             message=message,
                         )
                         return {"ok": False, "message": message}
-                self._stage_follow = receiver
-                self._stage_follower = follower
-                self._stage_follow_source = source
-                self._stage_follow_status = None
-                # Bound to the detected SLACS process; see _on_slacs_change.
-                bound = self._stage_follow_session = detected["session_id"]
-                self._stage_follow_receiver_id = descriptor.get("session_id")
-                self._stage_follow_lost = ""
+                else:
+                    self._stage_follow = receiver
+                    self._stage_follower = None
+                    self._stage_follow_session = bound
+                    self._stage_follow_receiver_id = descriptor.get("session_id")
+                    self._stage_follow_source = source
+                    self._stage_follow_status = None
+                    self._stage_follow_lost = ""
         if reused_result is not None:
             self._yield_focus_to_slacs()
             return reused_result
@@ -1132,6 +1161,71 @@ class StageFollowMixin:
                 return False, message
         return True, None
 
+    @staticmethod
+    def _same_point_2d(a, b, tol: float) -> bool:
+        if a is None and b is None:
+            return True
+        if not (
+            isinstance(a, (list, tuple))
+            and isinstance(b, (list, tuple))
+            and len(a) == 2
+            and len(b) == 2
+        ):
+            return False
+        try:
+            return abs(float(a[0]) - float(b[0])) <= tol and abs(float(a[1]) - float(b[1])) <= tol
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _same_overlay_geometry(cls, prev: dict | None, view: dict) -> bool:
+        if not isinstance(prev, dict) or "at" not in prev:
+            return False
+        if (
+            prev.get("follow_session") != view.get("follow_session")
+            or prev.get("follow_seq") != view.get("follow_seq")
+            or prev.get("locked") is not view.get("locked")
+            or prev.get("flip") is not view.get("flip")
+        ):
+            return False
+        if not cls._same_point_2d(prev.get("center_px"), view.get("center_px"), 1e-3):
+            return False
+        prev_zoom, view_zoom = prev.get("zoom"), view.get("zoom")
+        if (
+            isinstance(prev_zoom, bool)
+            or isinstance(view_zoom, bool)
+            or not isinstance(prev_zoom, (int, float))
+            or not isinstance(view_zoom, (int, float))
+            or abs(float(prev_zoom) - float(view_zoom)) > 1e-6
+        ):
+            return False
+        prev_rot, view_rot = prev.get("rotation"), view.get("rotation")
+        if (
+            isinstance(prev_rot, bool)
+            or isinstance(view_rot, bool)
+            or not isinstance(prev_rot, (int, float))
+            or not isinstance(view_rot, (int, float))
+        ):
+            return False
+        rot_diff = abs((float(prev_rot) - float(view_rot) + 180.0) % 360.0 - 180.0)
+        if rot_diff > 1e-4:
+            return False
+        if not cls._same_point_2d(prev.get("target_px"), view.get("target_px"), 1e-3):
+            return False
+        prev_corners = prev.get("target_corners_px")
+        view_corners = view.get("target_corners_px")
+        if prev_corners is None and view_corners is None:
+            return True
+        if not (
+            isinstance(prev_corners, (list, tuple))
+            and isinstance(view_corners, (list, tuple))
+            and len(prev_corners) == len(view_corners) == 4
+        ):
+            return False
+        return all(
+            cls._same_point_2d(pa, pb, 1e-3) for pa, pb in zip(prev_corners, view_corners)
+        )
+
     def report_overlay_view(self, payload):
         """Keep the page's current view for SLACS laser-shot records; never logged.
 
@@ -1148,7 +1242,14 @@ class StageFollowMixin:
         with self._lock:
             if self._closed:
                 return {"ok": False}
-            self._overlay_view = {**view, "at": time.monotonic()}
+            now = time.monotonic()
+            prev = self._overlay_view
+            moved_at = (
+                prev.get("moved_at", prev["at"])
+                if self._same_overlay_geometry(prev, view)
+                else now
+            )
+            self._overlay_view = {**view, "at": now, "moved_at": moved_at}
             self._overlay_view_epoch = self._epoch
             locked = view["locked"]
             changed = self._lock_reported is not None and self._lock_reported != locked
@@ -1230,7 +1331,7 @@ class StageFollowMixin:
             return None, "view_moved"
         if view["follow_seq"] < seq:
             return None, "stale_view"
-        if record.get("observed_at") is not None and view["at"] > record["observed_at"]:
+        if record.get("observed_at") is not None and float(view.get("moved_at", view["at"])) > record["observed_at"]:
             rec_epoch = record.get("lock_epoch")
             prior_seq = record.get("prior_view_seq")
             same_lock_catchup = (
