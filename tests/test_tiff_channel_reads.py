@@ -167,8 +167,9 @@ def test_zarr_levels_read_each_channel_once_and_write_identical_tiffs(
         truth = truth[0]
     pixels, (pages, shape, tile, planar, dtype) = decoded(tmp_path / "new.tif")
     np.testing.assert_array_equal(pixels, truth)
-    assert (pages, shape, tile, dtype) == (1, truth.shape, (TILE, TILE), store["0"].dtype)
-    assert (planar == 2) == (len(channels) > 1)  # separate planes for several channels
+    assert (pages, shape, tile, planar, dtype) == (
+        len(channels), (h, w), (TILE, TILE), 1, store["0"].dtype
+    )
 
 
 def test_rgb_store_channel_subset_still_writes_separate_planes(tmp_path, monkeypatch):

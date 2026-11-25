@@ -245,7 +245,7 @@ def run():
         protocol = objc.formal_protocol("Nd2wsiQAUserDriverStandIn", None, [
             objc.selector(None, selector=name.encode(), signature=signature) for name, signature in signatures.items()])
         driver = on_main(lambda: updater._driver_class(protocol).alloc().initWithCard_(card))
-        api.attach_updater(SimpleNamespace(card=card))
+        api._attach_updater(SimpleNamespace(card=card))
 
         def call(name, *args):
             report["selectors"].append(name)

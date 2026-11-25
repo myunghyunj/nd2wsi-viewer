@@ -215,6 +215,10 @@ def test_python_and_node_header_readers_agree_on_shared_binary_vectors(tmp_path)
             {"width": 640, "height": 480},
         ),
         ("valid-png", _png_header(4096, 3072), {"width": 4096, "height": 3072}),
+        ("at-limit-2b-jpeg", b"\xff\xd8" + _jpeg_sof_segment(0xC0, 40_000, 50_000) + b"\xff\xd9", {"width": 40_000, "height": 50_000}),
+        ("at-limit-2b-png", _png_header(40_000, 50_000), {"width": 40_000, "height": 50_000}),
+        ("over-limit-2b-jpeg", b"\xff\xd8" + _jpeg_sof_segment(0xC0, 50_000, 50_000) + b"\xff\xd9", None),
+        ("over-limit-2b-png", _png_header(50_000, 50_000), None),
         ("truncated-jpeg-segment", b"\xff\xd8\xff\xe1\x00\x40" + b"\x00" * 10, None),
         ("jpeg-sos-without-sof", b"\xff\xd8\xff\xda\x00\x02", None),
         ("jpeg-truncated-sof", b"\xff\xd8" + _jpeg_sof_segment(0xC0, 100, 100, components=3, declared_len=10) + b"\xff\xd9", None),
@@ -239,7 +243,7 @@ def test_python_and_node_header_readers_agree_on_shared_binary_vectors(tmp_path)
         f"const mod = require({json.dumps(str(ASTROMAP_IMPORT_JS))});"
         f"const items = {json.dumps(manifest)};"
         "(async () => {"
-        "  const out = {};"
+        "  const out = { maxPixels: mod.MAX_REFERENCE_HEADER_PIXELS, items: {} };"
         "  for (const item of items) {"
         "    const buf = fs.readFileSync(item.path);"
         "    const file = {"
@@ -249,16 +253,20 @@ def test_python_and_node_header_readers_agree_on_shared_binary_vectors(tmp_path)
         "        return { arrayBuffer: async () => sub.buffer.slice(sub.byteOffset, sub.byteOffset + sub.byteLength) };"
         "      },"
         "    };"
-        "    try { out[item.name] = { ok: true, size: await mod.readImageSize(file) }; }"
-        "    catch (e) { out[item.name] = { ok: false, error: e.message }; }"
+        "    try { out.items[item.name] = { ok: true, size: await mod.readImageSize(file) }; }"
+        "    catch (e) { out.items[item.name] = { ok: false, error: e.message }; }"
         "  }"
         "  process.stdout.write(JSON.stringify(out));"
         "})().catch(e => { console.error(e); process.exit(1); });"
     )
     proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
-    node_results = json.loads(proc.stdout)
+    node_payload = json.loads(proc.stdout)
+    assert node_payload["maxPixels"] == _MAX_REFERENCE_HEADER_PIXELS == 2_000_000_000
+    node_results = node_payload["items"]
     for name, _payload, expected in vectors:
         if expected is None:
             assert node_results[name]["ok"] is False, f"Node unexpectedly accepted {name}"
+            if name.startswith("over-limit-2b-"):
+                assert "exceed safety limits" in node_results[name]["error"]
         else:
             assert node_results[name] == {"ok": True, "size": expected}, f"Mismatch on {name}"

@@ -9,7 +9,7 @@ What runs, all inside this Agent window's own process:
 2. One real export lease of that slide is held, so the real
    ``Api.update_block_reason()`` reports an export in flight.  This keeps the
    update preparation in its export drain: it can never reach the shared
-   install gate, ``stop_server_for_update`` or the install continuation.
+   install gate, ``_stop_server_for_update`` or the install continuation.
 3. Update preparation is entered on AppKit's main thread through the real
    Sparkle delegate callback ``updater_shouldPostponeRelaunchForUpdate_
    untilInvokingBlock_`` wrapping ``app.UpdateShutdownCoordinator`` (the same
@@ -659,5 +659,5 @@ finally:
         write_report()
     finally:
         if api._httpd is not None:
-            api.stop_server_for_update()
+            api._stop_server_for_update()
         session.mark_closed()

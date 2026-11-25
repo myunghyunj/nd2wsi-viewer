@@ -558,7 +558,7 @@ class TranslucentApi:
 
         selected = self._window.create_file_dialog(
             webview.OPEN_DIALOG, allow_multiple=True,
-            file_types=("ROI list & image (*.txt;*.jpg;*.jpeg;*.png)",),
+            file_types=("ROI list and image (*.txt;*.jpg;*.jpeg;*.png)",),
         )
         if not selected:
             return {"ok": False, "cancelled": True}
