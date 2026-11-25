@@ -475,6 +475,18 @@
       else displayGate.resetState(nextQuery);
       return true;
     };
+    const advanceRejectedRevision = snap => {
+      if (
+        !disposed &&
+        !state.expired &&
+        snap?.expired !== true &&
+        (!state.launchToken || !snap.launch_token || snap.launch_token === state.launchToken) &&
+        Number.isInteger(snap.revision) &&
+        snap.revision > state.displayRevision
+      ) {
+        state.displayRevision = snap.revision;
+      }
+    };
     const startDisplayLoop = () => {
       if (disposed || displayLoopStarted) return;
       displayLoopStarted = true;
@@ -489,7 +501,7 @@
             if (disposed || initialSnap?.closed) return;
             if (initialSnap?.ok) {
               if (initialSnap.expired !== true) clearSyncStatus();
-              applyDisplaySnapshot(initialSnap);
+              if (!applyDisplaySnapshot(initialSnap)) advanceRejectedRevision(initialSnap);
             }
           } catch (_) {
             // Transient initial pull errors fall through to the long-poll loop.
@@ -512,7 +524,9 @@
               continue;
             }
             clearSyncStatus();
-            if (!res.unchanged) applyDisplaySnapshot(res);
+            if (!res.unchanged && !applyDisplaySnapshot(res)) {
+              advanceRejectedRevision(res);
+            }
             continue;
           }
           consecutiveErrors += 1;
@@ -760,7 +774,7 @@
     const paintImportReview = () => {
       const review = state.importReview;
       importReview.hidden = !review?.issues.length;
-      importRepair.hidden = !review?.issues.some(issue => issue.repairable && !issue.repaired);
+      importRepair.hidden = !state.importResult || !review?.issues.some(issue => issue.repairable && !issue.repaired);
       importSummary.textContent = review ?
         `${state.importApplied ? "Imported" : "Ready"} ${review.count} ROIs · ${review.skippedCount} skipped · ${review.repairedCount} repaired` : "";
       importIssues.textContent = review ? [
@@ -781,9 +795,20 @@
       paintRois();
       paintZoom();
     };
-    const cancelGesture = () => {
-      if (state.gesture) state.gesture.cancelled = true;
+    const releaseGestureCapture = pointerId => {
+      if (pointerId == null || typeof overlay.releasePointerCapture !== "function") return;
+      try {
+        if (typeof overlay.hasPointerCapture !== "function" || overlay.hasPointerCapture(pointerId)) {
+          overlay.releasePointerCapture(pointerId);
+        }
+      } catch (_) { /* Ignore capture loss or synthetic pointer events. */ }
+    };
+    const cancelGesture = ({ releaseCapture = true } = {}) => {
+      const gesture = state.gesture;
+      if (!gesture) return;
+      gesture.cancelled = true;
       state.gesture = null;
+      if (releaseCapture) releaseGestureCapture(gesture.pointerId);
     };
     const toggleLock = async () => {
       if (state.pending) return;
@@ -839,9 +864,19 @@
           paintRois();
           if (!importer?.review || !importer?.mapToSource) throw new Error("AstroMapper import is unavailable");
           const review = importer.review(result.text, result.coordinateSize, { repairZeroArea });
-          state.importResult = { ...result, coordinateSize: { ...result.coordinateSize } };
           state.importReview = review;
           state.importApplied = false;
+          if (typeof importer.checkAspectRatio === "function") {
+            try {
+              importer.checkAspectRatio(result.coordinateSize, { width: info.width, height: info.height });
+            } catch (aspectError) {
+              state.importResult = null;
+              paintImportReview();
+              paintRois();
+              throw aspectError;
+            }
+          }
+          state.importResult = { ...result, coordinateSize: { ...result.coordinateSize } };
           paintImportReview();
           paintRois();
           if (!review.count) throw new Error("No valid ROIs to import. Review the skipped rows.");
@@ -1013,16 +1048,23 @@
       if (state.locked || state.pending || event.button !== 0) return;
       event.preventDefault(); event.stopImmediatePropagation();
       cancelGesture();
-      const gesture = { edge, startX: event.screenX, startY: event.screenY,
+      const gesture = { edge, pointerId: event.pointerId, startX: event.screenX, startY: event.screenY,
         x: event.screenX, y: event.screenY, appliedX: event.screenX, appliedY: event.screenY,
         width: win.innerWidth, height: win.innerHeight, appliedWidth: win.innerWidth,
         appliedHeight: win.innerHeight, nativePending: !edge, dirty: false };
       state.gesture = gesture;
-      overlay.setPointerCapture?.(event.pointerId);
+      if (event.pointerId != null) {
+        try { overlay.setPointerCapture?.(event.pointerId); }
+        catch (_) { /* Ignore synthetic or unsupported pointer capture. */ }
+      }
       if (!edge) {
         try {
           const native = await api.start_window_drag();
-          if (native === true) { gesture.cancelled = true; if (state.gesture === gesture) state.gesture = null; }
+          if (native === true) {
+            gesture.cancelled = true;
+            if (state.gesture === gesture) state.gesture = null;
+            releaseGestureCapture(gesture.pointerId);
+          }
         } catch (_) { /* The incremental bridge is available when native dragging is unavailable. */ }
         gesture.nativePending = false;
         pumpGeometry(gesture);
@@ -1038,17 +1080,32 @@
     const moveGesture = event => {
       const gesture = state.gesture;
       if (!gesture) return;
+      if (gesture.pointerId != null && event?.pointerId != null && event.pointerId !== gesture.pointerId) return;
       event.preventDefault();
       gesture.x = event.screenX; gesture.y = event.screenY; gesture.dirty = true;
       pumpGeometry(gesture);
     };
     overlay.addEventListener("pointermove", moveGesture);
     overlay.addEventListener("pointerup", event => {
+      const gesture = state.gesture;
+      if (!gesture) return;
+      if (gesture.pointerId != null && event?.pointerId != null && event.pointerId !== gesture.pointerId) return;
       moveGesture(event);
       state.gesture = null;
-      overlay.releasePointerCapture?.(event.pointerId);
+      releaseGestureCapture(gesture.pointerId ?? event?.pointerId);
     });
-    overlay.addEventListener("pointercancel", cancelGesture);
+    overlay.addEventListener("pointercancel", event => {
+      const gesture = state.gesture;
+      if (!gesture) return;
+      if (gesture.pointerId != null && event?.pointerId != null && event.pointerId !== gesture.pointerId) return;
+      cancelGesture();
+    });
+    overlay.addEventListener("lostpointercapture", event => {
+      const gesture = state.gesture;
+      if (!gesture) return;
+      if (gesture.pointerId != null && event?.pointerId != null && event.pointerId !== gesture.pointerId) return;
+      cancelGesture({ releaseCapture: false });
+    });
     const isInZoomControl = el => {
       if (!el) return false;
       if (el === zoomControl || el === zoomBadge || el === zoomPopover || el === zoomInput) return true;

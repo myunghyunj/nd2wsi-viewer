@@ -181,10 +181,12 @@
     let activeQuery = "";
     let paintedQuery = null;
     let pendingQuery = null;
+    let pendingForce = false;
     let rendering = false;
     let drawnActive = false;
     let dirtySinceDraw = false;
     let fullyLoadedReady = false;
+    let activeFailed = false;
     let stallTimer = null;
     let disposed = false;
 
@@ -217,6 +219,7 @@
         if (!disposed && !rendering && pendingQuery !== null) {
           const next = pendingQuery;
           pendingQuery = null;
+          pendingForce = false;
           beginReset(next);
         }
       }, timeoutMs);
@@ -226,12 +229,15 @@
       clearWatchdog();
       rendering = false;
       paintedQuery = activeQuery;
-      const hasPending = !disposed && pendingQuery !== null && pendingQuery !== paintedQuery;
+      const hasPending =
+        !disposed && pendingQuery !== null && (pendingForce || pendingQuery !== paintedQuery);
       onPaintComplete?.(paintedQuery, { timedOut: false, hasPending });
       if (!disposed && !rendering && pendingQuery !== null) {
         const next = pendingQuery;
+        const force = pendingForce;
         pendingQuery = null;
-        if (next !== paintedQuery) {
+        pendingForce = false;
+        if (force || next !== paintedQuery) {
           beginReset(next);
         }
       }
@@ -243,10 +249,12 @@
       const hadPainted = paintedQuery !== null;
       activeQuery = next;
       pendingQuery = null;
+      pendingForce = false;
       paintedQuery = null;
       drawnActive = false;
       dirtySinceDraw = false;
       fullyLoadedReady = false;
+      activeFailed = false;
       const item = currentItem();
       onBeforeReset?.(item, { hadPainted });
       if (disposed) return false;
@@ -254,12 +262,15 @@
         rendering = false;
         paintedQuery = next;
         currentViewer()?.forceRedraw?.();
-        const hasPending = !disposed && pendingQuery !== null && pendingQuery !== paintedQuery;
+        const hasPending =
+          !disposed && pendingQuery !== null && (pendingForce || pendingQuery !== paintedQuery);
         onPaintComplete?.(paintedQuery, { timedOut: false, hasPending });
         if (!disposed && !rendering && pendingQuery !== null) {
           const queued = pendingQuery;
+          const force = pendingForce;
           pendingQuery = null;
-          if (queued !== paintedQuery) beginReset(queued);
+          pendingForce = false;
+          if (force || queued !== paintedQuery) beginReset(queued);
         }
         return true;
       }
@@ -269,12 +280,15 @@
         resetTiledImage(item, { clearImageLoader: true });
         currentViewer()?.forceRedraw?.();
         paintedQuery = next;
-        const hasPending = !disposed && pendingQuery !== null && pendingQuery !== paintedQuery;
+        const hasPending =
+          !disposed && pendingQuery !== null && (pendingForce || pendingQuery !== paintedQuery);
         onPaintComplete?.(paintedQuery, { timedOut: false, hasPending });
         if (!disposed && !rendering && pendingQuery !== null) {
           const queued = pendingQuery;
+          const force = pendingForce;
           pendingQuery = null;
-          if (queued !== paintedQuery) beginReset(queued);
+          pendingForce = false;
+          if (force || queued !== paintedQuery) beginReset(queued);
         }
         return true;
       }
@@ -293,10 +307,12 @@
       activeQuery = normalizeQuery(query);
       paintedQuery = painted ? activeQuery : null;
       pendingQuery = null;
+      pendingForce = false;
       rendering = false;
       drawnActive = false;
       dirtySinceDraw = false;
       fullyLoadedReady = false;
+      activeFailed = false;
     }
 
     function init(initialQuery) {
@@ -321,6 +337,7 @@
       }
       if (rendering) {
         pendingQuery = next;
+        pendingForce = pendingForce || force;
         return true;
       }
       beginReset(next);
@@ -359,6 +376,7 @@
         return;
       }
       if (
+        !activeFailed &&
         paintedQuery === null &&
         hasActiveTile &&
         (typeof item?.getFullyLoaded !== "function" || Boolean(item.getFullyLoaded()))
@@ -396,6 +414,7 @@
       const item = currentItem();
       if (event?.tiledImage && event.tiledImage !== item) return false;
       if (!isActiveTile(item, event?.tile, activeQuery)) return false;
+      activeFailed = true;
       onActiveTileError?.(event);
       clearWatchdog();
       rendering = false;
@@ -403,9 +422,10 @@
       drawnActive = false;
       dirtySinceDraw = false;
       fullyLoadedReady = false;
-      if (!disposed && pendingQuery !== null) {
+      if (!disposed && !rendering && pendingQuery !== null) {
         const next = pendingQuery;
         pendingQuery = null;
+        pendingForce = false;
         beginReset(next);
       }
       return true;
@@ -415,9 +435,11 @@
       disposed = true;
       rendering = false;
       pendingQuery = null;
+      pendingForce = false;
       drawnActive = false;
       dirtySinceDraw = false;
       fullyLoadedReady = false;
+      activeFailed = false;
       clearWatchdog();
     }
 

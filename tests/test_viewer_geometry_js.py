@@ -1036,3 +1036,289 @@ def test_tile_refresh_gate_watchdog_metadata_had_painted_and_reset_state_unpaint
     assert out["afterUnpaintedReset"] == {"active": "c=1&g=g2", "rendering": False, "timers": 0}
     assert out["reqSameAfterUnpainted"] is True
     assert out["reqSameAfterPainted"] is False
+
+
+def test_tile_refresh_gate_active_failure_blocks_late_draw_promotion_and_allows_retry():
+    out = run("""
+      const completed = [];
+      const errors = [];
+      let fullyLoaded = false;
+      const item = {
+        tilesMatrix: {},
+        reset() {},
+        getDrawArea() { return { x: 0, y: 0, width: 256, height: 256 }; },
+        _setFullyLoaded(v) { fullyLoaded = v; },
+        getFullyLoaded() { return fullyLoaded; },
+      };
+      const gate = geometry.createTileRefreshGate({
+        getItem: () => item,
+        getViewer: () => ({ forceRedraw() {} }),
+        onPaintComplete: (q, meta) => completed.push([q, meta]),
+        onActiveTileError: (ev) => errors.push(ev.message),
+      });
+
+      gate.init('c=0&win=0:255');
+      gate.request('c=0&win=0:128');
+      const tileFail = { level: 0, x: 0, y: 0 };
+      const tileSibling = { level: 0, x: 1, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileFail }, 1: { 0: tileSibling } } };
+
+      // Partial tile failure drops rendering and marks activeFailed=true.
+      const handled = gate.onTileLoadFailed({ tiledImage: item, tile: tileFail, message: 'tile-500' });
+      const renderingAfterFail = gate.isRendering();
+
+      // Sibling tile finishing later with getFullyLoaded() === true MUST NOT promote the failed pass.
+      fullyLoaded = true;
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileSibling] });
+      const completesAfterSiblingDraw = completed.length;
+
+      // Retrying the exact same query MUST trigger a fresh reset (not be deduplicated as painted).
+      const retryAccepted = gate.request('c=0&win=0:128');
+      const renderingOnRetry = gate.isRendering();
+
+      // Fresh reset clears activeFailed so painting now succeeds normally.
+      const tileRetry = { level: 0, x: 0, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileRetry } } };
+      fullyLoaded = true;
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileRetry] });
+      const dupAfterCleanRetry = gate.request('c=0&win=0:128');
+
+      // resetState({ painted: false }) also clears activeFailed so a late draw can recover.
+      gate.request('c=0&win=0:64');
+      const tileFail2 = { level: 0, x: 0, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileFail2 } } };
+      gate.onTileLoadFailed({ tiledImage: item, tile: tileFail2, message: 'tile-503' });
+      gate.resetState('c=0&win=0:64', { painted: false });
+      const tileAfterReset = { level: 0, x: 0, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileAfterReset } } };
+      fullyLoaded = true;
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileAfterReset] });
+
+      return {
+        handled,
+        renderingAfterFail,
+        completesAfterSiblingDraw,
+        retryAccepted,
+        renderingOnRetry,
+        dupAfterCleanRetry,
+        errors,
+        completed,
+      };
+    """)
+    assert out["handled"] is True
+    assert out["renderingAfterFail"] is False
+    assert out["completesAfterSiblingDraw"] == 0
+    assert out["retryAccepted"] is True
+    assert out["renderingOnRetry"] is True
+    assert out["dupAfterCleanRetry"] is False
+    assert out["errors"] == ["tile-500", "tile-503"]
+    assert out["completed"] == [
+        ["c=0&win=0%3A128", {"timedOut": False, "hasPending": False}],
+        ["c=0&win=0%3A64", {"timedOut": False, "hasPending": False}],
+    ]
+
+
+def test_tile_refresh_gate_pending_force_drains_across_all_sites_and_clears_on_reset_or_dispose():
+    out = run("""
+      let nextId = 1;
+      const timers = new Map();
+      const setTimer = (fn, ms) => { const id = nextId++; timers.set(id, { fn, ms }); return id; };
+      const clearTimer = (id) => { timers.delete(id); };
+
+      let resets = 0;
+      let fullyLoaded = false;
+      let drawArea = { x: 0, y: 0, width: 100, height: 100 };
+      const makeItem = () => ({
+        tilesMatrix: {},
+        reset() { resets += 1; },
+        getDrawArea() { return drawArea; },
+        _setFullyLoaded(v) { fullyLoaded = v; },
+        getFullyLoaded() { return fullyLoaded; },
+      });
+      let currentItem = makeItem();
+      let onBeforeHook = null;
+      const completes = [];
+
+      const gate = geometry.createTileRefreshGate({
+        getItem: () => currentItem,
+        getViewer: () => ({ forceRedraw() {} }),
+        onBeforeReset: (it, meta) => { if (onBeforeHook) onBeforeHook(it, meta); },
+        onPaintComplete: (q, meta) => completes.push([q, meta]),
+        setTimer,
+        clearTimer,
+        stallTimeoutMs: 2000,
+      });
+
+      const paintActive = () => {
+        const tile = { level: 0, x: 0, y: 0 };
+        currentItem.tilesMatrix = { 0: { 0: { 0: tile } } };
+        fullyLoaded = true;
+        gate.onTiledImageDrawn({ tiledImage: currentItem, tiles: [tile] });
+      };
+
+      // 1) completePaint drain site: forced same-query request while rendering survives a later non-force request.
+      gate.init('c=0&win=0:255');
+      gate.request('c=0&win=0:128');
+      gate.request('c=0&win=0:128', { force: true });
+      gate.request('c=0&win=0:128'); // non-force must NOT clear pendingForce
+      paintActive();
+      const afterFirstPaint = { rendering: gate.isRendering(), resets, completes: completes.slice() };
+      paintActive();
+      const afterForcedDrain = { rendering: gate.isRendering(), resets, completes: completes.slice() };
+
+      // 2) !item drain site: forced pending query drains cleanly when item disappears before completePaint.
+      completes.length = 0;
+      resets = 0;
+      gate.request('c=0&win=0:96');
+      gate.request('c=0&win=0:96', { force: true });
+      const savedItem = currentItem;
+      let queuedOnce = false;
+      onBeforeHook = () => {
+        if (!queuedOnce && currentItem === null) {
+          queuedOnce = true;
+        }
+      };
+      // Paint completes on savedItem, draining into next beginReset with currentItem === null.
+      const tileForNull = { level: 0, x: 0, y: 0 };
+      savedItem.tilesMatrix = { 0: { 0: { 0: tileForNull } } };
+      fullyLoaded = true;
+      currentItem = null;
+      // Trigger complete via savedItem? getItem() must match during onTiledImageDrawn, so swap inside onPaintComplete.
+      currentItem = savedItem;
+      onBeforeHook = null;
+
+      // Test !item and offscreen drain sites directly via onBeforeReset / onPaintComplete queueing.
+      let nullForced = 0;
+      let offscreenForced = 0;
+      let mode = 'null';
+      let hookItem = null;
+      const drainEvents = [];
+      const gate2 = geometry.createTileRefreshGate({
+        getItem: () => hookItem,
+        getViewer: () => ({ forceRedraw() {} }),
+        onPaintComplete: (q, meta) => {
+          drainEvents.push([mode, q, meta]);
+        },
+        setTimer,
+        clearTimer,
+      });
+      gate2.init('c=0');
+      // 2a) completePaint -> !item when item is nulled after paint begins
+      hookItem = makeItem();
+      gate2.request('c=1');
+      gate2.request('c=1', { force: true });
+      const tNull = { level: 0, x: 0, y: 0 };
+      hookItem.tilesMatrix = { 0: { 0: { 0: tNull } } };
+      fullyLoaded = true;
+      const origOnPaint = drainEvents.length;
+      // Switch item to null right as forced drain begins by replacing getItem behavior via gate3.
+      let item3 = makeItem();
+      const g3Events = [];
+      const gate3 = geometry.createTileRefreshGate({
+        getItem: () => item3,
+        getViewer: () => ({ forceRedraw() {} }),
+        onPaintComplete: (q, meta) => {
+          g3Events.push([q, meta]);
+          if (meta.hasPending && g3Events.length === 1) {
+            if (mode === 'null') item3 = null;
+            else if (mode === 'offscreen') drawArea = null;
+          }
+        },
+        setTimer,
+        clearTimer,
+      });
+      gate3.init('c=0');
+      gate3.request('c=1');
+      gate3.request('c=1', { force: true });
+      const t3 = { level: 0, x: 0, y: 0 };
+      item3.tilesMatrix = { 0: { 0: { 0: t3 } } };
+      fullyLoaded = true;
+      gate3.onTiledImageDrawn({ tiledImage: item3, tiles: [t3] });
+      nullForced = g3Events.length;
+      const nullFinalRendering = gate3.isRendering();
+
+      // 3) offscreen drain site
+      mode = 'offscreen';
+      drawArea = { x: 0, y: 0, width: 100, height: 100 };
+      item3 = makeItem();
+      g3Events.length = 0;
+      gate3.resetState('c=0');
+      gate3.request('c=2');
+      gate3.request('c=2', { force: true });
+      const t4 = { level: 0, x: 0, y: 0 };
+      item3.tilesMatrix = { 0: { 0: { 0: t4 } } };
+      fullyLoaded = true;
+      gate3.onTiledImageDrawn({ tiledImage: item3, tiles: [t4] });
+      offscreenForced = g3Events.length;
+      const offscreenFinalRendering = gate3.isRendering();
+      drawArea = { x: 0, y: 0, width: 100, height: 100 };
+
+      // 4) onTileLoadFailed drain site clears pendingForce after draining
+      resets = 0;
+      gate.resetState('c=0');
+      gate.request('c=3');
+      gate.request('c=3', { force: true });
+      const failTile = { level: 0, x: 0, y: 0 };
+      currentItem.tilesMatrix = { 0: { 0: { 0: failTile } } };
+      gate.onTileLoadFailed({ tiledImage: currentItem, tile: failTile });
+      const resetsAfterFailDrain = resets;
+      paintActive();
+      const afterFailDrainPaint = { rendering: gate.isRendering(), resets };
+
+      // 5) armWatchdog drain site clears pendingForce after draining
+      resets = 0;
+      gate.resetState('c=0');
+      gate.request('c=4');
+      gate.request('c=4', { force: true });
+      const [wdId, wdTimer] = [...timers.entries()].at(-1);
+      timers.delete(wdId);
+      wdTimer.fn();
+      const resetsAfterWatchdogDrain = resets;
+      paintActive();
+      const afterWatchdogDrainPaint = { rendering: gate.isRendering(), resets };
+
+      // 6) resetState and dispose clear pendingForce
+      gate.resetState('c=0');
+      gate.request('c=5');
+      gate.request('c=5', { force: true });
+      gate.resetState('c=5');
+      const dupAfterResetState = gate.request('c=5');
+      gate.request('c=6');
+      gate.request('c=6', { force: true });
+      gate.dispose();
+      const reqAfterDispose = gate.request('c=6', { force: true });
+
+      return {
+        afterFirstPaint,
+        afterForcedDrain,
+        nullForced,
+        nullFinalRendering,
+        offscreenForced,
+        offscreenFinalRendering,
+        resetsAfterFailDrain,
+        afterFailDrainPaint,
+        resetsAfterWatchdogDrain,
+        afterWatchdogDrainPaint,
+        dupAfterResetState,
+        reqAfterDispose,
+      };
+    """)
+    assert out["afterFirstPaint"]["rendering"] is True
+    assert out["afterFirstPaint"]["resets"] == 2
+    assert out["afterFirstPaint"]["completes"] == [
+        ["c=0&win=0%3A128", {"timedOut": False, "hasPending": True}]
+    ]
+    assert out["afterForcedDrain"]["rendering"] is False
+    assert out["afterForcedDrain"]["resets"] == 2
+    assert out["afterForcedDrain"]["completes"] == [
+        ["c=0&win=0%3A128", {"timedOut": False, "hasPending": True}],
+        ["c=0&win=0%3A128", {"timedOut": False, "hasPending": False}],
+    ]
+    assert out["nullForced"] == 2 and out["nullFinalRendering"] is False
+    assert out["offscreenForced"] == 2 and out["offscreenFinalRendering"] is False
+    assert out["resetsAfterFailDrain"] == 2
+    assert out["afterFailDrainPaint"] == {"rendering": False, "resets": 2}
+    assert out["resetsAfterWatchdogDrain"] == 2
+    assert out["afterWatchdogDrainPaint"] == {"rendering": False, "resets": 2}
+    assert out["dupAfterResetState"] is False
+    assert out["reqAfterDispose"] is False

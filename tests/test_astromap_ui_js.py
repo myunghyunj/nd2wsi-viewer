@@ -1277,3 +1277,229 @@ process.stdout.write(JSON.stringify({cancelled,added:f.added}));
 """)
     assert out["cancelled"] == {"tool": None, "rubber": "none", "added": [], "nav": True}
     assert out["added"] == [{"x": 200, "y": 300, "w": 40, "h": 60}]
+
+
+def test_import_reads_utf16_le_be_and_utf8_arraybuffer_and_rejects_invalid_encoding():
+    out = _run_import(r"""
+const sample = 'INDEX\tX1\tY1\tX2\tY2\tNOTE\n1\t10\t20\t29\t39\t조직 A\n';
+function encodeUtf16(str, be) {
+  const buf = new Uint8Array(2 + str.length * 2);
+  buf[0] = be ? 0xfe : 0xff;
+  buf[1] = be ? 0xff : 0xfe;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    buf[2 + i * 2] = be ? (code >> 8) & 0xff : code & 0xff;
+    buf[2 + i * 2 + 1] = be ? code & 0xff : (code >> 8) & 0xff;
+  }
+  return buf;
+}
+function makeFile(name, bytes) {
+  return { name, size: bytes.length, arrayBuffer: async () => bytes.slice().buffer };
+}
+const results = {};
+for (const [label, bytes] of [
+  ['utf16le', encodeUtf16(sample, false)],
+  ['utf16be', encodeUtf16(sample, true)],
+  ['utf8', new TextEncoder().encode(sample)],
+  ['invalid', new Uint8Array([0x80, 0xff, 0xfe, 0x80])],
+]) {
+  const f = importFixture();
+  f.c.TextDecoder = TextDecoder;
+  const ok = await f.c.readAstromapImportFile(makeFile(label + '.txt', bytes));
+  results[label] = {
+    ok,
+    text: f.c.state.astromap.pendingImport?.text ?? null,
+    status: f.nodes.get('astromap-import-status').textContent,
+  };
+}
+return results;
+""")
+    for enc in ("utf16le", "utf16be", "utf8"):
+        assert out[enc]["ok"] is True
+        assert "조직 A" in out[enc]["text"]
+    assert out["invalid"]["ok"] is False
+    assert out["invalid"]["text"] is None
+    assert out["invalid"]["status"] == "Save the ROI text as UTF-8 or UTF-16"
+
+
+def test_refresh_astromap_import_validates_size_and_aspect_before_confirm_and_clears_size_error():
+    out = _run_import(r"""
+const f = importFixture();
+const text = 'INDEX\tX1\tY1\tX2\tY2\tNOTE\n1\t10\t20\t29\t39\tok\n2\t10\t20\t9\t39\tzero';
+await f.c.readAstromapImportFile({ name: 'regions.txt', size: text.length, text: async () => text });
+const initialStatus = f.nodes.get('astromap-import-status').textContent;
+
+// 1) Invalid dimension clears review/repair UI, sets size error, and disables confirm.
+f.nodes.get('astromap-import-width').value = '0';
+f.c.refreshAstromapImport();
+const afterInvalidSize = {
+  status: f.nodes.get('astromap-import-status').textContent,
+  sizeError: f.c.state.astromap.importSizeError,
+  reviewHidden: f.nodes.get('astromap-import-review').hidden,
+  repairHidden: f.nodes.get('astromap-import-repair-row').hidden,
+  confirmDisabled: f.nodes.get('astromap-import-confirm').disabled,
+};
+
+// 2) Valid whole numbers with mismatched aspect ratio show aspect error before confirm.
+f.nodes.get('astromap-import-width').value = '1000';
+f.nodes.get('astromap-import-height').value = '1000';
+f.c.refreshAstromapImport();
+const afterAspectMismatch = {
+  status: f.nodes.get('astromap-import-status').textContent,
+  sizeError: f.c.state.astromap.importSizeError,
+  reviewHidden: f.nodes.get('astromap-import-review').hidden,
+  repairHidden: f.nodes.get('astromap-import-repair-row').hidden,
+  confirmDisabled: f.nodes.get('astromap-import-confirm').disabled,
+};
+
+// 3) Fixing dimensions clears the stale importSizeError status and restores review/confirm.
+f.nodes.get('astromap-import-height').value = '500';
+f.c.refreshAstromapImport();
+const afterFixed = {
+  status: f.nodes.get('astromap-import-status').textContent,
+  sizeError: f.c.state.astromap.importSizeError,
+  reviewHidden: f.nodes.get('astromap-import-review').hidden,
+  repairHidden: f.nodes.get('astromap-import-repair-row').hidden,
+  confirmDisabled: f.nodes.get('astromap-import-confirm').disabled,
+};
+
+// 4) Informational message from choosing a matching JPG is preserved even after a prior size error.
+f.nodes.get('astromap-import-height').value = '1000';
+f.c.refreshAstromapImport();
+const okPng = new Blob([new Uint8Array([
+  137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+  0, 0, 0, 100, 0, 0, 0, 50, 8, 2, 0, 0, 0, 0, 0, 0, 0,
+])]);
+okPng.name = 'match.png';
+await f.c.readAstromapImportJpg(okPng);
+const afterMatchingPng = {
+  status: f.nodes.get('astromap-import-status').textContent,
+  sizeError: f.c.state.astromap.importSizeError,
+  confirmDisabled: f.nodes.get('astromap-import-confirm').disabled,
+};
+
+// 5) Choosing a mismatched PNG surfaces aspect error immediately (overwriting Ready to import).
+const badPng = new Blob([new Uint8Array([
+  137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+  0, 0, 0, 100, 0, 0, 0, 100, 8, 2, 0, 0, 0, 0, 0, 0, 0,
+])]);
+badPng.name = 'cropped.png';
+await f.c.readAstromapImportJpg(badPng);
+const afterBadPng = {
+  status: f.nodes.get('astromap-import-status').textContent,
+  sizeError: f.c.state.astromap.importSizeError,
+  confirmDisabled: f.nodes.get('astromap-import-confirm').disabled,
+};
+
+return { initialStatus, afterInvalidSize, afterAspectMismatch, afterFixed, afterMatchingPng, afterBadPng };
+""")
+    assert "Confirm the coordinate image size" in out["initialStatus"]
+    assert out["afterInvalidSize"] == {
+        "status": "Enter positive whole-number image dimensions.",
+        "sizeError": True, "reviewHidden": True, "repairHidden": True, "confirmDisabled": True,
+    }
+    assert "JPG/PNG (1000 × 1000)" in out["afterAspectMismatch"]["status"]
+    assert "current image (1000 × 500)" in out["afterAspectMismatch"]["status"]
+    assert out["afterAspectMismatch"]["sizeError"] is True
+    assert out["afterAspectMismatch"]["reviewHidden"] is True
+    assert out["afterAspectMismatch"]["repairHidden"] is True
+    assert out["afterAspectMismatch"]["confirmDisabled"] is True
+    assert out["afterFixed"] == {
+        "status": "", "sizeError": False, "reviewHidden": False, "repairHidden": False, "confirmDisabled": False,
+    }
+    assert "match.png: 100 × 50 px. Ready to import." == out["afterMatchingPng"]["status"]
+    assert out["afterMatchingPng"]["sizeError"] is False
+    assert out["afterMatchingPng"]["confirmDisabled"] is False
+    assert "JPG/PNG (100 × 100)" in out["afterBadPng"]["status"]
+    assert out["afterBadPng"]["sizeError"] is True
+    assert out["afterBadPng"]["confirmDisabled"] is True
+
+
+def test_astromap_drag_snaps_to_integers_clamped_in_bounds_and_add_enforces_2000_cap():
+    out = _run_export(r"""
+const f = fixture(), c = f.c;
+Object.assign(c.state.info, { width: 100, height: 80 });
+c.state.annContext = 1;
+c.state.annotations = [
+  { id: 'astro', type: 'box', astromap: true, x: 10, y: 20, w: 15, h: 12, text: '' },
+  { id: 'plain', type: 'box', x: 10, y: 20, w: 15, h: 12, text: '' },
+];
+const winListeners = new Map();
+function makeNode(id) {
+  return {
+    id, attrs: {}, children: [], parentNode: null, listeners: {}, hidden: true,
+    setAttribute(k, v) { this.attrs[k] = String(v); },
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
+    append(...items) { for (const item of items) { item.parentNode = this; this.children.push(item); } },
+    addEventListener(k, fn) { this.listeners[k] = fn; },
+    removeEventListener(k) { delete this.listeners[k]; },
+    contains(other) { for (; other; other = other.parentNode) if (other === this) return true; return false; },
+    closest() { return 'data-ann-id' in this.attrs ? this : null; },
+  };
+}
+const layer = makeNode('ann-layer');
+const astroHit = makeNode('hit-astro'); astroHit.setAttribute('data-ann-id', 'astro');
+const plainHit = makeNode('hit-plain'); plainHit.setAttribute('data-ann-id', 'plain');
+layer.append(astroHit, plainHit);
+f.nodes.set('ann-layer', layer);
+f.nodes.set('stage', makeNode('stage'));
+f.nodes.set('ann-editor', makeNode('ann-editor'));
+c.clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+c.window.addEventListener = (k, fn) => winListeners.set(k, fn);
+c.window.removeEventListener = (k) => winListeners.delete(k);
+c.elementPoint = (ev) => ({ x: ev.clientX, y: ev.clientY });
+c.viewerElementToImagePoint = (p) => p;
+c.astromapItems = () => c.state.annotations.filter(a => a.type === 'box' && a.astromap === true);
+c.selectAstromapRoi = () => {};
+c.openEditor = () => {};
+c.renderAnnotations = () => {};
+c.annotationsChanged = () => {};
+vm.runInContext('let annotationFrame = null;\n' + production('wireAnnotationPointer') + '\n' + production('addAstromapRoi'), c);
+c.wireAnnotationPointer();
+
+// Drag Astromap box by fractional delta (7.6, 5.4) -> snaps to integer (18, 25).
+layer.listeners.pointerdown({ button: 0, target: astroHit, clientX: 10, clientY: 20, pointerId: 1, stopPropagation() {} });
+winListeners.get('pointermove')({ clientX: 17.6, clientY: 25.4, pointerId: 1 });
+winListeners.get('pointerup')({ clientX: 17.6, clientY: 25.4, pointerId: 1 });
+const astroSnapped = { x: c.state.annotations[0].x, y: c.state.annotations[0].y };
+
+// Drag Astromap box past right/bottom edge -> clamped to floor(100 - 15) = 85, floor(80 - 12) = 68.
+layer.listeners.pointerdown({ button: 0, target: astroHit, clientX: 18, clientY: 25, pointerId: 2, stopPropagation() {} });
+winListeners.get('pointermove')({ clientX: 500.7, clientY: 500.9, pointerId: 2 });
+winListeners.get('pointerup')({ clientX: 500.7, clientY: 500.9, pointerId: 2 });
+const astroClamped = { x: c.state.annotations[0].x, y: c.state.annotations[0].y };
+
+// Non-Astromap box keeps fractional drag position.
+layer.listeners.pointerdown({ button: 0, target: plainHit, clientX: 10, clientY: 20, pointerId: 3, stopPropagation() {} });
+winListeners.get('pointermove')({ clientX: 17.6, clientY: 25.4, pointerId: 3 });
+winListeners.get('pointerup')({ clientX: 17.6, clientY: 25.4, pointerId: 3 });
+const plainDragged = { x: c.state.annotations[1].x, y: c.state.annotations[1].y };
+
+// addAstromapRoi enforces 2000-region cap before normalizeRect/overlaps.
+c.state.annotations = Array.from({ length: 2000 }, (_, i) => ({
+  id: 'a' + i, type: 'box', astromap: true, x: 0, y: 0, w: 1, h: 1,
+}));
+let normalizeCalled = 0;
+c.window.Nd2Astromap = {
+  ...c.window.Nd2Astromap,
+  normalizeRect() { normalizeCalled++; return { x: 1, y: 1, w: 2, h: 2 }; },
+};
+const added = c.addAstromapRoi({ x: 1, y: 1, w: 2, h: 2 });
+
+return {
+  astroSnapped,
+  astroClamped,
+  plainDragged,
+  added,
+  normalizeCalled,
+  status: f.nodes.get('astromap-status').textContent,
+  toasts: f.notices,
+};
+""")
+    assert out["astroSnapped"] == {"x": 18, "y": 25}
+    assert out["astroClamped"] == {"x": 85, "y": 68}
+    assert out["plainDragged"] == pytest.approx({"x": 17.6, "y": 25.4})
+    assert out["added"] is None
+    assert out["normalizeCalled"] == 0
+    assert out["status"] == "Astromap supports up to 2000 regions"
+    assert out["toasts"] == ["Astromap supports up to 2000 regions"]
