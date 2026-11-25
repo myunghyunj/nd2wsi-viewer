@@ -277,3 +277,63 @@ def test_http_export_download_pair_stale_generation_and_lifecycle_lease(monkeypa
         assert error.value.code == 409
         assert len(writes) == 1
     assert all(not folder.exists() for folder in writes)
+
+
+def test_render_image_clamps_boundary_tile_resize_box_for_float_overshoot(monkeypatch):
+    # Both lw=23 -> ow=21 and real-world lw=8002 -> ow=8000 strictly exceed lw
+    # in IEEE-754 float64 (ow * (lw / ow) > lw), crashing unclamped Pillow resize.
+    assert 21 * (23 / 21) > 23.0
+    assert 8000 * (8002 / 8000) > 8002.0
+    monkeypatch.setattr(am, "MAX_EDGE", 21)
+    st_fp = make_state(width=23, height=23, rgb=True)
+    plan_fp = prepare(st_fp, rois=[{"x": 0, "y": 0, "w": 23, "h": 23}])
+    assert plan_fp.size == (21, 21)
+    with plan_fp.render_image() as img_fp:
+        assert img_fp.size == (21, 21)
+
+    monkeypatch.setattr(am, "MAX_EDGE", 8000)
+
+    class Strip:
+        dtype = np.dtype("uint8")
+
+        def __init__(self, w, h):
+            self.shape = (3, h, w)
+
+        def __getitem__(self, key):
+            _, ys, xs = key
+            return np.full((ys.stop - ys.start, xs.stop - xs.start), 120, self.dtype)
+
+    st_8002 = make_state(
+        width=8002,
+        height=64,
+        rgb=True,
+        levels=[{"path": "0", "width": 8002, "height": 64}],
+        root={"0": Strip(8002, 64)},
+    )
+    plan_8002 = prepare(st_8002, rois=[{"x": 7990, "y": 0, "w": 12, "h": 64}])
+    assert plan_8002.size == (8000, 63)
+    with plan_8002.render_image() as img_8002:
+        assert img_8002.size == (8000, 63)
+
+
+def test_http_astromap_accepts_over_1mb_utf8_payload():
+    st = make_state()
+    # 500 ROIs with 3-byte UTF-8 notes -> > 1.5 MB JSON body (exceeds legacy 1 MB cap).
+    note = "조직" * 600  # 1,200 chars, 3,600 UTF-8 bytes
+    rois = [{"x": 5, "y": 6, "w": 12, "h": 9, "note": note} for _ in range(500)]
+    body = json.dumps(payload(rois=rois), ensure_ascii=False).encode("utf-8")
+    assert 1_500_000 < len(body) < 26_000_000
+    with http_server(st) as (_server, base):
+        req = urllib.request.Request(
+            base + "api/astromap",
+            body,
+            {"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as response:
+            result = json.load(response)
+        assert result["count"] == 500
+        with urllib.request.urlopen(urllib.parse.urljoin(base, result["download_url"])) as response:
+            with zipfile.ZipFile(io.BytesIO(response.read())) as bundle:
+                lines = bundle.read("example.txt").decode("utf-8").splitlines()
+                assert len(lines) == 501
+                assert lines[1].endswith(f"\t{note}")

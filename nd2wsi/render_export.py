@@ -235,6 +235,14 @@ def _build_roi_ome_xml(
             f' PhysicalSizeY="{py_um!r}" PhysicalSizeYUnit="µm"'
         )
 
+    if not rgb and len(channels) > 1:
+        tiffdata_xml = "".join(
+            f'<TiffData FirstC="{out_idx}" FirstZ="0" FirstT="0" IFD="{out_idx}" PlaneCount="1"/>'
+            for out_idx in range(len(channels))
+        )
+    else:
+        tiffdata_xml = '<TiffData IFD="0" PlaneCount="1"/>'
+
     uid = uuid.uuid5(
         uuid.NAMESPACE_OID,
         f"nd2wsi-ome:{clean_source}:{clean_desc}:{w}x{h}:{ome_type}:{rgb}:{ch_meta_seed}:{px_um}:{py_um}",
@@ -246,10 +254,11 @@ def _build_roi_ome_xml(
         f'<Image ID="Image:0" Name={_xml_quoteattr(clean_source)}>'
         f"<Description>{_xml_escape(clean_desc)}</Description>"
         f'<Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="{ome_type}" '
+        f'BigEndian="false" '
         f'SizeX="{int(w)}" SizeY="{int(h)}" SizeC="{size_c}" SizeZ="1" SizeT="1" '
         f'Interleaved="{interleaved}"{phys_xml}>'
         f"{ch_xml}"
-        '<TiffData IFD="0" PlaneCount="1"/>'
+        f"{tiffdata_xml}"
         "</Pixels></Image></OME>"
     )
     return xml.encode("ascii", "xmlcharrefreplace").decode("ascii")
@@ -302,15 +311,20 @@ def export_roi_tiff(
         except (TypeError, ValueError):
             pass
 
-    def counted(it: Iterator[np.ndarray], total: int) -> Iterator[np.ndarray]:
-        for n, block in enumerate(it, 1):
-            yield block
-            if on_progress and (n % 8 == 0 or n == total):
-                on_progress(n / total)
-
     ny = -(-h // tile)
     nx = -(-w // tile)
     rgb = bool(meta["rgb"]) and channels == [0, 1, 2]
+    total_tiles = ny * nx * (1 if rgb else len(channels))
+    completed_tiles = 0
+
+    def counted(it: Iterator[np.ndarray]) -> Iterator[np.ndarray]:
+        nonlocal completed_tiles
+        for block in it:
+            completed_tiles += 1
+            if on_progress and completed_tiles % 8 == 0 and completed_tiles < total_tiles:
+                on_progress(completed_tiles / total_tiles)
+            yield block
+
     summary = (
         f"nd2wsi ROI from {source_description} level {level} "
         f"(downsample {factor}) x={x} y={y} w={w} h={h}"
@@ -329,10 +343,10 @@ def export_roi_tiff(
         rgb=rgb,
         col=col,
     )
-    with tifffile.TiffWriter(out_file, bigtiff=True) as tw:
+    with tifffile.TiffWriter(out_file, bigtiff=True, byteorder="<") as tw:
         if rgb:
             tw.write(
-                counted(r._roi_rgb_tile_iter(root, level_path, x, y, w, h, tile), ny * nx),
+                counted(r._roi_rgb_tile_iter(root, level_path, x, y, w, h, tile)),
                 shape=(h, w, 3),
                 dtype=dtype,
                 tile=(tile, tile),
@@ -340,29 +354,28 @@ def export_roi_tiff(
                 **res_kw,
                 compression="zlib",
                 description=ome_description,
+                metadata=None,
             )
         else:
-            multi = len(channels) > 1
-            kwargs = dict(
-                dtype=dtype,
-                tile=(tile, tile),
-                photometric="minisblack",
-                **res_kw,
-                compression="zlib",
-                description=ome_description,
-            )
-            if multi:
-                kwargs["shape"] = (len(channels), h, w)
-                kwargs["planarconfig"] = "separate"
-            else:
-                kwargs["shape"] = (h, w)
-            tw.write(
-                counted(
-                    r._roi_tile_iter(root, level_path, x, y, w, h, channels, tile),
-                    ny * nx * len(channels),
-                ),
-                **kwargs,
-            )
+            for out_idx, ci in enumerate(channels):
+                page_kw: dict[str, Any] = {
+                    "shape": (h, w),
+                    "dtype": dtype,
+                    "tile": (tile, tile),
+                    "photometric": "minisblack",
+                    "contiguous": False,
+                    **res_kw,
+                    "compression": "zlib",
+                    "metadata": None,
+                }
+                if out_idx == 0:
+                    page_kw["description"] = ome_description
+                tw.write(
+                    counted(r._roi_tile_iter(root, level_path, x, y, w, h, [ci], tile)),
+                    **page_kw,
+                )
+    if on_progress and total_tiles > 0:
+        on_progress(1.0)
 
 
 def export_roi_rendered(

@@ -348,3 +348,142 @@ def test_legacy_sidecar_migration_skips_symlinks(tmp_path, symlink_support):
     assert not sidecar.exists()
     assert legacy_link.is_symlink()
     assert secret.exists()
+
+
+def test_annotation_lock_path_reuses_existing_nfd_sibling_and_defaults_to_nfc(tmp_path, monkeypatch):
+    import os
+    import unicodedata
+
+    from nd2wsi.annotation_workspace import annotation_lock_path
+    from nd2wsi.session_lock import SessionFileLock
+
+    nfc_name = unicodedata.normalize("NFC", "annotations_샘플.nd2--t0-p0-z0.json")
+    nfd_name = unicodedata.normalize("NFD", "annotations_샘플.nd2--t0-p0-z0.json")
+    assert nfc_name != nfd_name
+
+    # Without an existing sibling lockfile, NFD input resolves to canonical NFC lockfile name.
+    fresh_dir = tmp_path / "fresh"
+    fresh_dir.mkdir()
+    fresh_lock = annotation_lock_path(fresh_dir / nfd_name)
+    assert unicodedata.is_normalized("NFC", fresh_lock.name)
+    assert fresh_lock.name == f".{nfc_name}.window-lock"
+
+    # Simulate normalization-sensitive filesystem (Windows/Linux exFAT) with an existing 2.6.10 NFD lockfile.
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    nfd_lock = shared_dir / f".{nfd_name}.window-lock"
+    nfd_lock.write_text("{}", encoding="utf-8")
+
+    real_exists = Path.exists
+    real_is_symlink = Path.is_symlink
+    shared_resolved = shared_dir.resolve()
+
+    def _missing_exact(p: Path) -> bool:
+        if not p.name or p.name.isascii():
+            return False
+        try:
+            p.parent.resolve().relative_to(shared_resolved)
+        except Exception:
+            return False
+        try:
+            return p.name not in os.listdir(p.parent)
+        except OSError:
+            return True
+
+    monkeypatch.setattr(Path, "exists", lambda self, *a, **kw: False if _missing_exact(self) else real_exists(self, *a, **kw))
+    monkeypatch.setattr(Path, "is_symlink", lambda self: False if _missing_exact(self) else real_is_symlink(self))
+
+    # Asking for the NFC sidecar reuses the existing NFD sibling lockfile on disk.
+    resolved_lock = annotation_lock_path(shared_dir / nfc_name)
+    assert resolved_lock == nfd_lock
+
+    # Browser-mode server POST detects contention on that existing NFD lockfile instead of splitting.
+    sidecar_nfc = shared_dir / nfc_name
+    import nd2wsi.annotation_workspace as aw
+
+    monkeypatch.setattr(aw, "_LOCK_TIMEOUT", 0.05)
+    lock = SessionFileLock(nfd_lock)
+    lock.acquire(timeout=1.0)
+    try:
+        httpd = create_server([], port=0)
+        attrs = _attrs(tmp_path / "sample.nd2")
+        sid = httpd.registry.sid_for(sidecar_nfc)
+        st = ViewerState({}, attrs, annotations_path=sidecar_nfc, source_path=tmp_path / "sample.nd2")
+        httpd.registry.slides[sid] = st
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/{httpd.token}"
+        with serving(httpd):
+            status, body = _request(f"{base}/s/{sid}/api/annotations", {"items": [{"id": "contended"}]})
+            assert status == 409
+            assert "another window" in body["error"]
+    finally:
+        lock.release()
+
+
+def test_annotation_workspace_snapshot_normalizes_nfc_nfd_and_preserves_surrogates(tmp_path, monkeypatch):
+    import unicodedata
+
+    session = create_window_session("agent", tmp_path / "sessions")
+    workspace = AnnotationWorkspace(session)
+
+    nfc_dir = tmp_path / unicodedata.normalize("NFC", "폴더")
+    nfd_dir = tmp_path / unicodedata.normalize("NFD", "폴더")
+    nfc_file = nfc_dir / unicodedata.normalize("NFC", "주석.json")
+    nfd_file = nfd_dir / unicodedata.normalize("NFD", "주석.json")
+    nfc_dir.mkdir()
+    nfc_file.write_text('{"items": [{"id": "k1"}]}', encoding="utf-8")
+
+    # Preserve exact NFD spelling in Path.resolve() to mimic Linux/Windows norm-sensitive FS.
+    real_resolve = Path.resolve
+
+    def _keep_nfd_resolve(self: Path, strict: bool = False) -> Path:
+        if self == nfd_file:
+            return real_resolve(tmp_path) / nfd_dir.name / nfd_file.name
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", _keep_nfd_resolve)
+
+    snap_nfc = workspace.snapshot(nfc_file)
+    snap_nfd = workspace.snapshot(nfd_file, source=nfc_file)
+    assert snap_nfc == snap_nfd
+
+    # Surrogate-escaped bytes in a path part must never raise UnicodeEncodeError.
+    surrogate_canonical = tmp_path / unicodedata.normalize("NFD", "폴더") / "bad\udcffname.json"
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda self, strict=False: (
+            real_resolve(tmp_path) / unicodedata.normalize("NFD", "폴더") / "bad\udcffname.json"
+            if self == surrogate_canonical
+            else real_resolve(self, strict=strict)
+        ),
+    )
+    snap_surrogate = workspace.snapshot(surrogate_canonical, source=nfc_file)
+    assert snap_surrogate.is_file()
+    assert json.loads(snap_surrogate.read_text(encoding="utf-8")) == {"items": [{"id": "k1"}]}
+
+
+def test_annotation_workspace_routes_os_calls_through_filesystem_path(tmp_path, monkeypatch):
+    import nd2wsi.annotation_workspace as aw
+    from nd2wsi.platform_io import filesystem_path as real_fs_path
+
+    seen: list[Path] = []
+
+    def tracking_fs_path(p):
+        seen.append(Path(p))
+        return real_fs_path(p)
+
+    monkeypatch.setattr(aw, "filesystem_path", tracking_fs_path)
+    session = create_window_session("user", tmp_path / "sessions")
+    workspace = AnnotationWorkspace(session)
+    sidecar = tmp_path / "deep" / "annotations.json"
+
+    doc, rev0 = workspace.read(sidecar)
+    assert doc == {} and rev0 == "missing"
+    rev1 = workspace.write(sidecar, {"items": [{"id": "r1"}]}, rev0)
+    doc1, rev1_check = workspace.read(sidecar)
+    assert doc1["items"] == [{"id": "r1"}] and rev1_check == rev1
+    snap = workspace.snapshot(sidecar)
+    assert snap.is_file()
+    assert sidecar in seen
+    assert sidecar.parent in seen
+    assert snap in seen

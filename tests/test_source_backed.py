@@ -299,3 +299,86 @@ def test_lifecycle_waits_for_readers_then_bars_the_door():
     closer.join(5)
     assert closed == [True]
     t.join(5)
+
+
+def test_overview_degraded_disables_nd2_export_and_defaults_tiff_level(big_nd2, tmp_path):
+    """B6 & B7: overview-degraded rejects ND2 export (with job error) and defaults omitted TIFF level to base path."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    from http_fixture import running_server
+
+    from nd2wsi import ometiff
+    from nd2wsi.region_export import ExportRequestError, prepare_export
+    from nd2wsi.server import _frame_args, server_url
+
+    path, _ = big_nd2
+    store = ensure_cache(path, tile=512)
+    hidden = path.with_name("elsewhere.nd2")
+    path.rename(hidden)
+    try:
+        with running_server(store) as httpd:
+            base = server_url(httpd).rstrip("/")
+            info = json.loads(urllib.request.urlopen(base + "/api/info").read())
+            assert info["storage"] == "overview-degraded"
+            assert info["nd2Export"] is False
+            assert (
+                info["nd2ExportReason"]
+                == "ND2 export requires the original full-resolution slide; use TIFF export instead."
+            )
+
+            st = next(iter(httpd.registry.slides.values()))
+            # prepare_export rejects ND2 regardless of level (omitted, 0, or 1)
+            for extra in ({}, {"level": ["0"]}, {"level": ["1"]}):
+                with pytest.raises(
+                    ExportRequestError,
+                    match="ND2 export requires the original full-resolution slide; use TIFF export instead.",
+                ):
+                    prepare_export(
+                        st,
+                        {"x": ["0"], "y": ["0"], "w": ["64"], "h": ["64"], "format": ["nd2"], **extra},
+                        resolve_frame=_frame_args,
+                    )
+
+            # HTTP ND2 export returns 400 and records job failure in EXPORT_JOBS
+            with pytest.raises(urllib.error.HTTPError) as err_nd2:
+                urllib.request.urlopen(
+                    base + "/api/roi?level=0&x=0&y=0&w=64&h=64&format=nd2&job=deg-nd2"
+                )
+            assert err_nd2.value.code == 400
+            prog_nd2 = json.loads(
+                urllib.request.urlopen(base + "/api/roi/progress?job=deg-nd2").read()
+            )
+            assert prog_nd2["state"] == "error"
+            assert (
+                prog_nd2["error"]
+                == "ND2 export requires the original full-resolution slide; use TIFF export instead."
+            )
+
+            # Omitting level on overview-degraded TIFF export defaults to levels[0]["path"] (1)
+            plan = prepare_export(
+                st,
+                {"x": ["0"], "y": ["0"], "w": ["64"], "h": ["64"], "format": ["tiff"]},
+                resolve_frame=_frame_args,
+            )
+            assert plan.level == 1
+
+            tif_bytes = urllib.request.urlopen(
+                base + "/api/roi?x=0&y=0&w=64&h=64&format=tiff&job=deg-tif", timeout=60
+            ).read()
+            tif_out = tmp_path / "degraded.ome.tif"
+            tif_out.write_bytes(tif_bytes)
+            prog_tif = json.loads(
+                urllib.request.urlopen(base + "/api/roi/progress?job=deg-tif").read()
+            )
+            assert prog_tif["state"] == "done" and prog_tif["pct"] == 100
+
+            root_rt, attrs_rt = ometiff.open_direct(tif_out)
+            try:
+                assert root_rt["0"].shape == (2, 64, 64)
+                assert attrs_rt["nd2wsi"]["pixel_size_um"] == pytest.approx([1.0, 1.0])
+            finally:
+                root_rt.close()
+    finally:
+        hidden.rename(path)

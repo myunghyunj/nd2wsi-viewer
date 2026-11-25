@@ -24,6 +24,20 @@ from .metal import reduce2x_cpu
 JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
+def parse_job_id(query: dict[str, Any] | None) -> str | None:
+    """Extract a validated export job id from a query-parameter mapping."""
+    if not isinstance(query, dict):
+        return None
+    raw = query.get("job")
+    if isinstance(raw, (list, tuple)):
+        job = raw[0] if raw else None
+    else:
+        job = raw
+    if isinstance(job, str) and JOB_RE.match(job):
+        return job
+    return None
+
+
 def _safe_export_stem(source: str | Path) -> str:
     stem = slide_stem(source)
     stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", stem).strip(". ")[:120]
@@ -231,7 +245,18 @@ def prepare_export(
             raise ExportRequestError(f"invalid {name}: {exc}") from None
 
     meta = state.attrs["nd2wsi"]
-    level = qi("level", 0)
+    fmt = (query.get("format") or ["nd2"])[0].lower()
+    is_overview_degraded = meta.get("kind") == "overview-degraded"
+    if fmt == "nd2" and is_overview_degraded:
+        raise ExportRequestError(
+            "ND2 export requires the original full-resolution slide; use TIFF export instead."
+        )
+    default_level = (
+        int(meta["levels"][0]["path"])
+        if is_overview_degraded and fmt in ("tif", "tiff") and meta.get("levels")
+        else 0
+    )
+    level = qi("level", default_level)
     try:
         entry = render.level_entry(meta["levels"], level)
     except KeyError:
@@ -240,7 +265,6 @@ def prepare_export(
     x, y, w, h = qi("x"), qi("y"), qi("w"), qi("h")
     x, y = max(0, min(x, lw - 1)), max(0, min(y, lh - 1))
     w, h = max(1, min(w, lw - x)), max(1, min(h, lh - y))
-    fmt = (query.get("format") or ["nd2"])[0].lower()
     scale_bar = fmt == "svg" or (query.get("scalebar") or ["0"])[0] == "1"
     if scale_bar and fmt not in ("svg", "jpg", "jpeg"):
         raise ExportRequestError("Scale bar export supports SVG and JPEG")
@@ -255,9 +279,7 @@ def prepare_export(
     if not channels and fmt in ("nd2", "tif", "tiff"):
         raise ExportRequestError("Select at least one channel to export")
     window = (query.get("win") or [None])[0]
-    job = (query.get("job") or [None])[0]
-    if job and not JOB_RE.match(job):
-        job = None
+    job = parse_job_id(query)
     stem = _safe_export_stem(meta["source"])
     base_sel = meta.get("selection") if isinstance(meta.get("selection"), dict) else {}
     sel_p = base_sel.get("p")

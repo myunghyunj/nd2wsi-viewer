@@ -180,9 +180,15 @@ class AstromapPlan:
                                 False, [gammas[c] for c in self.channels],
                             )
                         source_tile = Image.fromarray(pixels)
+                        w = float(source_tile.width)
+                        h = float(source_tile.height)
+                        bx0 = min(max(0.0, ox * sx - x0), w)
+                        by0 = min(max(0.0, oy * sy - y0), h)
+                        bx1 = max(bx0, min(w, ex * sx - x0))
+                        by1 = max(by0, min(h, ey * sy - y0))
                         resized = source_tile.resize(
                             (ex - ox, ey - oy), Image.Resampling.BILINEAR,
-                            box=(ox * sx - x0, oy * sy - y0, ex * sx - x0, ey * sy - y0),
+                            box=(bx0, by0, bx1, by1),
                         )
                         image.paste(resized, (ox, oy))
                         resized.close()
