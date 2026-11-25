@@ -45,6 +45,8 @@ from nd2wsi.window_sessions import create_window_session  # noqa: E402
 qa = Path(os.environ["ASTROMAP_QA_ROOT"]).resolve()
 report_path = qa / os.environ.get("ASTROMAP_QA_REPORT", "translucent-native-check.json")
 session = create_window_session("agent", qa / "sessions")
+os.environ["ND2WSI_LUT_SETTINGS_ROOT"] = str(session.exports_root / "lut-settings")
+os.environ["ND2WSI_UI_SETTINGS_ROOT"] = str(session.exports_root / "ui-settings")
 api, parent = app.create_app_window(None, window_session=session)
 include_keyboard = os.environ.get("ND2WSI_QA_KEYBOARD") != "0"
 report = {"ok": False, "module": nd2wsi.__file__, "session": session.as_dict(),
@@ -351,10 +353,25 @@ def run():
                 "status": "not_run",
                 "reason": "focused translucent behavior check; shared focus keyboard probe separately recorded",
             }
-        pane_eval(parent, """state.channels=[1]; state.luts=[null,{lo:100,hi:3500,gamma:.7}];
+        pane_eval(parent, """if (Array.isArray(state.lutAutoPending)) state.lutAutoPending.fill(false);
+          state.channels=[1]; state.luts=[null,{lo:100,hi:3500,gamma:.7}];
+          if (state.lutWidgets?.[0]) state.lutWidgets[0].reset();
+          if (state.lutWidgets?.[1]) state.lutWidgets[1].setLut({lo:100,hi:3500,gamma:.7});
+          refreshTiles({force:true});
           const p=state.viewer.viewport; p.setRotation(90,true); p.setFlip(true);
           p.zoomTo(p.imageToViewportZoom(.8),null,true);
           p.panTo(p.imageToViewportCoordinates(768,512),true); true""")
+        wait_for(
+            lambda: pane_eval(
+                parent,
+                "Boolean(state.tileRefreshGate"
+                " ? (!state.tileRefreshGate.isRendering()"
+                " && state.tileRefreshGate.getActiveQuery() === Nd2ViewerGeometry.normalizeQuery(tileQuery()))"
+                " : true)"
+                " && Boolean(state.viewer.world.getItemAt(0)?.getFullyLoaded())",
+            ),
+            description="main tiles refreshed for channel 1",
+        )
         result = exercise_translucent_viewer(
             api, parent, screenshot_path=session.exports_root / "translucent-native.png", extra_checks=pair_checks,
         )
