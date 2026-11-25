@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .platform_io import BINARY, filesystem_path
 
-MAX_BYTES = 16 * 1024 * 1024
+MAX_BYTES = 32 * 1024 * 1024
 # Header-only inspection never decodes pixels; allow full-slide reference images
 # up to 2 billion pixels (e.g. ~45k x 45k) while refusing absurd headers.
 _MAX_REFERENCE_HEADER_PIXELS = 2_000_000_000
@@ -163,7 +163,7 @@ def load_roi_file(path, *, width: int, height: int, image_path=None) -> dict:
         if fd >= 0:
             os.close(fd)
     if len(raw) > MAX_BYTES:
-        raise ValueError("ROI TXT must be smaller than 16 MiB")
+        raise ValueError("ROI TXT must be smaller than 32 MiB")
     try:
         text = raw.decode("utf-16" if raw.startswith((bytes([255, 254]), bytes([254, 255]))) else "utf-8-sig")
     except UnicodeError as exc:

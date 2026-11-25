@@ -537,15 +537,72 @@ def test_release_writes_only_its_fd_when_successor_arrives(slide, monkeypatch):
 
 def test_sweep_clears_stranded_backups_and_stagings(tmp_path):
     from nd2wsi.cache import sweep_stale_builds
+    from nd2wsi.storage.single_file import SQLiteStore
 
     caches = tmp_path / "caches"
+    final_dir = caches / "a--t0-p0-zmid.nd2wsi-cache"
     dead1 = caches / "a--t0-p0-zmid.nd2wsi-cache.building-99999999"
     dead2 = caches / "a--t0-p0-zmid.nd2wsi-cache.replaced-deadbeef"
     weird = caches / "b[1]--t0-p0-zmid.nd2wsi-cache.building-99999999"
     for d in (dead1, dead2, weird):
         d.mkdir(parents=True)
-    assert sweep_stale_builds(caches) == 3
-    assert not dead1.exists() and not dead2.exists() and not weird.exists()
+    # Also create a valid single-file .replaced-* backup with its final .nd2svs missing.
+    final_file = caches / "c--t0-p0-zmid.nd2svs"
+    dead_file = caches / "c--t0-p0-zmid.nd2svs.replaced-cafebabe"
+    with SQLiteStore(dead_file) as store:
+        store.write_bytes("marker", b"previous-cache")
+
+    # While final caches are missing, .replaced-* backups (both dir and file) MUST be preserved,
+    # while orphaned .building-* staging dirs are swept.
+    assert sweep_stale_builds(caches) == 2
+    assert not dead1.exists() and not weird.exists()
+    assert dead2.is_dir() and dead_file.is_file()
+
+    # Once final caches are present, stranded .replaced-* backups are rescued & cleaned up.
+    ann = dead2 / "annotations_a.json"
+    ann.write_text('{"items": [{"id": "keep"}]}', encoding="utf-8")
+    final_dir.mkdir()
+    final_file.write_bytes(dead_file.read_bytes())
+    assert sweep_stale_builds(caches) == 2
+    assert not dead2.exists() and not dead_file.exists()
+    rescued = list((tmp_path / "annotations").glob("*annotations_a.json"))
+    assert len(rescued) == 1
+    assert json.loads(rescued[0].read_text(encoding="utf-8")) == {"items": [{"id": "keep"}]}
+
+
+def test_sweep_preserves_replaced_backup_when_final_is_symlink_or_unreadable(
+    tmp_path, monkeypatch, symlink_support
+):
+    from nd2wsi.cache import sweep_stale_builds
+
+    caches = tmp_path / "caches"
+    caches.mkdir()
+    backup = caches / "slide--t0-p0-zmid.nd2wsi-cache.replaced-11223344"
+    backup.mkdir()
+    (backup / "sentinel.bin").write_bytes(b"sole-copy")
+
+    # Symlink in final slot does not count as a real final cache -> preserve backup.
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    final_link = caches / "slide--t0-p0-zmid.nd2wsi-cache"
+    final_link.symlink_to(target, target_is_directory=True)
+    assert sweep_stale_builds(caches) == 0
+    assert (backup / "sentinel.bin").read_bytes() == b"sole-copy"
+
+    # Unreadable final path (OSError on lstat) fails safe -> preserve backup.
+    final_link.unlink()
+    final_link.mkdir()
+    real_lstat = os.lstat
+
+    def flaky_lstat(p, *args, **kwargs):
+        text = os.fspath(p)
+        if text.endswith("slide--t0-p0-zmid.nd2wsi-cache"):
+            raise PermissionError(13, "access denied")
+        return real_lstat(p, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", flaky_lstat)
+    assert sweep_stale_builds(caches) == 0
+    assert (backup / "sentinel.bin").read_bytes() == b"sole-copy"
 
 
 def test_sweep_preserves_the_staging_directory_of_a_live_process(tmp_path):
@@ -1354,16 +1411,60 @@ def test_convert_overwrite_guards_non_zarr_dir_regular_file_symlink_and_toctou(
 ):
     from nd2wsi import convert_cache
 
-    # _is_zarr_directory rejects symlinked .zattrs / .zgroup markers.
+    # _is_zarr_directory rejects symlinked markers, bare .zgroup, corrupt/unrelated .zattrs,
+    # and accepts valid Zarr v2 OME-Zarr/nd2wsi stores and legacy .nd2wsi-cache containers.
     spoof_dir = tmp_path / "spoof.ome.zarr"
     spoof_dir.mkdir()
     outside_marker = tmp_path / "outside.json"
-    outside_marker.write_text("{}", encoding="utf-8")
+    outside_marker.write_text('{"nd2wsi": {}}', encoding="utf-8")
+    (spoof_dir / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
+    # Bare .zgroup alone (missing .zattrs) must be refused.
+    assert convert_cache._is_zarr_directory(spoof_dir) is False
+    # Symlinked .zattrs must be refused.
     (spoof_dir / ".zattrs").symlink_to(outside_marker)
     assert convert_cache._is_zarr_directory(spoof_dir) is False
     (spoof_dir / ".zattrs").unlink()
+    # Corrupt JSON, empty dict, unrelated dict, or invalid multiscales must be refused.
+    for bad_attrs in ("{not-json", "{}", '{"unrelated": 1}', '{"multiscales": []}', '{"multiscales": [1]}'):
+        (spoof_dir / ".zattrs").write_text(bad_attrs, encoding="utf-8")
+        assert convert_cache._is_zarr_directory(spoof_dir) is False
+    # Invalid zarr_format must be refused even with valid .zattrs.
+    (spoof_dir / ".zattrs").write_text('{"nd2wsi": {}}', encoding="utf-8")
+    for bad_group in ('{"zarr_format": 3}', '{"zarr_format": true}', "{corrupt"):
+        (spoof_dir / ".zgroup").write_text(bad_group, encoding="utf-8")
+        assert convert_cache._is_zarr_directory(spoof_dir) is False
+    # Valid .zgroup (zarr_format == 2) + nd2wsi or OME-Zarr multiscales .zattrs is accepted.
     (spoof_dir / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
     assert convert_cache._is_zarr_directory(spoof_dir) is True
+    (spoof_dir / ".zattrs").write_text('{"multiscales": [{"version": "0.4"}]}', encoding="utf-8")
+    assert convert_cache._is_zarr_directory(spoof_dir) is True
+
+    # Legacy .nd2wsi-cache container: requires valid manifest.json + real store.ome.zarr Zarr v2 dir.
+    legacy_cache = tmp_path / "legacy.nd2wsi-cache"
+    (legacy_cache / "store.ome.zarr").mkdir(parents=True)
+    (legacy_cache / "manifest.json").write_text('{"format": "nd2wsi-cache/2"}', encoding="utf-8")
+    assert convert_cache._is_zarr_directory(legacy_cache) is False
+    (legacy_cache / "store.ome.zarr" / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
+    (legacy_cache / "store.ome.zarr" / ".zattrs").write_text('{"nd2wsi": {}}', encoding="utf-8")
+    assert convert_cache._is_zarr_directory(legacy_cache) is True
+    (legacy_cache / "manifest.json").write_text('{"format": "unknown/99"}', encoding="utf-8")
+    assert convert_cache._is_zarr_directory(legacy_cache) is False
+
+    # overwrite=True refuses directories with bare .zgroup, corrupt JSON, or unrelated .zattrs.
+    for label, files in (
+        ("bare_zgroup", {".zgroup": '{"zarr_format": 2}'}),
+        ("corrupt_json", {".zgroup": '{"zarr_format": 2}', ".zattrs": "{broken"}),
+        ("empty_zattrs", {".zgroup": '{"zarr_format": 2}', ".zattrs": "{}"}),
+        ("unrelated_zattrs", {".zgroup": '{"zarr_format": 2}', ".zattrs": '{"notes": "keep"}'}),
+    ):
+        decoy = tmp_path / f"{label}.ome.zarr"
+        decoy.mkdir()
+        for fname, content in files.items():
+            (decoy / fname).write_text(content, encoding="utf-8")
+        (decoy / "precious.txt").write_bytes(b"keep-me")
+        with pytest.raises(IsADirectoryError, match="non-Zarr"):
+            convert_mod.convert(slide, decoy, overwrite=True, progress=False)
+        assert (decoy / "precious.txt").read_bytes() == b"keep-me"
 
     # Directory overwrite=True refuses a non-Zarr user directory and preserves user files.
     user_dir = tmp_path / "my_notes.ome.zarr"

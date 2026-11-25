@@ -78,7 +78,7 @@ def test_bounded_file_and_extension(tmp_path):
     path = tmp_path / "bad.txt"
     Image.new("RGB", (80, 60)).save(path.with_suffix(".jpg"))
     path.write_bytes(b"x" * (MAX_BYTES + 1))
-    with pytest.raises(ValueError, match="16 MiB"):
+    with pytest.raises(ValueError, match="32 MiB"):
         load_roi_file(path, width=80, height=60)
     with pytest.raises(ValueError, match=".txt"):
         load_roi_file(path.with_suffix(".json"), width=80, height=60)

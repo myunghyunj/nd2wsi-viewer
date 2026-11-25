@@ -4,11 +4,14 @@ from __future__ import annotations
 import copy
 import io
 import json
+import shutil
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,6 +20,7 @@ from http_fixture import serving
 from PIL import Image
 
 from nd2wsi import astromap_export as am
+from nd2wsi import roi_list
 from nd2wsi.server import ViewerState, _frame_args, create_server
 
 
@@ -322,7 +326,7 @@ def test_http_astromap_accepts_over_1mb_utf8_payload():
     note = "조직" * 600  # 1,200 chars, 3,600 UTF-8 bytes
     rois = [{"x": 5, "y": 6, "w": 12, "h": 9, "note": note} for _ in range(500)]
     body = json.dumps(payload(rois=rois), ensure_ascii=False).encode("utf-8")
-    assert 1_500_000 < len(body) < 26_000_000
+    assert 1_500_000 < len(body) < roi_list.MAX_BYTES
     with http_server(st) as (_server, base):
         req = urllib.request.Request(
             base + "api/astromap",
@@ -337,3 +341,84 @@ def test_http_astromap_accepts_over_1mb_utf8_payload():
                 lines = bundle.read("example.txt").decode("utf-8").splitlines()
                 assert len(lines) == 501
                 assert lines[1].endswith(f"\t{note}")
+
+
+def test_http_astromap_1500_korean_notes_over_16mib_roundtrips_through_translucent_importer(
+    tmp_path: Path,
+):
+    st = make_state()
+    # 1,500 ROIs with 4,096-char Korean notes (~12,288 UTF-8 bytes each) -> ~17.6 MiB TXT,
+    # exceeding the old 16 MiB cap while fitting inside the aligned 32 MiB export/import limit.
+    note = "조직" * 2048
+    assert len(note) == 4096
+    rois = [{"x": 5, "y": 6, "w": 12, "h": 9, "note": note} for _ in range(1500)]
+    body = json.dumps(payload(rois=rois), ensure_ascii=False).encode("utf-8")
+    assert 16 * 1024 * 1024 < len(body) < roi_list.MAX_BYTES
+
+    with http_server(st) as (_server, base):
+        req = urllib.request.Request(
+            base + "api/astromap",
+            body,
+            {"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as response:
+            result = json.load(response)
+        assert result["count"] == 1500
+        with urllib.request.urlopen(urllib.parse.urljoin(base, result["download_url"])) as response:
+            zip_bytes = response.read()
+
+    txt_path = tmp_path / "example.txt"
+    jpg_path = tmp_path / "example.jpg"
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as bundle:
+        txt_path.write_bytes(bundle.read("example.txt"))
+        jpg_path.write_bytes(bundle.read("example.jpg"))
+
+    assert 16 * 1024 * 1024 < txt_path.stat().st_size < roi_list.MAX_BYTES
+
+    # Translucent viewer backend reader accepts the >16 MiB exported TXT + JPG pair cleanly.
+    loaded = roi_list.load_roi_file(txt_path, width=80, height=60, image_path=jpg_path)
+    assert loaded["ok"] is True
+    assert loaded["coordinateSize"] == {"width": 80, "height": 60}
+    lines = loaded["text"].splitlines()
+    assert len(lines) == 1501
+    assert lines[1].endswith(f"\t{note}")
+    assert lines[-1].endswith(f"\t{note}")
+
+    node = shutil.which("node")
+    if node is not None:
+        importer_js = Path(__file__).resolve().parents[1] / "nd2wsi/static/astromap-import-v1.js"
+        script = (
+            "const fs = require('node:fs');"
+            "const imp = require(process.argv[1]);"
+            "const text = fs.readFileSync(process.argv[2], 'utf8');"
+            "const size = { width: 80, height: 60 };"
+            "const review = imp.review(text, size);"
+            "const mapped = imp.mapToSource(review.rows, size, size);"
+            "process.stdout.write(JSON.stringify({"
+            "  count: review.count,"
+            "  skipped: review.skippedCount,"
+            "  mapped: mapped.length,"
+            "  firstLen: mapped[0].text.length,"
+            "  lastLen: mapped[mapped.length - 1].text.length,"
+            "  firstMatch: mapped[0].text === '조직'.repeat(2048),"
+            "  lastMatch: mapped[mapped.length - 1].text === '조직'.repeat(2048),"
+            "}));"
+        )
+        proc = subprocess.run(
+            [node, "-e", script, str(importer_js), str(txt_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+        parsed = json.loads(proc.stdout)
+        assert parsed == {
+            "count": 1500,
+            "skipped": 0,
+            "mapped": 1500,
+            "firstLen": 4096,
+            "lastLen": 4096,
+            "firstMatch": True,
+            "lastMatch": True,
+        }

@@ -3368,7 +3368,7 @@ async function readAstromapImportFile(file) {
   $("astromap-import-status").textContent = "Reading ROI coordinates…";
   refreshAstromapImport();
   try {
-    if (file.size > 16 * 1024 * 1024) throw new Error("ROI TXT must be smaller than 16 MiB");
+    if (file.size > 32 * 1024 * 1024) throw new Error("ROI TXT must be smaller than 32 MiB");
     let text;
     if (typeof file.arrayBuffer === "function") {
       const bytes = new Uint8Array(await file.arrayBuffer());
