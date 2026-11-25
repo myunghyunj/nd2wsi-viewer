@@ -562,18 +562,18 @@ def test_plate_reuses_cache_across_korean_nfc_nfd_names(tmp_path, plate_nd2, mon
     real_is_symlink = Path.is_symlink
     root_resolved = slide_dir.resolve()
 
-    def strict_exists(self: Path, *, follow_symlinks: bool = True) -> bool:
+    def strict_exists(self: Path, *args: object, **kwargs: object) -> bool:
         try:
             self.resolve().relative_to(root_resolved)
         except Exception:
-            return real_exists(self, follow_symlinks=follow_symlinks)
+            return real_exists(self, *args, **kwargs)
         if not self.name.isascii():
             try:
                 if self.name not in os.listdir(self.parent):
                     return False
             except OSError:
                 return False
-        return real_exists(self, follow_symlinks=follow_symlinks)
+        return real_exists(self, *args, **kwargs)
 
     def strict_is_symlink(self: Path) -> bool:
         try:

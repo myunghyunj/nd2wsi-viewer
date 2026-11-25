@@ -86,20 +86,20 @@ def _simulate_norm_sensitive_fs(monkeypatch: pytest.MonkeyPatch, root: Path) -> 
         except OSError:
             return True
 
-    def strict_exists(self: Path, *, follow_symlinks: bool = True) -> bool:
+    def strict_exists(self: Path, *args: object, **kwargs: object) -> bool:
         if _missing_exact_entry(self):
             return False
-        return real_exists(self, follow_symlinks=follow_symlinks)
+        return real_exists(self, *args, **kwargs)
 
     def strict_is_symlink(self: Path) -> bool:
         if _missing_exact_entry(self):
             return False
         return real_is_symlink(self)
 
-    def strict_is_dir(self: Path, *, follow_symlinks: bool = True) -> bool:
+    def strict_is_dir(self: Path, *args: object, **kwargs: object) -> bool:
         if _missing_exact_entry(self):
             return False
-        return real_is_dir(self, follow_symlinks=follow_symlinks)
+        return real_is_dir(self, *args, **kwargs)
 
     def strict_resolve(self: Path, strict: bool = False) -> Path:
         if _missing_exact_entry(self):
