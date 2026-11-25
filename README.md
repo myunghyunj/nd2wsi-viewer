@@ -20,6 +20,7 @@
 
 ## Recent updates
 
+- **AstroMapper multi-step resize import, multi-channel OME-TIFF fixes & security/lifecycle hardening (`2.6.11`):** accept 1-step and 2-step downscaled JPG/PNG AstroMapper reference images with dimension-bearing mismatch diagnostics, UTF-16 BOM ROI text support, PNG reference parity in the translucent viewer, 4,096-character ROI notes, integer-snapped dragged ROI boxes, and raised export payload limits; fix standards-compliant multi-IFD OME-TIFF 2016-06 output for multi-channel exports, degraded-overview ND2 export guards, and pre-stream export error reporting; and harden Zarr v2 metadata/symlink validation, overwrite conversion safety, atomic shading-correction recovery, translucent window close/capture/live-LUT reliability, and NFC/NFD locks with Windows long-path (`\\?\`) support. [2.6.11 release notes](docs/release-notes-2.6.11.md).
 - **Live translucent LUT updates & cross-OS exFAT cache portability (`2.6.10`):** sync contrast, gamma, colour, and channel edits live into the translucent viewer during continuous drags with paint-complete redraw gating, preserved lock/ROI alignment, and shading-rebuild expiry notices; preserve `.nd2svs` caches and Korean/non-ASCII sidecars seamlessly between macOS and Windows on external exFAT drives with timestamp-skew tolerance and NFC/NFD Unicode normalization. [2.6.10 release notes](docs/release-notes-2.6.10.md).
 - **Pre-1709 Windows 10 & LTSC workstation Setup support (`2.6.9`):** remove the Windows 10 build `16299` gate in per-user NSIS Setup so 64-bit Windows 10 (`10240+`, including Enterprise 2015/2016 LTSC microscope PCs) and Windows Server 2016+ install cleanly when `.NET Framework 4.6.2+` and WebView2 (`>= 109`) are present, with pre-1607 system-DPI overlay scaling, bundled MSVC CRT verification, and PowerShell `5.0` verifier compatibility. [2.6.9 release notes](docs/release-notes-2.6.9.md).
 - **Manually drawn Astromap ROIs in the translucent overlay (`2.6.8`):** carry over all enabled Astromap regions (both manually drawn and imported) into the translucent tracing window with their numbering, notes, and active selection intact. [2.6.8 release notes](docs/release-notes-2.6.8.md).
@@ -37,10 +38,10 @@
 
 ## Download
 
-| Platform | Download · 2.6.10 | Requirements |
+| Platform | Download · 2.6.11 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.10/nd2wsi-viewer-2.6.10-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.10/nd2wsi-viewer-2.6.10-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.10/nd2wsi-viewer-2.6.10-windows-x64.zip) | Windows 11 (x64, or ARM64 via x64 emulation) · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-windows-x64.zip) | Windows 11 (x64, or ARM64 via x64 emulation) · WebView2 |
 
 On macOS, drag the app into **Applications**; on first launch, choose **System Settings → Privacy & Security → Open Anyway** once (ad-hoc signed; signed Sparkle updates run from **nd2wsi-viewer → Check for Updates…** thereafter). On Windows, run the per-user **Installer** (no administrator prompt) or extract the entire **Portable ZIP** keeping `_internal` beside `nd2wsi-viewer.exe`, and allow the SmartScreen unsigned-publisher prompt if shown (verify against the accompanying `.sha256` checksum). See the [installation guide](docs/user-guide.md#get-started).
 
