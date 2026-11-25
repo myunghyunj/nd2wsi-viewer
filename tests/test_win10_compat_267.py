@@ -65,6 +65,16 @@ class _StatProxy:
         return getattr(self._real, name)
 
 
+def _plain_path(p: str | os.PathLike) -> Path:
+    """Strip Windows extended-length prefixes before comparing mocked paths."""
+    text = os.fspath(p)
+    if text.startswith("\\\\?\\UNC\\"):
+        text = "\\\\" + text[8:]
+    elif text.startswith("\\\\?\\"):
+        text = text[4:]
+    return Path(text)
+
+
 # ---------------------------------------------------------------------------
 # 1. is_windows_name_surrogate_reparse
 # ---------------------------------------------------------------------------
@@ -163,13 +173,13 @@ def test_session_lock_accepts_onedrive_and_rejects_surrogate(tmp_path: Path, mon
 
     def fake_lstat(p, *a, **kw):
         res = real_lstat(p, *a, **kw)
-        if Path(p) == lock_path:
+        if _plain_path(p) == lock_path:
             return _StatProxy(res, attrs=ATTR_REPARSE, tag=state["tag"])
         return res
 
     def fake_stat(p, *a, **kw):
         res = real_stat(p, *a, **kw)
-        if isinstance(p, (str, os.PathLike)) and Path(p) == lock_path:
+        if isinstance(p, (str, os.PathLike)) and _plain_path(p) == lock_path:
             return _StatProxy(res, attrs=ATTR_REPARSE, tag=state["tag"])
         return res
 
@@ -205,7 +215,7 @@ def test_annotation_workspace_accepts_onedrive_and_rejects_surrogate(
 
     def fake_lstat(p, *a, **kw):
         res = real_lstat(p, *a, **kw)
-        if Path(p) == sidecar:
+        if _plain_path(p) == sidecar:
             return _StatProxy(res, attrs=ATTR_REPARSE, tag=state["lstat_tag"])
         return res
 
@@ -242,7 +252,7 @@ def test_cache_lock_accepts_onedrive_and_rejects_surrogate(tmp_path: Path, monke
 
     def fake_lstat(p, *a, **kw):
         res = real_lstat(p, *a, **kw)
-        if Path(p) == lock.path:
+        if _plain_path(p) == lock.path:
             return _StatProxy(res, attrs=ATTR_REPARSE, tag=state["tag"])
         return res
 
@@ -283,7 +293,7 @@ def test_migration_accepts_onedrive_and_rejects_surrogate(tmp_path: Path, monkey
 
     def fake_lstat(p, *a, **kw):
         res = real_lstat(p, *a, **kw)
-        path = Path(p)
+        path = _plain_path(p)
         if path == container or container in path.parents:
             tag = state["dir_tag"] if stat.S_ISDIR(res.st_mode) else state["file_tag"]
             return _StatProxy(res, attrs=ATTR_REPARSE, tag=tag)
@@ -828,7 +838,7 @@ def test_annotation_workspace_end_to_end_write_with_win32_retry(
     calls = {"n": 0}
 
     def flaky_replace(src, dst):
-        if Path(dst) == sidecar and calls["n"] < 2:
+        if _plain_path(dst) == sidecar and calls["n"] < 2:
             calls["n"] += 1
             raise PermissionError(13, "transient Defender lock")
         return real_replace(src, dst)

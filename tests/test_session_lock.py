@@ -304,5 +304,5 @@ def test_session_file_lock_routes_os_calls_through_filesystem_path(tmp_path: Pat
     lock = SessionFileLock(path)
     with lock:
         assert lock.acquired
-    assert str(path) in seen
-    assert str(path.parent) in seen
+    assert real_fs_path(path) in seen
+    assert real_fs_path(path.parent) in seen
