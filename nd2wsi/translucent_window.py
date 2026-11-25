@@ -19,7 +19,8 @@ import uuid
 from functools import lru_cache
 from pathlib import Path
 
-from .window_chrome import NativeTitlebarDrag
+from .roi_list import roi_pair_paths
+from .window_chrome import NativeTitlebarDrag, _direct_destroy_window
 
 OPACITY = 0.55
 MIN_OPACITY = 0.10
@@ -30,6 +31,8 @@ _LOGPIXELSX = 88
 # Match nd2wsi/render.py without eagerly importing numpy at module load time.
 _FLOAT32_SAFE_BOUND = 3e38
 _HEX6_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+_ROI_BOUND_EPS = 1e-6
+_MAX_QUERY_BYTES = 16384
 
 
 @lru_cache(maxsize=1)
@@ -124,8 +127,12 @@ def validate_roi(store, payload):
     rectangle = {key: _number(payload.get(key), "ROI rectangle", 0, limit)
                  for key, limit in (("x", width), ("y", height), ("w", width), ("h", height))}
     if (rectangle["w"] <= 0 or rectangle["h"] <= 0
-            or rectangle["x"] + rectangle["w"] > width
-            or rectangle["y"] + rectangle["h"] > height):
+            or rectangle["x"] + rectangle["w"] > width + _ROI_BOUND_EPS
+            or rectangle["y"] + rectangle["h"] > height + _ROI_BOUND_EPS):
+        raise ValueError("ROI rectangle is outside the slide")
+    rectangle["w"] = min(rectangle["w"], width - rectangle["x"])
+    rectangle["h"] = min(rectangle["h"], height - rectangle["y"])
+    if rectangle["w"] <= 0 or rectangle["h"] <= 0:
         raise ValueError("ROI rectangle is outside the slide")
     return rectangle
 
@@ -237,6 +244,17 @@ def validate_display_query(store, display_query: str) -> list[tuple[str, str]]:
     return validate_display_params(store, params)
 
 
+def encode_validated_query(pairs) -> str:
+    """Encode validated query pairs and enforce the post-encode 16,384-byte limit."""
+    cleaned = urllib.parse.urlencode(pairs)
+    if not cleaned:
+        return ""
+    encoded = "?" + cleaned
+    if len(encoded) > _MAX_QUERY_BYTES:
+        raise ValueError("Query too long")
+    return encoded
+
+
 def merge_display_query(store, base_query: str, display_query: str) -> str:
     """Merge validated display overrides onto immutable launch base keys (g, t, p, z)."""
     display_pairs = validate_display_query(store, display_query)
@@ -245,8 +263,7 @@ def merge_display_query(store, base_query: str, display_query: str) -> str:
     base_pairs = urllib.parse.parse_qsl(base_query.removeprefix("?"), keep_blank_values=True)
     base_map = dict(base_pairs)
     preserved = [(key, base_map[key]) for key in ("g", "t", "p", "z") if key in base_map]
-    merged = display_pairs + preserved
-    return "?" + urllib.parse.urlencode(merged) if merged else ""
+    return encode_validated_query(display_pairs + preserved)
 
 
 def validate_context(store, payload, *, slide_url):
@@ -295,8 +312,7 @@ def validate_context(store, payload, *, slide_url):
                 canonical_pairs.append((key, display_map[key]))
         else:
             canonical_pairs.append((key, value))
-    cleaned = urllib.parse.urlencode(canonical_pairs)
-    context = {"version": 1, "slide_url": slide_url, "query": "?" + cleaned if cleaned else "",
+    context = {"version": 1, "slide_url": slide_url, "query": encode_validated_query(canonical_pairs),
                "center": center, "zoom": zoom, "rotation": rotation, "flip": flip,
                "dimensions": [width, height],
                "opacity": OPACITY, "opacity_mode": "native" if sys.platform == "win32" else "layer",
@@ -311,7 +327,7 @@ def validate_context(store, payload, *, slide_url):
         for roi in rois:
             rectangle = validate_roi(store, roi)
             label, index = roi.get("label"), roi.get("index")
-            if not isinstance(label, str) or len(label) > 1000:
+            if not isinstance(label, str) or len(label) > 4096:
                 raise ValueError("Invalid ROI label")
             if type(index) is not int or not 1 <= index <= 2**53 - 1 or index in indices:
                 raise ValueError("ROI indices must be positive, unique safe integers")
@@ -535,14 +551,14 @@ class TranslucentApi:
         self._on_closed(self)
 
     def choose_roi_file(self):
-        """Choose a coordinate-reference JPG and its AstroMapper TXT together."""
+        """Choose a coordinate-reference JPG/PNG and its AstroMapper TXT together."""
         if self._closed or self._locked:
             return {"ok": False, "message": "Unlock the translucent viewer to load ROIs."}
         import webview
 
         selected = self._window.create_file_dialog(
             webview.OPEN_DIALOG, allow_multiple=True,
-            file_types=("AstroMapper JPG and ROI coordinates (*.jpg;*.jpeg;*.txt)",),
+            file_types=("ROI list & image (*.txt;*.jpg;*.jpeg;*.png)",),
         )
         if not selected:
             return {"ok": False, "cancelled": True}
@@ -556,7 +572,7 @@ class TranslucentApi:
                 companion = self._window.create_file_dialog(
                     webview.OPEN_DIALOG, allow_multiple=False,
                     directory=str(chosen.parent),
-                    file_types=(("Matching coordinate reference JPG (*.jpg;*.jpeg)" if image_needed
+                    file_types=(("Reference image (*.jpg;*.jpeg;*.png)" if image_needed
                                  else "Matching AstroMapper ROI coordinates (*.txt)"),),
                 )
                 if not companion:
@@ -569,32 +585,7 @@ class TranslucentApi:
     @staticmethod
     def _roi_pair_paths(paths, *, require_pair=True):
         """Resolve one explicitly selected pair; never guess among siblings."""
-        if not isinstance(paths, (list, tuple)) or not 1 <= len(paths) <= 2:
-            raise ValueError("Choose one matching JPG and TXT pair.")
-        paths = [Path(path) for path in paths]
-        if any(path.suffix.casefold() not in (".txt", ".jpg", ".jpeg") for path in paths):
-            raise ValueError("Choose a coordinate-reference JPG and AstroMapper TXT.")
-        if len(paths) == 1:
-            chosen = paths[0]
-            suffixes = (".jpg", ".jpeg") if chosen.suffix.casefold() == ".txt" else (".txt",)
-            companions = [path for path in chosen.parent.iterdir()
-                          if path.stem.casefold() == chosen.stem.casefold()
-                          and path.suffix.casefold() in suffixes and path.is_file()]
-            if len(companions) == 1:
-                paths.append(companions[0])
-            elif require_pair:
-                message = ("More than one matching reference file was found. Drop the intended JPG and TXT together."
-                           if companions else "The matching JPG/TXT is missing. Drop both files together.")
-                raise ValueError(message)
-            else:
-                return paths
-        text = [path for path in paths if path.suffix.casefold() == ".txt"]
-        images = [path for path in paths if path.suffix.casefold() in (".jpg", ".jpeg")]
-        if len(text) != 1 or len(images) != 1:
-            raise ValueError("Choose one JPG and one TXT file.")
-        if text[0].stem.casefold() != images[0].stem.casefold():
-            raise ValueError("The reference JPG and TXT must have the same filename before the extension.")
-        return [text[0], images[0]]
+        return roi_pair_paths(paths, require_pair=require_pair)
 
     def _load_roi_files(self, paths):
         """Read the chosen pair for the shared AstroMapper browser importer."""
@@ -859,9 +850,21 @@ class TranslucentApi:
             self._epoch += 1
             self._session.retired = True
             self._session.cond.notify_all()
+            win = self._window
+            configured = self._configured
+        shown_event = getattr(getattr(win, "events", None), "shown", None)
+        unshown = (
+            win is not None
+            and callable(getattr(shown_event, "is_set", None))
+            and not shown_event.is_set()
+            and not configured
+        )
         try:
-            if self._window is not None:
-                self._window.destroy()
+            if win is not None:
+                if unshown:
+                    _direct_destroy_window(win)
+                else:
+                    win.destroy()
         finally:
             self._notify_closed()
         return True

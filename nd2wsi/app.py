@@ -419,7 +419,7 @@ def _install_app_updater(api: Api, window) -> None:
             )
             _UPDATER_COORDINATOR = coordinator
             _UPDATER_HANDLE = handle
-            api.attach_updater(handle)
+            api._attach_updater(handle)
         except Exception as exc:
             _dlog(f"updater setup failed: {exc!r}")
 
@@ -862,7 +862,7 @@ class Api:
     def open_update_notes(self, token):
         return self._open_manual_update(token, notes=True)
 
-    def attach_updater(self, handle) -> None:
+    def _attach_updater(self, handle) -> None:
         self._updater = handle
 
     def update_block_reason(self) -> str | None:
@@ -880,7 +880,7 @@ class Api:
             return f"Waiting for {count} {noun} to finish…"
         return None
 
-    def stop_server_for_update(self, timeout: float | None = None) -> None:
+    def _stop_server_for_update(self, timeout: float | None = None) -> None:
         """Synchronously release sockets, ND2 handles, and plate writers.
 
         With ``timeout``, raise TimeoutError if slide reads still hold their
@@ -888,7 +888,6 @@ class Api:
         and the release goes on; a later call, such as the exit teardown,
         waits for that same release again.
         """
-        self._close_translucent_windows(owner_closing=False)
         with self._server_lock:
             if self._httpd is not None:
                 server = self._httpd
@@ -896,6 +895,7 @@ class Api:
                 self._releasing_httpd = server
             else:
                 server = self._releasing_httpd
+        self._close_translucent_windows(owner_closing=False)
         if server is None:
             return
         shutdown = getattr(server, "shutdown_for_relaunch", None)
@@ -1281,14 +1281,14 @@ def _stop_server_at_exit(api, *, diagnostic: bool) -> None:
     would let an update in another window go ahead past it.
     """
     if diagnostic or not _HARD_EXIT_FOLLOWS.is_set():
-        api.stop_server_for_update()
+        api._stop_server_for_update()
         return
     finished = threading.Event()
     failure = []
 
     def stop():
         try:
-            api.stop_server_for_update()
+            api._stop_server_for_update()
         except BaseException as exc:
             failure.append(exc)
         finally:

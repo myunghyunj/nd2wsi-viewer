@@ -107,12 +107,40 @@ def test_existing_imported_roi_snapshot_preserves_source_geometry_without_select
 
 @pytest.mark.parametrize("change", [
     {"x": -1}, {"w": 0}, {"x": 7999, "w": 2}, {"y": float("nan")},
-    {"index": True}, {"index": 0}, {"index": 2**53}, {"label": None}, {"label": "x" * 1001},
+    {"index": True}, {"index": 0}, {"index": 2**53}, {"label": None}, {"label": "x" * 4097},
 ])
 def test_imported_roi_snapshot_rejects_invalid_geometry_or_metadata(store, payload, change):
     roi = {"x": 1, "y": 2, "w": 3, "h": 4, "index": 1, "label": "ROI 1", **change}
     with pytest.raises(ValueError):
         overlay.validate_context(store, {**payload, "rois": [roi]}, slide_url="local/")
+
+
+def test_validate_roi_allows_4096_label_and_clamps_two_axis_epsilon_overshoot(store, payload):
+    roi = {
+        "x": 7999.0000005,
+        "y": 5999.0000005,
+        "w": 1.0,
+        "h": 1.0,
+        "index": 1,
+        "label": "x" * 4096,
+    }
+    res = overlay.validate_context(store, {**payload, "rois": [roi]}, slide_url="local/")
+    cleaned = res["rois"][0]
+    assert len(cleaned["label"]) == 4096
+    assert cleaned["x"] + cleaned["w"] <= 8000
+    assert cleaned["y"] + cleaned["h"] <= 6000
+    assert cleaned["w"] > 0 and cleaned["h"] > 0
+
+    # Overshoot beyond 1e-6 on either axis is rejected.
+    for bad in (
+        {"x": 7999.0, "y": 1.0, "w": 1.000002, "h": 1.0},
+        {"x": 1.0, "y": 5999.0, "w": 1.0, "h": 1.000002},
+        # Clamping to zero width/height at the exact slide edge must still be rejected.
+        {"x": 8000.0, "y": 1.0, "w": 1e-7, "h": 1.0},
+        {"x": 1.0, "y": 6000.0, "w": 1.0, "h": 1e-7},
+    ):
+        with pytest.raises(ValueError, match="outside the slide"):
+            overlay.validate_roi(store, bad)
 
 
 @pytest.mark.parametrize("rois,selected", [
@@ -373,7 +401,7 @@ def test_cancelled_second_picker_does_not_import_partial_roi_data(cocoa_api, mon
 
 @pytest.mark.parametrize("names", [
     ["a.txt", "b.jpg"], ["a.txt", "a.txt"], ["a.jpg", "a.jpeg"],
-    ["a.txt", "a.png"], ["a.txt", "a.jpg", "a.jpeg"], [],
+    ["a.txt", "a.bmp"], ["a.txt", "a.jpg", "a.jpeg"], [],
 ])
 def test_pair_import_rejects_mismatched_extra_or_unsupported_files(cocoa_api, monkeypatch, tmp_path, names):
     load = Mock()
@@ -382,6 +410,28 @@ def test_pair_import_rejects_mismatched_extra_or_unsupported_files(cocoa_api, mo
     assert not result["ok"]
     assert result["message"]
     load.assert_not_called()
+
+
+def test_png_pair_import_and_picker_filters(cocoa_api, monkeypatch, tmp_path, raw_roi_pair):
+    q = cocoa_api
+    load = Mock(return_value=raw_roi_pair)
+    monkeypatch.setitem(sys.modules, "nd2wsi.roi_list", SimpleNamespace(load_roi_file=load))
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(OPEN_DIALOG=10))
+    text, image = tmp_path / "roi.txt", tmp_path / "elsewhere" / "roi.png"
+    text.touch()
+    q.window.create_file_dialog.side_effect = [[str(text)], [str(image)]]
+    assert q.api.choose_roi_file()["ok"]
+    first_types = q.window.create_file_dialog.call_args_list[0].kwargs["file_types"]
+    second_types = q.window.create_file_dialog.call_args_list[1].kwargs["file_types"]
+    assert any("*.png" in entry for entry in first_types)
+    assert any("*.png" in entry for entry in second_types)
+    load.assert_called_once_with(text, width=8000, height=6000, image_path=image)
+
+    load.reset_mock()
+    sibling_png = tmp_path / "ROI.PNG"
+    sibling_png.touch()
+    assert q.api._load_roi_files([text])["ok"]
+    load.assert_called_once_with(text, width=8000, height=6000, image_path=sibling_png)
 
 
 def test_drop_imports_pair_atomically_and_does_not_open_file_picker(cocoa_api, monkeypatch, tmp_path, raw_roi_pair):
@@ -542,7 +592,7 @@ def test_cancelled_update_and_individual_tab_close_manage_translucent_windows(st
     assert api.close_translucent_viewer("s1") == {"ok": True, "closed": True}
     children["s1"].close_translucent.assert_called_once()
     assert "s1" not in api._translucent_windows and "s2" in api._translucent_windows
-    api.stop_server_for_update()
+    api._stop_server_for_update()
     children["s2"].close_translucent.assert_called_once()
     assert api._translucent_owner_closed is False
 
@@ -1147,6 +1197,9 @@ def test_create_app_window_assigns_api_window_and_private_helpers_not_exposed(mo
     assert "open_translucent_viewer" in parent_funcs
     assert "update_translucent_display" in parent_funcs
     assert "close_translucent_viewer" in parent_funcs
+    assert "update_block_reason" in parent_funcs
+    assert "attach_updater" not in parent_funcs
+    assert "stop_server_for_update" not in parent_funcs
     assert all(not part.startswith("_") for name in parent_funcs for part in name.split("."))
 
     child_api = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
@@ -1290,4 +1343,157 @@ def test_create_translucent_window_triggers_did_close_when_closed_event_already_
     assert api._session_snapshot()[3] is True
     assert api._configured is False
     on_closed.assert_called_once_with(api)
+
+
+def test_encode_validated_query_enforces_post_encode_16384_byte_cap(payload, monkeypatch):
+    # Many channels with raw ':' and ',' pass the pre-parse 16384-char check but
+    # expand past 16384 bytes once percent-encoded (%3A, %2C).
+    many_channels = 2200
+    big_store = SimpleNamespace(
+        attrs={
+            "nd2wsi": {"rgb": False, "levels": [{"width": 8000, "height": 6000}]},
+            "omero": {"channels": [{} for _ in range(many_channels)]},
+        },
+        generation="pixels-2",
+        plate=None,
+    )
+    raw_win = ",".join(["0:1"] * many_channels)
+    raw_query = f"?win={raw_win}&g=pixels-2"
+    assert len(raw_query) <= 16384
+    assert len("?win=" + raw_win.replace(":", "%3A").replace(",", "%2C") + "&g=pixels-2") > 16384
+
+    with pytest.raises(ValueError, match="Query too long"):
+        overlay.validate_context(big_store, {**payload, "query": raw_query}, slide_url="http://local/s/abc/")
+
+    with pytest.raises(ValueError, match="Query too long"):
+        overlay.merge_display_query(big_store, "?g=pixels-2", f"win={raw_win}")
+
+    # Live display update surfaces the post-encode cap cleanly as invalid.
+    monkeypatch.setattr(sys, "platform", "darwin")
+    child = overlay.TranslucentApi(
+        {"dimensions": [8000, 6000], "query": "?g=pixels-2"},
+        logger=Mock(),
+        on_closed=Mock(),
+        launch_token="tok-long",
+        launch_generation="pixels-2",
+    )
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: big_store if sid == "s1" else None))
+    api._translucent_windows["s1"] = child
+    res = api.update_translucent_display("s1", "tok-long", 1, f"win={raw_win}")
+    assert res == {"ok": False, "invalid": True, "message": "Query too long"}
+
+    # Exact 16384-byte encoded query succeeds; 16385 fails.
+    exact = overlay.encode_validated_query([("g", "a" * (16384 - len("?g=")))])
+    assert len(exact) == 16384
+    with pytest.raises(ValueError, match="Query too long"):
+        overlay.encode_validated_query([("g", "a" * (16385 - len("?g=")))])
+    assert overlay.encode_validated_query([]) == ""
+
+
+def test_close_translucent_bypasses_shown_wait_on_confirmed_unshown_cocoa_window(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    queued = []
+    monkeypatch.setitem(sys.modules, "Foundation", SimpleNamespace(
+        NSOperationQueue=SimpleNamespace(mainQueue=lambda: SimpleNamespace(addOperationWithBlock_=queued.append)),
+    ))
+    native = SimpleNamespace(close=Mock())
+    window = SimpleNamespace(
+        uid="ov-cocoa-1",
+        native=native,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(side_effect=AssertionError("must not call @_shown_call destroy() on unshown window")),
+    )
+    on_closed = Mock()
+    api = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed)
+    api._window = window
+
+    assert api.close_translucent() is True
+    window.destroy.assert_not_called()
+    assert len(queued) == 1
+    native.close.assert_not_called()
+    queued.pop()()
+    native.close.assert_called_once_with()
+    on_closed.assert_called_once_with(api)
+
+
+def test_close_translucent_direct_destroy_winforms_and_gui_fallback(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda fn: fn))
+
+    # 1. Worker thread (InvokeRequired=True) uses BeginInvoke and checks IsDisposed.
+    invoked = []
+    native = SimpleNamespace(
+        IsDisposed=False,
+        InvokeRequired=True,
+        BeginInvoke=invoked.append,
+        Close=Mock(),
+    )
+    window = SimpleNamespace(
+        uid="ov-win-1",
+        native=native,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(side_effect=AssertionError("must not block in destroy()")),
+    )
+    on_closed = Mock()
+    api = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed)
+    api._window = window
+    assert api.close_translucent() is True
+    assert len(invoked) == 1
+    invoked.pop()()
+    native.Close.assert_called_once_with()
+    on_closed.assert_called_once_with(api)
+
+    # 2. Already disposed native form skips Close().
+    disposed_native = SimpleNamespace(IsDisposed=True, InvokeRequired=False, Close=Mock())
+    api2 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
+    api2._window = SimpleNamespace(native=disposed_native, events=SimpleNamespace(shown=Event()), destroy=Mock())
+    assert api2.close_translucent() is True
+    disposed_native.Close.assert_not_called()
+    api2._window.destroy.assert_not_called()
+
+    # 3. Missing native falls back to gui.destroy_window(uid).
+    gui = SimpleNamespace(destroy_window=Mock())
+    api3 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
+    api3._window = SimpleNamespace(uid="ov-fallback", native=None, gui=gui, events=SimpleNamespace(shown=Event()), destroy=Mock())
+    assert api3.close_translucent() is True
+    gui.destroy_window.assert_called_once_with("ov-fallback")
+    api3._window.destroy.assert_not_called()
+
+    # 4. Shown window still uses normal window.destroy().
+    shown = Event()
+    shown.is_set = lambda: True
+    api4 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
+    api4._window = SimpleNamespace(uid="ov-shown", native=native, events=SimpleNamespace(shown=shown), destroy=Mock())
+    assert api4.close_translucent() is True
+    api4._window.destroy.assert_called_once_with()
+
+    # 5. Invoke-only WinForms native and InvokeRequired=False both call Close().
+    invoke_only_native = SimpleNamespace(IsDisposed=False, InvokeRequired=True, Invoke=lambda fn: fn(), Close=Mock())
+    api5 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
+    api5._window = SimpleNamespace(native=invoke_only_native, events=SimpleNamespace(shown=Event()), destroy=Mock())
+    assert api5.close_translucent() is True
+    invoke_only_native.Close.assert_called_once_with()
+    api5._window.destroy.assert_not_called()
+
+    direct_native = SimpleNamespace(IsDisposed=False, InvokeRequired=False, Close=Mock())
+    api6 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
+    api6._window = SimpleNamespace(native=direct_native, events=SimpleNamespace(shown=Event()), destroy=Mock())
+    assert api6.close_translucent() is True
+    direct_native.Close.assert_called_once_with()
+
+    # 6. Configured window uses normal window.destroy(), and failing direct-destroy still notifies closed.
+    api7 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
+    api7._configured = True
+    api7._window = SimpleNamespace(native=native, events=SimpleNamespace(shown=Event()), destroy=Mock())
+    assert api7.close_translucent() is True
+    api7._window.destroy.assert_called_once_with()
+
+    on_closed_err = Mock()
+    api8 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed_err)
+    failing_gui = SimpleNamespace(destroy_window=Mock(side_effect=RuntimeError("native boom")))
+    api8._window = SimpleNamespace(uid="ov-fail", native=None, gui=failing_gui, events=SimpleNamespace(shown=Event()), destroy=Mock())
+    with pytest.raises(RuntimeError, match="native boom"):
+        api8.close_translucent()
+    on_closed_err.assert_called_once_with(api8)
 

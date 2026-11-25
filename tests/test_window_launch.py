@@ -229,7 +229,7 @@ def test_windows_main_window_gets_the_same_close_guard_without_cocoa(monkeypatch
 def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monkeypatch, tmp_path, argv, role, platform):
     monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path))
-    api = SimpleNamespace(_startup_error=None, stop_server_for_update=Mock())
+    api = SimpleNamespace(_startup_error=None, _stop_server_for_update=Mock())
     create = Mock(return_value=(api, object()))
     monkeypatch.setattr(app, "create_app_window", create)
     webview = SimpleNamespace(start=Mock())
@@ -245,7 +245,7 @@ def test_native_main_creates_fresh_session_private_webview_and_marks_closed(monk
         expected["storage_path"] = str(udf)
         assert udf.is_dir()
     webview.start.assert_called_once_with(**expected)
-    api.stop_server_for_update.assert_called_once()
+    api._stop_server_for_update.assert_called_once()
 
 
 class MainQueue:

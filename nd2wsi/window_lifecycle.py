@@ -35,7 +35,7 @@ class LifecycleApi(Protocol):
 
     def update_block_reason(self) -> str | None: ...
 
-    def stop_server_for_update(self, timeout: float | None = None) -> None: ...
+    def _stop_server_for_update(self, timeout: float | None = None) -> None: ...
 
 
 class LifecycleWindow(Protocol):
@@ -436,14 +436,21 @@ class UpdateShutdownCoordinator:
             if not self._drain_and_close(request_id, cancelled):
                 return
             def finish():
-                if not self._is_current(request_id, cancelled):
+                with self._lock:
+                    current = self._request_id == request_id and not cancelled.is_set()
+                    torn_down = self._teardown_started
+                if not current:
                     return
                 try:
                     self._log("Sparkle shutdown: resources released; resuming installer")
-                    # Preparation ends here. Resuming makes Sparkle send this
-                    # app a quit, which arrives as a native close; it must
-                    # reach the close guard exactly as before, not the veto.
-                    self._ownership().release(self, request_id)
+                    # Preparation saved the panes and stopped the server. Mark
+                    # teardown complete before releasing ownership so Sparkle's
+                    # quit passes the close guard immediately without vetoing
+                    # or running a second save handshake against a stopped server.
+                    ownership = self._ownership()
+                    if torn_down and getattr(self.api, "_httpd", None) is None:
+                        ownership.mark_torn_down()
+                    ownership.release(self, request_id)
                     completion()
                 except Exception as exc:
                     completion_errors.append(exc)
@@ -513,7 +520,7 @@ class UpdateShutdownCoordinator:
         wait, waiting = self._TEARDOWN_TIMEOUT, False
         while True:
             try:
-                self.api.stop_server_for_update(timeout=max(0.0, min(wait, deadline - time.monotonic())))
+                self.api._stop_server_for_update(timeout=max(0.0, min(wait, deadline - time.monotonic())))
                 return
             except TimeoutError as exc:
                 if cancelled.is_set():

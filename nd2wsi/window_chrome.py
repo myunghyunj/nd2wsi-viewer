@@ -428,3 +428,66 @@ def install_window_menu(api, window, *, logger: Callable[[str], None]) -> None:
         NSOperationQueue.mainQueue().addOperationWithBlock_(install)
     except Exception as exc:
         logger(f"window menu setup failed: {exc!r}")
+
+
+def _direct_destroy_window(window) -> None:
+    """Destroy a pywebview window without waiting for its ``shown`` event.
+
+    pywebview's ``Window.destroy()`` is decorated with ``@_shown_call``, which
+    blocks for 20 seconds and raises if a window created with ``hidden=True``
+    is closed before its native ``shown`` event fires.
+    """
+    native = getattr(window, "native", None)
+    if sys.platform == "win32" and native is not None and callable(getattr(native, "Close", None)):
+        if getattr(native, "IsDisposed", False):
+            return
+
+        def _close_winforms() -> None:
+            if not getattr(native, "IsDisposed", False):
+                native.Close()
+
+        if getattr(native, "InvokeRequired", False):
+            def _close_winforms_guarded() -> None:
+                try:
+                    _close_winforms()
+                except Exception:
+                    pass
+
+            try:
+                from System import Action
+
+                delegate = Action(_close_winforms_guarded)
+            except Exception:
+                delegate = _close_winforms_guarded
+            begin_invoke = getattr(native, "BeginInvoke", None)
+            if callable(begin_invoke):
+                begin_invoke(delegate)
+                return
+            invoke = getattr(native, "Invoke", None)
+            if callable(invoke):
+                invoke(delegate)
+                return
+        else:
+            _close_winforms()
+            return
+    elif sys.platform == "darwin":
+        target = native if callable(getattr(native, "close", None)) else getattr(native, "window", None)
+        if target is not None and callable(getattr(target, "close", None)):
+            try:
+                from Foundation import NSOperationQueue
+            except Exception:
+                NSOperationQueue = None
+            if NSOperationQueue is not None:
+                def _close_cocoa() -> None:
+                    try:
+                        target.close()
+                    except Exception:
+                        pass
+
+                NSOperationQueue.mainQueue().addOperationWithBlock_(_close_cocoa)
+                return
+    gui = getattr(window, "gui", None)
+    uid = getattr(window, "uid", None)
+    destroy_window = getattr(gui, "destroy_window", None)
+    if callable(destroy_window) and uid is not None:
+        destroy_window(uid)
