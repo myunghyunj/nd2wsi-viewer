@@ -37,6 +37,7 @@ from .cache_removal import (
     rescue_annotations,
 )
 from .direct_common import _Lifecycle
+from .platform_io import filesystem_path
 from .server_series import (
     _inspect_path_series,
     _path_usage,
@@ -240,7 +241,7 @@ class ViewerState:
         path = self.cache_path
         try:
             if path is not None and path.suffix.lower() == ".nd2svs":
-                st = path.stat()
+                st = os.stat(filesystem_path(path))
                 return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
         except OSError:
             pass

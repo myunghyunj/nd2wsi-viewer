@@ -750,3 +750,48 @@ def test_nfc_nfd_cache_locks_and_sweep_coexist_with_2610_locks_on_norm_sensitive
     )
     assert sweep_stale_builds(caches) == 2
     assert not nfd_staging.exists() and not nfc_staging.exists()
+
+
+def test_resolve_existing_path_and_cache_lock_init_route_through_filesystem_path(
+    tmp_path, monkeypatch
+):
+    from nd2wsi import cache as cache_mod
+    from nd2wsi.cache import CacheLock, resolve_existing_path
+
+    seen: list[str] = []
+    real_fs_path = cache_mod.filesystem_path
+
+    def spy_fs_path(p, **kw):
+        res = real_fs_path(p, **kw)
+        seen.append(res)
+        return res
+
+    monkeypatch.setattr(cache_mod, "filesystem_path", spy_fs_path)
+
+    caches = tmp_path / "caches"
+    caches.mkdir()
+    nfc_name = unicodedata.normalize("NFC", "샘플_경로.nd2svs")
+    nfd_name = unicodedata.normalize("NFD", "샘플_경로.nd2svs")
+    assert nfc_name != nfd_name
+
+    # 1. resolve_existing_path routes exists/is_symlink/is_dir/scandir through filesystem_path
+    #    while returning a plain Path matching the existing NFD sibling.
+    nfd_file = caches / nfd_name
+    nfd_file.write_bytes(b"cache")
+    _simulate_norm_sensitive_fs(monkeypatch, tmp_path)
+
+    found = resolve_existing_path(caches / nfc_name, kind="file")
+    assert found == nfd_file
+    assert real_fs_path(caches / nfc_name) in seen
+    assert real_fs_path(caches) in seen
+
+    # 2. CacheLock.__init__ routes its canonical-vs-arbiter existence check through filesystem_path.
+    seen.clear()
+    nfd_arbiter = caches / (nfd_name + ".lock.arbiter")
+    nfd_arbiter.write_bytes(b"")
+    lock = CacheLock(caches / nfc_name)
+    assert lock.path == caches / (nfd_name + ".lock")
+    expected_canonical_lock = real_fs_path(caches / (nfc_name + ".lock"))
+    assert seen.count(expected_canonical_lock) >= 2
+    assert real_fs_path(caches / (nfc_name + ".lock.arbiter")) in seen
+    assert real_fs_path(caches) in seen

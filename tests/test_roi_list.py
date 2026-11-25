@@ -149,6 +149,41 @@ def test_roi_pair_paths_supports_png_and_case_insensitive_stems(tmp_path):
         roi_pair_paths([txt, tmp_path / "Other.png"])
 
 
+def test_roi_companion_discovery_routes_through_filesystem_path_and_returns_plain_paths(
+    tmp_path, monkeypatch
+):
+    seen: list[str] = []
+    real_fs_path = roi_list.filesystem_path
+
+    def spy_fs_path(p, **kw):
+        res = real_fs_path(p, **kw)
+        seen.append(res)
+        return res
+
+    monkeypatch.setattr(roi_list, "filesystem_path", spy_fs_path)
+
+    txt = tmp_path / "sample.txt"
+    jpg = tmp_path / "sample.jpg"
+    txt.write_text(TEXT, encoding="utf-8")
+    Image.new("RGB", (80, 60)).save(jpg)
+
+    # 1. roi_pair_paths routes scandir and is_file through filesystem_path and returns plain Paths.
+    pair = roi_pair_paths([txt])
+    assert pair == [txt, jpg]
+    assert all(not str(p).startswith("\\\\?\\") for p in pair)
+    assert real_fs_path(tmp_path) in seen
+    assert real_fs_path(jpg) in seen
+
+    # 2. load_roi_file companion auto-discovery routes is_file + os.open through filesystem_path.
+    seen.clear()
+    result = load_roi_file(txt, width=800, height=600)
+    assert result["ok"] is True
+    assert result["coordinateSize"] == {"width": 80, "height": 60}
+    assert result["reference"] == {"name": "sample.jpg", "width": 80, "height": 60}
+    assert real_fs_path(txt) in seen
+    assert seen.count(real_fs_path(jpg)) >= 2
+
+
 def test_header_reader_enforces_2b_pixel_cap_and_invalid_dimensions():
     assert _MAX_REFERENCE_HEADER_PIXELS == 2_000_000_000
     # Exactly at the 2B pixel ceiling succeeds for both JPEG and PNG.

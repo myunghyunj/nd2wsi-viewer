@@ -2212,3 +2212,134 @@ def test_close_translucent_direct_destroy_winforms_and_gui_fallback(monkeypatch)
         api8.close_translucent()
     on_closed_err.assert_called_once_with(api8)
 
+
+def test_close_translucent_winforms_uncreated_handle_falls_back_without_off_thread_close(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda fn: fn))
+
+    # 1. IsHandleCreated=False with InvokeRequired=False (off-thread hidden Form) must NOT call Close().
+    native = SimpleNamespace(IsDisposed=False, IsHandleCreated=False, InvokeRequired=False, Close=Mock())
+    gui = SimpleNamespace(destroy_window=Mock())
+    on_closed = Mock()
+    api = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed)
+    api._window = SimpleNamespace(
+        uid="ov-uncreated",
+        native=native,
+        gui=gui,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(),
+    )
+    assert api.close_translucent() is True
+    native.Close.assert_not_called()
+    gui.destroy_window.assert_called_once_with("ov-uncreated")
+    api._window.destroy.assert_not_called()
+    on_closed.assert_called_once_with(api)
+
+    # 2. IsHandleCreated=False with InvokeRequired=True also skips BeginInvoke/Close and falls back.
+    native2 = SimpleNamespace(
+        IsDisposed=False,
+        IsHandleCreated=False,
+        InvokeRequired=True,
+        BeginInvoke=Mock(),
+        Close=Mock(),
+    )
+    gui2 = SimpleNamespace(destroy_window=Mock())
+    on_closed2 = Mock()
+    api2 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed2)
+    api2._window = SimpleNamespace(
+        uid="ov-uncreated-invoke",
+        native=native2,
+        gui=gui2,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(),
+    )
+    assert api2.close_translucent() is True
+    native2.BeginInvoke.assert_not_called()
+    native2.Close.assert_not_called()
+    gui2.destroy_window.assert_called_once_with("ov-uncreated-invoke")
+    on_closed2.assert_called_once_with(api2)
+
+    # 3. IsHandleCreated=True with InvokeRequired=False calls Close() directly without gui fallback.
+    created_native = SimpleNamespace(IsDisposed=False, IsHandleCreated=True, InvokeRequired=False, Close=Mock())
+    gui3 = SimpleNamespace(destroy_window=Mock())
+    api3 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
+    api3._window = SimpleNamespace(
+        uid="ov-created",
+        native=created_native,
+        gui=gui3,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(),
+    )
+    assert api3.close_translucent() is True
+    created_native.Close.assert_called_once_with()
+    gui3.destroy_window.assert_not_called()
+
+
+def test_close_translucent_winforms_absorbs_disposal_exceptions_and_notifies_closed(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda fn: fn))
+
+    # 1. BeginInvoke raising concurrent ObjectDisposedException is absorbed; _notify_closed still runs.
+    begin_native = SimpleNamespace(
+        IsDisposed=False,
+        IsHandleCreated=True,
+        InvokeRequired=True,
+        BeginInvoke=Mock(side_effect=RuntimeError("ObjectDisposedException")),
+        Invoke=Mock(),
+        Close=Mock(),
+    )
+    gui1 = SimpleNamespace(destroy_window=Mock())
+    on_closed1 = Mock()
+    api1 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed1)
+    api1._window = SimpleNamespace(
+        uid="ov-begin-disposed",
+        native=begin_native,
+        gui=gui1,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(),
+    )
+    assert api1.close_translucent() is True
+    begin_native.BeginInvoke.assert_called_once()
+    begin_native.Invoke.assert_not_called()
+    gui1.destroy_window.assert_not_called()
+    on_closed1.assert_called_once_with(api1)
+
+    # 2. Invoke raising concurrent InvalidOperationException is absorbed; _notify_closed still runs.
+    invoke_native = SimpleNamespace(
+        IsDisposed=False,
+        IsHandleCreated=True,
+        InvokeRequired=True,
+        Invoke=Mock(side_effect=RuntimeError("InvalidOperationException")),
+        Close=Mock(),
+    )
+    on_closed2 = Mock()
+    api2 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed2)
+    api2._window = SimpleNamespace(
+        uid="ov-invoke-disposed",
+        native=invoke_native,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(),
+    )
+    assert api2.close_translucent() is True
+    invoke_native.Invoke.assert_called_once()
+    on_closed2.assert_called_once_with(api2)
+
+    # 3. Direct Close() raising concurrent ObjectDisposedException is absorbed; _notify_closed still runs.
+    direct_native = SimpleNamespace(
+        IsDisposed=False,
+        IsHandleCreated=True,
+        InvokeRequired=False,
+        Close=Mock(side_effect=RuntimeError("ObjectDisposedException")),
+    )
+    on_closed3 = Mock()
+    api3 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed3)
+    api3._window = SimpleNamespace(
+        uid="ov-direct-disposed",
+        native=direct_native,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(),
+    )
+    assert api3.close_translucent() is True
+    direct_native.Close.assert_called_once_with()
+    on_closed3.assert_called_once_with(api3)
+

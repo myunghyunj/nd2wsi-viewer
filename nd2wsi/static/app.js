@@ -3414,6 +3414,7 @@ async function readAstromapImportJpg(file) {
   const seq = state.astromap.importSeq = (state.astromap.importSeq || 0) + 1;
   state.astromap.importReading = true;
   refreshAstromapImport();
+  let readError = null;
   try {
     const size = await window.Nd2AstromapImport.readImageSize(file);
     if (seq !== state.astromap.importSeq) return false;
@@ -3425,12 +3426,13 @@ async function readAstromapImportJpg(file) {
     $("astromap-import-status").textContent = `${file.name}: ${fmtInt(size.width)} × ${fmtInt(size.height)} px. Ready to import.`;
     return true;
   } catch (error) {
-    if (seq === state.astromap.importSeq) $("astromap-import-status").textContent = error.message;
+    readError = error?.message ?? String(error);
     return false;
   } finally {
     if (seq === state.astromap.importSeq) {
       state.astromap.importReading = false;
       refreshAstromapImport();
+      if (readError !== null) $("astromap-import-status").textContent = readError;
     }
   }
 }

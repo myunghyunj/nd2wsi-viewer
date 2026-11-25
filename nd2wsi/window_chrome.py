@@ -431,9 +431,11 @@ def install_window_menu(api, window, *, logger: Callable[[str], None]) -> None:
 
 
 def _close_winforms_native(native) -> bool:
-    """Close a WinForms native window on its UI thread, guarding disposed handles."""
+    """Close a WinForms native window on its UI thread, guarding disposed/uncreated handles."""
     if getattr(native, "IsDisposed", False):
         return True
+    if hasattr(native, "IsHandleCreated") and not native.IsHandleCreated:
+        return False
 
     def _close_winforms() -> None:
         if not getattr(native, "IsDisposed", False):
@@ -454,14 +456,23 @@ def _close_winforms_native(native) -> bool:
             delegate = _close_winforms_guarded
         begin_invoke = getattr(native, "BeginInvoke", None)
         if callable(begin_invoke):
-            begin_invoke(delegate)
+            try:
+                begin_invoke(delegate)
+            except Exception:
+                pass
             return True
         invoke = getattr(native, "Invoke", None)
         if callable(invoke):
-            invoke(delegate)
+            try:
+                invoke(delegate)
+            except Exception:
+                pass
             return True
         return False
-    _close_winforms()
+    try:
+        _close_winforms()
+    except Exception:
+        pass
     return True
 
 
@@ -498,6 +509,6 @@ def _direct_destroy_window(window) -> bool:
     if callable(destroy_window) and uid is not None:
         destroy_window(uid)
         return True
-    if native is not None and callable(getattr(native, "Close", None)):
+    if sys.platform != "win32" and native is not None and callable(getattr(native, "Close", None)):
         return _close_winforms_native(native)
     return False
