@@ -1014,6 +1014,7 @@ def test_c2_overwrite_262_zgroup_dir_keeps_old_store_if_publish_fails(
     legacy_dir = tmp_path / "legacy_262.nd2svs"
     legacy_dir.mkdir()
     (legacy_dir / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
+    (legacy_dir / ".zattrs").write_text('{"nd2wsi": {"tile": 16}}', encoding="utf-8")
     sentinel = legacy_dir / "old_level0_payload.bin"
     sentinel.write_bytes(b"old-262-store-bytes")
 
@@ -1135,6 +1136,7 @@ def test_cpe5_convert_nd2svs_single_file_and_cli_info(tmp_path: Path, capsys):
     out_nd2svs.unlink()
     out_nd2svs.mkdir()
     (out_nd2svs / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
+    (out_nd2svs / ".zattrs").write_text('{"nd2wsi": {"tile": 16}}', encoding="utf-8")
     convert(src, out_nd2svs, overwrite=True, progress=False)
     assert out_nd2svs.is_file() and is_single_file(out_nd2svs)
 

@@ -47,7 +47,7 @@ from typing import Any
 
 import numpy as np
 
-from . import render
+from . import render, roi_list
 from .annotation_sidecars import (
     SLIDE_SUFFIXES,
     _manifest_source_path,
@@ -1609,7 +1609,7 @@ def make_handler(
 
         def _astromap(self, st: ViewerState):
             try:
-                payload = self._body_json(limit=26_000_000)
+                payload = self._body_json(limit=roi_list.MAX_BYTES)
             except (ValueError, json.JSONDecodeError) as exc:
                 return self._error(400, str(exc))
             prefix = (f"agent-{registry.window_session.id[:12]}_" if registry.agent_window else "")

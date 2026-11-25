@@ -8,6 +8,7 @@ without circular imports.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import stat
@@ -255,27 +256,108 @@ def _sample_plane_blocks(src: PlaneSource, tile: int, points: int) -> list[np.nd
 # ---------------------------------------------------------------------------
 
 
+_MAX_METADATA_JSON_BYTES = 1_048_576
+
+
+def _read_bounded_json_dict(path: Path) -> dict[str, Any] | None:
+    """Safely read a regular, non-symlink, non-reparse JSON object <= 1 MiB."""
+    from .platform_io import BINARY, filesystem_path
+    from .windows_fs import is_windows_name_surrogate_reparse
+
+    native = filesystem_path(path)
+    try:
+        lst = os.lstat(native)
+    except OSError:
+        return None
+    if (
+        stat.S_ISLNK(lst.st_mode)
+        or is_windows_name_surrogate_reparse(lst)
+        or not stat.S_ISREG(lst.st_mode)
+    ):
+        return None
+    flags = (
+        os.O_RDONLY
+        | BINARY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(native, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or is_windows_name_surrogate_reparse(st, fd=fd)
+            or (
+                st.st_ino != 0
+                and lst.st_ino != 0
+                and (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino)
+            )
+            or st.st_size > _MAX_METADATA_JSON_BYTES
+        ):
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_METADATA_JSON_BYTES:
+                return None
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        parsed = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _is_valid_zarr_v2_store_dir(path: Path) -> bool:
+    zgroup = _read_bounded_json_dict(path / ".zgroup")
+    if zgroup is None or type(zgroup.get("zarr_format")) is not int or zgroup["zarr_format"] != 2:
+        return False
+    zattrs = _read_bounded_json_dict(path / ".zattrs")
+    if zattrs is None:
+        return False
+    if isinstance(zattrs.get("nd2wsi"), dict):
+        return True
+    multiscales = zattrs.get("multiscales")
+    return (
+        isinstance(multiscales, list)
+        and len(multiscales) > 0
+        and all(isinstance(m, dict) for m in multiscales)
+    )
+
+
 def _is_zarr_directory(path: Path) -> bool:
+    from .cache import KNOWN_FORMATS, MANIFEST_NAME, STORE_NAME
     from .platform_io import filesystem_path
     from .windows_fs import is_windows_name_surrogate_reparse
 
-    has_marker = False
-    for name in (".zattrs", ".zgroup"):
-        marker = path / name
-        try:
-            st = os.lstat(filesystem_path(marker))
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return False
-        if (
-            stat.S_ISLNK(st.st_mode)
-            or is_windows_name_surrogate_reparse(st)
-            or not stat.S_ISREG(st.st_mode)
-        ):
-            return False
-        has_marker = True
-    return has_marker
+    if _is_valid_zarr_v2_store_dir(path):
+        return True
+    manifest = _read_bounded_json_dict(path / MANIFEST_NAME)
+    if manifest is None or manifest.get("format") not in KNOWN_FORMATS:
+        return False
+    store_dir = path / STORE_NAME
+    try:
+        st = os.lstat(filesystem_path(store_dir))
+    except OSError:
+        return False
+    if (
+        stat.S_ISLNK(st.st_mode)
+        or is_windows_name_surrogate_reparse(st)
+        or not stat.S_ISDIR(st.st_mode)
+    ):
+        return False
+    return _is_valid_zarr_v2_store_dir(store_dir)
 
 
 def _validate_convert_target(

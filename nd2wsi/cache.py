@@ -1094,6 +1094,33 @@ def _sweep_lock_candidates(caches_dir: Path, family: str) -> list[CacheLock]:
     return candidates
 
 
+def _final_cache_present(caches_dir: Path, family: str) -> bool:
+    """True when ``family`` exists as a real, non-symlink file or directory."""
+    candidates: list[Path] = []
+    for base in (caches_dir / family, caches_dir / normalize_name(family)):
+        resolved = resolve_existing_path(base)
+        if resolved not in candidates:
+            candidates.append(resolved)
+        if base not in candidates:
+            candidates.append(base)
+    for candidate in candidates:
+        try:
+            st = os.lstat(filesystem_path(candidate))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Fail safe: if the final cache cannot be inspected, preserve backup.
+            return False
+        if (
+            stat.S_ISLNK(st.st_mode)
+            or is_windows_name_surrogate_reparse(st)
+            or not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode))
+        ):
+            continue
+        return True
+    return False
+
+
 def sweep_stale_builds(caches_dir: Path) -> int:
     """Remove leftover staging and backup dirs whose builder is gone.
 
@@ -1110,10 +1137,11 @@ def sweep_stale_builds(caches_dir: Path) -> int:
         names = [entry.name for entry in it]
     for name in names:
         item = caches_dir / name
-        match = re.fullmatch(r"(.+\.(?:nd2wsi-cache|nd2svs))\.(?:building|replaced)-[^/]+", name)
+        match = re.fullmatch(r"(.+\.(?:nd2wsi-cache|nd2svs))\.(building|replaced)-[^/]+", name)
         if match is None:
             continue
-        family = match.group(1)
+        family, kind = match.group(1), match.group(2)
+        is_replaced = kind == "replaced"
         locks = _sweep_lock_candidates(caches_dir, family)
         held_arbiters: list[SessionFileLock] = []
         held_inodes: set[tuple[int, int]] = set()
@@ -1176,6 +1204,9 @@ def sweep_stale_builds(caches_dir: Path) -> int:
                         break
             if unreadable or live:
                 continue
+            if is_replaced and not _final_cache_present(caches_dir, family):
+                # Preserve sole backup if commit crashed between the two renames.
+                continue
             try:
                 _refuse_database_companions(item)
                 item_st = os.lstat(filesystem_path(item))
@@ -1188,7 +1219,7 @@ def sweep_stale_builds(caches_dir: Path) -> int:
                     stat.S_ISDIR(item_st.st_mode)
                     and not stat.S_ISLNK(item_st.st_mode)
                     and not is_windows_name_surrogate_reparse(item_st)
-                    and ".replaced-" in name
+                    and is_replaced
                 ):
                     from .cache_removal import rescue_annotations
 

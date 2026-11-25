@@ -1573,3 +1573,54 @@ return {
     assert out["normalizeCalled"] == 0
     assert out["status"] == "Astromap supports up to 2000 regions"
     assert out["toasts"] == ["Astromap supports up to 2000 regions"]
+
+
+def test_read_astromap_import_file_accepts_over_16mib_korean_txt_and_rejects_over_32mib():
+    out = _run_import(r"""
+const note = '조직'.repeat(2048);
+const rows = ['INDEX\tX1\tY1\tX2\tY2\tNOTE'];
+for (let i = 1; i <= 1500; i++) rows.push(`${i}\t10\t20\t29\t39\t${note}`);
+const text = rows.join('\n') + '\n';
+const bytes = new TextEncoder().encode(text);
+
+const f = importFixture();
+f.c.TextDecoder = TextDecoder;
+const okLarge = await f.c.readAstromapImportFile({
+  name: 'large-korean.txt',
+  size: bytes.length,
+  arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+});
+const pending = f.c.state.astromap.pendingImport;
+const size = { width: 1000, height: 500 };
+const review = pending ? f.c.window.Nd2AstromapImport.review(pending.text, size) : null;
+const mapped = review ? f.c.window.Nd2AstromapImport.mapToSource(review.rows, size, size) : [];
+
+const fTooBig = importFixture();
+fTooBig.c.TextDecoder = TextDecoder;
+const okTooBig = await fTooBig.c.readAstromapImportFile({
+  name: 'over-32mib.txt',
+  size: 32 * 1024 * 1024 + 1,
+  arrayBuffer: async () => new ArrayBuffer(0),
+});
+
+return {
+  byteLength: bytes.length,
+  okLarge,
+  reviewCount: review?.count ?? 0,
+  skippedCount: review?.skippedCount ?? -1,
+  mappedCount: mapped.length,
+  firstMatches: mapped[0]?.text === note,
+  lastMatches: mapped[1499]?.text === note,
+  okTooBig,
+  tooBigStatus: fTooBig.nodes.get('astromap-import-status').textContent,
+};
+""")
+    assert 16 * 1024 * 1024 < out["byteLength"] < 32 * 1024 * 1024
+    assert out["okLarge"] is True
+    assert out["reviewCount"] == 1500
+    assert out["skippedCount"] == 0
+    assert out["mappedCount"] == 1500
+    assert out["firstMatches"] is True
+    assert out["lastMatches"] is True
+    assert out["okTooBig"] is False
+    assert out["tooBigStatus"] == "ROI TXT must be smaller than 32 MiB"
