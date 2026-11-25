@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import stat
 import time
 import uuid
 from collections.abc import Callable
@@ -255,7 +256,51 @@ def _sample_plane_blocks(src: PlaneSource, tile: int, points: int) -> list[np.nd
 
 
 def _is_zarr_directory(path: Path) -> bool:
-    return (path / ".zattrs").is_file() or (path / ".zgroup").is_file()
+    from .platform_io import filesystem_path
+    from .windows_fs import is_windows_name_surrogate_reparse
+
+    has_marker = False
+    for name in (".zattrs", ".zgroup"):
+        marker = path / name
+        try:
+            st = os.lstat(filesystem_path(marker))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if (
+            stat.S_ISLNK(st.st_mode)
+            or is_windows_name_surrogate_reparse(st)
+            or not stat.S_ISREG(st.st_mode)
+        ):
+            return False
+        has_marker = True
+    return has_marker
+
+
+def _validate_convert_target(
+    final_path: Path, *, overwrite: bool, single_file_out: bool
+) -> None:
+    from .platform_io import filesystem_path
+    from .windows_fs import is_windows_name_surrogate_reparse
+
+    try:
+        st = os.lstat(filesystem_path(final_path))
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode) or is_windows_name_surrogate_reparse(st):
+        raise ValueError("cache publication refuses symbolic links and junctions")
+    if not overwrite:
+        raise FileExistsError(f"{final_path} exists (use --overwrite)")
+    if stat.S_ISDIR(st.st_mode):
+        if not _is_zarr_directory(final_path):
+            raise IsADirectoryError(f"refusing to overwrite non-Zarr directory {final_path}")
+    elif not single_file_out:
+        raise FileExistsError(
+            f"refusing to overwrite existing file {final_path} with a directory store"
+        )
+    elif not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"refusing to overwrite non-regular target {final_path}")
 
 
 def _open_conversion_source(
@@ -432,7 +477,7 @@ def _pack_and_commit_export(
     overwrite: bool,
     hooks: _FacadeHooks,
 ) -> None:
-    from .cache import commit_container, quick_fingerprint
+    from .cache import _refuse_database_companions, commit_container, quick_fingerprint
     from .migration import pack_directory
 
     after_fp = quick_fingerprint(src_resolved)
@@ -448,12 +493,8 @@ def _pack_and_commit_export(
     close_val = getattr(r_val, "close", None)
     if close_val is not None:
         close_val()
-    if final_path.exists() and not overwrite:
-        raise FileExistsError(f"{final_path} exists (use --overwrite)")
-    if final_path.is_symlink():
-        raise ValueError("cache publication refuses symbolic links")
-    if overwrite and final_path.is_dir() and not _is_zarr_directory(final_path):
-        raise IsADirectoryError(f"refusing to overwrite non-Zarr directory {final_path}")
+    _refuse_database_companions(final_path)
+    _validate_convert_target(final_path, overwrite=overwrite, single_file_out=True)
     commit_container(packed_file, final_path)
     shutil.rmtree(staging_path, ignore_errors=True)
 
@@ -501,12 +542,7 @@ def run_convert(
             print(f"hardware: {os.cpu_count()} CPU cores -> {workers} worker threads")
 
     _refuse_database_companions(final_path)
-    if final_path.is_symlink():
-        raise ValueError("cache publication refuses symbolic links")
-    if final_path.exists() and not overwrite:
-        raise FileExistsError(f"{final_path} exists (use --overwrite)")
-    if single_file_out and overwrite and final_path.is_dir() and not _is_zarr_directory(final_path):
-        raise IsADirectoryError(f"refusing to overwrite non-Zarr directory {final_path}")
+    _validate_convert_target(final_path, overwrite=overwrite, single_file_out=single_file_out)
     final_path.parent.mkdir(parents=True, exist_ok=True)
     before_fp: dict[str, Any] | None = None
     src_resolved = source_path.resolve()
@@ -598,8 +634,8 @@ def run_convert(
                 hooks=hooks,
             )
         else:
-            if final_path.exists() and not overwrite:
-                raise FileExistsError(f"{final_path} exists (use --overwrite)")
+            _refuse_database_companions(final_path)
+            _validate_convert_target(final_path, overwrite=overwrite, single_file_out=False)
             commit_container(staging_path, final_path)
     except BaseException:
         shutil.rmtree(staging_path, ignore_errors=True)

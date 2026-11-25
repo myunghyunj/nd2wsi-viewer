@@ -602,3 +602,79 @@ def test_plate_reuses_cache_across_korean_nfc_nfd_names(tmp_path, plate_nd2, mon
         assert not list(container.parent.glob("*.corrupt-*"))
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("mode", ["r", "r+", "a"])
+def test_plate_group_validates_directory_and_single_file_zarrays_and_rejects_symlinks(
+    tmp_path, symlink_support, mode
+):
+    from nd2wsi.plate_store import THUMBS_NAME, _plate_group
+    from nd2wsi.storage.zarr_v2 import UnsafeZarrArrayError
+
+    unsafe_zarray = json.dumps(
+        {
+            "zarr_format": 2,
+            "shape": [1, 1, 1, 1, 2, 2],
+            "chunks": [1, 1, 1, 1, 2, 2],
+            "dtype": "<u2",
+            "fill_value": 0,
+            "order": "C",
+            "filters": None,
+            "compressor": {"id": "pickle"},
+        }
+    ).encode("utf-8")
+
+    # Legacy directory plate cache with unsafe .zarray in thumbs.zarr.
+    dir_container = tmp_path / "legacy.nd2wsi-cache"
+    (dir_container / THUMBS_NAME / "thumbs").mkdir(parents=True)
+    (dir_container / THUMBS_NAME / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
+    (dir_container / THUMBS_NAME / "thumbs" / ".zarray").write_bytes(unsafe_zarray)
+    with pytest.raises(UnsafeZarrArrayError):
+        _plate_group(dir_container, mode)
+
+    # Symlinked directory plate container is refused before opening Zarr.
+    clean_dir = tmp_path / "clean.nd2wsi-cache"
+    (clean_dir / THUMBS_NAME).mkdir(parents=True)
+    (clean_dir / THUMBS_NAME / ".zgroup").write_text('{"zarr_format": 2}', encoding="utf-8")
+    link_dir = tmp_path / "linked.nd2wsi-cache"
+    link_dir.symlink_to(clean_dir, target_is_directory=True)
+    with pytest.raises(UnsafeZarrArrayError):
+        _plate_group(link_dir, mode)
+
+    # Single-file plate container rejects unsafe .zarray on r/r+/a.
+    file_container = tmp_path / f"plate-{mode}.nd2svs"
+    write_entry(file_container, f"{THUMBS_NAME}/.zgroup", b'{"zarr_format": 2}')
+    write_entry(file_container, f"{THUMBS_NAME}/thumbs/.zarray", unsafe_zarray)
+    with pytest.raises(UnsafeZarrArrayError):
+        _plate_group(file_container, mode)
+
+
+def test_plate_locks_normalize_to_nfc_and_reuse_existing_nfd_sibling(tmp_path, monkeypatch):
+    import unicodedata
+
+    from nd2wsi.plate_store import PlateWriterLock, plate_session_lock_path
+
+    nfc_container = tmp_path / unicodedata.normalize("NFC", "샘플_플레이트.nd2--plate.nd2svs")
+    nfd_container = tmp_path / unicodedata.normalize("NFD", "샘플_플레이트.nd2--plate.nd2svs")
+    assert nfc_container.name != nfd_container.name
+
+    # Without pre-existing lockfiles, both NFC and NFD container names pick NFC lock paths.
+    assert plate_session_lock_path(nfd_container) == plate_session_lock_path(nfc_container)
+    assert unicodedata.is_normalized("NFC", plate_session_lock_path(nfd_container).name)
+    writer_nfd = PlateWriterLock(nfd_container)
+    assert unicodedata.is_normalized("NFC", writer_nfd._session.path.name)
+    assert unicodedata.is_normalized("NFC", writer_nfd._legacy.path.name)
+
+    # Pre-existing NFD lockfiles (from 2.6.10) are reused on normalization-sensitive filesystems.
+    nfd_session = tmp_path / (nfd_container.name + ".writer-session.lock")
+    nfd_legacy = tmp_path / (nfd_container.name + ".writer.lock")
+    nfd_session.write_text("{}", encoding="utf-8")
+    nfd_legacy.write_text('{"released": true}', encoding="utf-8")
+
+    from test_cross_os_cache_portability import _simulate_norm_sensitive_fs
+
+    _simulate_norm_sensitive_fs(monkeypatch, tmp_path)
+    assert plate_session_lock_path(nfc_container) == nfd_session
+    writer_nfc = PlateWriterLock(nfc_container)
+    assert writer_nfc._session.path == nfd_session
+    assert writer_nfc._legacy.path == nfd_legacy

@@ -42,6 +42,7 @@ from .cache import (
     read_manifest,
     write_manifest,
 )
+from .platform_io import filesystem_path
 from .storage import DEFAULT_STORAGE
 from .storage.single_file import CORRECTED_FORMAT_VERSION, SQLiteStore, read_entry
 
@@ -73,7 +74,7 @@ def _sha(value):
 
 
 def _identity(path, *, single_link=True):
-    st = Path(path).stat(follow_symlinks=False)
+    st = os.lstat(filesystem_path(path))
     if not stat.S_ISREG(st.st_mode) or (single_link and st.st_nlink != 1):
         raise ValueError("Persistent correction requires a regular, singly linked cache/source file")
     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
@@ -127,7 +128,7 @@ def load_model(container, manifest):
             or correction.get("model_key") != MODEL_KEY
             or correction.get("provenance_key") != PROVENANCE_KEY):
         raise ValueError("Unsupported persisted Shading Correction capability")
-    with Path(container).open("rb") as handle:
+    with open(filesystem_path(container), "rb") as handle:
         header = handle.read(100)
     if int.from_bytes(header[60:64], "big") != CORRECTED_FORMAT_VERSION:
         raise ValueError("Corrected cache lacks its required storage capability guard")
@@ -256,7 +257,11 @@ class PreparedReplacement:
                     if not known:
                         raise ValueError(f"Cache contains an unrecognized/user-owned entry; preserved: {key}")
             self.check()
-            self.directory = Path(tempfile.mkdtemp(prefix=self.final.name + ".building-h-", dir=self.final.parent))
+            created = tempfile.mkdtemp(
+                prefix=self.final.name + ".building-h-",
+                dir=filesystem_path(self.final.parent),
+            )
+            self.directory = self.final.parent / Path(created).name
         except BaseException:
             self._lock.release()
             raise
@@ -296,9 +301,15 @@ class PreparedReplacement:
         self._closed = True
         try:
             if self._owned_file:
-                self.staging.unlink(missing_ok=True)
+                try:
+                    Path(filesystem_path(self.staging)).unlink(missing_ok=True)
+                except OSError:
+                    pass
             if self.directory is not None:
-                shutil.rmtree(self.directory)
+                try:
+                    shutil.rmtree(filesystem_path(self.directory), ignore_errors=False)
+                except OSError:
+                    pass
         finally:
             self._lock.release()
 
@@ -394,7 +405,7 @@ def prepare_apply(state, model, model_record, event, progress):
         if not indices:
             raise ValueError("No enabled correction channel is available")
         channels, height, width = native.shape
-        model_payload = Path(model.path).read_bytes()
+        model_payload = Path(filesystem_path(model.path)).read_bytes()
         method = "bffree" if getattr(model, "model_schema", "").startswith("BF_free_") else "h"
         consensus = False
         source_labels = source_mapping = None
@@ -507,7 +518,7 @@ def prepare_apply(state, model, model_record, event, progress):
                 store.write_bytes(MANIFEST_NAME, _json_bytes(replacement.manifest))
         verified = load_model(replacement.staging, replacement.manifest)
         verified.data.close()
-        with replacement.staging.open("r+b") as handle:
+        with open(filesystem_path(replacement.staging), "r+b") as handle:
             os.fsync(handle.fileno())
         replacement.check()
         replacement._validate_before_publish()

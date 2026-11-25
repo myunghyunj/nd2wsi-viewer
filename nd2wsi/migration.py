@@ -25,7 +25,7 @@ from .cache import (
     names_match,
     quick_fingerprint,
 )
-from .platform_io import BINARY
+from .platform_io import BINARY, filesystem_path
 from .windows_fs import is_windows_name_surrogate_reparse
 
 # Maximum size of any single cache entry during directory-to-single-file packing
@@ -35,7 +35,7 @@ _MAX_PACK_ENTRY_BYTES = 256 * 1024 * 1024
 
 def _check_real_dir(path: Path) -> None:
     try:
-        st = os.lstat(path)
+        st = os.lstat(filesystem_path(path))
     except OSError as exc:
         raise ValueError(f"not a real cache directory: {path}") from exc
     if stat.S_ISLNK(st.st_mode) or is_windows_name_surrogate_reparse(st) or not stat.S_ISDIR(st.st_mode):
@@ -44,7 +44,8 @@ def _check_real_dir(path: Path) -> None:
 
 def _read_regular_entry(path: Path) -> tuple[os.stat_result, bytes]:
     """Read a regular, non-symlink, non-reparse cache entry safely without TOCTOU."""
-    lstat = os.lstat(path)
+    native = filesystem_path(path)
+    lstat = os.lstat(native)
     if stat.S_ISLNK(lstat.st_mode) or is_windows_name_surrogate_reparse(lstat) or not stat.S_ISREG(lstat.st_mode):
         raise ValueError(f"not a regular cache entry: {path}")
     flags = (
@@ -53,7 +54,7 @@ def _read_regular_entry(path: Path) -> tuple[os.stat_result, bytes]:
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0)
     )
-    fd = os.open(path, flags)
+    fd = os.open(native, flags)
     try:
         st = os.fstat(fd)
         if (
@@ -90,25 +91,26 @@ def cache_entries(container: Path) -> list[tuple[str, Path]]:
     Finder AppleDouble metadata is ignored, not interpreted as image data.
     """
     _check_real_dir(container)
+    walk_root = Path(filesystem_path(container))
     entries = []
 
     def _raise_walk_error(exc: OSError) -> None:
         raise exc
 
-    for base, dirs, files in os.walk(container, followlinks=False, onerror=_raise_walk_error):
+    for base, dirs, files in os.walk(walk_root, followlinks=False, onerror=_raise_walk_error):
         for name in dirs:
             subdir = Path(base) / name
-            sub_st = os.lstat(subdir)
+            sub_st = os.lstat(filesystem_path(subdir))
             if stat.S_ISLNK(sub_st.st_mode) or is_windows_name_surrogate_reparse(sub_st):
                 raise ValueError(f"symlink or junction in cache: {subdir}")
         for name in sorted(files):
             path = Path(base) / name
-            file_st = os.lstat(path)
+            file_st = os.lstat(filesystem_path(path))
             if stat.S_ISLNK(file_st.st_mode) or is_windows_name_surrogate_reparse(file_st) or not stat.S_ISREG(file_st.st_mode):
                 raise ValueError(f"not a regular cache entry: {path}")
             if name.startswith("._") or name == ".DS_Store":
                 continue
-            key = path.relative_to(container).as_posix()
+            key = path.relative_to(walk_root).as_posix()
             chunk_pat = (
                 r"\d+(?:\.\d+)*(?:\.corrupt-[0-9a-fA-FT-]+)?"
                 if key.startswith("thumbs.zarr/")
@@ -146,7 +148,8 @@ def pack_directory(
         raise ValueError("unsupported single-file packing version")
 
     container, target = Path(container), Path(target)
-    if target.exists() or target.is_symlink():
+    target_native = filesystem_path(target)
+    if os.path.lexists(target_native):
         raise FileExistsError(target)
     entries = cache_entries(container)
     _, original_manifest = _read_regular_entry(container / MANIFEST_NAME)
@@ -196,7 +199,7 @@ def pack_directory(
     new_manifest = json.dumps(manifest, indent=1).encode("utf-8")
     expected: dict[str, tuple[int, str]] = {}
     original_stats = {}
-    target.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(filesystem_path(target.parent), exist_ok=True)
     store = SQLiteStore.create_exclusive(target, format_version=storage_version)
     try:
         # One transaction avoids a journal sync per tiny metadata/chunk entry.
@@ -254,12 +257,12 @@ def pack_directory(
     expected[MANIFEST_NAME] = (len(final_manifest), hashlib.sha256(final_manifest).hexdigest())
     # Windows FlushFileBuffers (used by fsync/_commit) needs a writable handle.
     # r+b does not truncate or rewrite the independently verified container.
-    with target.open("r+b") as handle:
+    with open(target_native, "r+b") as handle:
         os.fsync(handle.fileno())
     return {
         "source_cache": str(container), "target": str(target),
         "source": str(source), "entries": len(expected),
         "payload_bytes": sum(size for size, _ in expected.values()),
-        "file_bytes": target.stat().st_size,
+        "file_bytes": os.stat(target_native).st_size,
         "verified": True, "manifest": manifest,
     }

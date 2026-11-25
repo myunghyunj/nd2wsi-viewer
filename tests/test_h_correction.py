@@ -647,3 +647,275 @@ def test_preflight_estimate_is_null_for_unsupported_slide(state):
     controller = hc.ShadingCorrectionController(state)
     assert controller.status()["estimated_seconds"] is None
     assert controller.start("h")["estimated_seconds"] is None
+
+
+class _FakeRoot(dict):
+    def __init__(self, generation: str, native: np.ndarray | None = None):
+        super().__init__()
+        self.generation = generation
+        self.closed = False
+        if native is not None:
+            self["0"] = native
+
+    def close(self, delay: int = 0) -> None:
+        self.closed = True
+
+
+def test_viewer_state_is_admitted_does_not_acquire_replacement_lock(tmp_path):
+    from nd2wsi.server_registry import ViewerState
+
+    cache = tmp_path / "slide.nd2svs"
+    cache.write_bytes(b"v1")
+    attrs = {"nd2wsi": {}, "omero": {"channels": []}}
+    st = ViewerState(_FakeRoot("g1"), attrs, store_path=cache, manifest={"generation": "g1"}, generation="g1")
+    assert st.is_admitted() is True
+
+    # Hold _replacement_lock on a background thread and verify is_admitted() returns without blocking.
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_replacement():
+        with st._replacement_lock:
+            held.set()
+            release.wait(5)
+
+    worker = threading.Thread(target=hold_replacement, daemon=True)
+    worker.start()
+    try:
+        assert held.wait(2)
+        started = time.monotonic()
+        assert st.is_admitted() is True
+        assert time.monotonic() - started < 0.5
+    finally:
+        release.set()
+        worker.join(2)
+
+    st.busy.close(timeout=0)
+    assert st.is_admitted() is False
+    st._readmit()
+    assert st.is_admitted() is True
+    st._mark_closed()
+    assert st.is_admitted() is False
+
+
+@pytest.mark.parametrize("operation", ["apply", "revoke"])
+def test_replace_pyramid_reopen_failure_preserves_old_generation_and_recovers_on_refresh(
+    tmp_path, monkeypatch, operation
+):
+    from nd2wsi.server_registry import ViewerState
+
+    cache = tmp_path / "slide.nd2svs"
+    cache.write_bytes(b"old-cache")
+    source = tmp_path / "slide.nd2"
+    source.write_bytes(b"source-nd2")
+    native = np.zeros((4, 64, 64), dtype=np.uint16)
+    levels = [{"path": "0", "height": 64, "width": 64, "downsample": 1}]
+    attrs = {
+        "nd2wsi": {"levels": levels, "rgb": False, "selection": {"z": 0}},
+        "omero": {"channels": [{"label": name} for name in ("CY3", "BF", "DAPI", "FITC")]},
+    }
+    applied_manifest = {
+        "generation": "gen-applied",
+        "kind": "overview",
+        "source": quick_fingerprint(source),
+        "h_correction": {"applied": True, "correction_id": "rev-1", "channel_indices": [3]},
+    }
+    raw_manifest = {
+        "generation": "gen-raw",
+        "kind": "full",
+        "source": quick_fingerprint(source),
+    }
+    prior = copy.deepcopy(raw_manifest if operation == "apply" else applied_manifest)
+    target = copy.deepcopy(applied_manifest if operation == "apply" else raw_manifest)
+
+    st = ViewerState(
+        _FakeRoot(prior["generation"], native),
+        attrs,
+        source_path=source,
+        store_path=cache,
+        manifest=prior,
+        generation=prior["generation"],
+    )
+    fail_final_open = {"active": True}
+
+    def open_pyramid(path, manifest):
+        if path == cache and fail_final_open["active"]:
+            raise OSError("transient Windows reopen lock")
+        return _FakeRoot(manifest["generation"], native), attrs
+
+    monkeypatch.setattr(st, "_open_pyramid", open_pyramid)
+    monkeypatch.setattr("nd2wsi.cache.read_manifest", lambda *a, **k: copy.deepcopy(target))
+
+    controller = hc.ShadingCorrectionController(st)
+    replacement = SimpleNamespace(
+        staging=tmp_path / "staging.nd2svs",
+        final=cache,
+        manifest=target,
+        prior_manifest=prior,
+        publish=lambda: cache.write_bytes(b"new-cache-bytes"),
+    )
+
+    with pytest.raises(RuntimeError, match="was saved but could not be opened"):
+        st.replace_pyramid(replacement)
+
+    # Generation and manifest must NOT advance while reads are closed!
+    assert st.generation == prior["generation"]
+    assert st.manifest["generation"] == prior["generation"]
+    assert st._cache_identity is None
+    assert st.is_admitted() is False
+
+    # Simulate controller recording failed state from replace_pyramid exception.
+    controller._status.update(state="failed", reason="RuntimeError: saved but could not be opened")
+
+    # While reopen keeps failing, status() catches refresh error (no HTTP 500) and keeps old generation.
+    during_outage = controller.status()
+    assert during_outage["state"] == "failed"
+    assert during_outage["generation"] == prior["generation"]
+    assert during_outage["applied"] is (operation == "revoke")
+
+    # Once transient reopen failure clears, status() recovers cleanly to ready (apply) or idle (revoke).
+    fail_final_open["active"] = False
+    recovered = controller.status()
+    assert st.is_admitted() is True
+    assert st.generation == target["generation"]
+    assert recovered["generation"] == target["generation"]
+    assert recovered["applied"] is (operation == "apply")
+    assert recovered["state"] == ("ready" if operation == "apply" else "idle")
+    assert recovered["pct"] == (100 if operation == "apply" else 0)
+    assert recovered["reason"] == ""
+
+
+def test_replace_pyramid_failed_rollback_reopen_remains_recoverable_via_refresh(tmp_path, monkeypatch):
+    from nd2wsi.server_registry import ViewerState
+
+    cache = tmp_path / "slide.nd2svs"
+    cache.write_bytes(b"original-bytes")
+    attrs = {"nd2wsi": {}, "omero": {"channels": []}}
+    prior = {"generation": "gen-old", "kind": "full"}
+    target = {"generation": "gen-new", "kind": "overview", "h_correction": {"applied": True}}
+    st = ViewerState(_FakeRoot("gen-old"), attrs, store_path=cache, manifest=prior, generation="gen-old")
+
+    fail_final = {"active": True}
+
+    def open_pyramid(path, manifest):
+        if path == cache and fail_final["active"]:
+            raise OSError("rollback reopen denied")
+        return _FakeRoot(manifest["generation"]), attrs
+
+    monkeypatch.setattr(st, "_open_pyramid", open_pyramid)
+    monkeypatch.setattr("nd2wsi.cache.read_manifest", lambda *a, **k: copy.deepcopy(prior))
+    replacement = SimpleNamespace(
+        staging=tmp_path / "staging.nd2svs",
+        final=cache,
+        manifest=target,
+        prior_manifest=prior,
+        publish=lambda: (_ for _ in ()).throw(PermissionError("rename denied")),
+    )
+    with pytest.raises(OSError, match="rollback reopen denied"):
+        st.replace_pyramid(replacement)
+
+    # _cache_identity was cleared before closing the old root, so refresh_pyramid recovers!
+    assert st._cache_identity is None
+    assert st.is_admitted() is False
+    fail_final["active"] = False
+    st.refresh_pyramid()
+    assert st.is_admitted() is True
+    assert not st.root.closed
+    assert st.generation == "gen-old"
+
+
+def test_status_simplenamespace_without_busy_and_isolated_finally_cleanup(state, monkeypatch):
+    # SimpleNamespace without is_admitted or busy still works cleanly in status().
+    bare_state = SimpleNamespace(
+        root=state.root,
+        attrs=state.attrs,
+        source_path=state.source_path,
+        generation=state.generation,
+        plate=None,
+        manifest=copy.deepcopy(state.manifest),
+    )
+    bare_ctrl = hc.ShadingCorrectionController(bare_state)
+    assert bare_ctrl.status()["state"] == "idle"
+
+    # Isolated finally: replacement.close() raising OSError must not skip model.data.close() or temporary.cleanup().
+    cleaned = {"model_closed": False, "temp_cleaned": False, "replacement_called": False}
+
+    class FailingReplacement:
+        def close(self):
+            cleaned["replacement_called"] = True
+            raise OSError("staging locked")
+
+    class TrackedModel(Model):
+        def __init__(self):
+            self.data = SimpleNamespace(close=lambda: cleaned.__setitem__("model_closed", True))
+
+    class TrackedTempDir:
+        def __init__(self, path):
+            self.name = str(path)
+
+        def cleanup(self):
+            cleaned["temp_cleaned"] = True
+
+    monkeypatch.setattr(hc, "_metadata_for_state", metadata)
+    monkeypatch.setattr(
+        hc,
+        "_fit_model",
+        lambda *_a, **_k: (TrackedModel(), {"selected": [{"channel": "FITC", "outcome": "fitted"}]}),
+    )
+    monkeypatch.setattr(hp, "prepare_apply", lambda *_a, **_k: FailingReplacement())
+    monkeypatch.setattr(
+        hc.tempfile,
+        "TemporaryDirectory",
+        lambda prefix="": TrackedTempDir(state.source_path.parent),
+    )
+    state.replace_pyramid = lambda _r: (_ for _ in ()).throw(RuntimeError("publish failed"))
+
+    controller = hc.ShadingCorrectionController(state)
+    controller.start("h")
+    status = done(controller)
+    assert status["state"] == "failed"
+    assert cleaned == {"model_closed": True, "temp_cleaned": True, "replacement_called": True}
+
+
+def test_trash_cache_closes_guard_fd_when_fstat_or_reparse_raises(tmp_path, monkeypatch):
+    import errno
+    import os
+
+    from nd2wsi import server_registry
+
+    cache_file = tmp_path / "guard_leak.nd2svs"
+    cache_file.write_bytes(b"cache-bytes")
+    registry = server_registry.SlideRegistry()
+    registry.slides["sid1"] = server_registry.ViewerState(
+        {"0": object()},
+        {},
+        trash_path=cache_file,
+        container_path=cache_file,
+        manifest={"generation": "g1"},
+    )
+
+    opened_fds: list[int] = []
+    real_open = os.open
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if os.fspath(path) == os.fspath(cache_file):
+            opened_fds.append(fd)
+        return fd
+
+    def fail_reparse(entry, *, fd=None):
+        if fd is not None:
+            raise OSError("simulated reparse query failure")
+        return False
+
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(server_registry, "is_windows_name_surrogate_reparse", fail_reparse)
+
+    with pytest.raises(OSError, match="simulated reparse query failure"):
+        registry.trash_cache("sid1")
+    if os.name != "nt":
+        assert len(opened_fds) == 1
+        with pytest.raises(OSError) as closed_err:
+            os.fstat(opened_fds[0])
+        assert closed_err.value.errno == errno.EBADF
+    assert cache_file.exists()

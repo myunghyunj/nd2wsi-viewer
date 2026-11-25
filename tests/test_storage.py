@@ -119,3 +119,187 @@ def test_zarr_v2_policy_owns_tile_and_allocation_model():
     assert layout["files"] == 7  # ten logical chunks, then 25% omitted and floored
     assert layout["disk_bytes"] == 7 * 262144 + 4 * 4096
     assert layout["disk_bytes"] < layout["data_bytes"]  # exact-zero chunks cost no file
+
+
+def _valid_zarray_bytes() -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "zarr_format": 2,
+            "shape": [1, 8, 8],
+            "chunks": [1, 4, 4],
+            "dtype": "<u2",
+            "fill_value": 0,
+            "order": "C",
+            "filters": None,
+            "compressor": None,
+        }
+    ).encode("utf-8")
+
+
+def _unsafe_zarray_bytes() -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "zarr_format": 2,
+            "shape": [1, 8, 8],
+            "chunks": [1, 4, 4],
+            "dtype": "<u2",
+            "fill_value": 0,
+            "order": "C",
+            "filters": None,
+            "compressor": {"id": "pickle"},
+        }
+    ).encode("utf-8")
+
+
+def test_validate_zarr_v2_directory_walks_nested_subdirs_and_skips_chunk_lstat(
+    tmp_path, monkeypatch
+):
+    import os
+
+    import pytest
+
+    from nd2wsi.storage import zarr_v2
+
+    store = tmp_path / "nested.ome.zarr"
+    nested = store / "group_a" / "group_b" / "0"
+    nested.mkdir(parents=True)
+    (nested / ".zarray").write_bytes(_valid_zarray_bytes())
+    for i in range(64):
+        (nested / f"0.0.{i}").write_bytes(b"chunk-data")
+
+    lstat_targets: list[str] = []
+    real_lstat = os.lstat
+
+    def spy_lstat(path, *args, **kwargs):
+        lstat_targets.append(os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", spy_lstat)
+    zarr_v2.validate_zarr_v2_directory(store)
+    # Chunk files must never trigger os.lstat calls during directory validation.
+    assert not any("0.0." in target for target in lstat_targets)
+
+    # An unsafe .zarray nested deeper than depth 1 must be caught.
+    (nested / ".zarray").write_bytes(_unsafe_zarray_bytes())
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        zarr_v2.validate_zarr_v2_directory(store)
+
+
+def test_validate_zarr_v2_directory_rejects_symlinks_junctions_and_non_dirs(
+    tmp_path, monkeypatch, symlink_support
+):
+    import os
+
+    import pytest
+
+    from nd2wsi.storage import zarr_v2
+
+    real_store = tmp_path / "real.ome.zarr"
+    (real_store / "0").mkdir(parents=True)
+    (real_store / "0" / ".zarray").write_bytes(_valid_zarray_bytes())
+
+    # Root symlink, non-directory file, and missing path are refused.
+    root_link = tmp_path / "root_link.ome.zarr"
+    root_link.symlink_to(real_store, target_is_directory=True)
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        zarr_v2.validate_zarr_v2_directory(root_link)
+
+    plain_file = tmp_path / "not-a-dir.ome.zarr"
+    plain_file.write_bytes(b"file")
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        zarr_v2.validate_zarr_v2_directory(plain_file)
+
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        zarr_v2.validate_zarr_v2_directory(tmp_path / "missing.ome.zarr")
+
+    # Symlinked subdirectory inside store is refused.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / ".zarray").write_bytes(_valid_zarray_bytes())
+    (real_store / "linked_sub").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        zarr_v2.validate_zarr_v2_directory(real_store)
+    (real_store / "linked_sub").unlink()
+
+    # Symlinked .zarray inside store is refused.
+    (real_store / "0" / ".zarray").unlink()
+    (real_store / "0" / ".zarray").symlink_to(outside / ".zarray")
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        zarr_v2.validate_zarr_v2_directory(real_store)
+    (real_store / "0" / ".zarray").unlink()
+    (real_store / "0" / ".zarray").write_bytes(_valid_zarray_bytes())
+
+    # Simulated Windows junction on root or subdirectory is refused.
+    target_ino = os.lstat(real_store / "0").st_ino
+    monkeypatch.setattr(
+        zarr_v2,
+        "is_windows_name_surrogate_reparse",
+        lambda st, fd=None: getattr(st, "st_ino", None) == target_ino,
+    )
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        zarr_v2.validate_zarr_v2_directory(real_store)
+
+    root_ino = os.lstat(real_store).st_ino
+    monkeypatch.setattr(
+        zarr_v2,
+        "is_windows_name_surrogate_reparse",
+        lambda st, fd=None: getattr(st, "st_ino", None) == root_ino,
+    )
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError):
+        zarr_v2.validate_zarr_v2_directory(real_store)
+
+
+def test_validate_zarr_v2_directory_enforces_depth_dir_count_size_and_fail_closed(
+    tmp_path, monkeypatch
+):
+    import os
+
+    import pytest
+
+    from nd2wsi.storage import zarr_v2
+
+    # Depth bound: MAX_ZARR_WALK_DEPTH allowed, +1 rejected.
+    deep_store = tmp_path / "deep.ome.zarr"
+    cur = deep_store
+    for i in range(zarr_v2.MAX_ZARR_WALK_DEPTH):
+        cur = cur / f"d{i}"
+    cur.mkdir(parents=True)
+    (cur / ".zarray").write_bytes(_valid_zarray_bytes())
+    zarr_v2.validate_zarr_v2_directory(deep_store)
+
+    too_deep = cur / "overflow"
+    too_deep.mkdir()
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError, match="depth limit"):
+        zarr_v2.validate_zarr_v2_directory(deep_store)
+
+    # Directory count bound (using small cap via monkeypatch).
+    wide_store = tmp_path / "wide.ome.zarr"
+    for i in range(3):
+        (wide_store / f"s{i}").mkdir(parents=True)
+    monkeypatch.setattr(zarr_v2, "MAX_ZARR_WALK_DIRS", 4)
+    zarr_v2.validate_zarr_v2_directory(wide_store)
+    (wide_store / "s3").mkdir()
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError, match="directory walk limit"):
+        zarr_v2.validate_zarr_v2_directory(wide_store)
+
+    # Oversized .zarray bound.
+    big_store = tmp_path / "big.ome.zarr"
+    (big_store / "0").mkdir(parents=True)
+    (big_store / "0" / ".zarray").write_bytes(b" " * (zarr_v2.MAX_ZARRAY_BYTES + 1))
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError, match="size limit"):
+        zarr_v2.validate_zarr_v2_directory(big_store)
+
+    # Fail closed on os.scandir OSError.
+    ok_store = tmp_path / "err.ome.zarr"
+    ok_store.mkdir()
+
+    def boom(_p):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(os, "scandir", boom)
+    with pytest.raises(zarr_v2.UnsafeZarrArrayError, match="cannot scan"):
+        zarr_v2.validate_zarr_v2_directory(ok_store)

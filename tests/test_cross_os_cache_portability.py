@@ -696,3 +696,57 @@ def test_metal_viewport_preservation_report_is_strict_on_mtime_skew(tmp_path):
     }
     report = source.preservation_report()
     assert report["unchanged"] is False
+
+
+def test_nfc_nfd_cache_locks_and_sweep_coexist_with_2610_locks_on_norm_sensitive_fs(
+    tmp_path, monkeypatch
+):
+    from nd2wsi.cache import CacheLock, sweep_stale_builds
+
+    caches = tmp_path / "caches"
+    caches.mkdir()
+    nfc_family = unicodedata.normalize("NFC", "샘플_락.nd2--t0-p0-zmid.nd2svs")
+    nfd_family = unicodedata.normalize("NFD", "샘플_락.nd2--t0-p0-zmid.nd2svs")
+    assert nfc_family != nfd_family
+
+    # 1. Without existing locks, both NFC and NFD container names pick the same NFC lock path.
+    lock_from_nfd = CacheLock(caches / nfd_family)
+    lock_from_nfc = CacheLock(caches / nfc_family)
+    assert lock_from_nfd.path == lock_from_nfc.path
+    assert unicodedata.is_normalized("NFC", lock_from_nfd.path.name)
+
+    # 2. Simulate a live 2.6.10 builder holding an NFD lock and staging directory on exFAT/Linux.
+    nfd_lock_file = caches / (nfd_family + ".lock")
+    nfd_staging = caches / f"{nfd_family}.building-live2610"
+    nfd_staging.mkdir()
+    (nfd_staging / "chunk").write_bytes(b"in-flight")
+    nfd_lock_file.write_text(
+        CacheLock._payload("legacy-2610-gen").decode("utf-8"),
+        encoding="utf-8",
+    )
+
+    _simulate_norm_sensitive_fs(monkeypatch, tmp_path)
+
+    # 2.6.11 CacheLock(NFC) must discover and contend against the existing NFD sibling lock.
+    contender = CacheLock(caches / nfc_family)
+    assert contender.path == nfd_lock_file
+    with pytest.raises(TimeoutError):
+        contender.acquire(timeout=0.02, poll=0.005)
+
+    # sweep_stale_builds must preserve the NFD staging dir while either NFD or NFC lock is live.
+    assert sweep_stale_builds(caches) == 0
+    assert (nfd_staging / "chunk").read_bytes() == b"in-flight"
+
+    # Also test NFC staging dir paired with NFD live lock (cross-spelling sweep check).
+    nfc_staging = caches / f"{nfc_family}.building-cross"
+    nfc_staging.mkdir()
+    assert sweep_stale_builds(caches) == 0
+    assert nfc_staging.is_dir()
+
+    # Once released, sweep_stale_builds cleans both stranded staging dirs.
+    nfd_lock_file.write_text(
+        CacheLock._payload("legacy-2610-gen", released=True).decode("utf-8"),
+        encoding="utf-8",
+    )
+    assert sweep_stale_builds(caches) == 2
+    assert not nfd_staging.exists() and not nfc_staging.exists()

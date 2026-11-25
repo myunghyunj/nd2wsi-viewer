@@ -171,6 +171,7 @@ class SQLiteStore(Store):
         self._closed = False
         self._in_batch = False
         self._exclusive = _exclusive
+        self._created_file = False
         self._recover = recover
         if format_version not in _WRITABLE_VERSIONS:
             raise ValueError("unsupported single-file creation version")
@@ -368,6 +369,7 @@ class SQLiteStore(Store):
                 with self._pool_lock:
                     self._read_connections.append(connection)
                     self._read_pool.put_nowait(connection)
+            self._created_file = created
             self._is_open = True
             return connection
 
@@ -1024,7 +1026,7 @@ class _DirectReadGroup:
 
 
 def _validate_store_zarrays(store: SQLiteStore) -> None:
-    """Validate every Zarr v2 ``.zarray`` entry in a read-only container before reading data."""
+    """Validate every Zarr v2 ``.zarray`` entry in a container before reading data."""
     listing_prefix = store._listing_prefix("")
     predicate, params = _prefix_predicate(listing_prefix)
     exact = f"{listing_prefix}.zarray"
@@ -1053,11 +1055,12 @@ def open_zarr_group(path: str | os.PathLike, prefix: str = "store.ome.zarr", mod
 
     if mode not in {"r", "r+", "a", "w", "w-", "x"}:
         raise ValueError(f"unsupported Zarr open mode: {mode!r}")
-    if mode in {"r", "r+"} and not os.path.exists(filesystem_path(path)):
+    existed = os.path.exists(filesystem_path(path))
+    if mode in {"r", "r+"} and not existed:
         raise FileNotFoundError(path)
     store = SQLiteStore(path, read_only=mode == "r", prefix=prefix)
     try:
-        if mode == "r":
+        if mode in {"r", "r+"} or (mode == "a" and (existed or not store._created_file)):
             _validate_store_zarrays(store)
         group = zarr.open_group(store=store, mode=mode, zarr_format=2)
         return _DirectReadGroup(group) if mode == "r" else group

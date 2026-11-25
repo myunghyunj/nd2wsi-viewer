@@ -39,7 +39,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .platform_io import BINARY, process_is_alive, read_at, set_fd_times, write_at
+from .platform_io import (
+    BINARY,
+    filesystem_path,
+    process_is_alive,
+    read_at,
+    set_fd_times,
+    write_at,
+)
 from .session_lock import SessionFileLock
 from .windows_fs import is_windows_name_surrogate_reparse
 
@@ -392,7 +399,8 @@ def _manifest_data(container: Path, *, recover: bool = False) -> Any:
         from .storage.single_file import read_entry
 
         return json.loads(read_entry(container, MANIFEST_NAME, recover=recover))
-    return json.loads((container / MANIFEST_NAME).read_text(encoding="utf-8"))
+    with open(filesystem_path(container / MANIFEST_NAME), encoding="utf-8") as fh:
+        return json.loads(fh.read())
 
 
 def quick_fingerprint(path: str | Path) -> dict[str, Any]:
@@ -403,9 +411,10 @@ def quick_fingerprint(path: str | Path) -> dict[str, Any]:
     leaves size, mtime and all three sampled windows intact goes unseen.
     """
     path = Path(path)
-    st = path.stat()
+    native = filesystem_path(path)
+    st = os.stat(native)
     h = hashlib.sha256()
-    with open(path, "rb") as fh:
+    with open(native, "rb") as fh:
         for offset in (
             0,
             max(0, st.st_size // 2 - (1 << 19)),
@@ -553,14 +562,15 @@ def write_manifest(
         write_entry(container, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
         return
     tmp = container / f".{MANIFEST_NAME}.{uuid.uuid4().hex}.tmp"
+    tmp_native = filesystem_path(tmp)
     try:
-        with open(tmp, "wb") as fh:
+        with open(tmp_native, "wb") as fh:
             fh.write(json.dumps(manifest, indent=1).encode("utf-8"))
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, container / MANIFEST_NAME)
+        os.replace(tmp_native, filesystem_path(container / MANIFEST_NAME))
     finally:
-        tmp.unlink(missing_ok=True)
+        Path(tmp_native).unlink(missing_ok=True)
 
 
 def read_manifest(container: str | Path, *, recover: bool = False) -> dict[str, Any] | None:
@@ -612,7 +622,7 @@ def _refuse_database_companions(path: Path) -> None:
     """Never detach a database from a possible recovery journal."""
     for suffix in ('-journal', '-wal', '-shm'):
         companion = path.with_name(path.name + suffix)
-        if companion.exists() or companion.is_symlink():
+        if os.path.lexists(filesystem_path(companion)):
             raise RuntimeError(f"cache has a database journal; preserve and recover it before replacement: {companion}")
 
 
@@ -663,17 +673,32 @@ class CacheLock:
     """
 
     def __init__(self, container: Path):
-        self.path = container.with_name(container.name + ".lock")
+        container = Path(container)
+        canonical = container.with_name(normalize_name(container.name) + ".lock")
+        resolved_lock = resolve_existing_path(canonical, kind="file")
+        resolved_arbiter = resolve_existing_path(
+            resolved_lock.with_name(resolved_lock.name + ".arbiter"),
+            kind="file",
+        )
+        if (
+            resolved_lock == canonical
+            and not (resolved_lock.exists() or resolved_lock.is_symlink())
+            and resolved_arbiter.name != canonical.name + ".arbiter"
+            and resolved_arbiter.name.endswith(".arbiter")
+        ):
+            resolved_lock = resolved_arbiter.with_name(
+                resolved_arbiter.name[: -len(".arbiter")]
+            )
+        self.path = resolved_lock
         self._gen: str | None = None
         self._fd: int | None = None
-        self._arbiter = SessionFileLock(
-            self.path.with_name(self.path.name + ".arbiter")
-        )
+        self._arbiter = SessionFileLock(resolved_arbiter)
         self._mutex = threading.RLock()
 
     def _read(self, path: Path | None = None) -> dict[str, Any] | None:
         try:
-            info = json.loads((path or self.path).read_text(encoding="utf-8"))
+            with open(filesystem_path(path or self.path), encoding="utf-8") as fh:
+                info = json.loads(fh.read())
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
         return info if isinstance(info, dict) else None
@@ -703,7 +728,7 @@ class CacheLock:
     def _path_is_fd(self, fd: int) -> bool:
         try:
             held = os.fstat(fd)
-            current = os.stat(self.path, follow_symlinks=False)
+            current = os.stat(filesystem_path(self.path), follow_symlinks=False)
         except OSError:
             return False
         return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
@@ -811,7 +836,8 @@ class CacheLock:
         with self._mutex:
             if self._fd is not None:
                 return
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            native = filesystem_path(self.path)
+            os.makedirs(filesystem_path(self.path.parent), exist_ok=True)
             gen = uuid.uuid4().hex
             while True:
                 remaining = max(0.0, deadline - time.monotonic())
@@ -830,13 +856,13 @@ class CacheLock:
                     payload = self._payload(gen)
                     try:
                         fd = os.open(
-                            self.path,
+                            native,
                             os.O_CREAT | os.O_EXCL | os.O_RDWR | BINARY,
                         )
                         acquired = self._install_claim(fd, payload, gen)
                     except FileExistsError:
                         try:
-                            pre_st = os.lstat(self.path)
+                            pre_st = os.lstat(native)
                             if (
                                 stat.S_ISLNK(pre_st.st_mode)
                                 or is_windows_name_surrogate_reparse(pre_st)
@@ -844,7 +870,7 @@ class CacheLock:
                                 fd = None
                             else:
                                 fd = os.open(
-                                    self.path,
+                                    native,
                                     os.O_RDWR | BINARY | getattr(os, "O_NOFOLLOW", 0),
                                 )
                         except FileNotFoundError:
@@ -982,23 +1008,36 @@ def commit_container(staging: Path, final: Path) -> None:
     """
     _refuse_database_companions(staging)
     _refuse_database_companions(final)
-    if staging.is_file() and (not final.exists() or final.is_file()):
-        if staging.is_symlink() or final.is_symlink():
-            raise ValueError("cache publication refuses symbolic links")
+    staging_native = filesystem_path(staging)
+    final_native = filesystem_path(final)
+    staging_st = os.lstat(staging_native)
+    if stat.S_ISLNK(staging_st.st_mode) or is_windows_name_surrogate_reparse(staging_st):
+        raise ValueError("cache publication refuses symbolic links and junctions")
+    try:
+        final_st = os.lstat(final_native)
+    except FileNotFoundError:
+        final_st = None
+    if final_st is not None and (
+        stat.S_ISLNK(final_st.st_mode) or is_windows_name_surrogate_reparse(final_st)
+    ):
+        raise ValueError("cache publication refuses symbolic links and junctions")
+    if stat.S_ISREG(staging_st.st_mode) and (final_st is None or stat.S_ISREG(final_st.st_mode)):
         # A single replacement keeps the pathname continuously valid. Existing
         # POSIX readers retain their old inode; Windows refuses if a reader has
         # not released its handle. Either outcome preserves a complete cache.
-        os.replace(staging, final)
+        os.replace(staging_native, final_native)
         return
     backup = None
-    if final.exists():
+    backup_native = None
+    if final_st is not None:
         backup = final.with_name(final.name + f".replaced-{uuid.uuid4().hex[:8]}")
-        final.rename(backup)
+        backup_native = filesystem_path(backup)
+        os.rename(final_native, backup_native)
     try:
-        staging.rename(final)
+        os.rename(staging_native, final_native)
     except OSError:
-        if backup is not None:
-            backup.rename(final)
+        if backup_native is not None:
+            os.rename(backup_native, final_native)
         raise
     if backup is not None:
         _remove_artifact(backup)
@@ -1007,10 +1046,47 @@ def commit_container(staging: Path, final: Path) -> None:
 def _remove_artifact(path: Path) -> None:
     """Remove one exact app-owned staging artifact, whether file or directory."""
     _refuse_database_companions(path)
-    if path.is_symlink() or path.is_file():
-        path.unlink(missing_ok=True)
-    else:
-        shutil.rmtree(path)
+    native = filesystem_path(path)
+    try:
+        st = os.lstat(native)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
+        try:
+            os.unlink(native)
+        except FileNotFoundError:
+            pass
+        return
+    if is_windows_name_surrogate_reparse(st):
+        raise ValueError(f"refusing to recursively remove junction or reparse point: {path}")
+    shutil.rmtree(native)
+
+
+def _sweep_lock_candidates(caches_dir: Path, family: str) -> list[CacheLock]:
+    """Return raw, NFC-normalized, and sibling-resolved lock candidates for ``family``."""
+    raw_container = caches_dir / family
+    nfc_container = caches_dir / normalize_name(family)
+    candidates: list[CacheLock] = []
+    seen_paths: set[Path] = set()
+    for candidate_container in (raw_container, nfc_container):
+        resolved = CacheLock(candidate_container)
+        if resolved.path not in seen_paths:
+            seen_paths.add(resolved.path)
+            candidates.append(resolved)
+        exact_path = candidate_container.with_name(candidate_container.name + ".lock")
+        if exact_path not in seen_paths:
+            seen_paths.add(exact_path)
+            exact_lock = CacheLock.__new__(CacheLock)
+            exact_lock.path = exact_path
+            exact_lock._gen = None
+            exact_lock._fd = None
+            exact_lock._arbiter = SessionFileLock(
+                exact_path.with_name(exact_path.name + ".arbiter")
+            )
+            exact_lock._mutex = threading.RLock()
+            candidates.append(exact_lock)
+    candidates.sort(key=lambda item: str(item._arbiter.path))
+    return candidates
 
 
 def sweep_stale_builds(caches_dir: Path) -> int:
@@ -1022,65 +1098,107 @@ def sweep_stale_builds(caches_dir: Path) -> int:
     bracketed NIS-Elements filename cannot inject wildcards.
     """
     n = 0
-    if not caches_dir.is_dir():
+    caches_native = filesystem_path(caches_dir)
+    if not os.path.isdir(caches_native):
         return 0
-    for item in caches_dir.iterdir():
-        name = item.name
+    with os.scandir(caches_native) as it:
+        names = [entry.name for entry in it]
+    for name in names:
+        item = caches_dir / name
         match = re.fullmatch(r"(.+\.(?:nd2wsi-cache|nd2svs))\.(?:building|replaced)-[^/]+", name)
         if match is None:
             continue
         family = match.group(1)
-        lock = CacheLock(caches_dir / family)
-        held_arbiter = False
-        if lock._arbiter.path.exists():
-            try:
-                lock._arbiter.acquire(timeout=0)
-                held_arbiter = True
-            except (TimeoutError, OSError):
-                continue  # another local process is actively coordinating this family
+        locks = _sweep_lock_candidates(caches_dir, family)
+        held_arbiters: list[SessionFileLock] = []
+        held_inodes: set[tuple[int, int]] = set()
+        held_paths: set[Path] = set()
+        contended = False
         try:
-            try:
-                lock_st = os.lstat(lock.path)
-            except FileNotFoundError:
-                lock_st = None
-            except OSError:
-                continue  # unreadable lockfile: assume build may still be active
+            for lock in locks:
+                arb_native = filesystem_path(lock._arbiter.path)
+                try:
+                    arb_st = os.lstat(arb_native)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    contended = True
+                    break
+                arb_ino = (arb_st.st_dev, arb_st.st_ino)
+                if arb_ino != (0, 0) and arb_ino in held_inodes:
+                    held_paths.add(lock._arbiter.path)
+                    continue
+                try:
+                    lock._arbiter.acquire(timeout=0)
+                    held_arbiters.append(lock._arbiter)
+                    held_paths.add(lock._arbiter.path)
+                    if arb_ino != (0, 0):
+                        held_inodes.add(arb_ino)
+                except (TimeoutError, OSError):
+                    contended = True
+                    break
+            if contended:
+                continue  # another local process is actively coordinating this family
             live = False
-            if lock_st is not None:
+            unreadable = False
+            for lock in locks:
+                try:
+                    lock_st = os.lstat(filesystem_path(lock.path))
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    unreadable = True
+                    break  # unreadable lockfile: assume build may still be active
                 info = lock._read()
                 if info is None:
                     # Momentarily empty/unreadable while being written: honor 30s grace.
-                    live = not CacheLock._stale_info(None, lock_st.st_mtime)
+                    if not CacheLock._stale_info(None, lock_st.st_mtime):
+                        live = True
+                        break
                 elif info.get("released") is True:
-                    live = False
+                    continue
                 elif _taken_elsewhere(info):
-                    live = False  # a builder on another machine or boot is not running here
+                    continue  # a builder on another machine or boot is not running here
                 else:
                     try:
-                        live = process_is_alive(int(info.get("pid", -1)))
+                        if process_is_alive(int(info.get("pid", -1))):
+                            live = True
+                            break
                     except (ProcessLookupError, ValueError, TypeError, OverflowError):
                         pass
                     except PermissionError:
                         live = True
-            if not live:
-                try:
-                    _refuse_database_companions(item)
-                    if item.is_file():
-                        from .storage.single_file import is_single_file
+                        break
+            if unreadable or live:
+                continue
+            try:
+                _refuse_database_companions(item)
+                item_st = os.lstat(filesystem_path(item))
+                if stat.S_ISREG(item_st.st_mode):
+                    from .storage.single_file import is_single_file
 
-                        if not is_single_file(item):
-                            continue  # an arbitrary file with a staging-like name is not cache
-                    elif item.is_dir() and not item.is_symlink() and ".replaced-" in name:
-                        from .cache_removal import rescue_annotations
+                    if not is_single_file(item):
+                        continue  # an arbitrary file with a staging-like name is not cache
+                elif (
+                    stat.S_ISDIR(item_st.st_mode)
+                    and not stat.S_ISLNK(item_st.st_mode)
+                    and not is_windows_name_surrogate_reparse(item_st)
+                    and ".replaced-" in name
+                ):
+                    from .cache_removal import rescue_annotations
 
-                        rescue_annotations(item, caches_dir.parent / ANNOTATIONS_DIR)
-                    if not held_arbiter and lock._arbiter.path.exists():
-                        continue  # a local builder started while we inspected this family
-                    _remove_artifact(item)
-                    n += 1
-                except (OSError, RuntimeError, ValueError):
-                    pass  # leave inaccessible or unrescuable artifacts in place
+                    rescue_annotations(item, caches_dir.parent / ANNOTATIONS_DIR)
+                if any(
+                    lock._arbiter.path not in held_paths
+                    and os.path.exists(filesystem_path(lock._arbiter.path))
+                    for lock in locks
+                ):
+                    continue  # a local builder started while we inspected this family
+                _remove_artifact(item)
+                n += 1
+            except (OSError, RuntimeError, ValueError):
+                pass  # leave inaccessible or unrescuable artifacts in place
         finally:
-            if held_arbiter:
-                lock._arbiter.release()
+            for arbiter in reversed(held_arbiters):
+                arbiter.release()
     return n

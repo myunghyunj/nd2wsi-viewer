@@ -106,7 +106,7 @@ def windows_allocation_block_bytes(path: str | os.PathLike) -> int:
 
     kernel = _windows_api()
     root = ctypes.create_unicode_buffer(32768)
-    if not kernel.GetVolumePathNameW(os.path.abspath(path), root, len(root)):
+    if not kernel.GetVolumePathNameW(filesystem_path(os.path.abspath(path)), root, len(root)):
         raise ctypes.WinError(ctypes.get_last_error())
     sectors, sector_bytes, free, total = (wintypes.DWORD() for _ in range(4))
     if not kernel.GetDiskFreeSpaceW(
