@@ -982,21 +982,21 @@ class StageFollowMixin:
                                 self._laser_delivery = None
 
                 if source == "keys":
-                    if self._on_laser_box is not None and self._laser_delivery is None:
-                        from .slacs_laser import LaserDelivery
-
-                        made_delivery = True
-                        self._laser_delivery = LaserDelivery(
-                            prepare=self._prepare_laser_box,
-                            deliver=self._deliver_laser_box,
-                            confirmed=self._confirm_laser_box,
-                        )
-                    controls = None
-                    if step_source == "slacs":
-                        controls, controls_error = self._slacs_controls_monitor()
-                    identifier = self._slacs_identifier()
-                    identifier_kwargs = {"identifier": identifier} if identifier is not None else {}
                     try:
+                        if self._on_laser_box is not None and self._laser_delivery is None:
+                            from .slacs_laser import LaserDelivery
+
+                            self._laser_delivery = LaserDelivery(
+                                prepare=self._prepare_laser_box,
+                                deliver=self._deliver_laser_box,
+                                confirmed=self._confirm_laser_box,
+                            )
+                            made_delivery = True
+                        controls = None
+                        if step_source == "slacs":
+                            controls, controls_error = self._slacs_controls_monitor()
+                        identifier = self._slacs_identifier()
+                        identifier_kwargs = {"identifier": identifier} if identifier is not None else {}
                         follower = SlacsKeyFollower(
                             receiver,
                             descriptor["session_id"],

@@ -2343,3 +2343,78 @@ def test_close_translucent_winforms_absorbs_disposal_exceptions_and_notifies_clo
     direct_native.Close.assert_called_once_with()
     on_closed3.assert_called_once_with(api3)
 
+
+def test_close_translucent_mid_reveal_skips_unshown_shortcut_and_clears_revealing_on_error(
+    cocoa_api, monkeypatch
+):
+    direct_destroy = Mock()
+    monkeypatch.setattr(overlay, "_direct_destroy_window", direct_destroy)
+
+    # 1. Closing while native reveal is in flight (_revealing=True) must NOT take
+    #    the unshown _direct_destroy_window shortcut; it must call window.destroy().
+    q = cocoa_api
+    q.window.events = SimpleNamespace(shown=Event())
+    saw_revealing = []
+
+    def close_during_reveal(_sender):
+        saw_revealing.append((q.api._revealing, q.api._configured))
+        assert q.api.close_translucent() is True
+
+    q.native.makeKeyAndOrderFront_.side_effect = close_during_reveal
+    q.api._configure_and_show()
+    q.queued.pop(0)()
+    assert saw_revealing == [(True, False)]
+    assert q.api._revealing is False
+    assert q.api._configured is True
+    direct_destroy.assert_not_called()
+    q.window.destroy.assert_called_once_with()
+    q.closed.assert_not_called()
+    q.api._did_close()
+    q.closed.assert_called_once_with(q.api)
+
+    # 2. Direct _revealing=True state also bypasses _direct_destroy_window and preserves
+    #    native closed-event single-overlay claim ownership.
+    direct_destroy.reset_mock()
+    on_closed2 = Mock()
+    api2 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=on_closed2)
+    api2._revealing = True
+    api2._window = SimpleNamespace(
+        uid="ov-revealing",
+        native=Mock(),
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(),
+    )
+    assert api2.close_translucent() is True
+    direct_destroy.assert_not_called()
+    api2._window.destroy.assert_called_once_with()
+    on_closed2.assert_not_called()
+    api2._did_close()
+    on_closed2.assert_called_once_with(api2)
+
+    # 3. If native reveal raises before completion, _revealing resets to False
+    #    and _configured stays False so subsequent close uses _direct_destroy_window.
+    direct_destroy.reset_mock()
+    logs3 = []
+    on_closed3 = Mock()
+    failing_native = Mock(
+        frame=lambda: q.frame,
+        makeKeyAndOrderFront_=Mock(side_effect=RuntimeError("reveal failed")),
+    )
+    api3 = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=logs3.append, on_closed=on_closed3)
+    api3._window = SimpleNamespace(
+        uid="ov-reveal-err",
+        native=failing_native,
+        events=SimpleNamespace(shown=Event()),
+        destroy=Mock(),
+    )
+    api3._configure_and_show()
+    q.queued.pop(0)()
+    assert api3._revealing is False
+    assert api3._configured is False
+    assert any("reveal failed" in msg for msg in logs3)
+    assert api3.close_translucent() is True
+    direct_destroy.assert_called_once_with(api3._window)
+    api3._window.destroy.assert_not_called()
+    on_closed3.assert_called_once_with(api3)
+
+

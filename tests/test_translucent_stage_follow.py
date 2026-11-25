@@ -923,3 +923,58 @@ def test_start_stage_follow_binds_all_attributes_before_follower_start_and_rolls
     followers3[0].stop.assert_called_once_with("start_failed")
     receiver3.close.assert_called_once_with()
     delivery3.close.assert_called_once_with()
+
+
+def test_start_stage_follow_rolls_back_receiver_and_delivery_on_pre_follower_errors(monkeypatch):
+    from nd2wsi import slacs_laser, stage_follow
+
+    def _make_api():
+        api = TranslucentApi(
+            {"pixel_size_um": [1.0, 1.0], "dimensions": [1024, 1024], "image_name": "test.nd2"},
+            logger=Mock(),
+            on_closed=Mock(),
+            on_laser_box=Mock(),
+        )
+        api._window = Mock()
+        api._dispatch = lambda _op: None
+        api._on_slacs_change({"available": True, "session_id": "slacs-proc-1", "status": "running"})
+        return api
+
+    # 1. _slacs_controls_monitor raising RuntimeError rolls back receiver + delivery.
+    receiver1 = Mock()
+    receiver1.start.return_value = {"session_id": "recv-1"}
+    delivery1 = Mock()
+    monkeypatch.setattr(stage_follow, "StageFollowReceiver", lambda: receiver1)
+    monkeypatch.setattr(slacs_laser, "LaserDelivery", lambda **_kw: delivery1)
+    api1 = _make_api()
+    monkeypatch.setattr(api1, "_slacs_controls_monitor", Mock(side_effect=RuntimeError("controls boom")))
+    res1 = api1.start_stage_follow({"source": "keys", "step_source": "slacs"})
+    assert res1 == {"ok": False, "message": "controls boom"}
+    receiver1.close.assert_called_once_with()
+    delivery1.close.assert_called_once_with()
+    assert api1._laser_delivery is None and api1._stage_follow is None
+
+    # 2. _slacs_identifier raising BaseException rolls back receiver + delivery and re-raises.
+    receiver2 = Mock()
+    receiver2.start.return_value = {"session_id": "recv-2"}
+    delivery2 = Mock()
+    monkeypatch.setattr(stage_follow, "StageFollowReceiver", lambda: receiver2)
+    monkeypatch.setattr(slacs_laser, "LaserDelivery", lambda **_kw: delivery2)
+    api2 = _make_api()
+    monkeypatch.setattr(api2, "_slacs_identifier", Mock(side_effect=KeyboardInterrupt("id interrupted")))
+    with pytest.raises(KeyboardInterrupt, match="id interrupted"):
+        api2.start_stage_follow({"source": "keys", "step_source": "manual"})
+    receiver2.close.assert_called_once_with()
+    delivery2.close.assert_called_once_with()
+    assert api2._laser_delivery is None and api2._stage_follow is None
+
+    # 3. LaserDelivery constructor raising RuntimeError still closes receiver cleanly.
+    receiver3 = Mock()
+    receiver3.start.return_value = {"session_id": "recv-3"}
+    monkeypatch.setattr(stage_follow, "StageFollowReceiver", lambda: receiver3)
+    monkeypatch.setattr(slacs_laser, "LaserDelivery", Mock(side_effect=RuntimeError("delivery init boom")))
+    api3 = _make_api()
+    res3 = api3.start_stage_follow({"source": "keys", "step_source": "manual"})
+    assert res3 == {"ok": False, "message": "delivery init boom"}
+    receiver3.close.assert_called_once_with()
+    assert api3._laser_delivery is None and api3._stage_follow is None
