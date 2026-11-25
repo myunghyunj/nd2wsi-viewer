@@ -3,8 +3,11 @@
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent !important; }
 body { user-select: none; -webkit-user-select: none; }
 #overlay { position: fixed; inset: 0; overflow: hidden; border-radius: 18px; isolation: isolate; }
-#translucent-stage { position: absolute; inset: 0; opacity: .55; background: transparent; cursor: grab; }
+#translucent-stage { position: absolute; inset: 0; opacity: .55; background: transparent; cursor: grab; isolation: isolate; }
 #translucent-stage:active { cursor: grabbing; }
+#translucent-backdrop { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
+#translucent-backdrop[hidden] { display: none; }
+#translucent-stage .openseadragon-container { position: relative; z-index: 1; }
 #translucent-stage .openseadragon-container, #translucent-stage .openseadragon-canvas { background: transparent !important; outline: none; }
 #roi-overlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: hidden; z-index: 1; opacity: 1; }
 #roi-overlay, #roi-overlay * { pointer-events: none; }

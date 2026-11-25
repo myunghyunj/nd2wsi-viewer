@@ -93,8 +93,305 @@
     return center;
   }
 
+  // Reset an OpenSeadragon TiledImage in place so the next draw rebuilds tile
+  // records through getTileUrl without reopening the source. Emptying
+  // tilesMatrix forces fresh tile URLs; clearing imageLoader (when requested)
+  // drops queued unstarted jobs from superseded display revisions; calling
+  // setClip with the unchanged clip schedules the tile pass.
+  function resetTiledImage(item, options = {}) {
+    if (!item || typeof item.reset !== "function") return false;
+    if (
+      options &&
+      options.clearImageLoader === true &&
+      typeof item.viewer?.imageLoader?.clear === "function"
+    ) {
+      item.viewer.imageLoader.clear();
+    }
+    item.reset();
+    if (item.tilesMatrix) item.tilesMatrix = {};
+    if (
+      typeof item._setFullyLoaded === "function" &&
+      typeof item.getDrawArea === "function" &&
+      item.getDrawArea()
+    ) {
+      item._setFullyLoaded(false);
+    }
+    if (typeof item.setClip === "function" && typeof item.getClip === "function") {
+      item.setClip(item.getClip());
+    }
+    return true;
+  }
+
+  // Canonical ?-less query string so internal display-query comparisons stay
+  // independent of leading "?" or encoding variants.
+  function normalizeQuery(raw) {
+    let text = "";
+    try {
+      text = raw ? String(raw) : "";
+    } catch (_) {
+      return "";
+    }
+    const body = text.replace(/^\?/, "");
+    if (!body) return "";
+    return typeof URLSearchParams === "function"
+      ? new URLSearchParams(body).toString()
+      : body;
+  }
+
+  // Identify whether a tile belongs to the currently active reset generation.
+  // Prefers exact object identity in item.tilesMatrix (handles A -> B -> A
+  // and post-reset stale tiles even when URLs collide), falling back to
+  // normalized URL query matching for minimal mocks without tilesMatrix.
+  function isActiveTile(item, tile, activeQuery) {
+    if (
+      item &&
+      item.tilesMatrix &&
+      tile &&
+      Number.isInteger(tile.level) &&
+      Number.isInteger(tile.x) &&
+      Number.isInteger(tile.y)
+    ) {
+      return item.tilesMatrix[tile.level]?.[tile.x]?.[tile.y] === tile;
+    }
+    if (typeof tile?.getUrl === "function") {
+      const url = String(tile.getUrl() || "");
+      const qIdx = url.indexOf("?");
+      const urlQuery = qIdx >= 0 ? url.slice(qIdx + 1) : "";
+      return normalizeQuery(urlQuery) === normalizeQuery(activeQuery);
+    }
+    return true;
+  }
+
+  // Paint-gated tile refresh controller shared by the main viewer and the
+  // translucent overlay. Holds at most one reset in flight at a time, coalesces
+  // newer display queries until full visible coverage paints (or the progress
+  // watchdog expires), and suppresses obsolete tile-load failures.
+  function createTileRefreshGate({
+    getItem,
+    getViewer,
+    onBeforeReset,
+    onPaintComplete,
+    onActiveTileError,
+    setTimer,
+    clearTimer,
+    stallTimeoutMs = 2000,
+  } = {}) {
+    const timeoutMs =
+      Number.isFinite(stallTimeoutMs) && stallTimeoutMs > 0 ? stallTimeoutMs : 2000;
+    let activeQuery = "";
+    let paintedQuery = null;
+    let pendingQuery = null;
+    let rendering = false;
+    let stallTimer = null;
+    let disposed = false;
+
+    function currentItem() {
+      return typeof getItem === "function" ? getItem() : null;
+    }
+
+    function currentViewer() {
+      return typeof getViewer === "function" ? getViewer() : null;
+    }
+
+    function clearWatchdog() {
+      if (stallTimer !== null) {
+        const id = stallTimer;
+        stallTimer = null;
+        if (typeof clearTimer === "function") clearTimer(id);
+      }
+    }
+
+    function armWatchdog() {
+      clearWatchdog();
+      if (disposed || !rendering || typeof setTimer !== "function") return;
+      stallTimer = setTimer(() => {
+        stallTimer = null;
+        if (disposed || !rendering) return;
+        rendering = false;
+        // Keep paintedQuery = null so an A -> B -> A revisit still resets.
+        onPaintComplete?.(null);
+        if (!disposed && !rendering && pendingQuery !== null) {
+          const next = pendingQuery;
+          pendingQuery = null;
+          beginReset(next);
+        }
+      }, timeoutMs);
+    }
+
+    function completePaint() {
+      clearWatchdog();
+      rendering = false;
+      paintedQuery = activeQuery;
+      onPaintComplete?.(paintedQuery);
+      if (!disposed && !rendering && pendingQuery !== null) {
+        const next = pendingQuery;
+        pendingQuery = null;
+        if (next !== paintedQuery) {
+          beginReset(next);
+        }
+      }
+    }
+
+    function beginReset(next) {
+      if (disposed) return false;
+      clearWatchdog();
+      activeQuery = next;
+      pendingQuery = null;
+      paintedQuery = null;
+      const item = currentItem();
+      onBeforeReset?.(item);
+      if (disposed) return false;
+      if (!item || typeof item.reset !== "function") {
+        rendering = false;
+        paintedQuery = next;
+        currentViewer()?.forceRedraw?.();
+        onPaintComplete?.(next);
+        if (!disposed && !rendering && pendingQuery !== null) {
+          const queued = pendingQuery;
+          pendingQuery = null;
+          if (queued !== paintedQuery) beginReset(queued);
+        }
+        return true;
+      }
+      const offscreen = typeof item.getDrawArea === "function" && !item.getDrawArea();
+      if (offscreen) {
+        rendering = false;
+        resetTiledImage(item, { clearImageLoader: true });
+        currentViewer()?.forceRedraw?.();
+        paintedQuery = next;
+        onPaintComplete?.(next);
+        if (!disposed && !rendering && pendingQuery !== null) {
+          const queued = pendingQuery;
+          pendingQuery = null;
+          if (queued !== paintedQuery) beginReset(queued);
+        }
+        return true;
+      }
+      rendering = true;
+      resetTiledImage(item, { clearImageLoader: true });
+      currentViewer()?.forceRedraw?.();
+      if (rendering && !disposed && stallTimer === null) {
+        armWatchdog();
+      }
+      return true;
+    }
+
+    function resetState(query) {
+      clearWatchdog();
+      activeQuery = normalizeQuery(query);
+      paintedQuery = activeQuery;
+      pendingQuery = null;
+      rendering = false;
+    }
+
+    function init(initialQuery) {
+      resetState(initialQuery);
+    }
+
+    function getActiveQuery() {
+      return activeQuery;
+    }
+
+    function isRendering() {
+      return rendering;
+    }
+
+    function request(nextQuery, options) {
+      if (disposed) return false;
+      const force = Boolean(options && options.force);
+      const next = normalizeQuery(nextQuery);
+      if (!rendering && !force && next === paintedQuery) {
+        activeQuery = next;
+        return false;
+      }
+      if (rendering) {
+        pendingQuery = next;
+        return true;
+      }
+      beginReset(next);
+      return true;
+    }
+
+    function onTileLoaded(event) {
+      if (disposed || !rendering) return;
+      const item = currentItem();
+      if (event?.tiledImage && event.tiledImage !== item) return;
+      if (isActiveTile(item, event?.tile, activeQuery)) {
+        armWatchdog();
+      }
+    }
+
+    function onTiledImageDrawn(event) {
+      if (disposed) return;
+      const item = currentItem();
+      if (event?.tiledImage && event.tiledImage !== item) return;
+      const hasActiveTile =
+        !Array.isArray(event?.tiles) ||
+        event.tiles.some((tile) => isActiveTile(item, tile, activeQuery));
+      if (rendering) {
+        const fullyLoaded =
+          typeof item?.getFullyLoaded !== "function" || Boolean(item.getFullyLoaded());
+        if (hasActiveTile && fullyLoaded) {
+          completePaint();
+        }
+        return;
+      }
+      if (paintedQuery === null && hasActiveTile && item?.getFullyLoaded?.()) {
+        paintedQuery = activeQuery;
+        onPaintComplete?.(activeQuery);
+      }
+    }
+
+    function onFullyLoadedChange(event) {
+      if (disposed || !rendering || event?.fullyLoaded !== true) return;
+      const item = currentItem();
+      if (event?.tiledImage && event.tiledImage !== item) return;
+      if (typeof item?.getFullyLoaded !== "function" || item.getFullyLoaded() !== false) {
+        completePaint();
+      }
+    }
+
+    function onTileLoadFailed(event) {
+      if (disposed) return false;
+      const item = currentItem();
+      if (event?.tiledImage && event.tiledImage !== item) return false;
+      if (!isActiveTile(item, event?.tile, activeQuery)) return false;
+      onActiveTileError?.(event);
+      clearWatchdog();
+      rendering = false;
+      paintedQuery = null;
+      if (!disposed && pendingQuery !== null) {
+        const next = pendingQuery;
+        pendingQuery = null;
+        beginReset(next);
+      }
+      return true;
+    }
+
+    function dispose() {
+      disposed = true;
+      rendering = false;
+      pendingQuery = null;
+      clearWatchdog();
+    }
+
+    return {
+      init,
+      getActiveQuery,
+      isRendering,
+      request,
+      onTileLoaded,
+      onTiledImageDrawn,
+      onFullyLoadedChange,
+      onTileLoadFailed,
+      resetState,
+      dispose,
+    };
+  }
+
   return {
     makeTileSource, flipAwareElementPoint, viewerElementToImagePoint,
     imageToViewerElementPoint, rectCornersToElementPoints, centerOnPreservingZoom,
+    resetTiledImage, normalizeQuery, isActiveTile, createTileRefreshGate,
   };
 });

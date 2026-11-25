@@ -10,10 +10,12 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from functools import lru_cache
 from pathlib import Path
 
@@ -25,6 +27,9 @@ OPACITY_TIMEOUT = 5
 MIN_SIZE = (220, 160)
 MAX_SIZE = 8192
 _LOGPIXELSX = 88
+# Match nd2wsi/render.py without eagerly importing numpy at module load time.
+_FLOAT32_SAFE_BOUND = 3e38
+_HEX6_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
 
 
 @lru_cache(maxsize=1)
@@ -125,6 +130,125 @@ def validate_roi(store, payload):
     return rectangle
 
 
+def validate_display_params(store, params) -> list[tuple[str, str]]:
+    """Validate and canonicalize display-only parameters (c, win, col)."""
+    if not isinstance(params, dict):
+        raise ValueError("Invalid display settings")
+    channels = store.attrs["omero"]["channels"]
+    n_channels = len(channels)
+    result: list[tuple[str, str]] = []
+
+    selected = params.get("c")
+    if selected not in (None, ""):
+        if not isinstance(selected, str):
+            raise ValueError("Invalid channel selection")
+        if selected == "none":
+            result.append(("c", "none"))
+        else:
+            indices = selected.split(",")
+            seen: set[int] = set()
+            for token in indices:
+                if (
+                    not token
+                    or not token.isascii()
+                    or not token.isdecimal()
+                    or (len(token) > 1 and token.startswith("0"))
+                ):
+                    raise ValueError("Invalid channel selection")
+                idx = int(token)
+                if not 0 <= idx < n_channels or idx in seen:
+                    raise ValueError("Invalid channel selection")
+                seen.add(idx)
+            result.append(("c", selected))
+
+    raw_win = params.get("win")
+    if raw_win is not None:
+        if not isinstance(raw_win, str):
+            raise ValueError("Invalid channel window")
+        slots = raw_win.split(",")
+        if len(slots) > n_channels:
+            raise ValueError("Too many channel windows")
+        for slot in slots:
+            if slot == "":
+                continue
+            parts = slot.split(":")
+            if len(parts) not in (2, 3):
+                raise ValueError("Invalid channel window")
+            values: list[float] = []
+            for tok in parts:
+                if not tok or tok != tok.strip() or any(ch.isspace() for ch in tok) or "_" in tok:
+                    raise ValueError("Invalid channel window")
+                try:
+                    val = float(tok)
+                except ValueError as exc:
+                    raise ValueError("Invalid channel window") from exc
+                if not math.isfinite(val):
+                    raise ValueError("Invalid channel window")
+                values.append(val)
+            lo, hi = values[0], values[1]
+            if (
+                abs(lo) >= _FLOAT32_SAFE_BOUND
+                or abs(hi) >= _FLOAT32_SAFE_BOUND
+                or not math.isfinite(hi - lo)
+                or hi <= lo
+            ):
+                raise ValueError("Invalid channel window")
+            if len(values) == 3 and not 0.1 <= values[2] <= 10.0:
+                raise ValueError("Invalid channel gamma")
+        if any(slot != "" for slot in slots):
+            result.append(("win", raw_win))
+
+    raw_col = params.get("col")
+    if raw_col is not None:
+        if not isinstance(raw_col, str):
+            raise ValueError("Invalid channel color")
+        tokens = raw_col.split(",")
+        if len(tokens) > n_channels:
+            raise ValueError("Too many channel colors")
+        cleaned_tokens: list[str] = []
+        for token in tokens:
+            if token == "":
+                cleaned_tokens.append("")
+                continue
+            cleaned = token[1:] if token.startswith("#") else token
+            if not _HEX6_RE.fullmatch(cleaned):
+                raise ValueError("Invalid channel color")
+            cleaned_tokens.append(cleaned)
+        if any(cleaned_tokens):
+            result.append(("col", ",".join(cleaned_tokens)))
+
+    return result
+
+
+def validate_display_query(store, display_query: str) -> list[tuple[str, str]]:
+    """Validate a display-only query string containing only c, win, and/or col."""
+    if not isinstance(display_query, str) or len(display_query) > 16384:
+        raise ValueError("Invalid display settings")
+    body = display_query.removeprefix("?")
+    pairs = urllib.parse.parse_qsl(
+        body,
+        keep_blank_values=True,
+        strict_parsing=True,
+        max_num_fields=3,
+    )
+    params = dict(pairs)
+    if len(params) != len(pairs) or set(params) - {"c", "win", "col"}:
+        raise ValueError("Unsupported display setting")
+    return validate_display_params(store, params)
+
+
+def merge_display_query(store, base_query: str, display_query: str) -> str:
+    """Merge validated display overrides onto immutable launch base keys (g, t, p, z)."""
+    display_pairs = validate_display_query(store, display_query)
+    if not isinstance(base_query, str):
+        raise ValueError("Invalid base query")
+    base_pairs = urllib.parse.parse_qsl(base_query.removeprefix("?"), keep_blank_values=True)
+    base_map = dict(base_pairs)
+    preserved = [(key, base_map[key]) for key in ("g", "t", "p", "z") if key in base_map]
+    merged = display_pairs + preserved
+    return "?" + urllib.parse.urlencode(merged) if merged else ""
+
+
 def validate_context(store, payload, *, slide_url):
     """Accept only a camera and tile-render settings for a registered slide."""
     if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
@@ -152,38 +276,7 @@ def validate_context(store, payload, *, slide_url):
     params = dict(pairs)
     if len(params) != len(pairs) or set(params) - {"c", "win", "g", "t", "p", "z", "col"}:
         raise ValueError("Unsupported display setting")
-    channels = store.attrs["omero"]["channels"]
-    selected = params.get("c")
-    if selected not in (None, "", "none"):
-        indices = selected.split(",")
-        if (any(not index.isascii() or not index.isdecimal() or not 0 <= int(index) < len(channels)
-                for index in indices) or len(set(indices)) != len(indices)):
-            raise ValueError("Invalid channel selection")
-    if "col" in params and params["col"] != "":
-        col_tokens = params["col"].split(",")
-        if len(col_tokens) > len(channels):
-            raise ValueError("Too many channel colors")
-        for token in col_tokens:
-            if not token:
-                continue
-            cleaned = token[1:] if token.startswith("#") else token
-            if len(cleaned) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in cleaned):
-                raise ValueError("Invalid channel color")
-    if "win" in params:
-        windows = params["win"].split(",")
-        if len(windows) > len(channels):
-            raise ValueError("Too many channel windows")
-        for window in windows:
-            if not window:
-                continue
-            values = window.split(":")
-            if len(values) not in (2, 3):
-                raise ValueError("Invalid channel window")
-            values = [float(value) for value in values]
-            if not all(math.isfinite(value) for value in values) or values[1] <= values[0]:
-                raise ValueError("Invalid channel window")
-            if len(values) == 3 and not 0.1 <= values[2] <= 10:
-                raise ValueError("Invalid channel gamma")
+    display_map = dict(validate_display_params(store, params))
     generation = getattr(store, "generation", "")
     if params.get("g", "") != generation:
         raise ValueError("The image changed; refresh the slide before opening the overlay")
@@ -195,7 +288,14 @@ def validate_context(store, payload, *, slide_url):
                 raise ValueError("Choose a valid plate site, time and Z plane first")
     elif set(params) & {"t", "p", "z"}:
         raise ValueError("Plane selection does not match this slide")
-    cleaned = urllib.parse.urlencode(pairs)
+    canonical_pairs = []
+    for key, value in pairs:
+        if key in ("c", "win", "col"):
+            if key in display_map:
+                canonical_pairs.append((key, display_map[key]))
+        else:
+            canonical_pairs.append((key, value))
+    cleaned = urllib.parse.urlencode(canonical_pairs)
     context = {"version": 1, "slide_url": slide_url, "query": "?" + cleaned if cleaned else "",
                "center": center, "zoom": zoom, "rotation": rotation, "flip": flip,
                "dimensions": [width, height],
@@ -248,10 +348,33 @@ class _OverlayDrag(NativeTitlebarDrag):
             self.logger(f"translucent window drag failed: {exc!r}")
 
 
+class _DisplaySession:
+    """Ephemeral per-launch display state and condition waiter."""
+
+    def __init__(
+        self,
+        *,
+        launch_token: str,
+        launch_generation: str,
+        base_query: str,
+        query: str,
+        cond: threading.Condition,
+    ):
+        self.launch_token = launch_token
+        self.launch_generation = launch_generation
+        self.base_query = base_query
+        self.query = query
+        self.revision = 0
+        self.expired = False
+        self.expired_reason = ""
+        self.retired = False
+        self.cond = cond
+
+
 class TranslucentApi:
     """Display-only bridge with read-only, user-selected JPG/TXT ROI import."""
 
-    def __init__(self, context, *, logger, on_closed):
+    def __init__(self, context, *, logger, on_closed, launch_token=None, launch_generation=""):
         self._context = copy.deepcopy(context)
         self._context.setdefault("opacity", OPACITY)
         self._context["opacity_mode"] = "native" if sys.platform == "win32" else "layer"
@@ -261,14 +384,155 @@ class TranslucentApi:
         self._drag = None
         self._locked = False
         self._closed = False
+        self._close_notified = False
         self._configured = False
         self._drop_document = None
         self._epoch = 0
         self._lock = threading.RLock()
+        initial_query = self._context.get("query", "")
+        if not isinstance(initial_query, str):
+            initial_query = ""
+        token = launch_token if isinstance(launch_token, str) and launch_token else uuid.uuid4().hex
+        gen = launch_generation if isinstance(launch_generation, str) else ""
+        self._session = _DisplaySession(
+            launch_token=token,
+            launch_generation=gen,
+            base_query=initial_query,
+            query=initial_query,
+            cond=threading.Condition(self._lock),
+        )
 
     def translucent_context(self):
         with self._lock:
-            return {**copy.deepcopy(self._context), "locked": self._locked}
+            s = self._session
+            return {
+                **copy.deepcopy(self._context),
+                "query": s.query,
+                "launch_token": s.launch_token,
+                "display_revision": s.revision,
+                "locked": self._locked,
+            }
+
+    def translucent_display_state(self) -> dict:
+        with self._lock:
+            s = self._session
+            if self._closed or s.retired:
+                return {"ok": False, "closed": True}
+            return {
+                "ok": True,
+                "launch_token": s.launch_token,
+                "revision": s.revision,
+                "query": s.query,
+                "expired": s.expired,
+                "reason": s.expired_reason,
+            }
+
+    def wait_translucent_display(
+        self,
+        launch_token: str,
+        after_revision: int,
+        timeout_ms: int = 25000,
+    ) -> dict:
+        if (
+            not isinstance(launch_token, str)
+            or type(after_revision) is not int
+            or not 0 <= after_revision <= 2**53 - 1
+            or isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, (int, float))
+            or not math.isfinite(timeout_ms)
+            or not 1 <= timeout_ms <= 60000
+        ):
+            return {"ok": False, "message": "Invalid display wait request"}
+        deadline = time.monotonic() + float(timeout_ms) / 1000.0
+        with self._lock:
+            s = self._session
+            if self._closed or s.retired or s.launch_token != launch_token:
+                return {"ok": False, "closed": True}
+            while not (
+                self._closed
+                or s.retired
+                or self._session is not s
+                or s.launch_token != launch_token
+                or s.expired
+                or s.revision > after_revision
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                s.cond.wait(timeout=remaining)
+            if self._closed or s.retired or self._session is not s or s.launch_token != launch_token:
+                return {"ok": False, "closed": True}
+            if s.expired:
+                return {
+                    "ok": True,
+                    "launch_token": s.launch_token,
+                    "revision": s.revision,
+                    "query": s.query,
+                    "expired": True,
+                    "reason": s.expired_reason,
+                }
+            if s.revision > after_revision:
+                return {
+                    "ok": True,
+                    "launch_token": s.launch_token,
+                    "revision": s.revision,
+                    "query": s.query,
+                    "expired": False,
+                    "unchanged": False,
+                }
+            return {
+                "ok": True,
+                "launch_token": s.launch_token,
+                "revision": s.revision,
+                "query": s.query,
+                "expired": False,
+                "unchanged": True,
+            }
+
+    def _session_snapshot(self) -> tuple[str, str, str, bool]:
+        with self._lock:
+            s = self._session
+            return (s.launch_token, s.launch_generation, s.base_query, self._closed or s.retired)
+
+    def _apply_display_query(self, launch_token: str, revision: int, merged_query: str) -> dict:
+        with self._lock:
+            s = self._session
+            if self._closed or s.retired:
+                return {"ok": False, "closed": True}
+            if s.launch_token != launch_token:
+                return {"ok": False, "stale": True}
+            if s.expired:
+                return {
+                    "ok": False,
+                    "stale_generation": True,
+                    "message": "The source image changed. Reopen the translucent viewer.",
+                }
+            if revision <= s.revision:
+                return {"ok": True, "applied": False, "revision": s.revision}
+            s.revision = revision
+            s.query = merged_query
+            self._context["query"] = merged_query
+            s.cond.notify_all()
+            return {"ok": True, "applied": True, "revision": revision}
+
+    def _expire_display_session(self, launch_token: str, reason: str = "generation_changed") -> bool:
+        with self._lock:
+            s = self._session
+            if not self._closed and not s.retired and s.launch_token == launch_token:
+                s.expired = True
+                s.expired_reason = reason
+                s.cond.notify_all()
+                return True
+            return False
+
+    def _notify_closed(self):
+        with self._lock:
+            if self._close_notified:
+                return
+            self._close_notified = True
+            self._session.retired = True
+            self._session.cond.notify_all()
+        self._on_closed(self)
 
     def choose_roi_file(self):
         """Choose a coordinate-reference JPG and its AstroMapper TXT together."""
@@ -396,8 +660,10 @@ class TranslucentApi:
 
     def _configure_and_show(self, *_args):
         def configure():
-            if self._closed or self._configured:
-                return
+            with self._lock:
+                if self._closed or self._configured:
+                    return
+                opacity = self._context["opacity"]
             native = self._window.native
             if sys.platform == "darwin":
                 import AppKit
@@ -421,12 +687,13 @@ class TranslucentApi:
                 # WebView2's ordinary HWND host does not provide per-pixel
                 # desktop alpha. Native form opacity supplies the tracing
                 # effect (including controls) without applying alpha twice.
-                native.Opacity = self._context["opacity"]
+                native.Opacity = opacity
                 native.TopMost = True
                 native.ShowInTaskbar = False
                 self._round_windows_region()
                 native.Show()
-            self._configured = True
+            with self._lock:
+                self._configured = True
 
         try:
             self._dispatch(configure)
@@ -590,22 +857,43 @@ class TranslucentApi:
                 return True
             self._closed = True
             self._epoch += 1
-        if self._window is not None:
-            self._window.destroy()
-        self._on_closed(self)
+            self._session.retired = True
+            self._session.cond.notify_all()
+        try:
+            if self._window is not None:
+                self._window.destroy()
+        finally:
+            self._notify_closed()
         return True
 
     def _did_close(self, *_args):
         with self._lock:
             self._closed = True
             self._epoch += 1
-        self._on_closed(self)
+            self._session.retired = True
+            self._session.cond.notify_all()
+        self._notify_closed()
 
 
-def create_translucent_window(context, *, url, title, logger, on_closed):
+def create_translucent_window(
+    context,
+    *,
+    url,
+    title,
+    logger,
+    on_closed,
+    launch_token=None,
+    launch_generation="",
+):
     import webview
 
-    api = TranslucentApi(context, logger=logger, on_closed=on_closed)
+    api = TranslucentApi(
+        context,
+        logger=logger,
+        on_closed=on_closed,
+        launch_token=launch_token,
+        launch_generation=launch_generation,
+    )
     window = webview.create_window(
         title, url=url, js_api=api, width=640, height=480, min_size=MIN_SIZE,
         frameless=True, easy_drag=False, resizable=False, on_top=True,

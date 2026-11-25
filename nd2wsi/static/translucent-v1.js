@@ -1,4 +1,4 @@
-/* Independent tiled tracing window. Source display is a read-only snapshot. */
+/* Independent tiled tracing window with live source display sync. */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
     module.exports = factory(require("./viewer-geometry-v1.js"));
@@ -10,6 +10,55 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function (geometry) {
   "use strict";
 
+  const ALLOWED_QUERY_KEYS = ["c", "win", "col", "g", "t", "p", "z"];
+  const BASE_QUERY_KEYS = ["g", "t", "p", "z"];
+  const MAX_QUERY_LENGTH = 16384;
+  const HEX6_RE = /^[0-9a-fA-F]{6}$/;
+  const EXPIRED_STATUS = "The source image changed. Close and reopen the translucent viewer.";
+  const SYNC_ERROR_STATUS = "Could not sync contrast settings.";
+  const TILE_LOAD_FAILED_STATUS = "Some image tiles could not load. Close and reopen the translucent viewer.";
+
+  function validateQueryParams(rawQuery, info = null) {
+    if (typeof rawQuery !== "string" || rawQuery.length > MAX_QUERY_LENGTH) {
+      throw new Error("Invalid image display settings");
+    }
+    const query = new URLSearchParams(rawQuery.replace(/^\?/, ""));
+    for (const key of query.keys()) {
+      if (!ALLOWED_QUERY_KEYS.includes(key) || query.getAll(key).length !== 1) {
+        throw new Error("Invalid image display settings");
+      }
+    }
+    const col = query.get("col");
+    if (col !== null) {
+      const tokens = col.split(",");
+      if (!tokens.length || !tokens.every(tok => tok === "" || HEX6_RE.test(tok))) {
+        throw new Error("Invalid image display settings");
+      }
+      if (Array.isArray(info?.channels) && tokens.length > info.channels.length) {
+        throw new Error("Invalid image display settings");
+      }
+    }
+    const winParam = query.get("win");
+    if (winParam !== null && Array.isArray(info?.channels)) {
+      const slots = winParam.split(",");
+      if (slots.length > info.channels.length) {
+        throw new Error("Invalid image display settings");
+      }
+    }
+    return query;
+  }
+
+  function validateMergedQuery(rawQuery, baseQuery, info) {
+    const params = validateQueryParams(rawQuery, info);
+    const baseParams = new URLSearchParams(String(baseQuery || "").replace(/^\?/, ""));
+    for (const key of BASE_QUERY_KEYS) {
+      if (params.get(key) !== baseParams.get(key)) {
+        throw new Error("Invalid image display settings");
+      }
+    }
+    return geometry.normalizeQuery(rawQuery);
+  }
+
   function validateContext(value, pageUrl) {
     if (!value || value.version !== 1 || !Array.isArray(value.center) ||
         value.center.length !== 2 || !value.center.every(Number.isFinite) ||
@@ -20,35 +69,32 @@
         !/^(\/[A-Za-z0-9._~%-]+)?\/s\/[a-zA-Z0-9_-]+\/$/.test(slide.pathname)) {
       throw new Error("The source must belong to this viewer");
     }
-    const query = new URLSearchParams(String(value.query || "").replace(/^\?/, ""));
-    for (const key of query.keys()) {
-      if (!["c", "win", "col", "g", "t", "p", "z"].includes(key) || query.getAll(key).length !== 1) {
-        throw new Error("Invalid image display settings");
-      }
+    if (value.query != null && typeof value.query !== "string") {
+      throw new Error("Invalid image display settings");
     }
-    const col = query.get("col");
-    if (col !== null) {
-      const tokens = col.split(",");
-      if (!tokens.length || tokens.length > 32 || !tokens.every(tok => tok === "" || /^[0-9a-fA-F]{6}$/.test(tok))) {
-        throw new Error("Invalid image display settings");
-      }
-    }
-    return { ...value, slide_url: slide.href, query: query.toString(),
+    const rawQuery = String(value.query || "");
+    validateQueryParams(rawQuery, null);
+    return { ...value, slide_url: slide.href, query: geometry.normalizeQuery(rawQuery),
       opacity: Math.max(.1, Math.min(1, Number.isFinite(value.opacity) ? value.opacity : .55)) };
   }
 
-  function makeTileSource(info, context, OSD) {
+  function makeTileSource(info, context, OSD, getQuery = null) {
     if ((info.rgb && !info.raster) || !Number.isFinite(info.width) || info.width <= 0 ||
         !Number.isFinite(info.height) || info.height <= 0 || !info.levels?.length) {
       throw new Error("Open a fluorescence image to use the translucent viewer");
     }
-    const requestedGeneration = new URLSearchParams(context.query).get("g");
+    const initialQuery = validateMergedQuery(String(context.query || ""), String(context.query || ""), info);
+    const requestedGeneration = new URLSearchParams(initialQuery).get("g");
     if (requestedGeneration && requestedGeneration !== info.generation) {
       throw new Error("The source changed. Reopen the translucent viewer.");
     }
-    // This window shows one fixed rendering, so the tile query never changes.
-    return geometry.makeTileSource({ info, OSD, baseUrl: context.slide_url,
-      query: context.query ? "?" + context.query : "" });
+    const query = typeof getQuery === "function"
+      ? () => {
+          const q = getQuery();
+          return q ? "?" + q : "";
+        }
+      : (initialQuery ? "?" + initialQuery : "");
+    return geometry.makeTileSource({ info, OSD, baseUrl: context.slide_url, query });
   }
 
   function camera(viewer) {
@@ -185,6 +231,7 @@
     const { window: win, document: doc, api, OSD, context, info } = options;
     const importer = options.importer || win.Nd2AstromapImport;
     const stage = doc.getElementById("translucent-stage");
+    const backdrop = doc.getElementById("translucent-backdrop");
     const overlay = doc.getElementById("overlay");
     const lock = doc.getElementById("overlay-lock");
     const status = doc.getElementById("overlay-status");
@@ -214,12 +261,24 @@
     if (zoomPopover) zoomPopover.hidden = true;
     const validOpacity = value => Number.isFinite(value) && value >= .1 && value <= 1;
     const initialOpacity = validOpacity(context.opacity) ? context.opacity : .55;
+    const initialQuery = validateMergedQuery(String(context.query || ""), String(context.query || ""), info);
+    const baseQuery = initialQuery;
     const state = { locked: context.locked === true, pending: false, gesture: null, ready: false,
       rois: [], roiIndex: -1, roiName: "", loadingRois: false,
       importResult: null, importReview: null, importApplied: false,
       opacity: initialOpacity, confirmedOpacity: initialOpacity,
-      zoomPopoverOpen: false };
+      zoomPopoverOpen: false,
+      query: initialQuery,
+      launchToken: typeof context.launch_token === "string" ? context.launch_token : "",
+      displayRevision: Number.isInteger(context.display_revision) && context.display_revision >= 0
+        ? context.display_revision : 0,
+      syncError: "",
+      expired: false };
     const showStatus = message => { status.textContent = message; status.hidden = !message; };
+    const clearSyncStatus = () => {
+      if (state.syncError && status.textContent === state.syncError) showStatus("");
+      state.syncError = "";
+    };
     let opacityTask = null, opacityError = "";
     const paintOpacity = () => {
       const percent = Math.round(state.opacity * 100);
@@ -274,18 +333,187 @@
     }, { passive: false });
     paintOpacity();
     const maxZoomRatio = Math.max(16, context.zoom || 1);
-    const viewer = OSD({
-      element: stage, tileSources: makeTileSource(info, context, OSD),
+    const setTimer = typeof win?.setTimeout === "function"
+      ? win.setTimeout.bind(win)
+      : (typeof setTimeout === "function" ? setTimeout : null);
+    const clearTimer = typeof win?.clearTimeout === "function"
+      ? win.clearTimeout.bind(win)
+      : (typeof clearTimeout === "function" ? clearTimeout : null);
+    let viewer = null;
+    let disposed = false;
+    let backdropVisible = false;
+    let lastViewportPose = null;
+    let displayLoopStarted = false;
+    let backoffTimer = null;
+    let cancelBackoff = null;
+    const readViewportPose = () => {
+      const vp = viewer?.viewport;
+      if (!vp) return null;
+      const c = vp.getCenter?.(true);
+      const z = vp.getZoom?.(true);
+      const r = typeof vp.getRotation === "function" ? vp.getRotation(true) : 0;
+      const f = typeof vp.getFlip === "function" ? Boolean(vp.getFlip()) : false;
+      const s = vp.getContainerSize?.();
+      return { cx: c?.x, cy: c?.y, z, r, f, sx: s?.x, sy: s?.y };
+    };
+    const poseChanged = (a, b) => {
+      if (!a || !b) return a !== b;
+      return a.cx !== b.cx || a.cy !== b.cy || a.z !== b.z ||
+        a.r !== b.r || a.f !== b.f || a.sx !== b.sx || a.sy !== b.sy;
+    };
+    const clearBackdrop = () => {
+      if (backdrop) {
+        backdrop.hidden = true;
+        if (backdropVisible) {
+          const ctx = typeof backdrop.getContext === "function" ? backdrop.getContext("2d") : null;
+          if (ctx && backdrop.width > 0 && backdrop.height > 0) {
+            ctx.clearRect(0, 0, backdrop.width, backdrop.height);
+          }
+        }
+      }
+      backdropVisible = false;
+    };
+    const captureBackdrop = () => {
+      if (!backdrop) return false;
+      const ctx = typeof backdrop.getContext === "function" ? backdrop.getContext("2d") : null;
+      const src = viewer?.drawer?.canvas;
+      if (!ctx || !src || !(src.width > 0 && src.height > 0)) return false;
+      try {
+        if (backdrop.width !== src.width) backdrop.width = src.width;
+        if (backdrop.height !== src.height) backdrop.height = src.height;
+        ctx.clearRect(0, 0, backdrop.width, backdrop.height);
+        ctx.drawImage(src, 0, 0);
+        backdrop.hidden = false;
+        backdropVisible = true;
+        lastViewportPose = readViewportPose();
+        return true;
+      } catch (_) {
+        backdropVisible = true;
+        clearBackdrop();
+        return false;
+      }
+    };
+    const displayGate = geometry.createTileRefreshGate({
+      getItem: () => viewer?.world?.getItemAt?.(0),
+      getViewer: () => viewer,
+      onBeforeReset: captureBackdrop,
+      onPaintComplete: painted => {
+        clearBackdrop();
+        clearSyncStatus();
+        if (painted !== null && status.textContent === TILE_LOAD_FAILED_STATUS) showStatus("");
+      },
+      onActiveTileError: () => {
+        clearBackdrop();
+        showStatus(TILE_LOAD_FAILED_STATUS);
+      },
+      setTimer,
+      clearTimer,
+      stallTimeoutMs: 2000,
+    });
+    displayGate.init(initialQuery);
+    viewer = OSD({
+      element: stage,
+      tileSources: makeTileSource(info, context, OSD, () => displayGate.getActiveQuery()),
       showNavigationControl: false, showNavigator: false, showSequenceControl: false,
       prefixUrl: "", drawer: "canvas", crossOriginPolicy: false,
       autoResize: false, preserveImageSizeOnResize: true,
       animationTime: .15, springStiffness: 12, zoomPerScroll: 1.2,
       minZoomImageRatio: .05, maxZoomPixelRatio: maxZoomRatio,
       visibilityRatio: 0, constrainDuringPan: false,
-      imageSmoothingEnabled: true, imageLoaderLimit: 6, maxImageCacheCount: 120,
+      imageSmoothingEnabled: true, imageLoaderLimit: 6, maxTilesPerFrame: 6, maxImageCacheCount: 120,
       gestureSettingsMouse: { clickToZoom: false, dblClickToZoom: false, scrollToZoom: false },
       gestureSettingsTouch: { pinchToZoom: true, flickEnabled: false, clickToZoom: false, dblClickToZoom: false },
     });
+    const sleepBackoff = ms => {
+      if (typeof setTimer !== "function") return null;
+      return new Promise(resolve => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          if (backoffTimer !== null && typeof clearTimer === "function") clearTimer(backoffTimer);
+          backoffTimer = null;
+          cancelBackoff = null;
+          resolve();
+        };
+        cancelBackoff = finish;
+        backoffTimer = setTimer(finish, ms);
+      });
+    };
+    const applyDisplaySnapshot = snap => {
+      if (disposed || state.expired || !snap || snap.ok === false) return false;
+      if (state.launchToken && snap.launch_token && snap.launch_token !== state.launchToken) return false;
+      if (snap.expired === true) {
+        state.expired = true;
+        clearBackdrop();
+        state.syncError = "";
+        showStatus(EXPIRED_STATUS);
+        return false;
+      }
+      if (!Number.isInteger(snap.revision) || snap.revision <= state.displayRevision) return false;
+      let nextQuery;
+      try {
+        nextQuery = validateMergedQuery(snap.query, baseQuery, info);
+      } catch (_) {
+        return false;
+      }
+      state.displayRevision = snap.revision;
+      state.query = nextQuery;
+      clearSyncStatus();
+      if (state.ready) displayGate.request(nextQuery);
+      else displayGate.resetState(nextQuery);
+      return true;
+    };
+    const startDisplayLoop = () => {
+      if (disposed || displayLoopStarted) return;
+      displayLoopStarted = true;
+      const hasStatePull = typeof api?.translucent_display_state === "function";
+      const hasWait = Boolean(state.launchToken) && typeof api?.wait_translucent_display === "function";
+      if (!hasStatePull && !hasWait) return;
+      Promise.resolve().then(async () => {
+        if (disposed) return;
+        if (hasStatePull) {
+          try {
+            const initialSnap = await api.translucent_display_state();
+            if (disposed || initialSnap?.closed) return;
+            if (initialSnap?.ok) {
+              if (initialSnap.expired !== true) clearSyncStatus();
+              applyDisplaySnapshot(initialSnap);
+            }
+          } catch (_) {
+            // Transient initial pull errors fall through to the long-poll loop.
+          }
+        }
+        if (!hasWait) return;
+        let consecutiveErrors = 0;
+        while (!disposed && !state.expired) {
+          let res;
+          try {
+            res = await api.wait_translucent_display(state.launchToken, state.displayRevision, 25000);
+          } catch (_) {
+            res = null;
+          }
+          if (disposed || res?.closed) break;
+          if (res?.ok) {
+            consecutiveErrors = 0;
+            if (res.expired === true) {
+              applyDisplaySnapshot(res);
+              continue;
+            }
+            clearSyncStatus();
+            if (!res.unchanged) applyDisplaySnapshot(res);
+            continue;
+          }
+          consecutiveErrors += 1;
+          if (consecutiveErrors === 1) continue;
+          state.syncError = SYNC_ERROR_STATUS;
+          showStatus(state.syncError);
+          const wait = sleepBackoff(1000);
+          if (!wait) break;
+          await wait;
+        }
+      });
+    };
     // On a focused canvas OSD's own keys rotate (R), flip (F), pan (W/A/S/D,
     // arrows) or zoom (+/-, 0). This window shows exactly the main viewer's
     // orientation and is aligned by hand, so none of them may act here.
@@ -669,6 +897,7 @@
       restoreCamera(viewer, { zoom: context.zoom,
         center: viewport.imageToViewportCoordinates(new OSD.Point(...context.center)) });
       state.ready = true;
+      lastViewportPose = readViewportPose();
       showStatus("");
       paintRois();
       paintZoom();
@@ -677,15 +906,41 @@
         setRois({ rois: context.rois, name: context.roiName || "" },
           { pan: false, index: context.roiIndex ?? -1, initial: true });
       }
+      startDisplayLoop();
     });
-    viewer.addHandler("open-failed", () => showStatus("Could not load this image. Close and reopen the translucent viewer."));
-    viewer.addHandler("tile-load-failed", () => showStatus("Some image tiles could not load. Close and reopen the translucent viewer."));
+    viewer.addHandler("open-failed", () => {
+      if (disposed) return;
+      clearBackdrop();
+      showStatus("Could not load this image. Close and reopen the translucent viewer.");
+    });
+    viewer.addHandler("tile-loaded", event => {
+      if (!disposed) displayGate.onTileLoaded(event);
+    });
+    viewer.addHandler("tiled-image-drawn", event => {
+      if (!disposed) displayGate.onTiledImageDrawn(event);
+    });
+    viewer.addHandler("fully-loaded-change", event => {
+      if (!disposed) displayGate.onFullyLoadedChange(event);
+    });
+    viewer.addHandler("tile-load-failed", event => {
+      if (!disposed) displayGate.onTileLoadFailed(event);
+    });
     viewer.addHandler("zoom", paintZoom);
     viewer.addHandler("animation", paintZoom);
-    viewer.addHandler("update-viewport", () => { renderRoiBoxes(); paintZoom(); });
+    viewer.addHandler("update-viewport", () => {
+      const pose = readViewportPose();
+      if (backdropVisible && poseChanged(lastViewportPose, pose)) {
+        clearBackdrop();
+      }
+      lastViewportPose = pose;
+      renderRoiBoxes();
+      paintZoom();
+    });
     const resize = () => {
+      clearBackdrop();
       if (state.ready) {
         resizePreservingScale(viewer, stage.clientWidth, stage.clientHeight, OSD);
+        lastViewportPose = readViewportPose();
         renderRoiBoxes();
         paintZoom();
       }
@@ -784,12 +1039,13 @@
       }
       return false;
     };
-    doc.addEventListener("pointerdown", event => {
+    const onDocPointerDown = event => {
       if (state.zoomPopoverOpen && !isInZoomControl(event.target)) {
         closeZoomPopover();
       }
-    }, true);
-    doc.addEventListener("keydown", event => {
+    };
+    doc.addEventListener("pointerdown", onDocPointerDown, true);
+    const onDocKeyDown = event => {
       if (event.repeat) return;
       if (event.key === "Escape" && !event.altKey && !event.ctrlKey && !event.metaKey) {
         if (state.zoomPopoverOpen) {
@@ -813,18 +1069,28 @@
       if (event.key.toLowerCase() === "l") { event.preventDefault(); toggleLock(); }
       else if (event.key === "ArrowLeft") { event.preventDefault(); selectRoi(state.roiIndex - 1); }
       else if (event.key === "ArrowRight") { event.preventDefault(); selectRoi(state.roiIndex + 1); }
-    }, true);
+    };
+    doc.addEventListener("keydown", onDocKeyDown, true);
     // Keep the embedded page itself at 100%; zoom belongs to the image.
-    doc.addEventListener("wheel", event => { if (event.ctrlKey || state.locked) event.preventDefault(); }, { passive: false });
+    const onDocWheel = event => { if (event.ctrlKey || state.locked) event.preventDefault(); };
+    doc.addEventListener("wheel", onDocWheel, { passive: false });
     win.addEventListener("pagehide", () => {
+      disposed = true;
+      cancelBackoff?.();
+      displayGate.dispose();
+      clearBackdrop();
       cancelGesture();
       closeZoomPopover();
-      win.removeEventListener("resize", resize);
+      win.removeEventListener?.("resize", resize);
+      doc.removeEventListener?.("pointerdown", onDocPointerDown, true);
+      doc.removeEventListener?.("keydown", onDocKeyDown, true);
+      doc.removeEventListener?.("wheel", onDocWheel, { passive: false });
       observer?.disconnect();
       viewer.destroy();
     }, { once: true });
     return { viewer, state, toggleLock, close, resize, setRois, selectRoi, setOpacity, repairRois,
-      openZoomPopover, closeZoomPopover, setZoom: applyImageZoom, stepZoom };
+      openZoomPopover, closeZoomPopover, setZoom: applyImageZoom, stepZoom,
+      applyDisplaySnapshot, displayGate };
   }
 
   async function boot(win) {
@@ -855,7 +1121,7 @@
     else win.addEventListener("pywebviewready", start, { once: true });
   }
 
-  return { validateContext, makeTileSource, camera, restoreCamera, resizePreservingScale,
+  return { validateContext, validateMergedQuery, makeTileSource, camera, restoreCamera, resizePreservingScale,
     resizeGeometry, roiBounds, importedRois, focusRoi, roiElementPoints,
     wheelZoomFactor, formatZoomLabel, parseZoomInput, mount, boot };
 });

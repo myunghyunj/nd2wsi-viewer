@@ -462,6 +462,7 @@ class Api:
         self._active_opens = 0
         self._translucent_lock = threading.RLock()
         self._translucent_windows = {}
+        self._translucent_pending_launches: dict[str, str] = {}
         self._translucent_owner_closed = False
         if native_gesture_scopes is None:
             from .native_gestures import NativeGestureScopeCache
@@ -479,65 +480,143 @@ class Api:
         """Open a display-only tracing window for this viewer's registered slide."""
         if sys.platform not in ("darwin", "win32"):
             return {"ok": False, "message": "The translucent viewer requires the macOS or Windows app."}
+        launch_token = uuid.uuid4().hex
         try:
             from urllib.parse import quote
 
             from .translucent_window import create_translucent_window, validate_context
 
             with self._server_lock:
-                server = self._httpd
-                store = server.registry.get(sid) if server is not None and isinstance(sid, str) else None
-                if store is None:
-                    raise ValueError("Open a fluorescence slide before opening the translucent viewer")
-                base_url = _server_url(server).rstrip("/") + "/"
-                context = validate_context(store, payload, slide_url=base_url + "s/" + quote(sid, safe="") + "/")
-
-            with self._translucent_lock:
-                if self._translucent_owner_closed:
-                    raise ValueError("The source viewer is closing")
-                previous = self._translucent_windows.pop(sid, None)
-
-            if previous is not None:
-                previous.close_translucent()
+                with self._translucent_lock:
+                    server = self._httpd
+                    store = server.registry.get(sid) if server is not None and isinstance(sid, str) else None
+                    if store is None:
+                        raise ValueError("Open a fluorescence slide before opening the translucent viewer")
+                    launch_generation = getattr(store, "generation", "")
+                    base_url = _server_url(server).rstrip("/") + "/"
+                    context = validate_context(store, payload, slide_url=base_url + "s/" + quote(sid, safe="") + "/")
+                    if self._translucent_owner_closed:
+                        raise ValueError("The source viewer is closing")
+                    self._translucent_pending_launches[sid] = launch_token
+                    previous = self._translucent_windows.pop(sid, None)
 
             def remove(closed):
                 with self._translucent_lock:
                     if self._translucent_windows.get(sid) is closed:
                         self._translucent_windows.pop(sid, None)
 
-            overlay = create_translucent_window(
-                context, url=base_url + "static/translucent.html",
-                title=APP_NAME + " — Translucent", logger=_dlog, on_closed=remove,
-            )
-            superseded = None
-            owner_closed = False
-            with self._translucent_lock:
-                if self._translucent_owner_closed:
-                    owner_closed = True
-                else:
-                    superseded = self._translucent_windows.get(sid)
-                    self._translucent_windows[sid] = overlay
-            if owner_closed:
+            try:
+                if previous is not None:
+                    previous.close_translucent()
+                overlay = create_translucent_window(
+                    context,
+                    url=base_url + "static/translucent.html",
+                    title=APP_NAME + " — Translucent",
+                    logger=_dlog,
+                    on_closed=remove,
+                    launch_token=launch_token,
+                    launch_generation=launch_generation,
+                )
+            except Exception:
+                with self._translucent_lock:
+                    if self._translucent_pending_launches.get(sid) == launch_token:
+                        self._translucent_pending_launches.pop(sid, None)
+                raise
+
+            abort_reason = None
+            with self._server_lock:
+                with self._translucent_lock:
+                    pending_matches = self._translucent_pending_launches.get(sid) == launch_token
+                    if pending_matches:
+                        self._translucent_pending_launches.pop(sid, None)
+                    server = self._httpd
+                    current_store = server.registry.get(sid) if server is not None else None
+                    if self._translucent_owner_closed:
+                        abort_reason = "The source viewer is closing"
+                    elif current_store is None:
+                        abort_reason = "The slide was closed while opening the overlay"
+                    elif not pending_matches:
+                        abort_reason = "The overlay launch was superseded"
+                    elif getattr(current_store, "generation", "") != launch_generation:
+                        abort_reason = "The image changed; refresh the slide before opening the overlay"
+                    else:
+                        self._translucent_windows[sid] = overlay
+
+            if abort_reason is not None:
                 overlay.close_translucent()
-                raise ValueError("The source viewer is closing")
-            if superseded is not None and superseded is not overlay:
-                superseded.close_translucent()
-            return {"ok": True, "id": overlay._window.uid}
+                raise ValueError(abort_reason)
+
+            return {"ok": True, "id": overlay._window.uid, "launch_token": launch_token}
         except Exception as exc:
             _dlog(f"translucent viewer open failed: {exc!r}")
             return {"ok": False, "message": f"Could not open translucent viewer: {exc}"}
 
+    def update_translucent_display(
+        self,
+        sid: str,
+        launch_token: str,
+        revision: int,
+        display_query: str,
+    ) -> dict:
+        """Apply validated live display overrides (c, win, col) to an active overlay."""
+        if (
+            not isinstance(sid, str)
+            or not sid
+            or not isinstance(launch_token, str)
+            or not launch_token
+            or type(revision) is not int
+            or not 1 <= revision <= 2**53 - 1
+            or not isinstance(display_query, str)
+        ):
+            return {"ok": False, "invalid": True, "message": "Invalid display update request"}
+
+        from .translucent_window import merge_display_query
+
+        expire_overlay = None
+        with self._server_lock:
+            with self._translucent_lock:
+                server = self._httpd
+                store = server.registry.get(sid) if server is not None else None
+                overlay = self._translucent_windows.get(sid)
+                if overlay is None or store is None:
+                    return {"ok": False, "closed": True}
+                cur_token, launch_gen, base_query, retired = overlay._session_snapshot()
+                if retired:
+                    return {"ok": False, "closed": True}
+                if cur_token != launch_token:
+                    return {"ok": False, "stale": True}
+                if getattr(store, "generation", "") != launch_gen:
+                    expire_overlay = overlay
+                else:
+                    try:
+                        merged = merge_display_query(store, base_query, display_query)
+                    except ValueError as exc:
+                        return {"ok": False, "invalid": True, "message": str(exc)}
+        if expire_overlay is not None:
+            expire_overlay._expire_display_session(launch_token, "generation_changed")
+            return {
+                "ok": False,
+                "stale_generation": True,
+                "message": "The source image changed. Reopen the translucent viewer.",
+            }
+        return overlay._apply_display_query(launch_token, revision, merged)
+
     def close_translucent_viewer(self, sid: str) -> dict:
         """Close the translucent tracing window for one slide tab, if open."""
         with self._translucent_lock:
-            overlay = self._translucent_windows.pop(sid, None) if isinstance(sid, str) else None
+            if isinstance(sid, str):
+                overlay = self._translucent_windows.pop(sid, None)
+                pending = self._translucent_pending_launches.pop(sid, None)
+            else:
+                overlay = None
+                pending = None
         if overlay is not None:
             try:
                 overlay.close_translucent()
             except Exception as exc:
                 _dlog(f"translucent viewer close failed: {exc!r}")
                 return {"ok": False, "message": str(exc)}
-        return {"ok": True, "closed": overlay is not None}
+        return {"ok": True, "closed": overlay is not None or pending is not None}
 
     def _close_translucent_windows(self, *_args, owner_closing: bool = True):
         with self._translucent_lock:
@@ -545,6 +624,7 @@ class Api:
                 self._translucent_owner_closed = True
             overlays = list(self._translucent_windows.values())
             self._translucent_windows.clear()
+            self._translucent_pending_launches.clear()
         for overlay in overlays:
             try:
                 overlay.close_translucent()
@@ -1485,6 +1565,7 @@ def create_app_window(initial: Path | None, window_session=None):
         frameless=sys.platform == "darwin",
         easy_drag=False,
     )
+    api._window = window
     # WKWebView can consume horizontal trackpad events in a private scroll
     # subview without creating DOM wheel events. A local AppKit monitor routes
     # only clearly horizontal gestures; vertical input keeps its normal path.

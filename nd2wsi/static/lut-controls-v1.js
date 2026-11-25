@@ -312,7 +312,7 @@
         mode = hiDistance < loDistance ? "hi" : "lo";
       else mode = "pan";
       panFrom = { x: p.x, lo: vmin, hi: vmax };
-      canvas.setPointerCapture(ev.pointerId);
+      try { canvas.setPointerCapture?.(ev.pointerId); } catch (_) {}
       if (mode !== "pan") drag(ev);
       ev.preventDefault();
     });
