@@ -14,6 +14,7 @@ import time
 import traceback
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qsl
 
 
 def _check(value, message):
@@ -77,6 +78,8 @@ def pane_eval(parent, expression):
         " const lutParam = __win.lutParam;"
         " const pixelSize = __win.pixelSize;"
         " const astromapItems = __win.astromapItems;"
+        " const refreshTiles = __win.refreshTiles;"
+        " const tileQuery = __win.tileQuery;"
         " const Nd2ViewerGeometry = __win.Nd2ViewerGeometry;"
         " const OpenSeadragon = __win.OpenSeadragon;"
         " " + stmt +
@@ -185,8 +188,10 @@ def wheel(window):
 def drag_image(window):
     return window.evaluate_js("""(() => {
       const c=window.nd2Translucent.viewer.canvas,r=c.getBoundingClientRect();
+      const active=window.nd2Translucent.viewer.innerTracker?.getActivePointersListByType?.('mouse')?.asArray?.()||[];
+      const pointerId=active.length ? active[0].id : 41;
       const point=(type,x,y)=>c.dispatchEvent(new PointerEvent(type,{
-        pointerId:41,pointerType:'mouse',isPrimary:true,button:0,
+        pointerId,pointerType:'mouse',isPrimary:true,button:0,
         buttons:type==='pointerup'?0:1,clientX:r.left+x,clientY:r.top+y,
         bubbles:true,cancelable:true}));
       point('pointerdown',r.width/2,r.height/2);
@@ -696,14 +701,56 @@ def find_signal_patch(window, *, is_pane=False):
     return (float(result["x"]), float(result["y"]))
 
 
-def _overlay_display_query(child):
+def _display_override_params(query):
+    return {
+        k: v
+        for k, v in parse_qsl(str(query or "").lstrip("?"), keep_blank_values=True)
+        if k in ("c", "win", "col")
+    }
+
+
+def _main_display_status(parent):
+    return pane_eval(
+        parent,
+        """(() => {
+          const norm = q => (typeof Nd2ViewerGeometry?.normalizeQuery === "function"
+            ? Nd2ViewerGeometry.normalizeQuery(q)
+            : String(q || "").replace(/^\\?/, ""));
+          const desired = typeof tileQuery === "function" ? norm(tileQuery()) : null;
+          const gate = state?.tileRefreshGate;
+          const active = typeof gate?.getActiveQuery === "function" ? norm(gate.getActiveQuery()) : desired;
+          const rendering = typeof gate?.isRendering === "function" ? Boolean(gate.isRendering()) : false;
+          const fullyLoaded = Boolean(state?.viewer?.world?.getItemAt?.(0)?.getFullyLoaded?.());
+          return { desired, active, rendering, fullyLoaded };
+        })()""",
+    )
+
+
+def _overlay_display_status(child):
     return child.evaluate_js("""(() => {
       const view = window.nd2Translucent;
-      if (typeof view?.state?.query === "string") return view.state.query;
-      const url = view?.viewer?.world?.getItemAt?.(0)?.source?.getTileUrl?.(0, 0, 0) || "";
-      const idx = url.indexOf("?");
-      return idx >= 0 ? url.slice(idx + 1) : "";
+      const norm = q => (typeof window.Nd2ViewerGeometry?.normalizeQuery === "function"
+        ? window.Nd2ViewerGeometry.normalizeQuery(q)
+        : String(q || "").replace(/^\\?/, ""));
+      const stateQuery = typeof view?.state?.query === "string" ? norm(view.state.query) : null;
+      const gate = view?.displayGate;
+      let active = typeof gate?.getActiveQuery === "function" ? norm(gate.getActiveQuery()) : stateQuery;
+      if (active === null) {
+        const url = view?.viewer?.world?.getItemAt?.(0)?.source?.getTileUrl?.(0, 0, 0) || "";
+        const idx = url.indexOf("?");
+        active = norm(idx >= 0 ? url.slice(idx + 1) : "");
+      }
+      const rendering = typeof gate?.isRendering === "function" ? Boolean(gate.isRendering()) : false;
+      const fullyLoaded = Boolean(view?.viewer?.world?.getItemAt?.(0)?.getFullyLoaded?.());
+      return { query: stateQuery ?? active, active, rendering, fullyLoaded };
     })()""")
+
+
+def _overlay_display_query(child):
+    status = _overlay_display_status(child)
+    if isinstance(status, dict):
+        return status.get("query") or status.get("active") or ""
+    return ""
 
 
 def _dispatch_lut_hi_pointer(parent, ch_index, event_type, target_value, pointer_id=71):
@@ -819,14 +866,36 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
         timeout=timeout,
         description="channels panel and LUT axis readiness",
     )
-    wait_for(lambda: pane_eval(parent, "state.viewer.world.getItemAt(0)?.getFullyLoaded()"),
-             timeout=timeout, description="main tiles before live LUT drag")
-    wait_for(lambda: child.evaluate_js("nd2Translucent.viewer.world.getItemAt(0)?.getFullyLoaded()"),
-             timeout=timeout, description="overlay tiles before live LUT drag")
+    pane_eval(
+        parent,
+        """(() => {
+          if (state.tileRefreshGate && typeof tileQuery === 'function' && typeof refreshTiles === 'function') {
+            const desired = Nd2ViewerGeometry.normalizeQuery(tileQuery());
+            if (state.tileRefreshGate.getActiveQuery() !== desired) refreshTiles();
+          }
+          return true;
+        })()""",
+    )
+    wait_for(
+        lambda: (
+            (ms := _main_display_status(parent)) is not None
+            and ms["active"] == ms["desired"]
+            and not ms["rendering"]
+            and ms["fullyLoaded"]
+            and (os_ := _overlay_display_status(child)) is not None
+            and os_["active"] == os_["query"]
+            and not os_["rendering"]
+            and os_["fullyLoaded"]
+            and _display_override_params(os_["active"]) == _display_override_params(ms["desired"])
+        ),
+        timeout=timeout,
+        description="main and overlay display sync before live LUT drag",
+    )
 
     initial_luts = pane_eval(parent, "state.luts.map(l => l ? {lo: l.lo, hi: l.hi, gamma: l.gamma} : null)")
     restore_overlay_query = _overlay_display_query(child)
     drag_start_query = restore_overlay_query
+    drag_start_main_query = (_main_display_status(parent) or {}).get("active")
     before_camera = camera(child)
     before_frame = native_state(child, timeout=timeout)["frame"]
     before_opacity = bridge_result(child, "pywebview.api.translucent_context()", timeout=timeout)["opacity"]
@@ -841,7 +910,15 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
         pane_eval(parent, f"state.lutWidgets[{ch_idx}].setLut({{lo: 0, hi: 255, gamma: 1}}); true")
         wait_for(
             lambda: (
-                (m := sample_canvas_patch(parent, px, py, is_pane=True))["min_alpha"] == 255
+                (ms := _main_display_status(parent)) is not None
+                and ms["active"] == ms["desired"]
+                and not ms["rendering"]
+                and ms["fullyLoaded"]
+                and (os_ := _overlay_display_status(child)) is not None
+                and os_["active"] == os_["query"]
+                and not os_["rendering"]
+                and os_["fullyLoaded"]
+                and (m := sample_canvas_patch(parent, px, py, is_pane=True))["min_alpha"] == 255
                 and abs(m["mean_intensity"] - 64.0) <= 8.0
                 and (o := sample_canvas_patch(child, px, py, is_pane=False))["min_alpha"] == 255
                 and abs(o["mean_intensity"] - 64.0) <= 8.0
@@ -850,6 +927,7 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
             description="calibration baseline 64 before live LUT drag",
         )
         drag_start_query = _overlay_display_query(child)
+        drag_start_main_query = (_main_display_status(parent) or {}).get("active")
         main_init = sample_canvas_patch(parent, px, py, is_pane=True)
         overlay_init = sample_canvas_patch(child, px, py, is_pane=False)
         start_hi = 255.0
@@ -871,8 +949,29 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
         if ch["hasOverride"]:
             pane_eval(
                 parent,
-                f"state.lutWidgets[{ch_idx}].setLut({json.dumps(ch['cur'])}); true",
+                f"state.lutWidgets[{ch_idx}].setLut({json.dumps(ch['cur'])});"
+                " if (typeof refreshTiles === 'function') refreshTiles(); true",
             )
+            wait_for(
+                lambda: (
+                    (ms := _main_display_status(parent)) is not None
+                    and ms["active"] == ms["desired"]
+                    and not ms["rendering"]
+                    and ms["fullyLoaded"]
+                    and (os_ := _overlay_display_status(child)) is not None
+                    and os_["active"] == os_["query"]
+                    and not os_["rendering"]
+                    and os_["fullyLoaded"]
+                ),
+                timeout=min(timeout, 10),
+                description="main and overlay settle after LUT widget alignment",
+            )
+            main_init = sample_canvas_patch(parent, px, py, is_pane=True)
+            overlay_init = sample_canvas_patch(child, px, py, is_pane=False)
+            _check(main_init["min_alpha"] == 255 and overlay_init["min_alpha"] == 255,
+                   f"Post-alignment live-LUT patch is not opaque: main={main_init}, overlay={overlay_init}")
+            drag_start_query = _overlay_display_query(child)
+            drag_start_main_query = (_main_display_status(parent) or {}).get("active")
         lo, hi = ch["cur"]["lo"], ch["cur"]["hi"]
         span = hi - lo
         min_step = 1.0 if discrete else max(span * 1e-4, 1e-9)
@@ -887,119 +986,169 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
         hold_targets = [(hi_1, None), (hi_2, None)]
         release_target = (hi_3, None)
 
-    steps = {"initial": {"main": main_init, "overlay": overlay_init, "overlay_query": drag_start_query}}
+    steps = {
+        "initial": {
+            "main": main_init,
+            "overlay": overlay_init,
+            "main_query": drag_start_main_query,
+            "overlay_query": drag_start_query,
+        }
+    }
+    seen_main_queries = {drag_start_main_query}
+    seen_overlay_queries = {drag_start_query}
     pre_release_queries = []
+
+    def _poll_step(hi_val, expected_intensity, *, hold_seconds, main_pred, overlay_pred):
+        target_main_query = (_main_display_status(parent) or {}).get("desired")
+        target_display_params = (
+            _display_override_params(target_main_query) if target_main_query is not None else None
+        )
+        t0 = time.monotonic()
+        deadline = t0 + hold_seconds
+        main_hit_ms = overlay_hit_ms = None
+        main_hit_sample = overlay_hit_sample = None
+        main_last_sample = overlay_last_sample = None
+        main_hit_query = overlay_hit_query = None
+        main_last_query = overlay_last_query = None
+        while True:
+            now_ms = round((time.monotonic() - t0) * 1000.0, 1)
+            if main_hit_ms is None:
+                m_status = _main_display_status(parent)
+                ms = sample_canvas_patch(parent, px, py, is_pane=True, allow_none=True)
+                if m_status:
+                    main_last_query = m_status.get("active")
+                if ms is not None:
+                    main_last_sample = ms
+                m_active = m_status.get("active") if m_status else None
+                m_query_ok = bool(
+                    m_status
+                    and not m_status.get("rendering")
+                    and m_status.get("fullyLoaded")
+                    and (
+                        (target_main_query is not None and m_active == target_main_query)
+                        or (target_main_query is None and m_active not in seen_main_queries)
+                    )
+                    and (
+                        m_active not in seen_main_queries
+                        if target_main_query not in seen_main_queries
+                        else True
+                    )
+                )
+                if m_query_ok and ms is not None and ms["min_alpha"] == 255 and main_pred(ms):
+                    main_hit_ms = now_ms
+                    main_hit_sample = ms
+                    main_hit_query = m_active
+            if overlay_hit_ms is None:
+                o_status = _overlay_display_status(child)
+                os_ = sample_canvas_patch(child, px, py, is_pane=False, allow_none=True)
+                if o_status:
+                    overlay_last_query = o_status.get("active") or o_status.get("query")
+                if os_ is not None:
+                    overlay_last_sample = os_
+                o_active = o_status.get("active") if o_status else None
+                o_matches_target = (
+                    _display_override_params(o_active) == target_display_params
+                    if target_display_params is not None
+                    else True
+                )
+                o_query_ok = bool(
+                    o_status
+                    and not o_status.get("rendering")
+                    and o_status.get("fullyLoaded")
+                    and o_active == o_status.get("query")
+                    and o_active not in seen_overlay_queries
+                    and o_matches_target
+                )
+                if o_query_ok and os_ is not None and os_["min_alpha"] == 255 and overlay_pred(os_):
+                    overlay_hit_ms = now_ms
+                    overlay_hit_sample = os_
+                    overlay_hit_query = o_active
+            if main_hit_ms is not None and overlay_hit_ms is not None:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(.05)
+        return {
+            "hi": hi_val,
+            "expected_intensity": expected_intensity,
+            "main_elapsed_ms": main_hit_ms,
+            "overlay_elapsed_ms": overlay_hit_ms,
+            "main": main_hit_sample or main_last_sample,
+            "overlay": overlay_hit_sample or overlay_last_sample,
+            "main_query": main_hit_query or main_last_query,
+            "overlay_query": overlay_hit_query or overlay_last_query,
+        }
+
     failed = False
     try:
         _dispatch_lut_hi_pointer(parent, ch_idx, "pointerdown", start_hi)
         released = False
+        prev_main_intensity = main_init["mean_intensity"]
+        prev_overlay_intensity = overlay_init["mean_intensity"]
         try:
             for step_idx, (hi_val, expected_intensity) in enumerate(hold_targets, start=1):
                 _dispatch_lut_hi_pointer(parent, ch_idx, "pointermove", hi_val)
-                t0 = time.monotonic()
-                deadline = t0 + 1.0
-                main_hit_ms = overlay_hit_ms = None
-                main_sample = overlay_sample = None
-                ov_query = None
-                seen_queries = {drag_start_query, *pre_release_queries}
-                while True:
-                    now_ms = round((time.monotonic() - t0) * 1000.0, 1)
-                    ms = sample_canvas_patch(parent, px, py, is_pane=True, allow_none=True)
-                    os_ = sample_canvas_patch(child, px, py, is_pane=False, allow_none=True)
-                    if ms is not None:
-                        main_sample = ms
-                    if os_ is not None:
-                        overlay_sample = os_
-                    ov_query = _overlay_display_query(child)
-                    if expected_intensity is not None:
-                        if main_hit_ms is None and main_sample is not None and main_sample["min_alpha"] == 255 and abs(main_sample["mean_intensity"] - expected_intensity) <= 8.0:
-                            main_hit_ms = now_ms
-                        if overlay_hit_ms is None and overlay_sample is not None and overlay_sample["min_alpha"] == 255 and abs(overlay_sample["mean_intensity"] - expected_intensity) <= 8.0:
-                            overlay_hit_ms = now_ms
-                        if main_hit_ms is not None and overlay_hit_ms is not None:
-                            break
-                    else:
-                        min_delta = 10.0 if step_idx >= 2 else 1.0
-                        if main_hit_ms is None and main_sample is not None and main_sample["min_alpha"] == 255 and main_sample["mean_intensity"] >= main_init["mean_intensity"] + min_delta:
-                            main_hit_ms = now_ms
-                        if (
-                            overlay_hit_ms is None
-                            and ov_query not in seen_queries
-                            and overlay_sample is not None
-                            and overlay_sample["min_alpha"] == 255
-                            and overlay_sample["mean_intensity"] >= overlay_init["mean_intensity"] + min_delta
-                        ):
-                            overlay_hit_ms = now_ms
-                        if main_hit_ms is not None and overlay_hit_ms is not None:
-                            break
-                    if time.monotonic() >= deadline:
-                        break
-                    time.sleep(.05)
-                if ov_query and ov_query != drag_start_query and ov_query not in pre_release_queries:
-                    pre_release_queries.append(ov_query)
-                steps[f"hold_{step_idx}"] = {
-                    "hi": hi_val,
-                    "expected_intensity": expected_intensity,
-                    "main_elapsed_ms": main_hit_ms,
-                    "overlay_elapsed_ms": overlay_hit_ms,
-                    "main": main_sample,
-                    "overlay": overlay_sample,
-                    "overlay_query": ov_query,
-                }
+                if expected_intensity is not None:
+                    step_data = _poll_step(
+                        hi_val,
+                        expected_intensity,
+                        hold_seconds=2.0,
+                        main_pred=lambda s, tgt=expected_intensity: abs(s["mean_intensity"] - tgt) <= 8.0,
+                        overlay_pred=lambda s, tgt=expected_intensity: abs(s["mean_intensity"] - tgt) <= 8.0,
+                    )
+                else:
+                    min_delta = 10.0 if step_idx >= 2 else 1.0
+                    prev_m = prev_main_intensity
+                    prev_o = prev_overlay_intensity
+                    step_data = _poll_step(
+                        hi_val,
+                        None,
+                        hold_seconds=2.0,
+                        main_pred=lambda s, d=min_delta, pm=prev_m, idx=step_idx: (
+                            s["mean_intensity"] >= main_init["mean_intensity"] + d
+                            and (idx == 1 or s["mean_intensity"] >= pm - 2.0)
+                        ),
+                        overlay_pred=lambda s, d=min_delta, po=prev_o, idx=step_idx: (
+                            s["mean_intensity"] >= overlay_init["mean_intensity"] + d
+                            and (idx == 1 or s["mean_intensity"] >= po - 2.0)
+                        ),
+                    )
+                if step_data["main_query"] is not None:
+                    seen_main_queries.add(step_data["main_query"])
+                ov_query = step_data["overlay_query"]
+                if ov_query:
+                    seen_overlay_queries.add(ov_query)
+                    if ov_query != drag_start_query and ov_query not in pre_release_queries:
+                        pre_release_queries.append(ov_query)
+                if step_data["main"] is not None and step_data["main"]["min_alpha"] == 255:
+                    prev_main_intensity = step_data["main"]["mean_intensity"]
+                if step_data["overlay"] is not None and step_data["overlay"]["min_alpha"] == 255:
+                    prev_overlay_intensity = step_data["overlay"]["mean_intensity"]
+                steps[f"hold_{step_idx}"] = step_data
             _dispatch_lut_hi_release(parent, ch_idx, release_target[0])
             released = True
         finally:
             if not released:
                 _dispatch_lut_hi_pointer(parent, ch_idx, "pointerup", release_target[0])
 
-        t0 = time.monotonic()
-        deadline = t0 + min(timeout, 5.0)
-        main_hit_ms = overlay_hit_ms = None
-        main_rel = overlay_rel = None
-        rel_query = None
-        prev_overlay = (steps["hold_2"]["overlay"] or overlay_init)["mean_intensity"]
-        prev_main = (steps["hold_2"]["main"] or main_init)["mean_intensity"]
-        while True:
-            now_ms = round((time.monotonic() - t0) * 1000.0, 1)
-            ms = sample_canvas_patch(parent, px, py, is_pane=True, allow_none=True)
-            os_ = sample_canvas_patch(child, px, py, is_pane=False, allow_none=True)
-            if ms is not None:
-                main_rel = ms
-            if os_ is not None:
-                overlay_rel = os_
-            rel_query = _overlay_display_query(child)
-            if release_target[1] is not None:
-                if main_hit_ms is None and main_rel is not None and main_rel["min_alpha"] == 255 and abs(main_rel["mean_intensity"] - release_target[1]) <= 8.0:
-                    main_hit_ms = now_ms
-                if overlay_hit_ms is None and overlay_rel is not None and overlay_rel["min_alpha"] == 255 and abs(overlay_rel["mean_intensity"] - release_target[1]) <= 8.0:
-                    overlay_hit_ms = now_ms
-                if main_hit_ms is not None and overlay_hit_ms is not None:
-                    break
-            else:
-                if main_hit_ms is None and main_rel is not None and main_rel["min_alpha"] == 255 and main_rel["mean_intensity"] >= prev_main - 2.0:
-                    main_hit_ms = now_ms
-                if (
-                    overlay_hit_ms is None
-                    and rel_query not in {drag_start_query, *pre_release_queries}
-                    and overlay_rel is not None
-                    and overlay_rel["min_alpha"] == 255
-                    and overlay_rel["mean_intensity"] >= prev_overlay - 2.0
-                ):
-                    overlay_hit_ms = now_ms
-                if main_hit_ms is not None and overlay_hit_ms is not None:
-                    break
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(.05)
-        steps["release"] = {
-            "hi": release_target[0],
-            "expected_intensity": release_target[1],
-            "main_elapsed_ms": main_hit_ms,
-            "overlay_elapsed_ms": overlay_hit_ms,
-            "main": main_rel,
-            "overlay": overlay_rel,
-            "overlay_query": rel_query,
-        }
+        if release_target[1] is not None:
+            steps["release"] = _poll_step(
+                release_target[0],
+                release_target[1],
+                hold_seconds=min(timeout, 5.0),
+                main_pred=lambda s, tgt=release_target[1]: abs(s["mean_intensity"] - tgt) <= 8.0,
+                overlay_pred=lambda s, tgt=release_target[1]: abs(s["mean_intensity"] - tgt) <= 8.0,
+            )
+        else:
+            prev_overlay = (steps["hold_2"]["overlay"] or overlay_init)["mean_intensity"]
+            prev_main = (steps["hold_2"]["main"] or main_init)["mean_intensity"]
+            steps["release"] = _poll_step(
+                release_target[0],
+                None,
+                hold_seconds=min(timeout, 5.0),
+                main_pred=lambda s, pm=prev_main: s["mean_intensity"] >= pm - 2.0,
+                overlay_pred=lambda s, po=prev_overlay: s["mean_intensity"] >= po - 2.0,
+            )
 
         if calibration_patch is not None:
             for key, target in (("hold_1", 85.0), ("hold_2", 127.0), ("release", 204.0)):
@@ -1023,6 +1172,11 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
             _check(len(pre_release_queries) >= 2,
                    f"Expected >= 2 distinct pre-release overlay query updates, got {pre_release_queries}")
             for key in ("hold_1", "hold_2", "release"):
+                _check(
+                    steps[key]["main_elapsed_ms"] is not None
+                    and steps[key]["overlay_elapsed_ms"] is not None,
+                    f"Live LUT drag {key} did not finish updating before deadline: {steps[key]}",
+                )
                 _check(
                     steps[key]["main"] is not None
                     and steps[key]["overlay"] is not None
@@ -1076,19 +1230,43 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
                 if (saved[i]) state.lutWidgets[i].setLut(saved[i]);
                 else state.lutWidgets[i].reset();
               }}
+              if (typeof refreshTiles === 'function') refreshTiles();
               return true;
             }})()""",
         )
+        last_restore = {}
+
+        def _restored():
+            ms = _main_display_status(parent)
+            os_ = _overlay_display_status(child)
+            last_restore.clear()
+            last_restore.update(
+                main=ms,
+                overlay=os_,
+                restore_overlay_query=restore_overlay_query,
+                initial_luts=initial_luts,
+            )
+            return bool(
+                ms is not None
+                and ms["active"] == ms["desired"]
+                and not ms["rendering"]
+                and ms["fullyLoaded"]
+                and os_ is not None
+                and os_["active"] == restore_overlay_query
+                and os_["query"] == restore_overlay_query
+                and not os_["rendering"]
+                and os_["fullyLoaded"]
+            )
+
         try:
             wait_for(
-                lambda: _overlay_display_query(child) == restore_overlay_query
-                and child.evaluate_js("Boolean(nd2Translucent.viewer.world.getItemAt(0)?.getFullyLoaded())"),
+                _restored,
                 timeout=min(timeout, 5.0),
                 description="live LUT restoration",
             )
-        except TimeoutError:
+        except TimeoutError as exc:
             if not failed:
-                raise
+                raise TimeoutError(f"{exc} (state={last_restore})") from exc
 
 
 def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None, extra_checks=None):
