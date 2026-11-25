@@ -3,6 +3,22 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.11</title>
+            <pubDate>Wed, 25 Nov 2026 14:53:16 +0000</pubDate>
+            <sparkle:version>2.6.11</sparkle:version>
+            <sparkle:shortVersionString>2.6.11</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>AstroMapper multi-step resize import, multi-channel OME-TIFF fixes, and security hardening</h2>
+<ul>
+<li><strong>AstroMapper multi-step resize import &amp; ROI parity.</strong> Accept 1-step and 2-step whole-slide downscaled JPG/PNG reference images with a dual-guard aspect tolerance (up to 2 px minor-axis drift within 0.5% relative difference) and clear dimension-bearing mismatch errors. Add UTF-16 BOM ROI text decoding, PNG reference parity in the translucent viewer, 4,096-character ROI notes, integer-snapped dragged ROI boxes, a 2,000-ROI guard, checkbox undo/help shortcuts, boundary-clamped AstroMapper exports, and aligned 32 MiB ROI TXT export/import limits for large multi-byte note lists.</li>
+<li><strong>Multi-channel OME-TIFF &amp; degraded-overview export fixes.</strong> Write standards-compliant multi-IFD OME-TIFF 2016-06 files for multi-channel non-RGB exports, guard ND2 exports clearly when only a degraded overview cache is present, and report pre-stream export failures visibly in the interface.</li>
+<li><strong>Cache security, lifecycle &amp; cross-OS hardening.</strong> Validate full Zarr v2 metadata and reject symlinks and directory junctions across read/write and directory stores, harden overwrite-conversion metadata validation and preserve <code>.replaced-*</code> backups whenever the final cache is missing, improve lockfile descriptor handling, make shading-correction generation recovery atomic, fix hidden and mid-reveal translucent window teardown and gesture-capture edge cases, improve live-LUT display-loop and tile-gate reliability, and unify NFC/NFD lockfiles with extended Windows long-path (<code>\\?\</code>) support.</li>
+</ul>
+<p>See the <a href="https://github.com/myunghyunj/nd2wsi-viewer/blob/v2.6.11/docs/release-notes-2.6.11.md">2.6.11 release notes</a> for full details and download checksums.</p>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-macos-arm64.dmg" length="135553270" type="application/octet-stream" sparkle:edSignature="JjD2c7PBkIlCkH1BYuvHC+bWXKuAl+WUZZ5ywHRs5lrStLE4NoW0rfjqx76Zlt+hbm9gtVkzYjW5Oz+iN/pLBQ=="/>
+        </item>
+        <item>
             <title>2.6.10</title>
             <pubDate>Wed, 25 Nov 2026 07:51:15 +0000</pubDate>
             <sparkle:version>2.6.10</sparkle:version>
