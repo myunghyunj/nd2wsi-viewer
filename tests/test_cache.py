@@ -1421,5 +1421,5 @@ def test_cache_lock_uses_filesystem_path_for_os_operations(tmp_path, monkeypatch
     lock = CacheLock(container)
     with lock:
         assert lock.refresh()
-    assert str(lock.path) in seen
-    assert str(lock._arbiter.path) in seen
+    assert real_fs_path(lock.path) in seen
+    assert real_fs_path(lock._arbiter.path) in seen
