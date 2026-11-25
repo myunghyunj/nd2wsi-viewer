@@ -6,11 +6,13 @@ preserving all public and test-referenced symbols and monkeypatch seams.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -90,7 +92,15 @@ def follow_flip_store(api):
         return api._follow_flips_store
 
 
-def prepare_translucent_context(api, sid: str, payload: dict, *, server_url) -> tuple[str, dict]:
+def _overlay_is_closed(overlay) -> bool:
+    if callable(getattr(overlay, "_is_closed", None)):
+        return bool(overlay._is_closed())
+    if callable(getattr(overlay, "_session_snapshot", None)):
+        return bool(overlay._session_snapshot()[3])
+    return bool(getattr(overlay, "_closed", False))
+
+
+def prepare_translucent_context(api, sid: str, payload: dict, *, server_url) -> tuple[str, dict, str]:
     """Validate and assemble the slide handoff context for a translucent tracing window."""
     from .translucent_window import validate_context
 
@@ -99,9 +109,10 @@ def prepare_translucent_context(api, sid: str, payload: dict, *, server_url) -> 
         store = server.registry.get(sid) if server is not None and isinstance(sid, str) else None
         if store is None:
             raise ValueError("Open an image before opening the translucent viewer")
+        launch_generation = getattr(store, "generation", "")
         base_url = server_url(server).rstrip("/") + "/"
         context = validate_context(store, payload, slide_url=base_url + "s/" + quote(sid, safe="") + "/")
-    return base_url, context
+    return base_url, context, launch_generation
 
 
 def acquire_translucent_slot(api, sid: str):
@@ -112,7 +123,7 @@ def acquire_translucent_slot(api, sid: str):
         if api._translucent_owner_closed:
             raise ValueError("The source viewer is closing")
         previous = api._translucent_windows.get(sid)
-        if previous is not None:
+        if previous is not None and not _overlay_is_closed(previous):
             return previous, None, None
         if api._translucent_windows or api._translucent_claim is not None:
             session_log.event("translucent_refused", reason="another_open", sid=sid)
@@ -135,7 +146,155 @@ def acquire_translucent_slot(api, sid: str):
         return None, claim, None
 
 
-def launch_translucent_overlay(api, sid: str, context: dict, *, base_url: str, claim, app_name: str, logger):
+def prepare_and_acquire_translucent_slot(
+    api,
+    sid: str,
+    payload: dict,
+    *,
+    launch_token: str,
+    server_url,
+):
+    """Atomically resolve store, validate context, reserve launch_token, and acquire claim."""
+    from .translucent_claim import tracing_claim
+    from .translucent_window import validate_context
+
+    with api._server_lock:
+        with api._translucent_lock:
+            server = api._httpd
+            store = server.registry.get(sid) if server is not None and isinstance(sid, str) else None
+            if store is None:
+                raise ValueError("Open an image before opening the translucent viewer")
+            launch_generation = getattr(store, "generation", "")
+            base_url = server_url(server).rstrip("/") + "/"
+            context = validate_context(
+                store,
+                payload,
+                slide_url=base_url + "s/" + quote(sid, safe="") + "/",
+            )
+            if api._translucent_owner_closed:
+                raise ValueError("The source viewer is closing")
+            previous = api._translucent_windows.get(sid)
+            if previous is not None and not _overlay_is_closed(previous):
+                api._translucent_pending_launches[sid] = launch_token
+                return base_url, context, launch_generation, previous, None, None
+            if api._translucent_windows or api._translucent_claim is not None:
+                session_log.event("translucent_refused", reason="another_open", sid=sid)
+                return (
+                    base_url,
+                    context,
+                    launch_generation,
+                    None,
+                    None,
+                    {
+                        "ok": False,
+                        "reason": "another_open",
+                        "message": "A tracing window is already open. Close it before opening another.",
+                    },
+                )
+            claim = tracing_claim(api._window_session)
+            try:
+                claim.acquire()
+            except TimeoutError:
+                session_log.event("translucent_refused", reason="another_open", sid=sid)
+                return (
+                    base_url,
+                    context,
+                    launch_generation,
+                    None,
+                    None,
+                    {
+                        "ok": False,
+                        "reason": "another_open",
+                        "message": "A tracing window is already open. Close it before opening another.",
+                    },
+                )
+            api._translucent_claim = claim
+            api._translucent_pending_launches[sid] = launch_token
+            return base_url, context, launch_generation, None, claim, None
+
+
+def cancel_pending_translucent_launch(api, sid: str, launch_token: str) -> None:
+    """Clear a pending launch reservation if it still belongs to ``launch_token``."""
+    if not isinstance(sid, str):
+        return
+    with api._translucent_lock:
+        if api._translucent_pending_launches.get(sid) == launch_token:
+            api._translucent_pending_launches.pop(sid, None)
+
+
+def reopen_translucent_overlay(
+    api,
+    sid: str,
+    previous,
+    context: dict,
+    *,
+    launch_token: str,
+    launch_generation: str,
+) -> dict:
+    """Serialize and validate same-window reopen without disturbing superseded sessions."""
+    refresh_lock = getattr(previous, "_refresh_lock", None)
+    lock_ctx = refresh_lock if refresh_lock is not None else contextlib.nullcontext()
+    with lock_ctx:
+        def _verify(*, pop_pending: bool) -> None:
+            with api._server_lock:
+                with api._translucent_lock:
+                    server = api._httpd
+                    current_store = server.registry.get(sid) if server is not None else None
+                    pending_matches = api._translucent_pending_launches.get(sid) == launch_token
+                    same_overlay = api._translucent_windows.get(sid) is previous
+                    closed = _overlay_is_closed(previous)
+                    configured = bool(getattr(previous, "_configured", True))
+                    if api._translucent_owner_closed:
+                        if pending_matches:
+                            api._translucent_pending_launches.pop(sid, None)
+                        raise ValueError("The source viewer is closing")
+                    if current_store is None:
+                        if pending_matches:
+                            api._translucent_pending_launches.pop(sid, None)
+                        raise ValueError("The slide was closed while opening the overlay")
+                    if not pending_matches:
+                        raise ValueError("The overlay launch was superseded")
+                    if getattr(current_store, "generation", "") != launch_generation:
+                        api._translucent_pending_launches.pop(sid, None)
+                        raise ValueError("The image changed; refresh the slide before opening the overlay")
+                    if not same_overlay or closed or not configured:
+                        api._translucent_pending_launches.pop(sid, None)
+                        raise ValueError("The tracing window is still opening or closing.")
+                    if pop_pending:
+                        api._translucent_pending_launches.pop(sid, None)
+
+        _verify(pop_pending=False)
+        if callable(getattr(previous, "stop_stage_follow", None)):
+            previous.stop_stage_follow()
+            _verify(pop_pending=True)
+            previous._refresh_context(
+                context,
+                launch_token=launch_token,
+                launch_generation=launch_generation,
+                _skip_stop=True,
+            )
+        else:
+            _verify(pop_pending=True)
+            previous._refresh_context(
+                context,
+                launch_token=launch_token,
+                launch_generation=launch_generation,
+            )
+    return {"ok": True, "id": previous._window.uid, "launch_token": launch_token}
+
+
+def launch_translucent_overlay(
+    api,
+    sid: str,
+    context: dict,
+    *,
+    base_url: str,
+    claim,
+    app_name: str,
+    logger,
+    launch_token: str | None = None,
+    launch_generation: str = "",
+):
     """Create the native translucent window and wire its close/lock/laser-box callbacks."""
     from .laser_target import LaserTargetStore
     from .translucent_window import create_translucent_window
@@ -173,22 +332,49 @@ def launch_translucent_overlay(api, sid: str, context: dict, *, base_url: str, c
         on_laser_box=deliver,
         is_active=lambda: api._active_translucent_sid == sid,
         on_lock=active,
+        launch_token=launch_token,
+        launch_generation=launch_generation,
     )
 
 
-def register_translucent_overlay(api, sid: str, overlay) -> dict:
-    """Register the created overlay unless the owner window started closing concurrently."""
-    owner_closed = False
-    with api._translucent_lock:
-        if api._translucent_owner_closed:
-            owner_closed = True
-        else:
-            api._translucent_windows[sid] = overlay
-    if owner_closed:
+def register_translucent_overlay(
+    api,
+    sid: str,
+    overlay,
+    *,
+    launch_token: str | None = None,
+    launch_generation: str = "",
+) -> dict:
+    """Register the created overlay unless aborted by close, removal, expiry, or superseding launch."""
+    token = launch_token if isinstance(launch_token, str) and launch_token else uuid.uuid4().hex
+    abort_reason = None
+    with api._server_lock:
+        with api._translucent_lock:
+            pending_matches = (
+                launch_token is None or api._translucent_pending_launches.get(sid) == launch_token
+            )
+            if launch_token is not None and pending_matches:
+                api._translucent_pending_launches.pop(sid, None)
+            server = api._httpd
+            current_store = server.registry.get(sid) if server is not None else None
+            overlay_closed = _overlay_is_closed(overlay)
+            if api._translucent_owner_closed:
+                abort_reason = "The source viewer is closing"
+            elif current_store is None:
+                abort_reason = "The slide was closed while opening the overlay"
+            elif not pending_matches:
+                abort_reason = "The overlay launch was superseded"
+            elif getattr(current_store, "generation", "") != launch_generation:
+                abort_reason = "The image changed; refresh the slide before opening the overlay"
+            elif overlay_closed:
+                abort_reason = "The overlay closed while opening"
+            else:
+                api._translucent_windows[sid] = overlay
+    if abort_reason is not None:
         overlay.close_translucent()
-        raise ValueError("The source viewer is closing")
+        raise ValueError(abort_reason)
     session_log.event("translucent_opened", sid=sid, id=overlay._window.uid)
-    return {"ok": True, "id": overlay._window.uid}
+    return {"ok": True, "id": overlay._window.uid, "launch_token": token}
 
 
 def release_translucent_claim(api, claim) -> None:
@@ -211,20 +397,25 @@ def report_slacs_laser_box(api, payload) -> dict:
         return {"ok": False}
     with api._translucent_lock:
         overlay = api._translucent_windows.get(payload["sid"])
-    return overlay.report_slacs_laser_box(payload) if overlay is not None else {"ok": False}
+    return overlay._report_slacs_laser_box(payload) if overlay is not None else {"ok": False}
 
 
 def close_translucent_viewer(api, sid: str, *, logger) -> dict:
     """Close the translucent tracing window for one slide tab, if open."""
     with api._translucent_lock:
-        overlay = api._translucent_windows.pop(sid, None) if isinstance(sid, str) else None
+        if isinstance(sid, str):
+            overlay = api._translucent_windows.pop(sid, None)
+            pending = api._translucent_pending_launches.pop(sid, None)
+        else:
+            overlay = None
+            pending = None
     if overlay is not None:
         try:
             overlay.close_translucent()
         except Exception as exc:
             logger(f"translucent viewer close failed: {exc!r}")
             return {"ok": False, "message": str(exc)}
-    return {"ok": True, "closed": overlay is not None}
+    return {"ok": True, "closed": overlay is not None or pending is not None}
 
 
 def close_translucent_windows(api, *, owner_closing: bool = True, logger) -> None:
@@ -234,6 +425,7 @@ def close_translucent_windows(api, *, owner_closing: bool = True, logger) -> Non
             api._translucent_owner_closed = True
         overlays = list(api._translucent_windows.values())
         api._translucent_windows.clear()
+        api._translucent_pending_launches.clear()
         detector, api._slacs_discovery = api._slacs_discovery, None
     if overlays:
         session_log.event("translucent_closing", count=len(overlays), reason="source viewer closing")
@@ -498,6 +690,7 @@ def startup_error(message: str, *, app_name: str, show_dialog: bool = True, logg
 __all__ = [
     "acquire_translucent_slot",
     "build_relaunch_command",
+    "cancel_pending_translucent_launch",
     "claim_slacs_offer",
     "close_translucent_viewer",
     "close_translucent_windows",
@@ -508,9 +701,11 @@ __all__ = [
     "launch_translucent_overlay",
     "log_slacs_detection",
     "maybe_relaunch_webview2_fallback",
+    "prepare_and_acquire_translucent_slot",
     "prepare_translucent_context",
     "register_translucent_overlay",
     "release_translucent_claim",
+    "reopen_translucent_overlay",
     "report_slacs_laser_box",
     "slacs_discovery_state",
     "startup_error",

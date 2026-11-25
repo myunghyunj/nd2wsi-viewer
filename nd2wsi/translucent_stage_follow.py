@@ -1325,7 +1325,7 @@ class StageFollowMixin:
         )
         return self._window.evaluate_js(script)
 
-    def report_slacs_laser_box(self, payload):
+    def _report_slacs_laser_box(self, payload):
         return (
             self._laser_delivery.accept(payload)
             if self._laser_delivery is not None

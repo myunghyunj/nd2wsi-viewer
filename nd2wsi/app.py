@@ -629,6 +629,7 @@ class Api:
         self._active_opens = 0
         self._translucent_lock = threading.RLock()
         self._translucent_windows = {}
+        self._translucent_pending_launches: dict[str, str] = {}
         self._active_translucent_sid = None
         self._translucent_claim = None
         self._translucent_owner_closed = False
@@ -704,22 +705,59 @@ class Api:
         """Open a display-only tracing window for this viewer's registered slide."""
         if sys.platform not in ("darwin", "win32"):
             return {"ok": False, "message": "The translucent viewer requires the macOS or Windows app."}
+        launch_token = uuid.uuid4().hex
         claim = None
         overlay_owns_claim = False
+        pending_reserved = False
         try:
-            base_url, context = _app_slacs.prepare_translucent_context(self, sid, payload, server_url=_server_url)
-            previous, claim, refusal = _app_slacs.acquire_translucent_slot(self, sid)
+            (
+                base_url,
+                context,
+                launch_generation,
+                previous,
+                claim,
+                refusal,
+            ) = _app_slacs.prepare_and_acquire_translucent_slot(
+                self,
+                sid,
+                payload,
+                launch_token=launch_token,
+                server_url=_server_url,
+            )
             if refusal is not None:
                 return refusal
+            pending_reserved = True
             if previous is not None:
-                previous.refresh_context(context)
-                return {"ok": True, "id": previous._window.uid}
+                return _app_slacs.reopen_translucent_overlay(
+                    self,
+                    sid,
+                    previous,
+                    context,
+                    launch_token=launch_token,
+                    launch_generation=launch_generation,
+                )
             overlay = _app_slacs.launch_translucent_overlay(
-                self, sid, context, base_url=base_url, claim=claim, app_name=APP_NAME, logger=_dlog,
+                self,
+                sid,
+                context,
+                base_url=base_url,
+                claim=claim,
+                app_name=APP_NAME,
+                logger=_dlog,
+                launch_token=launch_token,
+                launch_generation=launch_generation,
             )
             overlay_owns_claim = True
-            return _app_slacs.register_translucent_overlay(self, sid, overlay)
+            return _app_slacs.register_translucent_overlay(
+                self,
+                sid,
+                overlay,
+                launch_token=launch_token,
+                launch_generation=launch_generation,
+            )
         except Exception as exc:
+            if pending_reserved:
+                _app_slacs.cancel_pending_translucent_launch(self, sid, launch_token)
             if claim is not None and not overlay_owns_claim:
                 _app_slacs.release_translucent_claim(self, claim)
             return _app_slacs.handle_translucent_open_error(sid, exc, logger=_dlog)
@@ -730,6 +768,56 @@ class Api:
     def _follow_flip_store(self):
         """This window process's store of Follow flips per image format."""
         return _app_slacs.follow_flip_store(self)
+
+    def update_translucent_display(
+        self,
+        sid: str,
+        launch_token: str,
+        revision: int,
+        display_query: str,
+    ) -> dict:
+        """Apply validated live display overrides (c, win, col) to an active overlay."""
+        if (
+            not isinstance(sid, str)
+            or not sid
+            or not isinstance(launch_token, str)
+            or not launch_token
+            or type(revision) is not int
+            or not 1 <= revision <= 2**53 - 1
+            or not isinstance(display_query, str)
+        ):
+            return {"ok": False, "invalid": True, "message": "Invalid display update request"}
+
+        from .translucent_window import merge_display_query
+
+        expire_overlay = None
+        with self._server_lock:
+            with self._translucent_lock:
+                server = self._httpd
+                store = server.registry.get(sid) if server is not None else None
+                overlay = self._translucent_windows.get(sid)
+                if overlay is None or store is None:
+                    return {"ok": False, "closed": True}
+                cur_token, launch_gen, base_query, retired = overlay._session_snapshot()
+                if retired:
+                    return {"ok": False, "closed": True}
+                if cur_token != launch_token:
+                    return {"ok": False, "stale": True}
+                if getattr(store, "generation", "") != launch_gen:
+                    expire_overlay = overlay
+                else:
+                    try:
+                        merged = merge_display_query(store, base_query, display_query)
+                    except ValueError as exc:
+                        return {"ok": False, "invalid": True, "message": str(exc)}
+        if expire_overlay is not None:
+            expire_overlay._expire_display_session(launch_token, "generation_changed")
+            return {
+                "ok": False,
+                "stale_generation": True,
+                "message": "The source image changed. Reopen the translucent viewer.",
+            }
+        return overlay._apply_display_query(launch_token, revision, merged)
 
     def close_translucent_viewer(self, sid: str) -> dict:
         """Close the translucent tracing window for one slide tab, if open."""
@@ -1748,6 +1836,7 @@ def create_app_window(initial: Path | None, window_session=None):
         frameless=sys.platform == "darwin",
         easy_drag=False,
     )
+    api._window = window
     # WKWebView can consume horizontal trackpad events in a private scroll
     # subview without creating DOM wheel events. A local AppKit monitor routes
     # only clearly horizontal gestures; vertical input keeps its normal path.

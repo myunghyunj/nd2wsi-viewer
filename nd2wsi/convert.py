@@ -982,15 +982,15 @@ def _store_matches_selection(
     tile: int | None = None,
     require_provenance: bool = False,
 ) -> bool:
+    from .cache import fingerprints_match, names_match, quick_fingerprint
+
     requested = requested or PlaneSelection()
     meta = attrs.get("nd2wsi") or {}
     recorded_source = Path(str(meta.get("source") or "")).name
-    if recorded_source != slide.name:
+    if not names_match(recorded_source, slide.name):
         return False
     recorded_fp = meta.get("source_fingerprint")
     if isinstance(recorded_fp, dict) and slide.is_file():
-        from .cache import fingerprints_match, quick_fingerprint
-
         if not fingerprints_match(recorded_fp, quick_fingerprint(slide)):
             return False
     elif require_provenance:

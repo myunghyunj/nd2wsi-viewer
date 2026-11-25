@@ -774,6 +774,7 @@ class OverlayRun:
         monkeypatch.setattr(smoke, "drag_image", self.drag)
         monkeypatch.setattr(smoke, "exercise_opacity_controls", lambda *_args, **_kwargs: {"ok": True})
         monkeypatch.setattr(smoke, "exercise_roi_boxes", Mock(return_value={"ok": True}))
+        monkeypatch.setattr(smoke, "exercise_live_lut_drag", Mock(return_value={"ok": True}))
         self.follow_calls = []
 
         def follow(overlay, child, **kwargs):

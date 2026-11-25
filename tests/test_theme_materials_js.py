@@ -587,22 +587,23 @@ assert.ok(!read('translucent.html').includes('materials-v1.css'));
 # Separate baselines preserve the official top-right lock and lab bottom-left
 # lock when the theme changes merge into the lab line. No tracing file is themed.
 # Both baselines include the intentional 2.6.4 ROI recovery controls,
-# 2.6.6 custom channel-color (`col`), URL validation, and AppKit safety fixes,
-# 2.6.7 pywebview file-type filter / stage-follow laser delivery fixes, and
-# 2.6.9 pre-1607 Windows 10 system-DPI scale fallback; existing opacity,
-# locking and window geometry are covered by tracing tests.
+# 2.6.5/2.6.6 custom channel-color (`col`), URL validation, and AppKit safety fixes,
+# 2.6.7 pywebview file-type filter / stage-follow laser delivery fixes,
+# 2.6.9 pre-1607 Windows 10 system-DPI scale fallback, and 2.6.10 live LUT sync,
+# backdrop snapshot, and paint gate; existing opacity, locking and window
+# geometry are covered by tracing tests.
 TRACING_BASELINES = {
     "official": {
-        "translucent.html": "2c1b5b622ce3d7da88fefdae85a5876ff9e755aeaffcfe217336cc07a3caa304",
-        "translucent-v1.css": "83e79c386c2a37451b92cec4c28b4c0a53d9e58528d46ddb8d49b54eac0d5f86",
-        "translucent-v1.js": "a967166c76e1fa33e1b109c5535adcfb1e60546a2de21f8ea9f6137aa711bf00",
-        "../translucent_window.py": "7f0456798b3997addd8b5876ee28eaf528a857aa2dd881e61e968047fe34dedd",
+        "translucent.html": "4abe2b84b3e9ca060d51cab5a40bc655fb6836a93c75fa2b4a997f798815f237",
+        "translucent-v1.css": "682a0bfe03429c544d93da6a16fe73fc381aa526878828170e3c6d852d889957",
+        "translucent-v1.js": "1ed0d67112d8657e911b1d2bdbf50464037e6e8609ea4d61f1ff2e40bbff6176",
+        "../translucent_window.py": "10110d293f1be08830d5abdcb0a8945c03209f0d2ecde2b24a17cd2aa1dfd780",
     },
     "SLACS-module": {
-        "translucent.html": "fb5ef3993e655633ee3284252145e984701c5051a937ccace5bad4fcf7f75994",
-        "translucent-v1.css": "7e12d08f4aa41c30524c27e6e669c936a8010d229ea474f54c8e1e46f42e5e07",
-        "translucent-v1.js": "1e30a0580da1a825349f2740f3ff672117edd910e498b40afe218cb9a381f17f",
-        "../translucent_window.py": "2dc1d37a137438e67bbd807282179509f0ccf58ba1510aa4980dfc72a088a62d",
+        "translucent.html": "0d9503a25a731d116d6553c39fa089dd750f75ceb197c6de24215f4cdac96b98",
+        "translucent-v1.css": "7a2456cf6418dcf98498521b7d3d1af3de5d5e99b5a25317d2acbe7ad04a33d7",
+        "translucent-v1.js": "c96a2b3f1ae1d0c13cec672565331ac6ae30a078706af092078bd87b3e51c3ec",
+        "../translucent_window.py": "e337c1a4a7e43d7ab265410e13f6a5cc95aac933459f3d0c10ffe68e96e36deb",
     },
 }
 

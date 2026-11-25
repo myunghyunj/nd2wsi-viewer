@@ -198,7 +198,7 @@ def test_refresh_context_aborts_if_closed_during_stop_stage_follow():
 
     overlay.stop_stage_follow = close_mid_stop
     with pytest.raises(ValueError, match="still opening or closing"):
-        overlay.refresh_context({"query": "?g=2", "slide_url": "http://127.0.0.1:1/s/1/"})
+        overlay._refresh_context({"query": "?g=2", "slide_url": "http://127.0.0.1:1/s/1/"})
     overlay._window.load_url.assert_not_called()
     overlay._window.show.assert_not_called()
 

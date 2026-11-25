@@ -103,6 +103,8 @@ def pane_eval(parent, expression):
         " const lutParam = __win.lutParam;"
         " const pixelSize = __win.pixelSize;"
         " const astromapItems = __win.astromapItems;"
+        " const Nd2ViewerGeometry = __win.Nd2ViewerGeometry;"
+        " const OpenSeadragon = __win.OpenSeadragon;"
         " " + stmt +
         "})()"
     )
@@ -609,6 +611,635 @@ def exercise_roi_boxes(child, *, timeout=30, screenshot_path=None, expected_flip
             "checks": checks}
 
 
+def sample_canvas_patch(window, image_x, image_y, *, is_pane=False, allow_none=False):
+    """Sample a 5x5 image-centered composited patch (foreground + #translucent-backdrop)."""
+    viewer_expr = "state.viewer" if is_pane else "window.nd2Translucent && window.nd2Translucent.viewer"
+    include_backdrop_js = "false" if is_pane else "true"
+    script = f"""(() => {{
+      const viewer = {viewer_expr};
+      if (!viewer || !viewer.viewport || !viewer.drawer) return {{ error: "viewer not ready" }};
+      const vp = viewer.viewport;
+      const size = vp.getContainerSize();
+      const canvas = viewer.drawer.canvas;
+      const ctx = viewer.drawer.context || (canvas && canvas.getContext("2d"));
+      if (!canvas || !ctx || !(size.x > 0) || !(size.y > 0) || !(canvas.width > 0) || !(canvas.height > 0)) {{
+        return {{ error: "canvas not ready" }};
+      }}
+      const backdrop = {include_backdrop_js} ? document.getElementById("translucent-backdrop") : null;
+      let bgVis = false;
+      let bgOpacity = 0;
+      let bgCtx = null;
+      if (backdrop && !backdrop.hidden && backdrop.width > 0 && backdrop.height > 0) {{
+        const bgStyle = getComputedStyle(backdrop);
+        bgOpacity = Number.parseFloat(bgStyle.opacity) || 0;
+        if (bgStyle.display !== "none" && bgStyle.visibility !== "hidden" && bgOpacity > 0) {{
+          bgCtx = backdrop.getContext("2d");
+          if (bgCtx) bgVis = true;
+        }}
+      }}
+      const fgSx = canvas.width / size.x;
+      const fgSy = canvas.height / size.y;
+      const fgCoords = [];
+      let fgMinX = Infinity, fgMinY = Infinity, fgMaxX = -Infinity, fgMaxY = -Infinity;
+      const bgSx = bgVis ? backdrop.width / size.x : 0;
+      const bgSy = bgVis ? backdrop.height / size.y : 0;
+      const bgCoords = bgVis ? [] : null;
+      let bgMinX = Infinity, bgMinY = Infinity, bgMaxX = -Infinity, bgMaxY = -Infinity;
+      let hasBgCoords = false;
+      for (let dy = -2; dy <= 2; dy++) {{
+        for (let dx = -2; dx <= 2; dx++) {{
+          const pt = Nd2ViewerGeometry.imageToViewerElementPoint(
+            vp, {{ x: {float(image_x)!r} + dx + 0.5, y: {float(image_y)!r} + dy + 0.5 }}, OpenSeadragon
+          );
+          const fx = Math.floor(pt.x * fgSx);
+          const fy = Math.floor(pt.y * fgSy);
+          if (!Number.isFinite(fx) || !Number.isFinite(fy) ||
+              fx < 0 || fx >= canvas.width || fy < 0 || fy >= canvas.height) {{
+            return {{
+              error: "backing coordinate out of bounds",
+              coord: [fx, fy],
+              canvas: [canvas.width, canvas.height],
+            }};
+          }}
+          fgCoords.push([fx, fy]);
+          if (fx < fgMinX) fgMinX = fx;
+          if (fy < fgMinY) fgMinY = fy;
+          if (fx > fgMaxX) fgMaxX = fx;
+          if (fy > fgMaxY) fgMaxY = fy;
+          if (bgVis) {{
+            const bx = Math.floor(pt.x * bgSx);
+            const by = Math.floor(pt.y * bgSy);
+            if (!Number.isFinite(bx) || !Number.isFinite(by) ||
+                bx < 0 || bx >= backdrop.width || by < 0 || by >= backdrop.height) {{
+              bgCoords.push(null);
+            }} else {{
+              bgCoords.push([bx, by]);
+              hasBgCoords = true;
+              if (bx < bgMinX) bgMinX = bx;
+              if (by < bgMinY) bgMinY = by;
+              if (bx > bgMaxX) bgMaxX = bx;
+              if (by > bgMaxY) bgMaxY = by;
+            }}
+          }}
+        }}
+      }}
+      const fgBw = fgMaxX - fgMinX + 1;
+      const fgBh = fgMaxY - fgMinY + 1;
+      const fgData = ctx.getImageData(fgMinX, fgMinY, fgBw, fgBh).data;
+      let bgData = null;
+      let bgBw = 0;
+      if (bgVis && hasBgCoords) {{
+        bgBw = bgMaxX - bgMinX + 1;
+        const bgBh = bgMaxY - bgMinY + 1;
+        bgData = bgCtx.getImageData(bgMinX, bgMinY, bgBw, bgBh).data;
+      }}
+      let sumR = 0, sumG = 0, sumB = 0, minAlpha = 255;
+      let fgSumR = 0, fgSumG = 0, fgSumB = 0, fgMinAlpha = 255;
+      let bgMinAlpha = 255;
+      for (let i = 0; i < fgCoords.length; i++) {{
+        const [fx, fy] = fgCoords[i];
+        const fOff = ((fy - fgMinY) * fgBw + (fx - fgMinX)) * 4;
+        const fgR = fgData[fOff];
+        const fgG = fgData[fOff + 1];
+        const fgB = fgData[fOff + 2];
+        const fgA = fgData[fOff + 3];
+        fgSumR += fgR;
+        fgSumG += fgG;
+        fgSumB += fgB;
+        if (fgA < fgMinAlpha) fgMinAlpha = fgA;
+        let bgR = 0, bgG = 0, bgB = 0, bgA = 0;
+        if (bgVis) {{
+          const bc = bgCoords[i];
+          if (bc && bgData) {{
+            const bOff = ((bc[1] - bgMinY) * bgBw + (bc[0] - bgMinX)) * 4;
+            bgR = bgData[bOff];
+            bgG = bgData[bOff + 1];
+            bgB = bgData[bOff + 2];
+            bgA = bgData[bOff + 3];
+          }}
+        }}
+        const aF = fgA / 255;
+        const aB = bgVis ? (bgA / 255) * bgOpacity : 0;
+        if (bgVis) {{
+          const effBgA = Math.round(aB * 255);
+          if (effBgA < bgMinAlpha) bgMinAlpha = effBgA;
+        }}
+        const aOut = aF + aB * (1 - aF);
+        let outR = 0, outG = 0, outB = 0;
+        if (aOut > 0) {{
+          const bW = aB * (1 - aF);
+          outR = (fgR * aF + bgR * bW) / aOut;
+          outG = (fgG * aF + bgG * bW) / aOut;
+          outB = (fgB * aF + bgB * bW) / aOut;
+        }}
+        const outA = Math.round(aOut * 255);
+        sumR += outR;
+        sumG += outG;
+        sumB += outB;
+        if (outA < minAlpha) minAlpha = outA;
+      }}
+      const n = fgCoords.length;
+      const meanRgb = [sumR / n, sumG / n, sumB / n];
+      return {{
+        mean_rgb: meanRgb,
+        mean_intensity: (meanRgb[0] + meanRgb[1] + meanRgb[2]) / 3,
+        min_alpha: minAlpha,
+        fg_min_alpha: fgMinAlpha,
+        fg_mean_intensity: (fgSumR + fgSumG + fgSumB) / (3 * n),
+        backdrop_visible: bgVis,
+        backdrop_min_alpha: bgVis ? bgMinAlpha : null,
+        samples: n,
+      }};
+    }})()"""
+    result = None
+    for attempt in range(3):
+        result = pane_eval(window, script) if is_pane else window.evaluate_js(script)
+        if result is not None:
+            break
+        if attempt < 2:
+            time.sleep(.05)
+    if result is None and allow_none:
+        return None
+    if not isinstance(result, dict) or "error" in result:
+        raise AssertionError(f"sample_canvas_patch failed ({'pane' if is_pane else 'overlay'}): {result}")
+    return result
+
+
+def find_signal_patch(window, *, is_pane=False):
+    """Scan a coarse interior grid for an opaque 5x5 patch with mean_intensity in [15, 160]."""
+    viewer_expr = "state.viewer" if is_pane else "window.nd2Translucent && window.nd2Translucent.viewer"
+    script = f"""(() => {{
+      const viewer = {viewer_expr};
+      if (!viewer || !viewer.viewport || !viewer.drawer) return {{ error: "viewer not ready" }};
+      const item = viewer.world && viewer.world.getItemAt(0);
+      if (!item) return {{ error: "no tiled image" }};
+      const content = item.getContentSize();
+      const vp = viewer.viewport;
+      const size = vp.getContainerSize();
+      const canvas = viewer.drawer.canvas;
+      const ctx = viewer.drawer.context || (canvas && canvas.getContext("2d"));
+      if (!canvas || !ctx || !(size.x > 0) || !(size.y > 0) || !(canvas.width > 0) || !(canvas.height > 0)) {{
+        return {{ error: "canvas not ready" }};
+      }}
+      const sx = canvas.width / size.x;
+      const sy = canvas.height / size.y;
+      const steps = 13;
+      let best = null;
+      for (let gy = 0; gy < steps; gy++) {{
+        const ey = size.y * (0.12 + 0.76 * gy / (steps - 1));
+        for (let gx = 0; gx < steps; gx++) {{
+          const ex = size.x * (0.12 + 0.76 * gx / (steps - 1));
+          const imgPt = Nd2ViewerGeometry.viewerElementToImagePoint(vp, {{ x: ex, y: ey }}, OpenSeadragon);
+          const ix = Math.floor(imgPt.x);
+          const iy = Math.floor(imgPt.y);
+          if (!Number.isFinite(ix) || !Number.isFinite(iy) ||
+              ix < 3 || iy < 3 || ix >= content.x - 3 || iy >= content.y - 3) continue;
+          const coords = [];
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          let inBounds = true;
+          for (let dy = -2; dy <= 2 && inBounds; dy++) {{
+            for (let dx = -2; dx <= 2; dx++) {{
+              const pt = Nd2ViewerGeometry.imageToViewerElementPoint(
+                vp, {{ x: ix + dx + 0.5, y: iy + dy + 0.5 }}, OpenSeadragon
+              );
+              const bx = Math.floor(pt.x * sx);
+              const by = Math.floor(pt.y * sy);
+              if (!Number.isFinite(bx) || !Number.isFinite(by) ||
+                  bx < 0 || bx >= canvas.width || by < 0 || by >= canvas.height) {{
+                inBounds = false;
+                break;
+              }}
+              coords.push([bx, by]);
+              if (bx < minX) minX = bx;
+              if (by < minY) minY = by;
+              if (bx > maxX) maxX = bx;
+              if (by > maxY) maxY = by;
+            }}
+          }}
+          if (!inBounds) continue;
+          const bw = maxX - minX + 1;
+          const bh = maxY - minY + 1;
+          const data = ctx.getImageData(minX, minY, bw, bh).data;
+          let sumR = 0, sumG = 0, sumB = 0, minA = 255;
+          for (const [bx, by] of coords) {{
+            const off = ((by - minY) * bw + (bx - minX)) * 4;
+            sumR += data[off];
+            sumG += data[off + 1];
+            sumB += data[off + 2];
+            if (data[off + 3] < minA) minA = data[off + 3];
+          }}
+          if (minA !== 255) continue;
+          const mean = (sumR + sumG + sumB) / (3 * coords.length);
+          if (mean < 15 || mean > 160) continue;
+          const score = Math.abs(mean - 60);
+          if (!best || score < best.score) {{
+            best = {{ x: ix, y: iy, mean, score }};
+          }}
+        }}
+      }}
+      return best ? {{ x: best.x, y: best.y, mean: best.mean }} : {{ error: "no interior patch in [15, 160]" }};
+    }})()"""
+    result = pane_eval(window, script) if is_pane else window.evaluate_js(script)
+    if not isinstance(result, dict) or "error" in result:
+        raise AssertionError(f"find_signal_patch failed ({'pane' if is_pane else 'overlay'}): {result}")
+    return (float(result["x"]), float(result["y"]))
+
+
+def _overlay_display_query(child):
+    return child.evaluate_js("""(() => {
+      const view = window.nd2Translucent;
+      if (typeof view?.state?.query === "string") return view.state.query;
+      const url = view?.viewer?.world?.getItemAt?.(0)?.source?.getTileUrl?.(0, 0, 0) || "";
+      const idx = url.indexOf("?");
+      return idx >= 0 ? url.slice(idx + 1) : "";
+    })()""")
+
+
+def _dispatch_lut_hi_pointer(parent, ch_index, event_type, target_value, pointer_id=71):
+    return pane_eval(
+        parent,
+        f"""(() => {{
+          const canvas = document.querySelectorAll('.lut-canvas')[{int(ch_index)}];
+          if (!canvas) return {{ error: 'missing lut canvas' }};
+          const r = canvas.getBoundingClientRect();
+          const vmin = Number(canvas.getAttribute('data-axis-min'));
+          const vmax = Number(canvas.getAttribute('data-axis-max'));
+          const x0 = 4, x1 = r.width - 4;
+          const frac = Math.max(0, Math.min(1, ({float(target_value)!r} - vmin) / (vmax - vmin)));
+          const cx = r.left + x0 + frac * (x1 - x0);
+          const cy = r.top + 8;
+          canvas.dispatchEvent(new PointerEvent({json.dumps(event_type)}, {{
+            pointerId: {int(pointer_id)}, pointerType: 'mouse', isPrimary: true,
+            button: 0, buttons: {0 if event_type in ('pointerup', 'pointercancel') else 1},
+            clientX: cx, clientY: cy, bubbles: true, cancelable: true,
+          }}));
+          return {{ val: {float(target_value)!r}, cx, cy, vmin, vmax, lut: state.luts[{int(ch_index)}] }};
+        }})()""",
+    )
+
+
+def _dispatch_lut_hi_release(parent, ch_index, target_value, pointer_id=71):
+    """Dispatch final pointermove + pointerup atomically in one evaluate_js RPC."""
+    return pane_eval(
+        parent,
+        f"""(() => {{
+          const canvas = document.querySelectorAll('.lut-canvas')[{int(ch_index)}];
+          if (!canvas) return {{ error: 'missing lut canvas' }};
+          const r = canvas.getBoundingClientRect();
+          const vmin = Number(canvas.getAttribute('data-axis-min'));
+          const vmax = Number(canvas.getAttribute('data-axis-max'));
+          const x0 = 4, x1 = r.width - 4;
+          const frac = Math.max(0, Math.min(1, ({float(target_value)!r} - vmin) / (vmax - vmin)));
+          const cx = r.left + x0 + frac * (x1 - x0);
+          const cy = r.top + 8;
+          const send = (type, buttons) => canvas.dispatchEvent(new PointerEvent(type, {{
+            pointerId: {int(pointer_id)}, pointerType: 'mouse', isPrimary: true,
+            button: 0, buttons, clientX: cx, clientY: cy, bubbles: true, cancelable: true,
+          }}));
+          send('pointermove', 1);
+          send('pointerup', 0);
+          return {{ val: {float(target_value)!r}, cx, cy, vmin, vmax, lut: state.luts[{int(ch_index)}] }};
+        }})()""",
+    )
+
+
+def _pick_drag_channel(parent, sample_rgb):
+    info = pane_eval(
+        parent,
+        """(() => {
+          const canvases = [...document.querySelectorAll('.lut-canvas')];
+          const discrete = /^(?:u?int\\d+|bool|[<>=|]?[iu]\\d+)$/.test(String(state.info?.dtype || ''));
+          const enabled = Array.isArray(state.channels) && state.channels.length
+            ? [...state.channels] : [0];
+          return {
+            discrete,
+            enabled,
+            channels: state.info.channels.map((ch, i) => {
+              const c = canvases[i];
+              const cur = state.luts[i] || { lo: ch.window.start, hi: ch.window.end, gamma: 1 };
+              return {
+                index: i,
+                color: String(ch.color || 'FFFFFF').replace(/^#/, '').toUpperCase(),
+                cur: { lo: Number(cur.lo), hi: Number(cur.hi), gamma: Number(cur.gamma ?? 1) },
+                hasOverride: Boolean(state.luts[i]),
+                vmin: c ? Number(c.getAttribute('data-axis-min')) : NaN,
+                vmax: c ? Number(c.getAttribute('data-axis-max')) : NaN,
+              };
+            }),
+          };
+        })()""",
+    )
+    best = None
+    for idx in info["enabled"]:
+        ch = info["channels"][idx]
+        if not (math.isfinite(ch["vmin"]) and math.isfinite(ch["vmax"]) and ch["vmax"] > ch["vmin"]):
+            continue
+        if not (ch["cur"]["hi"] > ch["cur"]["lo"] and ch["vmin"] <= ch["cur"]["hi"] <= ch["vmax"]):
+            continue
+        hex_col = ch["color"] if len(ch["color"]) == 6 else "FFFFFF"
+        rgb = (int(hex_col[0:2], 16), int(hex_col[2:4], 16), int(hex_col[4:6], 16))
+        dot = sum(a * b for a, b in zip(rgb, sample_rgb))
+        key = (dot, ch["cur"]["hi"] - ch["cur"]["lo"], -idx)
+        if best is None or key > best[0]:
+            best = (key, ch)
+    _check(best is not None, f"No draggable enabled LUT channel found: {info}")
+    return best[1], bool(info["discrete"])
+
+
+def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None, locked=True):
+    """Drive a real continuous white-point handle drag and verify live overlay updates."""
+    pane_eval(parent, "if (state.windows.channels.isHidden()) state.windows.channels.open(); true")
+    wait_for(
+        lambda: pane_eval(
+            parent,
+            """(() => {
+              if (!state.info || !state.viewer || !state.viewer.isOpen()) return false;
+              if (state.lutAutoPending.some(Boolean)) return false;
+              const cs = [...document.querySelectorAll('.lut-canvas')];
+              if (cs.length !== state.info.channels.length || !cs.length) return false;
+              return cs.every(c => {
+                const r = c.getBoundingClientRect();
+                const a = Number(c.getAttribute('data-axis-min'));
+                const b = Number(c.getAttribute('data-axis-max'));
+                return r.width >= 150 && r.height >= 60 && Number.isFinite(a) && Number.isFinite(b) && b > a;
+              });
+            })()""",
+        ),
+        timeout=timeout,
+        description="channels panel and LUT axis readiness",
+    )
+    wait_for(lambda: pane_eval(parent, "state.viewer.world.getItemAt(0)?.getFullyLoaded()"),
+             timeout=timeout, description="main tiles before live LUT drag")
+    wait_for(lambda: child.evaluate_js("nd2Translucent.viewer.world.getItemAt(0)?.getFullyLoaded()"),
+             timeout=timeout, description="overlay tiles before live LUT drag")
+
+    initial_luts = pane_eval(parent, "state.luts.map(l => l ? {lo: l.lo, hi: l.hi, gamma: l.gamma} : null)")
+    restore_overlay_query = _overlay_display_query(child)
+    drag_start_query = restore_overlay_query
+    before_camera = camera(child)
+    before_frame = native_state(child, timeout=timeout)["frame"]
+    before_opacity = bridge_result(child, "pywebview.api.translucent_context()", timeout=timeout)["opacity"]
+    before_locked = bool(child.evaluate_js("Boolean(nd2Translucent.state.locked)"))
+    before_rois = child.evaluate_js("({rois: nd2Translucent.state.rois, index: nd2Translucent.state.roiIndex})")
+    _check(before_locked == bool(locked), f"Live LUT check expected locked={locked}, got {before_locked}")
+
+    if calibration_patch is not None:
+        px, py = float(calibration_patch[0]), float(calibration_patch[1])
+        enabled = pane_eval(parent, "[...state.channels]") or [0]
+        ch_idx = int(enabled[0])
+        pane_eval(parent, f"state.lutWidgets[{ch_idx}].setLut({{lo: 0, hi: 255, gamma: 1}}); true")
+        wait_for(
+            lambda: (
+                (m := sample_canvas_patch(parent, px, py, is_pane=True))["min_alpha"] == 255
+                and abs(m["mean_intensity"] - 64.0) <= 8.0
+                and (o := sample_canvas_patch(child, px, py, is_pane=False))["min_alpha"] == 255
+                and abs(o["mean_intensity"] - 64.0) <= 8.0
+            ),
+            timeout=min(timeout, 10),
+            description="calibration baseline 64 before live LUT drag",
+        )
+        drag_start_query = _overlay_display_query(child)
+        main_init = sample_canvas_patch(parent, px, py, is_pane=True)
+        overlay_init = sample_canvas_patch(child, px, py, is_pane=False)
+        start_hi = 255.0
+        hold_targets = [(192.0, 85.0), (128.0, 127.0)]
+        release_target = (80.0, 204.0)
+    else:
+        px, py = find_signal_patch(child, is_pane=False)
+        try:
+            main_init = sample_canvas_patch(parent, px, py, is_pane=True)
+        except AssertionError:
+            px, py = find_signal_patch(parent, is_pane=True)
+            main_init = sample_canvas_patch(parent, px, py, is_pane=True)
+        overlay_init = sample_canvas_patch(child, px, py, is_pane=False)
+        _check(main_init["min_alpha"] == 255 and overlay_init["min_alpha"] == 255,
+               f"Initial live-LUT patch is not opaque: main={main_init}, overlay={overlay_init}")
+        ch, discrete = _pick_drag_channel(parent, overlay_init["mean_rgb"])
+        ch_idx = ch["index"]
+        # Align widget internal handle position if state.luts was mutated directly before launch.
+        if ch["hasOverride"]:
+            pane_eval(
+                parent,
+                f"state.lutWidgets[{ch_idx}].setLut({json.dumps(ch['cur'])}); true",
+            )
+        lo, hi = ch["cur"]["lo"], ch["cur"]["hi"]
+        span = hi - lo
+        min_step = 1.0 if discrete else max(span * 1e-4, 1e-9)
+        hi_1 = max(lo + 3 * min_step, lo + span * 0.72)
+        hi_2 = max(lo + 2 * min_step, lo + span * 0.45)
+        hi_3 = max(lo + min_step, lo + span * 0.25)
+        if not (hi > hi_1 > hi_2 > hi_3 > lo):
+            hi_1 = lo + span * 0.75
+            hi_2 = lo + span * 0.50
+            hi_3 = lo + span * 0.25
+        start_hi = hi
+        hold_targets = [(hi_1, None), (hi_2, None)]
+        release_target = (hi_3, None)
+
+    steps = {"initial": {"main": main_init, "overlay": overlay_init, "overlay_query": drag_start_query}}
+    pre_release_queries = []
+    failed = False
+    try:
+        _dispatch_lut_hi_pointer(parent, ch_idx, "pointerdown", start_hi)
+        released = False
+        try:
+            for step_idx, (hi_val, expected_intensity) in enumerate(hold_targets, start=1):
+                _dispatch_lut_hi_pointer(parent, ch_idx, "pointermove", hi_val)
+                t0 = time.monotonic()
+                deadline = t0 + 1.0
+                main_hit_ms = overlay_hit_ms = None
+                main_sample = overlay_sample = None
+                ov_query = None
+                seen_queries = {drag_start_query, *pre_release_queries}
+                while True:
+                    now_ms = round((time.monotonic() - t0) * 1000.0, 1)
+                    ms = sample_canvas_patch(parent, px, py, is_pane=True, allow_none=True)
+                    os_ = sample_canvas_patch(child, px, py, is_pane=False, allow_none=True)
+                    if ms is not None:
+                        main_sample = ms
+                    if os_ is not None:
+                        overlay_sample = os_
+                    ov_query = _overlay_display_query(child)
+                    if expected_intensity is not None:
+                        if main_hit_ms is None and main_sample is not None and main_sample["min_alpha"] == 255 and abs(main_sample["mean_intensity"] - expected_intensity) <= 8.0:
+                            main_hit_ms = now_ms
+                        if overlay_hit_ms is None and overlay_sample is not None and overlay_sample["min_alpha"] == 255 and abs(overlay_sample["mean_intensity"] - expected_intensity) <= 8.0:
+                            overlay_hit_ms = now_ms
+                        if main_hit_ms is not None and overlay_hit_ms is not None:
+                            break
+                    else:
+                        min_delta = 10.0 if step_idx >= 2 else 1.0
+                        if main_hit_ms is None and main_sample is not None and main_sample["min_alpha"] == 255 and main_sample["mean_intensity"] >= main_init["mean_intensity"] + min_delta:
+                            main_hit_ms = now_ms
+                        if (
+                            overlay_hit_ms is None
+                            and ov_query not in seen_queries
+                            and overlay_sample is not None
+                            and overlay_sample["min_alpha"] == 255
+                            and overlay_sample["mean_intensity"] >= overlay_init["mean_intensity"] + min_delta
+                        ):
+                            overlay_hit_ms = now_ms
+                        if main_hit_ms is not None and overlay_hit_ms is not None:
+                            break
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(.05)
+                if ov_query and ov_query != drag_start_query and ov_query not in pre_release_queries:
+                    pre_release_queries.append(ov_query)
+                steps[f"hold_{step_idx}"] = {
+                    "hi": hi_val,
+                    "expected_intensity": expected_intensity,
+                    "main_elapsed_ms": main_hit_ms,
+                    "overlay_elapsed_ms": overlay_hit_ms,
+                    "main": main_sample,
+                    "overlay": overlay_sample,
+                    "overlay_query": ov_query,
+                }
+            _dispatch_lut_hi_release(parent, ch_idx, release_target[0])
+            released = True
+        finally:
+            if not released:
+                _dispatch_lut_hi_pointer(parent, ch_idx, "pointerup", release_target[0])
+
+        t0 = time.monotonic()
+        deadline = t0 + min(timeout, 5.0)
+        main_hit_ms = overlay_hit_ms = None
+        main_rel = overlay_rel = None
+        rel_query = None
+        prev_overlay = (steps["hold_2"]["overlay"] or overlay_init)["mean_intensity"]
+        prev_main = (steps["hold_2"]["main"] or main_init)["mean_intensity"]
+        while True:
+            now_ms = round((time.monotonic() - t0) * 1000.0, 1)
+            ms = sample_canvas_patch(parent, px, py, is_pane=True, allow_none=True)
+            os_ = sample_canvas_patch(child, px, py, is_pane=False, allow_none=True)
+            if ms is not None:
+                main_rel = ms
+            if os_ is not None:
+                overlay_rel = os_
+            rel_query = _overlay_display_query(child)
+            if release_target[1] is not None:
+                if main_hit_ms is None and main_rel is not None and main_rel["min_alpha"] == 255 and abs(main_rel["mean_intensity"] - release_target[1]) <= 8.0:
+                    main_hit_ms = now_ms
+                if overlay_hit_ms is None and overlay_rel is not None and overlay_rel["min_alpha"] == 255 and abs(overlay_rel["mean_intensity"] - release_target[1]) <= 8.0:
+                    overlay_hit_ms = now_ms
+                if main_hit_ms is not None and overlay_hit_ms is not None:
+                    break
+            else:
+                if main_hit_ms is None and main_rel is not None and main_rel["min_alpha"] == 255 and main_rel["mean_intensity"] >= prev_main - 2.0:
+                    main_hit_ms = now_ms
+                if (
+                    overlay_hit_ms is None
+                    and rel_query not in {drag_start_query, *pre_release_queries}
+                    and overlay_rel is not None
+                    and overlay_rel["min_alpha"] == 255
+                    and overlay_rel["mean_intensity"] >= prev_overlay - 2.0
+                ):
+                    overlay_hit_ms = now_ms
+                if main_hit_ms is not None and overlay_hit_ms is not None:
+                    break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(.05)
+        steps["release"] = {
+            "hi": release_target[0],
+            "expected_intensity": release_target[1],
+            "main_elapsed_ms": main_hit_ms,
+            "overlay_elapsed_ms": overlay_hit_ms,
+            "main": main_rel,
+            "overlay": overlay_rel,
+            "overlay_query": rel_query,
+        }
+
+        if calibration_patch is not None:
+            for key, target in (("hold_1", 85.0), ("hold_2", 127.0), ("release", 204.0)):
+                st = steps[key]
+                _check(
+                    st["main"] is not None
+                    and st["main"]["min_alpha"] == 255
+                    and abs(st["main"]["mean_intensity"] - target) <= 8.0,
+                    f"Live LUT calibration main {key} missed {target}±8: {st['main']}",
+                )
+                _check(
+                    st["overlay"] is not None
+                    and st["overlay"]["min_alpha"] == 255
+                    and abs(st["overlay"]["mean_intensity"] - target) <= 8.0,
+                    f"Live LUT calibration overlay {key} missed {target}±8: {st['overlay']}",
+                )
+                if key != "release":
+                    _check(st["main_elapsed_ms"] is not None and st["overlay_elapsed_ms"] is not None,
+                           f"Live LUT calibration {key} did not paint before pointerup: {st}")
+        else:
+            _check(len(pre_release_queries) >= 2,
+                   f"Expected >= 2 distinct pre-release overlay query updates, got {pre_release_queries}")
+            for key in ("hold_1", "hold_2", "release"):
+                _check(
+                    steps[key]["main"] is not None
+                    and steps[key]["overlay"] is not None
+                    and steps[key]["main"]["min_alpha"] == 255
+                    and steps[key]["overlay"]["min_alpha"] == 255,
+                    f"Live LUT drag {key} canvas was not opaque: {steps[key]}",
+                )
+            ov0 = overlay_init["mean_intensity"]
+            ov1 = steps["hold_1"]["overlay"]["mean_intensity"]
+            ov2 = steps["hold_2"]["overlay"]["mean_intensity"]
+            ov3 = steps["release"]["overlay"]["mean_intensity"]
+            m0 = main_init["mean_intensity"]
+            m2 = steps["hold_2"]["main"]["mean_intensity"]
+            _check(ov1 >= ov0 - 1.0 and ov2 >= ov1 - 2.0 and ov2 - ov0 >= 10.0,
+                   f"Overlay did not brighten monotonically by >= +10 before release: {[ov0, ov1, ov2, ov3]}")
+            _check(ov3 >= ov2 - 2.0 and m2 - m0 >= 10.0,
+                   f"Main/overlay brightening failed: main={[m0, m2]} overlay={[ov0, ov1, ov2, ov3]}")
+
+        after_camera = camera(child)
+        check_camera(after_camera, before_camera, description=f"live LUT drag (locked={locked})")
+        _check(after_camera["rotation"] == before_camera["rotation"] and after_camera["flip"] == before_camera["flip"],
+               f"Live LUT drag changed orientation (locked={locked})")
+        _check(native_state(child, timeout=timeout)["frame"] == before_frame,
+               f"Live LUT drag moved native overlay frame (locked={locked})")
+        _check(bool(child.evaluate_js("Boolean(nd2Translucent.state.locked)")) == bool(locked),
+               f"Live LUT drag changed lock state (locked={locked})")
+        _check(math.isclose(bridge_result(child, "pywebview.api.translucent_context()", timeout=timeout)["opacity"], before_opacity),
+               f"Live LUT drag changed overlay opacity (locked={locked})")
+        if before_rois["rois"]:
+            check_roi_boxes(child, expected_rois=before_rois["rois"], expected_index=before_rois["index"],
+                            timeout=timeout, description=f"live LUT drag ROI (locked={locked})")
+        return {
+            "ok": True,
+            "locked": bool(locked),
+            "channel": ch_idx,
+            "patch": [px, py],
+            "calibration": calibration_patch is not None,
+            "pre_release_overlay_queries": pre_release_queries,
+            "steps": steps,
+            "camera_and_window_unchanged": True,
+        }
+    except Exception:
+        failed = True
+        raise
+    finally:
+        pane_eval(
+            parent,
+            f"""(() => {{
+              const saved = {json.dumps(initial_luts)};
+              for (let i = 0; i < state.lutWidgets.length; i++) {{
+                if (saved[i]) state.lutWidgets[i].setLut(saved[i]);
+                else state.lutWidgets[i].reset();
+              }}
+              return true;
+            }})()""",
+        )
+        try:
+            wait_for(
+                lambda: _overlay_display_query(child) == restore_overlay_query
+                and child.evaluate_js("Boolean(nd2Translucent.viewer.world.getItemAt(0)?.getFullyLoaded())"),
+                timeout=min(timeout, 5.0),
+                description="live LUT restoration",
+            )
+        except TimeoutError:
+            if not failed:
+                raise
+
+
 def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None, extra_checks=None):
     """Exercise one newly-created overlay and close it, returning bounded evidence."""
     result = {"ok": False, "platform": sys.platform}
@@ -705,6 +1336,7 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
                                                  expected_flip=expected_flip)
         _check(pane_eval(parent, "JSON.stringify(state.annotations)") == source_annotations,
                "ROI box diagnostic changed source annotations")
+        result["live_lut_unlocked"] = exercise_live_lut_drag(parent, child, timeout=timeout, locked=False)
         if extra_checks is not None:
             result["extra"] = extra_checks(overlay, child)
 
@@ -737,6 +1369,7 @@ def exercise_translucent_viewer(api, parent, *, timeout=30, screenshot_path=None
             # requires a full round trip on its calibrated fixture.
             _check(follow["ok"] or (follow.get("skipped") == "uncalibrated" and "error" not in follow),
                    f"Stage follow round trip failed: {follow.get('error')}")
+        result["live_lut_locked"] = exercise_live_lut_drag(parent, child, timeout=timeout, locked=True)
         parent.minimize()
         restore_parent = True
         wait_for(lambda: native_state(parent, timeout=timeout)["minimized"], timeout=timeout, description="own parent minimize")

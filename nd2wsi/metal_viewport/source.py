@@ -310,7 +310,11 @@ class RawTileSource:
             "after": copy.deepcopy(self.fingerprints_after),
             "unchanged": (
                 all(
-                    fingerprints_match(before, self.fingerprints_after.get(path, {}))
+                    fingerprints_match(
+                        before,
+                        self.fingerprints_after.get(path, {}),
+                        allow_mtime_skew=False,
+                    )
                     for path, before in self.fingerprints_before.items()
                 )
                 if self._closed

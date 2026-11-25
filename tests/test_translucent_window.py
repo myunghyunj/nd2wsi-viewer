@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -480,7 +483,13 @@ def test_parent_registry_owns_overlay_and_cleans_up_without_touching_source(stor
     api = app.Api(None)
     api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store if sid == "abc" else None))
     api._window = source_window
-    assert api.open_translucent_viewer("abc", payload) == {"ok": True, "id": "trace-1"}
+    opened = api.open_translucent_viewer("abc", payload)
+    assert set(opened) == {"ok", "id", "launch_token"}
+    assert opened["ok"] is True
+    assert opened["id"] == "trace-1"
+    assert isinstance(opened["launch_token"], str) and len(opened["launch_token"]) == 32
+    assert create.call_args.kwargs["launch_token"] == opened["launch_token"]
+    assert create.call_args.kwargs["launch_generation"] == "pixels-2"
     context = create.call_args.args[0]
     assert context["slide_url"] == "http://127.0.0.1:8123/secret/s/abc/"
     assert create.call_args.kwargs["url"] == "http://127.0.0.1:8123/secret/static/translucent.html"
@@ -532,7 +541,7 @@ def test_parent_registry_passes_one_flip_store_to_each_overlay(store, payload, m
 
     def create(context, **options):
         created.append(options)
-        return SimpleNamespace(_window=SimpleNamespace(uid=f"trace-{len(created)}"), close_translucent=Mock(), refresh_context=Mock())
+        return SimpleNamespace(_window=SimpleNamespace(uid=f"trace-{len(created)}"), close_translucent=Mock(), _refresh_context=Mock())
 
     monkeypatch.setattr(overlay, "create_translucent_window", create)
     monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
@@ -636,7 +645,7 @@ def test_laser_route_stamps_owner_sid_and_only_returns_ack_to_that_overlay(store
 
     monkeypatch.setattr(sys, "platform", "darwin")
     child = SimpleNamespace(_window=SimpleNamespace(uid="trace"), close_translucent=Mock(),
-                            report_slacs_laser_box=Mock(return_value={"ok": True}))
+                            _report_slacs_laser_box=Mock(return_value={"ok": True}))
     create = Mock(return_value=child)
     monkeypatch.setattr(overlay, "create_translucent_window", create)
     monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/token/")
@@ -659,7 +668,7 @@ def test_laser_route_stamps_owner_sid_and_only_returns_ack_to_that_overlay(store
         assert not api.report_slacs_laser_box(None)["ok"]
         assert not api.report_slacs_laser_box({**message, "sid": "missing"})["ok"]
         assert api.report_slacs_laser_box(sent)["ok"]
-        child.report_slacs_laser_box.assert_called_once_with(sent)
+        child._report_slacs_laser_box.assert_called_once_with(sent)
     finally:
         options["on_closed"](child)
     assert not api.report_slacs_laser_box(sent)["ok"]
@@ -677,16 +686,16 @@ def test_reuse_refreshes_display_and_focuses_without_another_window():
             "slacs": {"kind": "laser_shot", "shots": 1}}
     api._confirm_laser_box({"item": item})
     updated = {"slide_url": "http://local/s/1/", "rotation": 90, "flip": True, "query": "?c=1&win=1:200", "center": [20, 30]}
-    api.refresh_context(updated)
+    api._refresh_context(updated)
     receiver.close.assert_called_once()
     assert api._overlay_view is None
     for key, value in updated.items():
         assert api.translucent_context()[key] == value
     assert api.translucent_context()["laser_items"] == [item]
-    api.refresh_context({**updated, "query": "?c=1&p=1&win=1:200"})
+    api._refresh_context({**updated, "query": "?c=1&p=1&win=1:200"})
     assert api.translucent_context()["laser_items"] == []
     api._confirm_laser_box({"item": item})
-    api.refresh_context({**updated, "slide_url": "http://local/s/2/"})
+    api._refresh_context({**updated, "slide_url": "http://local/s/2/"})
     assert api.translucent_context()["laser_items"] == []
     assert api._window.load_url.call_count == 3
     assert api._window.show.call_count == 3
@@ -751,11 +760,18 @@ def test_cancelled_update_and_individual_tab_close_manage_translucent_windows(st
         shutdown=Mock(),
         server_close=Mock(),
     )
-    assert api.open_translucent_viewer("s1", payload) == {"ok": True, "id": "trace-s1"}
+    opened1 = api.open_translucent_viewer("s1", payload)
+    assert set(opened1) == {"ok", "id", "launch_token"}
+    assert opened1["ok"] is True and opened1["id"] == "trace-s1"
+    assert isinstance(opened1["launch_token"], str) and opened1["launch_token"]
     assert api.close_translucent_viewer("s1") == {"ok": True, "closed": True}
     children["s1"].close_translucent.assert_called_once()
     assert "s1" not in api._translucent_windows
-    assert api.open_translucent_viewer("s2", payload) == {"ok": True, "id": "trace-s2"}
+    opened2 = api.open_translucent_viewer("s2", payload)
+    assert set(opened2) == {"ok", "id", "launch_token"}
+    assert opened2["ok"] is True and opened2["id"] == "trace-s2"
+    assert isinstance(opened2["launch_token"], str) and opened2["launch_token"]
+    assert opened1["launch_token"] != opened2["launch_token"]
     api.stop_server_for_update()
     children["s2"].close_translucent.assert_called_once()
     assert api._translucent_owner_closed is False
@@ -814,7 +830,7 @@ def test_refresh_context_updates_source_format_flips_and_resets_lock_realign_sta
     api._lock_reported = True
     api._last_locked_center = [100.0, 200.0]
     api._realign_from = [100.0, 200.0]
-    api.refresh_context({
+    api._refresh_context({
         "slide_url": "http://local/s/2/", "rotation": 0, "flip": False,
         "query": "?c=0&t=0&p=0&z=0", "source_format": "czi", "annotation_scope": "plane",
     })
@@ -853,7 +869,7 @@ def test_plane_scoped_laser_items_sync_on_open_refresh_deletion_and_plane_change
 
     # Deleting laser_1 in the main viewer and refreshing on the same plane removes it.
     after_delete = overlay.validate_context(store, {**payload, "laser_items": [laser_2]}, slide_url="http://local/s/1/")
-    api.refresh_context(after_delete)
+    api._refresh_context(after_delete)
     assert [item["id"] for item in api.translucent_context()["laser_items"]] == ["slacs-laser-r-2"]
 
     # Changing Z or T on a plane-scoped slide changes _laser_scope and rejects late confirmations.
@@ -861,7 +877,7 @@ def test_plane_scoped_laser_items_sync_on_open_refresh_deletion_and_plane_change
     z_changed = overlay.validate_context(
         store, {**payload, "query": "?c=1&g=pixels-2&t=1&p=0&z=3"}, slide_url="http://local/s/1/"
     )
-    api.refresh_context(z_changed)
+    api._refresh_context(z_changed)
     assert api.translucent_context()["laser_items"] == []
     assert api._confirm_laser_box({"item": laser_1}) is False
     assert api.translucent_context()["laser_items"] == []
@@ -870,12 +886,12 @@ def test_plane_scoped_laser_items_sync_on_open_refresh_deletion_and_plane_change
     store.attrs["nd2wsi"]["plate"]["annotationScope"] = "site"
     site_ctx = overlay.validate_context(store, {**payload, "laser_items": [laser_1]}, slide_url="http://local/s/1/")
     assert site_ctx["annotation_scope"] == "site"
-    api.refresh_context(site_ctx)
+    api._refresh_context(site_ctx)
     assert len(api.translucent_context()["laser_items"]) == 1
     site_z_changed = overlay.validate_context(
         store, {**payload, "query": "?c=1&g=pixels-2&t=1&p=0&z=3"}, slide_url="http://local/s/1/"
     )
-    api.refresh_context(site_z_changed)
+    api._refresh_context(site_z_changed)
     assert [item["id"] for item in api.translucent_context()["laser_items"]] == ["slacs-laser-r-1"]
     api._did_close()
 
@@ -987,7 +1003,7 @@ def test_slacs_1_1_and_1_2_refresh_interleaving_and_large_annotation_history(sto
         worker.start()
         assert reached.wait(5)
         try:
-            api.refresh_context({**race_ctx, "query": "?g=pixels&t=0&p=0&z=1", "laser_items": []})
+            api._refresh_context({**race_ctx, "query": "?g=pixels&t=0&p=0&z=1", "laser_items": []})
         finally:
             resume.set()
             worker.join(5)
@@ -1009,3 +1025,967 @@ def test_format_neutral_translucent_wording(payload, monkeypatch):
     html = (Path(__file__).resolve().parents[1] / "nd2wsi/static/translucent.html").read_text(encoding="utf-8")
     assert 'aria-label="Translucent viewer"' in html
     assert "fluorescence" not in html
+
+
+def test_float32_safe_bound_matches_render_without_importing_render():
+    from nd2wsi import render
+
+    assert overlay._FLOAT32_SAFE_BOUND == render._FLOAT32_SAFE_BOUND
+    assert overlay._HEX6_RE.pattern == render._HEX6_RE.pattern
+    assert "render" not in overlay.__dict__
+
+
+def test_validate_display_params_canonicalizes_colors_windows_and_channels(store):
+    # Bare hex, optional single '#', original case and sparse trailing slots preserved.
+    assert overlay.validate_display_params(
+        store,
+        {"col": "#ff00aa,#00FF88", "win": "1:500:0.25,2:600", "c": "1,0"},
+    ) == [
+        ("c", "1,0"),
+        ("win", "1:500:0.25,2:600"),
+        ("col", "ff00aa,00FF88"),
+    ]
+    assert overlay.validate_display_params(store, {"col": "FF00FF,"}) == [("col", "FF00FF,")]
+    assert overlay.validate_display_params(store, {"col": ",00ff88"}) == [("col", ",00ff88")]
+    assert overlay.validate_display_params(store, {"win": ",0:100:0.1"}) == [("win", ",0:100:0.1")]
+    assert overlay.validate_display_params(store, {"win": "-2e38:2e38:10.0"}) == [
+        ("win", "-2e38:2e38:10.0")
+    ]
+    assert overlay.validate_display_params(store, {"c": "none"}) == [("c", "none")]
+    assert overlay.validate_display_params(store, {"c": "", "win": ",", "col": ","}) == []
+    assert overlay.validate_display_params(store, {"c": None, "win": "", "col": ""}) == []
+
+    # High-channel (> 32) slides are supported without a legacy 32-slot ceiling.
+    many_store = SimpleNamespace(attrs={"omero": {"channels": [{} for _ in range(40)]}})
+    many_cols = ",".join(f"{i:06x}" for i in range(40))
+    assert overlay.validate_display_params(many_store, {"col": many_cols}) == [("col", many_cols)]
+
+
+@pytest.mark.parametrize("params,match", [
+    ({"c": "00"}, "channel selection"),
+    ({"c": "01"}, "channel selection"),
+    ({"c": "0,00"}, "channel selection"),
+    ({"c": "0,0"}, "channel selection"),
+    ({"c": "0,"}, "channel selection"),
+    ({"c": "2"}, "channel selection"),
+    ({"c": "٠"}, "channel selection"),
+    ({"c": " 0"}, "channel selection"),
+    ({"col": "ff00aa,00ff88,112233"}, "channel color"),
+    ({"col": ",,"}, "channel color"),
+    ({"col": "##ff00aa"}, "channel color"),
+    ({"col": "fff"}, "channel color"),
+    ({"col": "gggggg"}, "channel color"),
+    ({"col": "ff00aa\n"}, "channel color"),
+    ({"col": " ff00aa"}, "channel color"),
+    ({"win": "0:10,0:10,0:10"}, "channel windows"),
+    ({"win": ",,"}, "channel windows"),
+    ({"win": " 10:20"}, "channel window"),
+    ({"win": "10 :20"}, "channel window"),
+    ({"win": "10:\t20"}, "channel window"),
+    ({"win": "10:20 "}, "channel window"),
+    ({"win": "1_000:2000"}, "channel window"),
+    ({"win": "0:100:1_0"}, "channel window"),
+    ({"win": ":100"}, "channel window"),
+    ({"win": "0:"}, "channel window"),
+    ({"win": "0:100:"}, "channel window"),
+    ({"win": "0:100:1:2"}, "channel window"),
+    ({"win": "NaN:100"}, "channel window"),
+    ({"win": "0:inf"}, "channel window"),
+    ({"win": "-inf:0"}, "channel window"),
+    ({"win": "0:3e38"}, "channel window"),
+    ({"win": "-3e38:0"}, "channel window"),
+    ({"win": "0:1e39"}, "channel window"),
+    ({"win": "10:10"}, "channel window"),
+    ({"win": "20:10"}, "channel window"),
+    ({"win": "0:100:0.099"}, "channel gamma"),
+    ({"win": "0:100:10.001"}, "channel gamma"),
+])
+def test_validate_display_params_rejects_malformed_values(store, params, match):
+    with pytest.raises(ValueError, match=match):
+        overlay.validate_display_params(store, params)
+
+
+def test_validate_display_query_and_merge_display_query(store):
+    assert overlay.validate_display_query(store, "") == []
+    assert overlay.validate_display_query(store, "?") == []
+    assert overlay.validate_display_query(store, "?col=%23ff00aa%2C&c=0&win=0%3A128") == [
+        ("c", "0"),
+        ("win", "0:128"),
+        ("col", "ff00aa,"),
+    ]
+
+    for bad in (
+        None,
+        123,
+        "?" + "c=" + "0" * 16385,
+        "??c=0",
+        "c=0&c=1",
+        "g=pixels-2",
+        "c=0&g=pixels-2",
+        "t=0",
+        "p=0",
+        "z=0",
+        "c=0&win=0:10&col=ff0000&extra=1",
+        "c=0&",
+        "barekey",
+    ):
+        with pytest.raises(ValueError):
+            overlay.validate_display_query(store, bad)
+
+    # Merge replaces c/win/col while preserving immutable g, t, p, z in order.
+    base = "?c=1&win=1%3A500&col=ff0000&z=4&t=2&p=3&g=pixels-2"
+    assert (
+        overlay.merge_display_query(store, base, "col=%2300FFaa%2C&c=0&win=0%3A128")
+        == "?c=0&win=0%3A128&col=00FFaa%2C&g=pixels-2&t=2&p=3&z=4"
+    )
+    # Restoring defaults ("") strips c/win/col while retaining g/t/p/z.
+    assert overlay.merge_display_query(store, base, "") == "?g=pixels-2&t=2&p=3&z=4"
+    assert overlay.merge_display_query(store, base, "c=&win=,&col=,") == "?g=pixels-2&t=2&p=3&z=4"
+    assert overlay.merge_display_query(store, "?c=0&win=0%3A100", "") == ""
+
+
+def test_validate_context_strips_hash_col_preserves_order_and_rejects_bad_display(store, payload):
+    with_hash = {**payload, "query": "?g=pixels-2&col=%23ff00aa%2C%2300FF88&c=1"}
+    res = overlay.validate_context(store, with_hash, slide_url="http://local/s/abc/")
+    assert res["query"] == "?g=pixels-2&col=ff00aa%2C00FF88&c=1"
+
+    for bad_q in ("?c=0,00&g=pixels-2", "?win=1_000:2000&g=pixels-2", "?win=0:3e38&g=pixels-2"):
+        with pytest.raises(ValueError):
+            overlay.validate_context(store, {**payload, "query": bad_q}, slide_url="http://local/s/abc/")
+
+
+def test_wait_translucent_display_wake_timeout_expiry_close_and_invariance(cocoa_api):
+    q = cocoa_api
+    api = overlay.TranslucentApi(
+        {"dimensions": [8000, 6000], "query": "?c=0&g=pixels-2"},
+        logger=q.logs.append,
+        on_closed=q.closed,
+        launch_token="tok-1",
+        launch_generation="pixels-2",
+    )
+    api._window = q.window
+
+    ctx = api.translucent_context()
+    assert ctx["query"] == "?c=0&g=pixels-2"
+    assert ctx["launch_token"] == "tok-1"
+    assert ctx["display_revision"] == 0
+    assert ctx["locked"] is False
+    assert api.translucent_display_state() == {
+        "ok": True,
+        "launch_token": "tok-1",
+        "revision": 0,
+        "query": "?c=0&g=pixels-2",
+        "expired": False,
+        "reason": "",
+    }
+
+    # Invalid arguments rejected cleanly.
+    for bad_args in (
+        (123, 0, 50),
+        ("tok-1", -1, 50),
+        ("tok-1", True, 50),
+        ("tok-1", 2**53, 50),
+        ("tok-1", 0, 0),
+        ("tok-1", 0, 60001),
+        ("tok-1", 0, True),
+        ("tok-1", 0, float("nan")),
+    ):
+        bad_res = api.wait_translucent_display(*bad_args)
+        assert bad_res["ok"] is False and "Invalid" in bad_res["message"]
+
+    # Token mismatch returns closed without blocking.
+    assert api.wait_translucent_display("wrong-token", 0, timeout_ms=5000) == {
+        "ok": False,
+        "closed": True,
+    }
+
+    # Timeout returns unchanged=True.
+    t0 = time.monotonic()
+    timed_out = api.wait_translucent_display("tok-1", 0, timeout_ms=25)
+    assert timed_out == {
+        "ok": True,
+        "launch_token": "tok-1",
+        "revision": 0,
+        "query": "?c=0&g=pixels-2",
+        "expired": False,
+        "unchanged": True,
+    }
+    assert time.monotonic() - t0 < 2.0
+
+    # Locked overlay still accepts live display updates without bumping _epoch.
+    assert api.set_translucent_locked(True) == {"ok": True, "locked": True}
+    epoch_before = api._epoch
+
+    # Blocking waiter wakes immediately when _apply_display_query runs.
+    waiter_out = {}
+    started = threading.Event()
+
+    def run_waiter():
+        started.set()
+        waiter_out["res"] = api.wait_translucent_display("tok-1", 0, timeout_ms=5000)
+
+    t = threading.Thread(target=run_waiter)
+    t.start()
+    started.wait(timeout=2)
+    time.sleep(0.02)
+    applied = api._apply_display_query("tok-1", 2, "?win=0%3A128&g=pixels-2")
+    assert applied == {"ok": True, "applied": True, "revision": 2}
+    t.join(timeout=2)
+    assert not t.is_alive()
+    assert waiter_out["res"] == {
+        "ok": True,
+        "launch_token": "tok-1",
+        "revision": 2,
+        "query": "?win=0%3A128&g=pixels-2",
+        "expired": False,
+        "unchanged": False,
+    }
+    assert api._locked is True
+    assert api._epoch == epoch_before
+    ctx2 = api.translucent_context()
+    assert ctx2["query"] == "?win=0%3A128&g=pixels-2"
+    assert ctx2["display_revision"] == 2
+    assert ctx2["locked"] is True
+
+    # Immediate return when revision is already ahead of after_revision.
+    assert api.wait_translucent_display("tok-1", 1, timeout_ms=5000) == {
+        "ok": True,
+        "launch_token": "tok-1",
+        "revision": 2,
+        "query": "?win=0%3A128&g=pixels-2",
+        "expired": False,
+        "unchanged": False,
+    }
+
+    # Out-of-order / duplicate revision drops without changing state.
+    assert api._apply_display_query("tok-1", 2, "?c=1&g=pixels-2") == {
+        "ok": True,
+        "applied": False,
+        "revision": 2,
+    }
+    assert api._apply_display_query("tok-1", 1, "?c=1&g=pixels-2") == {
+        "ok": True,
+        "applied": False,
+        "revision": 2,
+    }
+    assert api.translucent_context()["query"] == "?win=0%3A128&g=pixels-2"
+
+    # Expiry wakes blocked waiter immediately.
+    expire_out = {}
+    started2 = threading.Event()
+
+    def run_expire_waiter():
+        started2.set()
+        expire_out["res"] = api.wait_translucent_display("tok-1", 2, timeout_ms=5000)
+
+    t2 = threading.Thread(target=run_expire_waiter)
+    t2.start()
+    started2.wait(timeout=2)
+    time.sleep(0.02)
+    assert api._expire_display_session("wrong-tok") is False
+    assert api._expire_display_session("tok-1", "generation_changed") is True
+    t2.join(timeout=2)
+    assert not t2.is_alive()
+    assert expire_out["res"] == {
+        "ok": True,
+        "launch_token": "tok-1",
+        "revision": 2,
+        "query": "?win=0%3A128&g=pixels-2",
+        "expired": True,
+        "reason": "generation_changed",
+    }
+    assert api._apply_display_query("tok-1", 3, "?c=1&g=pixels-2")["stale_generation"] is True
+
+
+def test_close_translucent_wakes_waiter_before_destroy_and_notifies_once():
+    events = []
+    on_closed = Mock(side_effect=lambda _self: events.append("on_closed"))
+    waiter_unblocked = threading.Event()
+    waiter_out = {}
+
+    api = overlay.TranslucentApi(
+        {"dimensions": [100, 100], "query": "?g=g1"},
+        logger=Mock(),
+        on_closed=on_closed,
+        launch_token="tok-close",
+        launch_generation="g1",
+    )
+
+    def destroy_and_fire_did_close():
+        # Waiter must already have been woken before destroy() completes.
+        assert waiter_unblocked.wait(timeout=2)
+        events.append("destroy")
+        api._did_close()
+
+    api._window = SimpleNamespace(destroy=Mock(side_effect=destroy_and_fire_did_close))
+
+    started = threading.Event()
+
+    def run_waiter():
+        started.set()
+        waiter_out["res"] = api.wait_translucent_display("tok-close", 0, timeout_ms=5000)
+        events.append("waiter_done")
+        waiter_unblocked.set()
+
+    t = threading.Thread(target=run_waiter)
+    t.start()
+    started.wait(timeout=2)
+    time.sleep(0.02)
+
+    assert api.close_translucent() is True
+    t.join(timeout=2)
+    assert not t.is_alive()
+    assert waiter_out["res"] == {"ok": False, "closed": True}
+    assert api.translucent_display_state() == {"ok": False, "closed": True}
+    assert api._apply_display_query("tok-close", 1, "?g=g1") == {"ok": False, "closed": True}
+
+    # Repeated _did_close / close_translucent must never duplicate on_closed.
+    api._did_close()
+    assert api.close_translucent() is True
+    on_closed.assert_called_once_with(api)
+    assert events.index("waiter_done") < events.index("destroy")
+
+
+def test_open_translucent_reservation_aborts_on_concurrent_close_remove_supersede_or_error(
+    store, payload, monkeypatch,
+):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+
+    def make_orphan(uid, on_closed):
+        child = SimpleNamespace(_window=SimpleNamespace(uid=uid))
+        child.close_translucent = Mock(side_effect=lambda: on_closed(child))
+        return child
+
+    # 1. Concurrent close_translucent_viewer during create_translucent_window
+    api = app.Api(None)
+    stores = {"abc": store}
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: stores.get(sid)))
+    orphans = []
+
+    def create_during_close(context, **kwargs):
+        assert api.close_translucent_viewer("abc") == {"ok": True, "closed": True}
+        orphan = make_orphan("orphan-1", kwargs["on_closed"])
+        orphans.append(orphan)
+        return orphan
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create_during_close)
+    res = api.open_translucent_viewer("abc", payload)
+    assert res["ok"] is False and "superseded" in res["message"]
+    orphans[-1].close_translucent.assert_called_once()
+    assert api._translucent_windows == {}
+    assert api._translucent_pending_launches == {}
+    assert api._translucent_claim is None
+
+    # 2. Concurrent registry removal + on_remove during create_translucent_window
+    def create_during_remove(context, **kwargs):
+        stores.pop("abc", None)
+        api.close_translucent_viewer("abc")
+        orphan = make_orphan("orphan-2", kwargs["on_closed"])
+        orphans.append(orphan)
+        return orphan
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create_during_remove)
+    res2 = api.open_translucent_viewer("abc", payload)
+    assert res2["ok"] is False and "slide was closed" in res2["message"]
+    orphans[-1].close_translucent.assert_called_once()
+    assert api._translucent_windows == {}
+    assert api._translucent_pending_launches == {}
+    assert api._translucent_claim is None
+
+    # 3. Concurrent fresh launch while exclusive claim is in-flight returns another_open without clobbering launch 1
+    stores["abc"] = store
+    first_entered = threading.Event()
+    allow_first_return = threading.Event()
+    created_children = []
+
+    def create_racing(context, **kwargs):
+        child = make_orphan("trace-first", kwargs["on_closed"])
+        created_children.append(child)
+        first_entered.set()
+        allow_first_return.wait(timeout=3)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create_racing)
+    first_result = {}
+
+    def open_first():
+        first_result["res"] = api.open_translucent_viewer("abc", payload)
+
+    t = threading.Thread(target=open_first)
+    t.start()
+    assert first_entered.wait(timeout=2)
+    second_result = api.open_translucent_viewer("abc", payload)
+    assert second_result["ok"] is False and second_result["reason"] == "another_open"
+    allow_first_return.set()
+    t.join(timeout=2)
+    assert first_result["res"]["ok"] is True and first_result["res"]["id"] == "trace-first"
+    assert api._translucent_windows["abc"] is created_children[0]
+    assert api._translucent_pending_launches == {}
+    assert api.close_translucent_viewer("abc") == {"ok": True, "closed": True}
+    assert api._translucent_claim is None
+
+    # 4. Concurrent generation change during create aborts launch and releases claim
+    def create_during_gen_change(context, **kwargs):
+        store.generation = "pixels-3"
+        orphan = make_orphan("orphan-3", kwargs["on_closed"])
+        orphans.append(orphan)
+        return orphan
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create_during_gen_change)
+    res_gen = api.open_translucent_viewer("abc", payload)
+    assert res_gen["ok"] is False and "image changed" in res_gen["message"]
+    orphans[-1].close_translucent.assert_called_once()
+    assert api._translucent_pending_launches == {}
+    assert api._translucent_claim is None
+
+    # 5. Exception in create_translucent_window cleans up pending reservation and claim
+    store.generation = "pixels-2"
+    monkeypatch.setattr(
+        overlay, "create_translucent_window", Mock(side_effect=RuntimeError("window failed")),
+    )
+    res_err = api.open_translucent_viewer("abc", payload)
+    assert res_err["ok"] is False
+    assert api._translucent_pending_launches == {}
+    assert api._translucent_claim is None
+
+
+def test_update_translucent_display_routing_generation_expiry_and_multi_owner_isolation(
+    store, payload, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    created = []
+
+    def make_real_api(context, *, url, title, logger, on_closed, launch_token=None, launch_generation="", **_extra):
+        child = overlay.TranslucentApi(
+            context,
+            logger=logger,
+            on_closed=on_closed,
+            launch_token=launch_token,
+            launch_generation=launch_generation,
+        )
+        child._window = SimpleNamespace(uid=f"win-{len(created) + 1}", destroy=Mock(side_effect=child._did_close))
+        created.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", make_real_api)
+
+    # Two independent Api owners (User + private Agent) sharing the same sid must never cross-talk.
+    store1 = copy.deepcopy(store)
+    store2 = copy.deepcopy(store)
+    api1 = app.Api(None)
+    api2 = app.Api(None, window_session=SimpleNamespace(role="agent", root=tmp_path / "agent"))
+    api1._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store1 if sid == "shared" else None))
+    api2._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store2 if sid == "shared" else None))
+
+    try:
+        r1 = api1.open_translucent_viewer("shared", payload)
+        r2 = api2.open_translucent_viewer("shared", payload)
+        assert r1["ok"] and r2["ok"] and r1["launch_token"] != r2["launch_token"]
+        ov1, ov2 = created[0], created[1]
+
+        # Invalid arg types rejected without mutating state.
+        for bad in (
+            ("", r1["launch_token"], 1, ""),
+            ("shared", "", 1, ""),
+            ("shared", r1["launch_token"], 0, ""),
+            ("shared", r1["launch_token"], True, ""),
+            ("shared", r1["launch_token"], 2**53, ""),
+            ("shared", r1["launch_token"], 1, None),
+        ):
+            bad_res = api1.update_translucent_display(*bad)
+            assert bad_res["ok"] is False and bad_res["invalid"] is True
+        assert ov1.translucent_display_state()["revision"] == 0
+
+        # Invalid display query rejected without mutating state.
+        bad_q = api1.update_translucent_display("shared", r1["launch_token"], 1, "g=tampered")
+        assert bad_q["ok"] is False and bad_q["invalid"] is True
+        assert ov1.translucent_display_state()["revision"] == 0
+
+        # Cross-owner token rejected as stale; neither overlay mutates.
+        assert api1.update_translucent_display("shared", r2["launch_token"], 1, "c=0") == {
+            "ok": False,
+            "stale": True,
+        }
+        assert ov1.translucent_display_state()["revision"] == 0
+        assert ov2.translucent_display_state()["revision"] == 0
+
+        # Valid update on api1 mutates only ov1, not ov2.
+        upd = api1.update_translucent_display("shared", r1["launch_token"], 1, "c=0&col=%23ff00aa%2C")
+        assert upd == {"ok": True, "applied": True, "revision": 1}
+        assert ov1.translucent_context()["query"] == "?c=0&col=ff00aa%2C&g=pixels-2"
+        assert ov2.translucent_context()["query"] == payload["query"]
+        assert ov2.translucent_display_state()["revision"] == 0
+
+        # Empty display query restores defaults while keeping g.
+        reset = api1.update_translucent_display("shared", r1["launch_token"], 2, "")
+        assert reset == {"ok": True, "applied": True, "revision": 2}
+        assert ov1.translucent_context()["query"] == "?g=pixels-2"
+
+        # Shading rebuild advancing store1.generation expires ov1 and wakes its waiter.
+        wait_out = {}
+        started = threading.Event()
+
+        def waiter():
+            started.set()
+            wait_out["res"] = ov1.wait_translucent_display(r1["launch_token"], 2, timeout_ms=5000)
+
+        wt = threading.Thread(target=waiter)
+        wt.start()
+        started.wait(timeout=2)
+        time.sleep(0.02)
+
+        store1.generation = "pixels-3"
+        stale_res = api1.update_translucent_display("shared", r1["launch_token"], 3, "c=1")
+        assert stale_res["ok"] is False and stale_res["stale_generation"] is True
+        wt.join(timeout=2)
+        assert not wt.is_alive()
+        assert wait_out["res"]["expired"] is True
+        assert wait_out["res"]["reason"] == "generation_changed"
+        # ov2 remains healthy and unaffected.
+        assert api2.update_translucent_display("shared", r2["launch_token"], 1, "c=1") == {
+            "ok": True,
+            "applied": True,
+            "revision": 1,
+        }
+
+        # Closing ov1 returns closed on further updates.
+        assert api1.close_translucent_viewer("shared") == {"ok": True, "closed": True}
+        assert api1.update_translucent_display("shared", r1["launch_token"], 4, "c=0") == {
+            "ok": False,
+            "closed": True,
+        }
+    finally:
+        api1._close_translucent_windows()
+        api2._close_translucent_windows()
+
+
+def test_create_app_window_assigns_api_window_and_private_helpers_not_exposed(monkeypatch, tmp_path):
+    webview = pytest.importorskip("webview")
+    window = SimpleNamespace(
+        uid="main-win",
+        events=SimpleNamespace(
+            before_load=Event(),
+            closed=Event(),
+            closing=Event(),
+            shown=Event(),
+            initialized=Event(),
+        ),
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(webview, "create_window", Mock(return_value=window))
+    monkeypatch.setenv("ND2WSI_WINDOW_SESSION_ROOT", str(tmp_path / "sessions"))
+    monkeypatch.setattr("nd2wsi.native_gestures.wire_native_trackpad_bridge", Mock())
+    monkeypatch.setattr(app, "_wire_file_drop", Mock())
+    monkeypatch.setattr(app, "_inline_traffic_lights", Mock())
+    monkeypatch.setattr(app, "_install_open_files_handler", Mock())
+    monkeypatch.setattr(app, "_guard_native_close", Mock())
+    monkeypatch.setattr(app._window_chrome, "NativeTitlebarDrag", Mock())
+
+    api, created_window = app.create_app_window(None)
+    assert created_window is window
+    assert api._window is window
+
+    # Verify pywebview JS bridge exposes public methods and omits all private '_' helpers.
+    def exposed_bridge_functions(js_api):
+        if hasattr(webview.util, "get_functions"):
+            return set(webview.util.get_functions(js_api))
+        scripts = []
+        loaded = threading.Event()
+        fake_win = SimpleNamespace(
+            _js_api=js_api,
+            _functions={},
+            _expose_lock=threading.Lock(),
+            run_js=scripts.append,
+            events=SimpleNamespace(
+                before_load=threading.Event(),
+                _pywebviewready=threading.Event(),
+                loaded=loaded,
+            ),
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(webview.util, "load_js_files", lambda _w, _p: ("", "%(functions)s"))
+            webview.util.inject_pywebview("cocoa", fake_win)
+        assert loaded.wait(timeout=2)
+        return {entry["func"] for entry in json.loads(scripts[-1])}
+
+    parent_funcs = exposed_bridge_functions(api)
+    assert "open_translucent_viewer" in parent_funcs
+    assert "update_translucent_display" in parent_funcs
+    assert "close_translucent_viewer" in parent_funcs
+    assert all(not part.startswith("_") for name in parent_funcs for part in name.split("."))
+
+    child_api = overlay.TranslucentApi({"dimensions": [100, 100]}, logger=Mock(), on_closed=Mock())
+    child_funcs = exposed_bridge_functions(child_api)
+    assert "translucent_context" in child_funcs
+    assert "translucent_display_state" in child_funcs
+    assert "wait_translucent_display" in child_funcs
+    # Bridge security: Python-only SLACS helpers and internal display helpers must not be exposed.
+    for forbidden_name in (
+        "refresh_context",
+        "report_slacs_laser_box",
+        "_refresh_context",
+        "_report_slacs_laser_box",
+        "_is_closed",
+        "_session_snapshot",
+        "_apply_display_query",
+        "_expire_display_session",
+        "_did_close",
+        "_configure_and_show",
+    ):
+        assert forbidden_name not in child_funcs
+    assert all(not part.startswith("_") for name in child_funcs for part in name.split("."))
+
+
+def test_open_translucent_refuses_to_register_already_closed_or_retired_child(
+    store, payload, monkeypatch,
+):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store if sid == "abc" else None))
+
+    # 1. Real TranslucentApi whose _did_close ran during create_translucent_window (retired=True).
+    closed_children = []
+
+    def create_already_closed(context, *, url, title, logger, on_closed, launch_token=None, launch_generation="", **_extra):
+        child = overlay.TranslucentApi(
+            context,
+            logger=logger,
+            on_closed=on_closed,
+            launch_token=launch_token,
+            launch_generation=launch_generation,
+        )
+        child._window = SimpleNamespace(uid="dead-real", destroy=Mock())
+        child._did_close()
+        closed_children.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create_already_closed)
+    res_real = api.open_translucent_viewer("abc", payload)
+    assert res_real["ok"] is False
+    assert "closed while opening" in res_real["message"]
+    assert api._translucent_windows == {}
+    assert api._translucent_pending_launches == {}
+    assert api._translucent_claim is None
+    assert closed_children[0]._session_snapshot()[3] is True
+
+    # 2. Stub child without _session_snapshot exposing _closed=True also aborts without wedging claim.
+    stubs = []
+
+    def create_closed_stub(context, **kwargs):
+        stub = SimpleNamespace(_window=SimpleNamespace(uid="dead-stub"), _closed=True)
+        stub.close_translucent = Mock(side_effect=lambda: kwargs["on_closed"](stub))
+        stubs.append(stub)
+        return stub
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create_closed_stub)
+    res_stub = api.open_translucent_viewer("abc", payload)
+    assert res_stub["ok"] is False
+    assert "closed while opening" in res_stub["message"]
+    stubs[0].close_translucent.assert_called_once()
+    assert api._translucent_windows == {}
+    assert api._translucent_pending_launches == {}
+    assert api._translucent_claim is None
+
+    # 3. Subsequent healthy launch succeeds (proving _translucent_claim was not wedged).
+    live = []
+
+    def create_healthy(context, **kwargs):
+        child = SimpleNamespace(_window=SimpleNamespace(uid="live-ok"), _closed=False)
+        child.close_translucent = Mock(side_effect=lambda: kwargs["on_closed"](child))
+        live.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create_healthy)
+    ok_res = api.open_translucent_viewer("abc", payload)
+    assert ok_res["ok"] is True and ok_res["id"] == "live-ok"
+    assert api.close_translucent_viewer("abc") == {"ok": True, "closed": True}
+    assert api._translucent_claim is None
+
+
+def test_empty_display_query_after_generation_change_expires_and_wakes_waiter(
+    store, payload, monkeypatch,
+):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    created = []
+
+    def make_real_api(context, *, url, title, logger, on_closed, launch_token=None, launch_generation="", **_extra):
+        child = overlay.TranslucentApi(
+            context,
+            logger=logger,
+            on_closed=on_closed,
+            launch_token=launch_token,
+            launch_generation=launch_generation,
+        )
+        child._window = SimpleNamespace(uid="win-expire", destroy=Mock(side_effect=child._did_close))
+        created.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", make_real_api)
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store if sid == "abc" else None))
+    try:
+        opened = api.open_translucent_viewer("abc", payload)
+        assert opened["ok"] is True
+        child = created[0]
+
+        wait_out = {}
+        started = threading.Event()
+
+        def waiter():
+            started.set()
+            wait_out["res"] = child.wait_translucent_display(opened["launch_token"], 0, timeout_ms=5000)
+
+        wt = threading.Thread(target=waiter)
+        wt.start()
+        assert started.wait(timeout=2)
+        time.sleep(0.02)
+
+        store.generation = "pixels-rebuilt"
+        res = api.update_translucent_display("abc", opened["launch_token"], 1, "")
+        assert res["ok"] is False and res["stale_generation"] is True
+        wt.join(timeout=2)
+        assert not wt.is_alive()
+        assert wait_out["res"]["ok"] is True
+        assert wait_out["res"]["expired"] is True
+        assert wait_out["res"]["reason"] == "generation_changed"
+    finally:
+        api._close_translucent_windows()
+
+
+def test_create_translucent_window_triggers_did_close_when_closed_event_already_set(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    class PreSetEvent(Event):
+        def __init__(self, preset: bool):
+            super().__init__()
+            self._preset = preset
+
+        def is_set(self):
+            return self._preset
+
+    window = SimpleNamespace(
+        events=SimpleNamespace(
+            shown=PreSetEvent(False),
+            closed=PreSetEvent(True),
+            closing=PreSetEvent(False),
+            before_load=PreSetEvent(False),
+            loaded=PreSetEvent(True),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=Mock(return_value=window)))
+    on_closed = Mock()
+    api = overlay.create_translucent_window(
+        {"dimensions": [100, 100], "query": "?g=g1"},
+        url="http://local/token/static/translucent.html",
+        title="Overlay",
+        logger=Mock(),
+        on_closed=on_closed,
+    )
+    assert api._closed is True
+    assert api._session_snapshot()[3] is True
+    assert api._configured is False
+    on_closed.assert_called_once_with(api)
+
+
+def test_slacs_same_window_reopen_atomically_swaps_session_wakes_waiter_and_retires_old_token(
+    store, payload, monkeypatch,
+):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    created = []
+
+    def make_real_api(context, *, url, title, logger, on_closed, launch_token=None, launch_generation="", **_extra):
+        child = overlay.TranslucentApi(
+            context,
+            logger=logger,
+            on_closed=on_closed,
+            launch_token=launch_token,
+            launch_generation=launch_generation,
+        )
+        child._configured = True
+        child._page_url = url
+        child._window = SimpleNamespace(
+            uid="slacs-reuse-1",
+            load_url=Mock(),
+            show=Mock(),
+            destroy=Mock(side_effect=child._did_close),
+        )
+        created.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", make_real_api)
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store if sid == "abc" else None))
+    try:
+        first = api.open_translucent_viewer("abc", payload)
+        assert first["ok"] is True and first["id"] == "slacs-reuse-1"
+        child = created[0]
+        old_token = first["launch_token"]
+
+        # Waiter blocked on old_token must wake with closed=True as soon as reopen swaps the session.
+        wait_out = {}
+        started = threading.Event()
+
+        def run_old_waiter():
+            started.set()
+            wait_out["res"] = child.wait_translucent_display(old_token, 0, timeout_ms=5000)
+
+        wt = threading.Thread(target=run_old_waiter)
+        wt.start()
+        assert started.wait(timeout=2)
+        time.sleep(0.02)
+
+        reopened = api.open_translucent_viewer("abc", {**payload, "query": "?c=1&g=pixels-2"})
+        assert reopened["ok"] is True
+        assert reopened["id"] == "slacs-reuse-1"
+        assert reopened["launch_token"] != old_token
+        assert len(created) == 1  # reused existing native window
+
+        wt.join(timeout=2)
+        assert not wt.is_alive()
+        assert wait_out["res"] == {"ok": False, "closed": True}
+
+        # Late live-LUT updates for old_token are rejected as stale; new_token succeeds.
+        assert api.update_translucent_display("abc", old_token, 1, "c=0") == {"ok": False, "stale": True}
+        assert api.update_translucent_display("abc", reopened["launch_token"], 1, "win=0:128") == {
+            "ok": True,
+            "applied": True,
+            "revision": 1,
+        }
+        assert child.translucent_context()["query"] == "?win=0%3A128&g=pixels-2"
+        assert child.translucent_context()["launch_token"] == reopened["launch_token"]
+    finally:
+        api._close_translucent_windows()
+
+
+def test_slacs_superseded_concurrent_reopen_preserves_follow_calibration_lock_and_newer_token(
+    store, payload, monkeypatch,
+):
+    from nd2wsi import laser_target
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    created = []
+
+    def make_real_api(context, *, url, title, logger, on_closed, launch_token=None, launch_generation="", **_extra):
+        child = overlay.TranslucentApi(
+            context,
+            logger=logger,
+            on_closed=on_closed,
+            launch_token=launch_token,
+            launch_generation=launch_generation,
+        )
+        child._configured = True
+        child._page_url = url
+        child._dispatch = Mock()
+        child._window = SimpleNamespace(
+            uid="slacs-race-1",
+            native=Mock(),
+            load_url=Mock(),
+            show=Mock(),
+            destroy=Mock(side_effect=child._did_close),
+        )
+        created.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", make_real_api)
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store if sid == "abc" else None))
+    try:
+        opened = api.open_translucent_viewer("abc", payload)
+        assert opened["ok"] is True
+        child = created[0]
+
+        # Set a calibrated laser target that must remain intact across reopen and race aborts.
+        calibrated = laser_target.validate({
+            "offset_css": [12.5, -8.0],
+            "side_um": 24.0,
+            "rotation_deg": 30.0,
+            "window": [100, 120, 640, 480],
+            "dpr": 2.0,
+        })
+        child._laser_target = copy.deepcopy(calibrated)
+
+        # Case A: Reopen 1 enters stop_stage_follow(); while blocked there, Reopen 2 arrives and
+        # supersedes pending launch token. Reopen 1 must abort without overwriting context/session/token,
+        # and Reopen 2 must win cleanly.
+        in_stop = threading.Event()
+        allow_stop_exit = threading.Event()
+        stop_calls = []
+        orig_stop = child.stop_stage_follow
+
+        def blocking_stop():
+            stop_calls.append(threading.get_ident())
+            if len(stop_calls) == 1:
+                in_stop.set()
+                allow_stop_exit.wait(timeout=3)
+            return orig_stop()
+
+        child.stop_stage_follow = blocking_stop
+        r1_out, r2_out = {}, {}
+
+        t1 = threading.Thread(
+            target=lambda: r1_out.__setitem__(
+                "res", api.open_translucent_viewer("abc", {**payload, "query": "?c=0&g=pixels-2"})
+            )
+        )
+        t1.start()
+        assert in_stop.wait(timeout=2)
+
+        t2 = threading.Thread(
+            target=lambda: r2_out.__setitem__(
+                "res", api.open_translucent_viewer("abc", {**payload, "query": "?c=1&g=pixels-2"})
+            )
+        )
+        t2.start()
+        # Wait until t2 has written its newer pending launch token before releasing t1.
+        deadline = time.monotonic() + 2.0
+        t1_pending = api._translucent_pending_launches.get("abc")
+        while time.monotonic() < deadline:
+            if api._translucent_pending_launches.get("abc") != t1_pending:
+                break
+            time.sleep(0.005)
+        allow_stop_exit.set()
+        t1.join(timeout=3)
+        t2.join(timeout=3)
+
+        assert r1_out["res"]["ok"] is False and "superseded" in r1_out["res"]["message"]
+        assert r2_out["res"]["ok"] is True
+        win_token = r2_out["res"]["launch_token"]
+        assert child.translucent_context()["launch_token"] == win_token
+        assert child.translucent_context()["query"] == "?c=1&g=pixels-2"
+        assert child.translucent_context()["laser_target"] == calibrated
+        assert child._window.load_url.call_count == 1
+
+        # Case B: A stale reopen that was superseded BEFORE acquiring _refresh_lock must abort
+        # BEFORE calling stop_stage_follow(), preserving active Follow, lock state, calibration, and token.
+        active_follow = Mock()
+        child._stage_follow = active_follow
+        child._locked = True
+        stop_spy = Mock(side_effect=AssertionError("superseded reopen must not call stop_stage_follow"))
+        child.stop_stage_follow = stop_spy
+        stale_context = {**child.translucent_context(), "query": "?c=0&g=pixels-2"}
+
+        with pytest.raises(ValueError, match="superseded"):
+            app._app_slacs.reopen_translucent_overlay(
+                api,
+                "abc",
+                child,
+                stale_context,
+                launch_token="stale-token",
+                launch_generation=store.generation,
+            )
+        stop_spy.assert_not_called()
+        active_follow.close.assert_not_called()
+        assert child._stage_follow is active_follow
+        assert child._locked is True
+        assert child.translucent_context()["launch_token"] == win_token
+        assert child.translucent_context()["query"] == "?c=1&g=pixels-2"
+        assert child.translucent_context()["laser_target"] == calibrated
+    finally:
+        api._close_translucent_windows()
+

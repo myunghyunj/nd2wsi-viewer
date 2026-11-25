@@ -726,7 +726,7 @@ def test_refresh_context_uses_show_noactivate_when_slacs_foreground_or_locked(wi
     try:
         # 1. SLACS is foreground (overlay unlocked) -> SW_SHOWNOACTIVATE + SetWindowPos, NOT window.show().
         harness.foreground_hwnd = harness.slacs_hwnd
-        api.refresh_context(base_ctx)
+        api._refresh_context(base_ctx)
         window.load_url.assert_called_once()
         window.show.assert_not_called()
         assert harness.show_window_calls == [(harness.overlay_hwnd, tw.SW_SHOWNOACTIVATE)]
@@ -745,7 +745,7 @@ def test_refresh_context_uses_show_noactivate_when_slacs_foreground_or_locked(wi
         hover_thread = api._win32_focus._hover_thread
         assert hover_thread is not None and hover_thread.is_alive()
 
-        api.refresh_context(base_ctx)
+        api._refresh_context(base_ctx)
         window.show.assert_not_called()
         assert harness.show_window_calls == [(harness.overlay_hwnd, tw.SW_SHOWNOACTIVATE)]
         assert not hover_thread.is_alive()
@@ -757,7 +757,7 @@ def test_refresh_context_uses_show_noactivate_when_slacs_foreground_or_locked(wi
         # 3. Neither SLACS foreground nor locked -> normal window.show().
         harness.show_window_calls.clear()
         harness.foreground_hwnd = harness.overlay_hwnd
-        api.refresh_context(base_ctx)
+        api._refresh_context(base_ctx)
         window.show.assert_called_once()
         assert harness.show_window_calls == []
     finally:

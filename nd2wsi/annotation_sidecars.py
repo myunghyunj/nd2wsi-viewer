@@ -54,20 +54,37 @@ def _manifest_source_path(container: Path, manifest: dict[str, Any]) -> Path | N
     answer as the slide's source (LUT settings, inspection, reveal and
     source-backed reads, each of which checks the file itself).
     """
-    from .cache import source_base
+    from .cache import names_match, resolve_existing_path, source_base
 
     src = manifest.get("source") or {}
     rel = src.get("relative_path") if isinstance(src, dict) else None
     if not isinstance(rel, str) or not rel:
         return None
     container = Path(container).resolve()
+    slide_folder = _slide_folder(container)
     candidate = (source_base(container) / rel).resolve()
     recorded_name = src.get("name")
-    if recorded_name and candidate.name != Path(str(recorded_name)).name:
+    if recorded_name and not names_match(candidate.name, Path(str(recorded_name)).name):
         return None
-    if candidate.parent != _slide_folder(container) or candidate.is_dir():
+    if candidate.parent != slide_folder:
         return None
-    return candidate
+    if not candidate.exists() and not candidate.is_symlink():
+        matched = resolve_existing_path(candidate, kind="file")
+        if matched != candidate:
+            if matched.parent != slide_folder:
+                return None
+            candidate = matched.resolve()
+            if recorded_name and not names_match(
+                candidate.name, Path(str(recorded_name)).name
+            ):
+                return None
+            if candidate.parent != slide_folder:
+                return None
+        elif resolve_existing_path(candidate, kind="dir").is_dir():
+            return None
+    if candidate.is_dir():
+        return None
+    return candidate.resolve() if candidate.exists() else candidate
 
 
 def _annotation_source_name(path: Path) -> str | None:
@@ -94,21 +111,29 @@ def _annotation_source_name(path: Path) -> str | None:
 
 def _legacy_sidecar_matches(path: Path, source_name: str, home: Path) -> bool:
     """Whether an unscoped sidecar can be migrated without guessing."""
+    from .cache import names_match, normalize_name
+
     declared = _annotation_source_name(path)
     if declared is not None:
-        return declared == source_name
+        return names_match(declared, source_name)
     from .raster import RASTER_SUFFIXES
     # An unscoped same-stem sidecar may describe the full ND2 pixel grid.
     # A downscaled JPG must never inherit those coordinates implicitly.
     if Path(source_name).suffix.lower() in RASTER_SUFFIXES:
         return False
-    stems = {Path(source_name).stem, slide_stem(source_name)}
+    stems = {
+        normalize_name(Path(source_name).stem),
+        normalize_name(slide_stem(source_name)),
+    }
     try:
         siblings = [
             item
             for item in home.iterdir()
             if item.is_file()
-            and (item.stem in stems or slide_stem(item.name) in stems)
+            and (
+                normalize_name(item.stem) in stems
+                or normalize_name(slide_stem(item.name)) in stems
+            )
             and item.suffix.lower() in SLIDE_SUFFIXES | RASTER_SUFFIXES
         ]
     except OSError:
@@ -131,7 +156,9 @@ def annotations_sidecar(
         ANNOTATIONS_DIR,
         MANAGED_DIR,
         manifest_container,
+        normalize_name,
         read_manifest,
+        resolve_existing_path,
         selection_tag,
     )
     from .convert import CACHE_DIR_NAME
@@ -139,7 +166,11 @@ def annotations_sidecar(
     store_path = Path(store_path).resolve()
     meta = attrs["nd2wsi"]
     source_name = Path(meta["source"]).name
-    candidate_stems = tuple(dict.fromkeys((slide_stem(source_name), Path(source_name).stem)))
+    candidate_stems = tuple(
+        dict.fromkeys(
+            (normalize_name(slide_stem(source_name)), normalize_name(Path(source_name).stem))
+        )
+    )
 
     container = manifest_container(store_path)
     # Always the slide's folder by the cache's own location: a recorded
@@ -161,14 +192,17 @@ def annotations_sidecar(
     elif "z" in raw_selection:
         selection["z"] = raw_selection["z"]
 
-    safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", source_name)
+    safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", normalize_name(source_name))
     filename = f"annotations_{safe_source}"
     if selection:
         filename += f"--{selection_tag(selection)}"
     filename += ".json"
 
     target_dir = home / MANAGED_DIR / ANNOTATIONS_DIR
-    new = target_dir / filename
+    candidate_new = target_dir / filename
+    if candidate_new.parent != target_dir:
+        raise ValueError(f"annotation sidecar name {filename!r} leaves its folder")
+    new = resolve_existing_path(candidate_new, kind="file")
     if new.parent != target_dir:
         raise ValueError(f"annotation sidecar name {filename!r} leaves its folder")
     if migrate:
@@ -176,14 +210,16 @@ def annotations_sidecar(
 
     if not new.exists():
         old_paths = tuple(
-            candidate
-            for stem in candidate_stems
-            for candidate in (
-                target_dir / f"annotations_{stem}.json",
-                home / f"annotations_{stem}.json",
-                home / CACHE_DIR_NAME / f"annotations_{stem}.json",
-                home / f"{stem}.annotations.json",
-                store_path.parent / f"annotations_{stem}.json",
+            dict.fromkeys(
+                resolve_existing_path(candidate, kind="file")
+                for stem in candidate_stems
+                for candidate in (
+                    target_dir / f"annotations_{stem}.json",
+                    home / f"annotations_{stem}.json",
+                    home / CACHE_DIR_NAME / f"annotations_{stem}.json",
+                    home / f"{stem}.annotations.json",
+                    store_path.parent / f"annotations_{stem}.json",
+                )
             )
         )
         for old in old_paths:
@@ -251,15 +287,18 @@ def plate_annotations_sidecar(
     Annotations on a plate are per site and shared across time and z, so
     the site index is the only scope in the name.
     """
-    from .cache import ANNOTATIONS_DIR, MANAGED_DIR
+    from .cache import ANNOTATIONS_DIR, MANAGED_DIR, normalize_name, resolve_existing_path
 
     path = Path(path).resolve()
     source_name = Path(attrs["nd2wsi"]["source"]).name or path.name
-    safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", source_name)
+    safe_source = re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", normalize_name(source_name))
     target_dir = _slide_folder(path) / MANAGED_DIR / ANNOTATIONS_DIR
     if create_directory:
         target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"annotations_{safe_source}--site{int(p)}.json"
+    return resolve_existing_path(
+        target_dir / f"annotations_{safe_source}--site{int(p)}.json",
+        kind="file",
+    )
 
 
 def confocal_annotations_sidecar(

@@ -30,9 +30,11 @@ from .cache import (
     fingerprints_match,
     is_file_container,
     managed_dir,
+    names_match,
     quarantine,
     quick_fingerprint,
     read_manifest,
+    resolve_existing_path,
     source_base,
     source_tag,
 )
@@ -468,9 +470,12 @@ class PlateStore:
     def _container_for(source: PlateSource, cache_path: str | Path | None) -> Path:
         if cache_path is not None:
             return Path(cache_path).expanduser().resolve()
-        container = plate_container(source.path)
+        container = resolve_existing_path(plate_container(source.path), kind="file")
         if not container.exists():
-            legacy = container.with_name(container.name[:-len('.nd2svs')] + CACHE_SUFFIX)
+            legacy = resolve_existing_path(
+                container.with_name(container.name[:-len(".nd2svs")] + CACHE_SUFFIX),
+                kind="dir",
+            )
             if legacy.is_dir():
                 return legacy
         return container
@@ -530,7 +535,7 @@ class PlateStore:
                     raise
             elif explicit:
                 raise ValueError('legacy plate cache does not match its source')
-            container = plate_container(source.path)
+            container = resolve_existing_path(plate_container(source.path), kind="file")
             manifest = cls._read(container, recover=True)
         container.parent.mkdir(parents=True, exist_ok=True)
         writer = PlateWriterLock(container)
@@ -750,7 +755,7 @@ class PlateStore:
             ch_dtypes_ok = stored_ch_dtypes in (None, ch_dtypes)
         return (
             fingerprints_match(manifest.get("source") or {}, fingerprint)
-            and (manifest.get('source') or {}).get('name') == Path(source.path).name
+            and names_match((manifest.get("source") or {}).get("name"), Path(source.path).name)
             and list(thumbs.get("shape") or []) == list(shape)
             and thumbs.get("dtype") == str(source.dtype)
             and ch_dtypes_ok

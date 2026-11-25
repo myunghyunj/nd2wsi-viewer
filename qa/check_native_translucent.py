@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import sys
 import time
 import traceback
 from pathlib import Path
 
 os.environ["ND2WSI_DISABLE_UPDATES"] = "1"
 os.environ["ND2WSI_APP_NAME"] = "nd2wsi-viewer Translucent QA"
+
+if importlib.util.find_spec("nd2wsi") is None:
+    ROOT = Path(__file__).resolve().parents[1]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 import webview  # noqa: E402

@@ -312,7 +312,7 @@
         mode = hiDistance < loDistance ? "hi" : "lo";
       else mode = "pan";
       panFrom = { x: p.x, lo: vmin, hi: vmax };
-      canvas.setPointerCapture(ev.pointerId);
+      try { canvas.setPointerCapture?.(ev.pointerId); } catch (_) {}
       if (mode !== "pan") drag(ev);
       ev.preventDefault();
     });
@@ -325,7 +325,18 @@
       panFrom = null;
       canvas.style.cursor = "grab";
     };
-    canvas.addEventListener("pointerup", endDrag);
+    canvas.addEventListener("pointerup", (ev) => {
+      if (mode && mode !== "pan" && ev && Number.isFinite(ev.clientX) && Number.isFinite(ev.clientY)) {
+        const p = pt(ev);
+        if (Number.isFinite(p.x) && Number.isFinite(p.y)) {
+          const next = nextDragLut(p);
+          if (next.lo !== cur.lo || next.hi !== cur.hi || next.gamma !== cur.gamma) {
+            drag(ev);
+          }
+        }
+      }
+      endDrag();
+    });
     canvas.addEventListener("pointercancel", endDrag);
     canvas.addEventListener("lostpointercapture", endDrag);
 
@@ -357,14 +368,7 @@
       navigateWheel(-Number(data.deltaX || 0), 0, data.clientX - canvas.getBoundingClientRect().left);
     });
 
-    function drag(ev) {
-      const p = pt(ev);
-      if (mode === "pan") {
-        const offset = (panFrom.x - p.x) / (PLOT.x1 - PLOT.x0) * (panFrom.hi - panFrom.lo);
-        canvas.style.cursor = "grabbing";
-        manualView(panFrom.lo + offset, panFrom.hi + offset);
-        return;
-      }
+    function nextDragLut(p) {
       const next = { ...cur };
       if (mode === "gamma") {
         const frac = (PLOT.y1 - Math.max(PLOT.y0, Math.min(PLOT.y1, p.y))) /
@@ -377,6 +381,18 @@
         if (mode === "lo") next.lo = Math.min(v, cur.hi - minWindow(v, cur.hi));
         else next.hi = Math.max(v, cur.lo + minWindow(v, cur.lo));
       }
+      return next;
+    }
+
+    function drag(ev) {
+      const p = pt(ev);
+      if (mode === "pan") {
+        const offset = (panFrom.x - p.x) / (PLOT.x1 - PLOT.x0) * (panFrom.hi - panFrom.lo);
+        canvas.style.cursor = "grabbing";
+        manualView(panFrom.lo + offset, panFrom.hi + offset);
+        return;
+      }
+      const next = nextDragLut(p);
       if (ev.shiftKey) {
         onShiftChange(next);
       } else {

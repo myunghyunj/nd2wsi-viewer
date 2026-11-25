@@ -7,11 +7,15 @@ would not open). These tests pin the container contract that replaced
 all of that.
 """
 
+import contextlib
 import json
 import os
 import sys
 import threading
 import time
+import unicodedata
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -842,3 +846,504 @@ def test_machine_id_survives_a_host_name_change(monkeypatch):
     before = cache_mod._machine_id()
     monkeypatch.setattr(cache_mod.socket, "gethostname", lambda: "renamed-2.local")
     assert cache_mod._machine_id() == before == cache_mod._MACHINE_ID
+
+
+# ---------------------------------------------------------------------------
+# Cross-OS exFAT mtime_ns skew tolerance & Unicode NFC/NFD portability
+# ---------------------------------------------------------------------------
+
+_SEC_NS = 1_000_000_000
+_MIN_NS = 60 * _SEC_NS
+_HOUR_NS = 3600 * _SEC_NS
+
+
+def _fp(mtime_ns: int, *, size: int = 4096, sha: object = "a" * 64) -> dict[str, object]:
+    return {"name": "slide.nd2", "size": size, "mtime_ns": mtime_ns, "quick_sha256": sha}
+
+
+@pytest.mark.parametrize(
+    "minutes",
+    [15, -15, 30, -30, 45, -45, 60, -60, 9 * 60, -9 * 60, 14 * 60, -14 * 60, 26 * 60, -26 * 60],
+)
+def test_fingerprints_match_tolerates_exfat_tz_shifts(minutes):
+    from nd2wsi.cache import fingerprints_match
+
+    base_ns = 1_700_000_123_456_789_123
+    shifted = base_ns + minutes * _MIN_NS
+    assert fingerprints_match(_fp(base_ns), _fp(shifted))
+    assert fingerprints_match(_fp(shifted), _fp(base_ns))
+    assert not fingerprints_match(_fp(base_ns), _fp(shifted), allow_mtime_skew=False)
+
+
+def test_fingerprints_match_tolerates_exfat_quantization_and_tz():
+    from nd2wsi.cache import fingerprints_match
+
+    # APFS ns -> exFAT 10ms truncation (floor & ceil) with and without TZ shift
+    fine_ns = 1_700_000_123_456_789_123
+    floor_10ms = (fine_ns // 10_000_000) * 10_000_000
+    ceil_10ms = floor_10ms + 10_000_000
+    for tz_hours in (0, 1, -1, 9, -9, 14, -12, 26, -26):
+        tz = tz_hours * _HOUR_NS
+        assert fingerprints_match(_fp(fine_ns), _fp(floor_10ms + tz))
+        assert fingerprints_match(_fp(floor_10ms + tz), _fp(fine_ns))
+        assert fingerprints_match(_fp(fine_ns), _fp(ceil_10ms + tz))
+        assert fingerprints_match(_fp(ceil_10ms + tz), _fp(fine_ns))
+
+    # 10ms 1-tick rounding when both sides are 10ms-aligned (including UTC+0)
+    tick_a = 1_700_000_123_450_000_000
+    for tz_hours in (0, 1, -9):
+        tz = tz_hours * _HOUR_NS
+        assert fingerprints_match(_fp(tick_a), _fp(tick_a + 10_000_000 + tz))
+        assert fingerprints_match(_fp(tick_a), _fp(tick_a - 10_000_000 + tz))
+        # 20ms difference between two non-1s-aligned 10ms ticks is rejected
+        assert not fingerprints_match(_fp(tick_a), _fp(tick_a + 20_000_000 + tz))
+
+    # 1s truncation (floor & ceil) with and without TZ shift
+    floor_1s = (fine_ns // _SEC_NS) * _SEC_NS
+    ceil_1s = floor_1s + _SEC_NS
+    for tz_hours in (0, 1, -9):
+        tz = tz_hours * _HOUR_NS
+        assert fingerprints_match(_fp(fine_ns), _fp(floor_1s + tz))
+        assert fingerprints_match(_fp(fine_ns), _fp(ceil_1s + tz))
+
+    # 2s FAT truncation: fine non-1s-aligned timestamp at UTC+0 and with TZ shift
+    floor_2s = (fine_ns // (2 * _SEC_NS)) * (2 * _SEC_NS)
+    ceil_2s = floor_2s + 2 * _SEC_NS
+    for tz_hours in (0, 1, -9):
+        tz = tz_hours * _HOUR_NS
+        assert fingerprints_match(_fp(fine_ns), _fp(floor_2s + tz))
+        assert fingerprints_match(_fp(fine_ns), _fp(ceil_2s + tz))
+
+    # 2s FAT truncation from an odd 1s-aligned timestamp WITH a TZ shift
+    odd_1s = 1_700_000_123 * _SEC_NS
+    assert fingerprints_match(_fp(odd_1s), _fp(odd_1s - _SEC_NS + 9 * _HOUR_NS))
+    assert fingerprints_match(_fp(odd_1s), _fp(odd_1s + _SEC_NS - _HOUR_NS))
+
+
+def test_fingerprints_match_rejections():
+    from nd2wsi.cache import fingerprints_match
+
+    fine_ns = 1_700_000_123_456_789_123
+    even_1s = 1_700_000_122 * _SEC_NS
+    odd_1s = 1_700_000_123 * _SEC_NS
+    aligned_10ms = 1_700_000_123_450_000_000
+
+    # Beyond ±26h TZ cap
+    assert not fingerprints_match(_fp(fine_ns), _fp(fine_ns + (26 * 60 + 15) * _MIN_NS))
+    assert not fingerprints_match(_fp(fine_ns), _fp(fine_ns - (26 * 60 + 15) * _MIN_NS))
+
+    # +1s rejected on BOTH ns-resolution and 1s-aligned timestamps (even->odd & odd->even)
+    assert not fingerprints_match(_fp(fine_ns), _fp(fine_ns + _SEC_NS))
+    assert not fingerprints_match(_fp(even_1s), _fp(even_1s + _SEC_NS))
+    assert not fingerprints_match(_fp(odd_1s), _fp(odd_1s + _SEC_NS))
+
+    # +2s, +10s, +60s rejected
+    assert not fingerprints_match(_fp(fine_ns), _fp(fine_ns + 2 * _SEC_NS))
+    assert not fingerprints_match(_fp(even_1s), _fp(even_1s + 2 * _SEC_NS))
+    assert not fingerprints_match(_fp(fine_ns), _fp(fine_ns + 10 * _SEC_NS))
+    assert not fingerprints_match(_fp(fine_ns), _fp(fine_ns + 60 * _SEC_NS))
+
+    # -1ns rejected with allow_mtime_skew=False (even from a 10ms-aligned value)
+    assert not fingerprints_match(
+        _fp(aligned_10ms), _fp(aligned_10ms - 1), allow_mtime_skew=False
+    )
+    assert not fingerprints_match(_fp(fine_ns), _fp(fine_ns - 1), allow_mtime_skew=False)
+    assert not fingerprints_match(_fp(fine_ns), _fp(fine_ns - 1), allow_mtime_skew=True)
+
+    # Epoch-0 and negative timestamps rejected on skew path
+    assert not fingerprints_match(_fp(0), _fp(15 * _MIN_NS))
+    assert not fingerprints_match(_fp(0), _fp(fine_ns))
+    assert not fingerprints_match(_fp(-15 * _MIN_NS), _fp(15 * _MIN_NS))
+
+    # Empty dicts, non-dicts, and missing keys rejected
+    assert not fingerprints_match({}, {})
+    assert not fingerprints_match(None, {})  # type: ignore[arg-type]
+    assert not fingerprints_match([], [])  # type: ignore[arg-type]
+    no_sha = {"size": 4096, "mtime_ns": fine_ns}
+    assert not fingerprints_match(no_sha, no_sha)
+    assert not fingerprints_match(no_sha, _fp(fine_ns))
+    assert not fingerprints_match({"size": 4096, "quick_sha256": "a" * 64}, _fp(fine_ns))
+    assert not fingerprints_match({"mtime_ns": fine_ns, "quick_sha256": "a" * 64}, _fp(fine_ns))
+
+    # Empty or non-string quick_sha256 rejected on skew path; int preserved on exact path
+    assert fingerprints_match(_fp(1, size=1, sha=1), _fp(1, size=1, sha=1))
+    assert not fingerprints_match(_fp(fine_ns, sha=1), _fp(fine_ns + _HOUR_NS, sha=1))
+    assert not fingerprints_match(_fp(fine_ns, sha=""), _fp(fine_ns + _HOUR_NS, sha=""))
+
+    # Bool values rejected for mtime_ns, size, and quick_sha256 (exact and skewed)
+    assert not fingerprints_match(_fp(True), _fp(True))
+    assert not fingerprints_match(_fp(True), _fp(1))
+    assert not fingerprints_match(_fp(fine_ns, size=True), _fp(fine_ns, size=True))
+    assert not fingerprints_match(_fp(fine_ns, size=True), _fp(fine_ns, size=1))
+    assert not fingerprints_match(_fp(fine_ns, size=True), _fp(fine_ns + _HOUR_NS, size=True))
+    assert not fingerprints_match(_fp(fine_ns, sha=True), _fp(fine_ns, sha=True))
+
+    # Changed size or quick_sha256 always rejected
+    assert not fingerprints_match(_fp(fine_ns, size=4096), _fp(fine_ns, size=4097))
+    assert not fingerprints_match(
+        _fp(fine_ns, size=4096), _fp(fine_ns + 9 * _HOUR_NS, size=4097)
+    )
+    assert not fingerprints_match(_fp(fine_ns, sha="a" * 64), _fp(fine_ns, sha="b" * 64))
+    assert not fingerprints_match(
+        _fp(fine_ns, sha="a" * 64), _fp(fine_ns + 9 * _HOUR_NS, sha="b" * 64)
+    )
+
+
+def _rewrite_single_file_manifest(container: Path, mutate) -> dict:
+    from nd2wsi.cache import MANIFEST_NAME
+    from nd2wsi.storage.single_file import SQLiteStore
+
+    with SQLiteStore(container) as store:
+        manifest = json.loads(store.read_bytes(MANIFEST_NAME))
+        mutate(manifest)
+        store.write_bytes(MANIFEST_NAME, json.dumps(manifest, indent=1).encode("utf-8"))
+    return manifest
+
+
+def test_ensure_cache_and_existing_store_tolerate_exfat_manifest_skew(slide, monkeypatch):
+    from nd2wsi.cache import cache_matches
+    from nd2wsi.convert import existing_cache_store
+
+    store = ensure_cache(slide)
+    container = cache_container(slide)
+    assert store == container
+    initial_manifest = read_manifest(container)
+    assert initial_manifest is not None
+    orig_mtime = initial_manifest["source"]["mtime_ns"]
+    orig_gen = initial_manifest["generation"]
+
+    # Mutate manifest mtime_ns by ±9h and ±1h + 10ms truncation; never rebuild or quarantine
+    skews = [
+        orig_mtime + 9 * _HOUR_NS,
+        orig_mtime - 9 * _HOUR_NS,
+        (orig_mtime // 10_000_000) * 10_000_000 + _HOUR_NS,
+        ((orig_mtime // 10_000_000) + 1) * 10_000_000 - _HOUR_NS,
+    ]
+    monkeypatch.setattr(
+        convert_mod,
+        "convert",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected cache rebuild")),
+    )
+    for skewed_mtime in skews:
+        _rewrite_single_file_manifest(
+            container, lambda m, ns=skewed_mtime: m["source"].__setitem__("mtime_ns", ns)
+        )
+        assert cache_matches(container, slide, PlaneSelection())
+        assert existing_cache_store(slide) == store
+        assert ensure_cache(slide) == store
+        assert read_manifest(container)["generation"] == orig_gen
+        assert not list(container.parent.glob("*.corrupt-*"))
+
+
+def test_store_matches_selection_tolerates_exfat_skew(slide, tmp_path):
+    import zarr
+
+    from nd2wsi.convert import _store_matches_selection, existing_cache_store
+
+    legacy = tmp_path / "pyramids" / "s.svs.ome.zarr"
+    convert_mod.convert(slide, legacy, progress=False)
+    root = zarr.open_group(str(legacy), mode="r+")
+    orig_meta = json.loads(json.dumps(dict(root.attrs["nd2wsi"])))
+    orig_mtime = orig_meta["source_fingerprint"]["mtime_ns"]
+
+    for skewed in (
+        orig_mtime + 9 * _HOUR_NS,
+        (orig_mtime // 10_000_000) * 10_000_000 - _HOUR_NS,
+    ):
+        meta = json.loads(json.dumps(orig_meta))
+        meta["source_fingerprint"]["mtime_ns"] = skewed
+        root.attrs["nd2wsi"] = meta
+        _, attrs = open_store(legacy)
+        assert _store_matches_selection(slide, attrs, PlaneSelection())
+        assert existing_cache_store(slide) == legacy
+        assert ensure_cache(slide) == legacy
+        assert not list(legacy.parent.glob("*.corrupt-*"))
+        assert not cache_container(slide).exists()
+
+    # +1s drift still rejected
+    bad_meta = json.loads(json.dumps(orig_meta))
+    bad_meta["source_fingerprint"]["mtime_ns"] = orig_mtime + _SEC_NS
+    root.attrs["nd2wsi"] = bad_meta
+    _, bad_attrs = open_store(legacy)
+    assert not _store_matches_selection(slide, bad_attrs, PlaneSelection())
+
+
+def test_pack_directory_tolerates_exfat_skew_and_strict_end_check(slide, tmp_path, monkeypatch):
+    from nd2wsi import migration as migration_mod
+    from nd2wsi.cache import (
+        MANIFEST_NAME,
+        directory_cache_container,
+        quick_fingerprint,
+        write_manifest,
+    )
+    from nd2wsi.migration import pack_directory
+
+    dir_cache = directory_cache_container(slide, PlaneSelection())
+    dir_cache.mkdir(parents=True)
+    convert_mod.convert(slide, dir_cache / "store.ome.zarr", progress=False)
+    root, attrs = open_store(dir_cache / "store.ome.zarr")
+    if hasattr(root, "close"):
+        root.close()
+    fp = quick_fingerprint(slide)
+    skewed_fp = {
+        **fp,
+        "mtime_ns": (fp["mtime_ns"] // 10_000_000) * 10_000_000 + 9 * _HOUR_NS,
+    }
+    lv0 = attrs["nd2wsi"]["levels"][0]
+    write_manifest(
+        dir_cache,
+        slide,
+        skewed_fp,
+        PlaneSelection().describe(),
+        attrs["nd2wsi"].get("selection", {}).get("z"),
+        attrs["nd2wsi"]["tile"],
+        (len(attrs["omero"]["channels"]), lv0["height"], lv0["width"]),
+        attrs["nd2wsi"]["dtype"],
+    )
+
+    packed = tmp_path / "packed-skew.nd2svs"
+    result = pack_directory(dir_cache, packed, source=slide)
+    assert result["verified"] is True
+    assert read_manifest(packed)["complete"] is True
+
+    # Intra-session end check (allow_mtime_skew=False) rejects even a +9h or -1ns shift
+    for delta in (-1, 9 * _HOUR_NS):
+        calls = {"n": 0}
+        real_qfp = quick_fingerprint
+
+        def shifted_second_call(p, *, _delta=delta, _calls=calls, _real=real_qfp):
+            _calls["n"] += 1
+            got = _real(p)
+            if _calls["n"] >= 2:
+                return {**got, "mtime_ns": got["mtime_ns"] + _delta}
+            return got
+
+        monkeypatch.setattr(migration_mod, "quick_fingerprint", shifted_second_call)
+        # Restore exact manifest mtime so the initial check passes before the end check
+        m = json.loads((dir_cache / MANIFEST_NAME).read_text(encoding="utf-8"))
+        m["source"]["mtime_ns"] = fp["mtime_ns"]
+        (dir_cache / MANIFEST_NAME).write_text(json.dumps(m), encoding="utf-8")
+
+        target_fail = tmp_path / f"packed-fail-{delta}.nd2svs"
+        with pytest.raises(ValueError, match="source file changed while packing"):
+            pack_directory(dir_cache, target_fail, source=slide)
+
+
+def test_unicode_nfc_nfd_helpers_and_no_nfkc(tmp_path):
+    from nd2wsi.cache import (
+        directory_cache_container,
+        legacy_cache_container,
+        names_match,
+        normalize_name,
+        source_tag,
+    )
+    from nd2wsi.convert import default_store_path
+
+    for sample in ("샘플_테스트.nd2", "café.nd2"):
+        nfc = unicodedata.normalize("NFC", sample)
+        nfd = unicodedata.normalize("NFD", sample)
+        assert nfc != nfd
+
+        assert normalize_name(nfd) == nfc
+        assert normalize_name(nfc) == nfc
+        assert names_match(nfc, nfd)
+        assert names_match(nfd, nfc)
+        assert not names_match(None, nfc)
+        assert not names_match(nfc, None)
+        assert not names_match(nfc, "other.nd2")
+
+        assert source_tag(tmp_path / nfd) == source_tag(tmp_path / nfc) == nfc
+        assert cache_container(tmp_path / nfd) == cache_container(tmp_path / nfc)
+        assert directory_cache_container(tmp_path / nfd) == directory_cache_container(
+            tmp_path / nfc
+        )
+        assert legacy_cache_container(tmp_path / nfd) == legacy_cache_container(tmp_path / nfc)
+        assert default_store_path(tmp_path / nfd) == default_store_path(tmp_path / nfc)
+        assert default_store_path(tmp_path / nfd).name == f"{nfc}.ome.zarr"
+
+    # Strictly NFC, NEVER NFKC/NFKD: fullwidth solidus must NOT become a path separator
+    fullwidth = "a\uff0fb.nd2"
+    assert fullwidth == "a／b.nd2"
+    assert normalize_name(fullwidth) == fullwidth
+    assert normalize_name(fullwidth) != "a/b.nd2"
+    assert not names_match(fullwidth, "a/b.nd2")
+
+
+def test_resolve_existing_path_simulated_normalization_sensitive_fs(tmp_path, monkeypatch):
+    from nd2wsi.cache import resolve_existing_path
+
+    # tmp_path does not contain the NFC filename on disk, so direct stat/exists
+    # returns False just like a normalization-sensitive FS (Windows/Linux) when
+    # an NFD-named file exists on disk; os.scandir supplies the NFD entry.
+    for sample in ("샘플_테스트.nd2svs", "café.nd2svs"):
+        nfc_name = unicodedata.normalize("NFC", sample)
+        nfd_name = unicodedata.normalize("NFD", sample)
+        assert nfc_name != nfd_name
+        nfc_path = tmp_path / nfc_name
+        assert not nfc_path.exists() and not nfc_path.is_symlink()
+
+        fake_file = SimpleNamespace(name=nfd_name, is_dir=lambda follow_symlinks=False: False)
+        fake_dir = SimpleNamespace(name=nfd_name, is_dir=lambda follow_symlinks=False: True)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "scandir", lambda _p, _e=fake_file: contextlib.nullcontext([_e]))
+            got_any = resolve_existing_path(nfc_path, kind="any")
+            got_file = resolve_existing_path(nfc_path, kind="file")
+            got_dir = resolve_existing_path(nfc_path, kind="dir")
+        assert got_any == tmp_path / nfd_name
+        assert got_file == tmp_path / nfd_name
+        assert got_dir == nfc_path
+
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "scandir", lambda _p, _e=fake_dir: contextlib.nullcontext([_e]))
+            got_any = resolve_existing_path(nfc_path, kind="any")
+            got_dir = resolve_existing_path(nfc_path, kind="dir")
+            got_file = resolve_existing_path(nfc_path, kind="file")
+        assert got_any == tmp_path / nfd_name
+        assert got_dir == tmp_path / nfd_name
+        assert got_file == nfc_path
+
+        # Multiple equivalent entries pick min(matches) deterministically
+        alt_a = SimpleNamespace(name=nfd_name, is_dir=lambda follow_symlinks=False: False)
+        alt_b = SimpleNamespace(name=nfc_name, is_dir=lambda follow_symlinks=False: False)
+        with monkeypatch.context() as mp:
+            mp.setattr(
+                os, "scandir", lambda _p, _a=alt_a, _b=alt_b: contextlib.nullcontext([_a, _b])
+            )
+            got_min = resolve_existing_path(nfc_path, kind="file")
+        assert got_min == tmp_path / min(nfc_name, nfd_name)
+
+        # OSError during scandir safely falls back to original path
+        def boom(_p):
+            raise OSError("permission denied")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "scandir", boom)
+            got_err = resolve_existing_path(nfc_path)
+        assert got_err == nfc_path
+
+    # Pure ASCII names skip os.scandir altogether
+    def must_not_scan(_p):
+        raise AssertionError("ASCII path should not invoke os.scandir")
+
+    ascii_missing = tmp_path / "missing_ascii.nd2svs"
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "scandir", must_not_scan)
+        got_ascii = resolve_existing_path(ascii_missing)
+    assert got_ascii == ascii_missing
+
+    with pytest.raises(ValueError, match="invalid kind"):
+        resolve_existing_path(ascii_missing, kind="bogus")
+
+
+@pytest.mark.parametrize("sample", ["샘플_테스트.svs", "café.svs"])
+def test_unicode_nfc_nfd_cache_matches_ensure_cache_and_pack(tmp_path, sample, monkeypatch):
+    import zarr
+
+    from nd2wsi import cache as cache_mod
+    from nd2wsi.cache import (
+        cache_matches,
+        directory_cache_container,
+        quick_fingerprint,
+        write_manifest,
+    )
+    from nd2wsi.convert import (
+        _legacy_store_matches_source,
+        _store_matches_selection,
+        existing_cache_store,
+        tidy_caches,
+    )
+    from nd2wsi.migration import pack_directory
+
+    nfc_name = unicodedata.normalize("NFC", sample)
+    nfd_name = unicodedata.normalize("NFD", sample)
+    assert nfc_name != nfd_name
+
+    rng = np.random.default_rng(7)
+    img = rng.integers(0, 255, (900, 1200, 3), dtype=np.uint8)
+    slide = tmp_path / nfc_name
+    tifffile.imwrite(
+        slide,
+        img,
+        tile=(240, 240),
+        photometric="rgb",
+        compression="jpeg2000",
+        compressionargs={"reversible": True},
+        description="Aperio Image|MPP = 0.5|AppMag = 20",
+    )
+
+    store = ensure_cache(slide)
+    container = cache_container(slide)
+    assert store == container
+    assert container.name.startswith(f"{nfc_name}--")
+    orig_gen = read_manifest(container)["generation"]
+
+    # Manifest written on macOS in NFD must still match when opened in NFC (zero rebuild/quarantine)
+    _rewrite_single_file_manifest(
+        container, lambda m: m["source"].__setitem__("name", nfd_name)
+    )
+    assert cache_matches(container, slide, PlaneSelection())
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            convert_mod,
+            "convert",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected cache rebuild")),
+        )
+        assert existing_cache_store(slide) == store
+        assert ensure_cache(slide) == store
+        assert read_manifest(container)["generation"] == orig_gen
+        assert not list(container.parent.glob("*.corrupt-*"))
+
+        # Also verify ensure_cache / existing_cache_store honor a resolved NFD container path
+        nfd_container = container.with_name(unicodedata.normalize("NFD", container.name))
+        real_resolve = cache_mod.resolve_existing_path
+
+        def resolve_to_nfd(path: Path, *, kind: str = "any") -> Path:
+            if path == container:
+                return nfd_container
+            return real_resolve(path, kind=kind)
+
+        mp.setattr(cache_mod, "resolve_existing_path", resolve_to_nfd)
+        # On normalization-sensitive FS this ensures the resolved path is locked/returned;
+        # on APFS nfd_container resolves to the same file on disk.
+        if nfd_container.exists():
+            assert existing_cache_store(slide) == nfd_container
+            assert ensure_cache(slide) == nfd_container
+
+    # Legacy .ome.zarr attrs with NFD source name matches NFC slide
+    legacy = tmp_path / "pyramids" / f"{nfc_name}.ome.zarr"
+    convert_mod.convert(slide, legacy, progress=False)
+    root = zarr.open_group(str(legacy), mode="r+")
+    meta = json.loads(json.dumps(dict(root.attrs["nd2wsi"])))
+    meta["source"] = nfd_name
+    root.attrs["nd2wsi"] = meta
+    _, attrs = open_store(legacy)
+    assert _store_matches_selection(slide, attrs, PlaneSelection())
+    assert _legacy_store_matches_source(legacy, slide, attrs)
+
+    # pack_directory accepts NFD manifest source.name when source path is NFC
+    dir_cache = directory_cache_container(slide, PlaneSelection())
+    dir_cache.mkdir(parents=True)
+    convert_mod.convert(slide, dir_cache / "store.ome.zarr", progress=False)
+    fp = quick_fingerprint(slide)
+    fp["name"] = nfd_name
+    lv0 = attrs["nd2wsi"]["levels"][0]
+    write_manifest(
+        dir_cache,
+        slide,
+        fp,
+        PlaneSelection().describe(),
+        attrs["nd2wsi"].get("selection", {}).get("z"),
+        attrs["nd2wsi"]["tile"],
+        (len(attrs["omero"]["channels"]), lv0["height"], lv0["width"]),
+        attrs["nd2wsi"]["dtype"],
+    )
+    packed = tmp_path / f"packed-{nfc_name}.nd2svs"
+    assert pack_directory(dir_cache, packed, source=slide)["verified"] is True
+
+    # tidy_caches skips moving a scattered store when an NFC/NFD twin already exists in pyramids/
+    scattered = tmp_path / f"{nfc_name}.ome.zarr"
+    scattered.mkdir()
+    (scattered / ".zattrs").write_text('{"nd2wsi": {}}', encoding="utf-8")
+    summary = tidy_caches(tmp_path, dry_run=True)
+    assert summary["moved"] == []

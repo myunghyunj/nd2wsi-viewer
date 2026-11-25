@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from . import follow_flips as follow_flips
@@ -49,6 +51,8 @@ from .translucent_stage_follow import (
 from .translucent_stage_follow import _hwnd_from_native as _hwnd_from_native
 from .translucent_stage_follow import _win32_has_per_window_dpi as _win32_has_per_window_dpi
 from .translucent_stage_follow import _win32_system_dpi_scale as _win32_system_dpi_scale
+from .translucent_validation import _FLOAT32_SAFE_BOUND as _FLOAT32_SAFE_BOUND
+from .translucent_validation import _HEX6_RE as _HEX6_RE
 from .translucent_validation import _HEX_COLOR_RE as _HEX_COLOR_RE
 from .translucent_validation import (
     CLIENT_LOG_FIELD_LIMIT,
@@ -68,10 +72,13 @@ from .translucent_validation import (
     VIEW_KEYS,
     _number,
     laser_scope,
+    merge_display_query,
     normalize_laser_items,
     normalize_source_format,
     roi_pair_paths,
     validate_context,
+    validate_display_params,
+    validate_display_query,
     validate_follow_flips,
     validate_laser_item,
     validate_laser_target_request,
@@ -124,6 +131,29 @@ class _OverlayDrag(NativeTitlebarDrag):
             self.logger(f"translucent window drag failed: {exc!r}")
 
 
+class _DisplaySession:
+    """Ephemeral per-launch display state and condition waiter."""
+
+    def __init__(
+        self,
+        *,
+        launch_token: str,
+        launch_generation: str,
+        base_query: str,
+        query: str,
+        cond: threading.Condition,
+    ):
+        self.launch_token = launch_token
+        self.launch_generation = launch_generation
+        self.base_query = base_query
+        self.query = query
+        self.revision = 0
+        self.expired = False
+        self.expired_reason = ""
+        self.retired = False
+        self.cond = cond
+
+
 class TranslucentApi(StageFollowMixin):
     """Display-only bridge with read-only, user-selected JPG/TXT ROI import.
 
@@ -142,23 +172,38 @@ class TranslucentApi(StageFollowMixin):
         on_laser_box=None,
         is_active=None,
         on_lock=None,
+        launch_token=None,
+        launch_generation="",
     ):
         self._context = copy.deepcopy(context)
         self._context.setdefault("opacity", OPACITY)
         self._context["opacity_mode"] = "native" if sys.platform == "win32" else "layer"
         self._logger = logger
         self._on_closed = on_closed
-        self._close_notified = False
         self._window = None
         self._page_url = None
         self._drag = None
         self._locked = False
         self._closed = False
+        self._close_notified = False
         self._configured = False
         self._drop_document = None
         self._epoch = 0
         self._context_epoch = 0
         self._lock = threading.RLock()
+        self._refresh_lock = threading.RLock()
+        initial_query = self._context.get("query", "")
+        if not isinstance(initial_query, str):
+            initial_query = ""
+        token = launch_token if isinstance(launch_token, str) and launch_token else uuid.uuid4().hex
+        gen = launch_generation if isinstance(launch_generation, str) else ""
+        self._session = _DisplaySession(
+            launch_token=token,
+            launch_generation=gen,
+            base_query=initial_query,
+            query=initial_query,
+            cond=threading.Condition(self._lock),
+        )
         self._stage_follow = None
         self._stage_follower = None
         self._stage_follow_source = None
@@ -206,15 +251,135 @@ class TranslucentApi(StageFollowMixin):
 
     def translucent_context(self):
         with self._lock:
+            s = self._session
             flip_x, flip_y = self._follow_flips
             return {
                 **copy.deepcopy(self._context),
+                "query": s.query,
+                "launch_token": s.launch_token,
+                "display_revision": s.revision,
                 "locked": self._locked,
                 "source_format": self._source_format,
                 "follow_flips": {"flip_x": flip_x, "flip_y": flip_y},
                 "laser_target": copy.deepcopy(self._laser_target),
                 "laser_items": copy.deepcopy(list(self._laser_items.values())),
             }
+
+    def translucent_display_state(self) -> dict:
+        with self._lock:
+            s = self._session
+            if self._closed or s.retired:
+                return {"ok": False, "closed": True}
+            return {
+                "ok": True,
+                "launch_token": s.launch_token,
+                "revision": s.revision,
+                "query": s.query,
+                "expired": s.expired,
+                "reason": s.expired_reason,
+            }
+
+    def wait_translucent_display(
+        self,
+        launch_token: str,
+        after_revision: int,
+        timeout_ms: int = 25000,
+    ) -> dict:
+        if (
+            not isinstance(launch_token, str)
+            or type(after_revision) is not int
+            or not 0 <= after_revision <= 2**53 - 1
+            or isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, (int, float))
+            or not math.isfinite(timeout_ms)
+            or not 1 <= timeout_ms <= 60000
+        ):
+            return {"ok": False, "message": "Invalid display wait request"}
+        deadline = time.monotonic() + float(timeout_ms) / 1000.0
+        with self._lock:
+            s = self._session
+            if self._closed or s.retired or s.launch_token != launch_token:
+                return {"ok": False, "closed": True}
+            while not (
+                self._closed
+                or s.retired
+                or self._session is not s
+                or s.launch_token != launch_token
+                or s.expired
+                or s.revision > after_revision
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                s.cond.wait(timeout=remaining)
+            if self._closed or s.retired or self._session is not s or s.launch_token != launch_token:
+                return {"ok": False, "closed": True}
+            if s.expired:
+                return {
+                    "ok": True,
+                    "launch_token": s.launch_token,
+                    "revision": s.revision,
+                    "query": s.query,
+                    "expired": True,
+                    "reason": s.expired_reason,
+                }
+            if s.revision > after_revision:
+                return {
+                    "ok": True,
+                    "launch_token": s.launch_token,
+                    "revision": s.revision,
+                    "query": s.query,
+                    "expired": False,
+                    "unchanged": False,
+                }
+            return {
+                "ok": True,
+                "launch_token": s.launch_token,
+                "revision": s.revision,
+                "query": s.query,
+                "expired": False,
+                "unchanged": True,
+            }
+
+    def _is_closed(self) -> bool:
+        with self._lock:
+            return self._closed or self._session.retired
+
+    def _session_snapshot(self) -> tuple[str, str, str, bool]:
+        with self._lock:
+            s = self._session
+            return (s.launch_token, s.launch_generation, s.base_query, self._closed or s.retired)
+
+    def _apply_display_query(self, launch_token: str, revision: int, merged_query: str) -> dict:
+        with self._lock:
+            s = self._session
+            if self._closed or s.retired:
+                return {"ok": False, "closed": True}
+            if s.launch_token != launch_token:
+                return {"ok": False, "stale": True}
+            if s.expired:
+                return {
+                    "ok": False,
+                    "stale_generation": True,
+                    "message": "The source image changed. Reopen the translucent viewer.",
+                }
+            if revision <= s.revision:
+                return {"ok": True, "applied": False, "revision": s.revision}
+            s.revision = revision
+            s.query = merged_query
+            self._context["query"] = merged_query
+            s.cond.notify_all()
+            return {"ok": True, "applied": True, "revision": revision}
+
+    def _expire_display_session(self, launch_token: str, reason: str = "generation_changed") -> bool:
+        with self._lock:
+            s = self._session
+            if not self._closed and not s.retired and s.launch_token == launch_token:
+                s.expired = True
+                s.expired_reason = reason
+                s.cond.notify_all()
+                return True
+            return False
 
     def choose_roi_file(self):
         """Choose a coordinate-reference JPG and its AstroMapper TXT together."""
@@ -351,8 +516,10 @@ class TranslucentApi(StageFollowMixin):
             self._load_timer.cancel()
 
         def configure():
-            if self._closed or self._configured:
-                return
+            with self._lock:
+                if self._closed or self._configured:
+                    return
+                opacity = self._context["opacity"]
             native = self._window.native
             if sys.platform == "darwin":
                 import AppKit
@@ -376,7 +543,7 @@ class TranslucentApi(StageFollowMixin):
                 # WebView2's ordinary HWND host does not provide per-pixel
                 # desktop alpha. Native form opacity supplies the tracing
                 # effect (including controls) without applying alpha twice.
-                native.Opacity = self._context["opacity"]
+                native.Opacity = opacity
                 native.TopMost = True
                 native.ShowInTaskbar = False
                 self._round_windows_region()
@@ -385,7 +552,8 @@ class TranslucentApi(StageFollowMixin):
                     self._win32_focus.apply_locked(native, self._context["opacity"])
                 if not self._show_windows_noactivate_if_needed(native):
                     native.Show()
-            self._configured = True
+            with self._lock:
+                self._configured = True
 
         try:
             self._dispatch(configure)
@@ -575,89 +743,126 @@ class TranslucentApi(StageFollowMixin):
 
         return {"ok": self._geometry(resize), "width": width, "height": height}
 
-    def refresh_context(self, context):
+    def _refresh_context(
+        self,
+        context,
+        *,
+        launch_token=None,
+        launch_generation="",
+        _skip_stop: bool = False,
+    ) -> str:
         """Reuse this process's visible tracing window with the source pane's view."""
-        with self._lock:
-            if self._closed or not self._configured:
-                raise ValueError("The tracing window is still opening or closing.")
-        self.stop_stage_follow()
-        was_locked = False
-        with self._lock:
-            if self._closed or not self._configured:
-                raise ValueError("The tracing window is still opening or closing.")
-            scope_changed = self._laser_scope(context) != self._laser_scope(self._context)
-            next_context = copy.deepcopy(context)
-            incoming_laser = next_context.pop("laser_items", None)
-            if incoming_laser is not None:
-                self._laser_items = normalize_laser_items(incoming_laser)
-            elif scope_changed:
-                self._laser_items = {}
-            if "source_format" in next_context:
-                new_format = normalize_source_format(next_context.get("source_format"))
-                format_changed = new_format != self._source_format
-                self._source_format = new_format
-            else:
-                format_changed = False
-            self._context = {
-                **next_context,
-                "opacity": self._context["opacity"],
-                "opacity_mode": self._context["opacity_mode"],
-            }
-            self._overlay_view = None
-            self._overlay_view_epoch = None
-            self._lock_reported = None
-            self._last_locked_center = None
-            self._realign_from = None
-            if self._locked:
-                self._locked = False
-                was_locked = True
-            self._epoch += 1
-            self._context_epoch += 1
-            requested_opacity = self._context["opacity"]
-        if format_changed:
-            self._follow_flips = (False, False)
-            if self._flip_store is not None:
-                self._restore_flips()
-        if was_locked:
-            if sys.platform == "win32":
-                self._win32_focus.stop_hover_timer()
+        token = launch_token if isinstance(launch_token, str) and launch_token else uuid.uuid4().hex
+        gen = launch_generation if isinstance(launch_generation, str) else ""
+        with self._refresh_lock:
+            with self._lock:
+                if self._closed or not self._configured:
+                    raise ValueError("The tracing window is still opening or closing.")
+            if not _skip_stop:
+                self.stop_stage_follow()
+            was_locked = False
+            with self._lock:
+                if self._closed or not self._configured:
+                    raise ValueError("The tracing window is still opening or closing.")
+                scope_changed = self._laser_scope(context) != self._laser_scope(self._context)
+                next_context = copy.deepcopy(context)
+                incoming_laser = next_context.pop("laser_items", None)
+                if incoming_laser is not None:
+                    self._laser_items = normalize_laser_items(incoming_laser)
+                elif scope_changed:
+                    self._laser_items = {}
+                if "source_format" in next_context:
+                    new_format = normalize_source_format(next_context.get("source_format"))
+                    format_changed = new_format != self._source_format
+                    self._source_format = new_format
+                else:
+                    format_changed = False
+                self._context = {
+                    **next_context,
+                    "opacity": self._context["opacity"],
+                    "opacity_mode": self._context["opacity_mode"],
+                }
+                if format_changed:
+                    self._follow_flips = (False, False)
+                    if self._flip_store is not None:
+                        self._restore_flips()
+                initial_query = self._context.get("query", "")
+                if not isinstance(initial_query, str):
+                    initial_query = ""
+                old_session = self._session
+                old_session.retired = True
+                old_session.cond.notify_all()
+                self._session = _DisplaySession(
+                    launch_token=token,
+                    launch_generation=gen,
+                    base_query=initial_query,
+                    query=initial_query,
+                    cond=threading.Condition(self._lock),
+                )
+                self._overlay_view = None
+                self._overlay_view_epoch = None
+                self._lock_reported = None
+                self._last_locked_center = None
+                self._realign_from = None
+                if self._locked:
+                    self._locked = False
+                    was_locked = True
+                self._epoch += 1
+                self._context_epoch += 1
+                epoch = self._epoch
+                requested_opacity = self._context["opacity"]
+            if was_locked:
+                if sys.platform == "win32":
+                    self._win32_focus.stop_hover_timer()
 
-            def unlock():
-                if self._closed:
-                    return
-                native = getattr(self._window, "native", None)
-                if native is None:
-                    return
-                if sys.platform == "darwin":
-                    native.setMovable_(True)
-                elif sys.platform == "win32":
-                    self._win32_focus.apply_unlocked(native, requested_opacity)
-
-            try:
-                self._dispatch(unlock)
-            except Exception:
-                pass
-            if self._on_lock is not None:
-                self._on_lock(False)
-        self._window.load_url(self._page_url)
-        if sys.platform == "win32" and (
-            was_locked or self._locked or self._win32_focus.is_slacs_foreground()
-        ):
-            native = getattr(self._window, "native", None)
-            if self._win32_focus.can_control(native):
-                def show_noactivate():
-                    if self._closed:
+                def unlock():
+                    with self._lock:
+                        if self._closed or epoch != self._epoch:
+                            return
+                    native = getattr(self._window, "native", None)
+                    if native is None:
                         return
-                    if not self._win32_focus.show_noactivate(native):
-                        self._window.show()
+                    if sys.platform == "darwin":
+                        native.setMovable_(True)
+                    elif sys.platform == "win32":
+                        self._win32_focus.apply_unlocked(native, requested_opacity)
 
                 try:
-                    self._dispatch(show_noactivate)
+                    self._dispatch(unlock)
                 except Exception:
-                    if not self._win32_focus.show_noactivate(native):
-                        self._window.show()
-                return
-        self._window.show()
+                    pass
+                if self._on_lock is not None:
+                    self._on_lock(False)
+            with self._lock:
+                if self._closed or self._session.launch_token != token:
+                    return token
+            self._window.load_url(self._page_url)
+            with self._lock:
+                if self._closed or self._session.launch_token != token:
+                    return token
+            if sys.platform == "win32" and (
+                was_locked or self._locked or self._win32_focus.is_slacs_foreground()
+            ):
+                native = getattr(self._window, "native", None)
+                if self._win32_focus.can_control(native):
+                    def show_noactivate():
+                        with self._lock:
+                            if self._closed or epoch != self._epoch or self._session.launch_token != token:
+                                return
+                        if not self._win32_focus.show_noactivate(native):
+                            self._window.show()
+
+                    try:
+                        self._dispatch(show_noactivate)
+                    except Exception:
+                        with self._lock:
+                            if self._closed or self._session.launch_token != token:
+                                return token
+                        if not self._win32_focus.show_noactivate(native):
+                            self._window.show()
+                    return token
+            self._window.show()
+            return token
 
     def _initial_load_timeout(self):
         with self._lock:
@@ -684,6 +889,8 @@ class TranslucentApi(StageFollowMixin):
             self._pending_laser_epoch = None
             self._pending_laser_context_epoch = None
             self._pending_laser_scope = None
+            self._session.retired = True
+            self._session.cond.notify_all()
         self._win32_focus.close()
         if self._laser_delivery is not None:
             self._laser_delivery.close()
@@ -710,6 +917,8 @@ class TranslucentApi(StageFollowMixin):
             self._pending_laser_epoch = None
             self._pending_laser_context_epoch = None
             self._pending_laser_scope = None
+            self._session.retired = True
+            self._session.cond.notify_all()
         self._win32_focus.close()
         if self._laser_delivery is not None:
             self._laser_delivery.close()
@@ -731,6 +940,8 @@ def create_translucent_window(
     on_laser_box=None,
     is_active=None,
     on_lock=None,
+    launch_token=None,
+    launch_generation="",
 ):
     import webview
 
@@ -743,6 +954,8 @@ def create_translucent_window(
         on_laser_box=on_laser_box,
         is_active=is_active,
         on_lock=on_lock,
+        launch_token=launch_token,
+        launch_generation=launch_generation,
     )
     try:
         window = webview.create_window(
@@ -776,13 +989,16 @@ def create_translucent_window(
     window.events.loaded += api._configure_and_show
     window.events.loaded += api._wire_drop
     window.events.closed += api._did_close
-    api._load_timer = threading.Timer(30, api._initial_load_timeout)
-    api._load_timer.daemon = True
-    api._load_timer.start()
-    # Dynamic window creation can load before callbacks are registered.
-    if window.events.loaded.is_set():
-        api._configure_and_show()
-        api._wire_drop()
+    if getattr(window.events.closed, "is_set", lambda: False)():
+        api._did_close()
+    else:
+        api._load_timer = threading.Timer(30, api._initial_load_timeout)
+        api._load_timer.daemon = True
+        api._load_timer.start()
+        # Dynamic window creation can load before callbacks are registered.
+        if window.events.loaded.is_set():
+            api._configure_and_show()
+            api._wire_drop()
     return api
 
 
@@ -825,9 +1041,12 @@ __all__ = [
     "Win32OverlayFocusController",
     "create_translucent_window",
     "laser_scope",
+    "merge_display_query",
     "point_in_interactive_rects",
     "roi_pair_paths",
     "validate_context",
+    "validate_display_params",
+    "validate_display_query",
     "validate_follow_flips",
     "validate_laser_item",
     "validate_laser_target_request",

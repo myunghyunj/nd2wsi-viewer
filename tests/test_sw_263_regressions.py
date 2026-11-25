@@ -208,7 +208,7 @@ def test_sw1_refresh_context_during_in_flight_confirmation_drops_stale_roi():
         assert reason is None
         assert api._deliver_laser_box(payload) is True
         # Refresh context (even with identical query/scope, e.g. reload) advances _context_epoch.
-        api.refresh_context(_laser_context(laser_items=[]))
+        api._refresh_context(_laser_context(laser_items=[]))
         api._window.evaluate_js.reset_mock()
         stale_item = {
             "id": "slacs-laser-r1-1",

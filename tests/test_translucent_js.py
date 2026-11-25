@@ -50,8 +50,9 @@ function fakeViewer(){
   return {viewport,calls,handlers,nav:true,addHandler(name,cb){handlers[name]=cb;},
     forceRedraw(){},setMouseNavEnabled(value){this.nav=value;},destroy(){}};
 }
-function harness({failLock=false,failOpacity=false,opacityResult,initialContext={},bridgeOverrides={},infoOverrides={},
-    stored={},blockStorage=false}={}){
+function harness({failLock=false,failOpacity=false,opacityResult,initialContext={},bridgeOverrides={},
+    infoOverrides={},stored={},blockStorage=false,withBackdrop=false,withWorld=false,
+    winOverrides={},docOverrides={},autoOpen=true}={}){
   const elements=new Map();
   function newElement(id){return {id,style:{},dataset:{},attributes:{},children:[],
     listeners:{},clientWidth:800,clientHeight:500,disabled:false,hidden:false,
@@ -62,10 +63,20 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
     appendChild(child){this.children=this.children.filter(item=>item!==child);this.children.push(child);return child;},
     get lastElementChild(){return this.children[this.children.length-1];}};}
   function element(id){if(!elements.has(id))elements.set(id,newElement(id));return elements.get(id);}
+  const backdropLog={draws:[],clears:[]};
+  if(withBackdrop){
+    const bd=element('translucent-backdrop');
+    bd.hidden=true;bd.width=0;bd.height=0;
+    const ctx={
+      clearRect(x,y,w,h){backdropLog.clears.push([x,y,w,h]);},
+      drawImage(src,x,y){backdropLog.draws.push({width:src.width,height:src.height,x,y});},
+    };
+    bd.getContext=kind=>kind==='2d'?ctx:null;
+  }
   const documentListeners={};
   const doc={getElementById:element,createElementNS(namespace,name){return newElement(name);},
-    querySelectorAll(){return [];},addEventListener(name,cb){documentListeners[name]=cb;}};
-  const windowListeners={},timers=new Map(),intervals=new Map();let timerIndex=0;
+    querySelectorAll(){return [];},addEventListener(name,cb){documentListeners[name]=cb;},...docOverrides};
+  const windowListeners={},winListeners=windowListeners,timers=new Map(),intervals=new Map();let timerIndex=0;
   const storage=new Map(Object.entries(stored));
   const blocked=()=>{throw new Error('SecurityError: storage is blocked');};
   const win={innerWidth:800,innerHeight:500,addEventListener(name,fn){windowListeners[name]=fn;},
@@ -75,8 +86,31 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
     setTimeout(fn,delay){const id=++timerIndex;timers.set(id,{fn,delay});return id;},
     clearTimeout(id){timers.delete(id);},
     setInterval(fn,delay){const id=++timerIndex;intervals.set(id,{fn,delay});return id;},
-    clearInterval(id){intervals.delete(id);}};
+    clearInterval(id){intervals.delete(id);},...winOverrides};
   const viewer=fakeViewer();
+  let item=null;
+  const loaderClears=[];
+  if(withBackdrop){
+    viewer.drawer={canvas:{width:800,height:500}};
+  }
+  if(withWorld){
+    viewer.imageLoader={clear(){loaderClears.push(true);}};
+    item={
+      viewer,
+      tilesMatrix:{},
+      resets:0,
+      fullyLoaded:true,
+      drawArea:{x:0,y:0,width:800,height:500},
+      clip:null,
+      reset(){this.resets+=1;},
+      getDrawArea(){return this.drawArea;},
+      getFullyLoaded(){return this.fullyLoaded;},
+      _setFullyLoaded(v){this.fullyLoaded=Boolean(v);},
+      getClip(){return this.clip;},
+      setClip(c){this.clip=c;},
+    };
+    viewer.world={getItemAt(i){return i===0?item:null;}};
+  }
   let osdOptions;
   const OSD=options=>{osdOptions=options;return viewer;};OSD.Point=Point;
   const nativeCalls=[];
@@ -91,8 +125,9 @@ function harness({failLock=false,failOpacity=false,opacityResult,initialContext=
   Object.assign(bridge,bridgeOverrides);
   const mounted=api.mount({window:win,document:doc,api:bridge,OSD,context:{...context,...initialContext},
     info:{...info,...infoOverrides},importer});
-  viewer.handlers.open();
-  return {mounted,viewer,element,win,storage,nativeCalls,osdOptions,documentListeners,windowListeners,timers,intervals};
+  if(autoOpen)viewer.handlers.open();
+  return {mounted,viewer,element,win,storage,nativeCalls,osdOptions,documentListeners,windowListeners,winListeners,
+    timers,intervals,backdropLog,item,loaderClears};
 }
 function followHarness(options={}){
   const snapshot={enabled:true,session_id:'session-one',seq:0,displacement_um:[0,0],status:'waiting'};
@@ -1826,14 +1861,994 @@ def test_view_reports_are_throttled_and_update_viewport_still_redraws_rois():
       viewTimers()[0].fn();await settle();
       const sent=reports.length-base,center=reports[reports.length-1].center_px;
       h.viewer.handlers['update-viewport']();
+      const unchangedTimers=viewTimers().length;
+      h.viewer.viewport.panTo(new Point(.43,.255));
+      h.viewer.handlers['update-viewport']();
       const rescheduled=viewTimers().length;
       h.windowListeners.pagehide();
-      const plain=followHarness();plain.viewer.handlers['update-viewport']();
-      return {initial,moved,pending,beforeTimer,sent,center,rescheduled,cleared:viewTimers().length,
+      const plain=followHarness();plain.viewer.viewport.panTo(new Point(.43,.255));plain.viewer.handlers['update-viewport']();
+      return {initial,moved,pending,beforeTimer,sent,center,unchangedTimers,rescheduled,cleared:viewTimers().length,
         plainTimers:[...plain.timers.values()].filter(t=>t.delay===200).length};
     """)
     assert result["moved"] != result["initial"]  # the outlines still follow the camera
     assert result["pending"] == 1 and result["beforeTimer"] == 0
     assert result["sent"] == 1 and result["center"] == pytest.approx([420, 255])
+    assert result["unchangedTimers"] == 1  # unchanged update-viewport schedules no view report
     assert result["rescheduled"] == 2 and result["cleared"] == 1  # pagehide clears the pending one
     assert result["plainTimers"] == 0  # a bridge without report_overlay_view starts no timer
+
+
+def test_translucent_html_and_css_define_backdrop_canvas_inside_stage():
+    static = MODULE.parent
+    html = (static / "translucent.html").read_text(encoding="utf-8")
+    css = (static / "translucent-v1.css").read_text(encoding="utf-8")
+
+    stage_start = html.index('<div id="translucent-stage"')
+    stage_end = html.index("</div>", stage_start)
+    stage_inner = html[stage_start:stage_end]
+    backdrop_tag = '<canvas id="translucent-backdrop" aria-hidden="true" hidden></canvas>'
+    assert backdrop_tag in stage_inner
+    assert stage_inner.index(backdrop_tag) == stage_inner.index(">") + 1
+    assert html.index('id="translucent-backdrop"') < html.index('id="roi-overlay"')
+
+    assert "#translucent-backdrop { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }" in css
+    assert "#translucent-stage .openseadragon-container { position: relative; z-index: 1; }" in css
+    assert "isolation: isolate;" in css
+
+
+def test_dynamic_make_tile_source_and_high_channel_validation_with_fallback():
+    result = run("""
+      let active = 'c=0&g=original';
+      const dyn = api.makeTileSource(info, { ...context, query: '?c=0&g=original' }, { Point }, () => active);
+      const urlA = dyn.getTileUrl(0, 1, 0);
+      active = 'c=1&win=10%3A200&g=original';
+      const urlB = dyn.getTileUrl(0, 1, 0);
+      active = '';
+      const urlEmpty = dyn.getTileUrl(0, 1, 0);
+
+      // >32 channel col passes validateContext (no hardcoded 32 cap) and normalizes without leading '?'.
+      const col40 = Array.from({ length: 40 }, (_, i) => i % 2 === 0 ? '00ff88' : '').join(',');
+      const ctx40 = api.validateContext({ ...context, query: '?col=' + encodeURIComponent(col40) + '&g=original' }, context.slide_url);
+      const info40 = { ...info, channels: Array.from({ length: 40 }, (_, i) => ({ name: 'C' + i })) };
+      const src40 = api.makeTileSource(info40, ctx40, { Point });
+      const merged40 = api.validateMergedQuery('?col=' + encodeURIComponent(col40) + '&g=original&t=2&p=4&z=1', context.query, info40);
+      const defaultsRestored = api.validateMergedQuery('?g=original&t=2&p=4&z=1', context.query, info40);
+
+      // Minimal info without channels array falls back to syntax-only validation.
+      const fallback40 = api.validateMergedQuery('col=' + encodeURIComponent(col40) + '&g=original&t=2&p=4&z=1', context.query, info);
+
+      const col41 = Array.from({ length: 41 }, () => 'ff00aa').join(',');
+      const info2 = { ...info, channels: [{ name: 'A' }, { name: 'B' }] };
+      const rejections = [];
+      for (const op of [
+        () => api.validateContext({ ...context, query: 'c=' + '0,'.repeat(8200) }, context.slide_url),
+        () => api.validateContext({ ...context, query: 'col=%23ff00aa' }, context.slide_url),
+        () => api.makeTileSource(info40, { ...context, query: 'col=' + encodeURIComponent(col41) + '&g=original' }, { Point }),
+        () => api.makeTileSource(info2, { ...context, query: 'win=0%3A10%2C0%3A20%2C0%3A30&g=original' }, { Point }),
+        () => api.validateMergedQuery('c=0&g=changed&t=2&p=4&z=1', context.query, info2),
+        () => api.validateMergedQuery('c=0&g=original&t=2&p=9&z=1', context.query, info2),
+        () => api.validateMergedQuery('c=0&g=original&t=2&z=1', context.query, info2),
+        () => api.validateMergedQuery('c=0&extra=1&g=original&t=2&p=4&z=1', context.query, info2),
+        () => api.validateMergedQuery('col=ff00aa,00ff88,0000ff&g=original&t=2&p=4&z=1', context.query, info2),
+        () => api.validateMergedQuery(null, context.query, info2),
+      ]) {
+        try { op(); rejections.push(null); } catch (e) { rejections.push(e.message); }
+      }
+      return {
+        urlA, urlB, urlEmpty,
+        ctx40QueryStartsWithQ: ctx40.query.startsWith('?'),
+        src40UrlHasCol: src40.getTileUrl(0, 0, 0).includes('col='),
+        merged40HasCol: merged40.includes('col='),
+        defaultsRestored,
+        fallback40HasCol: fallback40.includes('col='),
+        rejections,
+      };
+    """)
+    assert result["urlA"].endswith("/api/tile/1/1/0.jpg?c=0&g=original")
+    assert result["urlB"].endswith("/api/tile/1/1/0.jpg?c=1&win=10%3A200&g=original")
+    assert result["urlEmpty"].endswith("/api/tile/1/1/0.jpg")
+    assert result["ctx40QueryStartsWithQ"] is False
+    assert result["src40UrlHasCol"] is True
+    assert result["merged40HasCol"] is True
+    assert result["defaultsRestored"] == "g=original&t=2&p=4&z=1"
+    assert result["fallback40HasCol"] is True
+    assert all(msg and "Invalid image display" in msg for msg in result["rejections"])
+
+
+def test_wait_translucent_display_loop_handles_initial_pull_updates_unchanged_closed_and_expired():
+    result = run("""
+      const waitCalls = [];
+      const queue = [
+        { ok: true, launch_token: 'tok-1', revision: 2, query: '?c=1&g=original&t=2&p=4&z=1', expired: false, unchanged: true },
+        { ok: true, launch_token: 'wrong-tok', revision: 3, query: '?c=0&g=original&t=2&p=4&z=1', expired: false, unchanged: false },
+        { ok: true, launch_token: 'tok-1', revision: 2, query: '?c=0&g=original&t=2&p=4&z=1', expired: false, unchanged: false },
+        { ok: true, launch_token: 'tok-1', revision: 3, query: '?c=0&p=999&g=original&t=2&z=1', expired: false, unchanged: false },
+        { ok: true, launch_token: 'tok-1', revision: 4, query: '?g=original&t=2&p=4&z=1', expired: false, unchanged: false },
+        { ok: false, closed: true },
+      ];
+      let statePulls = 0;
+      const h = harness({
+        withWorld: true,
+        initialContext: { launch_token: 'tok-1', display_revision: 0 },
+        bridgeOverrides: {
+          async translucent_display_state() {
+            statePulls += 1;
+            return { ok: true, launch_token: 'tok-1', revision: 2, query: '?c=1&g=original&t=2&p=4&z=1', expired: false };
+          },
+          async wait_translucent_display(token, afterRev, timeoutMs) {
+            waitCalls.push([token, afterRev, timeoutMs]);
+            return queue.shift();
+          },
+        },
+      });
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      const urlBeforePaint2 = h.osdOptions.tileSources.getTileUrl(0, 0, 0);
+      // fully-loaded-change BEFORE tiled-image-drawn must not advance rev 2 to rev 4.
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true });
+      const urlAfterFullyLoadedOnly = h.osdOptions.tileSources.getTileUrl(0, 0, 0);
+      // Drawing active tiles completes rev 2 and drains pending rev 4 onto activeQuery.
+      const tileRev2 = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: tileRev2 } } };
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tileRev2] });
+      const afterClosed = {
+        statePulls,
+        waitCalls,
+        maxTilesPerFrame: h.osdOptions.maxTilesPerFrame,
+        query: h.mounted.state.query,
+        rev: h.mounted.state.displayRevision,
+        urlBeforePaint2,
+        urlAfterFullyLoadedOnly,
+        url: h.osdOptions.tileSources.getTileUrl(0, 0, 0),
+        status: h.element('overlay-status').textContent,
+        statusHidden: h.element('overlay-status').hidden,
+        syncError: h.mounted.state.syncError,
+      };
+
+      // Separate mount verifying expired: true stops the loop and shows reopen banner.
+      const expWaitCalls = [];
+      const hExp = harness({
+        withBackdrop: true,
+        withWorld: true,
+        initialContext: { launch_token: 'tok-exp', display_revision: 1 },
+        bridgeOverrides: {
+          async wait_translucent_display(token, afterRev, timeoutMs) {
+            expWaitCalls.push([token, afterRev, timeoutMs]);
+            if (expWaitCalls.length === 1) {
+              return { ok: true, launch_token: 'tok-exp', revision: 1, query: context.query, expired: true, reason: 'generation_changed' };
+            }
+            return { ok: true, launch_token: 'tok-exp', revision: 2, query: '?g=original&t=2&p=4&z=1', expired: false };
+          },
+        },
+      });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      const postExpiredAccepted = hExp.mounted.applyDisplaySnapshot({
+        ok: true, launch_token: 'tok-exp', revision: 5, query: '?g=original&t=2&p=4&z=1',
+      });
+      return {
+        afterClosed,
+        expired: {
+          calls: expWaitCalls.length,
+          flag: hExp.mounted.state.expired,
+          status: hExp.element('overlay-status').textContent,
+          statusHidden: hExp.element('overlay-status').hidden,
+          backdropHidden: hExp.element('translucent-backdrop').hidden,
+          postExpiredAccepted,
+        },
+      };
+    """)
+    assert result["afterClosed"]["statePulls"] == 1
+    assert result["afterClosed"]["maxTilesPerFrame"] == 6
+    assert result["afterClosed"]["waitCalls"][0] == ["tok-1", 2, 25000]
+    assert result["afterClosed"]["waitCalls"][-1] == ["tok-1", 4, 25000]
+    assert result["afterClosed"]["query"] == "g=original&t=2&p=4&z=1"
+    assert result["afterClosed"]["rev"] == 4
+    assert result["afterClosed"]["urlBeforePaint2"].endswith("/api/tile/1/0/0.jpg?c=1&g=original&t=2&p=4&z=1")
+    assert result["afterClosed"]["urlAfterFullyLoadedOnly"] == result["afterClosed"]["urlBeforePaint2"]
+    assert result["afterClosed"]["url"].endswith("/api/tile/1/0/0.jpg?g=original&t=2&p=4&z=1")
+    assert result["afterClosed"]["status"] == ""
+    assert result["afterClosed"]["statusHidden"] is True
+    assert result["afterClosed"]["syncError"] == ""
+    assert result["expired"] == {
+        "calls": 1,
+        "flag": True,
+        "status": "The source image changed. Close and reopen the translucent viewer.",
+        "statusHidden": False,
+        "backdropHidden": True,
+        "postExpiredAccepted": False,
+    }
+
+
+def test_wait_loop_transient_retry_persistent_sync_error_and_selective_status_clearing():
+    result = run("""
+      // 1) Single transient failure retries immediately with zero error banner.
+      let tCount = 0;
+      const hTransient = harness({
+        withWorld: true,
+        initialContext: { launch_token: 'tok-t', display_revision: 0 },
+        bridgeOverrides: {
+          async wait_translucent_display() {
+            tCount += 1;
+            if (tCount === 1) throw new Error('temporary ipc hiccup');
+            if (tCount === 2) return { ok: true, launch_token: 'tok-t', revision: 1, query: '?c=0&g=original&t=2&p=4&z=1', expired: false };
+            return { ok: false, closed: true };
+          },
+        },
+      });
+      for (let i = 0; i < 15; i++) await Promise.resolve();
+      const transient = {
+        calls: tCount,
+        rev: hTransient.mounted.state.displayRevision,
+        syncError: hTransient.mounted.state.syncError,
+        status: hTransient.element('overlay-status').textContent,
+      };
+
+      // 2) Two consecutive failures show sync error without resetting tiles, back off 1000ms, and clear on recovery.
+      const timers = [];
+      let pCount = 0;
+      const hPersist = harness({
+        withWorld: true,
+        initialContext: { launch_token: 'tok-p', display_revision: 0 },
+        winOverrides: {
+          setTimeout(fn, ms) { timers.push({ fn, ms, cleared: false }); return timers.length; },
+          clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
+        },
+        bridgeOverrides: {
+          async wait_translucent_display() {
+            pCount += 1;
+            if (pCount <= 2) throw new Error('bridge down');
+            if (pCount === 3) return { ok: true, launch_token: 'tok-p', revision: 1, query: '?c=0&g=original&t=2&p=4&z=1', expired: false };
+            return { ok: false, closed: true };
+          },
+        },
+      });
+      for (let i = 0; i < 15; i++) await Promise.resolve();
+      const duringError = {
+        calls: pCount,
+        resets: hPersist.item.resets,
+        syncError: hPersist.mounted.state.syncError,
+        status: hPersist.element('overlay-status').textContent,
+        backoffMs: timers.filter(t => t.ms === 1000).map(t => t.ms),
+      };
+      // Trigger the 1000ms backoff timer -> recovery should clear syncError and status.
+      timers.find(t => t.ms === 1000).fn();
+      for (let i = 0; i < 15; i++) await Promise.resolve();
+      const afterRecovery = {
+        rev: hPersist.mounted.state.displayRevision,
+        syncError: hPersist.mounted.state.syncError,
+        status: hPersist.element('overlay-status').textContent,
+        statusHidden: hPersist.element('overlay-status').hidden,
+      };
+
+      // 3) Sync recovery must NOT clear an unrelated status banner (e.g. opacity failure).
+      const timers2 = [];
+      let uCount = 0;
+      const hUnrelated = harness({
+        withWorld: true,
+        failOpacity: true,
+        initialContext: { launch_token: 'tok-u', display_revision: 0 },
+        winOverrides: {
+          setTimeout(fn, ms) { timers2.push({ fn, ms }); return timers2.length; },
+          clearTimeout() {},
+        },
+        bridgeOverrides: {
+          async wait_translucent_display() {
+            uCount += 1;
+            if (uCount <= 2) return { ok: false };
+            if (uCount === 3) return { ok: true, launch_token: 'tok-u', revision: 0, query: context.query, unchanged: true };
+            return { ok: false, closed: true };
+          },
+        },
+      });
+      for (let i = 0; i < 15; i++) await Promise.resolve();
+      await hUnrelated.mounted.setOpacity(0.7);
+      const beforeRecoverStatus = hUnrelated.element('overlay-status').textContent;
+      timers2.find(t => t.ms === 1000).fn();
+      for (let i = 0; i < 15; i++) await Promise.resolve();
+      const afterUnrelatedRecover = {
+        beforeRecoverStatus,
+        status: hUnrelated.element('overlay-status').textContent,
+        syncError: hUnrelated.mounted.state.syncError,
+      };
+
+      return { transient, duringError, afterRecovery, afterUnrelatedRecover };
+    """)
+    assert result["transient"] == {"calls": 3, "rev": 1, "syncError": "", "status": ""}
+    assert result["duringError"] == {
+        "calls": 2,
+        "resets": 0,
+        "syncError": "Could not sync contrast settings.",
+        "status": "Could not sync contrast settings.",
+        "backoffMs": [1000],
+    }
+    assert result["afterRecovery"] == {"rev": 1, "syncError": "", "status": "", "statusHidden": True}
+    assert result["afterUnrelatedRecover"] == {
+        "beforeRecoverStatus": "opacity unavailable",
+        "status": "opacity unavailable",
+        "syncError": "",
+    }
+
+
+def test_backdrop_captures_before_reset_and_clears_on_paint_camera_resize_error_and_pagehide():
+    result = run("""
+      const h = harness({
+        withBackdrop: true,
+        withWorld: true,
+        initialContext: { launch_token: 'tok-bd', display_revision: 0 },
+      });
+      const bd = h.element('translucent-backdrop');
+      const m = h.mounted;
+
+      // 1) Update triggers backdrop capture; unchanged update-viewport keeps backdrop visible; full paint clears it.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-bd', revision: 1, query: '?c=0&g=original&t=2&p=4&z=1' });
+      const afterReq1 = {
+        hidden: bd.hidden,
+        draws: h.backdropLog.draws.length,
+        clears: h.backdropLog.clears.length,
+        loaderClears: h.loaderClears.length,
+      };
+      // Redraw without camera change keeps backdrop visible.
+      h.viewer.handlers['update-viewport']();
+      const afterStillViewport = { hidden: bd.hidden };
+      // Full paint clears backdrop.
+      const tile1 = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: tile1 } } };
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tile1] });
+      const afterPaint = { hidden: bd.hidden, clears: h.backdropLog.clears.length };
+
+      const finishPaint = () => {
+        const tile = { level: 0, x: 0, y: 0 };
+        h.item.tilesMatrix = { 0: { 0: { 0: tile } } };
+        h.item.fullyLoaded = true;
+        h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true });
+        h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tile] });
+      };
+
+      // 2) Camera pan/zoom/rotate/flip clears backdrop immediately.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-bd', revision: 2, query: '?c=1&g=original&t=2&p=4&z=1' });
+      const visibleBeforePan = !bd.hidden;
+      h.viewer.viewport.panTo(new Point(0.45, 0.25));
+      h.viewer.handlers['update-viewport']();
+      const hiddenAfterPan = bd.hidden;
+      // Finish paint for rev 2 so gate settles.
+      finishPaint();
+
+      // 3) Rotation or flip change clears backdrop immediately.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-bd', revision: 3, query: '?c=0&g=original&t=2&p=4&z=1' });
+      const visibleBeforeFlip = !bd.hidden;
+      h.viewer.viewport.setFlip(false);
+      h.viewer.handlers['update-viewport']();
+      const hiddenAfterFlip = bd.hidden;
+      finishPaint();
+
+      // 4) resize() clears backdrop immediately.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-bd', revision: 4, query: '?c=1&g=original&t=2&p=4&z=1' });
+      const visibleBeforeResize = !bd.hidden;
+      h.element('translucent-stage').clientWidth = 640;
+      m.resize();
+      const hiddenAfterResize = bd.hidden;
+      finishPaint();
+
+      // 5) open-failed clears backdrop immediately.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-bd', revision: 5, query: '?c=0&g=original&t=2&p=4&z=1' });
+      const visibleBeforeOpenFail = !bd.hidden;
+      h.viewer.handlers['open-failed']();
+      const hiddenAfterOpenFail = bd.hidden;
+      finishPaint();
+
+      // 6) pagehide clears backdrop immediately.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-bd', revision: 6, query: '?c=1&g=original&t=2&p=4&z=1' });
+      const visibleBeforeHide = !bd.hidden;
+      h.winListeners.pagehide();
+      const hiddenAfterHide = bd.hidden;
+
+      return {
+        afterReq1, afterStillViewport, afterPaint,
+        visibleBeforePan, hiddenAfterPan,
+        visibleBeforeFlip, hiddenAfterFlip,
+        visibleBeforeResize, hiddenAfterResize,
+        visibleBeforeOpenFail, hiddenAfterOpenFail,
+        visibleBeforeHide, hiddenAfterHide,
+      };
+    """)
+    assert result["afterReq1"] == {"hidden": False, "draws": 1, "clears": 1, "loaderClears": 1}
+    assert result["afterStillViewport"] == {"hidden": False}
+    assert result["afterPaint"] == {"hidden": True, "clears": 2}
+    assert result["visibleBeforePan"] is True and result["hiddenAfterPan"] is True
+    assert result["visibleBeforeFlip"] is True and result["hiddenAfterFlip"] is True
+    assert result["visibleBeforeResize"] is True and result["hiddenAfterResize"] is True
+    assert result["visibleBeforeOpenFail"] is True and result["hiddenAfterOpenFail"] is True
+    assert result["visibleBeforeHide"] is True and result["hiddenAfterHide"] is True
+
+
+def test_live_display_a_b_a_locked_roi_camera_invariance_and_stale_tile_error_suppression():
+    result = run("""
+      const h = harness({
+        withBackdrop: true,
+        withWorld: true,
+        initialContext: {
+          rotation: 0, flip: false,
+          launch_token: 'tok-aba', display_revision: 0,
+          query: 'c=0&win=0%3A255&g=original&t=2&p=4&z=1',
+          rois: [{ x: 390, y: 240, w: 20, h: 20 }, { x: 450, y: 250, w: 10, h: 10 }],
+          roiIndex: 0,
+        },
+      });
+      const m = h.mounted;
+      await m.toggleLock();
+      const beforeCamera = api.camera(h.viewer);
+      const beforeRoiPoints = h.element('roi-overlay').children.map(b => b.attributes.points);
+      const beforeOpacity = m.state.opacity;
+
+      const qA = 'c=0&win=0%3A255&g=original&t=2&p=4&z=1';
+      const qB = 'c=0&win=0%3A128&g=original&t=2&p=4&z=1';
+      const qC = 'c=0&win=0%3A192&g=original&t=2&p=4&z=1';
+
+      // Start A -> B while locked.
+      h.item.fullyLoaded = false;
+      const acceptedB = m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-aba', revision: 1, query: '?' + qB });
+      const activeDuringB = m.displayGate.getActiveQuery();
+      const urlDuringB = h.osdOptions.tileSources.getTileUrl(0, 0, 0);
+
+      // Obsolete tile from A fails -> must be suppressed (no error banner!).
+      const activeTileB = { level: 0, x: 0, y: 0, getUrl: () => urlDuringB };
+      const staleTileA = { level: 0, x: 0, y: 0, getUrl: () => 'http://localhost:9876/token/s/abc/api/tile/1/0/0.jpg?' + qA };
+      h.item.tilesMatrix = { 0: { 0: { 0: activeTileB } } };
+      h.viewer.handlers['tile-load-failed']({ tile: staleTileA });
+      const statusAfterStaleError = h.element('overlay-status').textContent;
+
+      // Queue C then A while B is still rendering (A -> B -> A coalescing).
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-aba', revision: 2, query: '?' + qC });
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-aba', revision: 3, query: '?' + qA });
+      const stillRenderingB = m.displayGate.getActiveQuery();
+
+      // Finish B -> gate must advance straight to A (skipping C).
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [activeTileB] });
+      const activeAfterB = m.displayGate.getActiveQuery();
+      const urlAfterB = h.osdOptions.tileSources.getTileUrl(0, 0, 0);
+
+      // Active tile failure on A shows error banner and clears backdrop.
+      const activeTileA = { level: 0, x: 0, y: 0, getUrl: () => urlAfterB };
+      h.item.tilesMatrix = { 0: { 0: { 0: activeTileA } } };
+      h.viewer.handlers['tile-load-failed']({ tile: activeTileA });
+      const statusAfterActiveError = h.element('overlay-status').textContent;
+      const backdropHiddenAfterError = h.element('translucent-backdrop').hidden;
+
+      // Subsequent update paints cleanly and clears the tile-load-failed status.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-aba', revision: 4, query: '?' + qC });
+      const activeTileC = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: activeTileC } } };
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [activeTileC] });
+
+      return {
+        acceptedB,
+        activeDuringB,
+        stillRenderingB,
+        activeAfterB,
+        statusAfterStaleError,
+        statusAfterActiveError,
+        backdropHiddenAfterError,
+        statusAfterRecovery: h.element('overlay-status').textContent,
+        finalActive: m.displayGate.getActiveQuery(),
+        locked: m.state.locked,
+        opacityUnchanged: m.state.opacity === beforeOpacity,
+        cameraUnchanged: JSON.stringify(beforeCamera) === JSON.stringify(api.camera(h.viewer)),
+        roisUnchanged: JSON.stringify(beforeRoiPoints) === JSON.stringify(h.element('roi-overlay').children.map(b => b.attributes.points)),
+      };
+    """)
+    assert result["acceptedB"] is True
+    assert result["activeDuringB"] == "c=0&win=0%3A128&g=original&t=2&p=4&z=1"
+    assert result["stillRenderingB"] == result["activeDuringB"]
+    assert result["activeAfterB"] == "c=0&win=0%3A255&g=original&t=2&p=4&z=1"
+    assert result["statusAfterStaleError"] == ""
+    assert result["statusAfterActiveError"] == "Some image tiles could not load. Close and reopen the translucent viewer."
+    assert result["backdropHiddenAfterError"] is True
+    assert result["statusAfterRecovery"] == ""
+    assert result["finalActive"] == "c=0&win=0%3A192&g=original&t=2&p=4&z=1"
+    assert result["locked"] is True
+    assert result["opacityUnchanged"] is True
+    assert result["cameraUnchanged"] is True
+    assert result["roisUnchanged"] is True
+
+
+def test_pagehide_teardown_under_minimal_and_full_mocks():
+    result = run("""
+      // 1) Minimal timer-free VM sandbox with no removeEventListener and no backdrop getContext.
+      const fs = require('node:fs');
+      const vm = require('node:vm');
+      const path = require('node:path');
+      const dir = path.dirname(process.argv[1]);
+      const sandbox = { URL, URLSearchParams, console, Math, Number, Array, String, Boolean, Promise, Set, Map, Error };
+      sandbox.globalThis = sandbox;
+      sandbox.window = sandbox;
+      vm.createContext(sandbox);
+      vm.runInContext(fs.readFileSync(path.join(dir, 'viewer-geometry-v1.js'), 'utf8'), sandbox);
+      const mod = { exports: {} };
+      vm.runInContext(`(function(module, exports, require){ ${fs.readFileSync(process.argv[1], 'utf8')}\n })`, sandbox)(
+        mod, mod.exports, () => sandbox.Nd2ViewerGeometry
+      );
+      const minimalApi = mod.exports;
+      const winHandlers = {};
+      let destroyed = 0;
+      const els = new Map();
+      const getEl = id => {
+        if (!els.has(id)) {
+          els.set(id, { id, style: {}, dataset: {}, attributes: {}, children: [], clientWidth: 800, clientHeight: 500,
+            disabled: false, hidden: false, addEventListener() {}, setAttribute(k, v) { this.attributes[k] = v; },
+            replaceChildren() {}, appendChild(c) { return c; }, get lastElementChild() { return null; } });
+        }
+        return els.get(id);
+      };
+      const minDoc = { getElementById: getEl, createElementNS: () => getEl('svg-child'), querySelectorAll: () => [], addEventListener() {} };
+      const minWin = { innerWidth: 800, innerHeight: 500, addEventListener(n, cb) { winHandlers[n] = cb; } };
+      const minViewer = fakeViewer();
+      minViewer.destroy = () => { destroyed += 1; };
+      const minOSD = () => minViewer; minOSD.Point = Point;
+      let minWaitCalls = 0;
+      const minBridge = {
+        async wait_translucent_display() { minWaitCalls += 1; return { ok: false }; },
+      };
+      const minMounted = minimalApi.mount({
+        window: minWin, document: minDoc, api: minBridge, OSD: minOSD,
+        context: { ...context, launch_token: 'tok-min', display_revision: 0 }, info,
+      });
+      minViewer.handlers.open();
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      // Timer-free VM exited cleanly after 2 errors without spinning.
+      const timerFreeCalls = minWaitCalls;
+      const timerFreeError = minMounted.state.syncError;
+      winHandlers.pagehide();
+      const postDisposeAccepted = minMounted.applyDisplaySnapshot({ ok: true, launch_token: 'tok-min', revision: 1, query: '?c=0&g=original&t=2&p=4&z=1' });
+
+      // 2) Full mock verifies removeEventListener cleanup and backoff timer cancellation on pagehide.
+      const removedWin = [], removedDoc = [], clearedTimers = [];
+      let timerId = 0;
+      let fullCalls = 0;
+      const h = harness({
+        withWorld: true,
+        initialContext: { launch_token: 'tok-full', display_revision: 0 },
+        winOverrides: {
+          removeEventListener(name) { removedWin.push(name); },
+          setTimeout() { timerId += 1; return timerId; },
+          clearTimeout(id) { clearedTimers.push(id); },
+        },
+        docOverrides: {
+          removeEventListener(name) { removedDoc.push(name); },
+        },
+        bridgeOverrides: {
+          async wait_translucent_display() { fullCalls += 1; throw new Error('offline'); },
+        },
+      });
+      for (let i = 0; i < 15; i++) await Promise.resolve();
+      h.winListeners.pagehide();
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+
+      return {
+        destroyed,
+        timerFreeCalls,
+        timerFreeError,
+        postDisposeAccepted,
+        fullCalls,
+        clearedTimers,
+        removedWin,
+        removedDoc,
+      };
+    """)
+    assert result["destroyed"] == 1
+    assert result["timerFreeCalls"] == 2
+    assert result["timerFreeError"] == "Could not sync contrast settings."
+    assert result["postDisposeAccepted"] is False
+    assert result["fullCalls"] == 2
+    assert len(result["clearedTimers"]) >= 1
+    assert "resize" in result["removedWin"]
+    assert set(["pointerdown", "keydown", "wheel"]).issubset(set(result["removedDoc"]))
+
+
+def test_watchdog_timeout_preserves_backdrop_across_queued_reset_and_clears_on_late_draw():
+    result = run("""
+      let nextTimerId = 1;
+      const activeTimers = new Map();
+      const h = harness({
+        withBackdrop: true,
+        withWorld: true,
+        initialContext: { launch_token: 'tok-wd', display_revision: 0 },
+        winOverrides: {
+          setTimeout(fn, ms) {
+            const id = nextTimerId++;
+            activeTimers.set(id, { fn, ms });
+            return id;
+          },
+          clearTimeout(id) { activeTimers.delete(id); },
+        },
+      });
+      const bd = h.element('translucent-backdrop');
+      const m = h.mounted;
+      const fireWatchdog = () => {
+        const entry = [...activeTimers.entries()].find(([, v]) => v.ms === 2000);
+        if (!entry) throw new Error('expected 2000ms watchdog timer');
+        activeTimers.delete(entry[0]);
+        entry[1].fn();
+      };
+
+      // Rev 1 captures initial painted image into backdrop; queue Rev 2 while Rev 1 stalls.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 1, query: '?c=0&win=0:128&g=original&t=2&p=4&z=1' });
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 2, query: '?c=0&win=0:64&g=original&t=2&p=4&z=1' });
+      const beforeTimeout = { hidden: bd.hidden, draws: h.backdropLog.draws.length };
+
+      // Watchdog expires on Rev 1 -> keeps backdrop visible AND starts Rev 2 WITHOUT overwriting backdrop.
+      fireWatchdog();
+      const afterTimeout1 = {
+        hidden: bd.hidden,
+        draws: h.backdropLog.draws.length,
+        active: m.displayGate.getActiveQuery(),
+        rendering: m.displayGate.isRendering(),
+      };
+
+      // Watchdog expires on Rev 2 with no pending -> backdrop STILL stays visible.
+      fireWatchdog();
+      const afterTimeout2 = {
+        hidden: bd.hidden,
+        draws: h.backdropLog.draws.length,
+        rendering: m.displayGate.isRendering(),
+      };
+
+      // Late draw finally paints Rev 2 -> clears backdrop cleanly.
+      const lateTile = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: lateTile } } };
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [lateTile] });
+      const afterLateDraw = { hidden: bd.hidden, draws: h.backdropLog.draws.length };
+
+      // After timeout + camera pan (update-viewport clears backdrop), a subsequent reset with hadPainted=false
+      // must NOT capture an unpainted/blank canvas.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 3, query: '?c=0&win=0:32&g=original&t=2&p=4&z=1' });
+      const drawsAfterRev3 = h.backdropLog.draws.length;
+      fireWatchdog();
+      h.viewer.viewport.panTo(new Point(0.42, 0.25));
+      h.viewer.handlers['update-viewport']();
+      const hiddenAfterPan = bd.hidden;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 4, query: '?c=0&win=0:16&g=original&t=2&p=4&z=1' });
+      const afterUnpaintedReset = { hidden: bd.hidden, draws: h.backdropLog.draws.length };
+
+      // Paint Rev 4 cleanly so paintedQuery is non-null again, then verify pose change detected directly in captureBackdrop.
+      const tile4 = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: tile4 } } };
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tile4] });
+
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 5, query: '?c=0&win=0:8&g=original&t=2&p=4&z=1' });
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 6, query: '?c=0&win=0:4&g=original&t=2&p=4&z=1' });
+      const drawsAfterRev5 = h.backdropLog.draws.length;
+      // Pan WITHOUT firing update-viewport before watchdog advances to Rev 6 (hadPainted=false).
+      h.viewer.viewport.panTo(new Point(0.48, 0.25));
+      fireWatchdog();
+      const afterPoseMismatchInCapture = { hidden: bd.hidden, draws: h.backdropLog.draws.length };
+
+      return {
+        beforeTimeout,
+        afterTimeout1,
+        afterTimeout2,
+        afterLateDraw,
+        drawsAfterRev3,
+        hiddenAfterPan,
+        afterUnpaintedReset,
+        drawsAfterRev5,
+        afterPoseMismatchInCapture,
+      };
+    """)
+    assert result["beforeTimeout"] == {"hidden": False, "draws": 1}
+    assert result["afterTimeout1"] == {
+        "hidden": False,
+        "draws": 1,
+        "active": "c=0&win=0%3A64&g=original&t=2&p=4&z=1",
+        "rendering": True,
+    }
+    assert result["afterTimeout2"] == {"hidden": False, "draws": 1, "rendering": False}
+    assert result["afterLateDraw"] == {"hidden": True, "draws": 1}
+    assert result["drawsAfterRev3"] == 2
+    assert result["hiddenAfterPan"] is True
+    assert result["afterUnpaintedReset"] == {"hidden": True, "draws": 2}
+    assert result["drawsAfterRev5"] == 3
+    assert result["afterPoseMismatchInCapture"] == {"hidden": True, "draws": 3}
+
+
+def test_tiled_image_fully_loaded_change_binds_via_world_events_and_cleans_up_on_pagehide():
+    result = run("""
+      function makeEventedWorld() {
+        const worldHandlers = { 'add-item': [], 'remove-item': [] };
+        const items = [];
+        return {
+          items,
+          worldHandlers,
+          getItemAt(i) { return items[i] || null; },
+          addHandler(name, fn) { (worldHandlers[name] ||= []).push(fn); },
+          removeHandler(name, fn) {
+            if (!worldHandlers[name]) return;
+            worldHandlers[name] = worldHandlers[name].filter(cb => cb !== fn);
+          },
+          emit(name, ev) { for (const fn of [...(worldHandlers[name] || [])]) fn(ev); },
+        };
+      }
+      function makeTiledItem(viewer) {
+        const itemHandlers = {};
+        return {
+          viewer,
+          tilesMatrix: {},
+          fullyLoaded: false,
+          _needsDraw: true,
+          itemHandlers,
+          reset() { this._needsDraw = true; },
+          getDrawArea() { return { x: 0, y: 0, width: 800, height: 500 }; },
+          getFullyLoaded() { return this.fullyLoaded; },
+          _setFullyLoaded(v) { this.fullyLoaded = Boolean(v); },
+          needsDraw() { return this._needsDraw; },
+          getClip() { return null; },
+          setClip() {},
+          addHandler(name, fn) { (itemHandlers[name] ||= []).push(fn); },
+          removeHandler(name, fn) {
+            if (!itemHandlers[name]) return;
+            itemHandlers[name] = itemHandlers[name].filter(cb => cb !== fn);
+          },
+          emit(name, ev) {
+            for (const fn of [...(itemHandlers[name] || [])]) fn({ eventSource: this, ...ev });
+          },
+        };
+      }
+
+      // 1) World add-item / remove-item lifecycle + OSD event ordering + pagehide cleanup.
+      const world = makeEventedWorld();
+      const elements = new Map();
+      function newEl(id) {
+        return {
+          id, style: {}, dataset: {}, attributes: {}, children: [], listeners: {},
+          clientWidth: 800, clientHeight: 500, disabled: false, hidden: false,
+          addEventListener(n, cb) { this.listeners[n] = cb; },
+          setAttribute(n, v) { this.attributes[n] = v; },
+          replaceChildren(...c) { this.children = c; },
+          appendChild(c) { this.children.push(c); return c; },
+          get lastElementChild() { return this.children[this.children.length - 1]; },
+        };
+      }
+      function getEl(id) { if (!elements.has(id)) elements.set(id, newEl(id)); return elements.get(id); }
+      const bd = getEl('translucent-backdrop');
+      bd.hidden = true; bd.width = 0; bd.height = 0;
+      bd.getContext = kind => kind === '2d' ? { clearRect() {}, drawImage() {} } : null;
+      const winListeners = {};
+      const win = { innerWidth: 800, innerHeight: 500, addEventListener(n, cb) { winListeners[n] = cb; }, removeEventListener() {} };
+      const doc = { getElementById: getEl, createElementNS: (_, n) => newEl(n), querySelectorAll: () => [], addEventListener() {}, removeEventListener() {} };
+      const viewer = fakeViewer();
+      viewer.drawer = { canvas: { width: 800, height: 500 } };
+      viewer.world = world;
+      const OSD = () => viewer; OSD.Point = Point;
+      const mounted = api.mount({
+        window: win, document: doc, api: {}, OSD,
+        context: { ...context, launch_token: 'tok-ti', display_revision: 0 }, info,
+      });
+
+      const worldAddBound = world.worldHandlers['add-item'].length;
+      const worldRemoveBound = world.worldHandlers['remove-item'].length;
+
+      const item1 = makeTiledItem(viewer);
+      world.items.push(item1);
+      world.emit('add-item', { item: item1 });
+      // Open fallback must NOT attach a duplicate listener on item1.
+      viewer.handlers.open();
+      const item1HandlersAfterOpen = (item1.itemHandlers['fully-loaded-change'] || []).length;
+
+      // Start rev 1 and queue rev 2: TiledImage fully-loaded-change BEFORE tiled-image-drawn must wait!
+      mounted.applyDisplaySnapshot({ ok: true, launch_token: 'tok-ti', revision: 1, query: '?c=0&win=0:128&g=original&t=2&p=4&z=1' });
+      mounted.applyDisplaySnapshot({ ok: true, launch_token: 'tok-ti', revision: 2, query: '?c=0&win=0:64&g=original&t=2&p=4&z=1' });
+      const tile1 = { level: 0, x: 0, y: 0 };
+      item1.tilesMatrix = { 0: { 0: { 0: tile1 } } };
+      viewer.handlers['tile-loaded']({ tiledImage: item1, tile: tile1 });
+      item1.fullyLoaded = true;
+      item1.emit('fully-loaded-change', { fullyLoaded: true });
+      const beforeDraw = {
+        active: mounted.displayGate.getActiveQuery(),
+        backdropHidden: bd.hidden,
+      };
+      // Active draw completes rev 1 and starts rev 2.
+      item1._needsDraw = false;
+      viewer.handlers['tiled-image-drawn']({ tiledImage: item1, tiles: [tile1] });
+      const afterRev1Draw = {
+        active: mounted.displayGate.getActiveQuery(),
+        rendering: mounted.displayGate.isRendering(),
+      };
+
+      // Reverse order on rev 2: tiled-image-drawn first, then TiledImage fully-loaded-change with !needsDraw().
+      const tile2 = { level: 0, x: 0, y: 0 };
+      item1.tilesMatrix = { 0: { 0: { 0: tile2 } } };
+      viewer.handlers['tile-loaded']({ tiledImage: item1, tile: tile2 });
+      item1.fullyLoaded = false;
+      item1._needsDraw = false;
+      viewer.handlers['tiled-image-drawn']({ tiledImage: item1, tiles: [tile2] });
+      const stillRenderingRev2 = mounted.displayGate.isRendering();
+      item1.fullyLoaded = true;
+      item1.emit('fully-loaded-change', { fullyLoaded: true });
+      const afterRev2Reverse = {
+        rendering: mounted.displayGate.isRendering(),
+        backdropHidden: bd.hidden,
+      };
+
+      // remove-item unbinds item1's listener; add-item binds item2; pagehide unbinds world and item2.
+      world.items.splice(0, 1);
+      world.emit('remove-item', { item: item1 });
+      const item1HandlersAfterRemove = (item1.itemHandlers['fully-loaded-change'] || []).length;
+
+      const item2 = makeTiledItem(viewer);
+      world.items.push(item2);
+      world.emit('add-item', { item: item2 });
+      const item2HandlersBeforeHide = (item2.itemHandlers['fully-loaded-change'] || []).length;
+
+      winListeners.pagehide();
+      const afterHide = {
+        worldAdd: world.worldHandlers['add-item'].length,
+        worldRemove: world.worldHandlers['remove-item'].length,
+        item2Handlers: (item2.itemHandlers['fully-loaded-change'] || []).length,
+      };
+
+      // 2) open fallback when viewer.world has getItemAt but no addHandler.
+      const fallbackViewer = fakeViewer();
+      const fallbackItem = makeTiledItem(fallbackViewer);
+      fallbackViewer.world = { getItemAt(i) { return i === 0 ? fallbackItem : null; } };
+      const fbWinListeners = {};
+      const fbWin = { innerWidth: 800, innerHeight: 500, addEventListener(n, cb) { fbWinListeners[n] = cb; } };
+      const fbEls = new Map();
+      const fbGetEl = id => { if (!fbEls.has(id)) fbEls.set(id, newEl(id)); return fbEls.get(id); };
+      const fbDoc = { getElementById: fbGetEl, createElementNS: (_, n) => newEl(n), querySelectorAll: () => [], addEventListener() {} };
+      const fbOSD = () => fallbackViewer; fbOSD.Point = Point;
+      api.mount({ window: fbWin, document: fbDoc, api: {}, OSD: fbOSD, context, info });
+      fallbackViewer.handlers.open();
+      const fallbackBoundOnOpen = (fallbackItem.itemHandlers['fully-loaded-change'] || []).length;
+      fbWinListeners.pagehide();
+      const fallbackAfterHide = (fallbackItem.itemHandlers['fully-loaded-change'] || []).length;
+
+      return {
+        worldAddBound,
+        worldRemoveBound,
+        item1HandlersAfterOpen,
+        beforeDraw,
+        afterRev1Draw,
+        stillRenderingRev2,
+        afterRev2Reverse,
+        item1HandlersAfterRemove,
+        item2HandlersBeforeHide,
+        afterHide,
+        fallbackBoundOnOpen,
+        fallbackAfterHide,
+      };
+    """)
+    assert result["worldAddBound"] == 1
+    assert result["worldRemoveBound"] == 1
+    assert result["item1HandlersAfterOpen"] == 1
+    assert result["beforeDraw"] == {
+        "active": "c=0&win=0%3A128&g=original&t=2&p=4&z=1",
+        "backdropHidden": False,
+    }
+    assert result["afterRev1Draw"] == {
+        "active": "c=0&win=0%3A64&g=original&t=2&p=4&z=1",
+        "rendering": True,
+    }
+    assert result["stillRenderingRev2"] is True
+    assert result["afterRev2Reverse"] == {"rendering": False, "backdropHidden": True}
+    assert result["item1HandlersAfterRemove"] == 0
+    assert result["item2HandlersBeforeHide"] == 1
+    assert result["afterHide"] == {"worldAdd": 0, "worldRemove": 0, "item2Handlers": 0}
+    assert result["fallbackBoundOnOpen"] == 1
+    assert result["fallbackAfterHide"] == 0
+
+
+def test_lut_redraw_update_viewport_skips_view_report_and_laser_annotation_rebuild():
+    result = run("""
+      const reports = [];
+      const laserItem = {
+        id: 'slacs-laser-1', type: 'box', x: 390, y: 240, w: 20, h: 12,
+        text: 'SLACS_ROI #1', color: '#a0a6ae', slacs: { kind: 'laser_shot', shots: 1, isolation: 1 },
+      };
+      const h = followHarness({
+        withBackdrop: true,
+        withWorld: true,
+        initialContext: {
+          launch_token: 'tok-slacs',
+          display_revision: 0,
+          rotation: 0,
+          flip: false,
+          rois: [{ x: 400, y: 250, w: 20, h: 10 }],
+          roiIndex: 0,
+          laser_items: [laserItem],
+        },
+        bridgeOverrides: {
+          async report_overlay_view(view) { reports.push(view); return { ok: true }; },
+        },
+      });
+      const settle = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+      await h.mounted.startStageFollow();
+      await h.mounted.toggleLock();
+      await settle();
+
+      const laserLayer = h.element('laser-annotations');
+      let laserRebuilds = 0;
+      const origReplace = laserLayer.replaceChildren.bind(laserLayer);
+      laserLayer.replaceChildren = (...children) => {
+        laserRebuilds += 1;
+        return origReplace(...children);
+      };
+      const viewTimers = () => [...h.timers.values()].filter(t => t.delay === 200);
+      const baseReports = reports.length;
+      const baseViewTimers = viewTimers().length;
+      const baseFollowCalls = h.followCalls.length;
+
+      // Apply live LUT updates and fire OSD update-viewport without changing camera/target/follow.
+      const applied1 = h.mounted.applyDisplaySnapshot({
+        ok: true, launch_token: 'tok-slacs', revision: 1,
+        query: '?c=0&win=0%3A192&g=original&t=2&p=4&z=1',
+      });
+      h.viewer.handlers['update-viewport']();
+      const tile1 = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: tile1 } } };
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['tile-loaded']({ tile: tile1 });
+      h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true, eventSource: h.item });
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tile1] });
+      h.viewer.handlers['update-viewport']();
+
+      const applied2 = h.mounted.applyDisplaySnapshot({
+        ok: true, launch_token: 'tok-slacs', revision: 2,
+        query: '?c=0&win=0%3A128&g=original&t=2&p=4&z=1',
+      });
+      h.viewer.handlers['update-viewport']();
+      await settle();
+
+      const duringLut = {
+        applied1,
+        applied2,
+        query: h.mounted.state.query,
+        resets: h.item.resets,
+        reportsAdded: reports.length - baseReports,
+        viewTimersAdded: viewTimers().length - baseViewTimers,
+        laserRebuilds,
+        followEnabled: h.mounted.state.follow.enabled,
+        followSeq: h.mounted.state.follow.seq,
+        locked: h.mounted.state.locked,
+        followCallsAdded: h.followCalls.length - baseFollowCalls,
+      };
+
+      // A genuine viewport pan MUST still rebuild #laser-annotations and schedule a view report.
+      h.viewer.viewport.panTo(new Point(0.45, 0.27));
+      h.viewer.handlers['update-viewport']();
+      const afterPan = {
+        laserRebuilds,
+        viewTimersAdded: viewTimers().length - baseViewTimers,
+      };
+      h.windowListeners.pagehide();
+      return { duringLut, afterPan };
+    """)
+    assert result["duringLut"] == {
+        "applied1": True,
+        "applied2": True,
+        "query": "c=0&win=0%3A128&g=original&t=2&p=4&z=1",
+        "resets": 2,
+        "reportsAdded": 0,
+        "viewTimersAdded": 0,
+        "laserRebuilds": 0,
+        "followEnabled": True,
+        "followSeq": 0,
+        "locked": True,
+        "followCallsAdded": 0,
+    }
+    assert result["afterPan"]["laserRebuilds"] == 1
+    assert result["afterPan"]["viewTimersAdded"] == 1
+

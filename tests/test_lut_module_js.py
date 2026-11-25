@@ -116,3 +116,137 @@ process.stdout.write(JSON.stringify(Object.keys(context).sort()));
 """
     result = run_node(script, STATIC, json.dumps(list(modules)), check=True)
     assert json.loads(result.stdout) == sorted(modules.values())
+
+
+POINTERUP_HARDENING = r"""
+const path = require('path');
+const L = require(path.join(process.argv[1], 'lut-controls-v1.js'));
+const context2d = new Proxy({}, { get: (o, k) => o[k] || (() => {}) });
+function makeNode(tag) {
+  return {
+    tag, style: {}, attrs: {}, children: [], handlers: {},
+    append(...xs) { this.children.push(...xs); },
+    setAttribute(k, v) { this.attrs[k] = v; },
+    addEventListener(k, fn) { this.handlers[k] = fn; },
+    getContext: () => context2d,
+    setPointerCapture() {},
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 240, height: 96 }),
+  };
+}
+function setup() {
+  const window = {
+    devicePixelRatio: 1,
+    location: { origin: 'https://viewer.test' },
+    parent: {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const document = { createElement: makeNode, elementFromPoint: () => null };
+  const events = [];
+  const changes = [];
+  let flushes = 0;
+  let manualAxes = 0;
+  const widget = L.createWidget({
+    channel: { label: 'Cal', color: 'FFFFFF', window: { min: 0, max: 255, start: 0, end: 255 } },
+    dtype: 'uint8',
+    label: { textContent: '' },
+    width: 240,
+    document,
+    window,
+    protocolVersion: 2,
+    inkColor: () => '#fff',
+    currentTheme: () => 'dark',
+    fmtInt: v => String(Math.round(v)),
+    onChange(val) { events.push('change'); changes.push(val); },
+    onFlush() { events.push('flush'); flushes++; },
+    onManualAxis() { manualAxes++; },
+    onShiftChange() {},
+  });
+  const canvas = widget.element.children[0];
+  return { widget, canvas, events, changes, get flushes() { return flushes; }, get manualAxes() { return manualAxes; } };
+}
+const ev = (x, y, extra = {}) => ({
+  clientX: x, clientY: y, button: 0, pointerId: 9,
+  preventDefault() {}, stopPropagation() {}, ...extra,
+});
+
+// 1. pointerup(coords) without prior pointermove applies final coords before onFlush
+const direct = setup();
+direct.canvas.handlers.pointerdown(ev(236, 8));
+direct.canvas.handlers.pointerup(ev(120, 8));
+
+// 2. pointermove(target) followed by pointerup(target) emits NO duplicate onChange
+const dedup = setup();
+dedup.canvas.handlers.pointerdown(ev(236, 8));
+dedup.canvas.handlers.pointermove(ev(120, 8));
+dedup.canvas.handlers.pointerup(ev(120, 8));
+
+// 3. zero-arg pointerup() preserves value from pointermove and flushes once
+const zeroArg = setup();
+zeroArg.canvas.handlers.pointerdown(ev(236, 8));
+zeroArg.canvas.handlers.pointermove(ev(120, 8));
+zeroArg.canvas.handlers.pointerup();
+
+// 4. pointercancel(coords) and lostpointercapture(coords) NEVER apply coords
+const cancel = setup();
+cancel.canvas.handlers.pointerdown(ev(236, 8));
+cancel.canvas.handlers.pointercancel(ev(80, 8));
+
+const lost = setup();
+lost.canvas.handlers.pointerdown(ev(236, 8));
+lost.canvas.handlers.lostpointercapture(ev(80, 8));
+
+// 5. gamma knob pointerup(coords) without prior pointermove applies final gamma before onFlush
+// With width=240: H=round(96)=96, PLOT={x0:4,x1:236,y0:14,y1:78}, knob at mid x=120, y=78-0.5*64=46
+const gammaDirect = setup();
+gammaDirect.canvas.handlers.pointerdown(ev(120, 46));
+gammaDirect.canvas.handlers.pointerup(ev(120, 30));
+
+// 6. pan mode pointerup(coords) does not trigger LUT change or flush
+const pan = setup();
+pan.canvas.handlers.pointerdown(ev(60, 60));
+pan.canvas.handlers.pointerup(ev(100, 60));
+
+process.stdout.write(JSON.stringify({
+  direct: { events: direct.events, changes: direct.changes, flushes: direct.flushes },
+  dedup: { events: dedup.events, changes: dedup.changes, flushes: dedup.flushes },
+  zeroArg: { events: zeroArg.events, changes: zeroArg.changes, flushes: zeroArg.flushes },
+  cancel: { events: cancel.events, changes: cancel.changes, flushes: cancel.flushes },
+  lost: { events: lost.events, changes: lost.changes, flushes: lost.flushes },
+  gammaDirect: { events: gammaDirect.events, changes: gammaDirect.changes, flushes: gammaDirect.flushes },
+  pan: { events: pan.events, changes: pan.changes, flushes: pan.flushes, manualAxes: pan.manualAxes },
+}));
+"""
+
+
+def test_pointerup_hardening_direct_coords_dedup_zero_arg_and_cancel():
+    result = run_node(POINTERUP_HARDENING, STATIC, check=True)
+    out = json.loads(result.stdout)
+
+    # pointerup(coords) without prior pointermove applies target before flush
+    assert out["direct"]["events"] == ["change", "change", "flush"]
+    assert out["direct"]["flushes"] == 1
+    assert out["direct"]["changes"][-1]["hi"] == pytest.approx(127.5)
+
+    # pointermove(target) + pointerup(target) emits no duplicate onChange
+    assert out["dedup"]["events"] == ["change", "change", "flush"]
+    assert out["dedup"]["flushes"] == 1
+    assert out["dedup"]["changes"][-1]["hi"] == pytest.approx(127.5)
+
+    # zero-arg pointerup() preserves moved value and flushes cleanly
+    assert out["zeroArg"]["events"] == ["change", "change", "flush"]
+    assert out["zeroArg"]["flushes"] == 1
+    assert out["zeroArg"]["changes"][-1]["hi"] == pytest.approx(127.5)
+
+    # pointercancel / lostpointercapture never apply new coordinates
+    assert out["cancel"]["events"] == ["change", "flush"]
+    assert out["cancel"]["changes"] == [None]
+    assert out["lost"]["events"] == ["change", "flush"]
+    assert out["lost"]["changes"] == [None]
+
+    # gamma drag pointerup(coords) without prior pointermove updates gamma before flush
+    assert out["gammaDirect"]["events"] == ["change", "change", "flush"]
+    assert out["gammaDirect"]["changes"][-1]["gamma"] > 2.0
+
+    # pan mode pointerup does not emit LUT change or flush
+    assert out["pan"] == {"events": [], "changes": [], "flushes": 0, "manualAxes": 0}

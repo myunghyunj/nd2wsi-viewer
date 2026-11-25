@@ -497,7 +497,12 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "tidy":
-        from .cache import ANNOTATIONS_DIR, MANAGED_DIR, sweep_stale_builds
+        from .cache import (
+            ANNOTATIONS_DIR,
+            MANAGED_DIR,
+            resolve_existing_path,
+            sweep_stale_builds,
+        )
         from .cache_removal import _delete_verified_cache_tree, rescue_annotations
         from .convert import CACHE_DIR_NAME, tidy_caches
         from .reader import nice_bytes
@@ -519,7 +524,7 @@ def _main(argv: list[str] | None = None) -> int:
                     (folder / CACHE_DIR_NAME).glob("annotations_*.json")
                 ):
                     dest = target / stray.name
-                    if dest.exists():
+                    if resolve_existing_path(dest, kind="file").exists():
                         print(f"kept {stray} (a copy already lives in the managed folder)")
                         continue
                     if args.dry_run:
@@ -532,7 +537,8 @@ def _main(argv: list[str] | None = None) -> int:
                         print(f"kept {stray} (a copy already lives in the managed folder)")
                         continue
                     except OSError:
-                        if dest.exists() or dest.is_symlink():
+                        existing_dest = resolve_existing_path(dest, kind="file")
+                        if existing_dest.exists() or existing_dest.is_symlink():
                             print(f"kept {stray} (a copy already lives in the managed folder)")
                             continue
                         stray.rename(dest)
@@ -687,6 +693,7 @@ def _main(argv: list[str] | None = None) -> int:
                     from .cache import (
                         fingerprints_match,
                         manifest_container,
+                        names_match,
                         quick_fingerprint,
                         read_manifest,
                     )
@@ -699,7 +706,7 @@ def _main(argv: list[str] | None = None) -> int:
                         has_manifest_fp = True
                         src_rec = m_data["source"]
                         if (
-                            src_rec.get("name") != slide_resolved.name
+                            not names_match(src_rec.get("name"), slide_resolved.name)
                             or not fingerprints_match(src_rec, quick_fingerprint(slide_resolved))
                         ):
                             manifest_fp_ok = False

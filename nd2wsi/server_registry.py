@@ -569,7 +569,9 @@ class SlideRegistry:
 
     @staticmethod
     def sid_for(store_path: Path, *, series: int | None = None) -> str:
-        raw = str(store_path.resolve())
+        from .cache import normalize_name
+
+        raw = normalize_name(str(store_path.resolve()))
         if series is not None and series > 0:
             raw += f"#series={int(series)}"
         return hashlib.sha1(raw.encode()).hexdigest()[:8]
@@ -720,7 +722,13 @@ class SlideRegistry:
                 and registered_source.is_file()
                 and manifest.get("kind") in (None, "full")
             ):
-                from .cache import cache_container, fingerprints_match, quick_fingerprint
+                from .cache import (
+                    cache_container,
+                    fingerprints_match,
+                    names_match,
+                    quick_fingerprint,
+                    resolve_existing_path,
+                )
                 from .convert import (
                     SourceUnreadable,
                     _store_matches_source_semantics,
@@ -766,10 +774,22 @@ class SlideRegistry:
                 if not matches:
                     ViewerState._close_root(root)
                     root = None
+                    expected_container = (
+                        resolve_existing_path(cache_container(registered_source, sel))
+                        if container_path is not None
+                        else None
+                    )
                     if (
                         not self.agent_window
                         and container_path is not None
-                        and container_path == cache_container(registered_source, sel)
+                        and expected_container is not None
+                        and (
+                            container_path == expected_container
+                            or (
+                                container_path.parent == expected_container.parent
+                                and names_match(container_path.name, expected_container.name)
+                            )
+                        )
                     ):
                         tile_opt = int((attrs.get("nd2wsi") or {}).get("tile") or 0) or None
                         try:
@@ -785,6 +805,7 @@ class SlideRegistry:
                                             f"{rebuild_exc} (corrupt cache set aside as {set_aside.name})"
                                         ) from rebuild_exc
                             raise
+                        container_path = manifest_container(store_path) or container_path
                         manifest = read_manifest(container_path, recover=True) or {}
                         gen = gen_fn(store_path)
                         sid = self.sid_for(store_path)
@@ -1010,7 +1031,7 @@ class SlideRegistry:
                 except Exception:
                     ViewerState._close_root(root)
                     raise
-                if fingerprints_match(fingerprint, current):
+                if fingerprints_match(fingerprint, current, allow_mtime_skew=False):
                     fingerprint = current
                     break
                 ViewerState._close_root(root)
@@ -1084,7 +1105,7 @@ class SlideRegistry:
                 except BaseException:
                     candidate.close()
                     raise
-                if fingerprints_match(fingerprint, current):
+                if fingerprints_match(fingerprint, current, allow_mtime_skew=False):
                     source = candidate
                     fingerprint = current
                     break
@@ -1196,7 +1217,7 @@ class SlideRegistry:
                 except BaseException:
                     candidate.close()
                     raise
-                if fingerprints_match(fingerprint, current):
+                if fingerprints_match(fingerprint, current, allow_mtime_skew=False):
                     source = candidate
                     fingerprint = current
                     break

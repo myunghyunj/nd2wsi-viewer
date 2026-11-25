@@ -271,7 +271,7 @@ class PreparedReplacement:
         if (_identity(self.final) != self._container_identity
                 or read_manifest(self.final) != self.prior_manifest):
             raise ValueError("The cache changed during preparation; replacement refused")
-        if (not fingerprints_match(self._fingerprint, quick_fingerprint(self.source))
+        if (not fingerprints_match(self._fingerprint, quick_fingerprint(self.source), allow_mtime_skew=False)
                 or _identity(self.source, single_link=False) != self._source_identity):
             raise ValueError("The original ND2 changed during preparation; replacement refused")
         if not self.manifest or read_manifest(self.staging) != self.manifest:
