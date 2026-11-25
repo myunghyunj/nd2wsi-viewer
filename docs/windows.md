@@ -6,9 +6,9 @@
 
 | Channel | Download | Verification |
 | --- | --- | --- |
-| Stable 2.6.11 | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.6.11) |
+| SLACS-module 2.6.11 | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11_SLACS-module/nd2wsi-viewer-2.6.11_SLACS-module-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11_SLACS-module/nd2wsi-viewer-2.6.11_SLACS-module-windows-x64.zip) | [Release and checksums](https://github.com/myunghyunj/nd2wsi-viewer/releases/tag/v2.6.11_SLACS-module) |
 
-Run the per-user Setup installer (`nd2wsi-viewer-2.6.11-windows-x64-setup.exe`, no administrator prompt) or extract the entire portable ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
+Run the per-user Setup installer (`nd2wsi-viewer-2.6.11_SLACS-module-windows-x64-setup.exe`, no administrator prompt) or extract the entire portable ZIP and open `nd2wsi-viewer.exe`. Keep `_internal` beside it.
 From 2.5.7 the extracted `nd2wsi-viewer` folder holds only `nd2wsi-viewer.exe`,
 `_internal` and `READ-ME.txt`. Licences, build provenance, the bundled WebView2
 runtime notice, and the SDPC decoder's LGPL notice and source information are in
@@ -38,9 +38,9 @@ Supported Milestone 1 formats include Nikon ND2 (`.nd2`), Zeiss CZI (`.czi`),
 Leica LIF (`.lif`), OME-TIFF and TIFF (`.ome.tif`, `.ome.tiff`, `.tif`,
 `.tiff`), QPTIFF (`.qptiff`), Aperio SVS (`.svs`), SQRAY SDPC (`.sdpc`), and
 single-file viewing caches (`.nd2svs`), with calibrated OME-TIFF / ND2 / PNG
-ROI export and Astromap ROI import/export. Stable 2.6.11 publishes both the
-per-user NSIS Setup installer (`nd2wsi-viewer-2.6.11-windows-x64-setup.exe`) and
-the portable ZIP (`nd2wsi-viewer-2.6.11-windows-x64.zip`) linked above.
+ROI export and Astromap ROI import/export. SLACS-module 2.6.11 publishes both the
+per-user NSIS Setup installer (`nd2wsi-viewer-2.6.11_SLACS-module-windows-x64-setup.exe`) and
+the portable ZIP (`nd2wsi-viewer-2.6.11_SLACS-module-windows-x64.zip`) linked above.
 Shading Correction assesses supported FITC and CY3 channels on stitched single-frame ND2 scans; BF and DAPI remain
 unchanged. See the [current method and limits](shading-correction-validation.md).
 
@@ -131,7 +131,7 @@ The Windows app uses a native frame and Microsoft Edge WebView2.
 `packaging/build_windows_installer.py` and `packaging/windows-installer.nsi`
 wrap the checksum-verified portable ZIP into a per-user NSIS Setup executable
 (`nd2wsi-viewer-<version>-windows-x64-setup.exe`) while keeping the portable ZIP
-(`nd2wsi-viewer-<version>-windows-x64.zip`) intact alongside it. Stable 2.6.11
+(`nd2wsi-viewer-<version>-windows-x64.zip`) intact alongside it. SLACS-module 2.6.11
 publishes both the per-user Setup installer and the portable ZIP above; check
 each GitHub Release's attached assets, `.sha256` sidecars, and `build-info.json`
 for the exact artifacts published for that tag.
@@ -272,8 +272,8 @@ To bundle the WebView2 runtime as CI does, download the cab pinned in
 to the build command.
 
 For the current source, the expected output is
-`dist/windows/nd2wsi-viewer-2.6.11-windows-x64.zip` and its `.sha256` (plus
-`dist/windows/nd2wsi-viewer-2.6.11-windows-x64-setup.exe` when building the NSIS
+`dist/windows/nd2wsi-viewer-2.6.11_SLACS-module-windows-x64.zip` and its `.sha256` (plus
+`dist/windows/nd2wsi-viewer-2.6.11_SLACS-module-windows-x64-setup.exe` when building the NSIS
 installer).
 The actual version comes from the built package and its build manifest.
 There is no packaging switch to skip the mandatory executable smoke checks.
@@ -281,7 +281,7 @@ There is no packaging switch to skip the mandatory executable smoke checks.
 Verify the extracted delivery archive on a Windows target with Windows PowerShell 5.0 or later:
 
 ```powershell
-./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.6.11-windows-x64.zip -SmokeFile docs/example_cell.nd2
+./packaging/verify_windows.ps1 -Archive dist/windows/nd2wsi-viewer-2.6.11_SLACS-module-windows-x64.zip -SmokeFile docs/example_cell.nd2
 ```
 
 This verification uses the shipped EXE without installing Python, checks
