@@ -287,14 +287,18 @@ def resolve_existing_path(path: Path, *, kind: str = "any") -> Path:
     path = Path(path)
     if kind not in ("any", "file", "dir"):
         raise ValueError(f"invalid kind: {kind!r}")
-    if path.exists() or path.is_symlink():
+    fs_path = Path(filesystem_path(path))
+    if fs_path.exists() or fs_path.is_symlink():
         return path
-    if path.name.isascii() or not path.parent.is_dir():
+    if path.name.isascii():
+        return path
+    fs_parent = Path(filesystem_path(path.parent))
+    if not fs_parent.is_dir():
         return path
     norm = normalize_name(path.name)
     matches: list[str] = []
     try:
-        with os.scandir(path.parent) as entries:
+        with os.scandir(fs_parent) as entries:
             for entry in entries:
                 if normalize_name(entry.name) != norm:
                     continue
@@ -682,13 +686,14 @@ class CacheLock:
         )
         if (
             resolved_lock == canonical
-            and not (resolved_lock.exists() or resolved_lock.is_symlink())
             and resolved_arbiter.name != canonical.name + ".arbiter"
             and resolved_arbiter.name.endswith(".arbiter")
         ):
-            resolved_lock = resolved_arbiter.with_name(
-                resolved_arbiter.name[: -len(".arbiter")]
-            )
+            fs_resolved = Path(filesystem_path(resolved_lock))
+            if not (fs_resolved.exists() or fs_resolved.is_symlink()):
+                resolved_lock = resolved_arbiter.with_name(
+                    resolved_arbiter.name[: -len(".arbiter")]
+                )
         self.path = resolved_lock
         self._gen: str | None = None
         self._fd: int | None = None

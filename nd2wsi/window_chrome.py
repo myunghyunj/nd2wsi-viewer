@@ -441,35 +441,44 @@ def _direct_destroy_window(window) -> None:
     if sys.platform == "win32" and native is not None and callable(getattr(native, "Close", None)):
         if getattr(native, "IsDisposed", False):
             return
+        if not (hasattr(native, "IsHandleCreated") and not native.IsHandleCreated):
+            def _close_winforms() -> None:
+                if not getattr(native, "IsDisposed", False):
+                    native.Close()
 
-        def _close_winforms() -> None:
-            if not getattr(native, "IsDisposed", False):
-                native.Close()
+            if getattr(native, "InvokeRequired", False):
+                def _close_winforms_guarded() -> None:
+                    try:
+                        _close_winforms()
+                    except Exception:
+                        pass
 
-        if getattr(native, "InvokeRequired", False):
-            def _close_winforms_guarded() -> None:
+                try:
+                    from System import Action
+
+                    delegate = Action(_close_winforms_guarded)
+                except Exception:
+                    delegate = _close_winforms_guarded
+                begin_invoke = getattr(native, "BeginInvoke", None)
+                if callable(begin_invoke):
+                    try:
+                        begin_invoke(delegate)
+                    except Exception:
+                        pass
+                    return
+                invoke = getattr(native, "Invoke", None)
+                if callable(invoke):
+                    try:
+                        invoke(delegate)
+                    except Exception:
+                        pass
+                    return
+            else:
                 try:
                     _close_winforms()
                 except Exception:
                     pass
-
-            try:
-                from System import Action
-
-                delegate = Action(_close_winforms_guarded)
-            except Exception:
-                delegate = _close_winforms_guarded
-            begin_invoke = getattr(native, "BeginInvoke", None)
-            if callable(begin_invoke):
-                begin_invoke(delegate)
                 return
-            invoke = getattr(native, "Invoke", None)
-            if callable(invoke):
-                invoke(delegate)
-                return
-        else:
-            _close_winforms()
-            return
     elif sys.platform == "darwin":
         target = native if callable(getattr(native, "close", None)) else getattr(native, "window", None)
         if target is not None and callable(getattr(target, "close", None)):

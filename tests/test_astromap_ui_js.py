@@ -1415,6 +1415,76 @@ return { initialStatus, afterInvalidSize, afterAspectMismatch, afterFixed, after
     assert out["afterBadPng"]["confirmDisabled"] is True
 
 
+def test_corrupt_jpg_error_stays_visible_after_invalid_or_mismatched_dimensions():
+    out = _run_import(r"""
+const f = importFixture();
+f.c.wireAstromapImport();
+const text = 'INDEX\tX1\tY1\tX2\tY2\tNOTE\n1\t10\t20\t29\t39\tok';
+await f.c.readAstromapImportFile({ name: 'regions.txt', size: text.length, text: async () => text });
+
+function makeCorruptJpg(name) {
+  const blob = new Blob([new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x04])]);
+  blob.name = name;
+  return blob;
+}
+
+// 1) Previously invalid dimension (width = 0, importSizeError = true): corrupt JPG error stays visible.
+f.nodes.get('astromap-import-width').value = '0';
+f.c.refreshAstromapImport();
+const beforeInvalid = f.nodes.get('astromap-import-status').textContent;
+const okAfterInvalid = await f.c.readAstromapImportJpg(makeCorruptJpg('broken1.jpg'));
+const afterInvalid = {
+  ok: okAfterInvalid,
+  status: f.nodes.get('astromap-import-status').textContent,
+  reading: f.c.state.astromap.importReading,
+  confirmDisabled: f.nodes.get('astromap-import-confirm').disabled,
+  jpgDisabled: f.nodes.get('astromap-import-jpg').disabled,
+  widthDisabled: f.nodes.get('astromap-import-width').disabled,
+  heightDisabled: f.nodes.get('astromap-import-height').disabled,
+};
+
+// 2) Previously aspect-mismatched dimensions (1000x1000, importSizeError = true):
+//    selecting a corrupt JPG via file input keeps the read error and resets input.value.
+f.nodes.get('astromap-import-width').value = '1000';
+f.nodes.get('astromap-import-height').value = '1000';
+f.c.refreshAstromapImport();
+const beforeMismatch = f.nodes.get('astromap-import-status').textContent;
+const jpgInput = f.nodes.get('astromap-import-jpg-file');
+jpgInput.files = [makeCorruptJpg('broken2.jpg')];
+jpgInput.value = 'C:\\fakepath\\broken2.jpg';
+await jpgInput.onchange();
+const afterMismatch = {
+  status: f.nodes.get('astromap-import-status').textContent,
+  inputValue: jpgInput.value,
+  reading: f.c.state.astromap.importReading,
+  confirmDisabled: f.nodes.get('astromap-import-confirm').disabled,
+  jpgDisabled: f.nodes.get('astromap-import-jpg').disabled,
+  widthDisabled: f.nodes.get('astromap-import-width').disabled,
+};
+
+return { beforeInvalid, afterInvalid, beforeMismatch, afterMismatch };
+""")
+    assert out["beforeInvalid"] == "Enter positive whole-number image dimensions."
+    assert out["afterInvalid"] == {
+        "ok": False,
+        "status": "The selected file is not a JPG image.",
+        "reading": False,
+        "confirmDisabled": True,
+        "jpgDisabled": False,
+        "widthDisabled": False,
+        "heightDisabled": False,
+    }
+    assert "JPG/PNG (1000 × 1000)" in out["beforeMismatch"]
+    assert out["afterMismatch"] == {
+        "status": "The selected file is not a JPG image.",
+        "inputValue": "",
+        "reading": False,
+        "confirmDisabled": True,
+        "jpgDisabled": False,
+        "widthDisabled": False,
+    }
+
+
 def test_astromap_drag_snaps_to_integers_clamped_in_bounds_and_add_enforces_2000_cap():
     out = _run_export(r"""
 const f = fixture(), c = f.c;

@@ -33,13 +33,16 @@ def roi_pair_paths(paths, *, require_pair: bool = True) -> list[Path]:
     if len(resolved) == 1:
         chosen = resolved[0]
         suffixes = ROI_IMAGE_SUFFIXES if chosen.suffix.casefold() == ".txt" else (".txt",)
-        companions = [
-            path
-            for path in chosen.parent.iterdir()
-            if path.stem.casefold() == chosen.stem.casefold()
-            and path.suffix.casefold() in suffixes
-            and path.is_file()
-        ]
+        companions: list[Path] = []
+        with os.scandir(filesystem_path(chosen.parent)) as entries:
+            for entry in entries:
+                candidate = chosen.parent / entry.name
+                if (
+                    candidate.stem.casefold() == chosen.stem.casefold()
+                    and candidate.suffix.casefold() in suffixes
+                    and Path(filesystem_path(candidate)).is_file()
+                ):
+                    companions.append(candidate)
         if len(companions) == 1:
             resolved.append(companions[0])
         elif require_pair:
@@ -139,8 +142,8 @@ def load_roi_file(path, *, width: int, height: int, image_path=None) -> dict:
         raise ValueError("Choose an AstroMapper .txt file")
     candidate_suffixes = (*ROI_IMAGE_SUFFIXES, *(suffix.upper() for suffix in ROI_IMAGE_SUFFIXES))
     paired = Path(image_path) if image_path is not None else next(
-        (path.with_suffix(suffix) for suffix in candidate_suffixes
-         if path.with_suffix(suffix).is_file()), None)
+        (candidate for suffix in candidate_suffixes
+         if Path(filesystem_path(candidate := path.with_suffix(suffix))).is_file()), None)
     if paired is None:
         raise ValueError("Load the matching full-image JPG and AstroMapper TXT together")
     if (paired.suffix.lower() not in ROI_IMAGE_SUFFIXES or

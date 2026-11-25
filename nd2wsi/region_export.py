@@ -21,7 +21,7 @@ from .annotation_sidecars import slide_stem
 from .direct_common import _parse_cyx_index
 from .metal import reduce2x_cpu
 
-JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+JOB_RE = re.compile(r"\A[A-Za-z0-9_-]{1,40}\Z")
 
 
 def parse_job_id(query: dict[str, Any] | None) -> str | None:
@@ -33,7 +33,7 @@ def parse_job_id(query: dict[str, Any] | None) -> str | None:
         job = raw[0] if raw else None
     else:
         job = raw
-    if isinstance(job, str) and JOB_RE.match(job):
+    if isinstance(job, str) and JOB_RE.fullmatch(job):
         return job
     return None
 

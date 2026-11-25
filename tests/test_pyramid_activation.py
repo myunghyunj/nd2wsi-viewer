@@ -113,3 +113,34 @@ def test_other_window_generation_reopens_once(activation, monkeypatch):
     assert st.generation == "new" and not st.busy.closed
     st.refresh_pyramid()
     assert len(created) == 1
+
+
+def test_pyramid_identity_routes_stat_through_filesystem_path(tmp_path, monkeypatch):
+    from nd2wsi import server_registry as reg_mod
+
+    seen: list[str] = []
+    real_fs_path = reg_mod.filesystem_path
+
+    def spy_fs_path(p, **kw):
+        res = real_fs_path(p, **kw)
+        seen.append(res)
+        return res
+
+    monkeypatch.setattr(reg_mod, "filesystem_path", spy_fs_path)
+
+    cache = tmp_path / "long-path-cache.nd2svs"
+    cache.write_bytes(b"old")
+    attrs = {"nd2wsi": {}, "omero": {"channels": []}}
+    st = ViewerState(Root("old"), attrs, store_path=cache, manifest={"generation": "old"}, generation="old")
+    expected = real_fs_path(cache.resolve())
+    assert st._cache_identity is not None
+    assert expected in seen
+
+    seen.clear()
+    new_manifest = {"generation": "new", "kind": "full"}
+    monkeypatch.setattr(st, "_open_pyramid", lambda _p, m: (Root(m["generation"]), attrs))
+    monkeypatch.setattr("nd2wsi.cache.read_manifest", lambda *a, **k: new_manifest)
+    cache.write_bytes(b"new-pyramid-payload")
+    st.refresh_pyramid()
+    assert st.generation == "new"
+    assert expected in seen

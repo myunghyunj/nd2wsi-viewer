@@ -444,6 +444,20 @@ def test_multichannel_ome_tiff_writes_little_endian_multi_ifd_and_roundtrips_via
         assert px_rgb.attrib["Interleaved"] == "true"
 
 
+def test_parse_job_id_rejects_trailing_newline_and_invalid_values():
+    from nd2wsi.region_export import JOB_RE, parse_job_id
+
+    assert parse_job_id({"job": ["valid_1-a"]}) == "valid_1-a"
+    assert parse_job_id({"job": "valid_1-a"}) == "valid_1-a"
+    for bad in ("abc\n", "\nabc", "bad/job!", "", "a" * 41):
+        assert parse_job_id({"job": [bad]}) is None
+        assert parse_job_id({"job": bad}) is None
+        assert JOB_RE.fullmatch(bad) is None
+        assert JOB_RE.match(bad) is None
+    assert parse_job_id({}) is None
+    assert parse_job_id(None) is None
+
+
 def test_pre_stream_roi_errors_record_job_error_state(fluor_nd2, tmp_path):
     """B7: Pre-stream 400 and 409 /api/roi rejections record error state in EXPORT_JOBS."""
     import json
