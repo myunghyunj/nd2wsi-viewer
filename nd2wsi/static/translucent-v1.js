@@ -373,8 +373,18 @@
       }
       backdropVisible = false;
     };
-    const captureBackdrop = () => {
+    const captureBackdrop = (_item, meta) => {
       if (!backdrop) return false;
+      if (backdropVisible) {
+        if (poseChanged(lastViewportPose, readViewportPose())) {
+          clearBackdrop();
+          if (meta?.hadPainted === false) return false;
+        } else {
+          return true;
+        }
+      } else if (meta?.hadPainted === false) {
+        return false;
+      }
       const ctx = typeof backdrop.getContext === "function" ? backdrop.getContext("2d") : null;
       const src = viewer?.drawer?.canvas;
       if (!ctx || !src || !(src.width > 0 && src.height > 0)) return false;
@@ -397,10 +407,11 @@
       getItem: () => viewer?.world?.getItemAt?.(0),
       getViewer: () => viewer,
       onBeforeReset: captureBackdrop,
-      onPaintComplete: painted => {
+      onPaintComplete: (painted, meta) => {
+        if (painted === null || meta?.timedOut) return;
         clearBackdrop();
         clearSyncStatus();
-        if (painted !== null && status.textContent === TILE_LOAD_FAILED_STATUS) showStatus("");
+        if (status.textContent === TILE_LOAD_FAILED_STATUS) showStatus("");
       },
       onActiveTileError: () => {
         clearBackdrop();
@@ -890,7 +901,32 @@
       catch (error) { showStatus(error.message); return false; }
     };
 
+    const boundFullyLoadedItems = new Set();
+    const onFullyLoadedChange = event => {
+      if (!disposed) displayGate.onFullyLoadedChange(event);
+    };
+    const bindItemFullyLoaded = item => {
+      if (!item || boundFullyLoadedItems.has(item) || typeof item.addHandler !== "function") return;
+      item.addHandler("fully-loaded-change", onFullyLoadedChange);
+      boundFullyLoadedItems.add(item);
+    };
+    const unbindItemFullyLoaded = item => {
+      if (!item || !boundFullyLoadedItems.has(item)) return;
+      item.removeHandler?.("fully-loaded-change", onFullyLoadedChange);
+      boundFullyLoadedItems.delete(item);
+    };
+    const onWorldAddItem = event => {
+      if (!disposed) bindItemFullyLoaded(event?.item);
+    };
+    const onWorldRemoveItem = event => {
+      unbindItemFullyLoaded(event?.item);
+    };
+    viewer.world?.addHandler?.("add-item", onWorldAddItem);
+    viewer.world?.addHandler?.("remove-item", onWorldRemoveItem);
+    bindItemFullyLoaded(viewer.world?.getItemAt?.(0));
+
     viewer.addHandler("open", () => {
+      bindItemFullyLoaded(viewer.world?.getItemAt?.(0));
       const viewport = viewer.viewport;
       viewport.setRotation(context.rotation || 0, true);
       viewport.setFlip(context.flip === true);
@@ -919,9 +955,7 @@
     viewer.addHandler("tiled-image-drawn", event => {
       if (!disposed) displayGate.onTiledImageDrawn(event);
     });
-    viewer.addHandler("fully-loaded-change", event => {
-      if (!disposed) displayGate.onFullyLoadedChange(event);
-    });
+    viewer.addHandler("fully-loaded-change", onFullyLoadedChange);
     viewer.addHandler("tile-load-failed", event => {
       if (!disposed) displayGate.onTileLoadFailed(event);
     });
@@ -1081,6 +1115,11 @@
       clearBackdrop();
       cancelGesture();
       closeZoomPopover();
+      viewer.world?.removeHandler?.("add-item", onWorldAddItem);
+      viewer.world?.removeHandler?.("remove-item", onWorldRemoveItem);
+      for (const item of Array.from(boundFullyLoadedItems)) {
+        unbindItemFullyLoaded(item);
+      }
       win.removeEventListener?.("resize", resize);
       doc.removeEventListener?.("pointerdown", onDocPointerDown, true);
       doc.removeEventListener?.("keydown", onDocKeyDown, true);

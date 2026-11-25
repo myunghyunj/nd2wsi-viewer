@@ -475,3 +475,130 @@ def test_a_window_record_with_an_oversized_number_is_measured_again():
     assert plate._stored_windows(manifest, source) is None
     window[plate._WINDOW_FIELDS[0]] = 2.0
     assert plate._stored_windows(manifest, source) == [{field: float(window[field]) for field in plate._WINDOW_FIELDS}]
+
+
+@pytest.mark.parametrize(
+    "skew_fn",
+    [
+        pytest.param(lambda ns: ns + 9 * 3600 * 10**9, id="plus-9h"),
+        pytest.param(lambda ns: ns - 9 * 3600 * 10**9, id="minus-9h"),
+        pytest.param(
+            lambda ns: (ns // 10_000_000) * 10_000_000 + 3600 * 10**9,
+            id="plus-1h-dst-10ms-trunc",
+        ),
+        pytest.param(
+            lambda ns: (ns // 10_000_000) * 10_000_000 - 3600 * 10**9,
+            id="minus-1h-dst-10ms-trunc",
+        ),
+    ],
+)
+def test_plate_reuses_cache_and_windows_across_exfat_mtime_skew(
+    plate_nd2, monkeypatch, skew_fn
+):
+    first = PlateSource(plate_nd2)
+    try:
+        measured = _windows(first)
+        assert np.all(first.reduced(0, 0, 0, THUMB_K) == value(0, 0, 0))
+    finally:
+        first.close()
+
+    path = plate_container(plate_nd2)
+    manifest = read_manifest(path)
+    orig_gen = manifest["generation"]
+    skewed_ns = skew_fn(int(manifest["source"]["mtime_ns"]))
+    manifest["source"]["mtime_ns"] = skewed_ns
+    manifest[WINDOWS_KEY]["source"]["mtime_ns"] = skewed_ns
+    write_entry(path, "manifest.json", json.dumps(manifest).encode("utf-8"))
+
+    monkeypatch.setattr(PlateSource, "_measure_windows", _no_measuring)
+    reopened = PlateSource(plate_nd2)
+    try:
+        assert reopened.store is not None
+        assert reopened.store.manifest["generation"] == orig_gen
+        assert _windows(reopened) == measured
+        assert np.all(reopened.store.get(0, 0, 0) == value(0, 0, 0))
+        assert not list(path.parent.glob("*.corrupt-*"))
+    finally:
+        reopened.close()
+
+
+def test_plate_reuses_cache_across_korean_nfc_nfd_names(tmp_path, plate_nd2, monkeypatch):
+    import unicodedata
+    from pathlib import Path
+
+    nfc_name = unicodedata.normalize("NFC", "샘플_플레이트.nd2")
+    nfd_name = unicodedata.normalize("NFD", "샘플_플레이트.nd2")
+    assert nfc_name != nfd_name
+
+    slide_dir = tmp_path / "korean_plate"
+    slide_dir.mkdir()
+    nfc_slide = slide_dir / nfc_name
+    shutil.copy2(plate_nd2, nfc_slide)
+
+    first = PlateSource(nfc_slide)
+    try:
+        measured = _windows(first)
+        assert np.all(first.reduced(0, 0, 0, THUMB_K) == value(0, 0, 0))
+    finally:
+        first.close()
+
+    container = plate_container(nfc_slide)
+    assert unicodedata.is_normalized("NFC", container.name)
+    manifest = read_manifest(container)
+    orig_gen = manifest["generation"]
+    # Simulate a manifest written on macOS with NFD source name & relative_path.
+    manifest["source"]["name"] = nfd_name
+    manifest["source"]["relative_path"] = f"../../{nfd_name}"
+    write_entry(container, "manifest.json", json.dumps(manifest).encode("utf-8"))
+
+    # Also test pre-existing NFD container on a normalization-sensitive filesystem.
+    nfd_container = container.with_name(unicodedata.normalize("NFD", container.name))
+    if nfd_container.name not in os.listdir(container.parent):
+        tmp_rename = container.with_name("temp-rename.nd2svs")
+        container.rename(tmp_rename)
+        tmp_rename.rename(nfd_container)
+
+    real_exists = Path.exists
+    real_is_symlink = Path.is_symlink
+    root_resolved = slide_dir.resolve()
+
+    def strict_exists(self: Path, *, follow_symlinks: bool = True) -> bool:
+        try:
+            self.resolve().relative_to(root_resolved)
+        except Exception:
+            return real_exists(self, follow_symlinks=follow_symlinks)
+        if not self.name.isascii():
+            try:
+                if self.name not in os.listdir(self.parent):
+                    return False
+            except OSError:
+                return False
+        return real_exists(self, follow_symlinks=follow_symlinks)
+
+    def strict_is_symlink(self: Path) -> bool:
+        try:
+            self.resolve().relative_to(root_resolved)
+        except Exception:
+            return real_is_symlink(self)
+        if not self.name.isascii():
+            try:
+                if self.name not in os.listdir(self.parent):
+                    return False
+            except OSError:
+                return False
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "exists", strict_exists)
+    monkeypatch.setattr(Path, "is_symlink", strict_is_symlink)
+    monkeypatch.setattr(PlateSource, "_measure_windows", _no_measuring)
+
+    reopened = PlateSource(nfc_slide)
+    try:
+        assert reopened.store is not None
+        assert reopened.store.manifest["generation"] == orig_gen
+        assert reopened.store.container.name in os.listdir(container.parent)
+        assert _windows(reopened) == measured
+        assert np.all(reopened.store.get(0, 0, 0) == value(0, 0, 0))
+        assert not list(container.parent.glob("*.corrupt-*"))
+    finally:
+        reopened.close()

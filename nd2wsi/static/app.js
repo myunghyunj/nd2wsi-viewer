@@ -108,6 +108,8 @@ const state = {
     revision: 0,
     acceptedQuery: null,
     inflight: false,
+    retryTimer: null,
+    retryCount: 0,
   },
   tileRefreshGate: null,
   navRefreshPending: false,
@@ -211,6 +213,16 @@ function captureTranslucentView() {
   return snapshot;
 }
 
+const TRANSLUCENT_RETRY_DELAYS_MS = [150, 350, 750, 1500];
+
+function cancelTranslucentRetry(sync = state.translucentSync) {
+  if (!sync) return;
+  if (sync.retryTimer != null && typeof clearTimeout === "function") {
+    clearTimeout(sync.retryTimer);
+  }
+  sync.retryTimer = null;
+}
+
 function openTranslucentViewer() {
   if (state.translucentOpening) return Promise.resolve(false);
   state.translucentOpening = true;
@@ -227,12 +239,18 @@ function openTranslucentViewer() {
       const openedGen = state.info?.generation || "";
       let seq = 0;
       if (sync) {
+        if (typeof cancelTranslucentRetry === "function") cancelTranslucentRetry(sync);
+        else if (sync.retryTimer != null && typeof clearTimeout === "function") {
+          clearTimeout(sync.retryTimer);
+          sync.retryTimer = null;
+        }
         seq = ++sync.launchSeq;
         sync.launchToken = null;
         sync.generation = "";
         sync.revision = 0;
         sync.acceptedQuery = null;
         sync.inflight = false;
+        sync.retryCount = 0;
       }
       const result = await native.open_translucent_viewer(currentSlideSid(), snapshot);
       if (!result?.ok) throw new Error(result?.message || "Could not open the translucent viewer");
@@ -242,9 +260,14 @@ function openTranslucentViewer() {
         sync.generation = openedGen;
         sync.revision = 0;
         sync.acceptedQuery = openedQuery;
+        sync.retryCount = 0;
         if (typeof displayQuery === "function" && displayQuery() !== openedQuery &&
             typeof publishTranslucentDisplay === "function") {
           publishTranslucentDisplay();
+        }
+      } else if (result?.launch_token && (state.info?.generation || "") !== openedGen) {
+        if (typeof expireTranslucentSync === "function") {
+          expireTranslucentSync(result.launch_token, 0);
         }
       }
       return true;
@@ -261,19 +284,53 @@ function openTranslucentViewer() {
 function clearTranslucentSync() {
   const sync = state.translucentSync;
   if (!sync) return;
+  if (typeof cancelTranslucentRetry === "function") cancelTranslucentRetry(sync);
+  else if (sync.retryTimer != null && typeof clearTimeout === "function") {
+    clearTimeout(sync.retryTimer);
+    sync.retryTimer = null;
+  }
   sync.launchSeq += 1;
   sync.launchToken = null;
   sync.generation = "";
   sync.revision = 0;
   sync.acceptedQuery = null;
   sync.inflight = false;
+  sync.retryTimer = null;
+  sync.retryCount = 0;
 }
 
-function publishTranslucentDisplay() {
+function expireTranslucentSync(tokenOverride = null, revOverride = null) {
+  const sync = state.translucentSync;
+  const token = tokenOverride ?? sync?.launchToken ?? null;
+  const baseRev = revOverride ?? sync?.revision ?? 0;
+  const rev = Math.max(1, (Number.isSafeInteger(baseRev) ? baseRev : 0) + 1);
+  if (typeof clearTranslucentSync === "function") clearTranslucentSync();
+  if (!token) return;
+  const native = (window.parent !== window ? window.parent : window).pywebview?.api;
+  if (typeof native?.update_translucent_display !== "function") return;
+  try {
+    Promise.resolve(
+      native.update_translucent_display(currentSlideSid(), token, rev, "")
+    ).catch(() => {});
+  } catch (_) {
+    // Best-effort expiry notification; sync is already cleared.
+  }
+}
+
+function publishTranslucentDisplay({ isRetry = false } = {}) {
   const sync = state.translucentSync;
   if (!sync || !sync.launchToken || state.quitPreparing) return;
+  if (!isRetry) {
+    if (typeof cancelTranslucentRetry === "function") cancelTranslucentRetry(sync);
+    else if (sync.retryTimer != null && typeof clearTimeout === "function") {
+      clearTimeout(sync.retryTimer);
+      sync.retryTimer = null;
+    }
+    sync.retryCount = 0;
+  }
   if ((state.info?.generation || "") !== sync.generation) {
-    clearTranslucentSync();
+    if (typeof expireTranslucentSync === "function") expireTranslucentSync();
+    else clearTranslucentSync();
     return;
   }
   const desired = displayQuery();
@@ -283,11 +340,16 @@ function publishTranslucentDisplay() {
   if (typeof native?.update_translucent_display !== "function") return;
   sync.inflight = true;
   const drainSeq = sync.launchSeq;
+  const retryDelays = typeof TRANSLUCENT_RETRY_DELAYS_MS !== "undefined"
+    ? TRANSLUCENT_RETRY_DELAYS_MS
+    : [150, 350, 750, 1500];
+  let shouldRetry = false;
   (async () => {
     try {
       while (sync.launchSeq === drainSeq && sync.launchToken && !state.quitPreparing) {
         if ((state.info?.generation || "") !== sync.generation) {
-          clearTranslucentSync();
+          if (typeof expireTranslucentSync === "function") expireTranslucentSync();
+          else clearTranslucentSync();
           break;
         }
         const target = displayQuery();
@@ -298,21 +360,54 @@ function publishTranslucentDisplay() {
         try {
           res = await native.update_translucent_display(currentSlideSid(), token, rev, target);
         } catch (_) {
+          shouldRetry = true;
           break;
         }
         if (sync.launchSeq !== drainSeq || sync.launchToken !== token) break;
+        if (res?.ok === true) {
+          sync.acceptedQuery = target;
+          sync.retryCount = 0;
+          if (typeof cancelTranslucentRetry === "function") cancelTranslucentRetry(sync);
+          continue;
+        }
         if (res?.closed || res?.stale || res?.stale_generation) {
           clearTranslucentSync();
           break;
         }
-        if (res?.ok) {
-          sync.acceptedQuery = target;
-          continue;
+        if (res?.invalid || res?.invalid_query) {
+          if (typeof cancelTranslucentRetry === "function") cancelTranslucentRetry(sync);
+          sync.retryCount = 0;
+          break;
         }
+        shouldRetry = true;
         break;
       }
     } finally {
-      if (sync.launchSeq === drainSeq) sync.inflight = false;
+      if (sync.launchSeq === drainSeq) {
+        sync.inflight = false;
+        if (sync.launchToken && (state.info?.generation || "") !== sync.generation) {
+          if (typeof expireTranslucentSync === "function") expireTranslucentSync();
+          else clearTranslucentSync();
+        } else if (
+          shouldRetry &&
+          sync.launchToken &&
+          !state.quitPreparing &&
+          displayQuery() !== sync.acceptedQuery &&
+          (sync.retryCount || 0) < retryDelays.length &&
+          typeof setTimeout === "function"
+        ) {
+          if (typeof cancelTranslucentRetry === "function") cancelTranslucentRetry(sync);
+          const attempt = sync.retryCount || 0;
+          sync.retryCount = attempt + 1;
+          const delay = retryDelays[attempt];
+          sync.retryTimer = setTimeout(() => {
+            sync.retryTimer = null;
+            if (sync.launchSeq === drainSeq && sync.launchToken && !state.quitPreparing) {
+              publishTranslucentDisplay({ isRetry: true });
+            }
+          }, delay);
+        }
+      }
     }
   })();
 }
@@ -523,7 +618,6 @@ async function refreshShadingPyramid(generation, captured) {
   });
   const nextChannels = next.channels;
   Object.assign(info, next);
-  if (typeof clearTranslucentSync === "function") clearTranslucentSync();
   info.channels = prevChannels;
   prevChannels.forEach((channel, index) => {
     const updated = nextChannels[index];
@@ -544,6 +638,8 @@ async function refreshShadingPyramid(generation, captured) {
   $("level-lamps").replaceChildren();
   buildLevelLamps();
   updateScaleStrip();
+  if (typeof expireTranslucentSync === "function") expireTranslucentSync();
+  else if (typeof clearTranslucentSync === "function") clearTranslucentSync();
   // The coordinate system is unchanged. Keep camera, orientation, ROI and
   // current annotation objects; only invalidate the old pyramid's requests.
   const opened = await reopenPreservingView(true);
@@ -1118,10 +1214,18 @@ function tileQuery() {
 }
 
 function makeTileSource() {
-  // tileQuery is read per tile request so a tile refresh (LUT, channel
-  // switch, frame change) picks up the current settings without a reopen
+  // Serve tiles from the paint gate's pinned active query so an in-flight
+  // revision never mixes tile URLs from a queued newer edit.
   return window.Nd2ViewerGeometry.makeTileSource({
-    info: state.info, OSD: OpenSeadragon, query: tileQuery,
+    info: state.info,
+    OSD: OpenSeadragon,
+    query: () => {
+      if (state.tileRefreshGate) {
+        const q = state.tileRefreshGate.getActiveQuery();
+        return q ? "?" + q : "";
+      }
+      return tileQuery();
+    },
   });
 }
 
@@ -1141,6 +1245,30 @@ function imageToViewerElementPoint(point) {
 }
 
 function buildViewer() {
+  const tileLoadFailedToast = debounceToast("some tiles failed to load");
+  state.tileRefreshGate = typeof window.Nd2ViewerGeometry?.createTileRefreshGate === "function"
+    ? window.Nd2ViewerGeometry.createTileRefreshGate({
+      getItem: () => state.viewer?.world?.getItemAt?.(0),
+      getViewer: () => state.viewer,
+      onPaintComplete: (painted, meta) => {
+        if (
+          painted !== null &&
+          !meta?.timedOut &&
+          !meta?.hasPending &&
+          state.navRefreshPending &&
+          typeof flushNavigatorTiles === "function"
+        ) {
+          flushNavigatorTiles();
+        }
+      },
+      onActiveTileError: () => tileLoadFailedToast(),
+      setTimer: typeof setTimeout === "function" ? setTimeout : null,
+      clearTimer: typeof clearTimeout === "function" ? clearTimeout : null,
+      stallTimeoutMs: 2000,
+    })
+    : null;
+  state.tileRefreshGate?.init?.(typeof tileQuery === "function" ? tileQuery() : "");
+
   const viewer = OpenSeadragon({
     id: "stage",
     tileSources: makeTileSource(),
@@ -1174,23 +1302,37 @@ function buildViewer() {
     maxImageCacheCount: 120,
   });
   state.viewer = viewer;
-  const tileLoadFailedToast = debounceToast("some tiles failed to load");
-  state.tileRefreshGate = typeof window.Nd2ViewerGeometry?.createTileRefreshGate === "function"
-    ? window.Nd2ViewerGeometry.createTileRefreshGate({
-      getItem: () => state.viewer?.world?.getItemAt?.(0),
-      getViewer: () => state.viewer,
-      onPaintComplete: () => {
-        if (state.navRefreshPending && typeof flushNavigatorTiles === "function") {
-          flushNavigatorTiles();
-        }
-      },
-      onActiveTileError: () => tileLoadFailedToast(),
-      setTimer: typeof setTimeout === "function" ? setTimeout : null,
-      clearTimer: typeof clearTimeout === "function" ? clearTimeout : null,
-      stallTimeoutMs: 2000,
-    })
-    : null;
-  state.tileRefreshGate?.init?.(typeof tileQuery === "function" ? tileQuery() : "");
+
+  let trackedTileItem = null;
+  const onTiledImageFullyLoaded = (ev) => state.tileRefreshGate?.onFullyLoadedChange(ev);
+  const detachTrackedTileItem = () => {
+    if (trackedTileItem && typeof trackedTileItem.removeHandler === "function") {
+      trackedTileItem.removeHandler("fully-loaded-change", onTiledImageFullyLoaded);
+    }
+    trackedTileItem = null;
+  };
+  const syncTrackedTileItem = (candidate = null) => {
+    const nextItem = viewer.world?.getItemAt?.(0) || candidate || null;
+    if (nextItem === trackedTileItem) return;
+    detachTrackedTileItem();
+    if (nextItem && typeof nextItem.addHandler === "function") {
+      trackedTileItem = nextItem;
+      nextItem.addHandler("fully-loaded-change", onTiledImageFullyLoaded);
+    }
+  };
+  const onWorldAddItem = (ev) => syncTrackedTileItem(ev?.item || null);
+  const onWorldRemoveItem = (ev) => {
+    if (!ev?.item || ev.item === trackedTileItem) detachTrackedTileItem();
+    syncTrackedTileItem();
+  };
+  viewer.world?.addHandler?.("add-item", onWorldAddItem);
+  viewer.world?.addHandler?.("remove-item", onWorldRemoveItem);
+  syncTrackedTileItem();
+  window.addEventListener?.("pagehide", () => {
+    detachTrackedTileItem();
+    viewer.world?.removeHandler?.("add-item", onWorldAddItem);
+    viewer.world?.removeHandler?.("remove-item", onWorldRemoveItem);
+  }, { once: true });
 
   viewer.addHandler("canvas-key", (event) => {
     const original = event.originalEvent;
@@ -1199,6 +1341,7 @@ function buildViewer() {
     if (original?.isComposing || original?.keyCode === 229) event.preventDefaultAction = true;
   });
   viewer.addHandler("open", () => {
+    syncTrackedTileItem();
     applyDesiredDisplayTransform(false);
     if (state.initialViewHandoff) {
       window.Nd2ViewState.applyCamera(viewer, state.initialViewHandoff);
@@ -1236,7 +1379,7 @@ function buildViewer() {
   viewer.addHandler("open-failed", () => showToast("could not open tile source"));
   viewer.addHandler("tile-loaded", (ev) => state.tileRefreshGate?.onTileLoaded(ev));
   viewer.addHandler("tiled-image-drawn", (ev) => state.tileRefreshGate?.onTiledImageDrawn(ev));
-  viewer.addHandler("fully-loaded-change", (ev) => state.tileRefreshGate?.onFullyLoadedChange(ev));
+  viewer.addHandler("fully-loaded-change", onTiledImageFullyLoaded);
   viewer.addHandler("tile-load-failed", (ev) => {
     if (state.tileRefreshGate) state.tileRefreshGate.onTileLoadFailed(ev);
     else tileLoadFailedToast();
@@ -1285,11 +1428,23 @@ function reopenPreservingView(preservePose = false) {
   const gate = state.viewportRelay.commandGate;
   const capturedIdentity = JSON.stringify(gate.envelope());
   const capturedCommandSeq = gate.latestCommandSeq;
+  const readQuery = () => (typeof tileQuery === "function" ? tileQuery() : "");
+  const normalize = (raw) => {
+    if (typeof window !== "undefined" && typeof window.Nd2ViewerGeometry?.normalizeQuery === "function") {
+      return window.Nd2ViewerGeometry.normalizeQuery(raw);
+    }
+    const body = String(raw || "").replace(/^\?/, "");
+    return body && typeof URLSearchParams === "function"
+      ? new URLSearchParams(body).toString()
+      : body;
+  };
   clearTimeout(state.viewportRelay.timer);
   state.viewportRelay.timer = null;
   state.viewportRelay.reopening = true;
   state.viewportRelay.suppressUntil = Number.POSITIVE_INFINITY;
-  state.tileRefreshGate?.resetState?.(typeof tileQuery === "function" ? tileQuery() : "");
+  const initialQuery = readQuery();
+  const openedQuery = normalize(initialQuery);
+  state.tileRefreshGate?.resetState?.(initialQuery, { painted: false });
   postSpatialReadiness(); // stop shell spatial work while the tile source is closed
   const cleanup = () => {
     viewer.removeHandler("open", restored);
@@ -1303,7 +1458,16 @@ function reopenPreservingView(preservePose = false) {
     restoreRoiOverlay();
     state.viewportRelay.reopening = false;
     state.viewportRelay.suppressUntil = Date.now() + 180;
-    state.tileRefreshGate?.resetState?.(typeof tileQuery === "function" ? tileQuery() : "");
+    const currentQuery = readQuery();
+    if (
+      normalize(currentQuery) !== openedQuery &&
+      typeof state.tileRefreshGate?.request === "function"
+    ) {
+      state.navRefreshPending = true;
+      state.tileRefreshGate.request(currentQuery, { force: true });
+    } else {
+      state.tileRefreshGate?.resetState?.(currentQuery);
+    }
     postViewportState("restore");
     finish(true);
   };
@@ -1311,7 +1475,7 @@ function reopenPreservingView(preservePose = false) {
     cleanup();
     state.viewportRelay.reopening = false;
     state.viewportRelay.suppressUntil = 0;
-    state.tileRefreshGate?.resetState?.(typeof tileQuery === "function" ? tileQuery() : "");
+    state.tileRefreshGate?.resetState?.(readQuery(), { painted: false });
     postSpatialReadiness();
     finish(false);
   };
@@ -1890,27 +2054,47 @@ function refreshTiles(options = {}) {
     paintPlate();
     if (state.plate.focus === null) {
       state.plate.stale = true;
+      state.tileRefreshGate?.resetState?.(tileQuery(), { painted: false });
       return;
     }
     wasStale = !!state.plate.stale;
     state.plate.stale = false;
   }
   // a reopen is already in flight and its tile source reads the current
-  // query when it opens, so there is nothing extra to do
-  if (state.viewportRelay.reopening) return;
+  // query when it opens, so keep the gate aligned without resetting mid-open
+  if (state.viewportRelay.reopening) {
+    state.tileRefreshGate?.resetState?.(tileQuery(), { painted: false });
+    return;
+  }
   const item = viewer && viewer.world && viewer.world.getItemAt(0);
   if (!item || typeof item.reset !== "function") {
     reopenPreservingView();
     return;
   }
   if (state.tileRefreshGate) {
+    const nextQuery = tileQuery();
+    const normalizedNext =
+      typeof window !== "undefined" && typeof window.Nd2ViewerGeometry?.normalizeQuery === "function"
+        ? window.Nd2ViewerGeometry.normalizeQuery(nextQuery)
+        : (() => {
+          const body = String(nextQuery || "").replace(/^\?/, "");
+          return body && typeof URLSearchParams === "function"
+            ? new URLSearchParams(body).toString()
+            : body;
+        })();
     if (!flushNavigator) state.navRefreshPending = true;
-    const requested = state.tileRefreshGate.request(tileQuery(), {
+    const requested = state.tileRefreshGate.request(nextQuery, {
       force: !!(options?.force || wasStale),
     });
-    if (flushNavigator) {
+    const activeMatches =
+      typeof state.tileRefreshGate.getActiveQuery === "function"
+        ? state.tileRefreshGate.getActiveQuery() === normalizedNext
+        : true;
+    if (flushNavigator && activeMatches) {
       flushNavigatorTiles();
-    } else if (!requested && state.navRefreshPending) {
+    } else if (flushNavigator) {
+      state.navRefreshPending = true;
+    } else if (!requested && state.navRefreshPending && activeMatches) {
       flushNavigatorTiles();
     }
   } else {
@@ -6351,7 +6535,7 @@ function setPlateFocus(p) {
   wrap.classList.toggle("plate-grid", next === null);
   wrap.classList.toggle("plate-focus", next !== null);
   if (next !== null) {
-    state.tileRefreshGate?.resetState?.("");
+    state.tileRefreshGate?.resetState?.(typeof tileQuery === "function" ? tileQuery() : "", { painted: false });
     if (!pl.everFocused) {
       pl.everFocused = true;
       state.viewer.viewport.goHome(true);
@@ -6360,7 +6544,7 @@ function setPlateFocus(p) {
       state.viewer.navigator.update(state.viewer.viewport);
     }
   } else {
-    state.tileRefreshGate?.resetState?.("");
+    state.tileRefreshGate?.resetState?.(typeof tileQuery === "function" ? tileQuery() : "", { painted: false });
     setPlatePlaying(false);
     layoutPlate();
   }

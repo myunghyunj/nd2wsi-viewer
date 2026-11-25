@@ -908,8 +908,10 @@ def create_translucent_window(
     window.events.loaded += api._configure_and_show
     window.events.loaded += api._wire_drop
     window.events.closed += api._did_close
+    if getattr(window.events.closed, "is_set", lambda: False)():
+        api._did_close()
     # Dynamic window creation can load before callbacks are registered.
-    if window.events.loaded.is_set():
+    elif window.events.loaded.is_set():
         api._configure_and_show()
         api._wire_drop()
     return api

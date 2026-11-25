@@ -22,6 +22,7 @@ from .cache import (
     SINGLE_FILE_FORMAT,
     STORE_NAME,
     fingerprints_match,
+    names_match,
     quick_fingerprint,
 )
 from .platform_io import BINARY
@@ -170,7 +171,7 @@ def pack_directory(
             )
         source = resolved_source
     source = Path(source).resolve()
-    if source_info.get("name") != source.name:
+    if not names_match(source_info.get("name"), source.name):
         raise ValueError("cache source name does not match its relative path")
     source_before = quick_fingerprint(source)
     if not fingerprints_match(source_info, source_before):
@@ -239,7 +240,9 @@ def pack_directory(
     # subsequently removes the old directory.
     if [(k, p) for k, p in cache_entries(container)] != entries:
         raise ValueError("source cache entry set changed while packing")
-    if not fingerprints_match(source_before, quick_fingerprint(source)):
+    if not fingerprints_match(
+        source_before, quick_fingerprint(source), allow_mtime_skew=False
+    ):
         raise ValueError("source file changed while packing its cache")
     manifest["complete"] = True
     final_manifest = json.dumps(manifest, indent=1).encode("utf-8")

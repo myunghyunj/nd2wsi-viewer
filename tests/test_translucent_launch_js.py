@@ -182,6 +182,7 @@ def _run_live_sync(body: str, config: dict | None = None):
       translucentSync: {
         launchSeq: 0, launchToken: null, generation: '',
         revision: 0, acceptedQuery: null, inflight: false,
+        retryTimer: null, retryCount: 0,
       },
       tileRefreshGate: null,
       navRefreshPending: false,
@@ -219,12 +220,17 @@ def _run_live_sync(body: str, config: dict | None = None):
       reopenPreservingView: () => { out.reopens += 1; },
     };
     vm.createContext(context);
+    const retryConstStart = source.indexOf('const TRANSLUCENT_RETRY_DELAYS_MS =');
+    const retryConst = source.slice(retryConstStart, source.indexOf(';', retryConstStart) + 1);
     vm.runInContext(
+      retryConst + '\n' +
       serializer + '\n' +
       production('tileQuery') + '\n' +
       production('captureTranslucentView') + '\n' +
+      production('cancelTranslucentRetry') + '\n' +
       production('openTranslucentViewer') + '\n' +
       production('clearTranslucentSync') + '\n' +
+      production('expireTranslucentSync') + '\n' +
       production('publishTranslucentDisplay') + '\n' +
       production('flushNavigatorTiles') + '\n' +
       production('refreshTiles') + '\n' +
@@ -454,7 +460,7 @@ def test_lazy_retirement_stops_bridge_traffic_after_closed_stale_or_generation_e
     assert out["sync"]["inflight"] is False
 
 
-def test_shading_generation_mismatch_and_refresh_clear_sync_only_after_commit():
+def test_shading_generation_mismatch_and_refresh_notify_expiry_only_after_commit():
     script = r"""
     const fs = require('fs'), vm = require('vm');
     const source = fs.readFileSync(process.argv[1], 'utf8');
@@ -464,32 +470,59 @@ def test_shading_generation_mismatch_and_refresh_clear_sync_only_after_commit():
       if (start < 0) throw Error('Missing ' + prefix);
       return source.slice(start, source.indexOf('\n}', start) + 2);
     }
+    const retryConstStart = source.indexOf('const TRANSLUCENT_RETRY_DELAYS_MS =');
+    const retryConst = source.slice(retryConstStart, source.indexOf(';', retryConstStart) + 1);
     const serializer = source.slice(
       source.indexOf('function lutParam('),
       source.indexOf('function activeFrameParams(')
     );
     const updates = [];
+    const tokensDuringUpdate = [];
     const info = {
       generation: 'g1', kind: 'slide', width: 100, height: 80, dtype: 'uint8',
       channels: [{ label: 'FITC', color: '00FF00', window: { min: 0, max: 255, start: 0, end: 255 } }],
       levels: [],
     };
+    const viewport = {
+      getCenter: () => ({ x: 0.5, y: 0.5 }),
+      viewportToImageCoordinates: () => ({ x: 50, y: 40 }),
+      getZoom: () => 1,
+      viewportToImageZoom: () => 1,
+      getRotation: () => 0,
+      getFlip: () => false,
+    };
     const state = {
-      info, channels: [0], luts: [null], lutAutoPending: [false], inspect: null,
-      quitPreparing: false,
+      info, viewer: { viewport }, channels: [0], luts: [null], lutAutoPending: [false], inspect: null,
+      quitPreparing: false, annotations: [], annReady: false, astromap: { activeId: null },
       translucentSync: {
         launchSeq: 1, launchToken: 'tok-1', generation: 'g1',
-        revision: 0, acceptedQuery: '', inflight: false,
+        revision: 0, acceptedQuery: '', inflight: false, retryTimer: null, retryCount: 0,
       },
     };
     let nextPayload = { ...info, generation: 'g2', width: 999 }; // invalid geometry
+    let openResolve = null;
+    const native = {
+      open_translucent_viewer: () => new Promise((resolve) => { openResolve = resolve; }),
+      update_translucent_display: async (...a) => {
+        tokensDuringUpdate.push(state.translucentSync.launchToken);
+        updates.push(a);
+        return { ok: false, stale_generation: true };
+      },
+    };
     const window = {
       Nd2LutTransfer: { currentLut: (ch) => ({ lo: ch.window.start, hi: ch.window.end, gamma: 1 }) },
-      parent: { pywebview: { api: { update_translucent_display: async (...a) => { updates.push(a); return { ok: true }; } } } },
+      parent: { pywebview: { api: native } },
     };
     const ctx = vm.createContext({
       state, window, URLSearchParams, Promise, Error, Object, Array,
       activeFrameContext: () => ({ key: 's1:' + state.info.generation }),
+      activeFrameParams: () => null,
+      backingFrameParams: () => null,
+      appendFrameParams: (q) => q,
+      spatialImageReady: () => true,
+      annotationOwnerReady: () => false,
+      postViewportState() {},
+      showToast() {},
       currentSlideSid: () => 's1',
       fetch: async () => ({ ok: true, json: async () => nextPayload }),
       frameRequests: { pixels: { invalidate() {} }, histograms: { schedule() {} } },
@@ -497,8 +530,14 @@ def test_shading_generation_mismatch_and_refresh_clear_sync_only_after_commit():
       buildLevelLamps() {}, updateScaleStrip() {}, reopenPreservingView: async () => true,
     });
     vm.runInContext(
+      retryConst + '\n' +
       serializer + '\n' +
+      production('tileQuery') + '\n' +
+      production('captureTranslucentView') + '\n' +
+      production('cancelTranslucentRetry') + '\n' +
       production('clearTranslucentSync') + '\n' +
+      production('expireTranslucentSync') + '\n' +
+      production('openTranslucentViewer') + '\n' +
       production('publishTranslucentDisplay') + '\n' +
       production('refreshShadingPyramid', true),
       ctx
@@ -507,20 +546,41 @@ def test_shading_generation_mismatch_and_refresh_clear_sync_only_after_commit():
       let validationError = '';
       try { await ctx.refreshShadingPyramid('g2', { key: 's1:g1' }); } catch (e) { validationError = e.message; }
       const tokenAfterFailedShading = state.translucentSync.launchToken;
+      const updatesAfterFailedShading = updates.slice();
+
       nextPayload = { ...info, generation: 'g2', channels: [{ ...info.channels[0] }] };
       await ctx.refreshShadingPyramid('g2', { key: 's1:g1' });
       const tokenAfterCommittedShading = state.translucentSync.launchToken;
-      // Direct generation mismatch in publishTranslucentDisplay clears with zero bridge calls.
+      const updatesAfterCommittedShading = updates.slice();
+
+      // Direct generation mismatch in publishTranslucentDisplay expires with rev + 1 and clears sync first.
       state.translucentSync.launchToken = 'tok-stale';
       state.translucentSync.generation = 'g1';
+      state.translucentSync.revision = 2;
       state.luts = [{ lo: 0, hi: 100, gamma: 1 }];
       ctx.publishTranslucentDisplay();
       for (let i = 0; i < 6; i++) await Promise.resolve();
+      const tokenAfterMismatchPublish = state.translucentSync.launchToken;
+      const updatesAfterMismatchPublish = updates.slice();
+
+      // Generation changing mid-openTranslucentViewer expires the newly returned launch_token.
+      const opening = ctx.openTranslucentViewer();
+      for (let i = 0; i < 4; i++) await Promise.resolve();
+      state.info.generation = 'g3';
+      openResolve({ ok: true, id: 'win-race', launch_token: 'tok-race' });
+      await opening;
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+
       process.stdout.write(JSON.stringify({
         validationError,
         tokenAfterFailedShading,
+        updatesAfterFailedShading,
         tokenAfterCommittedShading,
-        tokenAfterMismatchPublish: state.translucentSync.launchToken,
+        updatesAfterCommittedShading,
+        tokenAfterMismatchPublish,
+        updatesAfterMismatchPublish,
+        tokenAfterRaceOpen: state.translucentSync.launchToken,
+        tokensDuringUpdate,
         updates,
       }));
     })();
@@ -528,9 +588,21 @@ def test_shading_generation_mismatch_and_refresh_clear_sync_only_after_commit():
     out = json.loads(run_node(script, APP, check=True, timeout=10).stdout)
     assert "does not match" in out["validationError"]
     assert out["tokenAfterFailedShading"] == "tok-1"
+    assert out["updatesAfterFailedShading"] == []
     assert out["tokenAfterCommittedShading"] is None
+    assert out["updatesAfterCommittedShading"] == [["s1", "tok-1", 1, ""]]
     assert out["tokenAfterMismatchPublish"] is None
-    assert out["updates"] == []
+    assert out["updatesAfterMismatchPublish"] == [
+        ["s1", "tok-1", 1, ""],
+        ["s1", "tok-stale", 3, ""],
+    ]
+    assert out["tokenAfterRaceOpen"] is None
+    assert out["updates"] == [
+        ["s1", "tok-1", 1, ""],
+        ["s1", "tok-stale", 3, ""],
+        ["s1", "tok-race", 1, ""],
+    ]
+    assert out["tokensDuringUpdate"] == [None, None, None]
 
 
 def test_color_input_throttles_through_apply_luts_and_pointer_capture_error_is_safe():
@@ -753,5 +825,618 @@ def test_build_viewer_wires_paint_gate_max_tiles_and_filters_tile_errors():
     assert out["toasts"] == 1
     assert out["navFlushes"] == 1
     assert out["tokenAfterSceneSwitch"] is None
+
+
+def test_make_tile_source_pins_urls_to_gate_active_query_and_build_viewer_inits_before_osd():
+    script = r"""
+    const fs = require('fs'), path = require('path'), vm = require('vm');
+    const source = fs.readFileSync(path.join(process.argv[1], 'app.js'), 'utf8');
+    const geometry = require(path.join(process.argv[1], 'viewer-geometry-v1.js'));
+    function production(name) {
+      const start = source.indexOf('function ' + name + '(');
+      if (start < 0) throw Error('Missing function ' + name);
+      return source.slice(start, source.indexOf('\n}', start) + 2);
+    }
+    const order = [];
+    let liveQuery = '?c=0&g=g1';
+    let capturedSource = null;
+    const worldHandlers = new Map();
+    const viewerHandlers = new Map();
+    const pagehideHandlers = [];
+    const itemEvents = [];
+    function makeItem(id) {
+      const h = new Map();
+      return {
+        id,
+        addHandler(name, fn) {
+          itemEvents.push(['add', id, name]);
+          if (!h.has(name)) h.set(name, []);
+          h.get(name).push(fn);
+        },
+        removeHandler(name, fn) {
+          itemEvents.push(['remove', id, name]);
+          if (h.has(name)) h.set(name, h.get(name).filter((f) => f !== fn));
+        },
+        raise(name, ev) { (h.get(name) || []).forEach((fn) => fn(ev)); },
+      };
+    }
+    let currentItem = null;
+    const viewer = {
+      viewport: { zoomBy() { return { applyConstraints() {} }; }, goHome() {} },
+      world: {
+        getItemAt: (i) => (i === 0 ? currentItem : null),
+        addHandler(name, fn) {
+          if (!worldHandlers.has(name)) worldHandlers.set(name, []);
+          worldHandlers.get(name).push(fn);
+        },
+        removeHandler(name, fn) {
+          if (worldHandlers.has(name)) worldHandlers.set(name, worldHandlers.get(name).filter((f) => f !== fn));
+        },
+      },
+      addHandler(name, fn) {
+        if (!viewerHandlers.has(name)) viewerHandlers.set(name, []);
+        viewerHandlers.get(name).push(fn);
+      },
+    };
+    const gateLog = [];
+    let gateOpts = null;
+    let activeQuery = '';
+    const fakeGate = {
+      init(q) { order.push(['gate-init', q]); activeQuery = String(q || '').replace(/^\?/, ''); },
+      getActiveQuery() { return activeQuery; },
+      onTileLoaded(ev) { gateLog.push(['loaded', ev]); },
+      onTiledImageDrawn(ev) { gateLog.push(['drawn', ev]); },
+      onFullyLoadedChange(ev) { gateLog.push(['full', ev.from]); },
+      onTileLoadFailed() { return false; },
+    };
+    const elements = new Map();
+    const $ = (id) => {
+      if (!elements.has(id)) elements.set(id, { style: {}, addEventListener() {}, onclick: null });
+      return elements.get(id);
+    };
+    let navFlushes = 0;
+    const state = {
+      info: {
+        kind: 'slide', width: 512, height: 512, tileSize: 256,
+        levels: [{ width: 512, height: 512, path: '0' }],
+      },
+      viewer: null,
+      plate: null,
+      viewportRelay: {},
+      tileRefreshGate: null,
+      navRefreshPending: false,
+    };
+    const OpenSeadragon = (cfg) => {
+      order.push(['osd-ctor', state.tileRefreshGate === fakeGate, cfg.tileSources.getTileUrl(0, 0, 0)]);
+      capturedSource = cfg.tileSources;
+      return viewer;
+    };
+    OpenSeadragon.Point = function (x, y) { this.x = x; this.y = y; };
+    const win = {
+      devicePixelRatio: 1,
+      Nd2ViewerGeometry: {
+        makeTileSource: geometry.makeTileSource,
+        createTileRefreshGate(opts) { order.push(['gate-create']); gateOpts = opts; return fakeGate; },
+      },
+      addEventListener(name, fn) { if (name === 'pagehide') pagehideHandlers.push(fn); },
+    };
+    const ctx = vm.createContext({
+      state, window: win, $, setTimeout, clearTimeout, OpenSeadragon,
+      tileQuery: () => liveQuery,
+      flushNavigatorTiles: () => { navFlushes += 1; state.navRefreshPending = false; },
+      debounceToast: () => () => {},
+      renderAnnotations() {}, updateAlignmentDrag() {}, finishAlignmentDrag() {},
+      beginAlignmentDrag() {}, elementPoint() {}, viewerElementToImagePoint() {},
+      updateCursor() {}, updateScalebar() {}, moveRoiOverlay() {},
+      refreshAnnotationsForViewport() {}, scheduleViewportState() {},
+      updateReadout() {}, restoreRoiOverlay() {}, postViewportState() {},
+      refreshAstromapPanel() {}, applyDesiredDisplayTransform() {}, showToast() {},
+    });
+    vm.runInContext(production('makeTileSource') + '\n' + production('buildViewer'), ctx);
+    ctx.buildViewer();
+
+    // While activeQuery is pinned to c=0&g=g1, changing liveQuery must not leak into tile URLs.
+    liveQuery = '?c=1&g=g1';
+    const pinnedUrl = capturedSource.getTileUrl(0, 0, 0);
+    // Empty activeQuery yields bare tile URL without trailing '?'.
+    activeQuery = '';
+    const emptyActiveUrl = capturedSource.getTileUrl(0, 0, 0);
+    // Without a gate, makeTileSource falls back to live tileQuery().
+    const savedGate = state.tileRefreshGate;
+    state.tileRefreshGate = null;
+    const fallbackUrl = capturedSource.getTileUrl(0, 0, 0);
+    state.tileRefreshGate = savedGate;
+
+    // TiledImage add-item / remove-item / open wiring for fully-loaded-change.
+    const itemA = makeItem('A');
+    currentItem = itemA;
+    worldHandlers.get('add-item').forEach((fn) => fn({ item: itemA }));
+    itemA.raise('fully-loaded-change', { fullyLoaded: true, from: 'itemA' });
+    const itemB = makeItem('B');
+    currentItem = itemB;
+    worldHandlers.get('remove-item').forEach((fn) => fn({ item: itemA }));
+    itemA.raise('fully-loaded-change', { fullyLoaded: true, from: 'itemA-stale' });
+    itemB.raise('fully-loaded-change', { fullyLoaded: true, from: 'itemB' });
+    // Fallback open wiring attaches itemC if add-item wasn't emitted.
+    const itemC = makeItem('C');
+    currentItem = itemC;
+    viewerHandlers.get('open')[0]();
+    itemC.raise('fully-loaded-change', { fullyLoaded: true, from: 'itemC' });
+    pagehideHandlers.forEach((fn) => fn());
+    itemC.raise('fully-loaded-change', { fullyLoaded: true, from: 'itemC-after-pagehide' });
+
+    // onPaintComplete metadata gating for navigator flush.
+    state.navRefreshPending = true;
+    gateOpts.onPaintComplete(null, { timedOut: true, hasPending: false });
+    const flushAfterNull = navFlushes;
+    gateOpts.onPaintComplete('c=0&g=g1', { timedOut: true, hasPending: false });
+    const flushAfterTimedOut = navFlushes;
+    gateOpts.onPaintComplete('c=0&g=g1', { timedOut: false, hasPending: true });
+    const flushAfterHasPending = navFlushes;
+    gateOpts.onPaintComplete('c=0&g=g1', { timedOut: false, hasPending: false });
+    const flushAfterFinal = navFlushes;
+
+    process.stdout.write(JSON.stringify({
+      order, pinnedUrl, emptyActiveUrl, fallbackUrl,
+      gateLog, itemEvents,
+      flushes: [flushAfterNull, flushAfterTimedOut, flushAfterHasPending, flushAfterFinal],
+    }));
+    """
+    out = json.loads(run_node(script, STATIC, check=True, timeout=10).stdout)
+    assert out["order"] == [
+        ["gate-create"],
+        ["gate-init", "?c=0&g=g1"],
+        ["osd-ctor", True, "api/tile/0/0/0.jpg?c=0&g=g1"],
+    ]
+    assert out["pinnedUrl"] == "api/tile/0/0/0.jpg?c=0&g=g1"
+    assert out["emptyActiveUrl"] == "api/tile/0/0/0.jpg"
+    assert out["fallbackUrl"] == "api/tile/0/0/0.jpg?c=1&g=g1"
+    assert out["gateLog"] == [["full", "itemA"], ["full", "itemB"], ["full", "itemC"]]
+    assert out["flushes"] == [0, 0, 0, 1]
+
+
+def test_plate_focus_reopen_drift_and_deferred_navigator_gate_sync():
+    script = r"""
+    const fs = require('fs'), path = require('path'), vm = require('vm');
+    const source = fs.readFileSync(path.join(process.argv[1], 'app.js'), 'utf8');
+    const geometry = require(path.join(process.argv[1], 'viewer-geometry-v1.js'));
+    function production(name) {
+      const start = source.indexOf('function ' + name + '(');
+      if (start < 0) throw Error('Missing function ' + name);
+      return source.slice(start, source.indexOf('\n}', start) + 2);
+    }
+    const serializer = source.slice(
+      source.indexOf('function lutParam('),
+      source.indexOf('function activeFrameParams(')
+    );
+    const gateCalls = [];
+    const viewerHandlers = new Map();
+    let navFlushes = 0;
+    let activeQuery = 'g=g1&t=0&p=0&z=0';
+    let gateBusy = false;
+    const item = { reset() {}, tilesMatrix: {}, getDrawArea: () => ({ x: 0, y: 0, width: 10, height: 10 }), getClip: () => null, setClip() {} };
+    const navItem = { reset() { navFlushes += 1; }, tilesMatrix: {}, getDrawArea: () => ({ x: 0, y: 0, width: 10, height: 10 }), getClip: () => null, setClip() {} };
+    const viewer = {
+      viewport: {
+        getBounds: () => ({ x: 0, y: 0, width: 1, height: 1 }),
+        fitBounds() {},
+        goHome() {},
+      },
+      world: { getItemAt: (i) => (i === 0 ? item : null) },
+      navigator: { world: { getItemAt: (i) => (i === 0 ? navItem : null) }, update() {} },
+      addHandler(name, fn) {
+        if (!viewerHandlers.has(name)) viewerHandlers.set(name, []);
+        viewerHandlers.get(name).push(fn);
+      },
+      removeHandler(name, fn) {
+        if (viewerHandlers.has(name)) viewerHandlers.set(name, viewerHandlers.get(name).filter((f) => f !== fn));
+      },
+      open() {},
+      forceRedraw() {},
+    };
+    const fakeGate = {
+      getActiveQuery: () => activeQuery,
+      resetState(q, opts) {
+        gateCalls.push(['resetState', q, opts || null]);
+        activeQuery = geometry.normalizeQuery(q);
+      },
+      request(q, opts) {
+        gateCalls.push(['request', q, opts || null]);
+        if (!gateBusy) activeQuery = geometry.normalizeQuery(q);
+        return true;
+      },
+    };
+    const state = {
+      info: {
+        kind: 'plate', generation: 'g1', dtype: 'uint8',
+        plate: { T: 2, P: 4, Z: 3 },
+        channels: [{ label: 'Ch0', color: '00FF00', metadataColor: '00FF00', window: { min: 0, max: 255, start: 0, end: 255 } }],
+      },
+      channels: [0],
+      luts: [null],
+      plate: { t: 1, z: 2, focus: null, everFocused: false, stale: false },
+      viewer,
+      viewportRelay: {
+        timer: null, reopening: false, contextChanging: false, suppressUntil: 0,
+        commandGate: { latestCommandSeq: 1, envelope: () => ({ generation: 'g1' }) },
+      },
+      tileRefreshGate: fakeGate,
+      navRefreshPending: false,
+      quitPreparing: false,
+      sceneSwitching: false,
+      editingId: null,
+      tool: null,
+      roi: null,
+    };
+    const ctx = vm.createContext({
+      state, URLSearchParams, Promise, Date, Number, JSON,
+      window: { Nd2ViewerGeometry: geometry },
+      clamp: (v, lo, hi) => Math.max(lo, Math.min(hi, v)),
+      $: () => ({ classList: { toggle() {} } }),
+      clearTimeout() {},
+      backingFrameParams: () => ({ t: state.plate.t, p: state.plate.focus ?? 0, z: state.plate.z }),
+      appendFrameParams: (q, f) => { q.set('t', String(f.t)); q.set('p', String(f.p)); q.set('z', String(f.z)); return q; },
+      annotationStore: { saveDeparting: () => true, resetOwner() {} },
+      refreshSpatialContext() {},
+      setPlatePlaying() {},
+      layoutPlate() {},
+      loadAnnotations() {},
+      paintPlate() {},
+      plateFrameChanged() { ctx.refreshTiles(); },
+      updateReadout() {},
+      postSpatialReadiness() {},
+      postViewportState() {},
+      applyDesiredDisplayTransform() {},
+      restoreRoiOverlay() {},
+      makeTileSource: () => ({}),
+      publishTranslucentDisplay() {},
+    });
+    vm.runInContext(
+      serializer + '\n' +
+      production('tileQuery') + '\n' +
+      production('resetTiledImage') + '\n' +
+      production('flushNavigatorTiles') + '\n' +
+      production('reopenPreservingView') + '\n' +
+      production('refreshTiles') + '\n' +
+      production('setPlateFocus'),
+      ctx
+    );
+
+    // 1. Grid refreshTiles keeps stale=true and syncs gate with { painted: false }.
+    state.luts = [{ lo: 0, hi: 200, gamma: 1 }];
+    ctx.refreshTiles();
+    const afterGridRefresh = { stale: state.plate.stale, calls: gateCalls.splice(0) };
+
+    // 2. Entering plate focus resets gate with valid g/t/p/z and { painted: false } (not ""), then requests.
+    ctx.setPlateFocus(2);
+    const afterEnterFocus = { calls: gateCalls.splice(0), activeQuery };
+
+    // 3. While gate is busy rendering an older query, flushNavigator=true must defer navigator flush.
+    gateBusy = true;
+    navFlushes = 0;
+    state.navRefreshPending = false;
+    state.luts = [{ lo: 0, hi: 120, gamma: 1 }];
+    ctx.refreshTiles({ flushNavigator: true });
+    const afterBusyRelease = {
+      navFlushes,
+      navRefreshPending: state.navRefreshPending,
+      calls: gateCalls.splice(0),
+    };
+    // When idle and activeQuery matches, flushNavigator=true flushes immediately.
+    gateBusy = false;
+    state.luts = [{ lo: 0, hi: 90, gamma: 1 }];
+    ctx.refreshTiles({ flushNavigator: true });
+    const afterIdleRelease = {
+      navFlushes,
+      navRefreshPending: state.navRefreshPending,
+      calls: gateCalls.splice(0),
+    };
+
+    // 4. Leaving plate focus back to grid syncs gate with valid g/t/p/z and { painted: false }.
+    ctx.setPlateFocus(null);
+    const afterLeaveFocus = { calls: gateCalls.splice(0) };
+
+    // 5. reopenPreservingView: edit during reopening syncs gate and forces request on restored.
+    state.plate.focus = 2;
+    const reopenDriftPromise = ctx.reopenPreservingView();
+    state.luts = [{ lo: 0, hi: 64, gamma: 1 }];
+    ctx.refreshTiles();
+    viewerHandlers.get('open').slice().forEach((fn) => fn());
+    const afterReopenDrift = {
+      navRefreshPending: state.navRefreshPending,
+      calls: gateCalls.splice(0),
+    };
+
+    // 6. reopenPreservingView: without drift, restored calls resetState(currentQuery).
+    const reopenCleanPromise = ctx.reopenPreservingView();
+    viewerHandlers.get('open').slice().forEach((fn) => fn());
+    const afterReopenClean = { calls: gateCalls.splice(0) };
+
+    Promise.all([reopenDriftPromise, reopenCleanPromise]).then(() => {
+      process.stdout.write(JSON.stringify({
+        afterGridRefresh,
+        afterEnterFocus,
+        afterBusyRelease,
+        afterIdleRelease,
+        afterLeaveFocus,
+        afterReopenDrift,
+        afterReopenClean,
+      }));
+    });
+    """
+    out = json.loads(run_node(script, STATIC, check=True, timeout=10).stdout)
+    assert out["afterGridRefresh"]["stale"] is True
+    assert out["afterGridRefresh"]["calls"] == [
+        ["resetState", "?win=0%3A200&g=g1&t=1&p=0&z=2", {"painted": False}]
+    ]
+    assert out["afterEnterFocus"]["calls"][0] == [
+        "resetState",
+        "?win=0%3A200&g=g1&t=1&p=2&z=2",
+        {"painted": False},
+    ]
+    assert out["afterEnterFocus"]["calls"][1] == [
+        "request",
+        "?win=0%3A200&g=g1&t=1&p=2&z=2",
+        {"force": True},
+    ]
+    assert out["afterBusyRelease"]["navFlushes"] == 0
+    assert out["afterBusyRelease"]["navRefreshPending"] is True
+    assert out["afterIdleRelease"]["navFlushes"] == 1
+    assert out["afterIdleRelease"]["navRefreshPending"] is False
+    assert out["afterLeaveFocus"]["calls"][0] == [
+        "resetState",
+        "?win=0%3A90&g=g1&t=1&p=0&z=2",
+        {"painted": False},
+    ]
+    assert out["afterReopenDrift"]["navRefreshPending"] is True
+    assert out["afterReopenDrift"]["calls"] == [
+        ["resetState", "?win=0%3A90&g=g1&t=1&p=2&z=2", {"painted": False}],
+        ["resetState", "?win=0%3A64&g=g1&t=1&p=2&z=2", {"painted": False}],
+        ["request", "?win=0%3A64&g=g1&t=1&p=2&z=2", {"force": True}],
+    ]
+    assert out["afterReopenClean"]["calls"] == [
+        ["resetState", "?win=0%3A64&g=g1&t=1&p=2&z=2", {"painted": False}],
+        ["resetState", "?win=0%3A64&g=g1&t=1&p=2&z=2", None],
+    ]
+
+
+def test_translucent_sync_bounded_retry_recovery_exhaustion_and_cancellation():
+    script = r"""
+    const fs = require('fs'), vm = require('vm');
+    const source = fs.readFileSync(process.argv[1], 'utf8');
+    function production(name) {
+      const start = source.indexOf('function ' + name + '(');
+      if (start < 0) throw Error('Missing function ' + name);
+      return source.slice(start, source.indexOf('\n}', start) + 2);
+    }
+    const retryConstStart = source.indexOf('const TRANSLUCENT_RETRY_DELAYS_MS =');
+    const retryConst = source.slice(retryConstStart, source.indexOf(';', retryConstStart) + 1);
+    const serializer = source.slice(
+      source.indexOf('function lutParam('),
+      source.indexOf('function activeFrameParams(')
+    );
+    let nextTimerId = 1;
+    const activeTimers = new Map();
+    const scheduledDelays = [];
+    const clearedIds = [];
+    const fakeSetTimeout = (fn, ms) => {
+      const id = nextTimerId++;
+      activeTimers.set(id, { fn, ms });
+      scheduledDelays.push(ms);
+      return id;
+    };
+    const fakeClearTimeout = (id) => {
+      if (activeTimers.has(id)) {
+        activeTimers.delete(id);
+        clearedIds.push(id);
+      }
+    };
+    const fireNextTimer = () => {
+      const entry = activeTimers.entries().next();
+      if (entry.done) return false;
+      const [id, timer] = entry.value;
+      activeTimers.delete(id);
+      timer.fn();
+      return true;
+    };
+    const flush = async (n = 12) => { for (let i = 0; i < n; i++) await Promise.resolve(); };
+
+    const state = {
+      info: {
+        rgb: false, dtype: 'uint8', generation: 'g1',
+        channels: [{ label: 'Ch0', color: '00FF00', metadataColor: '00FF00', window: { min: 0, max: 255, start: 0, end: 255 } }],
+      },
+      channels: [0],
+      luts: [null],
+      quitPreparing: false,
+      translucentSync: {
+        launchSeq: 1, launchToken: 'tok-1', generation: 'g1',
+        revision: 0, acceptedQuery: '', inflight: false, retryTimer: null, retryCount: 0,
+      },
+    };
+    const calls = [];
+    let responder = async () => ({ ok: true });
+    const native = {
+      update_translucent_display: async (sid, token, rev, query) => {
+        calls.push({ sid, token, rev, query });
+        return responder(sid, token, rev, query);
+      },
+    };
+    const ctx = vm.createContext({
+      state, URLSearchParams, Promise, Error,
+      setTimeout: fakeSetTimeout,
+      clearTimeout: fakeClearTimeout,
+      window: { parent: { pywebview: { api: native } } },
+      currentSlideSid: () => 'sid-1',
+    });
+    vm.runInContext(
+      retryConst + '\n' +
+      serializer + '\n' +
+      production('cancelTranslucentRetry') + '\n' +
+      production('clearTranslucentSync') + '\n' +
+      production('expireTranslucentSync') + '\n' +
+      production('publishTranslucentDisplay'),
+      ctx
+    );
+
+    (async () => {
+      // 1. Transient throw then non-ok reply then recovery on retry #2 (delays 150, 350).
+      let attempt = 0;
+      responder = async () => {
+        attempt += 1;
+        if (attempt === 1) throw new Error('IPC busy');
+        if (attempt === 2) return { ok: false, message: 'temporary' };
+        return { ok: true, applied: true };
+      };
+      state.luts = [{ lo: 0, hi: 180, gamma: 1 }];
+      ctx.publishTranslucentDisplay();
+      await flush();
+      fireNextTimer();
+      await flush();
+      fireNextTimer();
+      await flush();
+      const recovery = {
+        delays: scheduledDelays.splice(0),
+        acceptedQuery: state.translucentSync.acceptedQuery,
+        retryCount: state.translucentSync.retryCount,
+        pendingTimers: activeTimers.size,
+        callCount: calls.length,
+      };
+
+      // 2. Persistent transient failure stops cleanly after 4 bounded retries [150, 350, 750, 1500].
+      calls.length = 0;
+      responder = async () => { throw new Error('still down'); };
+      state.luts = [{ lo: 0, hi: 150, gamma: 1 }];
+      ctx.publishTranslucentDisplay();
+      await flush();
+      while (fireNextTimer()) await flush();
+      const exhausted = {
+        delays: scheduledDelays.splice(0),
+        callCount: calls.length,
+        retryCount: state.translucentSync.retryCount,
+        pendingTimers: activeTimers.size,
+        launchToken: state.translucentSync.launchToken,
+      };
+
+      // 3. Fresh (!isRetry) edit cancels pending timer, resets retryCount, and delivers immediately.
+      calls.length = 0;
+      let failOnce = true;
+      responder = async () => {
+        if (failOnce) { failOnce = false; throw new Error('drop'); }
+        return { ok: true, applied: true };
+      };
+      state.luts = [{ lo: 0, hi: 140, gamma: 1 }];
+      ctx.publishTranslucentDisplay();
+      await flush();
+      const timerCountBeforeFresh = activeTimers.size;
+      state.luts = [{ lo: 0, hi: 130, gamma: 1 }];
+      ctx.publishTranslucentDisplay();
+      await flush();
+      const afterFreshEdit = {
+        timerCountBeforeFresh,
+        pendingTimers: activeTimers.size,
+        retryCount: state.translucentSync.retryCount,
+        acceptedQuery: state.translucentSync.acceptedQuery,
+        queries: calls.map((c) => c.query),
+      };
+
+      // 4. invalid and invalid_query replies do not schedule retries and keep launchToken.
+      scheduledDelays.length = 0;
+      responder = async () => ({ ok: false, invalid_query: true });
+      state.luts = [{ lo: 0, hi: 120, gamma: 1 }];
+      ctx.publishTranslucentDisplay();
+      await flush();
+      responder = async () => ({ ok: false, invalid: true });
+      state.luts = [{ lo: 0, hi: 110, gamma: 1 }];
+      ctx.publishTranslucentDisplay();
+      await flush();
+      const afterInvalid = {
+        delays: scheduledDelays.slice(),
+        pendingTimers: activeTimers.size,
+        retryCount: state.translucentSync.retryCount,
+        launchToken: state.translucentSync.launchToken,
+      };
+
+      // 5. clearTranslucentSync cancels armed retry timer (same path used by pagehide & selectScene).
+      responder = async () => { throw new Error('down'); };
+      state.luts = [{ lo: 0, hi: 100, gamma: 1 }];
+      ctx.publishTranslucentDisplay();
+      await flush();
+      const armedBeforeClear = activeTimers.size;
+      ctx.clearTranslucentSync();
+      const afterClear = {
+        armedBeforeClear,
+        pendingTimers: activeTimers.size,
+        retryTimer: state.translucentSync.retryTimer,
+        retryCount: state.translucentSync.retryCount,
+        launchToken: state.translucentSync.launchToken,
+      };
+
+      // 6. Terminal closed reply clears sync and schedules no retry.
+      state.translucentSync.launchToken = 'tok-2';
+      state.translucentSync.generation = 'g1';
+      state.translucentSync.acceptedQuery = '';
+      scheduledDelays.length = 0;
+      responder = async () => ({ ok: false, closed: true });
+      state.luts = [{ lo: 0, hi: 90, gamma: 1 }];
+      ctx.publishTranslucentDisplay();
+      await flush();
+      const afterClosed = {
+        delays: scheduledDelays.slice(),
+        pendingTimers: activeTimers.size,
+        launchToken: state.translucentSync.launchToken,
+      };
+
+      process.stdout.write(JSON.stringify({
+        recovery, exhausted, afterFreshEdit, afterInvalid, afterClear, afterClosed,
+      }));
+    })();
+    """
+    out = json.loads(run_node(script, APP, check=True, timeout=10).stdout)
+    assert out["recovery"] == {
+        "delays": [150, 350],
+        "acceptedQuery": "win=0%3A180",
+        "retryCount": 0,
+        "pendingTimers": 0,
+        "callCount": 3,
+    }
+    assert out["exhausted"] == {
+        "delays": [150, 350, 750, 1500],
+        "callCount": 5,
+        "retryCount": 4,
+        "pendingTimers": 0,
+        "launchToken": "tok-1",
+    }
+    assert out["afterFreshEdit"] == {
+        "timerCountBeforeFresh": 1,
+        "pendingTimers": 0,
+        "retryCount": 0,
+        "acceptedQuery": "win=0%3A130",
+        "queries": ["win=0%3A140", "win=0%3A130"],
+    }
+    assert out["afterInvalid"] == {
+        "delays": [],
+        "pendingTimers": 0,
+        "retryCount": 0,
+        "launchToken": "tok-1",
+    }
+    assert out["afterClear"] == {
+        "armedBeforeClear": 1,
+        "pendingTimers": 0,
+        "retryTimer": None,
+        "retryCount": 0,
+        "launchToken": None,
+    }
+    assert out["afterClosed"] == {
+        "delays": [],
+        "pendingTimers": 0,
+        "launchToken": None,
+    }
+    # Verify pagehide invokes clearTranslucentSync in production app.js.
+    app_src = APP.read_text(encoding="utf-8")
+    pagehide_slice = app_src[app_src.index('window.addEventListener("pagehide", () => {\n  applyLuts.cancel();') :]
+    pagehide_slice = pagehide_slice[: pagehide_slice.index("}, { once: true });")]
+    assert "clearTranslucentSync()" in pagehide_slice
+
 
 

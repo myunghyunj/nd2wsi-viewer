@@ -34,6 +34,7 @@ import stat
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,12 @@ SINGLE_FILE_FORMAT = "nd2wsi-cache/4"
 CORRECTED_SINGLE_FILE_FORMAT = "nd2wsi-cache/5"
 KNOWN_FORMATS = (MANIFEST_FORMAT, OVERVIEW_FORMAT, SINGLE_FILE_FORMAT, CORRECTED_SINGLE_FILE_FORMAT)
 ALGORITHM = "box-mean-floor-v1"
+
+_EXFAT_TZ_STEP_NS = 15 * 60 * 1_000_000_000
+_EXFAT_MAX_TZ_STEPS = 26 * 4
+_EXFAT_10MS_NS = 10_000_000
+_COARSE_1S_NS = 1_000_000_000
+_FAT_2S_NS = 2_000_000_000
 
 # A lock names the machine and boot that took it. A drive carried to
 # another computer brings its lockfiles along, and a pid from the other
@@ -254,6 +261,51 @@ def selection_tag(selection: Any) -> str:
     return f"t{t}-p{p}-z{z}"
 
 
+def normalize_name(name: str) -> str:
+    """Canonical NFC filename form for cross-OS macOS/Windows portability.
+
+    Strictly uses NFC (never NFKC/NFKD) so fullwidth punctuation such as
+    U+FF0F ('／') can never turn into path separators.
+    """
+    return unicodedata.normalize("NFC", name)
+
+
+def names_match(a: str | None, b: str | None) -> bool:
+    """True when two filenames are equal after NFC normalization."""
+    return isinstance(a, str) and isinstance(b, str) and normalize_name(a) == normalize_name(b)
+
+
+def resolve_existing_path(path: Path, *, kind: str = "any") -> Path:
+    """Return ``path`` or an NFC/NFD-equivalent existing sibling on disk."""
+    path = Path(path)
+    if kind not in ("any", "file", "dir"):
+        raise ValueError(f"invalid kind: {kind!r}")
+    if path.exists() or path.is_symlink():
+        return path
+    if path.name.isascii() or not path.parent.is_dir():
+        return path
+    norm = normalize_name(path.name)
+    matches: list[str] = []
+    try:
+        with os.scandir(path.parent) as entries:
+            for entry in entries:
+                if normalize_name(entry.name) != norm:
+                    continue
+                try:
+                    if kind == "file" and entry.is_dir(follow_symlinks=False):
+                        continue
+                    if kind == "dir" and not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                matches.append(entry.name)
+    except OSError:
+        return path
+    if matches:
+        return path.parent / min(matches)
+    return path
+
+
 def managed_dir(slide: str | Path) -> Path:
     return Path(slide).parent / MANAGED_DIR
 
@@ -264,7 +316,7 @@ def source_tag(slide: str | Path) -> str:
     Keeping ``.nd2`` or ``.svs`` in the key prevents two files with the same
     stem from sharing a cache container.
     """
-    return re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", Path(slide).name)
+    return re.sub(r'[\/:*?"<>|\x00-\x1f]+', "_", normalize_name(Path(slide).name))
 
 
 def legacy_cache_container(
@@ -276,7 +328,7 @@ def legacy_cache_container(
     slide = Path(slide)
     base = Path(cache_dir) if cache_dir else managed_dir(slide) / CACHES_DIR
     tag = selection_tag(selection or PlaneSelection())
-    return base / f"{slide.stem}--{tag}{CACHE_SUFFIX}"
+    return base / f"{normalize_name(slide.stem)}--{tag}{CACHE_SUFFIX}"
 
 
 def directory_cache_container(
@@ -370,8 +422,84 @@ def quick_fingerprint(path: str | Path) -> dict[str, Any]:
     }
 
 
-def fingerprints_match(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    return all(a.get(k) == b.get(k) for k in ("size", "mtime_ns", "quick_sha256"))
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_quantized_pair(a_ns: int, b_ns: int, quantum_ns: int) -> bool:
+    a_aligned = a_ns % quantum_ns == 0
+    b_aligned = b_ns % quantum_ns == 0
+    if a_aligned == b_aligned:
+        return False
+    coarse, fine = (a_ns, b_ns) if a_aligned else (b_ns, a_ns)
+    floored = (fine // quantum_ns) * quantum_ns
+    return coarse in (floored, floored + quantum_ns)
+
+
+def _exfat_mtime_skew_matches(a_ns: int, b_ns: int) -> bool:
+    if a_ns <= 0 or b_ns <= 0:
+        return False
+    delta = b_ns - a_ns
+    q, r = divmod(abs(delta), _EXFAT_TZ_STEP_NS)
+    steps = q + (1 if r * 2 > _EXFAT_TZ_STEP_NS else 0)
+    if steps > _EXFAT_MAX_TZ_STEPS:
+        return False
+    signed_steps = steps if delta >= 0 else -steps
+    b_adj = b_ns - signed_steps * _EXFAT_TZ_STEP_NS
+    rem = abs(b_adj - a_ns)
+    if rem == 0:
+        return True
+    if rem <= _EXFAT_10MS_NS and (
+        _is_quantized_pair(a_ns, b_adj, _EXFAT_10MS_NS)
+        or (a_ns % _EXFAT_10MS_NS == 0 and b_adj % _EXFAT_10MS_NS == 0)
+    ):
+        return True
+    if rem < _COARSE_1S_NS and _is_quantized_pair(a_ns, b_adj, _COARSE_1S_NS):
+        return True
+    if rem < _FAT_2S_NS and _is_quantized_pair(a_ns, b_adj, _FAT_2S_NS):
+        fine = a_ns if b_adj % _FAT_2S_NS == 0 else b_adj
+        return signed_steps != 0 or fine % _COARSE_1S_NS != 0
+    return False
+
+
+def fingerprints_match(
+    a: dict[str, Any], b: dict[str, Any], *, allow_mtime_skew: bool = True
+) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    size_a, size_b = a.get("size"), b.get("size")
+    sha_a, sha_b = a.get("quick_sha256"), b.get("quick_sha256")
+    mtime_a, mtime_b = a.get("mtime_ns"), b.get("mtime_ns")
+    if (
+        size_a is None
+        or size_b is None
+        or sha_a is None
+        or sha_b is None
+        or mtime_a is None
+        or mtime_b is None
+    ):
+        return False
+    if any(
+        isinstance(v, bool)
+        for v in (size_a, size_b, sha_a, sha_b, mtime_a, mtime_b)
+    ):
+        return False
+    if size_a != size_b or sha_a != sha_b:
+        return False
+    if mtime_a == mtime_b:
+        return True
+    if not allow_mtime_skew:
+        return False
+    if not (
+        _is_int(size_a)
+        and _is_int(size_b)
+        and isinstance(sha_a, str)
+        and bool(sha_a)
+        and _is_int(mtime_a)
+        and _is_int(mtime_b)
+    ):
+        return False
+    return _exfat_mtime_skew_matches(mtime_a, mtime_b)
 
 
 def write_manifest(
@@ -464,14 +592,18 @@ def cache_matches(
         return False
     if kind is not None and m.get("kind", "full") != kind:
         return False
-    if m.get("source", {}).get("name") not in (None, slide.name):
+    source_info = m.get("source")
+    if not isinstance(source_info, dict):
+        return False
+    stored_name = source_info.get("name")
+    if stored_name is not None and not names_match(stored_name, slide.name):
         return False
     sel = selection.describe() if hasattr(selection, "describe") else dict(selection)
     stored = m.get("selection", {})
     if any(str(stored.get(k)) != str(v) for k, v in sel.items()):
         return False
     try:
-        return fingerprints_match(m.get("source", {}), quick_fingerprint(slide))
+        return fingerprints_match(source_info, quick_fingerprint(slide))
     except OSError:
         return False
 

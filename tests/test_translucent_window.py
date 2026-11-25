@@ -1164,3 +1164,130 @@ def test_create_app_window_assigns_api_window_and_private_helpers_not_exposed(mo
     ):
         assert private_name not in child_funcs
     assert all(not part.startswith("_") for name in child_funcs for part in name.split("."))
+
+
+def test_open_translucent_refuses_to_register_already_closed_or_retired_child(
+    store, payload, monkeypatch,
+):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store if sid == "abc" else None))
+
+    # 1. Real TranslucentApi whose _did_close ran during create_translucent_window (retired=True).
+    closed_children = []
+
+    def create_already_closed(context, *, url, title, logger, on_closed, launch_token=None, launch_generation=""):
+        child = overlay.TranslucentApi(
+            context,
+            logger=logger,
+            on_closed=on_closed,
+            launch_token=launch_token,
+            launch_generation=launch_generation,
+        )
+        child._window = SimpleNamespace(uid="dead-real", destroy=Mock())
+        child._did_close()
+        closed_children.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", create_already_closed)
+    res_real = api.open_translucent_viewer("abc", payload)
+    assert res_real["ok"] is False
+    assert "closed while opening" in res_real["message"]
+    assert api._translucent_windows == {}
+    assert api._translucent_pending_launches == {}
+    assert closed_children[0]._session_snapshot()[3] is True
+
+    # 2. Stub child without _session_snapshot exposing _closed=True also aborts and invokes close_translucent.
+    closed_stub = SimpleNamespace(_window=SimpleNamespace(uid="dead-stub"), _closed=True, close_translucent=Mock())
+    monkeypatch.setattr(overlay, "create_translucent_window", lambda *a, **k: closed_stub)
+    res_stub = api.open_translucent_viewer("abc", payload)
+    assert res_stub["ok"] is False
+    assert "closed while opening" in res_stub["message"]
+    closed_stub.close_translucent.assert_called_once()
+    assert api._translucent_windows == {}
+    assert api._translucent_pending_launches == {}
+
+
+def test_empty_display_query_after_generation_change_expires_and_wakes_waiter(
+    store, payload, monkeypatch,
+):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(app, "_server_url", lambda _: "http://127.0.0.1:8123/secret/")
+    created = []
+
+    def make_real_api(context, *, url, title, logger, on_closed, launch_token=None, launch_generation=""):
+        child = overlay.TranslucentApi(
+            context,
+            logger=logger,
+            on_closed=on_closed,
+            launch_token=launch_token,
+            launch_generation=launch_generation,
+        )
+        child._window = SimpleNamespace(uid="win-expire", destroy=Mock())
+        created.append(child)
+        return child
+
+    monkeypatch.setattr(overlay, "create_translucent_window", make_real_api)
+    api = app.Api(None)
+    api._httpd = SimpleNamespace(registry=SimpleNamespace(get=lambda sid: store if sid == "abc" else None))
+    opened = api.open_translucent_viewer("abc", payload)
+    assert opened["ok"] is True
+    child = created[0]
+
+    wait_out = {}
+    started = threading.Event()
+
+    def waiter():
+        started.set()
+        wait_out["res"] = child.wait_translucent_display(opened["launch_token"], 0, timeout_ms=5000)
+
+    wt = threading.Thread(target=waiter)
+    wt.start()
+    assert started.wait(timeout=2)
+    time.sleep(0.02)
+
+    store.generation = "pixels-rebuilt"
+    res = api.update_translucent_display("abc", opened["launch_token"], 1, "")
+    assert res["ok"] is False and res["stale_generation"] is True
+    wt.join(timeout=2)
+    assert not wt.is_alive()
+    assert wait_out["res"]["ok"] is True
+    assert wait_out["res"]["expired"] is True
+    assert wait_out["res"]["reason"] == "generation_changed"
+
+
+def test_create_translucent_window_triggers_did_close_when_closed_event_already_set(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    class PreSetEvent(Event):
+        def __init__(self, preset: bool):
+            super().__init__()
+            self._preset = preset
+
+        def is_set(self):
+            return self._preset
+
+    window = SimpleNamespace(
+        events=SimpleNamespace(
+            shown=PreSetEvent(False),
+            closed=PreSetEvent(True),
+            closing=PreSetEvent(False),
+            before_load=PreSetEvent(False),
+            loaded=PreSetEvent(True),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=Mock(return_value=window)))
+    on_closed = Mock()
+    api = overlay.create_translucent_window(
+        {"dimensions": [100, 100], "query": "?g=g1"},
+        url="http://local/token/static/translucent.html",
+        title="Overlay",
+        logger=Mock(),
+        on_closed=on_closed,
+    )
+    assert api._closed is True
+    assert api._session_snapshot()[3] is True
+    assert api._configured is False
+    on_closed.assert_called_once_with(api)
+

@@ -462,9 +462,10 @@ def exercise_roi_boxes(child, *, timeout=30, screenshot_path=None):
             "checks": checks}
 
 
-def sample_canvas_patch(window, image_x, image_y, *, is_pane=False):
-    """Sample a 5x5 image-centered patch from the OSD 2D canvas (pre-opacity)."""
+def sample_canvas_patch(window, image_x, image_y, *, is_pane=False, allow_none=False):
+    """Sample a 5x5 image-centered composited patch (foreground + #translucent-backdrop)."""
     viewer_expr = "state.viewer" if is_pane else "window.nd2Translucent && window.nd2Translucent.viewer"
+    include_backdrop_js = "false" if is_pane else "true"
     script = f"""(() => {{
       const viewer = {viewer_expr};
       if (!viewer || !viewer.viewport || !viewer.drawer) return {{ error: "viewer not ready" }};
@@ -475,49 +476,129 @@ def sample_canvas_patch(window, image_x, image_y, *, is_pane=False):
       if (!canvas || !ctx || !(size.x > 0) || !(size.y > 0) || !(canvas.width > 0) || !(canvas.height > 0)) {{
         return {{ error: "canvas not ready" }};
       }}
-      const sx = canvas.width / size.x;
-      const sy = canvas.height / size.y;
-      const coords = [];
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      const backdrop = {include_backdrop_js} ? document.getElementById("translucent-backdrop") : null;
+      let bgVis = false;
+      let bgOpacity = 0;
+      let bgCtx = null;
+      if (backdrop && !backdrop.hidden && backdrop.width > 0 && backdrop.height > 0) {{
+        const bgStyle = getComputedStyle(backdrop);
+        bgOpacity = Number.parseFloat(bgStyle.opacity) || 0;
+        if (bgStyle.display !== "none" && bgStyle.visibility !== "hidden" && bgOpacity > 0) {{
+          bgCtx = backdrop.getContext("2d");
+          if (bgCtx) bgVis = true;
+        }}
+      }}
+      const fgSx = canvas.width / size.x;
+      const fgSy = canvas.height / size.y;
+      const fgCoords = [];
+      let fgMinX = Infinity, fgMinY = Infinity, fgMaxX = -Infinity, fgMaxY = -Infinity;
+      const bgSx = bgVis ? backdrop.width / size.x : 0;
+      const bgSy = bgVis ? backdrop.height / size.y : 0;
+      const bgCoords = bgVis ? [] : null;
+      let bgMinX = Infinity, bgMinY = Infinity, bgMaxX = -Infinity, bgMaxY = -Infinity;
+      let hasBgCoords = false;
       for (let dy = -2; dy <= 2; dy++) {{
         for (let dx = -2; dx <= 2; dx++) {{
           const pt = Nd2ViewerGeometry.imageToViewerElementPoint(
             vp, {{ x: {float(image_x)!r} + dx + 0.5, y: {float(image_y)!r} + dy + 0.5 }}, OpenSeadragon
           );
-          const bx = Math.floor(pt.x * sx);
-          const by = Math.floor(pt.y * sy);
-          if (!Number.isFinite(bx) || !Number.isFinite(by) ||
-              bx < 0 || bx >= canvas.width || by < 0 || by >= canvas.height) {{
+          const fx = Math.floor(pt.x * fgSx);
+          const fy = Math.floor(pt.y * fgSy);
+          if (!Number.isFinite(fx) || !Number.isFinite(fy) ||
+              fx < 0 || fx >= canvas.width || fy < 0 || fy >= canvas.height) {{
             return {{
               error: "backing coordinate out of bounds",
-              coord: [bx, by],
+              coord: [fx, fy],
               canvas: [canvas.width, canvas.height],
             }};
           }}
-          coords.push([bx, by]);
-          if (bx < minX) minX = bx;
-          if (by < minY) minY = by;
-          if (bx > maxX) maxX = bx;
-          if (by > maxY) maxY = by;
+          fgCoords.push([fx, fy]);
+          if (fx < fgMinX) fgMinX = fx;
+          if (fy < fgMinY) fgMinY = fy;
+          if (fx > fgMaxX) fgMaxX = fx;
+          if (fy > fgMaxY) fgMaxY = fy;
+          if (bgVis) {{
+            const bx = Math.floor(pt.x * bgSx);
+            const by = Math.floor(pt.y * bgSy);
+            if (!Number.isFinite(bx) || !Number.isFinite(by) ||
+                bx < 0 || bx >= backdrop.width || by < 0 || by >= backdrop.height) {{
+              bgCoords.push(null);
+            }} else {{
+              bgCoords.push([bx, by]);
+              hasBgCoords = true;
+              if (bx < bgMinX) bgMinX = bx;
+              if (by < bgMinY) bgMinY = by;
+              if (bx > bgMaxX) bgMaxX = bx;
+              if (by > bgMaxY) bgMaxY = by;
+            }}
+          }}
         }}
       }}
-      const bw = maxX - minX + 1;
-      const bh = maxY - minY + 1;
-      const img = ctx.getImageData(minX, minY, bw, bh).data;
-      let sumR = 0, sumG = 0, sumB = 0, minAlpha = 255;
-      for (const [bx, by] of coords) {{
-        const off = ((by - minY) * bw + (bx - minX)) * 4;
-        sumR += img[off];
-        sumG += img[off + 1];
-        sumB += img[off + 2];
-        if (img[off + 3] < minAlpha) minAlpha = img[off + 3];
+      const fgBw = fgMaxX - fgMinX + 1;
+      const fgBh = fgMaxY - fgMinY + 1;
+      const fgData = ctx.getImageData(fgMinX, fgMinY, fgBw, fgBh).data;
+      let bgData = null;
+      let bgBw = 0;
+      if (bgVis && hasBgCoords) {{
+        bgBw = bgMaxX - bgMinX + 1;
+        const bgBh = bgMaxY - bgMinY + 1;
+        bgData = bgCtx.getImageData(bgMinX, bgMinY, bgBw, bgBh).data;
       }}
-      const n = coords.length;
+      let sumR = 0, sumG = 0, sumB = 0, minAlpha = 255;
+      let fgSumR = 0, fgSumG = 0, fgSumB = 0, fgMinAlpha = 255;
+      let bgMinAlpha = 255;
+      for (let i = 0; i < fgCoords.length; i++) {{
+        const [fx, fy] = fgCoords[i];
+        const fOff = ((fy - fgMinY) * fgBw + (fx - fgMinX)) * 4;
+        const fgR = fgData[fOff];
+        const fgG = fgData[fOff + 1];
+        const fgB = fgData[fOff + 2];
+        const fgA = fgData[fOff + 3];
+        fgSumR += fgR;
+        fgSumG += fgG;
+        fgSumB += fgB;
+        if (fgA < fgMinAlpha) fgMinAlpha = fgA;
+        let bgR = 0, bgG = 0, bgB = 0, bgA = 0;
+        if (bgVis) {{
+          const bc = bgCoords[i];
+          if (bc && bgData) {{
+            const bOff = ((bc[1] - bgMinY) * bgBw + (bc[0] - bgMinX)) * 4;
+            bgR = bgData[bOff];
+            bgG = bgData[bOff + 1];
+            bgB = bgData[bOff + 2];
+            bgA = bgData[bOff + 3];
+          }}
+        }}
+        const aF = fgA / 255;
+        const aB = bgVis ? (bgA / 255) * bgOpacity : 0;
+        if (bgVis) {{
+          const effBgA = Math.round(aB * 255);
+          if (effBgA < bgMinAlpha) bgMinAlpha = effBgA;
+        }}
+        const aOut = aF + aB * (1 - aF);
+        let outR = 0, outG = 0, outB = 0;
+        if (aOut > 0) {{
+          const bW = aB * (1 - aF);
+          outR = (fgR * aF + bgR * bW) / aOut;
+          outG = (fgG * aF + bgG * bW) / aOut;
+          outB = (fgB * aF + bgB * bW) / aOut;
+        }}
+        const outA = Math.round(aOut * 255);
+        sumR += outR;
+        sumG += outG;
+        sumB += outB;
+        if (outA < minAlpha) minAlpha = outA;
+      }}
+      const n = fgCoords.length;
       const meanRgb = [sumR / n, sumG / n, sumB / n];
       return {{
         mean_rgb: meanRgb,
         mean_intensity: (meanRgb[0] + meanRgb[1] + meanRgb[2]) / 3,
         min_alpha: minAlpha,
+        fg_min_alpha: fgMinAlpha,
+        fg_mean_intensity: (fgSumR + fgSumG + fgSumB) / (3 * n),
+        backdrop_visible: bgVis,
+        backdrop_min_alpha: bgVis ? bgMinAlpha : null,
         samples: n,
       }};
     }})()"""
@@ -528,6 +609,8 @@ def sample_canvas_patch(window, image_x, image_y, *, is_pane=False):
             break
         if attempt < 2:
             time.sleep(.05)
+    if result is None and allow_none:
+        return None
     if not isinstance(result, dict) or "error" in result:
         raise AssertionError(f"sample_canvas_patch failed ({'pane' if is_pane else 'overlay'}): {result}")
     return result
@@ -641,6 +724,31 @@ def _dispatch_lut_hi_pointer(parent, ch_index, event_type, target_value, pointer
             button: 0, buttons: {0 if event_type in ('pointerup', 'pointercancel') else 1},
             clientX: cx, clientY: cy, bubbles: true, cancelable: true,
           }}));
+          return {{ val: {float(target_value)!r}, cx, cy, vmin, vmax, lut: state.luts[{int(ch_index)}] }};
+        }})()""",
+    )
+
+
+def _dispatch_lut_hi_release(parent, ch_index, target_value, pointer_id=71):
+    """Dispatch final pointermove + pointerup atomically in one evaluate_js RPC."""
+    return pane_eval(
+        parent,
+        f"""(() => {{
+          const canvas = document.querySelectorAll('.lut-canvas')[{int(ch_index)}];
+          if (!canvas) return {{ error: 'missing lut canvas' }};
+          const r = canvas.getBoundingClientRect();
+          const vmin = Number(canvas.getAttribute('data-axis-min'));
+          const vmax = Number(canvas.getAttribute('data-axis-max'));
+          const x0 = 4, x1 = r.width - 4;
+          const frac = Math.max(0, Math.min(1, ({float(target_value)!r} - vmin) / (vmax - vmin)));
+          const cx = r.left + x0 + frac * (x1 - x0);
+          const cy = r.top + 8;
+          const send = (type, buttons) => canvas.dispatchEvent(new PointerEvent(type, {{
+            pointerId: {int(pointer_id)}, pointerType: 'mouse', isPrimary: true,
+            button: 0, buttons, clientX: cx, clientY: cy, bubbles: true, cancelable: true,
+          }}));
+          send('pointermove', 1);
+          send('pointerup', 0);
           return {{ val: {float(target_value)!r}, cx, cy, vmin, vmax, lut: state.luts[{int(ch_index)}] }};
         }})()""",
     )
@@ -784,6 +892,7 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
     failed = False
     try:
         _dispatch_lut_hi_pointer(parent, ch_idx, "pointerdown", start_hi)
+        released = False
         try:
             for step_idx, (hi_val, expected_intensity) in enumerate(hold_targets, start=1):
                 _dispatch_lut_hi_pointer(parent, ch_idx, "pointermove", hi_val)
@@ -795,23 +904,28 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
                 seen_queries = {drag_start_query, *pre_release_queries}
                 while True:
                     now_ms = round((time.monotonic() - t0) * 1000.0, 1)
-                    main_sample = sample_canvas_patch(parent, px, py, is_pane=True)
-                    overlay_sample = sample_canvas_patch(child, px, py, is_pane=False)
+                    ms = sample_canvas_patch(parent, px, py, is_pane=True, allow_none=True)
+                    os_ = sample_canvas_patch(child, px, py, is_pane=False, allow_none=True)
+                    if ms is not None:
+                        main_sample = ms
+                    if os_ is not None:
+                        overlay_sample = os_
                     ov_query = _overlay_display_query(child)
                     if expected_intensity is not None:
-                        if main_hit_ms is None and main_sample["min_alpha"] == 255 and abs(main_sample["mean_intensity"] - expected_intensity) <= 8.0:
+                        if main_hit_ms is None and main_sample is not None and main_sample["min_alpha"] == 255 and abs(main_sample["mean_intensity"] - expected_intensity) <= 8.0:
                             main_hit_ms = now_ms
-                        if overlay_hit_ms is None and overlay_sample["min_alpha"] == 255 and abs(overlay_sample["mean_intensity"] - expected_intensity) <= 8.0:
+                        if overlay_hit_ms is None and overlay_sample is not None and overlay_sample["min_alpha"] == 255 and abs(overlay_sample["mean_intensity"] - expected_intensity) <= 8.0:
                             overlay_hit_ms = now_ms
                         if main_hit_ms is not None and overlay_hit_ms is not None:
                             break
                     else:
                         min_delta = 10.0 if step_idx >= 2 else 1.0
-                        if main_hit_ms is None and main_sample["min_alpha"] == 255 and main_sample["mean_intensity"] >= main_init["mean_intensity"] + min_delta:
+                        if main_hit_ms is None and main_sample is not None and main_sample["min_alpha"] == 255 and main_sample["mean_intensity"] >= main_init["mean_intensity"] + min_delta:
                             main_hit_ms = now_ms
                         if (
                             overlay_hit_ms is None
                             and ov_query not in seen_queries
+                            and overlay_sample is not None
                             and overlay_sample["min_alpha"] == 255
                             and overlay_sample["mean_intensity"] >= overlay_init["mean_intensity"] + min_delta
                         ):
@@ -832,35 +946,42 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
                     "overlay": overlay_sample,
                     "overlay_query": ov_query,
                 }
-            _dispatch_lut_hi_pointer(parent, ch_idx, "pointermove", release_target[0])
+            _dispatch_lut_hi_release(parent, ch_idx, release_target[0])
+            released = True
         finally:
-            _dispatch_lut_hi_pointer(parent, ch_idx, "pointerup", release_target[0])
+            if not released:
+                _dispatch_lut_hi_pointer(parent, ch_idx, "pointerup", release_target[0])
 
         t0 = time.monotonic()
         deadline = t0 + min(timeout, 5.0)
         main_hit_ms = overlay_hit_ms = None
         main_rel = overlay_rel = None
         rel_query = None
-        prev_overlay = steps["hold_2"]["overlay"]["mean_intensity"]
-        prev_main = steps["hold_2"]["main"]["mean_intensity"]
+        prev_overlay = (steps["hold_2"]["overlay"] or overlay_init)["mean_intensity"]
+        prev_main = (steps["hold_2"]["main"] or main_init)["mean_intensity"]
         while True:
             now_ms = round((time.monotonic() - t0) * 1000.0, 1)
-            main_rel = sample_canvas_patch(parent, px, py, is_pane=True)
-            overlay_rel = sample_canvas_patch(child, px, py, is_pane=False)
+            ms = sample_canvas_patch(parent, px, py, is_pane=True, allow_none=True)
+            os_ = sample_canvas_patch(child, px, py, is_pane=False, allow_none=True)
+            if ms is not None:
+                main_rel = ms
+            if os_ is not None:
+                overlay_rel = os_
             rel_query = _overlay_display_query(child)
             if release_target[1] is not None:
-                if main_hit_ms is None and main_rel["min_alpha"] == 255 and abs(main_rel["mean_intensity"] - release_target[1]) <= 8.0:
+                if main_hit_ms is None and main_rel is not None and main_rel["min_alpha"] == 255 and abs(main_rel["mean_intensity"] - release_target[1]) <= 8.0:
                     main_hit_ms = now_ms
-                if overlay_hit_ms is None and overlay_rel["min_alpha"] == 255 and abs(overlay_rel["mean_intensity"] - release_target[1]) <= 8.0:
+                if overlay_hit_ms is None and overlay_rel is not None and overlay_rel["min_alpha"] == 255 and abs(overlay_rel["mean_intensity"] - release_target[1]) <= 8.0:
                     overlay_hit_ms = now_ms
                 if main_hit_ms is not None and overlay_hit_ms is not None:
                     break
             else:
-                if main_hit_ms is None and main_rel["min_alpha"] == 255 and main_rel["mean_intensity"] >= prev_main - 2.0:
+                if main_hit_ms is None and main_rel is not None and main_rel["min_alpha"] == 255 and main_rel["mean_intensity"] >= prev_main - 2.0:
                     main_hit_ms = now_ms
                 if (
                     overlay_hit_ms is None
                     and rel_query not in {drag_start_query, *pre_release_queries}
+                    and overlay_rel is not None
                     and overlay_rel["min_alpha"] == 255
                     and overlay_rel["mean_intensity"] >= prev_overlay - 2.0
                 ):
@@ -883,10 +1004,18 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
         if calibration_patch is not None:
             for key, target in (("hold_1", 85.0), ("hold_2", 127.0), ("release", 204.0)):
                 st = steps[key]
-                _check(st["main"]["min_alpha"] == 255 and abs(st["main"]["mean_intensity"] - target) <= 8.0,
-                       f"Live LUT calibration main {key} missed {target}±8: {st['main']}")
-                _check(st["overlay"]["min_alpha"] == 255 and abs(st["overlay"]["mean_intensity"] - target) <= 8.0,
-                       f"Live LUT calibration overlay {key} missed {target}±8: {st['overlay']}")
+                _check(
+                    st["main"] is not None
+                    and st["main"]["min_alpha"] == 255
+                    and abs(st["main"]["mean_intensity"] - target) <= 8.0,
+                    f"Live LUT calibration main {key} missed {target}±8: {st['main']}",
+                )
+                _check(
+                    st["overlay"] is not None
+                    and st["overlay"]["min_alpha"] == 255
+                    and abs(st["overlay"]["mean_intensity"] - target) <= 8.0,
+                    f"Live LUT calibration overlay {key} missed {target}±8: {st['overlay']}",
+                )
                 if key != "release":
                     _check(st["main_elapsed_ms"] is not None and st["overlay_elapsed_ms"] is not None,
                            f"Live LUT calibration {key} did not paint before pointerup: {st}")
@@ -894,8 +1023,13 @@ def exercise_live_lut_drag(parent, child, *, timeout=30, calibration_patch=None,
             _check(len(pre_release_queries) >= 2,
                    f"Expected >= 2 distinct pre-release overlay query updates, got {pre_release_queries}")
             for key in ("hold_1", "hold_2", "release"):
-                _check(steps[key]["main"]["min_alpha"] == 255 and steps[key]["overlay"]["min_alpha"] == 255,
-                       f"Live LUT drag {key} canvas was not opaque: {steps[key]}")
+                _check(
+                    steps[key]["main"] is not None
+                    and steps[key]["overlay"] is not None
+                    and steps[key]["main"]["min_alpha"] == 255
+                    and steps[key]["overlay"]["min_alpha"] == 255,
+                    f"Live LUT drag {key} canvas was not opaque: {steps[key]}",
+                )
             ov0 = overlay_init["mean_intensity"]
             ov1 = steps["hold_1"]["overlay"]["mean_intensity"]
             ov2 = steps["hold_2"]["overlay"]["mean_intensity"]

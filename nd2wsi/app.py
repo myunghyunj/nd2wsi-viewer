@@ -531,6 +531,11 @@ class Api:
                         self._translucent_pending_launches.pop(sid, None)
                     server = self._httpd
                     current_store = server.registry.get(sid) if server is not None else None
+                    overlay_closed = (
+                        overlay._session_snapshot()[3]
+                        if callable(getattr(overlay, "_session_snapshot", None))
+                        else bool(getattr(overlay, "_closed", False))
+                    )
                     if self._translucent_owner_closed:
                         abort_reason = "The source viewer is closing"
                     elif current_store is None:
@@ -539,6 +544,8 @@ class Api:
                         abort_reason = "The overlay launch was superseded"
                     elif getattr(current_store, "generation", "") != launch_generation:
                         abort_reason = "The image changed; refresh the slide before opening the overlay"
+                    elif overlay_closed:
+                        abort_reason = "The overlay closed while opening"
                     else:
                         self._translucent_windows[sid] = overlay
 

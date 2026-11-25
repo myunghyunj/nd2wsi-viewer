@@ -787,6 +787,7 @@ def ensure_cache(
         directory_cache_container,
         legacy_cache_container,
         newer_cache_format,
+        resolve_existing_path,
     )
     from .sdpc import is_sdpc
 
@@ -796,7 +797,7 @@ def ensure_cache(
     selection = selection or PlaneSelection()
     want = None if kind == "auto" else kind
 
-    container = cache_container(slide, selection)
+    container = resolve_existing_path(cache_container(slide, selection))
     store = container  # a v2 destination is a file, even if a damaged directory occupies it
 
     def refuse_if_newer() -> None:
@@ -827,8 +828,8 @@ def ensure_cache(
     # ``slide.svs`` may live together.
     old_valid = None
     for old_container in (
-        directory_cache_container(slide, selection),
-        legacy_cache_container(slide, selection),
+        resolve_existing_path(directory_cache_container(slide, selection)),
+        resolve_existing_path(legacy_cache_container(slide, selection)),
     ):
         old_store = container_store(old_container)
         if (
@@ -901,14 +902,15 @@ def existing_cache_store(
         container_store,
         directory_cache_container,
         legacy_cache_container,
+        resolve_existing_path,
     )
 
     slide = Path(slide).resolve()
     selection = selection or PlaneSelection()
     for container in (
-        cache_container(slide, selection),
-        directory_cache_container(slide, selection),
-        legacy_cache_container(slide, selection),
+        resolve_existing_path(cache_container(slide, selection)),
+        resolve_existing_path(directory_cache_container(slide, selection)),
+        resolve_existing_path(legacy_cache_container(slide, selection)),
     ):
         store = container_store(container)
         if cache_matches(container, slide, selection, tile=tile) and store.exists():
@@ -929,6 +931,8 @@ def _legacy_store_matches_source(
     hooks: _FacadeHooks,
 ) -> bool:
     """Whether a stem-only store can be assigned to this source safely."""
+    from .cache import names_match
+
     try:
         if attrs is None:
             root, attrs = hooks.open_store(store)
@@ -944,13 +948,13 @@ def _legacy_store_matches_source(
     if attrs is not None:
         recorded = Path(str(attrs.get("nd2wsi", {}).get("source") or "")).name
     if recorded:
-        return recorded == slide.name
+        return names_match(recorded, slide.name)
     try:
         siblings = [
             item
             for item in slide.parent.iterdir()
             if item.is_file()
-            and item.stem == slide.stem
+            and names_match(item.stem, slide.stem)
             and item.suffix.lower() in (".nd2", ".czi", ".lif", ".svs", ".sdpc")
         ]
     except OSError:
@@ -967,16 +971,17 @@ def _legacy_store(
     hooks: _FacadeHooks,
 ) -> Path | None:
     """A complete portable store found beside this source."""
-    from .cache import quarantine
+    from .cache import quarantine, resolve_existing_path
 
     selection = selection or PlaneSelection()
     base = slide.parent
-    for cand in (
+    for raw_cand in (
         base / CACHE_DIR_NAME / f"{slide.name}.ome.zarr",
         base / CACHE_DIR_NAME / f"{slide.stem}.ome.zarr",
         base / f"pyramid_{slide.stem}.ome.zarr",
         base / f"{slide.stem}.ome.zarr",
     ):
+        cand = resolve_existing_path(raw_cand, kind="dir")
         if not cand.exists():
             continue
         try:
@@ -1019,16 +1024,22 @@ def default_store_path(
     hooks: _FacadeHooks,
 ) -> Path:
     """Default path for a complete, portable pyramid."""
+    from .cache import normalize_name, resolve_existing_path
+
     nd2_path = Path(nd2_path)
     base = Path(cache_dir) if cache_dir else nd2_path.parent
-    for legacy in (
+    for raw_legacy in (
         base / CACHE_DIR_NAME / f"{nd2_path.stem}.ome.zarr",
         base / f"pyramid_{nd2_path.stem}.ome.zarr",
         base / f"{nd2_path.stem}.ome.zarr",
     ):
+        legacy = resolve_existing_path(raw_legacy, kind="dir")
         if legacy.exists() and hooks.legacy_matches_source(legacy, nd2_path):
             return legacy
-    return base / CACHE_DIR_NAME / f"{nd2_path.name}.ome.zarr"
+    return resolve_existing_path(
+        base / CACHE_DIR_NAME / f"{normalize_name(nd2_path.name)}.ome.zarr",
+        kind="dir",
+    )
 
 
 def is_nd2wsi_store(path: str | Path) -> bool:
@@ -1044,6 +1055,8 @@ def tidy_caches(
     folder: str | Path, *, dry_run: bool = False, hooks: _FacadeHooks
 ) -> dict[str, Any]:
     """Move scattered pyramid stores in ``folder`` into ``pyramids/``."""
+    from .cache import resolve_existing_path
+
     folder = Path(folder)
     dest = folder / CACHE_DIR_NAME
     moved = []
@@ -1061,7 +1074,7 @@ def tidy_caches(
         if stem.startswith("pyramid_"):
             stem = stem[len("pyramid_") :]
         target = dest / f"{stem}.ome.zarr"
-        if target.exists():
+        if resolve_existing_path(target, kind="dir").exists():
             continue
         moved.append((item, target))
         if not dry_run:

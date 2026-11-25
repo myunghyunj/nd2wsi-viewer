@@ -467,13 +467,19 @@ def test_tile_refresh_gate_waits_for_full_visible_coverage_and_active_tiles():
       const queryAfterFirst = gate.getActiveQuery();
       const renderingSecond = gate.isRendering();
 
-      // Complete second render via onFullyLoadedChange({ fullyLoaded: true }).
-      // First verify false getFullyLoaded() blocks completion.
+      // Second render: fully-loaded-change before draw must NOT complete prematurely;
+      // mixed frames with stale tiles must NOT complete; active draw completes cleanly.
       fullyLoaded = false;
       gate.onFullyLoadedChange({ fullyLoaded: true });
       const blockedByGetFullyLoaded = gate.isRendering();
       fullyLoaded = true;
       gate.onFullyLoadedChange({ fullyLoaded: true });
+      const blockedBeforeDraw = gate.isRendering();
+      const tile3 = { level: 1, x: 0, y: 0 };
+      item.tilesMatrix = { 1: { 0: { 0: tile3 } } };
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tile3, staleTile] });
+      const blockedByMixedFrame = gate.isRendering();
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tile3] });
 
       return {
         stillRenderingAfterStale,
@@ -481,6 +487,8 @@ def test_tile_refresh_gate_waits_for_full_visible_coverage_and_active_tiles():
         queryAfterFirst,
         renderingSecond,
         blockedByGetFullyLoaded,
+        blockedBeforeDraw,
+        blockedByMixedFrame,
         finalRendering: gate.isRendering(),
         completed,
       };
@@ -490,6 +498,8 @@ def test_tile_refresh_gate_waits_for_full_visible_coverage_and_active_tiles():
     assert out["queryAfterFirst"] == "c=0&win=0%3A80"
     assert out["renderingSecond"] is True
     assert out["blockedByGetFullyLoaded"] is True
+    assert out["blockedBeforeDraw"] is True
+    assert out["blockedByMixedFrame"] is True
     assert out["finalRendering"] is False
     assert out["completed"] == ["c=0&win=0%3A128", "c=0&win=0%3A80"]
 
@@ -776,3 +786,253 @@ process.stdout.write(JSON.stringify(out));
         "rendering": False,
         "completed": ["c=1"],
     }
+
+
+def test_tile_refresh_gate_paint_complete_ordering_reverse_order_offscreen_and_redraw():
+    out = run("""
+      const events = [];
+      let fullyLoaded = false;
+      let needsDraw = true;
+      let drawArea = { x: 0, y: 0, width: 256, height: 256 };
+      let redraws = 0;
+      const otherItem = {};
+      const item = {
+        tilesMatrix: {},
+        reset() { needsDraw = true; },
+        getDrawArea() { return drawArea; },
+        _setFullyLoaded(v) { fullyLoaded = v; },
+        getFullyLoaded() { return fullyLoaded; },
+        needsDraw() { return needsDraw; },
+      };
+      const viewer = { forceRedraw() { redraws += 1; } };
+      const gate = geometry.createTileRefreshGate({
+        getItem: () => item,
+        getViewer: () => viewer,
+        onBeforeReset: (_item, meta) => events.push(['before', gate.getActiveQuery(), meta]),
+        onPaintComplete: (q, meta) => events.push(['complete', q, meta]),
+      });
+
+      gate.init('c=0&win=0:255');
+
+      // 1) Normal OSD 5.0.1 order: tile-loaded -> fully-loaded-change BEFORE tiled-image-drawn.
+      gate.request('c=0&win=0:128');
+      gate.request('c=0&win=0:64');
+      const tileB = { level: 0, x: 0, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileB } } };
+      gate.onTileLoaded({ tiledImage: item, tile: tileB });
+      fullyLoaded = true;
+      // Wrong eventSource and false fullyLoaded must be ignored.
+      gate.onFullyLoadedChange({ eventSource: otherItem, fullyLoaded: true });
+      gate.onFullyLoadedChange({ eventSource: item, fullyLoaded: false });
+      // Real TiledImage fully-loaded-change fires BEFORE draw: must NOT advance gate!
+      gate.onFullyLoadedChange({ eventSource: item, fullyLoaded: true });
+      // A subsequent fullyLoaded: false clears fullyLoadedReady until fullyLoaded becomes true again.
+      fullyLoaded = false;
+      gate.onFullyLoadedChange({ eventSource: item, fullyLoaded: false });
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileB] });
+      const stillRenderingAfterResetReady = gate.isRendering();
+      gate.onTileLoaded({ tiledImage: item, tile: tileB });
+      fullyLoaded = true;
+      gate.onFullyLoadedChange({ eventSource: item, fullyLoaded: true });
+      const beforeDrawState = {
+        active: gate.getActiveQuery(),
+        rendering: gate.isRendering(),
+        completes: events.filter(e => e[0] === 'complete').length,
+      };
+      // Now tiled-image-drawn paints active tiles -> completes B with hasPending: true and starts C.
+      needsDraw = false;
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileB] });
+      const afterBDraw = {
+        active: gate.getActiveQuery(),
+        rendering: gate.isRendering(),
+      };
+
+      // 2) Partial draw then 2nd tile loads -> dirtySinceDraw blocks premature completion.
+      const tileC1 = { level: 0, x: 0, y: 0 };
+      const tileC2 = { level: 0, x: 1, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileC1 }, 1: { 0: tileC2 } } };
+      gate.onTileLoaded({ tiledImage: item, tile: tileC1 });
+      fullyLoaded = false;
+      needsDraw = false;
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileC1] });
+      // Second tile arrives -> dirtySinceDraw becomes true; even with needsDraw=false, must wait for draw.
+      gate.onTileLoaded({ tiledImage: item, tile: tileC2 });
+      fullyLoaded = true;
+      gate.onFullyLoadedChange({ eventSource: item, fullyLoaded: true });
+      const blockedByDirtySinceDraw = gate.isRendering();
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileC1, tileC2] });
+      const afterCDraw = gate.isRendering();
+
+      // 3) Reverse order: tiled-image-drawn first, then fully-loaded-change with !dirtySinceDraw & !needsDraw().
+      gate.request('c=0&win=0:32');
+      const tileD = { level: 0, x: 0, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileD } } };
+      gate.onTileLoaded({ tiledImage: item, tile: tileD });
+      fullyLoaded = false;
+      needsDraw = false;
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileD] });
+      const stillWaitingReverse = gate.isRendering();
+      fullyLoaded = true;
+      gate.onFullyLoadedChange({ eventSource: item, fullyLoaded: true });
+      const doneAfterReverse = gate.isRendering();
+
+      // 4) fully-loaded-change with !drawnActive and needsDraw() === false requests a redraw tick.
+      gate.request('c=0&win=0:16');
+      const redrawsBefore = redraws;
+      needsDraw = false;
+      fullyLoaded = true;
+      gate.onFullyLoadedChange({ eventSource: item, fullyLoaded: true });
+      const redrawTriggered = redraws - redrawsBefore;
+      const waitingForRedrawTick = gate.isRendering();
+      const tileE = { level: 0, x: 0, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileE } } };
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileE] });
+
+      // 5) fully-loaded-change completes immediately if item moved offscreen mid-render.
+      gate.request('c=0&win=0:8');
+      drawArea = null;
+      fullyLoaded = true;
+      gate.onFullyLoadedChange({ eventSource: item, fullyLoaded: true });
+      const doneOffscreen = gate.isRendering();
+      drawArea = { x: 0, y: 0, width: 256, height: 256 };
+
+      // 6) Pending identical to active query (A -> B -> B) reports hasPending: false.
+      gate.request('c=0&win=0:4');
+      gate.request('?c=0&win=0%3A4');
+      const tileF = { level: 0, x: 0, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileF } } };
+      fullyLoaded = true;
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileF] });
+
+      return {
+        stillRenderingAfterResetReady,
+        beforeDrawState,
+        afterBDraw,
+        blockedByDirtySinceDraw,
+        afterCDraw,
+        stillWaitingReverse,
+        doneAfterReverse,
+        redrawTriggered,
+        waitingForRedrawTick,
+        doneOffscreen,
+        events,
+      };
+    """)
+    assert out["stillRenderingAfterResetReady"] is True
+    assert out["beforeDrawState"] == {
+        "active": "c=0&win=0%3A128",
+        "rendering": True,
+        "completes": 0,
+    }
+    assert out["afterBDraw"] == {"active": "c=0&win=0%3A64", "rendering": True}
+    assert out["blockedByDirtySinceDraw"] is True
+    assert out["afterCDraw"] is False
+    assert out["stillWaitingReverse"] is True
+    assert out["doneAfterReverse"] is False
+    assert out["redrawTriggered"] == 1
+    assert out["waitingForRedrawTick"] is True
+    assert out["doneOffscreen"] is False
+    completes = [e for e in out["events"] if e[0] == "complete"]
+    assert completes == [
+        ["complete", "c=0&win=0%3A128", {"timedOut": False, "hasPending": True}],
+        ["complete", "c=0&win=0%3A64", {"timedOut": False, "hasPending": False}],
+        ["complete", "c=0&win=0%3A32", {"timedOut": False, "hasPending": False}],
+        ["complete", "c=0&win=0%3A16", {"timedOut": False, "hasPending": False}],
+        ["complete", "c=0&win=0%3A8", {"timedOut": False, "hasPending": False}],
+        ["complete", "c=0&win=0%3A4", {"timedOut": False, "hasPending": False}],
+    ]
+    befores = [e for e in out["events"] if e[0] == "before"]
+    assert all(entry[2] == {"hadPainted": True} for entry in befores)
+
+
+def test_tile_refresh_gate_watchdog_metadata_had_painted_and_reset_state_unpainted():
+    out = run("""
+      let nextId = 1;
+      const timers = new Map();
+      const setTimer = (fn, ms) => { const id = nextId++; timers.set(id, { fn, ms }); return id; };
+      const clearTimer = (id) => { timers.delete(id); };
+
+      const beforeLog = [];
+      const completeLog = [];
+      let fullyLoaded = false;
+      const item = {
+        tilesMatrix: {},
+        reset() {},
+        getDrawArea() { return { x: 0, y: 0, width: 100, height: 100 }; },
+        _setFullyLoaded(v) { fullyLoaded = v; },
+        getFullyLoaded() { return fullyLoaded; },
+      };
+      const gate = geometry.createTileRefreshGate({
+        getItem: () => item,
+        getViewer: () => ({ forceRedraw() {} }),
+        onBeforeReset: (_item, meta) => beforeLog.push([gate.getActiveQuery(), meta]),
+        onPaintComplete: (q, meta) => completeLog.push([q, meta]),
+        setTimer,
+        clearTimer,
+        stallTimeoutMs: 2000,
+      });
+
+      gate.init('c=0&win=0:255');
+      gate.request('c=0&win=0:128');
+      gate.request('c=0&win=0:64');
+      // Expire B's watchdog with C pending -> timedOut: true, hasPending: true, then C starts with hadPainted: false.
+      const t1 = [...timers.keys()][0];
+      const cb1 = timers.get(t1).fn;
+      timers.delete(t1);
+      cb1();
+
+      // Expire C's watchdog with NO pending -> timedOut: true, hasPending: false.
+      const t2 = [...timers.keys()][0];
+      const cb2 = timers.get(t2).fn;
+      timers.delete(t2);
+      cb2();
+
+      // Late draw recovers paintedQuery = C and fires timedOut: false, hasPending: false.
+      const tileC = { level: 0, x: 0, y: 0 };
+      item.tilesMatrix = { 0: { 0: { 0: tileC } } };
+      fullyLoaded = true;
+      gate.onTiledImageDrawn({ tiledImage: item, tiles: [tileC] });
+      const dupAfterLateDraw = gate.request('c=0&win=0:64');
+
+      // resetState(q, { painted: false }) updates activeQuery, clears timers/rendering, and clears paintedQuery.
+      gate.request('c=0&win=0:32');
+      const timersBeforeReset = timers.size;
+      gate.resetState('?c=1&g=g2', { painted: false });
+      const afterUnpaintedReset = {
+        active: gate.getActiveQuery(),
+        rendering: gate.isRendering(),
+        timers: timers.size,
+      };
+      // Requesting the same query still resets because paintedQuery is null, with hadPainted: false.
+      const reqSameAfterUnpainted = gate.request('c=1&g=g2');
+
+      // Default resetState(q) marks paintedQuery = activeQuery so identical request is a no-op.
+      gate.resetState('?c=2&g=g2');
+      const reqSameAfterPainted = gate.request('c=2&g=g2');
+
+      return {
+        beforeLog,
+        completeLog,
+        dupAfterLateDraw,
+        timersBeforeReset,
+        afterUnpaintedReset,
+        reqSameAfterUnpainted,
+        reqSameAfterPainted,
+      };
+    """)
+    assert out["beforeLog"] == [
+        ["c=0&win=0%3A128", {"hadPainted": True}],
+        ["c=0&win=0%3A64", {"hadPainted": False}],
+        ["c=0&win=0%3A32", {"hadPainted": True}],
+        ["c=1&g=g2", {"hadPainted": False}],
+    ]
+    assert out["completeLog"] == [
+        [None, {"timedOut": True, "hasPending": True}],
+        [None, {"timedOut": True, "hasPending": False}],
+        ["c=0&win=0%3A64", {"timedOut": False, "hasPending": False}],
+    ]
+    assert out["dupAfterLateDraw"] is False
+    assert out["timersBeforeReset"] == 1
+    assert out["afterUnpaintedReset"] == {"active": "c=1&g=g2", "rendering": False, "timers": 0}
+    assert out["reqSameAfterUnpainted"] is True
+    assert out["reqSameAfterPainted"] is False

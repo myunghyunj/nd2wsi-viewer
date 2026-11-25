@@ -99,65 +99,155 @@ def _pane_eval(expression):
     )
 
 
-def sample_canvas_patch(window, image_x, image_y, *, is_pane=False):
-    """Sample a 5x5 image-centered patch from the OSD 2D canvas (pre-opacity)."""
+_COMPOSITED_PATCH_SAMPLER_JS = """
+const sampleCompositedPatch = (viewer, imageX, imageY, includeBackdrop) => {
+  if (!viewer || !viewer.viewport || !viewer.drawer) return { error: "viewer not ready" };
+  const vp = viewer.viewport;
+  const size = vp.getContainerSize();
+  const canvas = viewer.drawer.canvas;
+  const ctx = viewer.drawer.context || (canvas && canvas.getContext("2d"));
+  if (!canvas || !ctx || !(size.x > 0) || !(size.y > 0) || !(canvas.width > 0) || !(canvas.height > 0)) {
+    return { error: "canvas not ready" };
+  }
+  const backdrop = includeBackdrop ? document.getElementById("translucent-backdrop") : null;
+  let bgVis = false;
+  let bgOpacity = 0;
+  let bgCtx = null;
+  if (backdrop && !backdrop.hidden && backdrop.width > 0 && backdrop.height > 0) {
+    const bgStyle = getComputedStyle(backdrop);
+    bgOpacity = Number.parseFloat(bgStyle.opacity) || 0;
+    if (bgStyle.display !== "none" && bgStyle.visibility !== "hidden" && bgOpacity > 0) {
+      bgCtx = backdrop.getContext("2d");
+      if (bgCtx) bgVis = true;
+    }
+  }
+  const fgSx = canvas.width / size.x;
+  const fgSy = canvas.height / size.y;
+  const fgCoords = [];
+  let fgMinX = Infinity, fgMinY = Infinity, fgMaxX = -Infinity, fgMaxY = -Infinity;
+  const bgSx = bgVis ? backdrop.width / size.x : 0;
+  const bgSy = bgVis ? backdrop.height / size.y : 0;
+  const bgCoords = bgVis ? [] : null;
+  let bgMinX = Infinity, bgMinY = Infinity, bgMaxX = -Infinity, bgMaxY = -Infinity;
+  let hasBgCoords = false;
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const pt = Nd2ViewerGeometry.imageToViewerElementPoint(
+        vp, { x: imageX + dx + 0.5, y: imageY + dy + 0.5 }, OpenSeadragon
+      );
+      const fx = Math.floor(pt.x * fgSx);
+      const fy = Math.floor(pt.y * fgSy);
+      if (!Number.isFinite(fx) || !Number.isFinite(fy) ||
+          fx < 0 || fx >= canvas.width || fy < 0 || fy >= canvas.height) {
+        return {
+          error: "backing coordinate out of bounds",
+          coord: [fx, fy],
+          canvas: [canvas.width, canvas.height],
+        };
+      }
+      fgCoords.push([fx, fy]);
+      if (fx < fgMinX) fgMinX = fx;
+      if (fy < fgMinY) fgMinY = fy;
+      if (fx > fgMaxX) fgMaxX = fx;
+      if (fy > fgMaxY) fgMaxY = fy;
+      if (bgVis) {
+        const bx = Math.floor(pt.x * bgSx);
+        const by = Math.floor(pt.y * bgSy);
+        if (!Number.isFinite(bx) || !Number.isFinite(by) ||
+            bx < 0 || bx >= backdrop.width || by < 0 || by >= backdrop.height) {
+          bgCoords.push(null);
+        } else {
+          bgCoords.push([bx, by]);
+          hasBgCoords = true;
+          if (bx < bgMinX) bgMinX = bx;
+          if (by < bgMinY) bgMinY = by;
+          if (bx > bgMaxX) bgMaxX = bx;
+          if (by > bgMaxY) bgMaxY = by;
+        }
+      }
+    }
+  }
+  const fgBw = fgMaxX - fgMinX + 1;
+  const fgBh = fgMaxY - fgMinY + 1;
+  const fgData = ctx.getImageData(fgMinX, fgMinY, fgBw, fgBh).data;
+  let bgData = null;
+  let bgBw = 0;
+  if (bgVis && hasBgCoords) {
+    bgBw = bgMaxX - bgMinX + 1;
+    const bgBh = bgMaxY - bgMinY + 1;
+    bgData = bgCtx.getImageData(bgMinX, bgMinY, bgBw, bgBh).data;
+  }
+  let sumR = 0, sumG = 0, sumB = 0, minAlpha = 255;
+  let fgSumR = 0, fgSumG = 0, fgSumB = 0, fgMinAlpha = 255;
+  let bgMinAlpha = 255;
+  for (let i = 0; i < fgCoords.length; i++) {
+    const [fx, fy] = fgCoords[i];
+    const fOff = ((fy - fgMinY) * fgBw + (fx - fgMinX)) * 4;
+    const fgR = fgData[fOff];
+    const fgG = fgData[fOff + 1];
+    const fgB = fgData[fOff + 2];
+    const fgA = fgData[fOff + 3];
+    fgSumR += fgR;
+    fgSumG += fgG;
+    fgSumB += fgB;
+    if (fgA < fgMinAlpha) fgMinAlpha = fgA;
+    let bgR = 0, bgG = 0, bgB = 0, bgA = 0;
+    if (bgVis) {
+      const bc = bgCoords[i];
+      if (bc && bgData) {
+        const bOff = ((bc[1] - bgMinY) * bgBw + (bc[0] - bgMinX)) * 4;
+        bgR = bgData[bOff];
+        bgG = bgData[bOff + 1];
+        bgB = bgData[bOff + 2];
+        bgA = bgData[bOff + 3];
+      }
+    }
+    const aF = fgA / 255;
+    const aB = bgVis ? (bgA / 255) * bgOpacity : 0;
+    if (bgVis) {
+      const effBgA = Math.round(aB * 255);
+      if (effBgA < bgMinAlpha) bgMinAlpha = effBgA;
+    }
+    const aOut = aF + aB * (1 - aF);
+    let outR = 0, outG = 0, outB = 0;
+    if (aOut > 0) {
+      const bW = aB * (1 - aF);
+      outR = (fgR * aF + bgR * bW) / aOut;
+      outG = (fgG * aF + bgG * bW) / aOut;
+      outB = (fgB * aF + bgB * bW) / aOut;
+    }
+    const outA = Math.round(aOut * 255);
+    sumR += outR;
+    sumG += outG;
+    sumB += outB;
+    if (outA < minAlpha) minAlpha = outA;
+  }
+  const n = fgCoords.length;
+  const meanRgb = [sumR / n, sumG / n, sumB / n];
+  return {
+    mean_rgb: meanRgb,
+    mean_intensity: (meanRgb[0] + meanRgb[1] + meanRgb[2]) / 3,
+    min_alpha: minAlpha,
+    fg_min_alpha: fgMinAlpha,
+    fg_mean_intensity: (fgSumR + fgSumG + fgSumB) / (3 * n),
+    backdrop_visible: bgVis,
+    backdrop_min_alpha: bgVis ? bgMinAlpha : null,
+    samples: n,
+  };
+};
+"""
+
+
+def sample_canvas_patch(window, image_x, image_y, *, is_pane=False, allow_none=False):
+    """Sample a 5x5 image-centered composited patch (foreground + #translucent-backdrop)."""
     viewer_expr = "state.viewer" if is_pane else "window.nd2Translucent && window.nd2Translucent.viewer"
-    script = f"""(() => {{
-      const viewer = {viewer_expr};
-      if (!viewer || !viewer.viewport || !viewer.drawer) return {{ error: "viewer not ready" }};
-      const vp = viewer.viewport;
-      const size = vp.getContainerSize();
-      const canvas = viewer.drawer.canvas;
-      const ctx = viewer.drawer.context || (canvas && canvas.getContext("2d"));
-      if (!canvas || !ctx || !(size.x > 0) || !(size.y > 0) || !(canvas.width > 0) || !(canvas.height > 0)) {{
-        return {{ error: "canvas not ready" }};
-      }}
-      const sx = canvas.width / size.x;
-      const sy = canvas.height / size.y;
-      const coords = [];
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (let dy = -2; dy <= 2; dy++) {{
-        for (let dx = -2; dx <= 2; dx++) {{
-          const pt = Nd2ViewerGeometry.imageToViewerElementPoint(
-            vp, {{ x: {float(image_x)!r} + dx + 0.5, y: {float(image_y)!r} + dy + 0.5 }}, OpenSeadragon
-          );
-          const bx = Math.floor(pt.x * sx);
-          const by = Math.floor(pt.y * sy);
-          if (!Number.isFinite(bx) || !Number.isFinite(by) ||
-              bx < 0 || bx >= canvas.width || by < 0 || by >= canvas.height) {{
-            return {{
-              error: "backing coordinate out of bounds",
-              coord: [bx, by],
-              canvas: [canvas.width, canvas.height],
-            }};
-          }}
-          coords.push([bx, by]);
-          if (bx < minX) minX = bx;
-          if (by < minY) minY = by;
-          if (bx > maxX) maxX = bx;
-          if (by > maxY) maxY = by;
-        }}
-      }}
-      const bw = maxX - minX + 1;
-      const bh = maxY - minY + 1;
-      const img = ctx.getImageData(minX, minY, bw, bh).data;
-      let sumR = 0, sumG = 0, sumB = 0, minAlpha = 255;
-      for (const [bx, by] of coords) {{
-        const off = ((by - minY) * bw + (bx - minX)) * 4;
-        sumR += img[off];
-        sumG += img[off + 1];
-        sumB += img[off + 2];
-        if (img[off + 3] < minAlpha) minAlpha = img[off + 3];
-      }}
-      const n = coords.length;
-      const meanRgb = [sumR / n, sumG / n, sumB / n];
-      return {{
-        mean_rgb: meanRgb,
-        mean_intensity: (meanRgb[0] + meanRgb[1] + meanRgb[2]) / 3,
-        min_alpha: minAlpha,
-        samples: n,
-      }};
-    }})()"""
+    include_backdrop_js = "false" if is_pane else "true"
+    script = (
+        "(() => {"
+        + _COMPOSITED_PATCH_SAMPLER_JS
+        + f"return sampleCompositedPatch({viewer_expr}, {float(image_x)!r}, {float(image_y)!r}, {include_backdrop_js});"
+        + "})()"
+    )
     result = None
     for attempt in range(3):
         result = _pane_eval(script) if is_pane else window.evaluate_js(script)
@@ -165,6 +255,8 @@ def sample_canvas_patch(window, image_x, image_y, *, is_pane=False):
             break
         if attempt < 2:
             time.sleep(0.05)
+    if result is None and allow_none:
+        return None
     if not isinstance(result, dict) or "error" in result:
         raise AssertionError(f"sample_canvas_patch failed ({'pane' if is_pane else 'overlay'}): {result}")
     return result
@@ -329,6 +421,34 @@ def _dispatch_hi_pointer(ch_index, event_type, target_value=None, pointer_id=77)
     )
 
 
+def _dispatch_hi_release(ch_index, target_value=None, pointer_id=77):
+    """Dispatch final pointermove + pointerup atomically in one evaluate_js RPC."""
+    val_js = "null" if target_value is None else repr(float(target_value))
+    return _pane_eval(
+        f"(() => {{"
+        f" const canvas = document.querySelectorAll('.lut-canvas')[{ch_index}];"
+        f" if (!canvas) return {{ error: 'missing lut canvas' }};"
+        f" const r = canvas.getBoundingClientRect();"
+        f" const vmin = Number(canvas.getAttribute('data-axis-min'));"
+        f" const vmax = Number(canvas.getAttribute('data-axis-max'));"
+        f" const ch = state.info.channels[{ch_index}];"
+        f" const cur = state.luts[{ch_index}] || {{ lo: ch.window.start, hi: ch.window.end, gamma: 1 }};"
+        f" const val = ({val_js}) === null ? cur.hi : ({val_js});"
+        f" const x0 = 4, x1 = r.width - 4;"
+        f" const frac = Math.max(0, Math.min(1, (val - vmin) / (vmax - vmin)));"
+        f" const cx = r.left + x0 + frac * (x1 - x0);"
+        f" const cy = r.top + 8;"
+        f" const send = (type, buttons) => canvas.dispatchEvent(new PointerEvent(type, {{"
+        f"   pointerId: {pointer_id}, pointerType: 'mouse', isPrimary: true,"
+        f"   button: 0, buttons, clientX: cx, clientY: cy, bubbles: true, cancelable: true"
+        f" }}));"
+        f" send('pointermove', 1);"
+        f" send('pointerup', 0);"
+        f" return {{ val, cx, cy, vmin, vmax, luts: state.luts[{ch_index}] }};"
+        f"}})()"
+    )
+
+
 def _dispatch_gamma_drag(ch_index, target_gamma, pointer_id=79):
     """Drag channel gamma knob vertically to target_gamma and release."""
     return _pane_eval(
@@ -371,16 +491,26 @@ def _poll_both_for_target(child, target, *, hold_seconds, tol=CAL_TOLERANCE):
     overlay_hit_sample = None
     main_last = None
     overlay_last = None
+    main_none_samples = 0
+    overlay_none_samples = 0
     while True:
         now_ms = round((time.monotonic() - t0) * 1000.0, 1)
-        main_last = sample_canvas_patch(parent, *CENTER, is_pane=True)
-        overlay_last = sample_canvas_patch(child, *CENTER, is_pane=False)
-        if main_hit_ms is None and _within(main_last, target, tol):
-            main_hit_ms = now_ms
-            main_hit_sample = main_last
-        if overlay_hit_ms is None and _within(overlay_last, target, tol):
-            overlay_hit_ms = now_ms
-            overlay_hit_sample = overlay_last
+        main_sample = sample_canvas_patch(parent, *CENTER, is_pane=True, allow_none=True)
+        overlay_sample = sample_canvas_patch(child, *CENTER, is_pane=False, allow_none=True)
+        if main_sample is None:
+            main_none_samples += 1
+        else:
+            main_last = main_sample
+            if main_hit_ms is None and _within(main_sample, target, tol):
+                main_hit_ms = now_ms
+                main_hit_sample = main_sample
+        if overlay_sample is None:
+            overlay_none_samples += 1
+        else:
+            overlay_last = overlay_sample
+            if overlay_hit_ms is None and _within(overlay_sample, target, tol):
+                overlay_hit_ms = now_ms
+                overlay_hit_sample = overlay_sample
         if main_hit_ms is not None and overlay_hit_ms is not None:
             break
         if time.monotonic() >= deadline:
@@ -392,6 +522,8 @@ def _poll_both_for_target(child, target, *, hold_seconds, tol=CAL_TOLERANCE):
         "overlay_hit": overlay_hit_ms is not None,
         "main_elapsed_ms": main_hit_ms,
         "overlay_elapsed_ms": overlay_hit_ms,
+        "main_none_samples": main_none_samples,
+        "overlay_none_samples": overlay_none_samples,
         "main": main_hit_sample or main_last,
         "overlay": overlay_hit_sample or overlay_last,
     }
@@ -411,6 +543,7 @@ def _run_continuous_drag_sequence(child, *, hold_seconds=1.0, release_seconds=2.
     }
 
     _dispatch_hi_pointer(0, "pointerdown", target_value=255.0)
+    released = False
     try:
         # Hold 1: hi -> 192 (expect ~85) BEFORE pointerup
         _dispatch_hi_pointer(0, "pointermove", target_value=192.0)
@@ -420,17 +553,25 @@ def _run_continuous_drag_sequence(child, *, hold_seconds=1.0, release_seconds=2.
         _dispatch_hi_pointer(0, "pointermove", target_value=128.0)
         steps["hold_128"] = _poll_both_for_target(child, 127.0, hold_seconds=hold_seconds)
 
-        # Release: hi -> 80 (expect ~204)
-        _dispatch_hi_pointer(0, "pointermove", target_value=80.0)
+        # Release: hi -> 80 (expect ~204) atomically in one evaluate_js RPC
+        _dispatch_hi_release(0, target_value=80.0)
+        released = True
     finally:
-        _dispatch_hi_pointer(0, "pointerup", target_value=80.0)
+        if not released:
+            _dispatch_hi_pointer(0, "pointerup", target_value=80.0)
 
     steps["release_80"] = _poll_both_for_target(child, 204.0, hold_seconds=release_seconds)
 
     main_ok = all(steps[k]["main_hit"] for k, _, _ in DRAG_TARGETS)
     overlay_ok = all(steps[k]["overlay_hit"] for k, _, _ in DRAG_TARGETS)
-    main_series = [round(steps[k]["main"]["mean_intensity"], 2) for k, _, _ in DRAG_TARGETS]
-    overlay_series = [round(steps[k]["overlay"]["mean_intensity"], 2) for k, _, _ in DRAG_TARGETS]
+    main_series = [
+        round(steps[k]["main"]["mean_intensity"], 2) if steps[k]["main"] else None
+        for k, _, _ in DRAG_TARGETS
+    ]
+    overlay_series = [
+        round(steps[k]["overlay"]["mean_intensity"], 2) if steps[k]["overlay"] else None
+        for k, _, _ in DRAG_TARGETS
+    ]
     return {
         "ok": main_ok and overlay_ok,
         "main_ok": main_ok,
@@ -511,10 +652,17 @@ def check_2_slow_tiles(child):
     # Wait briefly for overlay reset (on 2.6.9 it is already at 64; on 2.6.10 it settles back to 64).
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
-        if _within(sample_canvas_patch(child, *CENTER, is_pane=False), 64.0):
+        sample = sample_canvas_patch(child, *CENTER, is_pane=False, allow_none=True)
+        if (
+            sample is not None
+            and _within(sample, 64.0)
+            and sample["backdrop_visible"] is False
+            and sample["fg_min_alpha"] == 255
+        ):
             break
         time.sleep(0.05)
 
+    dark_flash_threshold = 64.0 - CAL_TOLERANCE
     orig_render = nd2wsi.server._render_tile_compat
     slow_calls = {"count": 0}
 
@@ -524,54 +672,56 @@ def check_2_slow_tiles(child):
         return orig_render(*args, **kwargs)
 
     nd2wsi.server._render_tile_compat = slow_render
+    drag_started = False
+    released = False
     try:
-        # Install overlay rAF sampler to measure painted frames, backdrop coverage, and banners.
-        child.evaluate_js("""(() => {
-          const vp = window.nd2Translucent.viewer.viewport;
-          const drawer = window.nd2Translucent.viewer.drawer;
-          const backdrop = document.getElementById('translucent-backdrop');
+        # Install overlay rAF sampler measuring true composited fg + #translucent-backdrop
+        # across both drag AND post-release settle phases.
+        child.evaluate_js(
+            "(() => {"
+            + _COMPOSITED_PATCH_SAMPLER_JS
+            + f"""
           const status = document.getElementById('overlay-status');
-          const rec = { running: true, samples: [], banners: [], unbackedTransparent: 0 };
+          const darkFlashThreshold = {float(dark_flash_threshold)!r};
+          const rec = {{
+            running: true, phase: 'drag', samples: [], banners: [],
+            unbackedTransparent: 0, darkFlash: 0,
+          }};
           window.__qaSlowOverlay = rec;
-          const sampleCanvas = (canvas) => {
-            if (!canvas || !(canvas.width > 0) || !(canvas.height > 0)) return null;
-            const ctx = canvas.getContext('2d');
-            const size = vp.getContainerSize();
-            if (!ctx || !(size.x > 0) || !(size.y > 0)) return null;
-            const sx = canvas.width / size.x, sy = canvas.height / size.y;
-            const pt = Nd2ViewerGeometry.imageToViewerElementPoint(vp, { x: 256.5, y: 256.5 }, OpenSeadragon);
-            const bx = Math.floor(pt.x * sx), by = Math.floor(pt.y * sy);
-            if (bx < 2 || by < 2 || bx >= canvas.width - 2 || by >= canvas.height - 2) return null;
-            const data = ctx.getImageData(bx - 2, by - 2, 5, 5).data;
-            let sr = 0, sg = 0, sb = 0, minA = 255;
-            for (let i = 0; i < data.length; i += 4) {
-              sr += data[i]; sg += data[i + 1]; sb += data[i + 2];
-              if (data[i + 3] < minA) minA = data[i + 3];
-            }
-            const n = data.length / 4;
-            return { mean_intensity: (sr + sg + sb) / (3 * n), min_alpha: minA };
-          };
-          const tick = () => {
+          const tick = () => {{
             if (!rec.running) return;
-            const s = sampleCanvas(drawer.canvas);
-            if (s) {
-              rec.samples.push({ t: Math.round(performance.now()), ...s });
-              if (s.min_alpha < 255) {
-                const bg = backdrop && !backdrop.hidden ? sampleCanvas(backdrop) : null;
-                if (!bg || bg.min_alpha < 255) rec.unbackedTransparent++;
-              }
-            }
-            if (status && !status.hidden && /could not load|reopen/i.test(status.textContent || '')) {
+            const s = sampleCompositedPatch(
+              window.nd2Translucent && window.nd2Translucent.viewer, {float(CENTER[0])!r}, {float(CENTER[1])!r}, true
+            );
+            if (s && !s.error) {{
+              rec.samples.push({{
+                t: Math.round(performance.now()),
+                phase: rec.phase,
+                mean_intensity: s.mean_intensity,
+                min_alpha: s.min_alpha,
+                fg_min_alpha: s.fg_min_alpha,
+                fg_mean_intensity: s.fg_mean_intensity,
+                backdrop_visible: s.backdrop_visible,
+                backdrop_min_alpha: s.backdrop_min_alpha,
+              }});
+              if (s.min_alpha < 255) rec.unbackedTransparent++;
+              if (s.mean_intensity < darkFlashThreshold) rec.darkFlash++;
+            }}
+            if (status && !status.hidden && /could not load|reopen/i.test(status.textContent || '')) {{
               rec.banners.push(status.textContent);
-            }
+            }}
             requestAnimationFrame(tick);
-          };
+          }};
           requestAnimationFrame(tick);
           return true;
-        })()""")
+        }})()"""
+        )
 
         # Drive continuous ~16ms pointermove in the slide pane for >= 2.2s WITHOUT releasing yet.
-        _pane_eval("""(() => {
+        _pane_eval(
+            "(() => {"
+            + _COMPOSITED_PATCH_SAMPLER_JS
+            + f"""
           const canvas = document.querySelectorAll('.lut-canvas')[0];
           const r = canvas.getBoundingClientRect();
           const vmin = Number(canvas.getAttribute('data-axis-min'));
@@ -579,78 +729,110 @@ def check_2_slow_tiles(child):
           const x0 = 4, x1 = r.width - 4;
           const cx = v => r.left + x0 + Math.max(0, Math.min(1, (v - vmin) / (vmax - vmin))) * (x1 - x0);
           const cy = r.top + 8;
-          const vp = state.viewer.viewport;
-          const drawer = state.viewer.drawer;
-          const rec = {
+          const rec = {{
             done: false, steps: 0, startMs: performance.now(), elapsedMs: 0,
             samples: [], banners: [],
-          };
+          }};
           __win.__qaSlowMain = rec;
-          const sampleMain = () => {
-            const c = drawer.canvas;
-            const ctx = drawer.context || (c && c.getContext('2d'));
-            const size = vp.getContainerSize();
-            if (!c || !ctx || !(size.x > 0) || !(size.y > 0)) return null;
-            const sx = c.width / size.x, sy = c.height / size.y;
-            const pt = Nd2ViewerGeometry.imageToViewerElementPoint(vp, { x: 256.5, y: 256.5 }, OpenSeadragon);
-            const bx = Math.floor(pt.x * sx), by = Math.floor(pt.y * sy);
-            if (bx < 2 || by < 2 || bx >= c.width - 2 || by >= c.height - 2) return null;
-            const data = ctx.getImageData(bx - 2, by - 2, 5, 5).data;
-            let sr = 0, sg = 0, sb = 0, minA = 255;
-            for (let i = 0; i < data.length; i += 4) {
-              sr += data[i]; sg += data[i + 1]; sb += data[i + 2];
-              if (data[i + 3] < minA) minA = data[i + 3];
-            }
-            const n = data.length / 4;
-            return { mean_intensity: (sr + sg + sb) / (3 * n), min_alpha: minA };
-          };
-          const dispatch = (type, val, buttons) => canvas.dispatchEvent(new PointerEvent(type, {
+          const dispatch = (type, val, buttons) => canvas.dispatchEvent(new PointerEvent(type, {{
             pointerId: 88, pointerType: 'mouse', isPrimary: true,
             button: 0, buttons, clientX: cx(val), clientY: cy, bubbles: true, cancelable: true,
-          }));
+          }}));
           dispatch('pointerdown', 255, 1);
           const durationMs = 2200;
-          const timer = setInterval(() => {
+          const timer = setInterval(() => {{
             const elapsed = performance.now() - rec.startMs;
             const frac = Math.min(1, elapsed / durationMs);
             const hi = 250 - frac * (250 - 85);
             dispatch('pointermove', hi, 1);
             rec.steps++;
             rec.elapsedMs = Math.round(elapsed);
-            if (elapsed >= durationMs) {
+            if (elapsed >= durationMs) {{
               clearInterval(timer);
               rec.done = true;
-            }
-          }, 16);
-          const raf = () => {
-            const s = sampleMain();
-            if (s) rec.samples.push({ t: Math.round(performance.now() - rec.startMs), ...s });
+            }}
+          }}, 16);
+          rec.stop = () => {{
+            clearInterval(timer);
+            rec.done = true;
+          }};
+          const raf = () => {{
+            const s = sampleCompositedPatch(state.viewer, {float(CENTER[0])!r}, {float(CENTER[1])!r}, false);
+            if (s && !s.error) {{
+              rec.samples.push({{
+                t: Math.round(performance.now() - rec.startMs),
+                mean_intensity: s.mean_intensity,
+                min_alpha: s.min_alpha,
+              }});
+            }}
             const toast = document.getElementById('toast');
-            if (toast && toast.classList.contains('show') && /failed to load/i.test(toast.textContent || '')) {
+            if (toast && toast.classList.contains('show') && /failed to load/i.test(toast.textContent || '')) {{
               rec.banners.push(toast.textContent);
-            }
+            }}
             if (!rec.done) requestAnimationFrame(raf);
-          };
+          }};
           requestAnimationFrame(raf);
           return true;
-        })()""")
+        }})()"""
+        )
+        drag_started = True
 
         wait_for(lambda: _pane_eval("Boolean(__win.__qaSlowMain && __win.__qaSlowMain.done)"),
                  timeout=10, description="slow-tile continuous drag phase")
 
-        # Snapshot all pre-release samples BEFORE dispatching pointerup!
-        main_pre = _pane_eval("__win.__qaSlowMain")
-        overlay_pre = child.evaluate_js(
-            "(() => { const r = window.__qaSlowOverlay; r.running = false; return r; })()"
+        main_pre = None
+        for attempt in range(3):
+            main_pre = _pane_eval(
+                "(() => { const r = __win.__qaSlowMain; if (!r) return null;"
+                " return { done: r.done, steps: r.steps, elapsedMs: r.elapsedMs, samples: r.samples, banners: r.banners }; })()"
+            )
+            if main_pre is not None:
+                break
+            if attempt < 2:
+                time.sleep(0.05)
+        check(isinstance(main_pre, dict), f"Failed to read slow-tile main sampler state: {main_pre}")
+
+        # Keep overlay rAF running into settle phase; tag pre- vs post-release frames so
+        # _distinct_intermediate_levels evaluates drag frames only while flicker/dark-flash
+        # assertions inspect both drag and settle.
+        child.evaluate_js(
+            "(() => { if (window.__qaSlowOverlay) window.__qaSlowOverlay.phase = 'settle'; return true; })()"
         )
 
-        # Now release at hi = 76 (expect int(64/76*255) = 214; fresh value never cached in Check 1).
-        _dispatch_hi_pointer(0, "pointermove", target_value=76.0, pointer_id=88)
-        _dispatch_hi_pointer(0, "pointerup", target_value=76.0, pointer_id=88)
+        # Now release atomically at hi = 76 (expect int(64/76*255) = 214; fresh value never cached in Check 1).
+        _dispatch_hi_release(0, target_value=76.0, pointer_id=88)
+        released = True
 
         settled = _poll_both_for_target(child, 214.0, hold_seconds=6.0)
+        # Wait for overlay foreground to complete painting and hide #translucent-backdrop.
+        post_settle_overlay = None
+        settle_deadline = time.monotonic() + 2.5
+        while True:
+            sample = sample_canvas_patch(child, *CENTER, is_pane=False, allow_none=True)
+            if sample is not None:
+                post_settle_overlay = sample
+                if sample["backdrop_visible"] is False and sample["fg_min_alpha"] == 255:
+                    break
+            if time.monotonic() >= settle_deadline:
+                break
+            time.sleep(0.05)
+
         # Allow any straggling delayed responses to land and verify no false reopen banner appears.
         time.sleep(0.4)
+        final_sample = sample_canvas_patch(child, *CENTER, is_pane=False, allow_none=True)
+        if final_sample is not None:
+            post_settle_overlay = final_sample
+
+        overlay_rec = None
+        for attempt in range(3):
+            overlay_rec = child.evaluate_js(
+                "(() => { const r = window.__qaSlowOverlay; if (!r) return null; r.running = false; return r; })()"
+            )
+            if overlay_rec is not None:
+                break
+            if attempt < 2:
+                time.sleep(0.05)
+
         overlay_banner_after = child.evaluate_js(
             "(() => { const s = document.getElementById('overlay-status');"
             " return s && !s.hidden ? (s.textContent || '') : ''; })()"
@@ -661,12 +843,36 @@ def check_2_slow_tiles(child):
         )
     finally:
         nd2wsi.server._render_tile_compat = orig_render
-        _pane_eval("delete __win.__qaSlowMain; true")
+        if drag_started and not released:
+            try:
+                _pane_eval("if (__win.__qaSlowMain?.stop) __win.__qaSlowMain.stop(); true")
+            except Exception:
+                pass
+            try:
+                _dispatch_hi_pointer(0, "pointerup", target_value=76.0, pointer_id=88)
+            except Exception:
+                pass
+        _pane_eval("if (__win.__qaSlowMain?.stop) __win.__qaSlowMain.stop(); delete __win.__qaSlowMain; true")
         child.evaluate_js("if (window.__qaSlowOverlay) window.__qaSlowOverlay.running = false; delete window.__qaSlowOverlay; true")
 
+    overlay_samples = list((overlay_rec or {}).get("samples") or [])
+    overlay_drag_samples = [s for s in overlay_samples if s.get("phase") == "drag"]
+    overlay_settle_samples = [s for s in overlay_samples if s.get("phase") == "settle"]
+
     main_levels = _distinct_intermediate_levels(main_pre["samples"], baseline=64.0, min_gap=8.0)
-    overlay_levels = _distinct_intermediate_levels(overlay_pre["samples"], baseline=64.0, min_gap=8.0)
-    overlay_banners = list(overlay_pre["banners"])
+    overlay_levels = _distinct_intermediate_levels(overlay_drag_samples, baseline=64.0, min_gap=8.0)
+    overlay_unbacked_transparent = sum(1 for s in overlay_samples if s.get("min_alpha", 0) < 255)
+    overlay_dark_flash = sum(
+        1 for s in overlay_samples if float(s.get("mean_intensity", 0.0)) < dark_flash_threshold
+    )
+    post_settle_backdrop_hidden = bool(
+        post_settle_overlay is not None and post_settle_overlay.get("backdrop_visible") is False
+    )
+    post_settle_fg_opaque = bool(
+        post_settle_overlay is not None and post_settle_overlay.get("fg_min_alpha") == 255
+    )
+
+    overlay_banners = list((overlay_rec or {}).get("banners") or [])
     if overlay_banner_after and ("could not load" in overlay_banner_after.lower() or "reopen" in overlay_banner_after.lower()):
         overlay_banners.append(overlay_banner_after)
     main_banners = list(main_pre["banners"])
@@ -682,10 +888,27 @@ def check_2_slow_tiles(child):
         errors.append(f"Main viewer starved under 250ms tiles (<2 distinct intermediate levels): {main_levels}")
     if len(overlay_levels) < 2:
         errors.append(f"Overlay starved under 250ms tiles (<2 distinct intermediate levels): {overlay_levels}")
+    if not overlay_samples:
+        errors.append("Overlay rAF sampler captured no frames")
+    if overlay_unbacked_transparent != 0:
+        errors.append(
+            f"Overlay flickered with unbacked transparent frames (composited min_alpha < 255): "
+            f"{overlay_unbacked_transparent}"
+        )
+    if overlay_dark_flash != 0:
+        errors.append(
+            f"Overlay dark-flashed below {dark_flash_threshold:.1f} during drag/settle: "
+            f"{overlay_dark_flash} frame(s)"
+        )
     if not settled["main_hit"]:
         errors.append(f"Main viewer did not settle to 214 ± 8 after release: {settled['main']}")
     if not settled["overlay_hit"]:
         errors.append(f"Overlay did not settle to 214 ± 8 after release: {settled['overlay']}")
+    if not post_settle_backdrop_hidden or not post_settle_fg_opaque:
+        errors.append(
+            f"Overlay post-settle state not foreground-only opaque "
+            f"(want backdrop_visible=False, fg_min_alpha=255): {post_settle_overlay}"
+        )
     if overlay_banners or main_banners:
         errors.append(f"False tile-load-failed banner(s): main={main_banners}, overlay={overlay_banners}")
 
@@ -696,7 +919,17 @@ def check_2_slow_tiles(child):
         "slow_render_calls": slow_calls["count"],
         "main_intermediate_levels": main_levels,
         "overlay_intermediate_levels": overlay_levels,
-        "overlay_unbacked_transparent_frames": overlay_pre["unbackedTransparent"],
+        "overlay_drag_frames": len(overlay_drag_samples),
+        "overlay_settle_frames": len(overlay_settle_samples),
+        "overlay_unbacked_transparent_frames": overlay_unbacked_transparent,
+        "overlay_dark_flash_frames": overlay_dark_flash,
+        "overlay_min_composited_alpha": min((s["min_alpha"] for s in overlay_samples), default=None),
+        "overlay_min_composited_intensity": (
+            round(min(float(s["mean_intensity"]) for s in overlay_samples), 2) if overlay_samples else None
+        ),
+        "post_settle_overlay": post_settle_overlay,
+        "post_settle_backdrop_hidden": post_settle_backdrop_hidden,
+        "post_settle_fg_opaque": post_settle_fg_opaque,
         "settled": settled,
         "main_banners": main_banners,
         "overlay_banners": overlay_banners,
@@ -747,7 +980,8 @@ def check_3_tracing_alignment(child):
         _wait_for_intensity(parent, 64.0, is_pane=True, timeout=10, description=f"main reset 64 ({mode})")
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
-            if _within(sample_canvas_patch(child, *CENTER, is_pane=False), 64.0):
+            sample = sample_canvas_patch(child, *CENTER, is_pane=False, allow_none=True)
+            if sample is not None and _within(sample, 64.0):
                 break
             time.sleep(0.05)
 
@@ -808,10 +1042,14 @@ def _poll_rgb_predicate(child, main_pred, overlay_pred, *, timeout=2.5):
     main_ok = overlay_ok = False
     main_s = overlay_s = None
     while True:
-        main_s = sample_canvas_patch(parent, *CENTER, is_pane=True)
-        overlay_s = sample_canvas_patch(child, *CENTER, is_pane=False)
-        main_ok = main_s["min_alpha"] == 255 and main_pred(main_s["mean_rgb"])
-        overlay_ok = overlay_s["min_alpha"] == 255 and overlay_pred(overlay_s["mean_rgb"])
+        ms = sample_canvas_patch(parent, *CENTER, is_pane=True, allow_none=True)
+        os_ = sample_canvas_patch(child, *CENTER, is_pane=False, allow_none=True)
+        if ms is not None:
+            main_s = ms
+        if os_ is not None:
+            overlay_s = os_
+        main_ok = main_s is not None and main_s["min_alpha"] == 255 and main_pred(main_s["mean_rgb"])
+        overlay_ok = overlay_s is not None and overlay_s["min_alpha"] == 255 and overlay_pred(overlay_s["mean_rgb"])
         if main_ok and overlay_ok:
             break
         if time.monotonic() >= deadline:
@@ -820,10 +1058,10 @@ def _poll_rgb_predicate(child, main_pred, overlay_pred, *, timeout=2.5):
     return {
         "main_ok": main_ok,
         "overlay_ok": overlay_ok,
-        "main_rgb": [round(v, 2) for v in main_s["mean_rgb"]],
-        "main_min_alpha": main_s["min_alpha"],
-        "overlay_rgb": [round(v, 2) for v in overlay_s["mean_rgb"]],
-        "overlay_min_alpha": overlay_s["min_alpha"],
+        "main_rgb": [round(v, 2) for v in main_s["mean_rgb"]] if main_s else None,
+        "main_min_alpha": main_s["min_alpha"] if main_s else None,
+        "overlay_rgb": [round(v, 2) for v in overlay_s["mean_rgb"]] if overlay_s else None,
+        "overlay_min_alpha": overlay_s["min_alpha"] if overlay_s else None,
         "main_query": _main_query_dict(),
         "overlay_query": _overlay_query_dict(child),
         "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 1),

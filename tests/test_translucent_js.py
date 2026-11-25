@@ -760,9 +760,14 @@ def test_wait_translucent_display_loop_handles_initial_pull_updates_unchanged_cl
       });
       for (let i = 0; i < 20; i++) await Promise.resolve();
       const urlBeforePaint2 = h.osdOptions.tileSources.getTileUrl(0, 0, 0);
-      // Completing paint for rev 2 drains pending rev 4 onto activeQuery.
+      // fully-loaded-change BEFORE tiled-image-drawn must not advance rev 2 to rev 4.
       h.item.fullyLoaded = true;
       h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true });
+      const urlAfterFullyLoadedOnly = h.osdOptions.tileSources.getTileUrl(0, 0, 0);
+      // Drawing active tiles completes rev 2 and drains pending rev 4 onto activeQuery.
+      const tileRev2 = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: tileRev2 } } };
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tileRev2] });
       const afterClosed = {
         statePulls,
         waitCalls,
@@ -770,6 +775,7 @@ def test_wait_translucent_display_loop_handles_initial_pull_updates_unchanged_cl
         query: h.mounted.state.query,
         rev: h.mounted.state.displayRevision,
         urlBeforePaint2,
+        urlAfterFullyLoadedOnly,
         url: h.osdOptions.tileSources.getTileUrl(0, 0, 0),
         status: h.element('overlay-status').textContent,
         statusHidden: h.element('overlay-status').hidden,
@@ -815,6 +821,7 @@ def test_wait_translucent_display_loop_handles_initial_pull_updates_unchanged_cl
     assert result["afterClosed"]["query"] == "g=original&t=2&p=4&z=1"
     assert result["afterClosed"]["rev"] == 4
     assert result["afterClosed"]["urlBeforePaint2"].endswith("/api/tile/1/0/0.jpg?c=1&g=original&t=2&p=4&z=1")
+    assert result["afterClosed"]["urlAfterFullyLoadedOnly"] == result["afterClosed"]["urlBeforePaint2"]
     assert result["afterClosed"]["url"].endswith("/api/tile/1/0/0.jpg?g=original&t=2&p=4&z=1")
     assert result["afterClosed"]["status"] == ""
     assert result["afterClosed"]["statusHidden"] is True
@@ -968,6 +975,14 @@ def test_backdrop_captures_before_reset_and_clears_on_paint_camera_resize_error_
       h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tile1] });
       const afterPaint = { hidden: bd.hidden, clears: h.backdropLog.clears.length };
 
+      const finishPaint = () => {
+        const tile = { level: 0, x: 0, y: 0 };
+        h.item.tilesMatrix = { 0: { 0: { 0: tile } } };
+        h.item.fullyLoaded = true;
+        h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true });
+        h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tile] });
+      };
+
       // 2) Camera pan/zoom/rotate/flip clears backdrop immediately.
       h.item.fullyLoaded = false;
       m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-bd', revision: 2, query: '?c=1&g=original&t=2&p=4&z=1' });
@@ -976,10 +991,7 @@ def test_backdrop_captures_before_reset_and_clears_on_paint_camera_resize_error_
       h.viewer.handlers['update-viewport']();
       const hiddenAfterPan = bd.hidden;
       // Finish paint for rev 2 so gate settles.
-      const tile2 = { level: 0, x: 0, y: 0 };
-      h.item.tilesMatrix = { 0: { 0: { 0: tile2 } } };
-      h.item.fullyLoaded = true;
-      h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true });
+      finishPaint();
 
       // 3) Rotation or flip change clears backdrop immediately.
       h.item.fullyLoaded = false;
@@ -988,8 +1000,7 @@ def test_backdrop_captures_before_reset_and_clears_on_paint_camera_resize_error_
       h.viewer.viewport.setFlip(false);
       h.viewer.handlers['update-viewport']();
       const hiddenAfterFlip = bd.hidden;
-      h.item.fullyLoaded = true;
-      h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true });
+      finishPaint();
 
       // 4) resize() clears backdrop immediately.
       h.item.fullyLoaded = false;
@@ -998,8 +1009,7 @@ def test_backdrop_captures_before_reset_and_clears_on_paint_camera_resize_error_
       h.element('translucent-stage').clientWidth = 640;
       m.resize();
       const hiddenAfterResize = bd.hidden;
-      h.item.fullyLoaded = true;
-      h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true });
+      finishPaint();
 
       // 5) open-failed clears backdrop immediately.
       h.item.fullyLoaded = false;
@@ -1007,8 +1017,7 @@ def test_backdrop_captures_before_reset_and_clears_on_paint_camera_resize_error_
       const visibleBeforeOpenFail = !bd.hidden;
       h.viewer.handlers['open-failed']();
       const hiddenAfterOpenFail = bd.hidden;
-      h.item.fullyLoaded = true;
-      h.viewer.handlers['fully-loaded-change']({ fullyLoaded: true });
+      finishPaint();
 
       // 6) pagehide clears backdrop immediately.
       h.item.fullyLoaded = false;
@@ -1220,3 +1229,300 @@ def test_pagehide_teardown_under_minimal_and_full_mocks():
     assert len(result["clearedTimers"]) >= 1
     assert "resize" in result["removedWin"]
     assert set(["pointerdown", "keydown", "wheel"]).issubset(set(result["removedDoc"]))
+
+
+def test_watchdog_timeout_preserves_backdrop_across_queued_reset_and_clears_on_late_draw():
+    result = run("""
+      let nextTimerId = 1;
+      const activeTimers = new Map();
+      const h = harness({
+        withBackdrop: true,
+        withWorld: true,
+        initialContext: { launch_token: 'tok-wd', display_revision: 0 },
+        winOverrides: {
+          setTimeout(fn, ms) {
+            const id = nextTimerId++;
+            activeTimers.set(id, { fn, ms });
+            return id;
+          },
+          clearTimeout(id) { activeTimers.delete(id); },
+        },
+      });
+      const bd = h.element('translucent-backdrop');
+      const m = h.mounted;
+      const fireWatchdog = () => {
+        const entry = [...activeTimers.entries()].find(([, v]) => v.ms === 2000);
+        if (!entry) throw new Error('expected 2000ms watchdog timer');
+        activeTimers.delete(entry[0]);
+        entry[1].fn();
+      };
+
+      // Rev 1 captures initial painted image into backdrop; queue Rev 2 while Rev 1 stalls.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 1, query: '?c=0&win=0:128&g=original&t=2&p=4&z=1' });
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 2, query: '?c=0&win=0:64&g=original&t=2&p=4&z=1' });
+      const beforeTimeout = { hidden: bd.hidden, draws: h.backdropLog.draws.length };
+
+      // Watchdog expires on Rev 1 -> keeps backdrop visible AND starts Rev 2 WITHOUT overwriting backdrop.
+      fireWatchdog();
+      const afterTimeout1 = {
+        hidden: bd.hidden,
+        draws: h.backdropLog.draws.length,
+        active: m.displayGate.getActiveQuery(),
+        rendering: m.displayGate.isRendering(),
+      };
+
+      // Watchdog expires on Rev 2 with no pending -> backdrop STILL stays visible.
+      fireWatchdog();
+      const afterTimeout2 = {
+        hidden: bd.hidden,
+        draws: h.backdropLog.draws.length,
+        rendering: m.displayGate.isRendering(),
+      };
+
+      // Late draw finally paints Rev 2 -> clears backdrop cleanly.
+      const lateTile = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: lateTile } } };
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [lateTile] });
+      const afterLateDraw = { hidden: bd.hidden, draws: h.backdropLog.draws.length };
+
+      // After timeout + camera pan (update-viewport clears backdrop), a subsequent reset with hadPainted=false
+      // must NOT capture an unpainted/blank canvas.
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 3, query: '?c=0&win=0:32&g=original&t=2&p=4&z=1' });
+      const drawsAfterRev3 = h.backdropLog.draws.length;
+      fireWatchdog();
+      h.viewer.viewport.panTo(new Point(0.42, 0.25));
+      h.viewer.handlers['update-viewport']();
+      const hiddenAfterPan = bd.hidden;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 4, query: '?c=0&win=0:16&g=original&t=2&p=4&z=1' });
+      const afterUnpaintedReset = { hidden: bd.hidden, draws: h.backdropLog.draws.length };
+
+      // Paint Rev 4 cleanly so paintedQuery is non-null again, then verify pose change detected directly in captureBackdrop.
+      const tile4 = { level: 0, x: 0, y: 0 };
+      h.item.tilesMatrix = { 0: { 0: { 0: tile4 } } };
+      h.item.fullyLoaded = true;
+      h.viewer.handlers['tiled-image-drawn']({ tiledImage: h.item, tiles: [tile4] });
+
+      h.item.fullyLoaded = false;
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 5, query: '?c=0&win=0:8&g=original&t=2&p=4&z=1' });
+      m.applyDisplaySnapshot({ ok: true, launch_token: 'tok-wd', revision: 6, query: '?c=0&win=0:4&g=original&t=2&p=4&z=1' });
+      const drawsAfterRev5 = h.backdropLog.draws.length;
+      // Pan WITHOUT firing update-viewport before watchdog advances to Rev 6 (hadPainted=false).
+      h.viewer.viewport.panTo(new Point(0.48, 0.25));
+      fireWatchdog();
+      const afterPoseMismatchInCapture = { hidden: bd.hidden, draws: h.backdropLog.draws.length };
+
+      return {
+        beforeTimeout,
+        afterTimeout1,
+        afterTimeout2,
+        afterLateDraw,
+        drawsAfterRev3,
+        hiddenAfterPan,
+        afterUnpaintedReset,
+        drawsAfterRev5,
+        afterPoseMismatchInCapture,
+      };
+    """)
+    assert result["beforeTimeout"] == {"hidden": False, "draws": 1}
+    assert result["afterTimeout1"] == {
+        "hidden": False,
+        "draws": 1,
+        "active": "c=0&win=0%3A64&g=original&t=2&p=4&z=1",
+        "rendering": True,
+    }
+    assert result["afterTimeout2"] == {"hidden": False, "draws": 1, "rendering": False}
+    assert result["afterLateDraw"] == {"hidden": True, "draws": 1}
+    assert result["drawsAfterRev3"] == 2
+    assert result["hiddenAfterPan"] is True
+    assert result["afterUnpaintedReset"] == {"hidden": True, "draws": 2}
+    assert result["drawsAfterRev5"] == 3
+    assert result["afterPoseMismatchInCapture"] == {"hidden": True, "draws": 3}
+
+
+def test_tiled_image_fully_loaded_change_binds_via_world_events_and_cleans_up_on_pagehide():
+    result = run("""
+      function makeEventedWorld() {
+        const worldHandlers = { 'add-item': [], 'remove-item': [] };
+        const items = [];
+        return {
+          items,
+          worldHandlers,
+          getItemAt(i) { return items[i] || null; },
+          addHandler(name, fn) { (worldHandlers[name] ||= []).push(fn); },
+          removeHandler(name, fn) {
+            if (!worldHandlers[name]) return;
+            worldHandlers[name] = worldHandlers[name].filter(cb => cb !== fn);
+          },
+          emit(name, ev) { for (const fn of [...(worldHandlers[name] || [])]) fn(ev); },
+        };
+      }
+      function makeTiledItem(viewer) {
+        const itemHandlers = {};
+        return {
+          viewer,
+          tilesMatrix: {},
+          fullyLoaded: false,
+          _needsDraw: true,
+          itemHandlers,
+          reset() { this._needsDraw = true; },
+          getDrawArea() { return { x: 0, y: 0, width: 800, height: 500 }; },
+          getFullyLoaded() { return this.fullyLoaded; },
+          _setFullyLoaded(v) { this.fullyLoaded = Boolean(v); },
+          needsDraw() { return this._needsDraw; },
+          getClip() { return null; },
+          setClip() {},
+          addHandler(name, fn) { (itemHandlers[name] ||= []).push(fn); },
+          removeHandler(name, fn) {
+            if (!itemHandlers[name]) return;
+            itemHandlers[name] = itemHandlers[name].filter(cb => cb !== fn);
+          },
+          emit(name, ev) {
+            for (const fn of [...(itemHandlers[name] || [])]) fn({ eventSource: this, ...ev });
+          },
+        };
+      }
+
+      // 1) World add-item / remove-item lifecycle + OSD event ordering + pagehide cleanup.
+      const world = makeEventedWorld();
+      const elements = new Map();
+      function newEl(id) {
+        return {
+          id, style: {}, dataset: {}, attributes: {}, children: [], listeners: {},
+          clientWidth: 800, clientHeight: 500, disabled: false, hidden: false,
+          addEventListener(n, cb) { this.listeners[n] = cb; },
+          setAttribute(n, v) { this.attributes[n] = v; },
+          replaceChildren(...c) { this.children = c; },
+          appendChild(c) { this.children.push(c); return c; },
+          get lastElementChild() { return this.children[this.children.length - 1]; },
+        };
+      }
+      function getEl(id) { if (!elements.has(id)) elements.set(id, newEl(id)); return elements.get(id); }
+      const bd = getEl('translucent-backdrop');
+      bd.hidden = true; bd.width = 0; bd.height = 0;
+      bd.getContext = kind => kind === '2d' ? { clearRect() {}, drawImage() {} } : null;
+      const winListeners = {};
+      const win = { innerWidth: 800, innerHeight: 500, addEventListener(n, cb) { winListeners[n] = cb; }, removeEventListener() {} };
+      const doc = { getElementById: getEl, createElementNS: (_, n) => newEl(n), querySelectorAll: () => [], addEventListener() {}, removeEventListener() {} };
+      const viewer = fakeViewer();
+      viewer.drawer = { canvas: { width: 800, height: 500 } };
+      viewer.world = world;
+      const OSD = () => viewer; OSD.Point = Point;
+      const mounted = api.mount({
+        window: win, document: doc, api: {}, OSD,
+        context: { ...context, launch_token: 'tok-ti', display_revision: 0 }, info,
+      });
+
+      const worldAddBound = world.worldHandlers['add-item'].length;
+      const worldRemoveBound = world.worldHandlers['remove-item'].length;
+
+      const item1 = makeTiledItem(viewer);
+      world.items.push(item1);
+      world.emit('add-item', { item: item1 });
+      // Open fallback must NOT attach a duplicate listener on item1.
+      viewer.handlers.open();
+      const item1HandlersAfterOpen = (item1.itemHandlers['fully-loaded-change'] || []).length;
+
+      // Start rev 1 and queue rev 2: TiledImage fully-loaded-change BEFORE tiled-image-drawn must wait!
+      mounted.applyDisplaySnapshot({ ok: true, launch_token: 'tok-ti', revision: 1, query: '?c=0&win=0:128&g=original&t=2&p=4&z=1' });
+      mounted.applyDisplaySnapshot({ ok: true, launch_token: 'tok-ti', revision: 2, query: '?c=0&win=0:64&g=original&t=2&p=4&z=1' });
+      const tile1 = { level: 0, x: 0, y: 0 };
+      item1.tilesMatrix = { 0: { 0: { 0: tile1 } } };
+      viewer.handlers['tile-loaded']({ tiledImage: item1, tile: tile1 });
+      item1.fullyLoaded = true;
+      item1.emit('fully-loaded-change', { fullyLoaded: true });
+      const beforeDraw = {
+        active: mounted.displayGate.getActiveQuery(),
+        backdropHidden: bd.hidden,
+      };
+      // Active draw completes rev 1 and starts rev 2.
+      item1._needsDraw = false;
+      viewer.handlers['tiled-image-drawn']({ tiledImage: item1, tiles: [tile1] });
+      const afterRev1Draw = {
+        active: mounted.displayGate.getActiveQuery(),
+        rendering: mounted.displayGate.isRendering(),
+      };
+
+      // Reverse order on rev 2: tiled-image-drawn first, then TiledImage fully-loaded-change with !needsDraw().
+      const tile2 = { level: 0, x: 0, y: 0 };
+      item1.tilesMatrix = { 0: { 0: { 0: tile2 } } };
+      viewer.handlers['tile-loaded']({ tiledImage: item1, tile: tile2 });
+      item1.fullyLoaded = false;
+      item1._needsDraw = false;
+      viewer.handlers['tiled-image-drawn']({ tiledImage: item1, tiles: [tile2] });
+      const stillRenderingRev2 = mounted.displayGate.isRendering();
+      item1.fullyLoaded = true;
+      item1.emit('fully-loaded-change', { fullyLoaded: true });
+      const afterRev2Reverse = {
+        rendering: mounted.displayGate.isRendering(),
+        backdropHidden: bd.hidden,
+      };
+
+      // remove-item unbinds item1's listener; add-item binds item2; pagehide unbinds world and item2.
+      world.items.splice(0, 1);
+      world.emit('remove-item', { item: item1 });
+      const item1HandlersAfterRemove = (item1.itemHandlers['fully-loaded-change'] || []).length;
+
+      const item2 = makeTiledItem(viewer);
+      world.items.push(item2);
+      world.emit('add-item', { item: item2 });
+      const item2HandlersBeforeHide = (item2.itemHandlers['fully-loaded-change'] || []).length;
+
+      winListeners.pagehide();
+      const afterHide = {
+        worldAdd: world.worldHandlers['add-item'].length,
+        worldRemove: world.worldHandlers['remove-item'].length,
+        item2Handlers: (item2.itemHandlers['fully-loaded-change'] || []).length,
+      };
+
+      // 2) open fallback when viewer.world has getItemAt but no addHandler.
+      const fallbackViewer = fakeViewer();
+      const fallbackItem = makeTiledItem(fallbackViewer);
+      fallbackViewer.world = { getItemAt(i) { return i === 0 ? fallbackItem : null; } };
+      const fbWinListeners = {};
+      const fbWin = { innerWidth: 800, innerHeight: 500, addEventListener(n, cb) { fbWinListeners[n] = cb; } };
+      const fbEls = new Map();
+      const fbGetEl = id => { if (!fbEls.has(id)) fbEls.set(id, newEl(id)); return fbEls.get(id); };
+      const fbDoc = { getElementById: fbGetEl, createElementNS: (_, n) => newEl(n), querySelectorAll: () => [], addEventListener() {} };
+      const fbOSD = () => fallbackViewer; fbOSD.Point = Point;
+      api.mount({ window: fbWin, document: fbDoc, api: {}, OSD: fbOSD, context, info });
+      fallbackViewer.handlers.open();
+      const fallbackBoundOnOpen = (fallbackItem.itemHandlers['fully-loaded-change'] || []).length;
+      fbWinListeners.pagehide();
+      const fallbackAfterHide = (fallbackItem.itemHandlers['fully-loaded-change'] || []).length;
+
+      return {
+        worldAddBound,
+        worldRemoveBound,
+        item1HandlersAfterOpen,
+        beforeDraw,
+        afterRev1Draw,
+        stillRenderingRev2,
+        afterRev2Reverse,
+        item1HandlersAfterRemove,
+        item2HandlersBeforeHide,
+        afterHide,
+        fallbackBoundOnOpen,
+        fallbackAfterHide,
+      };
+    """)
+    assert result["worldAddBound"] == 1
+    assert result["worldRemoveBound"] == 1
+    assert result["item1HandlersAfterOpen"] == 1
+    assert result["beforeDraw"] == {
+        "active": "c=0&win=0%3A128&g=original&t=2&p=4&z=1",
+        "backdropHidden": False,
+    }
+    assert result["afterRev1Draw"] == {
+        "active": "c=0&win=0%3A64&g=original&t=2&p=4&z=1",
+        "rendering": True,
+    }
+    assert result["stillRenderingRev2"] is True
+    assert result["afterRev2Reverse"] == {"rendering": False, "backdropHidden": True}
+    assert result["item1HandlersAfterRemove"] == 0
+    assert result["item2HandlersBeforeHide"] == 1
+    assert result["afterHide"] == {"worldAdd": 0, "worldRemove": 0, "item2Handlers": 0}
+    assert result["fallbackBoundOnOpen"] == 1
+    assert result["fallbackAfterHide"] == 0
