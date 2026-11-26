@@ -3,6 +3,21 @@
     <channel>
         <title>nd2wsi-viewer</title>
         <item>
+            <title>2.6.12</title>
+            <pubDate>Thu, 26 Nov 2026 15:00:13 GMT</pubDate>
+            <sparkle:version>2.6.12</sparkle:version>
+            <sparkle:shortVersionString>2.6.12</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<h2>Faster direct-to-SQLite pyramid caching and sequential ND2 overview streaming</h2>
+<ul>
+<li><strong>Direct-to-SQLite <code>.nd2svs</code> pyramid writer.</strong> Write Zarr v2 metadata and Blosc-compressed (<code>zstd</code>, level 3, bitshuffle) pyramid tiles directly into a single staging SQLite container in bounded batches instead of staging thousands of loose chunk files and repacking them afterward. Retains producer-side coordinate accounting (including omitted all-zero tiles), byte-bounded <code>rowid</code>-ordered SHA-256 verification on a reopened read-only handle, post-first-level source-mutation fast-fail checks, bounded Windows staging retries, and safe cleanup of interrupted <code>.building-*</code> and rollback <code>-journal</code> pairs, cutting temporary staging disk usage by ~50% with unchanged <code>nd2svs-sqlite/2</code> / <code>nd2wsi-cache/4</code> compatibility.</li>
+<li><strong>Channel-coherent sequential ND2 Level-1 overview reader.</strong> Stream uncompressed interleaved <code>uint8</code>/<code>uint16</code> ND2 planes sequentially via double-buffered OS reads with balanced multi-pass channel grouping during <code>overview=True</code> builds, failing closed automatically to the existing Dask path on compressed, legacy, multi-Z projection, or non-standard layouts. Improves verified overview cache builds by 5.7&times;&ndash;6.9&times; with ~72&ndash;75% lower peak RSS on 14&ndash;17 GiB four-channel exFAT scans on Apple silicon while preserving bit-identical pixels and OMERO display windows.</li>
+</ul>
+<p>See the <a href="https://github.com/myunghyunj/nd2wsi-viewer/blob/v2.6.12/docs/release-notes-2.6.12.md">2.6.12 release notes</a> for full details and download checksums.</p>]]></description>
+            <enclosure url="https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.12/nd2wsi-viewer-2.6.12-macos-arm64.dmg" length="135496858" type="application/octet-stream" sparkle:edSignature="QmVLaPeYHhaCmp9IwE4jDTPeSzuSChN+HD7BPzvCQ3Ew4QtanIHY9G9iuhDRMY1gY3UPdEz9B4vaOpp1TzH+BA=="/>
+        </item>
+        <item>
             <title>2.6.11</title>
             <pubDate>Wed, 25 Nov 2026 14:53:16 +0000</pubDate>
             <sparkle:version>2.6.11</sparkle:version>
