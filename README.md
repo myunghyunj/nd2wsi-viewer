@@ -20,6 +20,7 @@
 
 ## Recent updates
 
+- **Faster direct-to-SQLite `.nd2svs` pyramid caching & sequential ND2 overview streaming (`2.6.12`):** write Zarr v2 metadata and Blosc-compressed tiles straight into a single staging `.nd2svs` SQLite container with bounded batching, coordinate accounting, and reopened `rowid`-ordered SHA-256 verification (cutting temporary staging disk usage by ~50%), and stream uncompressed interleaved ND2 planes sequentially during `overview=True` builds (**5.7×–6.9× faster** end-to-end overview caching and **~72–75% lower peak RSS** on 14–17 GiB four-channel exFAT scans on Apple silicon) with bit-identical pixels and full 2.6.10/2.6.11 cache compatibility. [2.6.12 release notes](docs/release-notes-2.6.12.md).
 - **AstroMapper multi-step resize import, multi-channel OME-TIFF fixes & security/lifecycle hardening (`2.6.11`):** accept 1-step and 2-step downscaled JPG/PNG AstroMapper reference images with dimension-bearing mismatch diagnostics, UTF-16 BOM ROI text support, PNG reference parity in the translucent viewer, 4,096-character ROI notes, integer-snapped dragged ROI boxes, and raised export payload limits; fix standards-compliant multi-IFD OME-TIFF 2016-06 output for multi-channel exports, degraded-overview ND2 export guards, and pre-stream export error reporting; and harden Zarr v2 metadata/symlink validation, overwrite conversion safety, atomic shading-correction recovery, translucent window close/capture/live-LUT reliability, and NFC/NFD locks with Windows long-path (`\\?\`) support. [2.6.11 release notes](docs/release-notes-2.6.11.md).
 - **Live translucent LUT updates & cross-OS exFAT cache portability (`2.6.10`):** sync contrast, gamma, colour, and channel edits live into the translucent viewer during continuous drags with paint-complete redraw gating, preserved lock/ROI alignment, and shading-rebuild expiry notices; preserve `.nd2svs` caches and Korean/non-ASCII sidecars seamlessly between macOS and Windows on external exFAT drives with timestamp-skew tolerance and NFC/NFD Unicode normalization. [2.6.10 release notes](docs/release-notes-2.6.10.md).
 - **Pre-1709 Windows 10 & LTSC workstation Setup support (`2.6.9`):** remove the Windows 10 build `16299` gate in per-user NSIS Setup so 64-bit Windows 10 (`10240+`, including Enterprise 2015/2016 LTSC microscope PCs) and Windows Server 2016+ install cleanly when `.NET Framework 4.6.2+` and WebView2 (`>= 109`) are present, with pre-1607 system-DPI overlay scaling, bundled MSVC CRT verification, and PowerShell `5.0` verifier compatibility. [2.6.9 release notes](docs/release-notes-2.6.9.md).
@@ -38,10 +39,10 @@
 
 ## Download
 
-| Platform | Download · 2.6.11 | Requirements |
+| Platform | Download · 2.6.12 | Requirements |
 | --- | --- | --- |
-| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
-| Windows | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.11/nd2wsi-viewer-2.6.11-windows-x64.zip) | Windows 11 (x64, or ARM64 via x64 emulation) · WebView2 |
+| macOS | [DMG](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.12/nd2wsi-viewer-2.6.12-macos-arm64.dmg) | Apple silicon · macOS 14 or later |
+| Windows | [Installer](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.12/nd2wsi-viewer-2.6.12-windows-x64-setup.exe) · [Portable ZIP](https://github.com/myunghyunj/nd2wsi-viewer/releases/download/v2.6.12/nd2wsi-viewer-2.6.12-windows-x64.zip) | Windows 11 (x64, or ARM64 via x64 emulation) · WebView2 |
 
 On macOS, drag the app into **Applications**; on first launch, choose **System Settings → Privacy & Security → Open Anyway** once (ad-hoc signed; signed Sparkle updates run from **nd2wsi-viewer → Check for Updates…** thereafter). On Windows, run the per-user **Installer** (no administrator prompt) or extract the entire **Portable ZIP** keeping `_internal` beside `nd2wsi-viewer.exe`, and allow the SmartScreen unsigned-publisher prompt if shown (verify against the accompanying `.sha256` checksum). See the [installation guide](docs/user-guide.md#get-started).
 
