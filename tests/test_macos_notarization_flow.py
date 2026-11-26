@@ -197,12 +197,29 @@ def test_sign_release_ad_hoc_mode_signs_app_and_dmg_and_preserves_sparkle(tmp_pa
     dmg_src.mkdir()
     (dmg_src / "README.txt").write_text("dmg test\n", encoding="utf-8")
     dmg = tmp_path / "nd2wsi-viewer.dmg"
-    subprocess.run(
-        ["hdiutil", "create", "-volname", "nd2wsi-test", "-srcfolder", str(dmg_src), "-ov", "-format", "UDZO", str(dmg)],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    hdi_cmd = [
+        "hdiutil",
+        "create",
+        "-volname",
+        f"nd2wsi-test-{os.getpid()}",
+        "-srcfolder",
+        str(dmg_src),
+        "-ov",
+        "-format",
+        "UDZO",
+        str(dmg),
+    ]
+    for attempt in range(3):
+        proc = subprocess.run(hdi_cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            break
+        if attempt == 2:
+            raise subprocess.CalledProcessError(
+                proc.returncode, hdi_cmd, output=proc.stdout, stderr=proc.stderr
+            )
+        import time
+
+        time.sleep(0.5 * (attempt + 1))
 
     isolated_tmp = tmp_path / "isolated_tmp"
     isolated_tmp.mkdir()

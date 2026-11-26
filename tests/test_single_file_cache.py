@@ -616,9 +616,13 @@ def test_cli_and_python_nd2svs_export_overwrite_guards_progress_and_cleanup(
     orig_replace = os.replace
     replaced = {"done": False}
 
+    from nd2wsi.platform_io import filesystem_path
+
+    expected_dst = filesystem_path(cli_out)
+
     def spy_replace(src, dst):
         res = orig_replace(src, dst)
-        if Path(dst).resolve() == cli_out.resolve():
+        if filesystem_path(dst) == expected_dst:
             replaced["done"] = True
         return res
 
