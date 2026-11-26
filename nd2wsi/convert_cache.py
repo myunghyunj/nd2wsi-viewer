@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import shutil
 import stat
+import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,12 +26,24 @@ from typing import Any
 
 import numpy as np
 
-from .reader import PlaneSelection, PlaneSource, level_shapes, nice_bytes, open_plane
+from .reader import (
+    PlaneSelection,
+    PlaneSource,
+    SequentialNd2Layout,
+    level_shapes,
+    nice_bytes,
+    open_plane,
+    sequential_nd2_layout,
+)
 from .storage import DEFAULT_STORAGE, StorageBackend
 
 NGFF_VERSION = "0.4"
 DOWNSAMPLE_TASK_BUDGET = 96 << 20  # peak bytes one downsample task may hold
 CACHE_DIR_NAME = "pyramids"
+
+_SEQ_READ_CHUNK_BYTES = 4 * 1024 * 1024
+_SEQ_STRIP_BUDGET_BYTES = 48 * 1024 * 1024
+_SEQ_BAND_BUDGET_BYTES = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -47,6 +63,8 @@ class _FacadeHooks:
     legacy_store: Callable[..., Path | None]
     legacy_matches_source: Callable[..., bool]
     store_matches_selection: Callable[..., bool]
+    convert_is_default: bool = True
+    available_memory_bytes: Callable[[], int | None] | None = None
 
 
 class _StoreProgress:
@@ -97,6 +115,308 @@ def _write_level0(
     src: PlaneSource, arr: Any, storage: StorageBackend = DEFAULT_STORAGE
 ) -> None:
     _store_direct(src.data, arr, storage)
+
+
+def _read_exact_into(
+    fd: int,
+    buf: bytearray,
+    n_bytes: int,
+    chunk_bytes: int,
+    is_aborted: Callable[[], bool],
+) -> bool:
+    """Read ``n_bytes`` sequentially into ``buf``; return False if aborted."""
+    mv = memoryview(buf)
+    offset = 0
+    while offset < n_bytes:
+        if is_aborted():
+            return False
+        got = os.read(fd, min(chunk_bytes, n_bytes - offset))
+        if not got:
+            raise EOFError(f"unexpected EOF after {offset}/{n_bytes} bytes")
+        end = offset + len(got)
+        mv[offset:end] = got
+        offset = end
+    return True
+
+
+class _StripChannel:
+    """Single Condition-guarded 2-slot ping-pong channel for sequential ND2 reads."""
+
+    def __init__(self, slots: int = 2) -> None:
+        self._cv = threading.Condition(threading.Lock())
+        self._free_slots: deque[int] = deque(range(slots))
+        self._ready_slots: deque[tuple[int, int, int, int, int]] = deque()
+        self._eof = False
+        self._aborted = False
+        self._error: BaseException | None = None
+
+    def is_aborted(self) -> bool:
+        return self._aborted
+
+    def acquire_free(self) -> int | None:
+        with self._cv:
+            while not self._aborted and not self._free_slots:
+                self._cv.wait()
+            if self._aborted:
+                return None
+            return self._free_slots.popleft()
+
+    def push_ready(self, item: tuple[int, int, int, int, int]) -> bool:
+        with self._cv:
+            if self._aborted:
+                return False
+            self._ready_slots.append(item)
+            self._cv.notify_all()
+            return True
+
+    def pop_ready(self) -> tuple[int, int, int, int, int] | None:
+        with self._cv:
+            while (
+                not self._ready_slots
+                and not self._eof
+                and self._error is None
+                and not self._aborted
+            ):
+                self._cv.wait()
+            if self._error is not None:
+                raise self._error
+            if self._aborted:
+                return None
+            if not self._ready_slots and self._eof:
+                return None
+            return self._ready_slots.popleft()
+
+    def release_free(self, buf_idx: int) -> None:
+        with self._cv:
+            self._free_slots.append(buf_idx)
+            self._cv.notify_all()
+
+    def finish(self) -> None:
+        with self._cv:
+            self._eof = True
+            self._cv.notify_all()
+
+    def fail(self, exc: BaseException) -> None:
+        with self._cv:
+            if self._error is None:
+                self._error = exc
+            self._cv.notify_all()
+
+    def abort(self) -> None:
+        with self._cv:
+            self._aborted = True
+            self._cv.notify_all()
+
+
+def _write_level1_sequential_nd2(
+    layout: SequentialNd2Layout,
+    arr: Any,
+    storage: StorageBackend = DEFAULT_STORAGE,
+    *,
+    workers: int,
+    available_memory_fn: Callable[[], int | None] | None = None,
+    on_fraction: Callable[[float], None] | None = None,
+) -> bool:
+    """Build Level 1 from an eligible ND2 using forward sequential descriptor reads.
+
+    Returns ``True`` if Level 1 was written, or ``False`` to fail closed to the
+    existing Dask path.
+    """
+    from .metal import reduce2x_or_cpu
+    from .platform_io import BINARY, filesystem_path
+
+    c, h, w = layout.shape_cyx
+    even_h = h // 2 * 2
+    even_w = w // 2 * 2
+    l1_h = even_h // 2
+    l1_w = even_w // 2
+    if l1_h < 1 or l1_w < 1:
+        return False
+
+    chunked = storage.chunk_array(arr)
+    if len(chunked.chunk_shape) != 3:
+        return False
+    tile = int(chunked.chunk_shape[1])
+    if (
+        tile < 1
+        or tuple(int(v) for v in chunked.chunk_shape) != (1, tile, tile)
+        or tuple(int(v) for v in arr.shape) != (c, l1_h, l1_w)
+        or np.dtype(arr.dtype) != layout.dtype
+    ):
+        return False
+
+    ny_tiles = math.ceil(l1_h / tile)
+    nx_tiles = math.ceil(l1_w / tile)
+    band_h_max = min(tile, l1_h)
+
+    band_budget = _SEQ_BAND_BUDGET_BYTES
+    mem_fn = available_memory_fn
+    if mem_fn is None:
+        from .convert import available_memory_bytes
+
+        mem_fn = available_memory_bytes
+    avail = mem_fn()
+    if avail is not None:
+        band_budget = min(band_budget, max(1, int(avail * 0.25)))
+
+    one_ch_band_bytes = band_h_max * l1_w * int(layout.dtype.itemsize)
+    c_group_max = min(c, band_budget // max(1, one_ch_band_bytes))
+    if c_group_max < 1:
+        return False
+    n_passes = math.ceil(c / c_group_max)
+    c_group = math.ceil(c / n_passes)
+
+    if 2 * layout.y_stride > _SEQ_STRIP_BUDGET_BYTES:
+        return False
+    strip_rows = max(
+        2,
+        min(512, tile * 2, even_h, _SEQ_STRIP_BUDGET_BYTES // max(1, layout.y_stride)) // 2 * 2,
+    )
+
+    local_fd: int | None = None
+    if layout.fd is not None:
+        fd = layout.fd
+    else:
+        fd = os.open(filesystem_path(layout.source_path), os.O_RDONLY | BINARY)
+        local_fd = fd
+        if layout.source_identity is not None:
+            st = os.fstat(fd)
+            if (
+                st.st_ino != 0
+                and layout.source_identity[1] != 0
+                and (int(st.st_dev), int(st.st_ino)) != layout.source_identity
+            ):
+                os.close(fd)
+                return False
+
+    try:
+        l1_band = np.empty((c_group, band_h_max, l1_w), dtype=layout.dtype)
+        buf_size = strip_rows * layout.y_stride
+        buffers = (bytearray(buf_size), bytearray(buf_size))
+        channel = _StripChannel(slots=2)
+
+        def _reader_loop() -> None:
+            try:
+                os.lseek(fd, layout.frame_offset, os.SEEK_SET)
+                for ty in range(ny_tiles):
+                    band_src_start = ty * tile * 2
+                    band_src_end = min((ty + 1) * tile * 2, even_h)
+                    for pass_idx in range(n_passes):
+                        if channel.is_aborted():
+                            return
+                        if pass_idx > 0:
+                            os.lseek(
+                                fd,
+                                layout.frame_offset + band_src_start * layout.y_stride,
+                                os.SEEK_SET,
+                            )
+                        row_start = band_src_start
+                        while row_start < band_src_end:
+                            n_rows = min(strip_rows, band_src_end - row_start)
+                            buf_idx = channel.acquire_free()
+                            if buf_idx is None:
+                                return
+                            if row_start + n_rows == h:
+                                n_bytes = (n_rows - 1) * layout.y_stride + even_w * layout.x_stride
+                            else:
+                                n_bytes = n_rows * layout.y_stride
+                            ok = _read_exact_into(
+                                fd,
+                                buffers[buf_idx],
+                                n_bytes,
+                                _SEQ_READ_CHUNK_BYTES,
+                                channel.is_aborted,
+                            )
+                            if not ok:
+                                return
+                            if not channel.push_ready(
+                                (ty, pass_idx, row_start - band_src_start, n_rows, buf_idx)
+                            ):
+                                return
+                            row_start += n_rows
+                channel.finish()
+            except BaseException as exc:
+                channel.fail(exc)
+
+        n_slices = min(max(1, int(workers)), l1_w)
+        col_ranges = [
+            (i * l1_w // n_slices, (i + 1) * l1_w // n_slices) for i in range(n_slices)
+        ]
+        itemsize = int(layout.dtype.itemsize)
+
+        reader_thread = threading.Thread(
+            target=_reader_loop, name="nd2wsi-seq-reader", daemon=True
+        )
+        pool = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+        reader_thread.start()
+        try:
+            total_steps = ny_tiles * n_passes
+            while True:
+                item = channel.pop_ready()
+                if item is None:
+                    break
+                ty, pass_idx, band_src_offset, n_rows, buf_idx = item
+                c_start = pass_idx * c_group
+                c_end = min(c, c_start + c_group)
+                gc = c_end - c_start
+                band_r0 = band_src_offset // 2
+                band_r1 = band_r0 + n_rows // 2
+                band_src_end = min((ty + 1) * tile * 2, even_h)
+                band_src_len = band_src_end - ty * tile * 2
+                strip_view = np.ndarray(
+                    shape=(n_rows, even_w, c),
+                    dtype=layout.dtype,
+                    buffer=buffers[buf_idx],
+                    strides=(layout.y_stride, layout.x_stride, itemsize),
+                )
+
+                def _reduce_slice(
+                    ox0: int,
+                    ox1: int,
+                    *,
+                    _view: np.ndarray = strip_view,
+                    _c0: int = c_start,
+                    _c1: int = c_end,
+                    _gc: int = gc,
+                    _r0: int = band_r0,
+                    _r1: int = band_r1,
+                ) -> None:
+                    sub_cyx = _view[:, ox0 * 2 : ox1 * 2, _c0:_c1].transpose(2, 0, 1)
+                    l1_band[:_gc, _r0:_r1, ox0:ox1] = reduce2x_or_cpu(sub_cyx, layout.dtype)
+
+                strip_futures = [pool.submit(_reduce_slice, ox0, ox1) for ox0, ox1 in col_ranges]
+                for fut in strip_futures:
+                    fut.result()
+                channel.release_free(buf_idx)
+
+                if band_src_offset + n_rows == band_src_len:
+                    band_h = min(tile, l1_h - ty * tile)
+                    encode_futures = []
+                    for ci_local in range(gc):
+                        ci = c_start + ci_local
+                        for tx in range(nx_tiles):
+                            x0 = tx * tile
+                            x1 = min(x0 + tile, l1_w)
+                            sub = l1_band[ci_local : ci_local + 1, :band_h, x0:x1]
+                            encode_futures.append(
+                                pool.submit(chunked.write, (ci, ty, tx), sub)
+                            )
+                    for fut in encode_futures:
+                        fut.result()
+                    if on_fraction is not None:
+                        on_fraction((ty * n_passes + pass_idx + 1) / total_steps)
+        except BaseException:
+            channel.abort()
+            pool.shutdown(wait=True, cancel_futures=True)
+            reader_thread.join()
+            raise
+        else:
+            pool.shutdown(wait=True)
+            reader_thread.join()
+    finally:
+        if local_fd is not None:
+            os.close(local_fd)
+    return True
 
 
 def _write_level1_from_source(
@@ -223,6 +543,9 @@ def _downsample_into(
         for tx in range(x0 // nt, -(-x1 // nt)):
             cx0, cx1 = tx * nt - x0, min((tx + 1) * nt, nw) - x0
             if not row[:, cx0:cx1].any():  # all-zero chunk stays unwritten
+                record_zero = getattr(target, "record_zero", None)
+                if record_zero is not None:
+                    record_zero((ci, ty, tx))
                 continue
             out = np.zeros(ncs, dtype)  # v2 pads edge chunks to full size
             out[0, :h2, : cx1 - cx0] = row[:, cx0:cx1]
@@ -385,13 +708,13 @@ def _validate_convert_target(
         raise ValueError(f"refusing to overwrite non-regular target {final_path}")
 
 
-def _open_conversion_source(
+def _open_conversion_source_with_layout(
     stack: ExitStack,
     source_path: Path,
     selection: PlaneSelection,
     tile: int,
     overview: bool,
-) -> PlaneSource:
+) -> tuple[PlaneSource, SequentialNd2Layout | None]:
     import nd2
 
     from .czi import is_czi, open_czi
@@ -401,22 +724,38 @@ def _open_conversion_source(
     if is_svs(source_path):
         if overview:
             raise ValueError("overview stores are for ND2 sources only")
-        return open_svs(stack, source_path, tile=tile)
+        return open_svs(stack, source_path, tile=tile), None
     if is_czi(source_path):
         if overview:
             raise ValueError("overview stores are for ND2 sources only")
-        return open_czi(stack, source_path, selection=selection, tile=tile)
+        return open_czi(stack, source_path, selection=selection, tile=tile), None
     if is_lif(source_path):
         if overview:
             raise ValueError("overview stores are for ND2 sources only")
-        return open_lif(stack, source_path, selection=selection, tile=tile)
+        return open_lif(stack, source_path, selection=selection, tile=tile), None
     handle = stack.enter_context(nd2.ND2File(str(source_path)))
+    seq_layout = (
+        sequential_nd2_layout(handle, selection, source_path, stack=stack)
+        if overview
+        else None
+    )
     # Coarsening a 2*tile source block yields one tile-sized
     # level-1 block. This alignment prevents the hidden Dask
     # rechunk that made early compact-cache prototypes slower
     # than full conversion.
     source_tile = tile * 2 if overview else tile
-    return open_plane(handle, selection, tile=source_tile)
+    return open_plane(handle, selection, tile=source_tile), seq_layout
+
+
+def _open_conversion_source(
+    stack: ExitStack,
+    source_path: Path,
+    selection: PlaneSelection,
+    tile: int,
+    overview: bool,
+) -> PlaneSource:
+    src, _ = _open_conversion_source_with_layout(stack, source_path, selection, tile, overview)
+    return src
 
 
 def _write_pyramid_levels(
@@ -431,6 +770,9 @@ def _write_pyramid_levels(
     progress: bool,
     on_progress: Callable[[float], None] | None,
     hooks: _FacadeHooks,
+    workers: int | None = None,
+    seq_layout: SequentialNd2Layout | None = None,
+    after_first_level_hook: Callable[[], None] | None = None,
 ) -> None:
     channels = src.shape[0]
     arrays: dict[int, Any] = {}
@@ -443,6 +785,7 @@ def _write_pyramid_levels(
     weights = {level: shapes[level][0] * shapes[level][1] for level in arrays}
     total_pixels = float(sum(weights.values()))
     completed_pixels = 0.0
+    flush = getattr(root, "flush", None)
 
     def level_context(level: int):
         if on_progress is None:
@@ -456,12 +799,33 @@ def _write_pyramid_levels(
     if progress:
         action = "downsampling from the source" if overview else "writing from the source"
         print(f"  level {first_level}  {level_width} x {level_height}  {action} ...", flush=True)
-    with level_context(first_level):
-        if overview:
-            _write_level1_from_source(src, arrays[1], storage)
-        else:
-            _write_level0(src, arrays[0], storage)
+    used_seq = False
+    if overview and seq_layout is not None:
+        base = completed_pixels
+        seq_cb = (
+            (lambda fraction: on_progress((base + fraction * weights[1]) / total_pixels))
+            if on_progress is not None
+            else None
+        )
+        used_seq = _write_level1_sequential_nd2(
+            seq_layout,
+            arrays[1],
+            storage,
+            workers=workers or hooks.auto_workers(),
+            available_memory_fn=hooks.available_memory_bytes,
+            on_fraction=seq_cb,
+        )
+    if not used_seq:
+        with level_context(first_level):
+            if overview:
+                _write_level1_from_source(src, arrays[1], storage)
+            else:
+                _write_level0(src, arrays[0], storage)
+    if flush is not None:
+        flush()
     completed_pixels += weights[first_level]
+    if after_first_level_hook is not None:
+        after_first_level_hook()
 
     for level in range(first_level + 1, len(shapes)):
         level_height, level_width = shapes[level]
@@ -469,6 +833,8 @@ def _write_pyramid_levels(
             print(f"  level {level}  {level_width} x {level_height}  downsampling ...", flush=True)
         with level_context(level):
             hooks.downsample(arrays[level - 1], arrays[level], tile, src.dtype, storage)
+        if flush is not None:
+            flush()
         completed_pixels += weights[level]
 
 
@@ -484,6 +850,7 @@ def _build_store_attrs(
     overview: bool,
     ngff_version: str,
     hooks: _FacadeHooks,
+    source_fingerprint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     channels, height, width = src.shape
     level_paths = [str(level) for level in range(first_level, len(shapes))]
@@ -497,7 +864,9 @@ def _build_store_attrs(
         ngff_version=ngff_version,
     )
     attrs["nd2wsi"]["storage"] = storage.descriptor(ngff_version=ngff_version)
-    if source_path.is_file():
+    if source_fingerprint is not None:
+        attrs["nd2wsi"]["source_fingerprint"] = source_fingerprint
+    elif source_path.is_file():
         from .cache import quick_fingerprint
 
         attrs["nd2wsi"]["source_fingerprint"] = quick_fingerprint(source_path)
@@ -581,6 +950,161 @@ def _pack_and_commit_export(
     shutil.rmtree(staging_path, ignore_errors=True)
 
 
+def _cleanup_staging_best_effort(path: Path) -> None:
+    """Remove an owned staging artifact without masking the caller's exception."""
+    from .cache import remove_staging_artifact
+
+    try:
+        remove_staging_artifact(path)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+
+def _build_single_file_pyramid(
+    source_path: Path,
+    src_resolved: Path,
+    staging_db: Path,
+    final_target: Path,
+    selection: PlaneSelection,
+    *,
+    before_fp: dict[str, Any],
+    tile: int,
+    workers: int,
+    overview: bool,
+    progress: bool,
+    on_progress: Callable[[float], None] | None,
+    ngff_version: str,
+    origin: str | None,
+    validate_fn: Callable[[Path], None],
+    hooks: _FacadeHooks,
+) -> None:
+    """Build, verify, and finalize a fresh single-file ``.nd2svs`` staging DB."""
+    import dask
+
+    from .cache import build_manifest, fingerprints_match, quick_fingerprint
+    from .storage.single_file_writer import (
+        _SingleFileStagingBackend,
+        verify_and_finalize_single_file,
+    )
+
+    with dask.config.set(scheduler="threads", num_workers=workers):
+        with ExitStack() as stack:
+            src, seq_layout = _open_conversion_source_with_layout(
+                stack, source_path, selection, tile, overview
+            )
+            channels, height, width = src.shape
+            shapes = level_shapes(height, width, tile)
+            first_level = 1 if overview else 0
+            if overview and len(shapes) < 2:
+                raise ValueError(
+                    f"{source_path.name} fits one tile; an overview would be empty"
+                )
+
+            if progress:
+                raw = channels * height * width * src.dtype.itemsize
+                print(
+                    f"{source_path.name}: {width} x {height} px, "
+                    f"{channels} channel(s), {src.dtype}, "
+                    f"{'RGB' if src.rgb else 'grayscale'}, "
+                    f"~{nice_bytes(raw)} of level-0 pixels"
+                )
+                for note in src.notes:
+                    print(f"  note: {note}")
+                label = "overview levels 1.." if overview else "levels 0.."
+                print(f"  pyramid: {label}{len(shapes) - 1}, tile {tile}")
+
+            backend = _SingleFileStagingBackend()
+            try:
+                root = backend.create_group(staging_db)
+            except FileExistsError:
+                raise
+            except BaseException:
+                _cleanup_staging_best_effort(staging_db)
+                raise
+
+            try:
+                mid_fp_box = [before_fp]
+
+                def _check_source_after_first_level() -> None:
+                    mid_fp = quick_fingerprint(src_resolved)
+                    if not fingerprints_match(before_fp, mid_fp, allow_mtime_skew=False):
+                        raise RuntimeError(
+                            f"{source_path.name} changed while building its cache "
+                            "(still copying, or being written by the scanner?) — "
+                            "try again once the file is settled"
+                        )
+                    mid_fp_box[0] = mid_fp
+
+                level_progress = (
+                    (lambda fraction: on_progress(0.90 * min(1.0, max(0.0, fraction))))
+                    if on_progress is not None
+                    else None
+                )
+                _write_pyramid_levels(
+                    root,
+                    src,
+                    shapes,
+                    first_level,
+                    tile,
+                    backend,
+                    overview=overview,
+                    progress=progress,
+                    on_progress=level_progress,
+                    hooks=hooks,
+                    workers=workers,
+                    seq_layout=seq_layout,
+                    after_first_level_hook=_check_source_after_first_level,
+                )
+                attrs = _build_store_attrs(
+                    root,
+                    src,
+                    source_path,
+                    shapes,
+                    first_level,
+                    tile,
+                    backend,
+                    overview=overview,
+                    ngff_version=ngff_version,
+                    hooks=hooks,
+                    source_fingerprint=mid_fp_box[0],
+                )
+                root.attrs.update(attrs)
+                meta = attrs["nd2wsi"]
+                manifest = build_manifest(
+                    final_target,
+                    src_resolved,
+                    mid_fp_box[0],
+                    selection.describe(),
+                    meta.get("selection", {}).get("z"),
+                    meta["tile"],
+                    (channels, height, width),
+                    meta["dtype"],
+                    kind="overview" if overview else "full",
+                    storage=meta.get("storage"),
+                    origin=origin,
+                    single_file=True,
+                    complete=False,
+                )
+                verify_progress = (
+                    (lambda fraction: on_progress(0.90 + 0.09 * min(1.0, max(0.0, fraction))))
+                    if on_progress is not None
+                    else None
+                )
+                verify_and_finalize_single_file(
+                    root,
+                    staging_path=staging_db,
+                    source=src_resolved,
+                    before_fp=before_fp,
+                    manifest=manifest,
+                    validate_fn=validate_fn,
+                    on_verify_progress=verify_progress,
+                )
+            except BaseException:
+                root.close_handles(suppress_errors=True)
+                _cleanup_staging_best_effort(staging_db)
+                raise
+
+
 def run_convert(
     nd2_path: str | Path,
     out_path: str | Path,
@@ -626,8 +1150,58 @@ def run_convert(
     _refuse_database_companions(final_path)
     _validate_convert_target(final_path, overwrite=overwrite, single_file_out=single_file_out)
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    before_fp: dict[str, Any] | None = None
     src_resolved = source_path.resolve()
+    started = time.time()
+
+    if single_file_out and storage is DEFAULT_STORAGE:
+        final_path = final_path.parent.resolve() / final_path.name
+        before_fp = quick_fingerprint(src_resolved)
+        staging_db = final_path.with_name(f".{final_path.name}.building-{uuid.uuid4().hex}")
+
+        def _validate_export(candidate: Path) -> None:
+            r_val, _ = hooks.open_store(candidate)
+            try:
+                pass
+            finally:
+                close_val = getattr(r_val, "close", None)
+                if close_val is not None:
+                    close_val()
+
+        _build_single_file_pyramid(
+            source_path,
+            src_resolved,
+            staging_db,
+            final_path,
+            selection,
+            before_fp=before_fp,
+            tile=tile,
+            workers=workers,
+            overview=overview,
+            progress=progress,
+            on_progress=on_progress,
+            ngff_version=ngff_version,
+            origin="export",
+            validate_fn=_validate_export,
+            hooks=hooks,
+        )
+        try:
+            _refuse_database_companions(final_path)
+            _validate_convert_target(final_path, overwrite=overwrite, single_file_out=True)
+            commit_container(staging_db, final_path)
+        except BaseException:
+            _cleanup_staging_best_effort(staging_db)
+            raise
+        if on_progress is not None:
+            on_progress(1.0)
+        if progress:
+            size = final_path.stat().st_size
+            print(
+                f"  done in {time.time() - started:.1f}s -> {final_path} "
+                f"({nice_bytes(size)} on disk)"
+            )
+        return final_path
+
+    before_fp = None
     if single_file_out:
         final_path = final_path.parent.resolve() / final_path.name
         before_fp = quick_fingerprint(src_resolved)
@@ -645,7 +1219,6 @@ def run_convert(
         shutil.rmtree(staging_path, ignore_errors=True)
         store_build_dir = staging_path
 
-    started = time.time()
     swept = freed = 0
     try:
         with dask.config.set(scheduler="threads", num_workers=workers):
@@ -779,13 +1352,15 @@ def _validate_store(
     hooks: _FacadeHooks,
 ) -> None:
     root, attrs = hooks.open_store(candidate)
-    close = getattr(root, "close", None)
-    if close:
-        close()
-    if tile is not None and int((attrs.get("nd2wsi") or {}).get("tile") or 0) != int(tile):
-        raise ValueError("cached tile size does not match requested tile")
-    if not hooks.semantics(slide, selection, attrs):
-        raise ValueError("cached decoder or channel metadata semantics are outdated")
+    try:
+        if tile is not None and int((attrs.get("nd2wsi") or {}).get("tile") or 0) != int(tile):
+            raise ValueError("cached tile size does not match requested tile")
+        if not hooks.semantics(slide, selection, attrs):
+            raise ValueError("cached decoder or channel metadata semantics are outdated")
+    finally:
+        close = getattr(root, "close", None)
+        if close:
+            close()
 
 
 def _import_old_container(
@@ -836,11 +1411,43 @@ def _build_and_commit_cache(
     from .cache import commit_container, quarantine, quick_fingerprint, sweep_stale_builds
     from .migration import pack_directory
 
-    sweep_stale_builds(container.parent)
-    overview = kind == "auto" and _overview_eligible(
-        slide, selection, tile or hooks.auto_tile(container)
-    )
+    sweep_stale_builds(container.parent, owned_families=(container.name,))
+    resolved_tile = tile if tile is not None else hooks.auto_tile(container)
+    overview = kind == "auto" and _overview_eligible(slide, selection, resolved_tile)
     before = quick_fingerprint(slide)
+
+    if hooks.convert_is_default:
+        staging_db = container.with_name(f"{container.name}.building-{uuid.uuid4().hex}")
+        container.parent.mkdir(parents=True, exist_ok=True)
+        _build_single_file_pyramid(
+            slide,
+            slide.resolve(),
+            staging_db,
+            container,
+            selection,
+            before_fp=before,
+            tile=resolved_tile,
+            workers=hooks.auto_workers(),
+            overview=overview,
+            progress=False,
+            on_progress=on_progress,
+            ngff_version=NGFF_VERSION,
+            origin=None,
+            validate_fn=validate_fn,
+            hooks=hooks,
+        )
+        try:
+            if container.exists():
+                refuse_if_newer_fn()
+                quarantine(container)
+            commit_container(staging_db, container)
+        except BaseException:
+            _cleanup_staging_best_effort(staging_db)
+            raise
+        if on_progress is not None:
+            on_progress(1.0)
+        return
+
     staging = container.with_name(f"{container.name}.building-{uuid.uuid4().hex}")
     staging.mkdir(parents=True, exist_ok=False)
     try:

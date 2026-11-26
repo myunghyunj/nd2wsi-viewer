@@ -20,7 +20,7 @@ import sys
 import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -28,7 +28,8 @@ from urllib.parse import quote
 from zarr.abc.store import OffsetByteRequest, RangeByteRequest, Store, SuffixByteRequest
 from zarr.core.buffer import Buffer, BufferPrototype, default_buffer_prototype
 
-from ..platform_io import filesystem_path
+from ..platform_io import BINARY, filesystem_path
+from ..windows_fs import is_windows_name_surrogate_reparse
 from .zarr_v2 import UnsafeZarrArrayError, ZarrV2RegionReader, validate_zarr_v2_metadata
 
 APPLICATION_ID = 0x4E443253
@@ -176,14 +177,26 @@ class SQLiteStore(Store):
         if format_version not in _WRITABLE_VERSIONS:
             raise ValueError("unsupported single-file creation version")
         self._format_version = format_version
+        self._opened_version = format_version
         self._ensure_open_sync()
 
     @classmethod
     def create_exclusive(
-        cls, path: str | os.PathLike, *, prefix: str = "", format_version: int = FORMAT_VERSION,
+        cls,
+        path: str | os.PathLike,
+        *,
+        prefix: str = "",
+        format_version: int = FORMAT_VERSION,
+        cache_size: int | None = None,
     ) -> SQLiteStore:
         """Atomically create a new container; never adopt an existing pathname."""
-        return cls(path, prefix=prefix, _exclusive=True, format_version=format_version)
+        return cls(
+            path,
+            prefix=prefix,
+            _exclusive=True,
+            format_version=format_version,
+            cache_size=cache_size,
+        )
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, SQLiteStore) and (self.path, self.prefix) == (
@@ -217,7 +230,7 @@ class SQLiteStore(Store):
         )
 
     @staticmethod
-    def _validate(connection: sqlite3.Connection, *, read_only: bool) -> None:
+    def _validate(connection: sqlite3.Connection, *, read_only: bool) -> int:
         app_id = connection.execute("PRAGMA application_id").fetchone()[0]
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if app_id != APPLICATION_ID or version not in _READABLE_VERSIONS:
@@ -238,6 +251,7 @@ class SQLiteStore(Store):
             raise ValueError("unsupported single-file cache schema")
         if version in _WRITABLE_VERSIONS and schema[1][3] is not None:
             raise ValueError("unsupported single-file cache schema")
+        return int(version)
 
     @staticmethod
     def _configure(
@@ -382,13 +396,8 @@ class SQLiteStore(Store):
         with open(native, "rb") as source:
             st = os.fstat(source.fileno())
             header = source.read(100)
-        version = int.from_bytes(header[60:64], "big")
-        if (
-            len(header) != 100 or header[:16] != b"SQLite format 3\0"
-            or header[18:20] != b"\x01\x01"
-            or version not in _READABLE_VERSIONS
-            or int.from_bytes(header[68:72], "big") != APPLICATION_ID
-        ):
+        version = _parse_owned_sqlite_header(header, require_rollback_mode=True)
+        if version is None or version not in _READABLE_VERSIONS:
             raise ValueError("not a supported nd2wsi single-file cache (header)")
         if version not in _WRITABLE_VERSIONS and not read_only:
             raise ValueError("prototype single-file cache is read-only; rebuild it as format 2")
@@ -411,7 +420,7 @@ class SQLiteStore(Store):
                     connection, read_only=self.read_only, cache_size=self._cache_size
                 )
                 if not created:
-                    self._validate(connection, read_only=self.read_only)
+                    self._opened_version = self._validate(connection, read_only=self.read_only)
                 if not self.read_only:
                     mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
                     if mode.lower() != "delete":
@@ -427,7 +436,7 @@ class SQLiteStore(Store):
                     except BaseException:
                         connection.rollback()
                         raise
-                    self._validate(connection, read_only=self.read_only)
+                    self._opened_version = self._validate(connection, read_only=self.read_only)
             except sqlite3.Error as exc:
                 connection.close()
                 if (attempt == 0 and self.read_only and self._recover
@@ -790,6 +799,57 @@ class SQLiteStore(Store):
                 yield key[strip:]
             after = page[-1]
 
+    def iter_entries_by_rowid(
+        self,
+        *,
+        batch_rows: int = 256,
+        max_batch_bytes: int = 16 * 1024 * 1024,
+    ) -> Iterator[tuple[str, bytes]]:
+        """Stream ``(relative_key, payload)`` in physical SQLite rowid order.
+
+        Reads bounded pages inside ``_read_conn()`` (closing the cursor before
+        returning the pooled connection) and yields outside the lock. Legacy
+        format-1 ``WITHOUT ROWID`` containers fall back to ``list_keys()``.
+        """
+        if batch_rows < 1:
+            raise ValueError("batch_rows must be >= 1")
+        if max_batch_bytes < 1:
+            raise ValueError("max_batch_bytes must be >= 1")
+        if not getattr(self, "_is_open", False) and not self._closed:
+            self._ensure_open_sync()
+        if self._opened_version == 1:
+            for key in self.list_keys():
+                yield key, self.read_bytes(key)
+            return
+        prefix_slash = f"{self.prefix}/" if self.prefix else ""
+        strip = len(prefix_slash)
+        after_rowid = 0
+        while True:
+            page: list[tuple[str, bytes]] = []
+            page_bytes = 0
+            with self._read_conn() as connection:
+                with closing(
+                    connection.execute(
+                        "SELECT rowid, key, value FROM entries "
+                        "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                        (after_rowid, batch_rows),
+                    )
+                ) as cursor:
+                    for rowid, key, value in cursor:
+                        if not isinstance(value, bytes):
+                            raise ValueError("single-file cache entry is not a BLOB")
+                        page.append((key, value))
+                        after_rowid = int(rowid)
+                        page_bytes += len(value)
+                        if page_bytes >= max_batch_bytes:
+                            break
+            if not page:
+                break
+            for key, value in page:
+                if prefix_slash and not key.startswith(prefix_slash):
+                    continue
+                yield key[strip:], value
+
     async def list(self) -> AsyncIterator[str]:
         async for key in self.list_prefix(""):
             yield key
@@ -862,6 +922,78 @@ def write_entry(path: str | os.PathLike, key: str, payload: bytes | bytearray | 
         store.write_bytes(key, payload)
 
 
+def _parse_owned_sqlite_header(
+    header: bytes, *, require_rollback_mode: bool = True
+) -> int | None:
+    """Return PRAGMA user_version if ``header`` is an owned 100-byte SQLite header."""
+    if (
+        len(header) != 100
+        or header[:16] != b"SQLite format 3\0"
+        or int.from_bytes(header[68:72], "big") != APPLICATION_ID
+    ):
+        return None
+    if require_rollback_mode and header[18:20] != b"\x01\x01":
+        return None
+    return int.from_bytes(header[60:64], "big")
+
+
+def is_owned_rollback_sqlite_header(path: str | os.PathLike) -> bool:
+    """TOCTOU-safe check that ``path`` is a regular owned rollback-mode SQLite file.
+
+    Used strictly by destructive stale-staging sweeps so dead ``.building-*``
+    containers with hot ``-journal`` companions can be identified without
+    opening SQLite (which fails with ``SQLITE_READONLY_ROLLBACK``).
+    """
+    native = filesystem_path(path)
+    try:
+        lst = os.lstat(native)
+    except OSError:
+        return False
+    if (
+        stat.S_ISLNK(lst.st_mode)
+        or is_windows_name_surrogate_reparse(lst)
+        or not stat.S_ISREG(lst.st_mode)
+    ):
+        return False
+    flags = (
+        os.O_RDONLY
+        | BINARY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(native, flags)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or is_windows_name_surrogate_reparse(st, fd=fd)
+            or (
+                st.st_ino != 0
+                and lst.st_ino != 0
+                and (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino)
+            )
+        ):
+            return False
+        chunks: list[bytes] = []
+        remaining = 100
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        header = b"".join(chunks)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    version = _parse_owned_sqlite_header(header, require_rollback_mode=True)
+    return version in _READABLE_VERSIONS
+
+
 def is_single_file(path: str | os.PathLike) -> bool:
     try:
         with SQLiteStore(path, read_only=True):
@@ -881,13 +1013,8 @@ def newer_file_format(path: str | os.PathLike) -> int | None:
             header = source.read(100)
     except OSError:
         return None
-    if (
-        len(header) != 100 or header[:16] != b"SQLite format 3\0"
-        or int.from_bytes(header[68:72], "big") != APPLICATION_ID
-    ):
-        return None
-    version = int.from_bytes(header[60:64], "big")
-    return version if version > MAX_READABLE_VERSION else None
+    version = _parse_owned_sqlite_header(header, require_rollback_mode=False)
+    return version if version is not None and version > MAX_READABLE_VERSION else None
 
 
 _CHUNK_POOL_LOCK = threading.Lock()

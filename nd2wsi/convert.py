@@ -83,6 +83,8 @@ def _hooks() -> _convert_cache._FacadeHooks:
         legacy_store=_legacy_store,
         legacy_matches_source=_legacy_store_matches_source,
         store_matches_selection=_store_matches_selection,
+        convert_is_default=(convert is _DEFAULT_CONVERT),
+        available_memory_bytes=available_memory_bytes,
     )
 
 
@@ -483,6 +485,9 @@ def convert(
         ngff_version=ngff_version,
         hooks=_hooks(),
     )
+
+
+_DEFAULT_CONVERT = convert
 
 
 def ensure_cache(

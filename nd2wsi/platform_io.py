@@ -9,12 +9,72 @@ outside this section, and POSIX keeps its native concurrent pread/pwrite.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
+import time
+from collections.abc import Callable
 from functools import lru_cache
+from typing import TypeVar
+
+_T = TypeVar("_T")
+_SQLITE_TRANSIENT_PRIMARY_CODES = frozenset({5, 6, 14})  # BUSY, LOCKED, CANTOPEN
+_SQLITE_CANTOPEN_ISDIR = 526
+_WINDOWS_TRANSIENT_WINERRORS = frozenset({5, 32, 33})  # ACCESS_DENIED, SHARING, LOCK
 
 # A fixed number of locks avoids retaining a lock for every recycled fd.
 _POSITION_LOCKS = tuple(threading.RLock() for _ in range(64))
 BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _is_transient_windows_staging_error(exc: BaseException) -> bool:
+    """True for transient Windows sharing/antivirus errors on unpublished staging files."""
+    if isinstance(exc, PermissionError):
+        return getattr(exc, "winerror", None) in _WINDOWS_TRANSIENT_WINERRORS
+    op_exc: sqlite3.OperationalError | None = None
+    if isinstance(exc, sqlite3.OperationalError):
+        op_exc = exc
+    elif isinstance(exc, ValueError) and isinstance(exc.__cause__, sqlite3.OperationalError):
+        op_exc = exc.__cause__
+    if op_exc is None:
+        return False
+    code = getattr(op_exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        if code == _SQLITE_CANTOPEN_ISDIR:
+            return False
+        return (code & 0xFF) in _SQLITE_TRANSIENT_PRIMARY_CODES
+    msg = str(op_exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "unable to open database file",
+            "database is locked",
+            "database table is locked",
+        )
+    )
+
+
+def retry_windows_staging_op(
+    fn: Callable[[], _T],
+    *,
+    max_attempts: int = 5,
+    base_delay: float = 0.05,
+    platform: str | None = None,
+) -> _T:
+    """Retry transient Windows Defender/sharing errors on unpublished staging files.
+
+    Never use this helper on published viewer-held targets or ``quarantine()`` so
+    real user-facing lock errors are reported without delay or masking.
+    """
+    if (platform or os.name) != "nt" or max_attempts <= 1:
+        return fn()
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except BaseException as exc:
+            if attempt + 1 >= max_attempts or not _is_transient_windows_staging_error(exc):
+                raise
+            time.sleep(base_delay * (2**attempt))
+    raise AssertionError("unreachable staging retry loop")
 
 
 def filesystem_path(path: str | os.PathLike, *, platform: str | None = None) -> str:

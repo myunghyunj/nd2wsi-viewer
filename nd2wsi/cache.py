@@ -36,6 +36,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ from .platform_io import (
     filesystem_path,
     process_is_alive,
     read_at,
+    retry_windows_staging_op,
     set_fd_times,
     write_at,
 )
@@ -515,6 +517,67 @@ def fingerprints_match(
     return _exfat_mtime_skew_matches(mtime_a, mtime_b)
 
 
+def build_manifest(
+    container: Path,
+    slide: Path,
+    fingerprint: dict[str, Any],
+    selection: dict[str, Any],
+    resolved_z: Any,
+    tile: int,
+    shape_cyx: tuple[int, int, int],
+    dtype: str,
+    *,
+    kind: str = "full",
+    storage: dict[str, Any] | None = None,
+    origin: str | None = None,
+    single_file: bool | None = None,
+    complete: bool = True,
+) -> dict[str, Any]:
+    """Construct a cache manifest dictionary without mutating caller dicts."""
+    from . import __version__
+
+    use_single_file = is_file_container(container) if single_file is None else bool(single_file)
+    base_dir = container.parent if use_single_file else container
+    try:
+        rel_path = Path(os.path.relpath(slide, base_dir)).as_posix()
+    except ValueError:
+        rel_path = ""
+    storage_meta = (
+        dict(storage)
+        if storage is not None
+        else {
+            "format": "zarr",
+            "zarr_version": 2,
+            "ngff_version": "0.4",
+            "backend": "zarr-v2-direct",
+        }
+    )
+    if use_single_file:
+        storage_meta["container"] = "nd2svs-sqlite/2"
+    manifest: dict[str, Any] = {
+        "format": (
+            SINGLE_FILE_FORMAT
+            if use_single_file
+            else (MANIFEST_FORMAT if kind == "full" else OVERVIEW_FORMAT)
+        ),
+        "kind": kind,
+        "complete": bool(complete),
+        "generation": uuid.uuid4().hex,
+        "source": {
+            **fingerprint,
+            "relative_path": rel_path,
+        },
+        "selection": {**selection, "z_resolved": resolved_z},
+        "image": {"shape_cyx": list(shape_cyx), "dtype": dtype},
+        "pyramid": {"algorithm": ALGORITHM, "tile": tile},
+        "storage": storage_meta,
+        "created_by": {"nd2wsi_version": __version__},
+    }
+    if origin is not None:
+        manifest["origin"] = origin
+    return manifest
+
+
 def write_manifest(
     container: Path,
     slide: Path,
@@ -528,41 +591,25 @@ def write_manifest(
     storage: dict[str, Any] | None = None,
     origin: str | None = None,
 ) -> None:
-    from . import __version__
-
-    try:
-        rel_path = Path(os.path.relpath(slide, source_base(container))).as_posix()
-    except ValueError:
-        rel_path = ""
-    manifest: dict[str, Any] = {
-        "format": SINGLE_FILE_FORMAT if is_file_container(container) else (
-            MANIFEST_FORMAT if kind == "full" else OVERVIEW_FORMAT
-        ),
-        "kind": kind,
-        "complete": True,
-        "generation": uuid.uuid4().hex,
-        "source": {
-            **fingerprint,
-            "relative_path": rel_path,
-        },
-        "selection": {**selection, "z_resolved": resolved_z},
-        "image": {"shape_cyx": list(shape_cyx), "dtype": dtype},
-        "pyramid": {"algorithm": ALGORITHM, "tile": tile},
-        "storage": storage
-        or {
-            "format": "zarr",
-            "zarr_version": 2,
-            "ngff_version": "0.4",
-            "backend": "zarr-v2-direct",
-        },
-        "created_by": {"nd2wsi_version": __version__},
-    }
-    if origin is not None:
-        manifest["origin"] = origin
-    if is_file_container(container):
+    use_single_file = is_file_container(container)
+    manifest = build_manifest(
+        container,
+        slide,
+        fingerprint,
+        selection,
+        resolved_z,
+        tile,
+        shape_cyx,
+        dtype,
+        kind=kind,
+        storage=storage,
+        origin=origin,
+        single_file=use_single_file,
+        complete=True,
+    )
+    if use_single_file:
         from .storage.single_file import write_entry
 
-        manifest["storage"].update({"container": "nd2svs-sqlite/2"})
         write_entry(container, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
         return
     tmp = container / f".{MANIFEST_NAME}.{uuid.uuid4().hex}.tmp"
@@ -1030,7 +1077,7 @@ def commit_container(staging: Path, final: Path) -> None:
         # A single replacement keeps the pathname continuously valid. Existing
         # POSIX readers retain their old inode; Windows refuses if a reader has
         # not released its handle. Either outcome preserves a complete cache.
-        os.replace(staging_native, final_native)
+        retry_windows_staging_op(lambda: os.replace(staging_native, final_native))
         return
     backup = None
     backup_native = None
@@ -1039,7 +1086,7 @@ def commit_container(staging: Path, final: Path) -> None:
         backup_native = filesystem_path(backup)
         os.rename(final_native, backup_native)
     try:
-        os.rename(staging_native, final_native)
+        retry_windows_staging_op(lambda: os.rename(staging_native, final_native))
     except OSError:
         if backup_native is not None:
             os.rename(backup_native, final_native)
@@ -1048,23 +1095,141 @@ def commit_container(staging: Path, final: Path) -> None:
         _remove_artifact(backup)
 
 
-def _remove_artifact(path: Path) -> None:
-    """Remove one exact app-owned staging artifact, whether file or directory."""
-    _refuse_database_companions(path)
+_SQLITE_ROLLBACK_JOURNAL_MAGIC = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7"
+
+
+def _is_valid_orphan_rollback_journal(path: Path) -> bool:
+    """TOCTOU-safe check that ``path`` is a regular 0-byte or SQLite rollback journal."""
+    native = filesystem_path(path)
+    try:
+        lst = os.lstat(native)
+    except OSError:
+        return False
+    if (
+        stat.S_ISLNK(lst.st_mode)
+        or is_windows_name_surrogate_reparse(lst)
+        or not stat.S_ISREG(lst.st_mode)
+    ):
+        return False
+    flags = (
+        os.O_RDONLY
+        | BINARY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(native, flags)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or is_windows_name_surrogate_reparse(st, fd=fd)
+            or (
+                st.st_ino != 0
+                and lst.st_ino != 0
+                and (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino)
+            )
+        ):
+            return False
+        if st.st_size == 0:
+            return True
+        chunks: list[bytes] = []
+        remaining = len(_SQLITE_ROLLBACK_JOURNAL_MAGIC)
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks) == _SQLITE_ROLLBACK_JOURNAL_MAGIC
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _unlink_staging_file(native: str) -> bool:
+    def _do_unlink() -> bool:
+        try:
+            os.unlink(native)
+            return True
+        except FileNotFoundError:
+            return False
+
+    return retry_windows_staging_op(_do_unlink)
+
+
+def _remove_artifact(path: Path, *, allow_building_journal: bool = False) -> None:
+    """Remove one exact app-owned staging artifact, whether file or directory.
+
+    When ``allow_building_journal`` is True (strictly for unpublished
+    ``.building-*`` staging files), refuses ``-wal``/``-shm``, validates both
+    ``path`` and any regular non-symlink ``-journal``, and unlinks ``path``
+    first before unlinking ``-journal`` so a failed unlink never detaches a
+    database from its rollback journal.
+    """
+    if not allow_building_journal:
+        _refuse_database_companions(path)
+        native = filesystem_path(path)
+        try:
+            st = os.lstat(native)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
+            try:
+                os.unlink(native)
+            except FileNotFoundError:
+                pass
+            return
+        if is_windows_name_surrogate_reparse(st):
+            raise ValueError(f"refusing to recursively remove junction or reparse point: {path}")
+        shutil.rmtree(native)
+        return
+
+    for suffix in ("-wal", "-shm"):
+        companion = path.with_name(path.name + suffix)
+        if os.path.lexists(filesystem_path(companion)):
+            raise RuntimeError(
+                f"staging cache has a WAL companion; preserve and recover it: {companion}"
+            )
     native = filesystem_path(path)
     try:
         st = os.lstat(native)
     except FileNotFoundError:
-        return
-    if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
-        try:
-            os.unlink(native)
-        except FileNotFoundError:
-            pass
-        return
-    if is_windows_name_surrogate_reparse(st):
-        raise ValueError(f"refusing to recursively remove junction or reparse point: {path}")
-    shutil.rmtree(native)
+        st = None
+    if st is not None:
+        if stat.S_ISLNK(st.st_mode) or is_windows_name_surrogate_reparse(st):
+            raise ValueError(f"refusing to remove symlink or junction staging artifact: {path}")
+        if stat.S_ISDIR(st.st_mode):
+            _refuse_database_companions(path)
+            shutil.rmtree(native)
+            return
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"refusing to remove non-regular staging artifact: {path}")
+    journal = path.with_name(path.name + "-journal")
+    journal_native = filesystem_path(journal)
+    has_journal = os.path.lexists(journal_native)
+    if has_journal:
+        j_st = os.lstat(journal_native)
+        if (
+            stat.S_ISLNK(j_st.st_mode)
+            or is_windows_name_surrogate_reparse(j_st)
+            or not stat.S_ISREG(j_st.st_mode)
+        ):
+            raise RuntimeError(
+                f"refusing unsafe staging rollback journal; preserving artifact: {journal}"
+            )
+    if st is not None:
+        _unlink_staging_file(native)
+    if has_journal:
+        _unlink_staging_file(journal_native)
+
+
+def remove_staging_artifact(path: Path) -> None:
+    """Remove an unpublished ``.building-*`` staging file (and rollback journal) or directory."""
+    _remove_artifact(path, allow_building_journal=True)
 
 
 def _sweep_lock_candidates(caches_dir: Path, family: str) -> list[CacheLock]:
@@ -1121,95 +1286,235 @@ def _final_cache_present(caches_dir: Path, family: str) -> bool:
     return False
 
 
-def sweep_stale_builds(caches_dir: Path) -> int:
-    """Remove leftover staging and backup dirs whose builder is gone.
+def sweep_stale_builds(
+    caches_dir: Path, *, owned_families: Collection[str] = ()
+) -> int:
+    """Remove leftover staging and backup artifacts whose builder is gone.
 
-    Covers ``*.building-<pid>`` staging and ``*.replaced-*`` backups that
-    a crash inside commit_container can strand. Liveness is judged from
-    the family's exact lockfile — names are never fed to glob, so a
-    bracketed NIS-Elements filename cannot inject wildcards.
+    Covers ``*.building-*`` staging artifacts (including dead ``.nd2svs.building-*``
+    SQLite files with rollback ``-journal`` companions and orphaned rollback
+    journals) and ``*.replaced-*`` backups that a crash inside commit_container
+    can strand. ``owned_families`` names cache families whose ``CacheLock`` is
+    already held exclusively by the caller (before creating its new staging
+    file) so reopening a crashed slide reclaims its own prior staging file.
+    Liveness is judged from the family's exact lockfile — names are never fed
+    to glob, so a bracketed NIS-Elements filename cannot inject wildcards.
     """
     n = 0
+    owned = set(owned_families)
     caches_native = filesystem_path(caches_dir)
     if not os.path.isdir(caches_native):
         return 0
     with os.scandir(caches_native) as it:
         names = [entry.name for entry in it]
     for name in names:
+        if name.endswith(("-wal", "-shm")):
+            continue
         item = caches_dir / name
-        match = re.fullmatch(r"(.+\.(?:nd2wsi-cache|nd2svs))\.(building|replaced)-[^/]+", name)
+        orphan_match = re.fullmatch(
+            r"(.+\.nd2svs)\.building-[^/]+-journal", name, re.IGNORECASE
+        )
+        if orphan_match is not None:
+            base = item.with_name(name[: -len("-journal")])
+            if os.path.lexists(filesystem_path(base)):
+                continue
+            family = orphan_match.group(1)
+            is_owned = family in owned
+            locks = [] if is_owned else _sweep_lock_candidates(caches_dir, family)
+            held_arbiters: list[SessionFileLock] = []
+            held_inodes: set[tuple[int, int]] = set()
+            held_paths: set[Path] = set()
+            contended = False
+            try:
+                if not is_owned:
+                    for lock in locks:
+                        arb_native = filesystem_path(lock._arbiter.path)
+                        try:
+                            arb_st = os.lstat(arb_native)
+                        except FileNotFoundError:
+                            continue
+                        except OSError:
+                            contended = True
+                            break
+                        arb_ino = (arb_st.st_dev, arb_st.st_ino)
+                        if arb_ino != (0, 0) and arb_ino in held_inodes:
+                            held_paths.add(lock._arbiter.path)
+                            continue
+                        try:
+                            lock._arbiter.acquire(timeout=0)
+                            held_arbiters.append(lock._arbiter)
+                            held_paths.add(lock._arbiter.path)
+                            if arb_ino != (0, 0):
+                                held_inodes.add(arb_ino)
+                        except (TimeoutError, OSError):
+                            contended = True
+                            break
+                    if contended:
+                        continue
+                    live = False
+                    unreadable = False
+                    for lock in locks:
+                        try:
+                            lock_st = os.lstat(filesystem_path(lock.path))
+                        except FileNotFoundError:
+                            continue
+                        except OSError:
+                            unreadable = True
+                            break
+                        info = lock._read()
+                        if info is None:
+                            if not CacheLock._stale_info(None, lock_st.st_mtime):
+                                live = True
+                                break
+                        elif info.get("released") is True:
+                            continue
+                        elif _taken_elsewhere(info):
+                            continue
+                        else:
+                            try:
+                                if process_is_alive(int(info.get("pid", -1))):
+                                    live = True
+                                    break
+                            except (ProcessLookupError, ValueError, TypeError, OverflowError):
+                                pass
+                            except PermissionError:
+                                live = True
+                                break
+                    if unreadable or live:
+                        continue
+                try:
+                    if os.path.lexists(filesystem_path(base)):
+                        continue
+                    if any(
+                        os.path.lexists(filesystem_path(base.with_name(base.name + suffix)))
+                        for suffix in ("-wal", "-shm")
+                    ):
+                        continue
+                    if not _is_valid_orphan_rollback_journal(item):
+                        continue
+                    if not is_owned and any(
+                        lock._arbiter.path not in held_paths
+                        and os.path.exists(filesystem_path(lock._arbiter.path))
+                        for lock in locks
+                    ):
+                        continue
+                    if _unlink_staging_file(filesystem_path(item)):
+                        n += 1
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            finally:
+                for arbiter in reversed(held_arbiters):
+                    arbiter.release()
+            continue
+
+        if name.endswith("-journal"):
+            continue
+        match = re.fullmatch(
+            r"(.+\.(?:nd2wsi-cache|nd2svs))\.(building|replaced)-[^/]+",
+            name,
+            re.IGNORECASE,
+        )
         if match is None:
             continue
-        family, kind = match.group(1), match.group(2)
+        family, kind = match.group(1), match.group(2).lower()
         is_replaced = kind == "replaced"
-        locks = _sweep_lock_candidates(caches_dir, family)
-        held_arbiters: list[SessionFileLock] = []
-        held_inodes: set[tuple[int, int]] = set()
-        held_paths: set[Path] = set()
+        is_single_building = (
+            kind == "building" and family.lower().endswith(SINGLE_FILE_SUFFIX)
+        )
+        is_owned = family in owned
+        locks = [] if is_owned else _sweep_lock_candidates(caches_dir, family)
+        held_arbiters = []
+        held_inodes = set()
+        held_paths = set()
         contended = False
         try:
-            for lock in locks:
-                arb_native = filesystem_path(lock._arbiter.path)
-                try:
-                    arb_st = os.lstat(arb_native)
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    contended = True
-                    break
-                arb_ino = (arb_st.st_dev, arb_st.st_ino)
-                if arb_ino != (0, 0) and arb_ino in held_inodes:
-                    held_paths.add(lock._arbiter.path)
-                    continue
-                try:
-                    lock._arbiter.acquire(timeout=0)
-                    held_arbiters.append(lock._arbiter)
-                    held_paths.add(lock._arbiter.path)
-                    if arb_ino != (0, 0):
-                        held_inodes.add(arb_ino)
-                except (TimeoutError, OSError):
-                    contended = True
-                    break
-            if contended:
-                continue  # another local process is actively coordinating this family
-            live = False
-            unreadable = False
-            for lock in locks:
-                try:
-                    lock_st = os.lstat(filesystem_path(lock.path))
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    unreadable = True
-                    break  # unreadable lockfile: assume build may still be active
-                info = lock._read()
-                if info is None:
-                    # Momentarily empty/unreadable while being written: honor 30s grace.
-                    if not CacheLock._stale_info(None, lock_st.st_mtime):
-                        live = True
-                        break
-                elif info.get("released") is True:
-                    continue
-                elif _taken_elsewhere(info):
-                    continue  # a builder on another machine or boot is not running here
-                else:
+            if not is_owned:
+                for lock in locks:
+                    arb_native = filesystem_path(lock._arbiter.path)
                     try:
-                        if process_is_alive(int(info.get("pid", -1))):
+                        arb_st = os.lstat(arb_native)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        contended = True
+                        break
+                    arb_ino = (arb_st.st_dev, arb_st.st_ino)
+                    if arb_ino != (0, 0) and arb_ino in held_inodes:
+                        held_paths.add(lock._arbiter.path)
+                        continue
+                    try:
+                        lock._arbiter.acquire(timeout=0)
+                        held_arbiters.append(lock._arbiter)
+                        held_paths.add(lock._arbiter.path)
+                        if arb_ino != (0, 0):
+                            held_inodes.add(arb_ino)
+                    except (TimeoutError, OSError):
+                        contended = True
+                        break
+                if contended:
+                    continue  # another local process is actively coordinating this family
+                live = False
+                unreadable = False
+                for lock in locks:
+                    try:
+                        lock_st = os.lstat(filesystem_path(lock.path))
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        unreadable = True
+                        break  # unreadable lockfile: assume build may still be active
+                    info = lock._read()
+                    if info is None:
+                        # Momentarily empty/unreadable while being written: honor 30s grace.
+                        if not CacheLock._stale_info(None, lock_st.st_mtime):
                             live = True
                             break
-                    except (ProcessLookupError, ValueError, TypeError, OverflowError):
-                        pass
-                    except PermissionError:
-                        live = True
-                        break
-            if unreadable or live:
-                continue
+                    elif info.get("released") is True:
+                        continue
+                    elif _taken_elsewhere(info):
+                        continue  # a builder on another machine or boot is not running here
+                    else:
+                        try:
+                            if process_is_alive(int(info.get("pid", -1))):
+                                live = True
+                                break
+                        except (ProcessLookupError, ValueError, TypeError, OverflowError):
+                            pass
+                        except PermissionError:
+                            live = True
+                            break
+                if unreadable or live:
+                    continue
             if is_replaced and not _final_cache_present(caches_dir, family):
                 # Preserve sole backup if commit crashed between the two renames.
                 continue
             try:
-                _refuse_database_companions(item)
                 item_st = os.lstat(filesystem_path(item))
+                if (
+                    is_single_building
+                    and stat.S_ISREG(item_st.st_mode)
+                    and not stat.S_ISLNK(item_st.st_mode)
+                    and not is_windows_name_surrogate_reparse(item_st)
+                ):
+                    from .storage.single_file import is_owned_rollback_sqlite_header
+
+                    if any(
+                        os.path.lexists(filesystem_path(item.with_name(item.name + suffix)))
+                        for suffix in ("-wal", "-shm")
+                    ):
+                        continue
+                    if not is_owned_rollback_sqlite_header(item):
+                        continue
+                    if not is_owned and any(
+                        lock._arbiter.path not in held_paths
+                        and os.path.exists(filesystem_path(lock._arbiter.path))
+                        for lock in locks
+                    ):
+                        continue  # a local builder started while we inspected this family
+                    remove_staging_artifact(item)
+                    n += 1
+                    continue
+                _refuse_database_companions(item)
                 if stat.S_ISREG(item_st.st_mode):
                     from .storage.single_file import is_single_file
 
@@ -1224,7 +1529,7 @@ def sweep_stale_builds(caches_dir: Path) -> int:
                     from .cache_removal import rescue_annotations
 
                     rescue_annotations(item, caches_dir.parent / ANNOTATIONS_DIR)
-                if any(
+                if not is_owned and any(
                     lock._arbiter.path not in held_paths
                     and os.path.exists(filesystem_path(lock._arbiter.path))
                     for lock in locks

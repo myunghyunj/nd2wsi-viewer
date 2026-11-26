@@ -1524,3 +1524,64 @@ def test_cache_lock_uses_filesystem_path_for_os_operations(tmp_path, monkeypatch
         assert lock.refresh()
     assert real_fs_path(lock.path) in seen
     assert real_fs_path(lock._arbiter.path) in seen
+
+
+def test_downsample_into_monkeypatch_intercepts_direct_sqlite_and_cleans_journal(
+    slide, monkeypatch
+):
+    from nd2wsi import migration as migration_mod
+    from nd2wsi.storage.single_file_writer import SingleFileArrayHandle
+
+    container = cache_container(slide)
+    seen_targets: list[object] = []
+
+    def must_not_pack(*args, **kwargs):
+        raise AssertionError("direct-to-SQLite build must not invoke pack_directory")
+
+    def boom(src_arr, dst_arr, *args, **kwargs):
+        seen_targets.append(dst_arr)
+        stagings = list(container.parent.glob(f"{container.name}.building-*"))
+        assert len(stagings) == 1
+        journal = stagings[0].with_name(stagings[0].name + "-journal")
+        journal.write_bytes(b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7" + b"\x00" * 32)
+        raise RuntimeError("injected direct downsample error")
+
+    monkeypatch.setattr(migration_mod, "pack_directory", must_not_pack)
+    monkeypatch.setattr(convert_mod, "_downsample_into", boom)
+
+    with pytest.raises(RuntimeError, match="injected direct downsample error"):
+        ensure_cache(slide, tile=256)
+
+    assert len(seen_targets) == 1
+    assert isinstance(seen_targets[0], SingleFileArrayHandle)
+    assert not container.exists()
+    assert not list(container.parent.glob("*.building-*"))
+    assert not list(container.parent.glob("*-journal"))
+
+
+def test_convert_monkeypatch_falls_back_to_directory_pack_path(slide, monkeypatch):
+    from nd2wsi import migration as migration_mod
+
+    real_convert = convert_mod.convert
+    real_pack = migration_mod.pack_directory
+    calls = {"convert": 0, "pack": 0}
+
+    def wrapped_convert(*args, **kwargs):
+        calls["convert"] += 1
+        return real_convert(*args, **kwargs)
+
+    def wrapped_pack(*args, **kwargs):
+        calls["pack"] += 1
+        return real_pack(*args, **kwargs)
+
+    monkeypatch.setattr(convert_mod, "convert", wrapped_convert)
+    monkeypatch.setattr(migration_mod, "pack_directory", wrapped_pack)
+
+    store = ensure_cache(slide, tile=256)
+    assert calls["convert"] == 1
+    assert calls["pack"] == 1
+    root, _ = open_store(store)
+    try:
+        assert tuple(root["0"].shape) == (3, 900, 1200)
+    finally:
+        root.close()

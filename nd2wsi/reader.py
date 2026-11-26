@@ -25,12 +25,19 @@ read with a loud warning.
 from __future__ import annotations
 
 import math
+import mmap as _mmap
+import os
 import re
+import stat
 import warnings
+from contextlib import ExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from .platform_io import BINARY, filesystem_path, read_at
 
 FRAME_AXES = {"C", "Y", "X", "S"}
 
@@ -428,16 +435,160 @@ def plane_view(f: Any, selection: PlaneSelection) -> tuple[np.ndarray, bool]:
     return _frame_to_cyx(f.read_frame(seq), sizes)
 
 
-def _mmap_backed(a: np.ndarray) -> bool:
-    """True when the array is a non-owning view whose buffer is a memory map."""
-    import mmap as _mmap
+_SEQ_MAX_STRIP_BYTES = 48 * 1024 * 1024
 
+
+@dataclass(frozen=True)
+class SequentialNd2Layout:
+    """Verified physical file layout for sequential Level-1 ND2 streaming."""
+
+    source_path: Path
+    frame_offset: int
+    shape_cyx: tuple[int, int, int]
+    dtype: np.dtype
+    y_stride: int
+    x_stride: int
+    fd: int | None = None
+    source_identity: tuple[int, int] | None = None
+
+
+def _mmap_root(a: np.ndarray) -> _mmap.mmap | None:
+    """Return the underlying ``mmap.mmap`` if ``a`` is a non-owning mmap view."""
     if a.flags.owndata:
-        return False
-    base = a
+        return None
+    base: Any = a
     while getattr(base, "base", None) is not None:
         base = base.base
-    return isinstance(base, _mmap.mmap)
+    return base if isinstance(base, _mmap.mmap) else None
+
+
+def _mmap_backed(a: np.ndarray) -> bool:
+    """True when the array is a non-owning view whose buffer is a memory map."""
+    return _mmap_root(a) is not None
+
+
+def _read_at_exact(fd: int, size: int, offset: int) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = size
+    pos = offset
+    while remaining > 0:
+        chunk = read_at(fd, remaining, pos)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        pos += len(chunk)
+    return b"".join(chunks)
+
+
+def sequential_nd2_layout(
+    f: Any,
+    selection: PlaneSelection,
+    source_path: Path,
+    *,
+    stack: ExitStack | None = None,
+) -> SequentialNd2Layout | None:
+    """Return verified sequential-read layout for an uncompressed ND2 plane, or None.
+
+    Fail-closed: any unsupported dtype, non-native endianness, non-interleaved
+    stride, non-zero mmap base offset, or byte-probe mismatch returns ``None``
+    so the caller uses the existing Dask path.
+    """
+    ok, _ = is_source_backable(f, selection)
+    if not ok:
+        return None
+    try:
+        view, _ = plane_view(f, selection)
+    except (ValueError, NotImplementedError):
+        return None
+    if view.ndim != 3:
+        return None
+    dt = np.dtype(view.dtype)
+    if dt not in (np.dtype("uint8"), np.dtype("uint16")) or not dt.isnative:
+        return None
+    c, h, w = (int(v) for v in view.shape)
+    if c < 1 or h < 2 or w < 2:
+        return None
+    root_mmap = _mmap_root(view)
+    if root_mmap is None:
+        return None
+    c_stride, y_stride, x_stride = (int(v) for v in view.strides)
+    itemsize = int(dt.itemsize)
+    if x_stride != c * itemsize or y_stride < w * x_stride:
+        return None
+    if 2 * y_stride > _SEQ_MAX_STRIP_BYTES:
+        return None
+    if c == 1:
+        if c_stride not in (0, itemsize):
+            return None
+    elif c_stride != itemsize:
+        return None
+
+    mm_arr = np.frombuffer(root_mmap, dtype=np.uint8)
+    try:
+        mm_addr = int(mm_arr.__array_interface__["data"][0])
+        mm_len = len(root_mmap)
+    finally:
+        del mm_arr
+    frame_offset = int(view.__array_interface__["data"][0]) - mm_addr
+
+    src_path = Path(source_path)
+    try:
+        fd = os.open(filesystem_path(src_path), os.O_RDONLY | BINARY)
+    except OSError:
+        return None
+    transferred = False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or mm_len != st.st_size:
+            return None
+        file_size = int(st.st_size)
+        if frame_offset < 0 or frame_offset + (h - 1) * y_stride + w * x_stride > file_size:
+            return None
+
+        hdr_len = min(64, file_size)
+        if hdr_len > 0:
+            if _read_at_exact(fd, hdr_len, 0) != bytes(root_mmap[:hdr_len]):
+                return None
+
+        probe_len = min(64, w * x_stride)
+        probe_px = min(w, math.ceil(probe_len / x_stride))
+
+        exp_head = np.ascontiguousarray(view[:, 0, :probe_px]).T.tobytes()[:probe_len]
+        if _read_at_exact(fd, probe_len, frame_offset) != exp_head:
+            return None
+
+        mid_row = h // 2
+        exp_mid = np.ascontiguousarray(view[:, mid_row, :probe_px]).T.tobytes()[:probe_len]
+        if _read_at_exact(fd, probe_len, frame_offset + mid_row * y_stride) != exp_mid:
+            return None
+
+        exp_tail = np.ascontiguousarray(view[:, h - 1, w - probe_px :]).T.tobytes()[-probe_len:]
+        tail_offset = frame_offset + (h - 1) * y_stride + w * x_stride - probe_len
+        if _read_at_exact(fd, probe_len, tail_offset) != exp_tail:
+            return None
+
+        identity = (int(st.st_dev), int(st.st_ino))
+        layout_fd: int | None = None
+        if stack is not None:
+            stack.callback(os.close, fd)
+            transferred = True
+            layout_fd = fd
+        return SequentialNd2Layout(
+            source_path=src_path,
+            frame_offset=frame_offset,
+            shape_cyx=(c, h, w),
+            dtype=dt,
+            y_stride=y_stride,
+            x_stride=x_stride,
+            fd=layout_fd,
+            source_identity=identity,
+        )
+    except OSError:
+        return None
+    finally:
+        if not transferred:
+            os.close(fd)
 
 
 def is_source_backable(f: Any, selection: PlaneSelection) -> tuple[bool, str]:
